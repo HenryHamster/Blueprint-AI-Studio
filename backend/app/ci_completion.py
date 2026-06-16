@@ -1615,6 +1615,57 @@ async def handle_ci_completion(
             logger.info(
                 f"[CI] PR #{ci_pr_number} CI passed, waiting for review approval ({source})"
             )
+            # Stamp ci_last_polled so the orchestrator's per-task throttle
+            # engages on the NEXT cycle instead of re-polling immediately.
+            # Use a longer interval for parked PRs — review approval is driven
+            # by an event (review task APPROVE), not by rapid polling.
+            _REVIEW_WAIT_POLL_INTERVAL = 120  # seconds
+            ci_loop["ci_last_polled"] = _utcnow().isoformat()
+            ci_loop["ci_poll_interval"] = max(
+                ci_loop.get("ci_poll_interval", 30), _REVIEW_WAIT_POLL_INTERVAL
+            )
+            # Track when we first entered review-wait so the backstop below
+            # can detect an orphaned review task.
+            if not ci_loop.get("review_wait_started"):
+                ci_loop["review_wait_started"] = _utcnow().isoformat()
+            # Orphan-review backstop: if a review task died without setting
+            # review_approved, the PR parks here indefinitely. Force-escalate
+            # after a deadline so operators get an alert and the task can be
+            # manually resolved rather than silently burning quota forever.
+            _REVIEW_WAIT_TIMEOUT_MIN = 60
+            _rw_started = ci_loop.get("review_wait_started")
+            if _rw_started and not ci_loop.get("review_wait_escalated"):
+                try:
+                    from datetime import datetime
+
+                    _rw_dt = datetime.fromisoformat(_rw_started)
+                    _rw_age_s = (_utcnow() - _rw_dt).total_seconds()
+                    if _rw_age_s > _REVIEW_WAIT_TIMEOUT_MIN * 60:
+                        ci_loop["review_wait_escalated"] = True
+                        task.requires_approval = True
+                        task.latest_status_message = (
+                            f"CI passed on PR #{ci_pr_number} but review approval "
+                            f"never arrived after {_REVIEW_WAIT_TIMEOUT_MIN}min "
+                            "— review task may have died; requires manual approval"
+                        )
+                        await _maybe_create_failure_alert(
+                            task,
+                            session,
+                            f"PR #{ci_pr_number}: review approval pending >"
+                            f"{_REVIEW_WAIT_TIMEOUT_MIN}min — review task may be "
+                            "orphaned; manual approval required",
+                        )
+                        logger.warning(
+                            "[CI] PR #%s review-wait backstop fired for task %s "
+                            "(%.0f min elapsed) — set requires_approval",
+                            ci_pr_number,
+                            task.id,
+                            _rw_age_s / 60,
+                        )
+                except (ValueError, TypeError):
+                    pass
+            task.context = {**(task.context or {}), "review_loop": ci_loop}
+            flag_modified(task, "context")
             session.add(task)
             _bcast_status = task.status
             await session.commit()

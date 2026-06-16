@@ -373,6 +373,68 @@ async def glob_exists_on_branch(
     return None if truncated else False
 
 
+async def list_dir_children_on_branch(
+    dir_path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+) -> list | None:
+    """Immediate children of *dir_path* derived from the cached flat tree.
+
+    Returns a list of ``{name, type, path}`` dicts that mirror the shape of
+    GitHub's ``GET /repos/.../contents/<dir>`` response (only the fields
+    consumed by :func:`_detect_build_config` in ``admin_onboard``).  Type is
+    ``"file"`` for blobs and ``"dir"`` for inferred intermediate directories.
+
+    Returns ``None`` when the snapshot is unavailable or truncated — callers
+    MUST fall back to the direct GitHub Contents API on ``None`` to preserve
+    the detector's conservative degradation semantics (indeterminate must never
+    be treated as absent).
+    """
+    snapshot = await _get_snapshot(token, owner, repo, branch, project_id)
+    if snapshot is None:
+        return None
+    paths, truncated = snapshot
+    if truncated:
+        # A truncated tree would produce an incomplete listing — fall back to
+        # the direct API so the detector never silently misses files.
+        return None
+
+    # Build a prefix to match direct children of dir_path.
+    prefix = f"{dir_path}/" if dir_path and dir_path not in ("", ".") else ""
+    children: Dict[str, str] = {}  # name -> type
+    for p in paths:
+        if prefix:
+            if not p.startswith(prefix):
+                continue
+            rest = p[len(prefix):]
+        else:
+            rest = p
+        if not rest:
+            continue
+        slash_idx = rest.find("/")
+        if slash_idx == -1:
+            # Direct child file
+            children[rest] = "file"
+        else:
+            # File inside a subdirectory — first component is the dir child
+            child_name = rest[:slash_idx]
+            if child_name not in children:
+                children[child_name] = "dir"
+
+    return [
+        {
+            "name": name,
+            "type": typ,
+            "path": f"{prefix}{name}" if prefix else name,
+        }
+        for name, typ in sorted(children.items())
+    ]
+
+
 async def file_text_on_branch(
     path: str,
     *,

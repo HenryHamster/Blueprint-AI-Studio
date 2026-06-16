@@ -12,6 +12,18 @@ from app.models import Project, ProjectMember, Task, TaskStatus
 from app.schemas import BuildConfig as BuildConfigSchema
 
 
+@pytest.fixture(autouse=True)
+def _clear_redetect_cooldowns():
+    """Prevent module-level cooldown dicts from leaking between tests."""
+    from app import build_config_detection
+
+    build_config_detection._redetect_no_test_cooldown.clear()
+    build_config_detection._redetect_empty_cooldown.clear()
+    yield
+    build_config_detection._redetect_no_test_cooldown.clear()
+    build_config_detection._redetect_empty_cooldown.clear()
+
+
 # ---------------------------------------------------------------------------
 # Helper: simple project stub for ci_resolution unit tests
 # ---------------------------------------------------------------------------
@@ -1264,3 +1276,99 @@ async def test_maybe_redetect_missing_test_command_returns_false_when_detection_
     # Config unchanged — directories still have no test command
     assert project.build_config["directories"] == original_dirs
     session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_redetect_missing_test_command_honors_cooldown():
+    """Second call within the 6h cooldown window skips _detect_build_config entirely."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_redetect_missing_test_command
+
+    project = _make_project(
+        {
+            "requires_ci_checks": False,
+            "directories": [{"path": ".", "type": "python"}],
+        }
+    )
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    project.id = "proj-cooldown-test"
+
+    session = AsyncMock()
+    detected = {
+        "directories": [{"path": ".", "type": "python", "test_cmd": "pytest tests/"}]
+    }
+
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="test-token",
+        ),
+        patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+            return_value=detected,
+        ) as mock_detect,
+        patch("sqlalchemy.orm.attributes.flag_modified"),
+        patch(
+            "app.shared_state.get_project_integration_branch",
+            return_value="main",
+        ),
+    ):
+        # First call stamps the cooldown
+        result1 = await maybe_redetect_missing_test_command(project, session)
+        assert result1 is True
+        assert mock_detect.call_count == 1
+
+        # Second call within the cooldown window must return False without
+        # invoking _detect_build_config again.
+        result2 = await maybe_redetect_missing_test_command(project, session)
+        assert result2 is False
+        assert mock_detect.call_count == 1, (
+            "_detect_build_config must NOT be called on the second call within cooldown"
+        )
+
+
+@pytest.mark.asyncio
+async def test_maybe_redetect_missing_test_command_skips_when_quota_reserve_active():
+    """When the install-token quota is near exhaustion, re-detection is skipped."""
+    import time
+    from unittest.mock import AsyncMock, patch
+
+    from app import shared_state
+    from app.build_config_detection import maybe_redetect_missing_test_command
+    from app.github_repo_snapshot import GROUNDING_QUOTA_RESERVE
+
+    project = _make_project(
+        {
+            "requires_ci_checks": False,
+            "directories": [{"path": ".", "type": "python"}],
+        }
+    )
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    project.id = "proj-quota-test"
+
+    session = AsyncMock()
+
+    saved_quota = dict(shared_state.github_quota)
+    shared_state.github_quota.update(
+        {
+            "remaining": GROUNDING_QUOTA_RESERVE - 1,
+            "limit": 5000,
+            "reset_at": int(time.time()) + 1800,
+        }
+    )
+    try:
+        with patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+        ) as mock_detect:
+            result = await maybe_redetect_missing_test_command(project, session)
+    finally:
+        shared_state.github_quota.update(saved_quota)
+
+    assert result is False
+    mock_detect.assert_not_awaited()

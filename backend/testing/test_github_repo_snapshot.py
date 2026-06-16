@@ -399,6 +399,85 @@ async def test_get_branch_sha_allow_cached_serves_from_cache(mocker):
     assert shared_state.github_cache_hits.get("branch_sha_snapshot", 0) >= 1
 
 
+# ── list_dir_children_on_branch ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_dir_children_root_listing(mocker):
+    """Root listing (dir_path='') classifies blobs as 'file' and infers 'dir'
+    entries from nested paths."""
+    from app.github_repo_snapshot import list_dir_children_on_branch
+
+    tree_paths = ("README.md", "backend/app/main.py", "frontend/index.ts")
+    _patch_requests(mocker, [_ref_response(), _tree_response(tree_paths)])
+
+    children = await list_dir_children_on_branch(
+        "", token="ghs_test", owner="acme", repo="widget", branch="automain"
+    )
+    assert children is not None
+    by_name = {c["name"]: c for c in children}
+    assert by_name["README.md"]["type"] == "file"
+    assert by_name["backend"]["type"] == "dir"
+    assert by_name["frontend"]["type"] == "dir"
+    # No deeper entries (backend/app/main.py must NOT appear at root)
+    assert "app" not in by_name
+    assert "main.py" not in by_name
+
+
+@pytest.mark.asyncio
+async def test_list_dir_children_subdir_returns_only_immediate_children(mocker):
+    """Subdir listing returns only direct children, not grandchildren."""
+    from app.github_repo_snapshot import list_dir_children_on_branch
+
+    tree_paths = (
+        "backend/app/main.py",
+        "backend/app/models.py",
+        "backend/app/routers/admin.py",
+        "frontend/index.ts",
+    )
+    _patch_requests(mocker, [_ref_response(), _tree_response(tree_paths)])
+
+    children = await list_dir_children_on_branch(
+        "backend/app", token="ghs_test", owner="acme", repo="widget", branch="automain"
+    )
+    assert children is not None
+    by_name = {c["name"]: c for c in children}
+    assert by_name["main.py"]["type"] == "file"
+    assert by_name["models.py"]["type"] == "file"
+    assert by_name["routers"]["type"] == "dir"
+    # Grandchild must not appear
+    assert "admin.py" not in by_name
+    # Sibling branch must not appear
+    assert "frontend" not in by_name
+
+
+@pytest.mark.asyncio
+async def test_list_dir_children_truncated_snapshot_returns_none(mocker):
+    """A truncated tree snapshot returns None so callers fall back to direct API."""
+    from app.github_repo_snapshot import list_dir_children_on_branch
+
+    _patch_requests(mocker, [_ref_response(), _tree_response(truncated=True)])
+
+    result = await list_dir_children_on_branch(
+        "backend", token="ghs_test", owner="acme", repo="widget", branch="automain"
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_list_dir_children_unavailable_snapshot_returns_none(mocker):
+    """When the snapshot is unavailable (e.g. branch tip lookup fails), returns None."""
+    from app.github_repo_snapshot import list_dir_children_on_branch
+
+    # 404 on the branch-tip lookup makes _get_snapshot return None.
+    _patch_requests(mocker, [_FakeResponse(404)])
+
+    result = await list_dir_children_on_branch(
+        "backend", token="ghs_test", owner="acme", repo="widget", branch="automain"
+    )
+    assert result is None
+
+
 @pytest.mark.asyncio
 async def test_get_branch_sha_default_observes_live_tip(mocker):
     """Default (allow_cached=False) re-fetches every time and never populates

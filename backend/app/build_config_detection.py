@@ -13,9 +13,18 @@ import cycle.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+# In-memory per-project cooldown for expensive tree-walk re-detections.
+# Keyed by str(project.id); value = monotonic timestamp of last attempt.
+# Resets on process restart (rare, acceptable: burn is measured in minutes).
+_redetect_no_test_cooldown: Dict[str, float] = {}
+_redetect_empty_cooldown: Dict[str, float] = {}
+# 6-hour window: a no-test repo walks the tree at most once per window.
+_REDETECT_COOLDOWN_S: float = 6 * 3600.0
 
 
 def _normalize_dir_path(path: Any) -> str:
@@ -217,6 +226,15 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
         ):
             return False
 
+        # Cooldown: avoid repeated BFS walks within the same window.
+        _proj_id_key = str(getattr(project, "id", None) or "")
+        _now_mono = time.monotonic()
+        _last_attempt = _redetect_empty_cooldown.get(_proj_id_key)
+        if _last_attempt is not None and (_now_mono - _last_attempt) < _REDETECT_COOLDOWN_S:
+            return False
+        if _proj_id_key:
+            _redetect_empty_cooldown[_proj_id_key] = _now_mono
+
         from pydantic import ValidationError
         from sqlalchemy.orm.attributes import flag_modified
 
@@ -286,6 +304,9 @@ async def maybe_redetect_missing_test_command(project, session, *, ref=None) -> 
     it never competes with that path) and the project currently has no
     detectable test command.
 
+    A 6-hour in-memory cooldown prevents the BFS tree walk from re-running on
+    every orchestrator cycle for repos that genuinely have no test command.
+
     Returns True iff re-detection found a test command and persisted it.
     Best-effort: never raises into the caller; logs, rolls back the session on
     failure, and returns False.
@@ -300,6 +321,30 @@ async def maybe_redetect_missing_test_command(project, session, *, ref=None) -> 
         if not getattr(project, "github_owner", None) or not getattr(
             project, "github_repo", None
         ):
+            return False
+
+        # Cooldown: skip if last attempt was within _REDETECT_COOLDOWN_S.
+        # Prevents the BFS tree walk from firing on every orchestrator cycle
+        # for repos that genuinely have no test command.
+        _proj_id_key = str(getattr(project, "id", None) or "")
+        _now_mono = time.monotonic()
+        _last_attempt = _redetect_no_test_cooldown.get(_proj_id_key)
+        if _last_attempt is not None and (_now_mono - _last_attempt) < _REDETECT_COOLDOWN_S:
+            return False
+        # Stamp before any API call so concurrent callers in the same window
+        # skip rather than duplicate the expensive walk.
+        if _proj_id_key:
+            _redetect_no_test_cooldown[_proj_id_key] = _now_mono
+
+        # Quota reserve: skip when the install-bucket is near exhaustion so
+        # advisory re-detection never starves critical PR/merge/CI machinery.
+        from app.github_repo_snapshot import _quota_reserve_active
+
+        if _quota_reserve_active():
+            logger.debug(
+                "[BUILD_CONFIG] Skipping no-test redetect for project %s — quota reserve active",
+                getattr(project, "id", None),
+            )
             return False
 
         from app import ci_resolution

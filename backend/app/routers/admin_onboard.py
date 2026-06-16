@@ -424,14 +424,35 @@ async def _detect_build_config(
         )
 
     async def _fetch_file_text(file_path: str) -> str | None:
-        """Fetch + decode a single repo file's text via the GitHub contents API.
+        """Fetch + decode a single repo file's text.
 
-        Returns the decoded text, or None on any non-200 status, non-file
-        payload, missing/undecodable content, or transient error — callers must
-        treat None as 'could not confirm' and emit no command. Uses the same
-        headers/params (``ref``) as the listing requests so branch-targeted
-        detection stays consistent.
+        Prefers the cached snapshot layer (app.github_repo_snapshot) when a
+        branch ref is known — collapses repeated file fetches to ≤1 blob call
+        per unique file per TTL window.  Falls back to the direct GitHub
+        Contents API when the snapshot is unavailable (quota reserve, network
+        error, or no ref supplied).
+
+        Returns the decoded text, or None on any failure — callers must treat
+        None as 'could not confirm' and emit no command.
         """
+        if ref is not None:
+            from app.github_repo_snapshot import file_text_on_branch as _fton
+
+            _exists, _text = await _fton(
+                file_path,
+                token=token,
+                owner=owner,
+                repo=repo,
+                branch=ref,
+            )
+            if _text is not None:
+                return _text
+            if _exists is False:
+                # Definitively absent on this branch.
+                return None
+            # _exists is None (snapshot unavailable) or True but blob unreadable;
+            # fall through to direct API.
+
         resp = await _github_request(
             "GET",
             _contents_url(file_path),
@@ -541,21 +562,32 @@ async def _detect_build_config(
                     _add_fallback_directory(path, f"bash {script}")
                 return
 
-    # Fetch root directory listing
-    resp = await _github_request(
-        "GET",
-        _contents_url(),
-        headers,
-        max_retries=2,
-        params=params,
-    )
-    if resp.status_code != 200:
-        logger.warning(
-            f"[ONBOARD] Failed to list repo contents for {owner}/{repo}: {resp.status_code}"
-        )
-        return {}
+    # Fetch root directory listing — prefer the cached snapshot layer (one
+    # recursive git/trees call) over per-directory /contents requests.
+    root_listing: list[Dict[str, Any]] = []
+    _root_from_snapshot = False
+    if ref is not None:
+        from app.github_repo_snapshot import list_dir_children_on_branch as _ldcb
 
-    root_listing = [item for item in resp.json() if isinstance(item, dict)]
+        _snap_root = await _ldcb("", token=token, owner=owner, repo=repo, branch=ref)
+        if _snap_root is not None:
+            root_listing = _snap_root
+            _root_from_snapshot = True
+
+    if not _root_from_snapshot:
+        resp = await _github_request(
+            "GET",
+            _contents_url(),
+            headers,
+            max_retries=2,
+            params=params,
+        )
+        if resp.status_code != 200:
+            logger.warning(
+                f"[ONBOARD] Failed to list repo contents for {owner}/{repo}: {resp.status_code}"
+            )
+            return {}
+        root_listing = [item for item in resp.json() if isinstance(item, dict)]
     directories: list[Dict[str, Any]] = []
     languages: list[str] = []
     source_items: list[Dict[str, Any]] = list(root_listing)
@@ -593,25 +625,36 @@ async def _detect_build_config(
             )
             listing_complete = False
             break
-        sub_resp = await _github_request(
-            "GET",
-            _contents_url(subdir),
-            headers,
-            max_retries=1,
-            params=params,
-        )
-        if sub_resp.status_code != 200:
-            # We could not fully read this subdirectory. Record the incomplete
-            # read so emptiness classification degrades to "not empty" rather
-            # than silently concluding greenfield over a partial listing.
-            logger.warning(
-                f"[ONBOARD] Failed to list subdir {subdir} for {owner}/{repo}: "
-                f"{sub_resp.status_code}; treating repo read as incomplete"
-            )
-            listing_complete = False
-            continue
+        # Prefer the snapshot layer when the root was also read via snapshot
+        # (guarantees the same tree version for all directory listings).
+        sub_listing: list[Dict[str, Any]] | None = None
+        if _root_from_snapshot and ref is not None:
+            from app.github_repo_snapshot import list_dir_children_on_branch as _ldcb
 
-        sub_listing = [item for item in sub_resp.json() if isinstance(item, dict)]
+            sub_listing = await _ldcb(
+                subdir, token=token, owner=owner, repo=repo, branch=ref
+            )
+
+        if sub_listing is None:
+            sub_resp = await _github_request(
+                "GET",
+                _contents_url(subdir),
+                headers,
+                max_retries=1,
+                params=params,
+            )
+            if sub_resp.status_code != 200:
+                # We could not fully read this subdirectory. Record the
+                # incomplete read so emptiness classification degrades to
+                # "not empty" rather than silently concluding greenfield
+                # over a partial listing.
+                logger.warning(
+                    f"[ONBOARD] Failed to list subdir {subdir} for {owner}/{repo}: "
+                    f"{sub_resp.status_code}; treating repo read as incomplete"
+                )
+                listing_complete = False
+                continue
+            sub_listing = [item for item in sub_resp.json() if isinstance(item, dict)]
         scanned_directories += 1
         source_items.extend(sub_listing)
         if subdir == ".github/workflows" and any(

@@ -1660,11 +1660,18 @@ class TestBuildConfigDetection:
         # The pyproject body fetch (to confirm pytest) must carry the same ref.
         pyproject_resp = _file_content_resp("[tool.pytest.ini_options]\n")
 
-        with patch(
-            "app.github._github_request",
-            new_callable=AsyncMock,
-            side_effect=[root_resp, subdir_resp, pyproject_resp],
-        ) as mock_req:
+        with (
+            patch(
+                "app.github._github_request",
+                new_callable=AsyncMock,
+                side_effect=[root_resp, subdir_resp, pyproject_resp],
+            ) as mock_req,
+            patch(
+                "app.github_repo_snapshot._get_snapshot",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
             await _detect_build_config(
                 "fake-token", "owner", "repo", ref="feature-x"
             )
@@ -3213,6 +3220,64 @@ class TestMaybeRefreshEmptyBuildConfig:
         await db_session.refresh(project)
         # Marker preserved — repo remains eligible on the next landing.
         assert (project.build_config or {}).get("detection_incomplete") is True
+
+    @pytest.mark.asyncio
+    async def test_maybe_refresh_empty_build_config_honors_cooldown(self, db_session):
+        """Second call within the 6h cooldown window skips detection entirely."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import maybe_refresh_empty_build_config
+
+        project = Project(
+            name="Cooldown test",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="cooldown-repo",
+            integration_branch="main",
+            build_config={"language": "python", "directories": [], "repo_is_empty": True},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        bcd._redetect_empty_cooldown.clear()
+
+        detected = {
+            "repo_is_empty": False,
+            "directories": [{"path": ".", "type": "python", "test_cmd": "pytest"}],
+        }
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value=detected,
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            # First call refreshes and stamps the cooldown.
+            r1 = await maybe_refresh_empty_build_config(project, db_session)
+            assert r1 is True
+            assert mock_detect.call_count == 1
+
+            # Simulate repo_is_empty still True so guard doesn't skip by itself.
+            project.build_config = {
+                "language": "python",
+                "directories": [],
+                "repo_is_empty": True,
+            }
+            await db_session.commit()
+
+            # Second call within the cooldown window must skip detection.
+            r2 = await maybe_refresh_empty_build_config(project, db_session)
+            assert r2 is False
+            assert mock_detect.call_count == 1, (
+                "_detect_build_config must NOT be called on the second call within cooldown"
+            )
+
+        bcd._redetect_empty_cooldown.clear()
 
 
 class TestOnboardDetectionIncompleteMarker:

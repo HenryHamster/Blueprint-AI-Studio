@@ -4220,3 +4220,211 @@ async def test_first_merge_gate_verdict_is_idempotent(db_session, mocker):
     assert bc.get("first_merge_gate_executed_tests") is True
     # The fall-open reason from the second (skipped) verdict was NOT recorded.
     assert bc.get("first_merge_gate_unverified_reason") is None
+
+
+# ---------------------------------------------------------------------------
+# Review-wait throttle and orphan backstop (handle_ci_completion parked path)
+# ---------------------------------------------------------------------------
+
+def _make_task_no_review_approved(
+    db_session, project, pr_number: int = 42, ci_loop_extra: dict | None = None
+):
+    """Like _make_task but WITHOUT review_approved — forces the review-wait parked path."""
+    loop = {
+        "pr_number": pr_number,
+        "branch": "blueprint/test-branch",
+        "base_branch": "main",
+        "ci_waiting": True,
+        "iteration": 1,
+    }
+    if ci_loop_extra:
+        loop.update(ci_loop_extra)
+    task = Task(
+        project_id=project.id,
+        title="CI review-wait test task",
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "branch": "blueprint/test-branch",
+                "base_branch": "main",
+            }
+        ],
+        context={"review_loop": loop},
+        vm_instance_id=f"agent-vm-rw-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_review_wait_stamps_ci_last_polled_and_raises_poll_interval(
+    db_session, mocker
+):
+    """When CI passes but review is not yet approved, the parked path must
+    stamp ci_last_polled and raise ci_poll_interval to >= 120s."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+
+    project = Project(name="Review wait throttle", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task_no_review_approved(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_last_polled") is not None, (
+        "ci_last_polled must be stamped when parked in review-wait"
+    )
+    assert (review_loop.get("ci_poll_interval") or 0) >= 120, (
+        "ci_poll_interval must be raised to >= 120s when parked in review-wait"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_wait_started_set_on_first_entry_not_overwritten(
+    db_session, mocker
+):
+    """review_wait_started is stamped on first entry into the parked path and
+    must NOT be overwritten on subsequent polls."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+
+    project = Project(name="Review wait started idempotent", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task_no_review_approved(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+
+    # First poll — review_wait_started should be stamped.
+    await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+    rw_started_first = (task.context or {}).get("review_loop", {}).get(
+        "review_wait_started"
+    )
+    assert rw_started_first is not None, "review_wait_started must be set on first entry"
+
+    # Second poll — simulate a fresh handle_ci_completion call.  We keep the
+    # same task object (context already has review_wait_started) and call again.
+    result2 = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+    assert result2 is True
+    rw_started_second = (task.context or {}).get("review_loop", {}).get(
+        "review_wait_started"
+    )
+    assert rw_started_second == rw_started_first, (
+        "review_wait_started must NOT be overwritten on subsequent polls"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_wait_backstop_fires_after_timeout(db_session, mocker):
+    """After the 60-minute backstop threshold, requires_approval and
+    review_wait_escalated are set, and a failure alert is created."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name="Review wait backstop", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # _utcnow() returns naive UTC; review_wait_started must match so the
+    # subtraction doesn't raise TypeError (caught → silent backstop skip).
+    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_wait_escalated") is True, (
+        "review_wait_escalated must be set after 60-minute backstop"
+    )
+    assert task.requires_approval is True, (
+        "requires_approval must be set after 60-minute backstop"
+    )
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_review_wait_backstop_does_not_refire(db_session, mocker):
+    """Once review_wait_escalated=True, the backstop must NOT fire again."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name="Review wait backstop idempotent", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Naive UTC timestamp matching _utcnow() format.
+    old_started = (datetime.utcnow() - timedelta(minutes=120)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={
+            "review_wait_started": old_started,
+            "review_wait_escalated": True,
+        },
+    )
+    task.requires_approval = True
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    # handle_ci_completion's review-wait park path always returns True (an action
+    # was taken: the poll signal is persisted). The "does not refire" property is
+    # asserted by alert_mock.assert_not_called() below — because review_wait_escalated
+    # is already True, the backstop block is skipped and no second alert fires.
+    # (Do NOT flip this to False: there is no requires_approval early-return in
+    # handle_ci_completion; that gate lives in the separate merge helper.)
+    assert result is True
+    alert_mock.assert_not_called()
