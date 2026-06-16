@@ -4940,10 +4940,17 @@ _VALID_REVIEWER_RECOVERY_ORIGINS = frozenset(
 )
 
 
+class _ReviewerFinding(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    category: str | None = Field(None, max_length=100)
+    severity: str | None = Field(None, max_length=20)
+    description: str | None = Field(None, max_length=2000)
+
+
 class ReviewerMergeRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
-    reviewer_findings: list[dict]
-    reviewer_edges_considered: list[dict] = []
+    reviewer_findings: list[_ReviewerFinding] = Field(default=[], max_length=100)
+    reviewer_edges_considered: list[dict] = Field(default=[], max_length=50)
     # Optional recovery-origin flavor the agent computed in-VM. Absent for the
     # legacy operator-requested request shape (defaults preserve that path).
     reviewer_recovery_origin: str | None = None
@@ -5001,12 +5008,13 @@ async def merge_operator_reviewer_findings(
 
     orig_ctx = dict(original_task.context or {})
     sr = dict(orig_ctx.get("_self_review_outcome") or {})
-    sr["reviewer_findings"] = req.reviewer_findings
+    findings_dicts = [f.model_dump() for f in req.reviewer_findings]
+    sr["reviewer_findings"] = findings_dicts
     if recovery_origin:
         sr["reviewer_recovery_origin"] = recovery_origin
 
     check_results = dict(sr.get("check_results") or {})
-    for finding in req.reviewer_findings:
+    for finding in findings_dicts:
         cat = finding.get("category")
         if cat:
             existing = check_results.get(cat)

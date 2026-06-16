@@ -81,6 +81,7 @@ from app.retry_budget import append_failure_class_history
 from app.task_blocked import strip_fresh_attempt_context
 from app.time_utils import _utcnow, set_retry_after
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
+from app.schemas import redact_command_log_text
 
 logger = logging.getLogger(__name__)
 
@@ -819,7 +820,7 @@ def _extract_tool_trace_tail(task) -> str:
             continue
         t_str = entry.get("t", "").split("T")[-1][:8]  # HH:MM:SS from ISO-8601
         tool_name = entry.get("tool", "?")[:20]
-        input_preview = entry.get("input_preview", "")[:80]
+        input_preview = redact_command_log_text(entry.get("input_preview", ""))[:80]
         # Compact format: timestamp + tool + input
         part = f"{t_str} {tool_name}: {input_preview}"
         if total_len + len(part) + 3 > max_total:  # +3 for " | "

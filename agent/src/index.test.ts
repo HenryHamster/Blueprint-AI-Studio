@@ -2985,6 +2985,14 @@ describe('recordToolUse', () => {
     expect(entry.input_preview).toBe('raw string value');
   });
 
+  it('sanitizes credential patterns in input_preview', () => {
+    recordToolUse('Bash', { command: 'curl -H "Authorization: token ghp_abc123secretXYZ" https://api.github.com' });
+    const trace = snapshotToolTrace();
+    const entry = trace[trace.length - 1];
+    expect(entry.input_preview).not.toContain('ghp_abc123secretXYZ');
+    expect(entry.input_preview).toContain('ghp_***');
+  });
+
   it('can refresh the latest entry timestamp without adding a new tool use', () => {
     clearToolTrace();
     vi.useFakeTimers();

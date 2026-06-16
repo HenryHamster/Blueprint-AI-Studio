@@ -21898,6 +21898,83 @@ async def test_reviewer_merge_unrelated_task_still_403(client, db_session):
     assert resp.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_reviewer_merge_findings_list_too_long(client, db_session):
+    """reviewer_findings with more than 100 items must return HTTP 422."""
+    project = await _make_reviewer_merge_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-bounds-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-bounds-1")
+    oversized = [
+        {"category": "correctness", "description": f"finding {i}"} for i in range(101)
+    ]
+    resp = await client.post(
+        f"/api/agent/tasks/{task.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={"reviewer_findings": oversized},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_edges_list_too_long(client, db_session):
+    """reviewer_edges_considered with more than 50 items must return HTTP 422."""
+    project = await _make_reviewer_merge_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-bounds-2",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-bounds-2")
+    oversized_edges = [{"case": f"edge {i}"} for i in range(51)]
+    resp = await client.post(
+        f"/api/agent/tasks/{task.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={"reviewer_findings": [], "reviewer_edges_considered": oversized_edges},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_finding_description_too_long(client, db_session):
+    """A single finding whose description exceeds 2000 characters must return HTTP 422."""
+    project = await _make_reviewer_merge_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-bounds-3",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-bounds-3")
+    resp = await client.post(
+        f"/api/agent/tasks/{task.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={
+            "reviewer_findings": [
+                {"category": "correctness", "description": "x" * 2001}
+            ]
+        },
+    )
+    assert resp.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # POST /api/agent/build-config-discovery tests
 # ---------------------------------------------------------------------------

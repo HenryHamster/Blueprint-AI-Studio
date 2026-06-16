@@ -1681,7 +1681,7 @@ export function recordToolUse(toolName: string, input: unknown): void {
   _toolTrace.push({
     t: new Date().toISOString(),
     tool: toolName,
-    input_preview: preview.slice(0, 200),
+    input_preview: sanitize(preview).slice(0, 200),
   });
   if (_toolTrace.length > TOOL_TRACE_MAX) _toolTrace.shift();
 }
