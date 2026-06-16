@@ -5,8 +5,11 @@ import pytest
 from sqlmodel import select
 
 import app.shared_state as _ss
+import uuid
+
 from app.direction_lifecycle import (
     _process_direction_lifecycle,
+    _process_direction_lifecycle_locked,
 )
 from app.models import Project, Task, TaskStatus
 
@@ -2272,4 +2275,79 @@ async def test_already_fixed_deadlock_auto_completes_via_apply_post_spawn(db_ses
     assert result.scalars().first() is not None, (
         "expected a 'Direction auto-completed' alert"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Crash-guard: _directed_research_recently_completed folded into lifecycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_skips_direction_with_recently_completed_research(
+    db_session, mocker
+):
+    """A direction with no refractory_until but a recently-COMPLETED directed
+    research task is excluded from active_directions by
+    _process_direction_lifecycle_locked (crash guard)."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    direction_id = "d-crash-guard-01"
+    _runtime_config["completed_research_cooldown_minutes"] = 120
+
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+
+    try:
+        direction = {
+            "id": direction_id,
+            "text": "Crash guard direction",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            # No refractory_until — Gate 1 would allow this direction
+        }
+        project = Project(
+            name="Crash Guard Test",
+            user_id="u-crash-guard",
+            autonomous_enabled=True,
+            directions=[direction],
+            vision={"purpose": "test"},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Insert a COMPLETED research task for this direction within the cooldown window
+        completed_task = Task(
+            project_id=project.id,
+            title=f"Research: direction-{direction_id}",
+            description="x",
+            payloads=[
+                {
+                    "type": "research",
+                    "current_direction_id": direction_id,
+                    "directions": [],
+                    "base_branch": "main",
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(completed_task)
+        await db_session.commit()
+
+        active = await _process_direction_lifecycle_locked(
+            project, db_session, set(), datetime.utcnow()
+        )
+        assert active == [], (
+            "Direction with a recently-completed research task must be excluded "
+            "from active_directions by the crash guard"
+        )
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
 

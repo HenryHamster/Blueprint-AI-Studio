@@ -13034,7 +13034,7 @@ async def _add_directed_research(
 @pytest.mark.asyncio
 async def test_directed_completed_guard_false_when_none_exist(db_session):
     """Returns False when no research tasks for the direction exist at all."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
 
     project = Project(name="P", user_id="test-user-123")
     db_session.add(project)
@@ -13050,7 +13050,7 @@ async def test_directed_completed_guard_false_when_none_exist(db_session):
 @pytest.mark.asyncio
 async def test_directed_completed_guard_true_within_cooldown(db_session):
     """Returns True when a COMPLETED research task exists within the cooldown window."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     _runtime_config["completed_research_cooldown_minutes"] = 120
@@ -13080,7 +13080,7 @@ async def test_directed_completed_guard_true_when_completion_recent_but_created_
     db_session,
 ):
     """Uses the terminal timestamp, not created_at, for completed research cooldowns."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     _runtime_config["completed_research_cooldown_minutes"] = 60
@@ -13124,7 +13124,7 @@ async def test_directed_completed_guard_true_when_completion_recent_but_created_
 @pytest.mark.asyncio
 async def test_directed_completed_guard_false_after_cooldown(db_session):
     """Returns False when the COMPLETED task is older than the cooldown window."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     _runtime_config["completed_research_cooldown_minutes"] = 60
@@ -13152,7 +13152,7 @@ async def test_directed_completed_guard_false_after_cooldown(db_session):
 @pytest.mark.asyncio
 async def test_directed_completed_guard_false_for_different_direction(db_session):
     """Returns False when the COMPLETED task is on a different direction."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
 
     project = Project(name="P", user_id="test-user-123")
     db_session.add(project)
@@ -13177,7 +13177,7 @@ async def test_directed_completed_guard_false_for_different_direction(db_session
 async def test_directed_completed_guard_false_active_not_completed(db_session):
     """Returns False when only ACTIVE (non-COMPLETED) research exists — that path
     is handled by the active-tasks lock, not this guard."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
 
     project = Project(name="P", user_id="test-user-123")
     db_session.add(project)
@@ -13200,7 +13200,7 @@ async def test_directed_completed_guard_false_active_not_completed(db_session):
 @pytest.mark.asyncio
 async def test_directed_completed_guard_scoped_per_project(db_session):
     """A COMPLETED task in another project does not block this one."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
 
     p1 = Project(name="P1", user_id="test-user-123")
     p2 = Project(name="P2", user_id="test-user-123")
@@ -13229,7 +13229,7 @@ async def test_directed_completed_guard_scoped_per_project(db_session):
 @pytest.mark.asyncio
 async def test_directed_completed_guard_disabled_by_zero_cooldown(db_session):
     """Setting completed_research_cooldown_minutes <= 0 disables the guard."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     _runtime_config["completed_research_cooldown_minutes"] = 0
@@ -13400,7 +13400,7 @@ async def test_directed_completed_guard_derives_from_operator_cooldown(db_sessio
     """Without an explicit completed_research_cooldown_minutes, the window derives
     from autonomous_direction_cooldown_minutes — a completion outside the operator
     window must not hold the direction (it would under the old hardcoded 120)."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     sentinel = object()
@@ -13437,7 +13437,7 @@ async def test_directed_completed_guard_derives_from_operator_cooldown(db_sessio
 async def test_directed_completed_guard_derived_window_still_blocks_recent(db_session):
     """The derived window keeps the anti-churn intent: a completion inside the
     operator cooldown still blocks an immediate re-spawn."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     sentinel = object()
@@ -13475,7 +13475,7 @@ async def test_directed_completed_guard_explicit_key_overrides_operator_cooldown
     db_session,
 ):
     """An explicit completed_research_cooldown_minutes wins over the operator knob."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     sentinel = object()
@@ -13513,7 +13513,7 @@ async def test_directed_completed_guard_explicit_key_overrides_operator_cooldown
 async def test_directed_completed_guard_falls_back_when_no_keys_set(db_session):
     """With neither key configured the guard uses the 240-min fallback (matching
     Gate 1's default) — a completion at 180 min is still within the window."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     sentinel = object()
@@ -13550,7 +13550,7 @@ async def test_directed_completed_guard_falls_back_when_no_keys_set(db_session):
 async def test_directed_completed_guard_fallback_is_240_not_120(db_session):
     """Fallback window is 240 min (Gate 1 default), not the old 120. A task
     completed at 250 min must be outside the window; one at 130 min must be inside."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     sentinel = object()
@@ -13601,7 +13601,7 @@ async def test_directed_completed_guard_fallback_is_240_not_120(db_session):
 async def test_directed_completed_guard_uses_direction_productive_window(db_session):
     """When a direction dict is passed, the guard uses resolve_direction_refractory_minutes
     (productive path = 45 min by default). A completion at 30 min blocks; 50 min does not."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     _runtime_config.pop("completed_research_cooldown_minutes", None)
@@ -13658,7 +13658,7 @@ async def test_directed_completed_guard_uses_direction_saturated_window(db_sessi
     """Saturated direction uses 2x the standard window. With autonomous_direction_cooldown_minutes=60
     and 1 consecutive unproductive cycle (multiplier=0.375), the standard window is 22.5 min;
     saturated doubles it to 45 min. A completion at 30 min blocks; 50 min does not."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     sentinel = object()
@@ -13724,7 +13724,7 @@ async def test_directed_completed_guard_uses_direction_unproductive_window(db_se
     """Unproductive direction (3+ cycles, multiplier=1.0) uses the full standard window.
     With autonomous_direction_cooldown_minutes=60 the window is 60 min. A completion at
     50 min blocks; 70 min does not."""
-    from app.autonomous_research import _directed_research_recently_completed
+    from app.direction_lifecycle import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
     sentinel = object()
