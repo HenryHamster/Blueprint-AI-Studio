@@ -3185,6 +3185,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     type_filtered_by_dir: dict[str, int] = {}
     empty_prompt_count = 0
 
+    # Hashes of findings that survived parsing into `findings` but were dropped
+    # from the SPAWN set by deduplicate_findings (duplicate of existing in-flight,
+    # recently-terminal, or already-shipped work — word/hash/file/evidence
+    # overlap). Every finding either survives into `deduplicated` or is filtered,
+    # disjointly, so the dropped set is exactly {all hashes} − {survivor hashes}.
+    # Consumed at spawn-wiring (the depends_on_indices missing-sibling loop): a
+    # SURVIVING dependent that declared an edge to one of these duplicates spawns
+    # standalone instead of cancelling on a dead prerequisite.
+    _survivor_finding_hashes = {h for (_idx, _f, h) in _dedup_outcome.deduplicated}
+    _deduped_dropped_hashes = {
+        h for h in _title_to_fhash.values() if h not in _survivor_finding_hashes
+    }
+
     # Assess pipeline health once before spawning implementation tasks.
     # Metadata findings (design_doc_observation, direction_update) are processed
     # regardless; only VM-consuming implementation tasks are capped.
@@ -5235,6 +5248,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         needs: list = []
         unresolved_entries: list = []
         structurally_dead_entries: list = []
+        # depends_on edges dropped because the named sibling was deduped away as a
+        # duplicate of existing/covered work (recorded for observability; the
+        # dependent spawns standalone — see the missing-sibling loop below).
+        dropped_duplicate_prereqs: list = []
 
         dep_indices = findings[fi].get("depends_on_indices", [])
         missing_dep_indices = [j for j in dep_indices if j not in finding_to_child]
@@ -5302,6 +5319,33 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     prereq_label=f"task:{missing_hash}",
                 )
                 continue
+            # The named sibling survived parsing into `findings` but was dropped
+            # from the SPAWN set by deduplicate_findings — it duplicates work that
+            # already exists, is in-flight, or has shipped. resolve_prerequisite_task
+            # could not wire an edge because the duplicate is matched fuzzily (title /
+            # files / evidence), not by the exact finding_hash this loop recomputes,
+            # so the two identities diverge across independent research runs. The
+            # foundation IS covered, though, so the declared edge is ORPHANED, not a
+            # real unmet dependency: drop it and let the dependent spawn standalone
+            # rather than cancelling it as a dead need (no_live_or_deferred_provider)
+            # and failing the whole research task. Serialization against the
+            # duplicate was only a merge-order optimization the pipeline tolerates.
+            if missing_hash in _deduped_dropped_hashes:
+                logger.info(
+                    "[RESEARCH] Finding '%s' depends_on sibling '%s' that was deduped "
+                    "as a duplicate of existing/covered work — dropping the orphaned "
+                    "edge and spawning standalone (no dead need)",
+                    finding_title,
+                    missing_title,
+                )
+                dropped_duplicate_prereqs.append(
+                    {
+                        "finding_index": missing_fi,
+                        "title": missing_title,
+                        "finding_hash": missing_hash,
+                    }
+                )
+                continue
             unresolved_entries.append(
                 {
                     "finding_index": missing_fi,
@@ -5312,6 +5356,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             sibling_need = build_need("task", missing_hash, label=missing_title)
             if sibling_need:
                 needs.append(sibling_need)
+
+        # Stamp the orphaned-edge drops on the child context for observability:
+        # operators can see WHY a declared depends_on edge is absent (its sibling
+        # was a duplicate) without re-deriving it from logs.
+        if dropped_duplicate_prereqs:
+            _dd_ctx = dict(ct.context or {})
+            _dd_ctx["_spawn_prereq_dropped_duplicate"] = (
+                list(_dd_ctx.get("_spawn_prereq_dropped_duplicate") or [])
+                + dropped_duplicate_prereqs
+            )
+            ct.context = _dd_ctx
+            flag_modified(ct, "context")
+            session.add(ct)
 
         # Explicit {kind, ref} prerequisite: wire a real edge if it resolved to an
         # in-flight / sibling foundation this cycle, otherwise add it to the needs

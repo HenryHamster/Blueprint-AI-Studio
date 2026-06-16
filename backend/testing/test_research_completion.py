@@ -5336,6 +5336,108 @@ async def test_depends_on_indices_missing_sibling_wires_to_existing_inflight(
 
 
 @_pytest.mark.asyncio
+async def test_depends_on_indices_deduped_sibling_no_provider_spawns_standalone(
+    db_session, mocker
+):
+    """When a depends_on_indices sibling is dropped by deduplicate_findings as a
+    duplicate of EXISTING/COVERED work that is NOT identity-resolvable, the
+    dependent must spawn STANDALONE (orphaned edge dropped) — not be cancelled as
+    'no_live_or_deferred_provider', which would also fail the whole research task.
+
+    This is the real-world strand: two independent research runs surface the same
+    foundation finding. The foundation is word-overlap-deduped against an existing
+    in-flight task whose finding_hash differs (different body across runs), so
+    resolve_prerequisite_task cannot wire an edge — the hashes never line up. Before
+    the fix the dependent landed in dead_task_needs and was CANCELLED, escalating to
+    the parent which FAILED ('All N subtasks were cancelled'), discarding the whole
+    cycle. After the fix the dependent spawns standalone: the foundation is already
+    covered, so the declared edge is orphaned, not an unmet dependency."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-prq-dedup-standalone"
+    )
+
+    # Pre-existing in-flight task whose TITLE word-overlaps foundation finding A but
+    # whose finding_hash is DIFFERENT (a prior run's body) — so A is word-overlap
+    # deduped against it, yet A's recomputed hash resolves to no provider.
+    foundation_title = "reconcile chosen snecko act-2 move logic to canonical"
+    existing_inflight = _Task(
+        project_id=_project.id,
+        title=foundation_title,
+        payloads=[{"type": "create", "prompt": "earlier run of the same foundation"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        context={
+            "direction_id": direction["id"],
+            # Hash from a DIFFERENT body — deliberately not equal to finding A's hash.
+            "finding_hash": _finding_hash(foundation_title, "a different earlier body"),
+        },
+    )
+    db_session.add(existing_inflight)
+    await db_session.commit()
+    await db_session.refresh(existing_inflight)
+
+    # Foundation finding A (same title → word-overlap deduped; default body → its
+    # OWN hash, which differs from the existing task's stored hash).
+    finding_a = _make_finding(title=foundation_title, direction_id=direction["id"])
+    a_hash = _finding_hash(finding_a["title"], finding_a["description"])
+    assert a_hash != existing_inflight.context["finding_hash"], (
+        "test precondition: A's hash must differ from the existing task's so the "
+        "edge cannot be identity-resolved"
+    )
+
+    # Dependent finding B declares an edge to A (index 0).
+    finding_b = _make_finding(
+        title="dilute act-2 normal pool with canonical easy fights",
+        direction_id=direction["id"],
+    )
+    finding_b["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_a, finding_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    dep_children = [c for c in children if "dilute act-2" in c.title.lower()]
+    assert len(dep_children) == 1, "dependent finding B must spawn as a child task"
+    dep = dep_children[0]
+    assert dep.status not in (TaskStatus.CANCELLED, TaskStatus.BLOCKED), (
+        "dependent whose deduped foundation is unresolvable must spawn standalone, "
+        "not be cancelled/blocked as a dead need"
+    )
+    assert (dep.context or {}).get("prerequisite_escalation_reason") != (
+        "no_live_or_deferred_provider"
+    )
+    assert get_blocker_needs(dep) == [], (
+        "no unresolved need may persist — the orphaned edge is dropped, not gated"
+    )
+    assert str(existing_inflight.id) not in (dep.depends_on or []), (
+        "no edge is wired to the fuzzy word-overlap match (identities diverge)"
+    )
+    dropped = (dep.context or {}).get("_spawn_prereq_dropped_duplicate") or []
+    assert any(d.get("finding_hash") == a_hash for d in dropped), (
+        "the dropped-duplicate prerequisite must be stamped for observability"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_task_prerequisite_rebinds_to_same_batch_design_lineage(
     db_session, mocker
 ):
