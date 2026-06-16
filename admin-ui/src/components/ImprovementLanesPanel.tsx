@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, CircleDollarSign, GitBranch, RefreshCw, TimerReset, XCircle } from 'lucide-react';
-import { drainLanePilot, fetchImprovementLanes, fetchLanePilotPreflight, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse, type LanePilotTrialMetrics, type ShadowLaneHealth } from '../api';
+import { drainLanePilot, fetchImprovementLaneDetail, fetchImprovementLanes, fetchLanePilotPreflight, type ImprovementLaneCheckpoint, type ImprovementLaneCurrentTask, type ImprovementLaneDetail, type ImprovementLaneManifest, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse, type LanePilotTrialMetrics, type ShadowLaneHealth } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { formatAbsolute, formatDurationSec, parseTimestamp, timeAgo } from '../utils/time';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -66,6 +66,233 @@ function shadowClasses(shadow: boolean): string {
     : 'border-neutral-700 bg-neutral-800 text-neutral-300';
 }
 
+function CheckpointRow({ cp }: { cp: ImprovementLaneCheckpoint }) {
+  const short = (sha: string | null | undefined) => sha ? sha.slice(0, 7) : '—';
+  const boolBadge = (v: boolean | null | undefined, trueLabel = '✓', falseLabel = '✗') => {
+    if (v == null) return <span className="text-neutral-600">—</span>;
+    return v
+      ? <span className="text-emerald-400">{trueLabel}</span>
+      : <span className="text-red-400">{falseLabel}</span>;
+  };
+  return (
+    <tr className="border-t border-neutral-800/60">
+      <td className="py-1 pr-3 font-mono text-[10px] text-neutral-500">{cp.seq}</td>
+      <td className="py-1 pr-3 font-mono text-[10px] text-neutral-300">{cp.phase}</td>
+      <td className="py-1 pr-3 font-mono text-[10px] text-neutral-400">{short(cp.sha)}</td>
+      <td className="py-1 pr-3 text-center">{boolBadge(cp.validated?.lint)}</td>
+      <td className="py-1 pr-3 text-center">{boolBadge(cp.validated?.tests)}</td>
+      <td className="py-1 pr-3 text-center">{cp.warm_resume == null ? <span className="text-neutral-600">—</span> : cp.warm_resume ? <span className="text-emerald-400">warm</span> : <span className="text-neutral-400">cold</span>}</td>
+      <td className="py-1 pr-3 text-[10px] text-neutral-400">{cp.tokens_in != null ? cp.tokens_in.toLocaleString() : '—'}</td>
+      <td className="py-1 text-[10px] text-neutral-400">{cp.vm_cost_usd != null ? `$${cp.vm_cost_usd.toFixed(4)}` : '—'}</td>
+    </tr>
+  );
+}
+
+function ManifestSection({ manifest }: { manifest: ImprovementLaneManifest }) {
+  const listItems = (items: unknown[] | null | undefined) =>
+    items && items.length > 0
+      ? <ul className="mt-0.5 space-y-0.5">{items.map((it, i) => <li key={i} className="font-mono text-[10px] text-neutral-300">{String(it)}</li>)}</ul>
+      : <span className="text-[10px] text-neutral-600">none</span>;
+
+  const hasContent =
+    manifest.progress != null ||
+    (manifest.phase_log && manifest.phase_log.length > 0) ||
+    (manifest.remaining && (manifest.remaining as unknown[]).length > 0) ||
+    (manifest.critical_files && manifest.critical_files.length > 0) ||
+    (manifest.failing_tests && manifest.failing_tests.length > 0) ||
+    (manifest.risks && manifest.risks.length > 0) ||
+    manifest.recovery != null;
+
+  if (!hasContent) {
+    return <div className="text-[10px] text-neutral-600">No manifest data</div>;
+  }
+
+  return (
+    <div className="space-y-2">
+      {manifest.progress != null && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Progress</div>
+          <div className="mt-0.5 text-[10px] text-neutral-300">{String(manifest.progress)}</div>
+        </div>
+      )}
+      {manifest.phase_log && manifest.phase_log.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Phase log</div>
+          <div className="mt-0.5 space-y-0.5">
+            {manifest.phase_log.map((entry, i) => (
+              <div key={i} className="font-mono text-[10px] text-neutral-300">
+                {typeof entry === 'object' ? JSON.stringify(entry) : String(entry)}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {(manifest.remaining as unknown[] | null | undefined) && (manifest.remaining as unknown[]).length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Remaining</div>
+          {listItems(manifest.remaining as unknown[])}
+        </div>
+      )}
+      {manifest.critical_files && manifest.critical_files.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Critical files</div>
+          {listItems(manifest.critical_files)}
+        </div>
+      )}
+      {manifest.failing_tests && manifest.failing_tests.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Failing tests</div>
+          {listItems(manifest.failing_tests)}
+        </div>
+      )}
+      {manifest.risks && manifest.risks.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Risks</div>
+          {listItems(manifest.risks)}
+        </div>
+      )}
+      {manifest.recovery != null && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Recovery</div>
+          <div className="mt-0.5 font-mono text-[10px] text-neutral-300">
+            {typeof manifest.recovery === 'object' ? JSON.stringify(manifest.recovery) : String(manifest.recovery)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CurrentTaskSection({ task }: { task: ImprovementLaneCurrentTask | null }) {
+  if (task == null) {
+    return <div className="text-[10px] text-neutral-600">No task currently running</div>;
+  }
+  const statusColors: Record<string, string> = {
+    IN_PROGRESS: 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300',
+    PENDING: 'border-amber-500/30 bg-amber-500/15 text-amber-300',
+    COMPLETED: 'border-sky-500/30 bg-sky-500/15 text-sky-300',
+    FAILED: 'border-red-500/30 bg-red-500/15 text-red-300',
+  };
+  const statusClass = statusColors[task.status?.toUpperCase()] ?? 'border-neutral-700 bg-neutral-800 text-neutral-300';
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className={`rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${statusClass}`}>
+        {task.status}
+      </span>
+      {task.task_type && (
+        <span className="rounded border border-neutral-700 bg-neutral-800 px-1.5 py-0.5 text-[10px] leading-none text-neutral-400">
+          {task.task_type}
+        </span>
+      )}
+      <span className="text-[10px] text-neutral-300">{task.title ?? '—'}</span>
+      <span className="font-mono text-[10px] text-neutral-600">{task.task_id}</span>
+    </div>
+  );
+}
+
+interface LaneDetailPanelProps {
+  projectId: string;
+  laneId: string;
+}
+
+function LaneDetailPanel({ projectId, laneId }: LaneDetailPanelProps) {
+  const [detail, setDetail] = useState<ImprovementLaneDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const fetchedForRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const key = `${projectId}:${laneId}`;
+    if (fetchedForRef.current === key && detail != null) return;
+    const controller = new AbortController();
+    setLoading(true);
+    setError(null);
+    fetchImprovementLaneDetail(projectId, laneId, controller.signal)
+      .then((data) => {
+        if (controller.signal.aborted) return;
+        fetchedForRef.current = key;
+        setDetail(data);
+      })
+      .catch((e) => {
+        if (controller.signal.aborted) return;
+        setError(e instanceof Error ? e.message : 'Failed to load lane detail');
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, laneId]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 px-3 py-3 text-neutral-500">
+        <RefreshCw className="h-3 w-3 animate-spin" />
+        <span className="text-[11px]">Loading detail…</span>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex items-start gap-2 px-3 py-2 text-red-300">
+        <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+        <span className="text-[11px]">{error}</span>
+      </div>
+    );
+  }
+
+  if (!detail) return null;
+
+  const checkpoints = [...(detail.checkpoints ?? [])].reverse();
+
+  return (
+    <div className="border-t border-neutral-800/80 bg-neutral-950/40 px-3 py-3 space-y-4">
+      {/* Current task */}
+      <div>
+        <div className="mb-1.5 text-[10px] uppercase tracking-wide text-neutral-500 font-semibold">Current task</div>
+        <CurrentTaskSection task={detail.current_task} />
+      </div>
+
+      {/* Checkpoint history */}
+      <div>
+        <div className="mb-1.5 text-[10px] uppercase tracking-wide text-neutral-500 font-semibold">
+          Checkpoint history ({checkpoints.length})
+        </div>
+        {checkpoints.length === 0 ? (
+          <div className="text-[10px] text-neutral-600">No checkpoints yet</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-[11px]">
+              <thead>
+                <tr className="text-[10px] uppercase tracking-wide text-neutral-600">
+                  <th className="pb-1 pr-3 font-medium">#</th>
+                  <th className="pb-1 pr-3 font-medium">Phase</th>
+                  <th className="pb-1 pr-3 font-medium">SHA</th>
+                  <th className="pb-1 pr-3 font-medium">Lint</th>
+                  <th className="pb-1 pr-3 font-medium">Tests</th>
+                  <th className="pb-1 pr-3 font-medium">Resume</th>
+                  <th className="pb-1 pr-3 font-medium">Tokens in</th>
+                  <th className="pb-1 font-medium">VM cost</th>
+                </tr>
+              </thead>
+              <tbody>
+                {checkpoints.map((cp) => <CheckpointRow key={cp.seq} cp={cp} />)}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Manifest */}
+      <div>
+        <div className="mb-1.5 text-[10px] uppercase tracking-wide text-neutral-500 font-semibold">Manifest</div>
+        <ManifestSection manifest={detail.manifest} />
+      </div>
+    </div>
+  );
+}
+
 export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps) {
   const [lanes, setLanes] = useState<ImprovementLaneRow[]>([]);
   const [shadowHealth, setShadowHealth] = useState<ShadowLaneHealth | null>(null);
@@ -73,6 +300,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [collapsedPref, setCollapsedPref] = useState<boolean | null>(() => readCollapsedPreference());
+  const [expandedLaneId, setExpandedLaneId] = useState<string | null>(null);
   const [showDrainConfirm, setShowDrainConfirm] = useState(false);
   const [draining, setDraining] = useState(false);
   const [drainResult, setDrainResult] = useState<LanePilotDrainReport | null>(null);
@@ -460,6 +688,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                 const reservationIsExpired =
                   lane.reservation_expires_at != null &&
                   parseTimestamp(lane.reservation_expires_at).getTime() < Date.now();
+                const isExpanded = expandedLaneId === lane.id;
                 return (
                   <div
                     key={lane.id}
@@ -467,6 +696,15 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                     className={`rounded-lg border bg-neutral-950/60 ${lane.shadow ? 'border-orange-500/20' : 'border-neutral-800/80'}`}
                   >
                     <div className="flex min-h-[44px] flex-wrap items-center gap-1.5 px-3 py-2">
+                      <button
+                        type="button"
+                        data-testid="lane-expand-toggle"
+                        aria-expanded={isExpanded}
+                        onClick={() => setExpandedLaneId(isExpanded ? null : lane.id)}
+                        className="min-h-[44px] min-w-[44px] shrink-0 flex items-center justify-center rounded text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300"
+                      >
+                        {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                      </button>
                       <span className={`rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${statusClasses(lane.status)}`}>
                         {lane.status}
                       </span>
@@ -600,6 +838,9 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                         </div>
                       </div>
                     </div>
+                    {isExpanded && projectId && (
+                      <LaneDetailPanel projectId={projectId} laneId={lane.id} />
+                    )}
                   </div>
                 );
               })}

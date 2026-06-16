@@ -7,10 +7,13 @@ from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
+from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
+
+from testing.factories import make_project, make_task
 
 from app.improvement_lane_ops import (
     LaneCASError,
@@ -3044,3 +3047,306 @@ async def test_sweep_stranded_lanes_class1_recovery_task_carries_lane_chain_id(
     recovery_task = await db.get(Task, refreshed_lane.current_task_id)
     assert recovery_task is not None
     assert (recovery_task.context or {}).get(LANE_CHAIN_ID_KEY) == str(lane_id)
+
+
+# ---------------------------------------------------------------------------
+# TestImprovementLaneDetail — GET /api/admin/improvement-lanes/{lane_id}
+# ---------------------------------------------------------------------------
+
+
+def _make_lane_detail(project_id, **kwargs):
+    """Minimal ImprovementLane factory for detail endpoint tests."""
+    defaults = dict(
+        project_id=project_id,
+        direction_id="d-detail123",
+        title="Detail lane",
+        goal="Improve detail",
+        branch_name="lane/detail-branch",
+        base_branch="main",
+        status=ImprovementLaneStatus.PARKED.value,
+        checkpoint_seq=0,
+        checkpoints=[],
+        manifest={},
+        workspace_state="COLD",
+        phase_requeues=0,
+        llm_input_tokens_total=0,
+        llm_output_tokens_total=0,
+        vm_cost_usd_total=0.0,
+        reserved_idle_cost_usd_total=0.0,
+    )
+    defaults.update(kwargs)
+    return ImprovementLane(**defaults)
+
+
+class TestImprovementLaneDetail:
+    """Tests for GET /api/admin/improvement-lanes/{lane_id}."""
+
+    @pytest.mark.asyncio
+    async def test_404_on_unknown_lane_id(self, client: AsyncClient, db_session):
+        """Returns 404 when the lane_id does not exist."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        unknown_id = uuid.uuid4()
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/{unknown_id}?project_id={project.id}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_cross_project_returns_404(self, client: AsyncClient, db_session):
+        """Returns 404 when the lane belongs to project A but project B's id is given."""
+        project_a = make_project(name="Project A")
+        project_b = make_project(name="Project B")
+        db_session.add_all([project_a, project_b])
+        await db_session.commit()
+
+        lane = _make_lane_detail(project_a.id)
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/{lane.id}?project_id={project_b.id}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_returns_identity_and_timeline_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns lane identity and timeline fields."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane = _make_lane_detail(
+            project.id,
+            title="My lane",
+            goal="My goal",
+            direction_id="d-abc",
+            version_number=5,
+            status=ImprovementLaneStatus.ACTIVE.value,
+            branch_name="lane/my-branch",
+            base_branch="develop",
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/{lane.id}?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["id"] == str(lane.id)
+        assert body["title"] == "My lane"
+        assert body["goal"] == "My goal"
+        assert body["direction_id"] == "d-abc"
+        assert body["version_number"] == 5
+        assert body["status"] == ImprovementLaneStatus.ACTIVE.value
+        assert body["branch_name"] == "lane/my-branch"
+        assert body["base_branch"] == "develop"
+        assert body["created_at"] is not None
+        assert body["updated_at"] is not None
+        assert body["parked_at"] is None
+        assert body["last_resumed_at"] is None
+        assert body["retired_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_returns_full_checkpoints_array(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns the full checkpoints[] array as stored on the lane row."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        checkpoints = [
+            {
+                "seq": 1,
+                "phase": "review",
+                "sha": "aaa111",
+                "parent_sha": None,
+                "created_at": "2026-01-01T00:00:00",
+                "summary": "First checkpoint",
+                "validated": {"lint": True, "tests": True},
+                "wip_failing": False,
+                "tokens_in": 100,
+                "tokens_out": 50,
+                "vm_cost_usd": 0.01,
+                "warm_resume": False,
+            },
+            {
+                "seq": 2,
+                "phase": "fix",
+                "sha": "bbb222",
+                "parent_sha": "aaa111",
+                "created_at": "2026-01-01T01:00:00",
+                "summary": "Second checkpoint",
+                "validated": {"lint": True, "tests": False},
+                "wip_failing": True,
+                "tokens_in": 200,
+                "tokens_out": 80,
+                "vm_cost_usd": 0.02,
+                "warm_resume": True,
+            },
+        ]
+        lane = _make_lane_detail(
+            project.id,
+            checkpoint_seq=2,
+            checkpoints=checkpoints,
+            last_checkpoint_sha="bbb222",
+            last_checkpoint_phase="fix",
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/{lane.id}?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["checkpoint_seq"] == 2
+        assert body["last_checkpoint_sha"] == "bbb222"
+        assert body["last_checkpoint_phase"] == "fix"
+        assert len(body["checkpoints"]) == 2
+        assert body["checkpoints"][0]["sha"] == "aaa111"
+        assert body["checkpoints"][1]["sha"] == "bbb222"
+        assert body["checkpoints"][1]["warm_resume"] is True
+
+    @pytest.mark.asyncio
+    async def test_returns_full_manifest_dict(self, client: AsyncClient, db_session):
+        """Returns the full manifest dict as stored on the lane row."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        manifest = {
+            "phase_log": ["review", "fix"],
+            "remaining": ["test coverage"],
+            "critical_files": ["app/auth.py"],
+            "failing_tests": ["test_auth.py::test_login"],
+            "risks": ["auth latency regression"],
+            "progress": "50%",
+            "recovery": {"reason": "checkpoint_missing", "attempt": 1},
+        }
+        lane = _make_lane_detail(project.id, manifest=manifest)
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/{lane.id}?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["manifest"]["phase_log"] == ["review", "fix"]
+        assert body["manifest"]["critical_files"] == ["app/auth.py"]
+        assert body["manifest"]["recovery"]["reason"] == "checkpoint_missing"
+
+    @pytest.mark.asyncio
+    async def test_returns_workspace_and_accounting_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns workspace state and accounting rollup fields."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane = _make_lane_detail(
+            project.id,
+            workspace_state="WARM_RESERVED",
+            workspace_vm_instance_id="vm-123",
+            pilot_arm="lane",
+            llm_input_tokens_total=1000,
+            llm_output_tokens_total=500,
+            vm_cost_usd_total=0.25,
+            reserved_idle_cost_usd_total=0.05,
+            reservation_claimed_by_fix_count=2,
+            reservation_expired_before_fix_count=1,
+            reservation_force_expired_count=0,
+            phase_requeues=1,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/{lane.id}?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["workspace_state"] == "WARM_RESERVED"
+        assert body["workspace_vm_instance_id"] == "vm-123"
+        assert body["pilot_arm"] == "lane"
+        assert body["llm_input_tokens_total"] == 1000
+        assert body["llm_output_tokens_total"] == 500
+        assert abs(body["vm_cost_usd_total"] - 0.25) < 1e-5
+        assert abs(body["reserved_idle_cost_usd_total"] - 0.05) < 1e-5
+        assert body["reservation_claimed_by_fix_count"] == 2
+        assert body["reservation_expired_before_fix_count"] == 1
+        assert body["reservation_force_expired_count"] == 0
+        assert body["phase_requeues"] == 1
+
+    @pytest.mark.asyncio
+    async def test_current_task_populated_when_set(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns resolved current_task when current_task_id is non-null."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        task = make_task(
+            project.id,
+            title="Fix PR 42",
+            payloads=[{"type": "fix", "pr_number": 42}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        lane = _make_lane_detail(
+            project.id,
+            status=ImprovementLaneStatus.ACTIVE.value,
+            current_task_id=task.id,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/{lane.id}?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["current_task_id"] == str(task.id)
+        assert body["current_task"] is not None
+        assert body["current_task"]["task_id"] == str(task.id)
+        assert body["current_task"]["title"] == "Fix PR 42"
+        assert body["current_task"]["task_type"] == "fix"
+        assert body["current_task"]["status"] is not None
+
+    @pytest.mark.asyncio
+    async def test_current_task_null_when_not_set(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns current_task=null when current_task_id is null (idle/parked lane)."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane = _make_lane_detail(project.id, current_task_id=None)
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/{lane.id}?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["current_task_id"] is None
+        assert body["current_task"] is None

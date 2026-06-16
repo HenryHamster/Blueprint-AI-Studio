@@ -376,6 +376,7 @@ vi.mock('../api', () => ({
     promotion_head_sha: null,
   })),
   fetchImprovementLanes: vi.fn(async () => ({ total: 0, lanes: [] })),
+  fetchImprovementLaneDetail: vi.fn(async () => null),
   fetchLanePilotPreflight: vi.fn(async () => null),
   fetchVersionSummary: vi.fn(async () => ({})),
 }));

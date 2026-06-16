@@ -140,6 +140,7 @@ export function VersionSummaryPanel({
   acceptanceAggregate?: Record<string, number> | null;
 }): JSX.Element | null {
   const [copied, setCopied] = useState(false);
+  const [filter, setFilter] = useState('');
 
   if (tasksMerged === undefined) return null;
 
@@ -154,7 +155,16 @@ export function VersionSummaryPanel({
     );
   }
 
-  const groups = groupByType(tasksMerged);
+  const normalizedFilter = filter.trim().toLowerCase();
+  const filteredEntries = normalizedFilter
+    ? tasksMerged.filter((e) => {
+        const titleMatch = (e.title ?? '').toLowerCase().includes(normalizedFilter);
+        const prMatch = e.pr_number != null && String(e.pr_number).includes(normalizedFilter);
+        return titleMatch || prMatch;
+      })
+    : tasksMerged;
+
+  const groups = groupByType(filteredEntries);
 
   const handleCopyMarkdown = () => {
     const md = exportChangelogMarkdown(tasksMerged, heading ?? 'What shipped');
@@ -188,14 +198,29 @@ export function VersionSummaryPanel({
       {acceptanceAggregate && <AcceptanceBucketBreakdown aggregate={acceptanceAggregate} />}
       {/* Per-type count summary — lets operator grasp shape of release at a glance */}
       <div className="flex flex-wrap gap-1 mb-2" data-testid="type-count-summary">
-        {Array.from(groups.entries()).map(([type, entries]) => (
+        {Array.from(groupByType(tasksMerged).entries()).map(([type, entries]) => (
           <TypeCountBadge key={type} taskType={type} count={entries.length} />
         ))}
       </div>
+      <input
+        type="search"
+        data-testid="changelog-filter-input"
+        placeholder="Filter by title or PR…"
+        value={filter}
+        onChange={(e) => setFilter(e.target.value)}
+        className="w-full mb-2 rounded bg-slate-700/50 border border-slate-600/50 px-2 py-1 text-[11px] text-slate-300 placeholder-slate-500 outline-none focus:border-slate-500"
+        aria-label="Filter changelog entries"
+      />
       <div className="max-h-64 overflow-y-auto pr-1">
-        {Array.from(groups.entries()).map(([type, entries]) => (
-          <TypeSection key={type} taskType={type} entries={entries} defaultOpen={defaultOpen} />
-        ))}
+        {filteredEntries.length === 0 ? (
+          <div data-testid="changelog-filter-no-results" className="text-[11px] text-slate-500 italic py-1">
+            No entries match &ldquo;{filter}&rdquo;.
+          </div>
+        ) : (
+          Array.from(groups.entries()).map(([type, entries]) => (
+            <TypeSection key={type} taskType={type} entries={entries} defaultOpen={defaultOpen} />
+          ))
+        )}
       </div>
     </div>
   );

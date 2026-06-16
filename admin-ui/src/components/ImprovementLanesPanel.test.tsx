@@ -7,11 +7,13 @@ const STORAGE_KEY = 'blueprint-admin:improvementLanesPanelCollapsed';
 const fetchImprovementLanes = vi.fn();
 const drainLanePilot = vi.fn();
 const fetchLanePilotPreflight = vi.fn().mockResolvedValue(null);
+const fetchImprovementLaneDetail = vi.fn();
 
 vi.mock('../api', () => ({
   fetchImprovementLanes: (...args: unknown[]) => fetchImprovementLanes(...args),
   drainLanePilot: (...args: unknown[]) => drainLanePilot(...args),
   fetchLanePilotPreflight: (...args: unknown[]) => fetchLanePilotPreflight(...args),
+  fetchImprovementLaneDetail: (...args: unknown[]) => fetchImprovementLaneDetail(...args),
 }));
 
 const LANE_RESPONSE = {
@@ -88,6 +90,7 @@ describe('ImprovementLanesPanel', () => {
     drainLanePilot.mockReset();
     fetchLanePilotPreflight.mockReset();
     fetchLanePilotPreflight.mockResolvedValue(null);
+    fetchImprovementLaneDetail.mockReset();
     localStorage.clear();
   });
 
@@ -431,5 +434,247 @@ describe('ImprovementLanesPanel', () => {
     expect(await screen.findByTestId('lane-pilot-preflight')).toBeTruthy();
     expect(screen.getByText('Pilot ready to enable')).toBeTruthy();
     expect(screen.queryByText('Preflight data unavailable')).toBeNull();
+  });
+
+  test('expand toggle has correct aria-expanded state and calls fetchImprovementLaneDetail on open', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchImprovementLaneDetail.mockResolvedValueOnce({
+      id: 'lane-1',
+      title: null,
+      goal: null,
+      direction_id: 'd-123',
+      version_number: null,
+      status: 'ACTIVE',
+      branch_name: 'lane/branch-a',
+      base_branch: 'main',
+      created_at: null,
+      parked_at: null,
+      last_resumed_at: null,
+      retired_at: null,
+      updated_at: null,
+      last_checkpoint_sha: 'ccc333',
+      last_checkpoint_phase: 'review',
+      checkpoint_seq: 3,
+      phase_requeues: 1,
+      checkpoints: [],
+      manifest: { phase_log: null, remaining: null, critical_files: null, failing_tests: null, risks: null, progress: null, recovery: null },
+      workspace_state: null,
+      workspace_vm_instance_id: null,
+      pilot_arm: null,
+      llm_input_tokens_total: null,
+      llm_output_tokens_total: null,
+      vm_cost_usd_total: 0,
+      reserved_idle_cost_usd_total: 0,
+      reservation_claimed_by_fix_count: 0,
+      reservation_expired_before_fix_count: 0,
+      reservation_force_expired_count: 0,
+      current_task_id: null,
+      current_task: null,
+    });
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    const firstToggle = rows[0].querySelector('[data-testid="lane-expand-toggle"]') as HTMLElement;
+    expect(firstToggle).toBeTruthy();
+    expect(firstToggle.getAttribute('aria-expanded')).toBe('false');
+
+    fireEvent.click(firstToggle);
+
+    expect(firstToggle.getAttribute('aria-expanded')).toBe('true');
+    await waitFor(() => expect(fetchImprovementLaneDetail).toHaveBeenCalledWith('proj-1', 'lane-1', expect.any(AbortSignal)));
+  });
+
+  test('LaneDetailPanel shows loading spinner while fetch is pending', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    let resolve!: (v: unknown) => void;
+    fetchImprovementLaneDetail.mockReturnValueOnce(new Promise((r) => { resolve = r; }));
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    fireEvent.click(rows[0].querySelector('[data-testid="lane-expand-toggle"]') as HTMLElement);
+
+    expect(await screen.findByText('Loading detail…')).toBeTruthy();
+    resolve({
+      id: 'lane-1', title: null, goal: null, direction_id: null, version_number: null,
+      status: 'ACTIVE', branch_name: null, base_branch: null, created_at: null, parked_at: null,
+      last_resumed_at: null, retired_at: null, updated_at: null, last_checkpoint_sha: null,
+      last_checkpoint_phase: null, checkpoint_seq: 0, phase_requeues: 0, checkpoints: [],
+      manifest: {}, workspace_state: null, workspace_vm_instance_id: null, pilot_arm: null,
+      llm_input_tokens_total: null, llm_output_tokens_total: null, vm_cost_usd_total: 0,
+      reserved_idle_cost_usd_total: 0, reservation_claimed_by_fix_count: 0,
+      reservation_expired_before_fix_count: 0, reservation_force_expired_count: 0,
+      current_task_id: null, current_task: null,
+    });
+    await waitFor(() => expect(screen.queryByText('Loading detail…')).toBeNull());
+  });
+
+  test('LaneDetailPanel shows error message when fetch fails', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchImprovementLaneDetail.mockRejectedValueOnce(new Error('Failed to fetch improvement lane detail: 403'));
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    fireEvent.click(rows[0].querySelector('[data-testid="lane-expand-toggle"]') as HTMLElement);
+
+    expect(await screen.findByText('Failed to fetch improvement lane detail: 403')).toBeTruthy();
+  });
+
+  test('LaneDetailPanel renders checkpoint history table when checkpoints are present', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchImprovementLaneDetail.mockResolvedValueOnce({
+      id: 'lane-1', title: null, goal: null, direction_id: null, version_number: null,
+      status: 'ACTIVE', branch_name: null, base_branch: null, created_at: null, parked_at: null,
+      last_resumed_at: null, retired_at: null, updated_at: null, last_checkpoint_sha: 'abc123',
+      last_checkpoint_phase: 'fix', checkpoint_seq: 2, phase_requeues: 0,
+      checkpoints: [
+        {
+          seq: 1, phase: 'fix', task_id: 'task-1', sha: 'abc123', parent_sha: null,
+          created_at: '2026-06-11T10:00:00Z', summary: null,
+          validated: { lint: true, tests: false }, wip_failing: null,
+          tokens_in: 1000, tokens_out: 200, vm_cost_usd: 0.05, warm_resume: true,
+        },
+        {
+          seq: 2, phase: 'review', task_id: 'task-2', sha: 'def456', parent_sha: 'abc123',
+          created_at: '2026-06-11T11:00:00Z', summary: null,
+          validated: { lint: null, tests: null }, wip_failing: null,
+          tokens_in: null, tokens_out: null, vm_cost_usd: null, warm_resume: false,
+        },
+      ],
+      manifest: {},
+      workspace_state: null, workspace_vm_instance_id: null, pilot_arm: null,
+      llm_input_tokens_total: null, llm_output_tokens_total: null, vm_cost_usd_total: 0,
+      reserved_idle_cost_usd_total: 0, reservation_claimed_by_fix_count: 0,
+      reservation_expired_before_fix_count: 0, reservation_force_expired_count: 0,
+      current_task_id: 'task-2', current_task: null,
+    });
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    fireEvent.click(rows[0].querySelector('[data-testid="lane-expand-toggle"]') as HTMLElement);
+
+    // Shows checkpoint count
+    expect(await screen.findByText('Checkpoint history (2)')).toBeTruthy();
+    // Rows are reversed (latest first): seq 2 then seq 1
+    const cells = await screen.findAllByText(/^(fix|review)$/);
+    expect(cells.length).toBeGreaterThanOrEqual(2);
+    // warm_resume rendering: seq1 = warm, seq2 = cold
+    expect(await screen.findByText('warm')).toBeTruthy();
+    expect(await screen.findByText('cold')).toBeTruthy();
+  });
+
+  test('LaneDetailPanel renders CurrentTaskSection with status badge when task is present', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchImprovementLaneDetail.mockResolvedValueOnce({
+      id: 'lane-1', title: null, goal: null, direction_id: null, version_number: null,
+      status: 'ACTIVE', branch_name: null, base_branch: null, created_at: null, parked_at: null,
+      last_resumed_at: null, retired_at: null, updated_at: null, last_checkpoint_sha: null,
+      last_checkpoint_phase: null, checkpoint_seq: 0, phase_requeues: 0, checkpoints: [],
+      manifest: {},
+      workspace_state: null, workspace_vm_instance_id: null, pilot_arm: null,
+      llm_input_tokens_total: null, llm_output_tokens_total: null, vm_cost_usd_total: 0,
+      reserved_idle_cost_usd_total: 0, reservation_claimed_by_fix_count: 0,
+      reservation_expired_before_fix_count: 0, reservation_force_expired_count: 0,
+      current_task_id: 'task-abc',
+      current_task: { task_id: 'task-abc', status: 'IN_PROGRESS', title: 'Fix the bug', task_type: 'fix' },
+    });
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    fireEvent.click(rows[0].querySelector('[data-testid="lane-expand-toggle"]') as HTMLElement);
+
+    expect(await screen.findByText('IN_PROGRESS')).toBeTruthy();
+    expect(screen.getByText('Fix the bug')).toBeTruthy();
+    expect(screen.getByText('task-abc')).toBeTruthy();
+  });
+
+  test('LaneDetailPanel shows "No task currently running" when current_task is null', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchImprovementLaneDetail.mockResolvedValueOnce({
+      id: 'lane-1', title: null, goal: null, direction_id: null, version_number: null,
+      status: 'ACTIVE', branch_name: null, base_branch: null, created_at: null, parked_at: null,
+      last_resumed_at: null, retired_at: null, updated_at: null, last_checkpoint_sha: null,
+      last_checkpoint_phase: null, checkpoint_seq: 0, phase_requeues: 0, checkpoints: [],
+      manifest: {},
+      workspace_state: null, workspace_vm_instance_id: null, pilot_arm: null,
+      llm_input_tokens_total: null, llm_output_tokens_total: null, vm_cost_usd_total: 0,
+      reserved_idle_cost_usd_total: 0, reservation_claimed_by_fix_count: 0,
+      reservation_expired_before_fix_count: 0, reservation_force_expired_count: 0,
+      current_task_id: null, current_task: null,
+    });
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    fireEvent.click(rows[0].querySelector('[data-testid="lane-expand-toggle"]') as HTMLElement);
+
+    expect(await screen.findByText('No task currently running')).toBeTruthy();
+  });
+
+  test('LaneDetailPanel renders ManifestSection with phase_log array entries', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchImprovementLaneDetail.mockResolvedValueOnce({
+      id: 'lane-1', title: null, goal: null, direction_id: null, version_number: null,
+      status: 'ACTIVE', branch_name: null, base_branch: null, created_at: null, parked_at: null,
+      last_resumed_at: null, retired_at: null, updated_at: null, last_checkpoint_sha: null,
+      last_checkpoint_phase: null, checkpoint_seq: 0, phase_requeues: 0, checkpoints: [],
+      manifest: {
+        phase_log: ['fix: applied patch', 'review: lint passed'],
+        critical_files: ['backend/app/main.py'],
+        failing_tests: [],
+        risks: null,
+        progress: '50%',
+        recovery: null,
+        remaining: null,
+      },
+      workspace_state: null, workspace_vm_instance_id: null, pilot_arm: null,
+      llm_input_tokens_total: null, llm_output_tokens_total: null, vm_cost_usd_total: 0,
+      reserved_idle_cost_usd_total: 0, reservation_claimed_by_fix_count: 0,
+      reservation_expired_before_fix_count: 0, reservation_force_expired_count: 0,
+      current_task_id: null, current_task: null,
+    });
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    fireEvent.click(rows[0].querySelector('[data-testid="lane-expand-toggle"]') as HTMLElement);
+
+    expect(await screen.findByText('fix: applied patch')).toBeTruthy();
+    expect(screen.getByText('review: lint passed')).toBeTruthy();
+    expect(screen.getByText('backend/app/main.py')).toBeTruthy();
+    expect(screen.getByText('50%')).toBeTruthy();
+  });
+
+  test('clicking expand toggle again collapses the detail panel', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    fetchImprovementLaneDetail.mockResolvedValueOnce({
+      id: 'lane-1', title: null, goal: null, direction_id: null, version_number: null,
+      status: 'ACTIVE', branch_name: null, base_branch: null, created_at: null, parked_at: null,
+      last_resumed_at: null, retired_at: null, updated_at: null, last_checkpoint_sha: null,
+      last_checkpoint_phase: null, checkpoint_seq: 0, phase_requeues: 0, checkpoints: [],
+      manifest: {},
+      workspace_state: null, workspace_vm_instance_id: null, pilot_arm: null,
+      llm_input_tokens_total: null, llm_output_tokens_total: null, vm_cost_usd_total: 0,
+      reserved_idle_cost_usd_total: 0, reservation_claimed_by_fix_count: 0,
+      reservation_expired_before_fix_count: 0, reservation_force_expired_count: 0,
+      current_task_id: null, current_task: null,
+    });
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    const rows = await screen.findAllByTestId('improvement-lane-row');
+    const toggle = rows[0].querySelector('[data-testid="lane-expand-toggle"]') as HTMLElement;
+
+    fireEvent.click(toggle);
+    expect(await screen.findByText('No task currently running')).toBeTruthy();
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(screen.queryByText('No task currently running')).toBeNull());
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
   });
 });

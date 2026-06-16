@@ -1576,6 +1576,102 @@ async def get_improvement_lanes(
     }
 
 
+# GET /api/admin/improvement-lanes/{lane_id}
+# ---------------------------------------------------------------------------
+
+
+@router.get("/improvement-lanes/{lane_id:uuid}")
+async def get_improvement_lane_detail(
+    lane_id: uuid.UUID,
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return full detail for a single improvement lane.
+
+    Returns identity/timeline fields, the full checkpoints[] rolling window
+    (bounded at 50 entries — not all-time history), the full manifest dict,
+    workspace/reservation/accounting state, and a light current_task sub-object
+    when current_task_id is set (null when the lane is idle/parked).
+
+    Returns 404 when the lane is not found or does not belong to project_id.
+    """
+    lane = await session.get(ImprovementLane, lane_id)
+    if lane is None or lane.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Lane not found")
+
+    current_task_obj: Dict[str, Any] | None = None
+    if lane.current_task_id is not None:
+        task_row = (
+            (
+                await session.execute(
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.id,
+                            Task.status,
+                            Task.title,
+                            Task.payloads,
+                            raiseload=True,
+                        )
+                    )
+                    .where(Task.id == lane.current_task_id)
+                )
+            )
+            .scalars()
+            .one_or_none()
+        )
+        if task_row is not None:
+            current_task_obj = {
+                "task_id": str(task_row.id),
+                "status": task_row.status.value
+                if hasattr(task_row.status, "value")
+                else task_row.status,
+                "title": task_row.title,
+                "task_type": task_row.first_payload.get("type"),
+            }
+
+    return {
+        "id": str(lane.id),
+        "title": lane.title,
+        "goal": lane.goal,
+        "direction_id": lane.direction_id,
+        "version_number": lane.version_number,
+        "status": lane.status,
+        "branch_name": lane.branch_name,
+        "base_branch": lane.base_branch,
+        "created_at": lane.created_at.isoformat() if lane.created_at else None,
+        "parked_at": lane.parked_at.isoformat() if lane.parked_at else None,
+        "last_resumed_at": (
+            lane.last_resumed_at.isoformat() if lane.last_resumed_at else None
+        ),
+        "retired_at": lane.retired_at.isoformat() if lane.retired_at else None,
+        "updated_at": lane.updated_at.isoformat() if lane.updated_at else None,
+        "last_checkpoint_sha": lane.last_checkpoint_sha,
+        "last_checkpoint_phase": lane.last_checkpoint_phase,
+        "checkpoint_seq": lane.checkpoint_seq,
+        "phase_requeues": lane.phase_requeues,
+        "checkpoints": lane.checkpoints or [],
+        "manifest": lane.manifest or {},
+        "workspace_state": lane.workspace_state,
+        "workspace_vm_instance_id": lane.workspace_vm_instance_id,
+        "pilot_arm": lane.pilot_arm,
+        "llm_input_tokens_total": lane.llm_input_tokens_total,
+        "llm_output_tokens_total": lane.llm_output_tokens_total,
+        "vm_cost_usd_total": round(lane.vm_cost_usd_total or 0.0, 6),
+        "reserved_idle_cost_usd_total": round(
+            lane.reserved_idle_cost_usd_total or 0.0, 6
+        ),
+        "reservation_claimed_by_fix_count": lane.reservation_claimed_by_fix_count or 0,
+        "reservation_expired_before_fix_count": (
+            lane.reservation_expired_before_fix_count or 0
+        ),
+        "reservation_force_expired_count": lane.reservation_force_expired_count or 0,
+        "current_task_id": str(lane.current_task_id) if lane.current_task_id else None,
+        "current_task": current_task_obj,
+    }
+
+
 @router.get("/visual-pilot-status")
 async def get_visual_pilot_status(
     project_id: uuid.UUID = Query(...),
