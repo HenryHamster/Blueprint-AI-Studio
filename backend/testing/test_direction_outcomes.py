@@ -4331,6 +4331,80 @@ async def test_refresh_after_out_of_band_merge_path_heals_prs_merged(
 
 
 @pytest.mark.asyncio
+async def test_rollup_merge_triggers_direction_outcome_refresh(
+    db_session: AsyncSession,
+):
+    """Rollup-squash merge heals stale prs_merged via the refresh call.
+
+    Models the FALSE-AUTO-PAUSE root cause: children complete with PRs still
+    open, so prs_merged=0 at snapshot time. The rollup later squash-merges all
+    PRs, stamps landed_on_integration=True, then calls
+    refresh_direction_outcomes_after_merge on the first direction-lineage child.
+    The recompute re-counts every sibling in the cycle, so a single refresh
+    heals the whole entry — verified_prs_merged rises from 0 to the real count.
+    """
+    direction_id = "d-rollup-refresh"
+    project = await _create_project(db_session)
+    research_task = await _make_research_task(db_session, project.id)
+    rtid = str(research_task.id)
+    project.directions = [_make_direction(direction_id, rtid, tasks_created=2)]
+    db_session.add(project)
+    await db_session.flush()
+
+    child_ctx = {"direction_id": direction_id, "research_task_id": rtid}
+    children = [
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            context=dict(child_ctx),
+            title=f"rollup child {i}",
+        )
+        for i in range(2)
+    ]
+    await db_session.flush()
+
+    # Snapshot before rollup lands: PRs open but not yet merged.
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=rtid,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 0  # stale snapshot before rollup merge
+
+    # Rollup squash-merges: stamp landed signal on all children.
+    for c in children:
+        c.context = {
+            **c.context,
+            "pr_merged": True,
+            "landed_on_integration": True,
+        }
+        db_session.add(c)
+    await db_session.flush()
+
+    # The rollup merge path fires refresh on the first direction-lineage child.
+    _dir_child = next(
+        (
+            c
+            for c in children
+            if (c.context or {}).get("direction_id")
+            and (c.context or {}).get("research_task_id")
+        ),
+        None,
+    )
+    assert _dir_child is not None
+    await refresh_direction_outcomes_after_merge(_dir_child, db_session)
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # Both siblings counted — the recompute heals the whole cycle entry.
+    assert entry["prs_merged"] == 2
+
+
+@pytest.mark.asyncio
 async def test_tasks_completed_no_pr_counts_only_genuine_no_pr(
     db_session: AsyncSession,
 ):

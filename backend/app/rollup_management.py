@@ -2198,6 +2198,24 @@ async def _check_and_trigger_rollup(
                                 )
                             session.add(parent)
                             await session.commit()
+                            if _landed:
+                                from app.direction_outcomes import (
+                                    refresh_direction_outcomes_after_merge,
+                                )
+
+                                _dir_child = next(
+                                    (
+                                        c
+                                        for c in completed_children
+                                        if (c.context or {}).get("direction_id")
+                                        and (c.context or {}).get("research_task_id")
+                                    ),
+                                    None,
+                                )
+                                if _dir_child is not None:
+                                    await refresh_direction_outcomes_after_merge(
+                                        _dir_child, session
+                                    )
                             await _cleanup_branches(parent, session)
                             await broadcast_to_project(
                                 str(parent.project_id),
@@ -2575,6 +2593,24 @@ async def _check_and_trigger_rollup(
                         )
                     session.add(parent)
                     await session.commit()
+                    if _landed:
+                        from app.direction_outcomes import (
+                            refresh_direction_outcomes_after_merge,
+                        )
+
+                        _dir_child = next(
+                            (
+                                c
+                                for c in completed_children
+                                if (c.context or {}).get("direction_id")
+                                and (c.context or {}).get("research_task_id")
+                            ),
+                            None,
+                        )
+                        if _dir_child is not None:
+                            await refresh_direction_outcomes_after_merge(
+                                _dir_child, session
+                            )
                     await _cleanup_branches(parent, session)
                     await broadcast_to_project(
                         str(parent.project_id),
@@ -2989,6 +3025,24 @@ async def _check_and_trigger_rollup(
                             )
                         session.add(parent)
                         await session.commit()
+                        if _landed:
+                            from app.direction_outcomes import (
+                                refresh_direction_outcomes_after_merge,
+                            )
+
+                            _dir_child = next(
+                                (
+                                    c
+                                    for c in completed_children
+                                    if (c.context or {}).get("direction_id")
+                                    and (c.context or {}).get("research_task_id")
+                                ),
+                                None,
+                            )
+                            if _dir_child is not None:
+                                await refresh_direction_outcomes_after_merge(
+                                    _dir_child, session
+                                )
                         try:
                             await delete_branch(gh_token, owner, repo, staging_branch)
                         except Exception as del_err:
