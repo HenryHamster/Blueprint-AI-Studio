@@ -204,6 +204,26 @@ def _is_pipeline_task_stale(task: Task) -> bool:
     return task.started_at < threshold
 
 
+def _task_is_actively_ci_waiting(task: Task) -> bool:
+    """True if ``task`` is parked waiting on CI (``review_loop.ci_waiting``).
+
+    A CI-waiting task's silence is EXPECTED, not the signature of a dying VM:
+    the agent VM has already finished and pushed, and from here the ORCHESTRATOR
+    — not the VM — polls GitHub CI, so ``last_heartbeat`` deliberately goes
+    stale. A multi-shard CI run routinely outlasts ``PIPELINE_TASK_STALE_MINUTES``
+    (15), so :func:`_is_pipeline_task_stale` reports such a task as stale even
+    though it is making authoritative progress. Callers must therefore exempt a
+    CI-waiting task from stale-supersession / stale-skip exactly as they exempt a
+    BLOCKED precondition park — a genuinely-stuck CI-waiting task is bounded
+    instead by ci_completion's in-progress reset cap and the EVALUATING CI
+    backstop (which FAIL it, dropping it from the active pipeline). Without this
+    exemption, three false stale-supersessions of one CI-waiting fix trip the
+    supersession-churn halt and terminalize an otherwise-healthy chain
+    (research b2231dd0 / rollup PR #10389, 2026-06-16).
+    """
+    return bool(((task.context or {}).get("review_loop") or {}).get("ci_waiting"))
+
+
 async def _cap_exhausted_after_approve(
     orig: Task,
     source_task: Task,

@@ -34,7 +34,11 @@ from app.models import (
     TaskStatus,
     ArtifactType,
 )
-from app.review_pipeline import _spawn_pipeline_task, _is_pipeline_task_stale
+from app.review_pipeline import (
+    _spawn_pipeline_task,
+    _is_pipeline_task_stale,
+    _task_is_actively_ci_waiting,
+)
 from app.rollup_branch_cleanup import (  # noqa: F401 — re-exported for callers/tests
     _branch_task_id_prefix,
     _cleanup_branches,
@@ -1129,7 +1133,20 @@ async def _check_and_trigger_rollup(
         # the check for BLOCKED. Its lifetime is bounded instead by the
         # blocked-escalation machinery in reaper_sweeps, so it cannot wedge
         # rollup permanently.
-        if c.status != TaskStatus.BLOCKED and _is_pipeline_task_stale(c):
+        #
+        # A CI-waiting child (review_loop.ci_waiting) is likewise expected-silent:
+        # the orchestrator, not the VM, polls CI from here, so it goes stale while
+        # legitimately mid-CI. Skipping it as stale lets the rollup proceed past a
+        # still-active fix and spawn a review that then stale-supersedes that fix
+        # in _spawn_pipeline_task — the exact churn that tripped the supersession
+        # halt on PR #10389. Treat it as active (keep the rollup waiting) like a
+        # BLOCKED park; ci_completion + the CI backstop bound a genuinely-stuck
+        # one.
+        if (
+            c.status != TaskStatus.BLOCKED
+            and not _task_is_actively_ci_waiting(c)
+            and _is_pipeline_task_stale(c)
+        ):
             logger.warning(
                 f"[ROLLUP] Ignoring stale pipeline task {str(c.id)[:8]} "
                 f"(status={c.status}, last_heartbeat={c.last_heartbeat}) — not blocking rollup"

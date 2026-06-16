@@ -111,6 +111,7 @@ from app.review_loop_convergence import (
     _MID_BUDGET_NARROW_FOCUS_PREFIX,
     _SCOPE_PRESSURE_HARD_CAP_PREFIX,
     _is_pipeline_task_stale,
+    _task_is_actively_ci_waiting,
     _set_review_loop_terminal_outcome,
 )
 
@@ -1886,8 +1887,17 @@ async def _spawn_pipeline_task(
         # its stale (no-heartbeat) signal is expected and must NOT supersede it —
         # otherwise a legitimately parked same-PR fix gets cancelled and the
         # cross-type defer below is skipped. The blocked-escalation machinery in
-        # reaper_sweeps bounds its lifetime instead.
-        if t.status != TaskStatus.BLOCKED and _is_pipeline_task_stale(t):
+        # reaper_sweeps bounds its lifetime instead. A CI-waiting task
+        # (review_loop.ci_waiting) is expected-silent for the same reason — the
+        # orchestrator polls CI, not the VM — so stale-superseding it both cancels
+        # live progress and feeds the supersession-churn halt (research b2231dd0 /
+        # PR #10389). Exempt both; an incoming spawn DEFERS instead. See
+        # _task_is_actively_ci_waiting for the full rationale + the backstop.
+        if (
+            t.status != TaskStatus.BLOCKED
+            and not _task_is_actively_ci_waiting(t)
+            and _is_pipeline_task_stale(t)
+        ):
             from app.failure_classification import (
                 AGENT_TIMEOUT,
                 persist_failure_category,
