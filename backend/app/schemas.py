@@ -504,6 +504,29 @@ _BEARER_LIKE_RE = re.compile(
     r"\s*[=:]\s*\S+",
 )
 _RPC_MSG_SAFE_LIMIT = 400
+# Matches ``Bearer <token>`` (space-separated) — _BEARER_LIKE_RE only handles
+# ``keyword=value`` / ``keyword: value`` forms and would leave the actual token
+# value dangling when the full form is ``Authorization: Bearer <token>``.
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+\S+")
+_ENV_EXPORT_RE = re.compile(r"(?i)export\s+\w+=\S+")
+
+
+def redact_command_log_text(text: str) -> str:
+    """Redact credential-bearing patterns from command stdout/stderr text.
+
+    Applies the same URL-query and bearer-token scrubbers used for RPC
+    diagnostics, plus a shell-export redactor so secrets set via
+    ``export SECRET=value`` in experiment scripts do not persist in the
+    durable command_log stored in Artifact.logs or KnowledgeDocuments.
+    """
+    text = _URL_QUERY_RE.sub("?[redacted]", text)
+    # Apply Bearer-value pattern BEFORE _BEARER_LIKE_RE so that
+    # ``Authorization: Bearer TOKEN`` loses TOKEN before the header itself
+    # is collapsed — otherwise TOKEN survives as a dangling word.
+    text = _BEARER_TOKEN_RE.sub("Bearer [redacted]", text)
+    text = _BEARER_LIKE_RE.sub(r"\1=[redacted]", text)
+    text = _ENV_EXPORT_RE.sub("[export redacted]", text)
+    return text
 
 
 def sanitize_rpc_diagnostic(raw: Dict[str, Any] | None) -> Dict[str, Any] | None:
@@ -551,6 +574,15 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
     if isinstance(metadata, dict):
         for key in _POLLING_METADATA_LAUNCH_SPEC_KEYS:
             metadata.pop(key, None)
+
+    # Redact credential-bearing patterns from command_log text so raw stdout/stderr
+    # captured on the VM never reaches operator-facing API responses.
+    if isinstance(metadata, dict):
+        command_log = metadata.get("command_log")
+        if isinstance(command_log, dict) and isinstance(command_log.get("text"), str):
+            command_log = dict(command_log)
+            command_log["text"] = redact_command_log_text(command_log["text"])
+            metadata["command_log"] = command_log
 
     # Sanitize the promoted diagnostic — may carry raw provider exception text
     # with signed URLs or credential values.  Overwrite both the top-level

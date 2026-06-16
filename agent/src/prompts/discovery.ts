@@ -203,7 +203,7 @@ export function verifyCloneDelivered(task: Record<string, unknown>, branch?: str
 
 // ── Test Convention Extraction ───────────────────────────────────────────────
 // Cache: dirKey → convention summary string. Populated once per task invocation.
-const _testConventionCache = new Map<string, string>();
+const _testConventionCache = new Map<string, string>(); // @per-role
 
 export function clearTestConventionCache(): void { _testConventionCache.clear(); }
 

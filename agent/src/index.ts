@@ -113,7 +113,7 @@ export class GracefulShutdownSignal {
 // heartbeats. Today the only setter (the heartbeat 4xx path) exits 5s later, so
 // the leak is latent, but the warm-handoff reset (resetPerRoleModuleState)
 // clears it unconditionally so the invariant holds regardless of future setters.
-let cancelRequested = false;
+let cancelRequested = false; // @per-role
 function requestCancel(): void { cancelRequested = true; }
 function resetCancelRequested(): void { cancelRequested = false; }
 export function _isCancelRequestedForTesting(): boolean { return cancelRequested; }
@@ -980,14 +980,14 @@ export async function persistAndPostStatus(taskId: string, payload: Record<strin
 // Phase 0 telemetry — start-of-role timestamp captured by main() after a
 // successful claim and reset at the start of each warm role. Used by
 // enrichStatusPayload to derive setup_secs from firstToolUseAt.
-let roleClaimTimestamp: number | null = null;
+let roleClaimTimestamp: number | null = null; // @per-role
 
 // Phase 0 telemetry — claim → handler-complete elapsed seconds. Captured at
 // the success path of runRoleOnce() right after the handler returns; rides on
 // the next status payload via enrichStatusPayload. Reset to null between
 // roles in the role-loop telemetry-reset block. Stays null on failure paths
 // so the backend doesn't conflate fatal-error duration with completion time.
-let handlerDurationSecsForPayload: number | null = null;
+let handlerDurationSecsForPayload: number | null = null; // @per-role
 
 /** Test-only: seed the role-claim timestamp so a test can simulate
  *  timing without going through main(). */
@@ -1662,11 +1662,11 @@ const TOOL_TRACE_MAX = 20;
 // role gets its own setup_secs measurement. Module-level mutable so the
 // SDK message loop (which records tool uses) doesn't need a handle to
 // per-role state.
-let firstToolUseAt: number | null = null;
+let firstToolUseAt: number | null = null; // @per-role
 
 // Phase 0 telemetry — true when the current role was started via
 // pollForNextRole on a warm VM, false on the initial cold-start role.
-let isWarmStart = false;
+let isWarmStart = false; // @per-role
 
 export function recordToolUse(toolName: string, input: unknown): void {
   if (firstToolUseAt === null) {
@@ -1892,8 +1892,8 @@ function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: n
 // HEARTBEAT_INFLIGHT_DEADLINE treats the prior POST as wedged and reclaims it.
 // A `generation` token stops a late-settling wedged POST from clobbering the
 // reclaiming tick's own in-flight flag.
-let heartbeatInFlight = false;
-let heartbeatInFlightSince = 0;
+let heartbeatInFlight = false; // @per-role
+let heartbeatInFlightSince = 0; // @per-role
 let heartbeatGeneration = 0;
 
 function startHeartbeat(taskId: string, getMessage: () => string) {

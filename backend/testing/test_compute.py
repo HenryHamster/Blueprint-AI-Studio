@@ -31,6 +31,7 @@ from app import compute
 from app import compute_backends as compute_backends_module
 from app import compute_jobs
 from app import provision_error_scope
+from app import schemas
 from app import storage
 from app.compute_backends import (
     ComputeCostResult,
@@ -9574,3 +9575,113 @@ async def test_provision_local_does_not_inherit_orchestrator_secrets(
     assert "AGENT_JWT_SECRET" not in child_env
     assert child_env.get("PAYLOAD_URI") == "payload://test"
     assert child_env.get("VM_INSTANCE_ID") == vm_instance_id
+
+
+# ---------------------------------------------------------------------------
+# Credential redaction: command_log
+# ---------------------------------------------------------------------------
+
+
+def _make_job_with_command_log(text: str, truncated: bool = False) -> ComputeJob:
+    return ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="g2-standard-4",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+        polling_metadata={
+            "command_log": {"text": text, "truncated": truncated, "byte_count": len(text.encode())},
+        },
+    )
+
+
+def test_command_log_credentials_redacted_on_operator_and_knowledge_surfaces():
+    """Bearer tokens and signed-URL query strings in command_log are scrubbed on
+    every durable surface: admin API (serialize_compute_job_response_safe),
+    artifact JSON (build_compute_result_logs), and artifact Logs
+    (_link_terminal_artifact via redact_command_log_text applied before storage).
+
+    This is the named acceptance test for the fix-redact-credentials-command-log task.
+    """
+    raw = (
+        "Fetching artifact from https://storage.example.com/bucket/obj?X-Goog-Signature=SECRETVAL&expires=999\n"
+        "Authorization: Bearer ghp_SUPERSECRETTOKEN\n"
+        "export AWS_SECRET_KEY=MY_SECRET_VALUE\n"
+        "result: ok\n"
+    )
+    job = _make_job_with_command_log(raw)
+
+    # --- operator API surface ---
+    api_data = schemas.serialize_compute_job_response_safe(job)
+    api_text = api_data["polling_metadata"]["command_log"]["text"]
+    assert "SECRETVAL" not in api_text, "signed URL query value must be redacted from API"
+    assert "ghp_SUPERSECRETTOKEN" not in api_text, "bearer token must be redacted from API"
+    assert "MY_SECRET_VALUE" not in api_text, "export value must be redacted from API"
+    assert "result: ok" in api_text, "benign output must survive redaction"
+
+    # --- artifact JSON / knowledge document surface ---
+    result = compute_jobs.build_compute_result_logs(job)
+    import json as _json
+    artifact = _json.loads(result)
+    cl_text = artifact["command_log_text"]
+    assert "SECRETVAL" not in cl_text, "signed URL query value must be redacted from artifact JSON"
+    assert "ghp_SUPERSECRETTOKEN" not in cl_text, "bearer token must be redacted from artifact JSON"
+    assert "MY_SECRET_VALUE" not in cl_text, "export value must be redacted from artifact JSON"
+    assert "result: ok" in cl_text, "benign output must survive redaction in artifact JSON"
+
+    # --- direct helper ---
+    clean = schemas.redact_command_log_text(raw)
+    assert "SECRETVAL" not in clean
+    assert "ghp_SUPERSECRETTOKEN" not in clean
+    assert "MY_SECRET_VALUE" not in clean
+    assert "result: ok" in clean
+
+
+def test_redact_command_log_text_strips_bearer_tokens():
+    """redact_command_log_text removes Authorization headers and bearer-like values."""
+    text = "Authorization: Bearer abc123\ntoken=mysecret\nok\n"
+    result = schemas.redact_command_log_text(text)
+    assert "abc123" not in result
+    assert "mysecret" not in result
+    assert "ok" in result
+
+
+def test_redact_command_log_text_strips_url_query_strings():
+    """redact_command_log_text strips URL query parameters (signed URLs etc.)."""
+    text = "GET https://example.com/file?X-Goog-Signature=abc&Expires=123\ndone\n"
+    result = schemas.redact_command_log_text(text)
+    assert "abc" not in result
+    assert "X-Goog-Signature" not in result
+    assert "done" in result
+
+
+def test_redact_command_log_text_strips_shell_exports():
+    """redact_command_log_text redacts shell export statements."""
+    text = "export SECRET_KEY=supersecret\nexport PATH=/usr/bin\nrunning\n"
+    result = schemas.redact_command_log_text(text)
+    assert "supersecret" not in result
+    assert "running" in result
+
+
+def test_build_compute_result_logs_redacts_command_log_text():
+    """build_compute_result_logs scrubs credentials before embedding command_log_text."""
+    raw = "token=leaked_secret\nnormal output\n"
+    job = _make_job_with_command_log(raw)
+    import json as _json
+    result = _json.loads(compute_jobs.build_compute_result_logs(job))
+    assert "leaked_secret" not in result["command_log_text"]
+    assert "normal output" in result["command_log_text"]
+
+
+def test_serialize_compute_job_response_safe_redacts_command_log():
+    """serialize_compute_job_response_safe scrubs command_log.text for operator API."""
+    raw = "Bearer token=TOP_SECRET\nresult: 42\n"
+    job = _make_job_with_command_log(raw)
+    data = schemas.serialize_compute_job_response_safe(job)
+    text = data["polling_metadata"]["command_log"]["text"]
+    assert "TOP_SECRET" not in text
+    assert "result: 42" in text

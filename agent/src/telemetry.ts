@@ -19,7 +19,7 @@ export function computePromptFingerprint(staticContent: string): string {
   return createHash('sha256').update(staticContent).digest('hex').slice(0, 12);
 }
 
-let currentPromptFingerprint: string | null = null;
+let currentPromptFingerprint: string | null = null; // @per-role
 
 /** Register the fingerprint for the current task's prompt. Call before runClaudeCode. */
 export function setCurrentPromptFingerprint(fp: string | null): void {
@@ -36,9 +36,9 @@ export function getCurrentPromptFingerprint(): string | null {
 // parser (token totals). Reset between roles so warm-VM continuity does not
 // double-count prior roles' usage. Tokens accumulate across all turns within
 // a single CLI invocation; llm_call_count counts CLI invocations.
-let _llmCallCount = 0;
-let _totalInputTokens = 0;
-let _totalOutputTokens = 0;
+let _llmCallCount = 0; // @per-role
+let _totalInputTokens = 0; // @per-role
+let _totalOutputTokens = 0; // @per-role
 
 /** Increment the per-task LLM call counter (one per CLI invocation). */
 export function recordLlmCallStart(): void {
@@ -111,13 +111,13 @@ export type SchemaLabel =
   | 'review_verdict'
   | 'unknown';
 
-let _formatMissByReason: Record<string, number> = {};
-let _formatErrorTotal = 0;
-let _formatRepairAttempts = 0;
-let _formatRepairSuccesses = 0;
-let _formatMissBySchema: Partial<Record<SchemaLabel, number>> = {};
-let _formatRepairAttemptsBySchema: Partial<Record<SchemaLabel, number>> = {};
-let _formatRepairSuccessesBySchema: Partial<Record<SchemaLabel, number>> = {};
+let _formatMissByReason: Record<string, number> = {}; // @per-role
+let _formatErrorTotal = 0; // @per-role
+let _formatRepairAttempts = 0; // @per-role
+let _formatRepairSuccesses = 0; // @per-role
+let _formatMissBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
+let _formatRepairAttemptsBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
+let _formatRepairSuccessesBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 
 /** Record one unparseable final output, bucketed by the extraction verdict's
  *  reason class and, when provided, by the bounded schema label. Bumps the

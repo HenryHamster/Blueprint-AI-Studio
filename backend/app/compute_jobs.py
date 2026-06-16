@@ -57,6 +57,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.schemas import redact_command_log_text
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
     get_compute_rate_per_second,
@@ -2026,7 +2027,9 @@ def build_compute_result_logs(job: ComputeJob) -> str:
     if isinstance(command_log, dict):
         cl_text = str(command_log.get("text") or "").strip()
         if cl_text:
-            result["command_log_text"] = cl_text[:_COMMAND_LOG_EMBED_CHARS]
+            result["command_log_text"] = redact_command_log_text(cl_text)[
+                :_COMMAND_LOG_EMBED_CHARS
+            ]
             result["command_log_truncated"] = bool(command_log.get("truncated"))
     return json.dumps(result)
 
@@ -2074,6 +2077,11 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
             }
             command_log = (job.polling_metadata or {}).get("command_log")
             if command_log is not None:
+                if isinstance(command_log, dict) and isinstance(
+                    command_log.get("text"), str
+                ):
+                    command_log = dict(command_log)
+                    command_log["text"] = redact_command_log_text(command_log["text"])
                 artifact_logs["command_log"] = command_log
             artifact = Artifact(
                 task_id=job.task_id,
