@@ -11,6 +11,7 @@ from the live PR head so a missing stored branch can't wedge a poison task.
 """
 
 import asyncio
+import threading
 from datetime import timedelta
 
 import pytest
@@ -394,3 +395,158 @@ class TestAuthedOrchestratorHealth:
         resp = await client.get("/api/health/detailed")
         assert resp.status_code == 200
         assert resp.json()["components"]["orchestrator"]["status"] == "down"
+
+
+class TestHardWatchdogDecision:
+    """The out-of-loop hard watchdog's *decision* (no thread): when does it
+    declare the leader's event loop wedged past the hard bound?
+
+    Prod 2026-06-15: a fully-blocked leader loop (sync CPU stall / total pool
+    exhaustion) starves both the in-loop watchdog and /health, so only Cloud
+    Run's slow probe recycled the container (~6-min wedge). The hard watchdog is
+    the OS-thread backstop; this verifies its trigger reuses the shared liveness
+    predicate with a LARGER bound, and never fires for a fresh/idle marker.
+    """
+
+    def test_fresh_heartbeat_not_aborted(self, restore_orch_state):
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_cycle_started = None
+        _orch._orchestrator_last_progress = _utcnow() - timedelta(seconds=5)
+        abort, reason = _orch.hard_watchdog_should_abort()
+        assert abort is False
+        assert reason == ""
+
+    def test_stale_past_hard_bound_aborts(self, restore_orch_state):
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_cycle_started = None
+        _orch._orchestrator_last_progress = _utcnow() - timedelta(
+            seconds=_orch.ORCHESTRATOR_HARD_WATCHDOG_SECONDS + 30
+        )
+        abort, reason = _orch.hard_watchdog_should_abort()
+        assert abort is True
+        assert "no progress heartbeat" in reason
+
+    def test_stale_within_graceful_window_not_hard_aborted(self, restore_orch_state):
+        """Past the in-loop HANG bound but inside the hard bound: the graceful
+        in-loop cancel-and-restart path owns this window — the hard watchdog must
+        NOT pre-empt it (else it hard-kills a process the in-loop path would have
+        recovered without a restart)."""
+        assert (
+            _orch.ORCHESTRATOR_HANG_SECONDS < _orch.ORCHESTRATOR_HARD_WATCHDOG_SECONDS
+        )
+        midpoint = (
+            _orch.ORCHESTRATOR_HANG_SECONDS + _orch.ORCHESTRATOR_HARD_WATCHDOG_SECONDS
+        ) / 2
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_cycle_started = None
+        _orch._orchestrator_last_progress = _utcnow() - timedelta(seconds=midpoint)
+        abort, _reason = _orch.hard_watchdog_should_abort()
+        assert abort is False
+        # ...yet the in-loop predicate DOES see it as stalled (graceful path active).
+        assert _orch.evaluate_orchestrator_liveness().stalled is True
+
+    def test_nothing_recorded_not_aborted(self, restore_orch_state):
+        """Fresh process / follower: no heartbeat, no cycle started → not a wedge."""
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_last_progress = None
+        _orch._orchestrator_cycle_started = None
+        abort, reason = _orch.hard_watchdog_should_abort()
+        assert abort is False
+        assert reason == ""
+
+    def test_hard_bound_strictly_above_hang_bound(self):
+        """Invariant: the hard bound is clamped strictly above the in-loop bound
+        so the graceful path always gets first chance."""
+        assert (
+            _orch.ORCHESTRATOR_HARD_WATCHDOG_SECONDS
+            >= _orch.ORCHESTRATOR_HANG_SECONDS + 30
+        )
+
+
+class TestHardWatchdogStep:
+    """One poll of the watchdog loop body (pure, no thread)."""
+
+    def test_step_aborts_when_guarded_and_stale(self):
+        calls = []
+        fired = _orch._hard_watchdog_step(
+            is_guarded=lambda: True,
+            should_abort=lambda: (True, "wedged"),
+            abort=lambda reason: calls.append(reason),
+        )
+        assert fired is True
+        assert calls == ["wedged"]
+
+    def test_step_skips_when_not_guarded(self):
+        """Follower protection: a non-leader is never killed even if its (stale,
+        leftover) marker would otherwise read as wedged."""
+        calls = []
+        fired = _orch._hard_watchdog_step(
+            is_guarded=lambda: False,
+            should_abort=lambda: (True, "wedged"),
+            abort=lambda reason: calls.append(reason),
+        )
+        assert fired is False
+        assert calls == []
+
+    def test_step_swallows_should_abort_error(self):
+        """The watchdog must never crash its own thread and leave the loop
+        unguarded — an error in the decision is swallowed, no abort."""
+        calls = []
+
+        def boom():
+            raise RuntimeError("transient read error")
+
+        fired = _orch._hard_watchdog_step(
+            is_guarded=lambda: True,
+            should_abort=boom,
+            abort=lambda reason: calls.append(reason),
+        )
+        assert fired is False
+        assert calls == []
+
+
+class TestHardWatchdogThread:
+    """The real daemon thread: it observes module globals and fires the injected
+    abort — proving it runs independently of the (here, un-blocked) event loop."""
+
+    def test_thread_fires_on_stale_leader(self, restore_orch_state):
+        _ss.is_leader = True
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_cycle_started = None
+        _orch._orchestrator_last_progress = _utcnow() - timedelta(
+            seconds=_orch.ORCHESTRATOR_HARD_WATCHDOG_SECONDS + 60
+        )
+        fired = threading.Event()
+        captured = {}
+
+        def fake_abort(reason):
+            captured["reason"] = reason
+            fired.set()
+
+        try:
+            _orch.start_orchestrator_hard_watchdog(
+                is_guarded=lambda: _ss.is_leader,
+                poll_interval=0.01,
+                abort=fake_abort,
+            )
+            assert fired.wait(timeout=5), "watchdog did not fire on a stale leader"
+            assert "no progress heartbeat" in captured["reason"]
+        finally:
+            _orch.stop_orchestrator_hard_watchdog()
+
+    def test_thread_does_not_fire_for_follower(self, restore_orch_state):
+        _ss.is_leader = False  # follower: never guarded
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_cycle_started = None
+        _orch._orchestrator_last_progress = _utcnow() - timedelta(seconds=10_000)
+        fired = threading.Event()
+
+        try:
+            _orch.start_orchestrator_hard_watchdog(
+                is_guarded=lambda: _ss.is_leader,
+                poll_interval=0.01,
+                abort=lambda reason: fired.set(),
+            )
+            assert not fired.wait(timeout=0.5), "watchdog must not kill a follower"
+        finally:
+            _orch.stop_orchestrator_hard_watchdog()
