@@ -6930,6 +6930,92 @@ async def orchestrator_worker():
                             )
                             continue
 
+                        # ── Opt-in honest-block for DEGRADED unverified merges ──
+                        # Default-OFF per-project policy
+                        # (build_config.block_degraded_unverified_merge). When ON
+                        # and the no-CI gate fell open with a DEGRADED reason (it
+                        # EXPECTED to verify but could NOT run the suite), HOLD the
+                        # PR open instead of merging it UNVERIFIED. Benign
+                        # fall-opens (nothing to verify) and policy-OFF projects
+                        # take no branch here and merge exactly as today, so
+                        # default behavior is byte-for-byte unchanged. We do NOT
+                        # spawn a fix (no suite ran → there is no failing test to
+                        # fix) — we park the gate and surface a distinct,
+                        # operator-visible degraded-block signal (a recorded block
+                        # reason on merge_gate_runtime plus one alert). Subsequent
+                        # polls re-evaluate, re-park, and do NOT re-alert (sticky
+                        # ci_loop marker), so the PR stays held without spam.
+                        if _unverified_merge_reason:
+                            from app import ci_resolution as _blk_ci_res
+
+                            _block_proj = (
+                                await session.get(Project, ci_task.project_id)
+                                if ci_task.project_id
+                                else None
+                            )
+                            if _blk_ci_res.should_block_degraded_unverified_merge(
+                                _block_proj, _unverified_merge_reason
+                            ):
+                                from sqlalchemy.orm.attributes import (
+                                    flag_modified as _blk_flag_modified,
+                                )
+
+                                # Record the block + raise the alert ONCE per PR
+                                # strand. Subsequent parking polls re-enter here
+                                # (the verdict stays degraded) but must not inflate
+                                # the block tally or re-alert — the sticky marker
+                                # gates both.
+                                _already_blocked = bool(
+                                    ci_loop.get("no_ci_degraded_blocked")
+                                )
+                                if not _already_blocked:
+                                    _blk_ci_res.record_no_ci_gate_degraded_block(
+                                        session,
+                                        _block_proj,
+                                        unverified_reason=_unverified_merge_reason,
+                                        when=_utcnow(),
+                                    )
+                                ci_loop["no_ci_degraded_blocked"] = True
+                                ci_loop["no_ci_degraded_block_reason"] = (
+                                    _unverified_merge_reason
+                                )
+                                ci_task.latest_status_message = (
+                                    f"PR #{ci_pr_number}: no-CI merge gate could "
+                                    f"not verify the suite "
+                                    f"({_unverified_merge_reason}); the project's "
+                                    f"block-degraded-unverified-merge policy is ON "
+                                    f"— holding the PR open instead of merging "
+                                    f"UNVERIFIED"
+                                )
+                                ci_task.context = {
+                                    **(ci_task.context or {}),
+                                    "review_loop": ci_loop,
+                                }
+                                _blk_flag_modified(ci_task, "context")
+                                session.add(ci_task)
+                                if not _already_blocked:
+                                    await _maybe_create_failure_alert(
+                                        ci_task,
+                                        session,
+                                        f"PR #{ci_pr_number}: no-CI merge gate "
+                                        f"BLOCKED an unverified merge (degraded "
+                                        f"reason: {_unverified_merge_reason}) per "
+                                        f"the project's opt-in honest-block "
+                                        f"policy — the suite could not run, so "
+                                        f"the PR is held open for operator "
+                                        f"attention",
+                                    )
+                                await session.commit()
+                                await broadcast_to_project(
+                                    str(ci_task.project_id),
+                                    "task_updated",
+                                    {
+                                        "task_id": str(ci_task.id),
+                                        "status": ci_task.status,
+                                    },
+                                )
+                                continue
+
                         # CI completed — delegate to shared handler
                         from app.ci_completion import handle_ci_completion
 
@@ -7259,7 +7345,9 @@ async def orchestrator_worker():
                 await asyncio.sleep(5)
             # Check autonomous research every cycle — interval gate inside handles throttling.
             # Spawns only when VM slots are available (not tied to queue being empty).
-            await _bounded_leader_step("idle_research", _check_idle_research(), budget=60)
+            await _bounded_leader_step(
+                "idle_research", _check_idle_research(), budget=60
+            )
             # Utilization-triggered evergreen backlog auto-fill (d-2877ddc7).
             # Defaulted OFF; interval gate + mode gate handled inside. Additive
             # idle-fill parallelism — never competes with the release-critical path.

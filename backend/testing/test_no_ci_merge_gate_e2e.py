@@ -53,8 +53,10 @@ from app.ci_resolution import (
     merge_gate_runtime_block,
     probe_is_clear_failure,
     proceed_on_no_checks,
+    record_no_ci_gate_degraded_block,
     record_no_ci_gate_runtime,
     resolve_no_checks_escalation,
+    should_block_degraded_unverified_merge,
     should_run_no_ci_test_gate,
 )
 from app.build_config_detection import maybe_redetect_ci_presence
@@ -1580,6 +1582,126 @@ async def test_unverified_merge_alert_severity_degraded_vs_benign(db_session, mo
         assert alerts[0].severity == AlertSeverity.WARNING, (
             f"benign reason {benign_reason} must stay at WARNING severity"
         )
+
+
+async def _enable_block_policy(db_session, project):
+    """Turn ON the per-project opt-in honest-block policy (default OFF)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await db_session.get(Project, project.id)
+    bc = dict(project.build_config or {})
+    bc["block_degraded_unverified_merge"] = True
+    project.build_config = bc
+    flag_modified(project, "build_config")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_no_ci_optin_honest_block_blocks_degraded_fall_open(db_session, mocker):
+    """Opt-in honest-block policy: with the flag ON a DEGRADED external no-CI
+    fall-open is BLOCKED (PR held, block signal raised); with the flag OFF (the
+    default) the SAME degraded fall-open still merges UNVERIFIED exactly as
+    today. A BENIGN reason is never blocked even with the policy ON.
+
+    This pins BOTH halves of the default-off invariant by exercising the real
+    production decision helper ``should_block_degraded_unverified_merge`` and the
+    real block recorder ``record_no_ci_gate_degraded_block``, then mirroring the
+    orchestrator branch: block ⇒ do NOT call the merge primitive; no block ⇒ the
+    existing ``handle_ci_completion`` merges UNVERIFIED unchanged.
+    """
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    # The fall-open ci_result the orchestrator hands downstream is identical in
+    # both halves — only the policy flag differs.
+    ci_result = build_no_ci_gate_ci_result("undetected", "")
+    assert ci_result["conclusion"] == "success"
+    degraded_reason = (
+        "verify_setup_failed"  # gate expected to verify, suite could not run
+    )
+
+    # ── Half 1: policy ON + degraded reason ⇒ BLOCK (no merge) ───────────────
+    on_project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    on_project = await _enable_block_policy(db_session, on_project)
+    on_parent = _make_parent_task(db_session, on_project)
+    await db_session.commit()
+    await db_session.refresh(on_parent)
+    on_parent = await _set_unverified_reason(db_session, on_parent, degraded_reason)
+
+    assert (
+        should_block_degraded_unverified_merge(on_project, degraded_reason) is True
+    ), "policy ON + degraded reason must block"
+
+    # Mirror the orchestrator's block branch: record the honest block and do NOT
+    # invoke the merge primitive (the PR is held open).
+    record_no_ci_gate_degraded_block(
+        db_session, on_project, unverified_reason=degraded_reason, when=_RUNTIME_WHEN
+    )
+    await db_session.commit()
+    merge_mock.assert_not_called()
+
+    on_project = await db_session.get(Project, on_project.id)
+    runtime = merge_gate_runtime_block(on_project)
+    assert runtime is not None
+    assert runtime["last_degraded_block_reason"] == degraded_reason
+    assert runtime["last_degraded_block_at"] is not None
+    assert runtime["degraded_block_counts"][degraded_reason] == 1
+    # The block is a fall-open that did NOT run a real suite.
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_reason"] == degraded_reason
+
+    # ── Half 2: policy OFF (default) + SAME degraded reason ⇒ merge UNVERIFIED ─
+    off_project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    off_parent = _make_parent_task(db_session, off_project)
+    await db_session.commit()
+    await db_session.refresh(off_parent)
+    off_parent = await _set_unverified_reason(db_session, off_parent, degraded_reason)
+
+    assert (
+        should_block_degraded_unverified_merge(off_project, degraded_reason) is False
+    ), "policy OFF must never block — today's behavior is preserved"
+
+    # Mirror the orchestrator's merge branch: handle_ci_completion merges
+    # UNVERIFIED and raises exactly one operator alert, exactly as today.
+    acted = await handle_ci_completion(
+        off_parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()
+    alerts = await _unverified_merge_alerts(db_session, off_project.id)
+    assert len(alerts) == 1, "policy-OFF degraded fall-open merges unverified as today"
+
+    # ── Half 3: policy ON + BENIGN reason ⇒ never blocked ────────────────────
+    assert (
+        should_block_degraded_unverified_merge(on_project, "no_detectable_test_command")
+        is False
+    ), "a benign reason must never block, even with the policy ON"
+
+
+def test_orchestrator_consults_degraded_block_helper():
+    """Drift guard: the orchestrator's no-CI gate must still consult
+    ``should_block_degraded_unverified_merge`` and, when it returns True, BLOCK
+    (record the block and ``continue`` without calling ``handle_ci_completion``).
+    If a refactor drops this call the e2e mirror above stays green while
+    production silently regresses to merging degraded fall-opens unverified."""
+    src = _orchestrator_source()
+    required = [
+        "should_block_degraded_unverified_merge",
+        "record_no_ci_gate_degraded_block",
+        'ci_loop["no_ci_degraded_blocked"] = True',
+    ]
+    missing = [needle for needle in required if needle not in src]
+    assert not missing, (
+        "orchestrator no-CI honest-block wiring changed — missing: "
+        f"{missing}. The degraded-block branch must consult "
+        "should_block_degraded_unverified_merge and park the PR; update "
+        "orchestrator.py AND this guard together."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -978,6 +978,94 @@ async def update_task_branch_prefix_config(
 
 
 # ---------------------------------------------------------------------------
+# No-CI honest-block policy config endpoints
+#
+# DEFAULT-OFF per-project opt-in: when ON, the no-CI merge gate BLOCKS a PR
+# (holds it open) instead of merging it UNVERIFIED whenever the gate EXPECTED to
+# verify the code but could NOT run the repo's suite (a DEGRADED fall-open
+# reason). Absent/False == today's behavior. Member-read / owner-write, stored
+# in the build_config JSONB column (migration-free) alongside requires_ci_checks.
+# ---------------------------------------------------------------------------
+
+
+def _block_degraded_unverified_merge_value(project) -> bool:
+    return bool(
+        (project.build_config or {}).get("block_degraded_unverified_merge", False)
+    )
+
+
+@router.get("/projects/{project_id}/block-degraded-unverified-merge")
+async def get_block_degraded_unverified_merge_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project no-CI honest-block policy flag (default OFF)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "block_degraded_unverified_merge": _block_degraded_unverified_merge_value(
+            project
+        ),
+        "is_default": not _build_config_has_key(
+            project, "block_degraded_unverified_merge"
+        ),
+    }
+
+
+@router.patch("/projects/{project_id}/block-degraded-unverified-merge")
+async def update_block_degraded_unverified_merge_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project no-CI honest-block policy. Pass false to revert to the
+    default (merge UNVERIFIED on a degraded fall-open, today's behavior)."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "block_degraded_unverified_merge" not in body:
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must include 'block_degraded_unverified_merge'",
+        )
+
+    enabled = body["block_degraded_unverified_merge"]
+    if not isinstance(enabled, bool):
+        raise HTTPException(
+            status_code=422,
+            detail="'block_degraded_unverified_merge' must be a boolean",
+        )
+
+    project = await lock_project_or_429(session, project_id)
+    build_config = dict(project.build_config or {})
+    if enabled:
+        build_config["block_degraded_unverified_merge"] = True
+    else:
+        # Pop on False so absent == default == OFF (keeps build_config lean and
+        # is_default semantically correct).
+        build_config.pop("block_degraded_unverified_merge", None)
+    project.build_config = build_config
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "block_degraded_unverified_merge": _block_degraded_unverified_merge_value(
+            project
+        ),
+        "is_default": not _build_config_has_key(
+            project, "block_degraded_unverified_merge"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Staging-branch-prefixes config endpoints
 # ---------------------------------------------------------------------------
 

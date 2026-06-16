@@ -844,6 +844,16 @@ class BuildConfig(BaseModel):
     # round-trip unchanged. This is detection/guidance only — it never auto-flips
     # ``requires_ci_checks``.
     has_ci: bool | None = None
+    # Per-project, DEFAULT-OFF opt-in policy for external no-CI repos. When ON,
+    # the no-CI merge gate BLOCKS a PR (holds it open) instead of merging it
+    # UNVERIFIED whenever the gate EXPECTED to verify the code but could NOT run
+    # the repo's suite — i.e. a DEGRADED fall-open reason (see
+    # ``ci_resolution.DEGRADED_UNVERIFIED_REASONS``). Benign fall-opens (there
+    # was honestly nothing to verify) still merge UNVERIFIED exactly as today.
+    # Absent/False == today's behavior for every existing project, so this is
+    # fully additive and backward-compatible; onboarding never turns it on.
+    # Read by ``ci_resolution.should_block_degraded_unverified_merge``.
+    block_degraded_unverified_merge: bool = False
     # Per-project alembic versions directory path. None means "use the project default".
     # NOTE: this single string feeds only the backend-side migration-file guard;
     # it is NOT the agent's full layout resolver — see ``migration`` below.

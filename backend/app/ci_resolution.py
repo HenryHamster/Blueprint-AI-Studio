@@ -314,6 +314,72 @@ def record_no_ci_gate_runtime(
         )
 
 
+def record_no_ci_gate_degraded_block(
+    db_session,
+    project,
+    *,
+    unverified_reason: str | None,
+    when,
+) -> None:
+    """Best-effort persist that the no-CI gate HONESTLY BLOCKED a degraded
+    unverified merge — the opt-in ``block_degraded_unverified_merge`` policy is
+    ON and the gate fell open with a DEGRADED reason (the suite could not run).
+
+    Records the same terminal-outcome trend as any other fall-open via
+    :func:`record_no_ci_gate_runtime` (the suite did NOT run, so
+    ``executed_real_tests`` is False and the reason is tallied) AND additionally
+    stamps block-specific fields so an operator can distinguish a PR that was
+    deliberately HELD from one that merged UNVERIFIED:
+      - ``last_degraded_block_at`` / ``last_degraded_block_reason``;
+      - ``degraded_block_counts``: ``{reason_key: count}`` tally.
+
+    Best-effort by contract: mutates the in-memory ``project`` and stages it on
+    ``db_session`` (the caller's commit persists it) but NEVER raises — a
+    failure here must not block or break the gate hot path.
+    """
+    try:
+        if project is None:
+            return
+        # Reuse the canonical recorder so the rolling history / per-reason tally
+        # stay consistent with every other terminal outcome. The suite could NOT
+        # run, so this is an unverified fall-open with executed_real_tests=False.
+        record_no_ci_gate_runtime(
+            db_session,
+            project,
+            executed_real_tests=False,
+            unverified_reason=unverified_reason,
+            when=when,
+        )
+        when_iso = when.isoformat() if hasattr(when, "isoformat") else str(when)
+        runtime: dict[str, Any] = dict(
+            getattr(project, "merge_gate_runtime", None) or {}
+        )
+        runtime["last_degraded_block_at"] = when_iso
+        if unverified_reason:
+            runtime["last_degraded_block_reason"] = str(unverified_reason)
+            prior_counts = runtime.get("degraded_block_counts")
+            counts: dict[str, int] = (
+                dict(prior_counts) if isinstance(prior_counts, dict) else {}
+            )
+            key = str(unverified_reason)
+            counts[key] = int(counts.get(key, 0) or 0) + 1
+            runtime["degraded_block_counts"] = counts
+        project.merge_gate_runtime = runtime
+        # flag_modified is a no-op safety net for the JSONB nested-dict write; a
+        # detached/plain object (e.g. a unit-test stub) makes it raise, which the
+        # outer guard below catches — never let it break the gate path.
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(project, "merge_gate_runtime")
+        if db_session is not None:
+            db_session.add(project)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[CI_RESOLUTION] failed to record no-CI gate degraded block",
+            exc_info=True,
+        )
+
+
 def merge_gate_runtime_block(project) -> dict[str, Any] | None:
     """Normalize ``project.merge_gate_runtime`` into the stable API block, or
     ``None`` when the gate has never run for this project.
@@ -347,6 +413,26 @@ def merge_gate_runtime_block(project) -> dict[str, Any] | None:
         block["last_unverified_at"] = raw.get("last_unverified_at")
     if raw.get("last_unverified_reason") is not None:
         block["last_unverified_reason"] = raw.get("last_unverified_reason")
+
+    # Additive honest-block fields — present only when the opt-in
+    # ``block_degraded_unverified_merge`` policy actually HELD a PR. A project
+    # that never blocked (or never opted in) omits all three, so the shape stays
+    # backward-compatible.
+    if raw.get("last_degraded_block_at") is not None:
+        block["last_degraded_block_at"] = raw.get("last_degraded_block_at")
+    if raw.get("last_degraded_block_reason") is not None:
+        block["last_degraded_block_reason"] = raw.get("last_degraded_block_reason")
+    raw_block_counts = raw.get("degraded_block_counts")
+    block_counts: dict[str, int] = {}
+    if isinstance(raw_block_counts, dict):
+        for reason_key, count in raw_block_counts.items():
+            # The recorder only ever writes int counts; skip any malformed
+            # (str/None/bool) value defensively without a per-iteration guard.
+            if isinstance(count, bool) or not isinstance(count, (int, float)):
+                continue
+            block_counts[str(reason_key)] = int(count)
+    if block_counts:
+        block["degraded_block_counts"] = block_counts
 
     # Additive history fields. A legacy four-key-only record (no list, no tally)
     # simply omits these — older consumers keep working unchanged.
@@ -1036,6 +1122,40 @@ def is_degraded_unverified_reason(reason: str | None) -> bool:
     default — a key with no explicit classification never silently escalates.
     """
     return reason in DEGRADED_UNVERIFIED_REASONS
+
+
+def block_degraded_unverified_merge_enabled(project) -> bool:
+    """Whether the project opted into the honest-block policy (default OFF).
+
+    Reads ``build_config.block_degraded_unverified_merge``. Absent / falsy ==
+    OFF == today's behavior for every existing project. Defensive about a
+    missing / malformed ``build_config`` so it can be called on any project.
+    """
+    return bool(
+        (getattr(project, "build_config", None) or {}).get(
+            "block_degraded_unverified_merge", False
+        )
+    )
+
+
+def should_block_degraded_unverified_merge(project, unverified_reason) -> bool:
+    """Whether the no-CI merge gate should HONESTLY BLOCK (hold the PR open)
+    instead of merging it UNVERIFIED.
+
+    Returns True ONLY when BOTH hold:
+      - the project's opt-in policy flag is ON
+        (``build_config.block_degraded_unverified_merge``); AND
+      - the fall-open reason is DEGRADED — the gate EXPECTED to verify but could
+        NOT run the suite (:func:`is_degraded_unverified_reason`).
+
+    NEVER True for a benign reason (there was honestly nothing to verify — those
+    always merge UNVERIFIED as today) and NEVER True when the policy is off (the
+    default), so today's behavior is byte-for-byte unchanged for every existing
+    project. Defensive about ``project is None`` / missing build_config.
+    """
+    if not block_degraded_unverified_merge_enabled(project):
+        return False
+    return is_degraded_unverified_reason(unverified_reason)
 
 
 def classify_unverified_fall_open_reason(
