@@ -43,6 +43,13 @@ Public API:
   to_phase_block(version)
       Return a compact dict for embedding the version's phase state in the
       strategic agent's payload.
+
+  build_version_highlights(version, *, merged_count, aggregate_serving_status, acceptance_aggregate)
+      Build the shared human-readable ``highlights`` block (headline plus
+      at-a-glance metrics) for a version.  The 'serving' word in the headline is
+      driven off the aggregate required-artifact serving status, not the scalar
+      column.  Used by both the per-version summary endpoint and the
+      version-lifecycle current-version block so they render identical text.
 """
 
 from __future__ import annotations
@@ -1037,6 +1044,62 @@ def to_phase_block(
     if artifact_evidence is not None:
         block["artifacts"] = artifact_evidence
     return block
+
+
+def build_version_highlights(
+    version: ReleaseVersion,
+    *,
+    merged_count: int,
+    aggregate_serving_status: str | None,
+    acceptance_aggregate: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the human-readable ``highlights`` block for a release version.
+
+    Single source of truth for the version ``headline`` string and its
+    at-a-glance metrics, shared by the per-version summary endpoint
+    (``get_release_version_summary``) and the version-lifecycle endpoint's
+    ``current_version`` block so both surfaces render byte-identical text.
+
+    The 'serving' determination drives off ``aggregate_serving_status`` — the
+    truthful required-artifact aggregate read — NOT the scalar
+    ``version.serving_status`` column: a promoted version reads
+    ``"promoted & serving"`` only when every required artifact confirms,
+    otherwise ``"promoted"``.
+
+    ``acceptance_aggregate`` is the proven-vs-merged bucket mapping (keys
+    ``"proven"`` / ``"total"``); ``None`` on legacy versions that predate the
+    aggregate, in which case both counts default to 0.
+
+    Returns a dict with keys ``merged_count``, ``proven``,
+    ``total_merged_for_acceptance``, ``qualification_confidence``,
+    ``qualification_threshold`` and ``headline``.
+    """
+    acceptance = acceptance_aggregate or {}
+    proven = acceptance.get("proven", 0)
+    total_merged = acceptance.get("total", 0)
+    qual = version.last_qualification or {}
+    confidence = qual.get("confidence")
+    threshold = qual.get("threshold")
+
+    if version.status == "promoted" and aggregate_serving_status == "serving_confirmed":
+        headline = "promoted & serving"
+    elif version.status == "promoted":
+        headline = "promoted"
+    elif version.status == "abandoned":
+        headline = "abandoned"
+    elif merged_count == 0:
+        headline = f"open in {version.phase} with no merged work yet"
+    else:
+        headline = f"open in {version.phase} with {merged_count} merged"
+
+    return {
+        "merged_count": merged_count,
+        "proven": proven,
+        "total_merged_for_acceptance": total_merged,
+        "qualification_confidence": confidence,
+        "qualification_threshold": threshold,
+        "headline": headline,
+    }
 
 
 def set_version_phase(

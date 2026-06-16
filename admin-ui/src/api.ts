@@ -1654,6 +1654,12 @@ export interface CurrentVersion {
   opened_at: string;
   qualification_attempts: number;
   merged_task_count: number;
+  /** Human-readable what's-new headline + at-a-glance metrics (merged / proven /
+   *  conf-thr) for the current version, mirroring the per-version summary
+   *  endpoint's highlights. The 'serving' word in the headline derives from the
+   *  aggregate required-artifact serving truth, not the scalar serving_status.
+   *  Optional/additive — absent on older backends. */
+  highlights?: VersionSummaryHighlights | null;
   /** Tasks merged at/after the last qualification verdict's finalized_at — a
    *  verdict-staleness signal. >0 means work landed since the verdict was
    *  computed, so the displayed confidence no longer reflects the current tree.

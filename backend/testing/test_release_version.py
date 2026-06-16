@@ -1317,6 +1317,156 @@ def test_to_phase_block_acceptance_aggregate_none_on_legacy():
 
 
 # ===========================================================================
+# build_version_highlights — shared what's-new headline + at-a-glance metrics
+# ===========================================================================
+
+
+def test_build_version_highlights_open_no_merged_work():
+    """An open version with zero merged work yields the phase-context
+    'no merged work yet' headline and zeroed metrics."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=0,
+        aggregate_serving_status=None,
+        acceptance_aggregate=None,
+    )
+    assert h["headline"] == "open in build with no merged work yet"
+    assert h["merged_count"] == 0
+    assert h["proven"] == 0
+    assert h["total_merged_for_acceptance"] == 0
+    assert h["qualification_confidence"] is None
+    assert h["qualification_threshold"] is None
+
+
+def test_build_version_highlights_open_with_merged():
+    """An open version with merged work names the count in its phase context and
+    surfaces the proven/total acceptance metrics plus qualification conf/threshold."""
+    version = ReleaseVersion(
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"confidence": 0.82, "threshold": 0.9},
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=3,
+        aggregate_serving_status=None,
+        acceptance_aggregate={"proven": 2, "total": 3},
+    )
+    assert h["headline"] == "open in stabilize with 3 merged"
+    assert h["merged_count"] == 3
+    assert h["proven"] == 2
+    assert h["total_merged_for_acceptance"] == 3
+    assert h["qualification_confidence"] == 0.82
+    assert h["qualification_threshold"] == 0.9
+
+
+def test_build_version_highlights_promoted_and_serving_when_aggregate_confirmed():
+    """A promoted version reads 'promoted & serving' only when the AGGREGATE
+    serving status is serving_confirmed."""
+    version = ReleaseVersion(
+        version_number=4,
+        phase="stabilize",
+        status="promoted",
+        opened_at=_utcnow(),
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=12,
+        aggregate_serving_status="serving_confirmed",
+        acceptance_aggregate={"proven": 10, "total": 12},
+    )
+    assert h["headline"] == "promoted & serving"
+
+
+def test_build_version_highlights_promoted_uses_aggregate_not_scalar():
+    """A promoted version whose scalar serving_status would say 'serving_confirmed'
+    but whose AGGREGATE serving status is deploy_failed reads 'promoted' — the
+    helper drives the 'serving' word off the aggregate argument, never the scalar
+    column. This is the truthful-state guarantee the shared helper exists to keep."""
+    version = ReleaseVersion(
+        version_number=5,
+        phase="stabilize",
+        status="promoted",
+        opened_at=_utcnow(),
+        # Scalar column lies — a naive read would claim serving.
+        serving_status="serving_confirmed",
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=8,
+        aggregate_serving_status="deploy_failed",
+        acceptance_aggregate=None,
+    )
+    assert h["headline"] == "promoted"
+
+
+def test_build_version_highlights_promoted_unconfirmed_aggregate_is_just_promoted():
+    """A promoted version with an unconfirmed/absent aggregate reads 'promoted',
+    not 'promoted & serving'."""
+    version = ReleaseVersion(
+        version_number=6,
+        phase="stabilize",
+        status="promoted",
+        opened_at=_utcnow(),
+    )
+    for agg in ("unconfirmed", None):
+        h = rv.build_version_highlights(
+            version,
+            merged_count=1,
+            aggregate_serving_status=agg,
+            acceptance_aggregate=None,
+        )
+        assert h["headline"] == "promoted", f"aggregate={agg!r}"
+
+
+def test_build_version_highlights_abandoned():
+    """An abandoned version reads 'abandoned' regardless of merged count or serving."""
+    version = ReleaseVersion(
+        version_number=7,
+        phase="build",
+        status="abandoned",
+        opened_at=_utcnow(),
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=5,
+        aggregate_serving_status="serving_confirmed",
+        acceptance_aggregate={"proven": 1, "total": 5},
+    )
+    assert h["headline"] == "abandoned"
+
+
+def test_build_version_highlights_legacy_none_acceptance_defaults_zero():
+    """A legacy version with no acceptance aggregate and no verdict yields proven/
+    total 0 and null conf/threshold without crashing."""
+    version = ReleaseVersion(
+        version_number=8,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification=None,
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=2,
+        aggregate_serving_status=None,
+        acceptance_aggregate=None,
+    )
+    assert h["proven"] == 0
+    assert h["total_merged_for_acceptance"] == 0
+    assert h["qualification_confidence"] is None
+    assert h["qualification_threshold"] is None
+
+
+# ===========================================================================
 # summarize_qualification_state — disambiguates the overloaded status="pending"
 # ===========================================================================
 

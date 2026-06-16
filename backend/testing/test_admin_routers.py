@@ -10717,6 +10717,123 @@ class TestVersionLifecycleTasksMerged:
         assert current["tasks_merged"] == []
 
 
+class TestVersionLifecycleCurrentVersionHighlights:
+    """GET /version-lifecycle exposes a what's-new ``highlights`` block (headline +
+    at-a-glance metrics) on current_version, built by the SAME shared helper the
+    per-version summary endpoint uses so the open version renders an identical
+    headline. The headline's 'serving' determination is aggregate-driven; the
+    current/open version is never 'promoted', so the promoted/serving headline cases
+    are covered by TestGetReleaseVersionSummary and the release_version unit tests."""
+
+    @pytest.mark.asyncio
+    async def test_current_version_exposes_highlights_headline(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version.highlights carries all six keys and an 'open in <phase>
+        with <N> merged' headline reflecting the merged-work count."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=3),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert "highlights" in current, "current_version must expose highlights"
+        h = current["highlights"]
+        for key in (
+            "merged_count",
+            "proven",
+            "total_merged_for_acceptance",
+            "qualification_confidence",
+            "qualification_threshold",
+            "headline",
+        ):
+            assert key in h, f"highlights missing key: {key}"
+        # Open version with merged work -> phase-context headline reflecting the count.
+        assert h["headline"] == "open in build with 3 merged"
+        assert h["merged_count"] == 3
+        # No qualification verdict yet -> confidence/threshold are null, not fabricated.
+        assert h["qualification_confidence"] is None
+        assert h["qualification_threshold"] is None
+
+    @pytest.mark.asyncio
+    async def test_current_version_highlights_no_merged_work(
+        self, client: AsyncClient, db_session
+    ):
+        """An open version with zero merged work yields the 'no merged work yet'
+        headline for its phase."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert (
+            current["highlights"]["headline"]
+            == "open in stabilize with no merged work yet"
+        )
+        assert current["highlights"]["merged_count"] == 0
+
+
 class TestVersionLifecycleAcceptanceAggregate:
     """The version-lifecycle current_version and qualification-verdicts rows
     expose the additive ``acceptance_aggregate`` key (proven-vs-merged) ALONGSIDE

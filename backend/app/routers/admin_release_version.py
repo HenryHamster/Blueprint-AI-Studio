@@ -569,6 +569,18 @@ async def get_version_lifecycle(
                 # replacing it). Computed/stored by the acceptance layer; ``None`` on
                 # legacy open versions that predate the aggregate.
                 "acceptance_aggregate": acceptance_aggregate,
+                # Human-readable what's-new headline + at-a-glance metrics, built by
+                # the SAME shared helper the per-version summary endpoint uses so the
+                # current (open) version renders an identical headline. Additive and
+                # derived from data already loaded above — no extra I/O. The 'serving'
+                # word in the headline derives from the aggregate serving status, not
+                # the scalar serving_status column.
+                "highlights": _release_version.build_version_highlights(
+                    open_row,
+                    merged_count=merged_count,
+                    aggregate_serving_status=aggregate_serving["serving_status"],
+                    acceptance_aggregate=acceptance_aggregate,
+                ),
                 # Tasks merged AT/AFTER the last qualification verdict's finalized_at
                 # (verdict-staleness signal). None when no verdict/finalized_at.
                 "merged_since_verdict": merged_since_verdict,
@@ -1556,32 +1568,16 @@ async def get_release_version_summary(
         artifact_evidence=artifacts,
     )
 
-    # Derive highlights from the data above — no extra I/O.
-    proven = acceptance_aggregate.get("proven", 0)
-    total_merged = acceptance_aggregate.get("total", 0)
-    qual = version.last_qualification or {}
-    confidence = qual.get("confidence")
-    threshold = qual.get("threshold")
-
-    if version.status == "promoted" and aggregate_serving["serving_status"] == "serving_confirmed":
-        headline = "promoted & serving"
-    elif version.status == "promoted":
-        headline = "promoted"
-    elif version.status == "abandoned":
-        headline = "abandoned"
-    elif merged_count == 0:
-        headline = f"open in {version.phase} with no merged work yet"
-    else:
-        headline = f"open in {version.phase} with {merged_count} merged"
-
-    highlights: Dict[str, Any] = {
-        "merged_count": merged_count,
-        "proven": proven,
-        "total_merged_for_acceptance": total_merged,
-        "qualification_confidence": confidence,
-        "qualification_threshold": threshold,
-        "headline": headline,
-    }
+    # Derive highlights from the data above — no extra I/O. Shared helper so the
+    # version-lifecycle current_version block renders an identical headline; the
+    # 'serving' determination is driven off the aggregate serving status, not the
+    # scalar serving_status column.
+    highlights = _release_version.build_version_highlights(
+        version,
+        merged_count=merged_count,
+        aggregate_serving_status=aggregate_serving["serving_status"],
+        acceptance_aggregate=acceptance_aggregate,
+    )
 
     return {
         # Version identity

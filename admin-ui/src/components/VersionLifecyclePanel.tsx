@@ -24,6 +24,7 @@ import {
   type StagedDirection,
   type VersionLifecycleResponse,
   type VersionQualification,
+  type VersionSummaryHighlights,
   type VersionSummaryResponse,
   type PromotionPolicySource,
   type PromotionReadiness,
@@ -1016,6 +1017,41 @@ interface VersionLifecyclePanelProps {
   refreshing?: boolean;
 }
 
+/** Shared italic what's-new headline + at-a-glance metric line (merged / proven /
+ *  conf-thr / phase·status). Rendered for both the current (open) version and the
+ *  expanded past versions so they present an identical summary. The headline string
+ *  itself is computed server-side (release_version.build_version_highlights) and its
+ *  'serving' word reflects the aggregate required-artifact serving truth. */
+function VersionHighlightsLine({
+  highlights,
+  phase,
+  status,
+}: {
+  highlights: VersionSummaryHighlights;
+  phase: string;
+  status: string;
+}) {
+  const conf =
+    highlights.qualification_confidence != null
+      ? `${Math.round(highlights.qualification_confidence * 100)}%`
+      : null;
+  const thresh =
+    highlights.qualification_threshold != null
+      ? `${Math.round(highlights.qualification_threshold * 100)}%`
+      : null;
+  return (
+    <div className="space-y-0.5 text-[10px]" data-testid="version-headline">
+      <p className="text-neutral-300 italic">{highlights.headline}</p>
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-neutral-400">
+        <span>{highlights.merged_count} merged</span>
+        <span>{highlights.proven}/{highlights.total_merged_for_acceptance} proven</span>
+        {conf && thresh && <span>conf {conf} / thr {thresh}</span>}
+        <span className="text-neutral-500">{phase} · {status}</span>
+      </div>
+    </div>
+  );
+}
+
 function VersionHistorySummary({ versionId }: { versionId: string }) {
   const [summary, setSummary] = useState<VersionSummaryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1033,19 +1069,9 @@ function VersionHistorySummary({ versionId }: { versionId: string }) {
   if (loading) return <p className="text-[10px] text-neutral-500 pl-2">Loading…</p>;
   if (error || !summary) return <p className="text-[10px] text-red-400 pl-2">Failed to load summary</p>;
 
-  const h = summary.highlights;
-  const conf = h.qualification_confidence != null ? `${Math.round(h.qualification_confidence * 100)}%` : null;
-  const thresh = h.qualification_threshold != null ? `${Math.round(h.qualification_threshold * 100)}%` : null;
-
   return (
     <div className="mt-1 pl-2 border-l-2 border-neutral-700/40 space-y-0.5 text-[10px]">
-      <p className="text-neutral-300 italic">{h.headline}</p>
-      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-neutral-400">
-        <span>{h.merged_count} merged</span>
-        <span>{h.proven}/{h.total_merged_for_acceptance} proven</span>
-        {conf && thresh && <span>conf {conf} / thr {thresh}</span>}
-        <span className="text-neutral-500">{summary.phase} · {summary.status}</span>
-      </div>
+      <VersionHighlightsLine highlights={summary.highlights} phase={summary.phase} status={summary.status} />
       <VersionSummaryPanel tasksMerged={summary.tasks_merged} />
     </div>
   );
@@ -1460,6 +1486,13 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 </span>
               )}
             </div>
+            {/* What's-new headline for the CURRENT (open) version, matching the
+                summary line past versions get when expanded. Gated on highlights so
+                older backends that don't emit it degrade gracefully. Status is
+                always 'open' here — the lifecycle query only returns the open row. */}
+            {cv.highlights && (
+              <VersionHighlightsLine highlights={cv.highlights} phase={cv.phase} status="open" />
+            )}
             {editingGoal && projectId ? (
               <div className="flex flex-col gap-1.5">
                 <textarea

@@ -679,6 +679,56 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
+  describe("current version what's-new headline", () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    const HIGHLIGHTS: api.VersionSummaryHighlights = {
+      headline: 'open in stabilize with 7 merged',
+      merged_count: 7,
+      proven: 4,
+      total_merged_for_acceptance: 7,
+      qualification_confidence: 0.84,
+      qualification_threshold: 0.9,
+    };
+
+    it('renders the headline + at-a-glance metrics for the current version when highlights are present', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ phase: 'stabilize', highlights: HIGHLIGHTS }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const headline = screen.getByTestId('version-headline');
+      expect(headline).toHaveTextContent('open in stabilize with 7 merged');
+      expect(headline).toHaveTextContent('4/7 proven');
+      expect(headline).toHaveTextContent('conf 84% / thr 90%');
+      // Status for the current (open) version is always 'open'.
+      expect(headline).toHaveTextContent('stabilize · open');
+    });
+
+    it('omits the headline when the current version has no highlights (older backend)', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ phase: 'build' }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.queryByTestId('version-headline')).not.toBeInTheDocument();
+    });
+  });
+
   describe('staged directions summary', () => {
     beforeEach(() => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
