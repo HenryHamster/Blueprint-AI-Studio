@@ -2691,7 +2691,9 @@ async def test_recovery_rebind_releases_reserved_vm(db: AsyncSession):
     from app.time_utils import _utcnow
 
     project_id = await _make_project(db)
-    lane = await _make_active_lane(db, project_id, current_task_id=None, phase_requeues=1)
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=None, phase_requeues=1
+    )
 
     now = _utcnow()
     member = PoolVm(
@@ -2722,3 +2724,138 @@ async def test_recovery_rebind_releases_reserved_vm(db: AsyncSession):
     assert member.reserved_lane_id is None
     assert member.reservation_expires_at is None
     assert member.reservation_hard_expires_at is None
+
+
+# ---------------------------------------------------------------------------
+# checkpoint_or_recover_phase — operator board emit on RECOVER path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_or_recover_phase_emits_pre_exhaustion_operator_message(
+    db: AsyncSession,
+):
+    """RECOVER path must post a ProjectMessage so the operator board shows the miss.
+
+    Previously only logger.warning was emitted; this verifies that
+    emit_lane_event_message now writes a deduplicated ProjectMessage with
+    event_type='lane_checkpoint_recover' when the checkpoint budget is not yet
+    exhausted.
+    """
+    from app.models import ProjectMessage, TaskStatus
+    from app.review_fix_lane_pilot import (
+        CHECKPOINT_PHASE_RECOVER,
+        checkpoint_or_recover_phase,
+    )
+
+    project_id = await _make_project(db)
+    task = await _make_task(db, project_id, TaskStatus.EVALUATING)
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=task.id, phase_requeues=0
+    )
+
+    # sha=None triggers mark_checkpoint_missing (miss recorded, budget intact → RECOVER)
+    result = await checkpoint_or_recover_phase(
+        db,
+        task,
+        lane,
+        sha=None,
+        summary="test summary",
+        reserve_workspace=False,
+        enable_recovery=True,
+    )
+    await db.flush()
+
+    assert result == CHECKPOINT_PHASE_RECOVER
+
+    msgs = (
+        (
+            await db.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    recover_msgs = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "lane_checkpoint_recover"
+    ]
+    assert len(recover_msgs) == 1, (
+        f"expected 1 lane_checkpoint_recover message, got {len(recover_msgs)}: "
+        f"{[m.content for m in msgs]}"
+    )
+    assert (
+        str(lane.id) in recover_msgs[0].content or lane.title in recover_msgs[0].content
+    )
+
+
+# ---------------------------------------------------------------------------
+# sweep_stranded_lanes — operator board emit on recovery dispatch path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class1_recovery_dispatch_emits_operator_message(
+    db: AsyncSession,
+):
+    """Stranded ACTIVE lane with dispatch context spawns a recovery task AND emits
+    a ProjectMessage on the operator board."""
+    from app.models import ProjectMessage, Task, TaskStatus
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+
+    # Task with pr_number in payload so the recovery-dispatch branch is taken
+    task = Task(
+        project_id=project_id,
+        title="fix PR 42",
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix the issue",
+                "pr_number": 42,
+                "branch": "feat/test-branch",
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.FAILED,
+    )
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=task.id, phase_requeues=0
+    )
+    lane_id = lane.id
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(db, datetime.utcnow(), runtime_config={})
+    await db.commit()
+
+    assert count == 1
+
+    msgs = (
+        (
+            await db.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    recover_msgs = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "lane_checkpoint_recover"
+    ]
+    assert len(recover_msgs) == 1, (
+        f"expected 1 lane_checkpoint_recover message, got {len(recover_msgs)}: "
+        f"{[m.content for m in msgs]}"
+    )
+    assert str(lane_id) in (recover_msgs[0].context or {}).get("dedupe_key", "")

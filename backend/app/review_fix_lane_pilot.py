@@ -871,6 +871,15 @@ async def checkpoint_or_recover_phase(
             session, lane, reason="checkpoint_recovery_exhausted"
         )
         return CHECKPOINT_PHASE_EXHAUSTED
+    lane_title = getattr(lane, "title", None) or str(lane.id)
+    await emit_lane_event_message(
+        session,
+        lane.project_id,
+        lane.id,
+        "lane_checkpoint_recover",
+        f"lane '{lane_title}' checkpoint miss — recovery queued "
+        f"(phase_requeues={lane.phase_requeues or 0})",
+    )
     return CHECKPOINT_PHASE_RECOVER
 
 

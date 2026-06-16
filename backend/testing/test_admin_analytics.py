@@ -2376,6 +2376,69 @@ class TestImprovementLanes:
         assert abs(row["vm_cost_usd_total"] - 0.12) < 1e-5
         assert abs(row["reserved_idle_cost_usd_total"] - 0.03) < 1e-5
         assert row["shadow"] is False
+        assert row["title"] == "Test lane"
+        assert row["recovery"] is None
+
+    @pytest.mark.asyncio
+    async def test_title_included_in_lane_row(self, client: AsyncClient, db_session):
+        """Lane title is returned as a top-level field in the row."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane = _make_lane(project.id, title="My custom lane title")
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        row = resp.json()["lanes"][0]
+        assert row["title"] == "My custom lane title"
+
+    @pytest.mark.asyncio
+    async def test_recovery_field_included_when_manifest_has_recovery(
+        self, client: AsyncClient, db_session
+    ):
+        """Recovery state from lane manifest is surfaced in the row."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        recovery_payload = {
+            "reason": "checkpoint_miss",
+            "attempt": 2,
+            "exhausted": False,
+            "at": "2026-06-01T12:00:00",
+        }
+        lane = _make_lane(project.id, manifest={"recovery": recovery_payload})
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        row = resp.json()["lanes"][0]
+        assert row["recovery"] == recovery_payload
+        assert row["recovery"]["reason"] == "checkpoint_miss"
+        assert row["recovery"]["attempt"] == 2
+        assert row["recovery"]["exhausted"] is False
+
+    @pytest.mark.asyncio
+    async def test_recovery_field_null_when_manifest_empty(
+        self, client: AsyncClient, db_session
+    ):
+        """Recovery is None when lane manifest has no recovery key."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane = _make_lane(project.id, manifest={"other_key": "value"})
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        row = resp.json()["lanes"][0]
+        assert row["recovery"] is None
 
     @pytest.mark.asyncio
     async def test_pagination_limit_offset(self, client: AsyncClient, db_session):

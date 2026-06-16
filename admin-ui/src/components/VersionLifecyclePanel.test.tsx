@@ -90,6 +90,7 @@ describe('VersionLifecyclePanel', () => {
     vi.clearAllMocks();
     mockRefresh.mockClear();
     vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
   });
 
   it('renders the promotion policy source and fallback reason', () => {

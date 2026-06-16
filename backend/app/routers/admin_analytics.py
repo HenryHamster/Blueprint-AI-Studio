@@ -1479,6 +1479,7 @@ async def get_improvement_lanes(
         rows.append(
             {
                 "id": str(lane.id),
+                "title": lane.title,
                 "status": lane.status,
                 "direction_id": lane.direction_id,
                 "branch": lane.branch_name,

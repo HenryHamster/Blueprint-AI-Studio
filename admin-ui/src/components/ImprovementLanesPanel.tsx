@@ -445,7 +445,12 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                         </span>
                       )}
                       <span className="min-w-0 flex-1">
-                        <span className="block truncate font-medium text-neutral-200">
+                        {lane.title && (
+                          <span className="block truncate font-medium text-neutral-200">
+                            {lane.title}
+                          </span>
+                        )}
+                        <span className={`block truncate ${lane.title ? 'font-mono text-[10px] text-neutral-500' : 'font-medium text-neutral-200'}`}>
                           {lane.branch ?? '—'}
                         </span>
                         <span className="block truncate font-mono text-[10px] text-neutral-500">
@@ -526,6 +531,14 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                         <div className="mt-0.5 text-neutral-500">
                           Phase requeues {lane.phase_requeues}
                         </div>
+                        {lane.recovery && (
+                          <div className="mt-1 space-y-0.5 text-[10px]" data-testid="lane-recovery">
+                            <div className={lane.recovery.exhausted ? 'font-medium text-red-400' : 'text-amber-400'}>
+                              Recovery #{lane.recovery.attempt}{lane.recovery.exhausted ? ' (exhausted)' : ''}
+                            </div>
+                            <div className="text-neutral-500">{lane.recovery.reason}</div>
+                          </div>
+                        )}
                       </div>
                     </div>
 

@@ -665,6 +665,7 @@ export async function fetchPipelineRegressions(
 
 export interface ImprovementLaneRow {
   id: string;
+  title: string | null;
   status: string;
   direction_id: string | null;
   branch: string | null;
@@ -682,6 +683,7 @@ export interface ImprovementLaneRow {
   reservation_force_expired_count: number | null;
   pilot_arm: string | null;
   phase_requeues: number;
+  recovery: { reason: string; attempt: number; exhausted: boolean; at: string } | null;
   llm_input_tokens_total: number | null;
   llm_output_tokens_total: number | null;
   vm_cost_usd_total: number;
