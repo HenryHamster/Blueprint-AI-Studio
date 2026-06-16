@@ -6,6 +6,7 @@ task_completion, task_completion_self_audit, research_completion, and
 task_evaluators can all share the same implementations without circular imports.
 """
 
+import json
 from typing import Optional
 
 
@@ -132,3 +133,37 @@ def _extract_json_object(text: str, *required_keys: str) -> Optional[str]:
                     break
         start = text.find("{", start + 1)
     return None
+
+
+def scan_balanced_json_objects(
+    text: str, *, required_key: str | None = None, last: bool = False
+) -> dict | None:
+    """Find the first (or last when ``last=True``) balanced JSON object in
+    ``text`` that parses to a dict and, when ``required_key`` is given,
+    contains that key.  Returns ``None`` when no matching object is found.
+    """
+    result: dict | None = None
+    idx = text.find("{")
+    while idx != -1:
+        depth = 0
+        for j in range(idx, len(text)):
+            c = text[j]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[idx : j + 1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict) and (
+                            required_key is None or required_key in obj
+                        ):
+                            if not last:
+                                return obj
+                            result = obj
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    break
+        idx = text.find("{", idx + 1)
+    return result

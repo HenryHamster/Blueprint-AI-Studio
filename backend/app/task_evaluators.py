@@ -40,7 +40,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.acceptance_gate import CRITERION_OPS, coerce_number, criterion_met
-from app.json_extract import _extract_json_array, _extract_last_json_array
+from app.json_extract import (
+    _extract_json_array,
+    _extract_last_json_array,
+    scan_balanced_json_objects,
+)
 from app.models import Task, TaskStatus
 from app.task_capabilities import get_task_capability
 
@@ -765,7 +769,7 @@ def _extract_compute_measurement(
     unparseable, outcome-less, or cost-less artifact. ``final_cost_usd`` is
     preferred; ``accrued_cost_usd`` is the fallback the agent itself uses.
     """
-    obj = _extract_json_object(artifact_text)
+    obj = _parse_artifact_json(artifact_text)
     if obj is None:
         return None
     outcome = obj.get("outcome")
@@ -911,7 +915,7 @@ def evaluate_compute_success_criterion(
         value: float | None = _release_echo_numeric(binding_status, metric)
         raw_value: object = value
     else:
-        obj = _extract_json_object(artifact_text) or {}
+        obj = _parse_artifact_json(artifact_text) or {}
         raw_value = obj.get(metric)
         value = _coerce_number(raw_value)
     # Shared fail-closed core: a metric absent/non-numeric in the result is never
@@ -955,41 +959,7 @@ def _format_unmet_criterion(criterion: dict) -> str:
 _PERF_SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
-def _scan_balanced_json_objects(
-    text: str, *, required_key: str | None = None, last: bool = False
-) -> dict | None:
-    """Find the first (or last when ``last=True``) balanced JSON object in
-    ``text`` that parses to a dict and, when ``required_key`` is given,
-    contains that key.  Returns ``None`` when no matching object is found.
-    """
-    result: dict | None = None
-    idx = text.find("{")
-    while idx != -1:
-        depth = 0
-        for j in range(idx, len(text)):
-            c = text[j]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[idx : j + 1]
-                    try:
-                        obj = json.loads(candidate)
-                        if isinstance(obj, dict) and (
-                            required_key is None or required_key in obj
-                        ):
-                            if not last:
-                                return obj
-                            result = obj
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                    break
-        idx = text.find("{", idx + 1)
-    return result
-
-
-def _extract_json_object(artifact_text: str | None) -> dict | None:
+def _parse_artifact_json(artifact_text: str | None) -> dict | None:
     """Parse the first balanced JSON object from ``artifact_text``, or ``None``.
 
     Tries a direct parse first (the agent emits a bare ``JSON.stringify``
@@ -1005,7 +975,7 @@ def _extract_json_object(artifact_text: str | None) -> dict | None:
             return parsed
     except (json.JSONDecodeError, ValueError):
         pass
-    return _scan_balanced_json_objects(text)
+    return scan_balanced_json_objects(text)
 
 
 # ---------------------------------------------------------------------------
@@ -1562,7 +1532,7 @@ def parse_grader_verdict(logs: str | None, completed: bool = True) -> Evaluation
     if not text:
         return EvaluationVerdict(False, "grader produced no output", "forward-quality")
 
-    obj = _scan_balanced_json_objects(text, required_key="verdict")
+    obj = scan_balanced_json_objects(text, required_key="verdict")
     if obj is not None:
         v = str(obj.get("verdict", "")).strip().lower()
         reason = str(obj.get("reasoning") or obj.get("reason") or "")[:480]
@@ -1620,7 +1590,7 @@ def parse_safeguard_challenge_outcome(logs: str | None, completed: bool = True) 
     if not text:
         return _fail_closed
 
-    obj = _scan_balanced_json_objects(text, required_key="outcome")
+    obj = scan_balanced_json_objects(text, required_key="outcome")
     if obj is not None:
         outcome = str(obj.get("outcome", "")).strip().lower()
         reasoning = str(obj.get("reasoning") or "")[:480]
@@ -1939,7 +1909,7 @@ def parse_finding_challenge_verdict(
             finding_hash=finding_hash,
         )
 
-    obj = _scan_balanced_json_objects(text, required_key="verdict", last=True)
+    obj = scan_balanced_json_objects(text, required_key="verdict", last=True)
     if obj is None:
         return FindingChallengeRecord(
             challenged_boundary=boundary,
