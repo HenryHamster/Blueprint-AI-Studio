@@ -1234,6 +1234,20 @@ async def lifespan(app):
 
     monitor_task = asyncio.create_task(_monitor_background_tasks())
 
+    # Out-of-loop hard watchdog (leader only): a separate OS thread that hard-
+    # exits the process if the orchestrator progress heartbeat goes stale past a
+    # bound LARGER than ORCHESTRATOR_HANG_SECONDS. The in-loop watchdog above and
+    # /health both run on the event loop, so a FULLY blocked loop (sync CPU stall
+    # or total pool exhaustion — the class _bounded_leader_step documents it
+    # cannot interrupt) starves both, leaving only Cloud Run's slow liveness probe
+    # to recycle the container (~6-min wedge windows, prod 2026-06-15). A thread
+    # still runs while the loop is blocked, so it bounds that window and dumps all
+    # thread stacks on the way out. Gated on live leadership so a follower (which
+    # never pumps the heartbeat) is never killed.
+    from app.orchestrator import start_orchestrator_hard_watchdog
+
+    start_orchestrator_hard_watchdog(is_guarded=lambda: _shared_state.is_leader)
+
     yield
     # Shutdown: graceful cleanup with timeout to let in-flight operations finish
     tasks_to_cancel = [

@@ -10,6 +10,8 @@ detection. ``evaluate_findings`` collapses matches into a high/medium verdict
 content via ``app.github`` and runs the full scan.
 """
 
+import asyncio
+import os
 import re
 import base64
 import logging
@@ -302,6 +304,21 @@ FUZZY_PHRASES = [
     ("system prompt", "medium", "prompt_leak"),
 ]
 
+# Bounds for the fuzzy/evasion scan. ``_fuzzy_scan`` slides a Levenshtein window
+# over its whole input per phrase — O(chars × phrases × phrase_len²) — so on a
+# large PR diff (or a single huge minified / generated / data line) it pegs the
+# CPU for minutes. Run synchronously on the event loop inside post-commit's
+# ``scan_pr_for_injection``, that fully blocked the orchestrator loop → every
+# request hung the 300s Cloud Run ceiling → 504 storm → liveness kill (prod
+# 2026-06-16, pinpointed by the hard-watchdog all-threads stack dump:
+# _levenshtein←_fuzzy_scan←scan_diff_text←_process_post_commit on the loop thread).
+# These cap the fuzzy work two ways — per-line (skip pathologically long single
+# lines) and a cumulative budget across the diff. The cheaper exact-match
+# ``_scan_text`` is NEVER bounded, so evasion coverage degrades gracefully on an
+# oversized diff instead of taking the whole instance down. Env-overridable.
+_FUZZY_MAX_LINE_LEN = int(os.getenv("SECURITY_FUZZY_MAX_LINE_LEN", "1000"))
+_FUZZY_MAX_TOTAL_CHARS = int(os.getenv("SECURITY_FUZZY_MAX_TOTAL_CHARS", "50000"))
+
 # Leet-speak normalization map
 _LEET_MAP = str.maketrans("01345$@!", "oieassal")
 
@@ -441,6 +458,9 @@ def scan_diff_text(diff_text: str) -> List[Dict[str, str]]:
     """
     findings: List[Dict[str, str]] = []
     current_file = ""
+    # Running budget for the O(n²) fuzzy/evasion scan (see _FUZZY_* constants).
+    fuzzy_chars_used = 0
+    fuzzy_bounded = False
 
     for line in diff_text.split("\n"):
         # Track which file we're in
@@ -481,13 +501,25 @@ def scan_diff_text(diff_text: str) -> List[Dict[str, str]]:
                     f["source"] = f"deleted:{f['source']}"
             findings.extend(line_findings)
 
-            # Fuzzy matching for evasion (leet-speak, misspellings, separator tricks)
+            # Fuzzy matching for evasion (leet-speak, misspellings, separator
+            # tricks) — BOUNDED. The sliding-window Levenshtein is O(chars ×
+            # phrases × phrase_len²); unbounded, a large diff or a single huge
+            # minified/generated line pegged the event loop for minutes here and
+            # wedged the orchestrator (prod 2026-06-16). Skip pathologically long
+            # single lines and stop once the cumulative budget is spent; the
+            # exact-match scan above already ran in full on this line.
             if ext not in BINARY_EXTENSIONS:
-                fuzzy_findings = _fuzzy_scan(line_content, current_file)
-                if is_deletion:
-                    for f in fuzzy_findings:
-                        f["source"] = f"deleted:{f['source']}"
-                findings.extend(fuzzy_findings)
+                if len(line_content) > _FUZZY_MAX_LINE_LEN:
+                    fuzzy_bounded = True
+                elif fuzzy_chars_used + len(line_content) > _FUZZY_MAX_TOTAL_CHARS:
+                    fuzzy_bounded = True
+                else:
+                    fuzzy_chars_used += len(line_content)
+                    fuzzy_findings = _fuzzy_scan(line_content, current_file)
+                    if is_deletion:
+                        for f in fuzzy_findings:
+                            f["source"] = f"deleted:{f['source']}"
+                    findings.extend(fuzzy_findings)
 
             # Also check for hidden base64 payloads
             b64_findings = _check_base64_hidden_text(line_content, current_file)
@@ -496,6 +528,16 @@ def scan_diff_text(diff_text: str) -> List[Dict[str, str]]:
                     f["source"] = f"deleted:{f['source']}"
             findings.extend(b64_findings)
 
+    if fuzzy_bounded:
+        logger.warning(
+            "[SECURITY] Fuzzy/evasion scan bounded on a large diff "
+            "(per-line cap=%d, cumulative cap=%d chars) — the exact-match scan "
+            "still ran in full on every line, but evasion-obfuscated patterns in "
+            "the oversized portion may be unscanned. The bound stops the O(n²) "
+            "fuzzy scan from pegging the event loop (prod 2026-06-16 wedge).",
+            _FUZZY_MAX_LINE_LEN,
+            _FUZZY_MAX_TOTAL_CHARS,
+        )
     return findings
 
 
@@ -700,7 +742,15 @@ async def scan_pr_for_injection(
     try:
         diff_text = await get_pull_request_diff(gh_token, owner, repo, pr_number)
         if diff_text:
-            all_findings.extend(scan_diff_text(diff_text))
+            # Offload the synchronous diff scan to a worker thread. scan_diff_text
+            # is CPU-bound pure Python (fuzzy Levenshtein) and on a large diff ran
+            # for minutes directly on the event loop, blocking every other
+            # coroutine — heartbeats included — and wedging the orchestrator (prod
+            # 2026-06-16; hard-watchdog stack dump caught it here). On a thread the
+            # loop keeps getting scheduled (the GIL yields between work), so a slow
+            # scan degrades throughput instead of freezing liveness; the _FUZZY_*
+            # bounds inside scan_diff_text keep that thread time short too.
+            all_findings.extend(await asyncio.to_thread(scan_diff_text, diff_text))
             scanned.append("diff")
     except Exception as e:
         logger.warning(f"[SECURITY] Failed to fetch diff for PR #{pr_number}: {e}")
