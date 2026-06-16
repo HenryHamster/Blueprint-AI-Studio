@@ -2216,3 +2216,95 @@ def test_detect_already_fixed_deadlock_stops_at_legacy_entry():
     assert deadlocked
     assert consec == 3
 
+
+@pytest.mark.asyncio
+async def test_already_fixed_deadlock_auto_completes_via_apply_post_spawn(db_session):
+    """#10113 superseded: an already-fixed-deadlocked direction completes terminally
+    via apply_post_spawn_state instead of the old alert-only no-op.
+
+    Three prior cycles whose spawned tasks all resolved SCOPE_EMPTY (work already on
+    HEAD) make the direction genuinely exhausted. When a fresh no-findings cycle is
+    applied and the direction is neither code-failing nor externally frozen, it is
+    routed to terminal status='completed' with an exhaustion reason and an INFO
+    'Direction auto-completed' alert.
+    """
+    from app.models import Alert
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-af-complete"
+    # Prior cycles: tasks_created >= 1 and scope_empty_noop_count >= tasks_created
+    # (already-fixed deadlock signal), zero merges.
+    noop_history = [
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=h)).isoformat(),
+            "task_id": f"t-af-{h}",
+            "tasks_created": 2,
+            "scope_empty_noop_count": 2,
+            "prs_merged": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0, "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
+                "type_filtered": 0, "empty_prompt": 0,
+            },
+            "summary": "all tasks no-op — work already on HEAD",
+        }
+        for h in (15, 10, 5)
+    ]
+    direction = {
+        **_active_direction(direction_id, "Already-fixed deadlock completion"),
+        "research_history": noop_history,
+    }
+    project = Project(
+        name="AF Deadlock Complete Test",
+        user_id="u-af-complete",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Fresh no-findings cycle — the appended entry is excluded by the af site's
+    # history[:-1] detection, which still sees the 3 SCOPE_EMPTY cycles.
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "completed", (
+        f"already-fixed-deadlocked direction should be terminally completed, got {d['status']!r}"
+    )
+    assert d.get("auto_completed") is True, "auto_completed must be set"
+    assert d.get("completed_at") is not None, "completed_at must be stamped"
+    assert "exhausted" in (d.get("auto_completed_reason") or ""), (
+        f"auto_completed_reason must reflect exhaustion, got {d.get('auto_completed_reason')!r}"
+    )
+
+    result = await db_session.execute(
+        select(Alert).where(
+            Alert.project_id == project.id,
+            Alert.title == "Direction auto-completed",
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    assert result.scalars().first() is not None, (
+        "expected a 'Direction auto-completed' alert"
+    )
+

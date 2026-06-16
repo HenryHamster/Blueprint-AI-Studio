@@ -3013,23 +3013,20 @@ async def test_research_history_records_finding_challenge_summary(db_session):
 
 
 @_pytest.mark.asyncio
-async def test_dedup_deadlock_holds_direction_out_of_rotation_and_auto_recovers(
-    db_session, mocker
-):
-    """Detecting a dedup deadlock auto-pauses the direction and auto-recovery restores it.
+async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
+    """Detecting a dedup deadlock retires a genuinely-exhausted direction terminally.
 
-    Three consecutive dedup-zero research cycles must:
-    - Set direction status to 'paused' with auto_paused=True and a 'dedup_deadlock:' reason
-    - Increment auto_pause_count
-    - Create a WARNING alert and a BUG_REPORT message
-    - Be reversible: _process_direction_lifecycle reactivates the direction once the
-      cooldown (direction_dedup_deadlock_recovery_hours, default 8h) elapses.
+    #10112 superseded: instead of the old auto-pause-and-recover loop, three
+    consecutive dedup-zero research cycles on a direction that is not externally
+    frozen and not code-failing now:
+    - Set direction status to terminal 'completed' with auto_completed=True and an
+      exhaustion auto_completed_reason
+    - Stamp completed_at
+    - Create an INFO 'Direction auto-completed' alert (not the WARNING deadlock alert)
+    - NOT auto-pause (no auto_paused / paused_reason) — the direction is terminal.
     """
     from datetime import datetime, timedelta
 
-    from sqlalchemy.orm.attributes import flag_modified
-
-    from app.direction_lifecycle import _process_direction_lifecycle
     from app.models import Alert
     from app.research_direction_state import apply_post_spawn_state
     from test_autonomous_research import _active_direction, _make_research_task
@@ -3113,69 +3110,42 @@ async def test_dedup_deadlock_holds_direction_out_of_rotation_and_auto_recovers(
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "paused", (
-        f"direction should be paused on dedup deadlock, got {d['status']!r}"
+    assert d["status"] == "completed", (
+        f"dedup-deadlocked exhausted direction should be terminally completed, "
+        f"got {d['status']!r}"
     )
-    assert d.get("auto_paused") is True, "auto_paused must be set"
-    assert (d.get("paused_reason") or "").startswith("dedup_deadlock:"), (
-        f"paused_reason must start with 'dedup_deadlock:', got {d.get('paused_reason')!r}"
+    assert d.get("auto_completed") is True, "auto_completed must be set"
+    assert d.get("completed_at") is not None, "completed_at must be stamped"
+    assert "exhausted" in (d.get("auto_completed_reason") or ""), (
+        f"auto_completed_reason must reflect exhaustion, got {d.get('auto_completed_reason')!r}"
     )
-    assert d.get("auto_pause_count") == 1, (
-        f"auto_pause_count should be 1, got {d.get('auto_pause_count')}"
-    )
-    assert d.get("paused_at") is not None, "paused_at must be stamped"
+    # The superseded auto-pause must NOT have fired.
+    assert not d.get("auto_paused"), "exhausted-completed direction must not be auto-paused"
+    assert not d.get("paused_reason"), "no paused_reason on a completed direction"
 
-    # Verify a WARNING alert was created for the deadlock
+    # An INFO 'Direction auto-completed' alert is created (not the WARNING deadlock alert).
     result = await db_session.execute(
         _select(Alert).where(
             Alert.project_id == project.id,
-            Alert.title == "Dedup deadlock detected",
+            Alert.title == "Direction auto-completed",
             Alert.dismissed_at.is_(None),
         )
     )
     assert result.scalars().first() is not None, (
-        "expected a 'Dedup deadlock detected' alert"
+        "expected a 'Direction auto-completed' alert"
     )
-
-    # Simulate 50h elapsed since the pause (past the 8h dedup_deadlock recovery window)
-    dirs = list(project.directions)
-    dirs[0]["paused_at"] = (datetime.utcnow() - timedelta(hours=50)).isoformat()
-    project.directions = dirs
-    flag_modified(project, "directions")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    # Run direction lifecycle — should auto-recover the direction past the cooldown
-    mocker.patch(
-        "app.direction_lifecycle._compute_direction_error_fingerprint",
-        new_callable=AsyncMock,
-        return_value=None,
-    )
-    await _process_direction_lifecycle(
-        project,
-        db_session,
-        cooldown_minutes=0.0,
-        busy_direction_ids=set(),
-        now=datetime.utcnow(),
-    )
-    await db_session.refresh(project)
-
-    d = project.directions[0]
-    assert d["status"] == "active", (
-        f"direction should be active after cooldown, got {d['status']!r}"
-    )
-    assert d.get("auto_recovered_at") is not None, "auto_recovered_at must be stamped"
-    assert not d.get("auto_paused"), "auto_paused should be cleared on recovery"
-    assert not d.get("paused_reason"), "paused_reason should be cleared on recovery"
 
 
 @_pytest.mark.asyncio
 async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
-    """When a dedup deadlock fires, deadlock_filtered_titles is written on the direction.
+    """When a dedup deadlock fires but exhaustion-completion is DECLINED (the
+    direction is externally frozen), the existing auto-pause path still runs and
+    writes deadlock_filtered_titles.
 
     The field collects titles from filtered_findings across the deadlocked history window
-    so the next research cycle's prompt can exclude them explicitly.
+    so the next research cycle's prompt can exclude them explicitly. Externally-frozen
+    directions are guarded out of terminal completion (#10112 supersession), so they
+    fall through to the legacy pause behavior — which this test pins.
     """
     from datetime import datetime, timedelta
 
@@ -3220,6 +3190,9 @@ async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
     direction = {
         **_active_direction(direction_id, "Deadlock filtered titles test"),
         "research_history": old_history,
+        # Externally frozen → exhaustion-completion is declined, so the legacy
+        # auto-pause + deadlock_filtered_titles path still fires.
+        "needs_manual_intervention": True,
     }
     project = _Project(
         name="DFT Populate Test",
@@ -13515,6 +13488,130 @@ class TestStampNoFindingsRefractory:
         direction2 = project2.directions[0]
         assert direction2.get("status") == "completed", (
             "Direction with 3 verified aggregate merges must be auto-completed"
+        )
+
+    # ── Additive exhaustion route (terminal COMPLETED regardless of merge count) ──
+
+    def _make_exhausted_project(
+        self,
+        direction_id="d-test",
+        research_history=None,
+        extra=None,
+        consecutive_unproductive=2,
+    ):
+        """Build an active, about-to-be-saturated direction with optional extra fields."""
+        direction = {
+            "id": direction_id,
+            "text": "Exhausted direction",
+            "status": "active",
+            "research_history": research_history if research_history is not None else [],
+            "history_aggregate": {},
+            "consecutive_unproductive_cycles": consecutive_unproductive,
+        }
+        if extra:
+            direction.update(extra)
+        project = MagicMock()
+        project.directions = [direction]
+        return project
+
+    def test_exhausted_unproductive_direction_auto_completes(self):
+        """A saturated, genuinely-exhausted (already-fixed-deadlock) UNPRODUCTIVE
+        direction with < 3 merges auto-completes to terminal status='completed'.
+
+        This is the #10113 root fix: an already-fixed-deadlocked direction (its
+        spawned tasks all terminate SCOPE_EMPTY because the work is already on HEAD)
+        is retired terminally rather than looping or emitting an advisory-only alert,
+        even though it has zero verified merges.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # Three consecutive cycles whose spawned tasks all resolved SCOPE_EMPTY
+        # (tasks_created >= 1 and scope_empty_noop_count >= tasks_created) → the
+        # already-fixed deadlock signal. Zero merges.
+        already_fixed_history = [
+            {"tasks_created": 2, "scope_empty_noop_count": 2, "prs_merged": 0}
+            for _ in range(3)
+        ]
+        task = self._make_task()
+        project = self._make_exhausted_project(research_history=already_fixed_history)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+
+        direction = project.directions[0]
+        assert direction.get("status") == "completed", (
+            "A genuinely-exhausted already-fixed-deadlocked direction with <3 merges "
+            "must auto-complete to terminal 'completed'"
+        )
+        assert direction.get("auto_completed") is True, "auto_completed must be stamped"
+        assert direction.get("completed_at"), "completed_at must be stamped"
+        reason = direction.get("auto_completed_reason", "")
+        assert "exhausted" in reason and "no new work remaining" in reason, (
+            f"exhaustion reason must distinguish it from the proven-merge route, got: {reason!r}"
+        )
+
+    def test_exhaustion_complete_blocked_for_code_failing_direction(self):
+        """GUARDRAIL 1: a code-failing direction is BROKEN, not exhausted, and must
+        NOT auto-complete — the existing pause/diagnosis path owns it."""
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # Saturated-shaped history, but every cycle has a CODE failure (not infra) →
+        # _check_direction_health returns a 'High code failure rate' pause reason.
+        code_failing_history = [
+            {
+                "tasks_created": 1,
+                "tasks_failed": 1,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            }
+            for _ in range(3)
+        ]
+        task = self._make_task()
+        project = self._make_exhausted_project(research_history=code_failing_history)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "A code-failing direction must NOT be auto-completed as exhausted"
+        )
+
+    def test_exhaustion_complete_blocked_for_externally_frozen_direction(self):
+        """GUARDRAIL 2: an externally-frozen direction (needs_manual_intervention /
+        budget pause) may still have work once the block clears, so it must NOT be
+        auto-completed as exhausted."""
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # Saturated, no merges, no code failures → genuinely exhausted on its own…
+        plain_history = [
+            {"tasks_created": 1, "tasks_failed": 0, "prs_merged": 0} for _ in range(3)
+        ]
+        # …but flagged for manual intervention (an external freeze).
+        task = self._make_task()
+        project = self._make_exhausted_project(
+            research_history=plain_history,
+            extra={"needs_manual_intervention": True},
+        )
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "An externally-frozen (needs_manual_intervention) direction must NOT be "
+            "auto-completed as exhausted"
+        )
+
+        # Same exhaustion shape, but frozen by a budget pause instead.
+        task2 = self._make_task()
+        project2 = self._make_exhausted_project(
+            research_history=plain_history,
+            extra={
+                "cost_pause_evidence": {
+                    "cumulative_estimated_cost_usd": 12.0,
+                    "cost_budget_usd": 10.0,
+                }
+            },
+        )
+        self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
+        direction2 = project2.directions[0]
+        assert direction2.get("status") != "completed", (
+            "A budget-paused (cost_pause_evidence) direction must NOT be auto-completed"
         )
 
 

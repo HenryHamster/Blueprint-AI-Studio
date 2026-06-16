@@ -2059,6 +2059,152 @@ def _is_code_failure_pause_reason(pause_reason: str | None) -> bool:
     return pause_reason.startswith(_CODE_FAILURE_PAUSE_PREFIXES)
 
 
+def _direction_has_recent_merges(direction: dict) -> bool:
+    """True when a direction has merged PRs recently (rolling window) or over its
+    aggregated lifetime — i.e. it is still shipping output, even if unproven.
+
+    Used to keep a still-shipping direction OUT of the zero-output exhaustion
+    class: a direction that keeps merging PRs (verified or not) has work, so it is
+    not "genuinely exhausted". The proven >=3-verified-merge route owns retiring
+    productive saturated directions; the exhaustion route here is for directions
+    producing nothing. ``prs_merged`` (raw) is used deliberately — any merge, even
+    an unproven one, signals the direction is not output-empty.
+    """
+    history = direction.get("research_history") or []
+    window = history[-5:]
+    if sum(int(e.get("prs_merged", 0) or 0) for e in window) > 0:
+        return True
+    agg = direction.get("history_aggregate") or {}
+    try:
+        return int(agg.get("total_prs_merged", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _direction_genuinely_exhausted(direction: dict) -> bool:
+    """True when a direction has no new work left — the shared exhaustion predicate.
+
+    A direction is genuinely exhausted when it is dedup-deadlocked, already-fixed
+    -deadlocked, OR saturated while no longer shipping any output. All three mean
+    "there is no new work in this direction":
+
+      * dedup-deadlocked — research cycles keep producing findings immediately
+        rejected as already-known (``_detect_dedup_deadlock``);
+      * already-fixed-deadlocked — spawned tasks all terminate SCOPE_EMPTY because
+        the work is already on HEAD (``_detect_already_fixed_deadlock``);
+      * saturated (``possibly_saturated`` / ``_compute_saturation``) AND not still
+        shipping output (``_direction_has_recent_merges`` is False). The output
+        guard keeps a saturated-but-still-merging direction — which is a proof
+        /quality concern, not exhaustion — out of this class so the proven-merge
+        route remains the only path that retires it.
+
+    Detection helpers live in ``research_direction_state`` and are imported lazily
+    to avoid a module-level import cycle (that module lazily imports this one).
+    """
+    from app.research_direction_state import (
+        _compute_saturation,
+        _detect_already_fixed_deadlock,
+        _detect_dedup_deadlock,
+    )
+
+    history = direction.get("research_history") or []
+    if _detect_dedup_deadlock(history)[0]:
+        return True
+    if _detect_already_fixed_deadlock(history)[0]:
+        return True
+    saturated = bool(direction.get("possibly_saturated")) or _compute_saturation(
+        history
+    )
+    return saturated and not _direction_has_recent_merges(direction)
+
+
+def _direction_code_failing(direction: dict) -> bool:
+    """Guardrail 1: a code-failing direction is BROKEN, not exhausted.
+
+    True when ``_check_direction_health`` returns a code-failure pause reason
+    (Rules 3/4 — high code-failure rate or recent stall). Such a direction must
+    NOT be auto-completed as exhausted: the existing pause / diagnosis /
+    auto-retire-after-N path owns it. A crashing direction is broken, not done.
+    """
+    return _is_code_failure_pause_reason(_check_direction_health(direction))
+
+
+def _direction_externally_frozen(direction: dict) -> bool:
+    """Guardrail 2: a direction blocked by factors external to its own exhaustion.
+
+    Such a direction may still have real work once the external block clears, so
+    it must not be retired as exhausted. Derived entirely from EXISTING fields:
+
+      * ``needs_manual_intervention`` — operator action pending;
+      * ``cost_pause_evidence`` present, or cumulative estimated cost exceeds the
+        direction's ``cost_budget_usd`` (a budget/cost pause);
+      * a recorded budget / deploy-health / external-dependency pause reason.
+    """
+    if direction.get("needs_manual_intervention"):
+        return True
+    if direction.get("cost_pause_evidence"):
+        return True
+    budget = direction.get("cost_budget_usd")
+    try:
+        budget_f = float(budget) if budget is not None else None
+    except (TypeError, ValueError):
+        budget_f = None
+    if budget_f and budget_f > 0:
+        cumulative = 0.0
+        for entry in direction.get("research_history") or []:
+            raw = entry.get("estimated_cost_usd") or 0.0
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                cumulative += max(0.0, float(raw))
+        if cumulative > budget_f:
+            return True
+    paused_reason = direction.get("paused_reason")
+    return isinstance(paused_reason, str) and (
+        paused_reason.startswith("Budget exceeded:")
+        or "external_dependency" in paused_reason
+        or "deploy" in paused_reason.lower()
+    )
+
+
+def _exhaustion_complete_reason(direction: dict) -> str:
+    """Build the ``auto_completed_reason`` for an exhaustion-completed direction.
+
+    Distinguished from the proven-merge route's "verified PRs merged" wording so
+    operators can tell a saturated/deadlocked retirement apart from a productive
+    one. Includes the verified merge count (which may be <3 or zero) for context.
+    """
+    history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+    total_merged = sum(verified_merged_count(e) for e in history) + int(
+        agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
+    )
+    return (
+        f"Auto-completed: direction saturated/deadlocked and exhausted with "
+        f"{total_merged} verified PRs merged (no new work remaining)"
+    )
+
+
+def _should_autocomplete_exhausted(
+    direction: dict, *, exhausted: bool | None = None
+) -> bool:
+    """Shared decision: should this direction be terminally completed as exhausted?
+
+    ``exhausted`` lets a caller that has ALREADY detected a specific deadlock
+    signal (e.g. the already-fixed site detects on ``history[:-1]`` because the
+    just-appended cycle's children have not resolved yet) pass that verdict in;
+    otherwise the shared ``_direction_genuinely_exhausted`` predicate is used. The
+    two guardrails — code-failing and externally-frozen — are applied identically
+    regardless of how exhaustion was determined.
+    """
+    is_exhausted = (
+        exhausted if exhausted is not None else _direction_genuinely_exhausted(direction)
+    )
+    if not is_exhausted:
+        return False
+    if _direction_code_failing(direction):
+        return False
+    return not _direction_externally_frozen(direction)
+
+
 def _build_direction_failure_summary(direction: dict) -> Dict[str, Any]:
     """Aggregate recent failure metrics from a direction's research_history.
 

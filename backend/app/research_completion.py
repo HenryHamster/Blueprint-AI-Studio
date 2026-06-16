@@ -888,10 +888,19 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
         target["possibly_saturated"] = new_consec >= 3
         stamp_direction_refractory(target)
 
-        # Auto-complete if saturated and proven by merged PRs — same criteria as
-        # apply_post_spawn_state, applied here so the most exhausted directions
-        # (those producing zero findings) are retired rather than looping forever.
+        # Auto-complete the most exhausted directions (those producing zero
+        # findings) rather than looping forever — same criteria as
+        # apply_post_spawn_state:
+        #   * PROVEN route: saturated AND >= 3 verified PRs merged.
+        #   * ADDITIVE exhaustion route: genuinely exhausted (saturated with no
+        #     recent output / deadlocked) with < 3 merges, under the code-failing
+        #     and externally-frozen guardrails.
         if target.get("status") == "active" and target.get("possibly_saturated"):
+            from app.strategic_completion import (
+                _exhaustion_complete_reason,
+                _should_autocomplete_exhausted,
+            )
+
             history = target.get("research_history", [])
             agg = target.get("history_aggregate", {})
             total_merged = sum(verified_merged_count(e) for e in history) + int(
@@ -901,8 +910,8 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 )
                 or 0
             )
+            total_cycles = len(history) + (agg.get("total_cycles") or 0)
             if total_merged >= 3:
-                total_cycles = len(history) + (agg.get("total_cycles") or 0)
                 target["status"] = "completed"
                 target["completed_at"] = now_iso
                 target["auto_completed"] = True
@@ -914,6 +923,20 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                     {
                         "text": target.get("text", direction_id),
                         "reason": target["auto_completed_reason"],
+                        "total_merged": total_merged,
+                        "total_cycles": total_cycles,
+                    }
+                )
+            elif _should_autocomplete_exhausted(target):
+                reason = _exhaustion_complete_reason(target)
+                target["status"] = "completed"
+                target["completed_at"] = now_iso
+                target["auto_completed"] = True
+                target["auto_completed_reason"] = reason
+                _auto_complete_info.append(
+                    {
+                        "text": target.get("text", direction_id),
+                        "reason": reason,
                         "total_merged": total_merged,
                         "total_cycles": total_cycles,
                     }
@@ -933,8 +956,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 title="Direction auto-completed",
                 message=(
                     f"Direction '{info['text'][:80]}' was auto-completed: "
-                    f"saturated with {info['total_merged']} PRs merged "
-                    f"across {info['total_cycles']} cycles."
+                    f"{info['reason']}."
                 ),
             )
         )
