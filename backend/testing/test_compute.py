@@ -8692,7 +8692,9 @@ async def test_create_compute_job_respects_resource_envelope_spend_ceiling(db_se
         .scalars()
         .all()
     )
-    assert jobs == [], "no compute job should be created when resource_envelope ceiling is exceeded"
+    assert jobs == [], (
+        "no compute job should be created when resource_envelope ceiling is exceeded"
+    )
 
 
 @pytest.mark.asyncio
@@ -9342,9 +9344,7 @@ def test_gcp_startup_script_clones_repo_when_repo_clone_present():
         spec, artifact_upload_url="https://storage.example.com/upload"
     )
     assert "git clone --depth 1 --branch release-x" in script
-    assert (
-        "https://x-access-token:ghs_FAKETOKEN123@github.com/octo/demo.git" in script
-    )
+    assert "https://x-access-token:ghs_FAKETOKEN123@github.com/octo/demo.git" in script
     assert "cd /tmp/blueprint_repo" in script
     assert "export PYTHONPATH=/tmp/blueprint_repo:${PYTHONPATH:-}" in script
     # A clone failure must terminate the job LOUDLY (parseable markers), not leave
@@ -9433,7 +9433,9 @@ async def test_attach_repo_clone_sets_repo_and_token(db_session, monkeypatch):
     assert spec.repo_token == "ghs_FAKE"
 
 
-async def test_attach_repo_clone_skips_when_project_has_no_repo(db_session, monkeypatch):
+async def test_attach_repo_clone_skips_when_project_has_no_repo(
+    db_session, monkeypatch
+):
     """A repo-less project ⇒ no checkout and the token path is never touched."""
     project = Project(name="no-repo", user_id="u")
     db_session.add(project)
@@ -9594,7 +9596,11 @@ def _make_job_with_command_log(text: str, truncated: bool = False) -> ComputeJob
         accrued_cost_usd=0.5,
         final_cost_usd=0.5,
         polling_metadata={
-            "command_log": {"text": text, "truncated": truncated, "byte_count": len(text.encode())},
+            "command_log": {
+                "text": text,
+                "truncated": truncated,
+                "byte_count": len(text.encode()),
+            },
         },
     )
 
@@ -9618,20 +9624,33 @@ def test_command_log_credentials_redacted_on_operator_and_knowledge_surfaces():
     # --- operator API surface ---
     api_data = schemas.serialize_compute_job_response_safe(job)
     api_text = api_data["polling_metadata"]["command_log"]["text"]
-    assert "SECRETVAL" not in api_text, "signed URL query value must be redacted from API"
-    assert "ghp_SUPERSECRETTOKEN" not in api_text, "bearer token must be redacted from API"
+    assert "SECRETVAL" not in api_text, (
+        "signed URL query value must be redacted from API"
+    )
+    assert "ghp_SUPERSECRETTOKEN" not in api_text, (
+        "bearer token must be redacted from API"
+    )
     assert "MY_SECRET_VALUE" not in api_text, "export value must be redacted from API"
     assert "result: ok" in api_text, "benign output must survive redaction"
 
     # --- artifact JSON / knowledge document surface ---
     result = compute_jobs.build_compute_result_logs(job)
     import json as _json
+
     artifact = _json.loads(result)
     cl_text = artifact["command_log_text"]
-    assert "SECRETVAL" not in cl_text, "signed URL query value must be redacted from artifact JSON"
-    assert "ghp_SUPERSECRETTOKEN" not in cl_text, "bearer token must be redacted from artifact JSON"
-    assert "MY_SECRET_VALUE" not in cl_text, "export value must be redacted from artifact JSON"
-    assert "result: ok" in cl_text, "benign output must survive redaction in artifact JSON"
+    assert "SECRETVAL" not in cl_text, (
+        "signed URL query value must be redacted from artifact JSON"
+    )
+    assert "ghp_SUPERSECRETTOKEN" not in cl_text, (
+        "bearer token must be redacted from artifact JSON"
+    )
+    assert "MY_SECRET_VALUE" not in cl_text, (
+        "export value must be redacted from artifact JSON"
+    )
+    assert "result: ok" in cl_text, (
+        "benign output must survive redaction in artifact JSON"
+    )
 
     # --- direct helper ---
     clean = schemas.redact_command_log_text(raw)
@@ -9667,11 +9686,54 @@ def test_redact_command_log_text_strips_shell_exports():
     assert "running" in result
 
 
+def test_redact_command_log_text_covers_bare_token_formats():
+    """redact_command_log_text covers bare token formats not prefixed by 'Bearer'.
+
+    This is the named acceptance test: ghp_***, sk-ant-***, ya29***, embedded
+    git URL credential, and JSON access_token field must all be redacted even
+    when no 'Authorization: Bearer' header is present.
+    """
+    raw = (
+        # bare GitHub PAT — no Bearer prefix
+        "fatal: repository 'https://github.com/org/repo.git/' not found\n"
+        "token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123\n"
+        # embedded git URL credential
+        "Cloning into '/tmp/work'... (token=https://x-access-token:ghs_SECRETTOKEN123@github.com/org/repo)\n"
+        # Anthropic key
+        "api_key=sk-ant-api03-SUPERSECRETKEYVALUE\n"
+        # Google OAuth access token
+        "oauth: ya29.A0ARrdaM-GOOGLEOAUTHTOKEN\n"
+        # JSON access_token field (caught by _CRED_FIELD_RE in _redact_credentials)
+        '{"access_token": "ACCESS_TOKEN_VALUE_HERE", "expires_in": 3600}\n'
+        # benign output
+        "exit code: 1\n"
+    )
+    result = schemas.redact_command_log_text(raw)
+    assert "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123" not in result, (
+        "bare ghp_ token must be redacted"
+    )
+    assert "ghs_SECRETTOKEN123" not in result, (
+        "embedded git URL ghs_ token must be redacted"
+    )
+    assert "sk-ant-api03-SUPERSECRETKEYVALUE" not in result, (
+        "sk-ant- key must be redacted"
+    )
+    assert "ya29.A0ARrdaM-GOOGLEOAUTHTOKEN" not in result, (
+        "ya29. token must be redacted"
+    )
+    assert "ACCESS_TOKEN_VALUE_HERE" not in result, (
+        "JSON access_token value must be redacted"
+    )
+    assert "exit code: 1" in result, "benign output must survive"
+    assert "expires_in" in result, "benign JSON field must survive"
+
+
 def test_build_compute_result_logs_redacts_command_log_text():
     """build_compute_result_logs scrubs credentials before embedding command_log_text."""
     raw = "token=leaked_secret\nnormal output\n"
     job = _make_job_with_command_log(raw)
     import json as _json
+
     result = _json.loads(compute_jobs.build_compute_result_logs(job))
     assert "leaked_secret" not in result["command_log_text"]
     assert "normal output" in result["command_log_text"]

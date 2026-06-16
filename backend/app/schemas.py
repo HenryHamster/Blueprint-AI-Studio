@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.failure_classification import _CRED_FIELD_RE, _CRED_REDACT_SUBS
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
 from app.payload_schemas import RepoDomainOverview, RepoBootstrapOverview
 from app.task_blocked import (
@@ -514,11 +515,15 @@ _ENV_EXPORT_RE = re.compile(r"(?i)export\s+\w+=\S+")
 def redact_command_log_text(text: str) -> str:
     """Redact credential-bearing patterns from command stdout/stderr text.
 
-    Applies the same URL-query and bearer-token scrubbers used for RPC
-    diagnostics, plus a shell-export redactor so secrets set via
-    ``export SECRET=value`` in experiment scripts do not persist in the
-    durable command_log stored in Artifact.logs or KnowledgeDocuments.
+    Applies the broad _CRED_REDACT_SUBS table (bare GitHub tokens, Anthropic/
+    OpenAI/Google API keys, JWTs, embedded git-URL credentials, etc.) first,
+    then the URL-query, bearer-token, and shell-export scrubbers used for RPC
+    diagnostics — so raw stdout/stderr never reaches operator-facing surfaces
+    or KnowledgeDocuments with credentials intact.
     """
+    for pattern, replacement in _CRED_REDACT_SUBS:
+        text = pattern.sub(replacement, text)
+    text = _CRED_FIELD_RE.sub(r"\1***\3", text)
     text = _URL_QUERY_RE.sub("?[redacted]", text)
     # Apply Bearer-value pattern BEFORE _BEARER_LIKE_RE so that
     # ``Authorization: Bearer TOKEN`` loses TOKEN before the header itself
