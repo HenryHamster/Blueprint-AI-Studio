@@ -145,6 +145,7 @@ import {
   rotateOAuthCredentialsIfChanged as _rotateOAuthCredentialsIfChanged,
   ClaudeTimeoutError,
 } from './oauth-rotation.js';
+import { clearTestConventionCache } from './prompts/discovery.js';
 export { recordInitialOAuthAuthHash, ClaudeTimeoutError };
 
 /** Rotate OAuth credentials if changed, bound to the local apiPost. */
@@ -1838,6 +1839,9 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   // unique per tick, never reset between roles.)
   heartbeatInFlight = false;
   heartbeatInFlightSince = 0;
+  // Test convention cache in discovery.ts is per-repo; stale entries from a
+  // prior task's codebase must not carry into a new role on a warm VM.
+  clearTestConventionCache();
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────

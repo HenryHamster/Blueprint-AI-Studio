@@ -205,6 +205,8 @@ export function verifyCloneDelivered(task: Record<string, unknown>, branch?: str
 // Cache: dirKey → convention summary string. Populated once per task invocation.
 const _testConventionCache = new Map<string, string>();
 
+export function clearTestConventionCache(): void { _testConventionCache.clear(); }
+
 /**
  * Scan test files in the given directory and extract conventions:
  * fixtures, mock libraries, setup patterns, assertion style.

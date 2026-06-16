@@ -104,6 +104,7 @@ import {
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
+import * as discovery from './prompts/discovery.js';
 
 /** Asserts a value is defined and returns it (narrowed). Replaces unsafe `x!` in tests. */
 function defined<T>(v: T | undefined | null, msg = 'expected value to be defined'): T {
@@ -826,6 +827,16 @@ describe('resetPerRoleModuleState (warm-VM isolation)', () => {
     expect(snapshotLogBuffer().length).toBe(2);
     resetPerRoleModuleState();
     expect(snapshotLogBuffer().length).toBe(0);
+  });
+
+  it('clears the test convention cache so a warm VM role does not serve stale conventions', () => {
+    const spy = vi.spyOn(discovery, 'clearTestConventionCache');
+    try {
+      resetPerRoleModuleState();
+      expect(spy).toHaveBeenCalledOnce();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 
