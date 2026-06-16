@@ -1072,7 +1072,7 @@ function VersionHistorySummary({ versionId }: { versionId: string }) {
   return (
     <div className="mt-1 pl-2 border-l-2 border-neutral-700/40 space-y-0.5 text-[10px]">
       <VersionHighlightsLine highlights={summary.highlights} phase={summary.phase} status={summary.status} />
-      <VersionSummaryPanel tasksMerged={summary.tasks_merged} />
+      <VersionSummaryPanel tasksMerged={summary.tasks_merged} acceptanceAggregate={summary.acceptance_aggregate} />
     </div>
   );
 }
@@ -1720,7 +1720,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 <HistoricalAuditContext audit={cv.stale_audit} activeCandidateSha={cv.active_candidate_sha} />
               </div>
             )}
-            <VersionSummaryPanel tasksMerged={cv.tasks_merged} />
+            <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} />
             {projectId && (
               <div data-testid="phase-controls" className="flex flex-wrap items-center gap-2 pt-1">
                 {cv.phase === 'build' ? (

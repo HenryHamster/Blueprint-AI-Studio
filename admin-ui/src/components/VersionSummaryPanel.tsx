@@ -106,12 +106,38 @@ function TypeCountBadge({ taskType, count }: { taskType: string; count: number }
   );
 }
 
+const BUCKET_META: Record<string, { label: string; className: string }> = {
+  undeclared:                { label: 'no criteria',    className: 'text-amber-400' },
+  declared_unsatisfied:      { label: 'criteria failed', className: 'text-red-400' },
+  satisfied_unproven:        { label: 'satisfied',       className: 'text-slate-400' },
+  merged_unverified_degraded:{ label: 'degraded',        className: 'text-amber-400' },
+  malformed:                 { label: 'malformed',       className: 'text-red-400' },
+};
+
+function AcceptanceBucketBreakdown({ aggregate }: { aggregate: Record<string, number> }): JSX.Element | null {
+  const entries = Object.entries(BUCKET_META)
+    .map(([key, meta]) => ({ key, count: aggregate[key] ?? 0, ...meta }))
+    .filter(e => e.count > 0);
+  if (entries.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] mb-2" data-testid="acceptance-bucket-breakdown">
+      {entries.map(e => (
+        <span key={e.key} className={e.className}>
+          {e.count} {e.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 export function VersionSummaryPanel({
   tasksMerged,
   heading,
+  acceptanceAggregate,
 }: {
   tasksMerged: ChangelogEntry[] | undefined;
   heading?: string;
+  acceptanceAggregate?: Record<string, number> | null;
 }): JSX.Element | null {
   const [copied, setCopied] = useState(false);
 
@@ -159,6 +185,7 @@ export function VersionSummaryPanel({
           {copied ? 'Copied!' : 'Copy markdown'}
         </button>
       </div>
+      {acceptanceAggregate && <AcceptanceBucketBreakdown aggregate={acceptanceAggregate} />}
       {/* Per-type count summary — lets operator grasp shape of release at a glance */}
       <div className="flex flex-wrap gap-1 mb-2" data-testid="type-count-summary">
         {Array.from(groups.entries()).map(([type, entries]) => (

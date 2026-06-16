@@ -1754,6 +1754,8 @@ export interface CurrentVersion {
    *  each merged task, newest-first. Allows operators to see what shipped without
    *  manual release notes. */
   tasks_merged?: ChangelogEntry[];
+  /** Acceptance-criteria bucket counts for all merged tasks in this version. */
+  acceptance_aggregate?: Record<string, number> | null;
 }
 
 export interface RecentVersion {

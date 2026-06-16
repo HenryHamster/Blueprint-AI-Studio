@@ -229,6 +229,40 @@ describe('VersionSummaryPanel — viewport regression', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
   });
 
+  test('acceptance bucket breakdown renders non-zero non-proven buckets', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <VersionSummaryPanel
+          tasksMerged={SAMPLE_TASKS}
+          acceptanceAggregate={{ proven: 2, undeclared: 3, declared_unsatisfied: 1, satisfied_unproven: 0 }}
+        />,
+      );
+    });
+    const breakdown = host.querySelector('[data-testid="acceptance-bucket-breakdown"]');
+    if (breakdown === null) throw new Error('Expected acceptance-bucket-breakdown element');
+    const text = breakdown.textContent ?? '';
+    if (!text.includes('3') || !text.includes('no criteria')) throw new Error('Expected undeclared bucket in breakdown');
+    if (!text.includes('1') || !text.includes('criteria failed')) throw new Error('Expected declared_unsatisfied bucket in breakdown');
+    // proven is excluded from breakdown; satisfied_unproven is 0 so also excluded
+    if (text.includes('proven')) throw new Error('proven should not appear in bucket breakdown');
+  });
+
+  test('acceptance bucket breakdown is absent when aggregate is not provided', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+    const breakdown = host.querySelector('[data-testid="acceptance-bucket-breakdown"]');
+    if (breakdown !== null) throw new Error('Expected no acceptance-bucket-breakdown when acceptanceAggregate is absent');
+  });
+
   test('large version (>20 tasks) defaults sections to collapsed', async () => {
     const manyTasks: ChangelogEntry[] = Array.from({ length: 25 }, (_, i) => ({
       task_type: 'create',
