@@ -13200,8 +13200,9 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     assert count == 1
 
     await db_session.refresh(version)
-    # Force-finalized as a blocked qualification.
-    assert version.last_qualification["status"] == "not_promoted"
+    # Force-finalized as an infra failure (not a conclusive verdict) so the
+    # same SHA can be re-qualified once infrastructure recovers.
+    assert version.last_qualification["status"] == "infra_failure"
     assert version.last_qualification["blocker"] == "qualification_timeout"
     # Version stays open and returns to stabilize for the next strategic cycle.
     assert version.status == "open"
@@ -13680,7 +13681,7 @@ async def test_sweep_finalize_crash_increments_streak(db_session, mocker):
 @pytest.mark.asyncio
 async def test_sweep_finalize_crash_loop_force_finalizes_and_alerts(db_session, mocker):
     """After _MAX_SWEEP_CRASH_STREAK consecutive finalize crashes the sweep
-    force-finalizes the version as not_promoted/sweep_finalize_crash_loop, resets
+    force-finalizes the version as infra_failure/sweep_finalize_crash_loop, resets
     it to the stabilize phase, posts a WARNING Alert, and sends an operator
     notification — the crash-loop is never invisible to operators."""
     project, version = await _make_project_and_version(db_session)
@@ -13721,7 +13722,7 @@ async def test_sweep_finalize_crash_loop_force_finalizes_and_alerts(db_session, 
     await db_session.refresh(version)
     qual = version.last_qualification
     assert qual is not None
-    assert qual["status"] == "not_promoted"
+    assert qual["status"] == "infra_failure"
     assert qual["blocker"] == "sweep_finalize_crash_loop"
     assert qual.get("sweep_crash_streak") == 0  # reset after force-finalize
     assert version.phase == "stabilize"  # returned to stabilize for re-qualification
@@ -14576,7 +14577,7 @@ async def test_sweep_timeout_fires_when_started_at_unparseable(db_session, mocke
     # The timeout fired via the updated_at fallback, even with a bad started_at.
     assert count == 1
     await db_session.refresh(version)
-    assert version.last_qualification["status"] == "not_promoted"
+    assert version.last_qualification["status"] == "infra_failure"
     assert version.last_qualification["blocker"] == "qualification_timeout"
     assert version.phase == "stabilize"
 
@@ -23176,3 +23177,64 @@ async def test_finalize_locked_version_pre_gate_ci_result_flows_to_outcome(
     assert result is not None
     assert result.get("status") == "not_promoted"
     assert result.get("blocker") == "ci_not_green"
+
+
+# ===========================================================================
+# infra force-finalize re-qualification (fix: infra_failure not not_promoted)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_timed_out_qualification_requalifies_same_sha(db_session, mocker):
+    """A force-finalized infra_failure/qualification_timeout verdict must NOT
+    block re-qualification with the same candidate SHA.
+
+    Before this fix, _force_finalize_timed_out_qualification wrote
+    status='not_promoted', which is in _CONCLUSIVE_VERDICT_STATUSES.  Guard 3
+    in run_qualification then refused to re-qualify the same SHA, permanently
+    blocking the version until automain advanced — the opposite of how the
+    codebase treats infra failures elsewhere.
+
+    After the fix, it writes status='infra_failure', which is NOT conclusive.
+    Guard 3 skips it, and run_qualification proceeds to spawn a fresh audit
+    pair for the same candidate SHA.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Plant a force-finalized infra_failure/qualification_timeout record on the
+    # same SHA that automain will return.
+    candidate_sha = "dead1234" * 5
+    version.last_qualification = {
+        "status": "infra_failure",
+        "blocker": "qualification_timeout",
+        "candidate_sha": candidate_sha,
+        "finalized_at": "2026-06-01T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # automain HEAD returns the SAME sha as the prior infra_failure record.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate_sha),
+    )
+    # Sync gate: candidate is already absorbed into promotion_target (no deferral).
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed",
+        new=AsyncMock(return_value=True),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Must NOT return cached_verdict — infra_failure is non-conclusive and
+    # the same SHA must be eligible for re-qualification.
+    assert result["status"] == "spawned", (
+        f"expected 'spawned' (infra_failure is non-conclusive), got {result!r}"
+    )
+    assert result["candidate_sha"] == candidate_sha
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha

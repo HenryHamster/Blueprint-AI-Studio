@@ -4226,6 +4226,7 @@ async def test_first_merge_gate_verdict_is_idempotent(db_session, mocker):
 # Review-wait throttle and orphan backstop (handle_ci_completion parked path)
 # ---------------------------------------------------------------------------
 
+
 def _make_task_no_review_approved(
     db_session, project, pr_number: int = 42, ci_loop_extra: dict | None = None
 ):
@@ -4319,10 +4320,12 @@ async def test_review_wait_started_set_on_first_entry_not_overwritten(
     await handle_ci_completion(
         task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
     )
-    rw_started_first = (task.context or {}).get("review_loop", {}).get(
-        "review_wait_started"
+    rw_started_first = (
+        (task.context or {}).get("review_loop", {}).get("review_wait_started")
     )
-    assert rw_started_first is not None, "review_wait_started must be set on first entry"
+    assert rw_started_first is not None, (
+        "review_wait_started must be set on first entry"
+    )
 
     # Second poll — simulate a fresh handle_ci_completion call.  We keep the
     # same task object (context already has review_wait_started) and call again.
@@ -4330,8 +4333,8 @@ async def test_review_wait_started_set_on_first_entry_not_overwritten(
         task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
     )
     assert result2 is True
-    rw_started_second = (task.context or {}).get("review_loop", {}).get(
-        "review_wait_started"
+    rw_started_second = (
+        (task.context or {}).get("review_loop", {}).get("review_wait_started")
     )
     assert rw_started_second == rw_started_first, (
         "review_wait_started must NOT be overwritten on subsequent polls"
@@ -4428,3 +4431,73 @@ async def test_review_wait_backstop_does_not_refire(db_session, mocker):
     # handle_ci_completion; that gate lives in the separate merge helper.)
     assert result is True
     alert_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Non-terminal check-run status: waiting / requested / pending
+# ---------------------------------------------------------------------------
+
+
+class _MockResponse:
+    """Minimal httpx response mock for standalone get_check_runs tests."""
+
+    def __init__(self, status_code, json_data=None, links=None):
+        self.status_code = status_code
+        self._json_data = json_data if json_data is not None else {}
+        self.text = ""
+        self.headers = {}
+        self.links = links or {}
+
+    def json(self):
+        return self._json_data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "non_terminal_status",
+    ["waiting", "requested", "pending"],
+)
+async def test_waiting_check_run_does_not_resolve_green(mocker, non_terminal_status):
+    """A check-run in waiting/requested/pending must not make the aggregate green.
+
+    GitHub Actions uses these statuses for deployment-protection gates and queued
+    reusable workflows.  Previously only 'queued' and 'in_progress' were treated as
+    non-terminal, so a single passing sibling would yield a green aggregate while a
+    required check had not run.
+    """
+    from app.github import get_check_runs
+
+    payload = {
+        "check_runs": [
+            {
+                "id": 1,
+                "name": "deploy-gate",
+                "status": non_terminal_status,
+                "conclusion": None,
+            },
+            {
+                "id": 2,
+                "name": "unit-tests",
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+    }
+
+    async def mock_request(method, *args, **kwargs):
+        return _MockResponse(200, payload, links={})
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+
+    result = await get_check_runs("token", "owner", "repo", "abc123sha")
+
+    # The non-terminal check-run must keep the aggregate in "in_progress",
+    # not allow a false-green "completed/success" verdict.
+    assert result["status"] == "in_progress", (
+        f"status '{non_terminal_status}' must be treated as non-terminal "
+        f"but got aggregate status={result['status']!r}"
+    )
+    # Conclusion should not be 'success' while a check has not completed
+    assert result["conclusion"] != "success" or result["status"] != "completed", (
+        "aggregate must not resolve green while a check-run is still non-terminal"
+    )

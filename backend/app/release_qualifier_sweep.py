@@ -118,7 +118,7 @@ async def _force_finalize_timed_out_qualification(
     is the unconditional escape hatch — called regardless of child state once
     the qualification exceeds ``_MAX_QUALIFICATION_DURATION_SECONDS``.
 
-    Records ``last_qualification.status = "not_promoted"`` with
+    Records ``last_qualification.status = "infra_failure"`` with
     ``blocker = "qualification_timeout"``, sends the version back to the
     ``stabilize`` phase (so the next strategic cycle re-targets it), and raises
     an ``Alert`` so the stuck qualification is operator-visible.  The version
@@ -134,7 +134,7 @@ async def _force_finalize_timed_out_qualification(
     )
     record = {
         **qual,
-        "status": "not_promoted",
+        "status": "infra_failure",
         "blocker": "qualification_timeout",
         "detail": detail,
         "finalized_at": _utcnow().isoformat(),
@@ -183,14 +183,14 @@ async def _force_finalize_sweep_crash_loop(
 
     Called when _finalize_in_dedicated_session has raised on every consecutive
     sweep attempt for this version (_MAX_SWEEP_CRASH_STREAK times).  Records
-    last_qualification.status='not_promoted' with
+    last_qualification.status='infra_failure' with
     blocker='sweep_finalize_crash_loop', resets the version to stabilize phase,
     raises an Alert, and notifies the operator.  The caller commits the session.
     """
     qual = dict(version.last_qualification or {})
     record = {
         **qual,
-        "status": "not_promoted",
+        "status": "infra_failure",
         "blocker": "sweep_finalize_crash_loop",
         "detail": (
             f"sweep finalize raised on {streak} consecutive sweep(s) — "

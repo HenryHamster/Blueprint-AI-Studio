@@ -3812,7 +3812,7 @@ async def _finalize_locked_version(
                 )
                 await session.commit()
                 return {
-                    "status": "not_promoted",
+                    "status": "infra_failure",
                     "blocker": "qualification_timeout",
                 }
 

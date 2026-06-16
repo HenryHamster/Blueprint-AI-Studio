@@ -1241,7 +1241,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               }
             } else if (objType === 'error') {
               const errObj = (obj as { error?: { message?: string; type?: string; code?: string } }).error;
-              const errLine = `[claude-stream error] ${errObj?.message ?? ''}\n`;
+              const errLine = `[claude-stream error] ${sanitize(errObj?.message ?? '')}\n`;
               sendLog(ws, errLine);
               stderrBuffer = appendBoundedTail(stderrBuffer, errLine, STDERR_TAIL_BYTES);
               // Run report: a structured provider error event — the truthful
@@ -1392,7 +1392,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
             } else if (eventType === 'turn.failed') {
               const errEnvelope = obj.error as { message?: string; code?: string } | undefined;
               const err = errEnvelope?.message ?? '';
-              const oneLine = `[codex] turn.failed: ${err}\n`;
+              const oneLine = `[codex] turn.failed: ${sanitize(err)}\n`;
               sendLog(ws, oneLine);
               stderrBuffer = appendBoundedTail(stderrBuffer, oneLine, STDERR_TAIL_BYTES);
               recordProviderError(
@@ -1402,7 +1402,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               );
             } else if (eventType === 'error') {
               const msg = typeof obj.message === 'string' ? obj.message : '';
-              const oneLine = `[codex] error: ${msg}\n`;
+              const oneLine = `[codex] error: ${sanitize(msg)}\n`;
               sendLog(ws, oneLine);
               stderrBuffer = appendBoundedTail(stderrBuffer, oneLine, STDERR_TAIL_BYTES);
               recordProviderError('codex-error', msg || '(no message)');
@@ -1454,7 +1454,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                 }
               } else if (itemType === 'error') {
                 const msg = item && typeof item.message === 'string' ? item.message : '';
-                const oneLine = `[codex] item error: ${msg}\n`;
+                const oneLine = `[codex] item error: ${sanitize(msg)}\n`;
                 sendLog(ws, oneLine);
                 stderrBuffer = appendBoundedTail(stderrBuffer, oneLine, STDERR_TAIL_BYTES);
                 recordProviderError('codex-item-error', msg || '(no message)');

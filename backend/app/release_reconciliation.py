@@ -51,7 +51,13 @@ from app.release_promotion import (
     _resolve_github_with_session,
 )
 from app.rollup_migration_validation import _validate_migration_chain_post_merge
-from app.release_scoring import _CI_GREEN, _CI_NO_CHECKS, _CI_PENDING, _CI_RED, _classify_check_runs
+from app.release_scoring import (
+    _CI_GREEN,
+    _CI_NO_CHECKS,
+    _CI_PENDING,
+    _CI_RED,
+    _classify_check_runs,
+)
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -245,6 +251,10 @@ async def _persist_managed_check_wait_snapshot(
             )
         else:
             updated_pending.pop("api_error_sweep_count", None)
+        # Reset consecutive-transient-red counter whenever CI leaves the red
+        # state so intermittent flakiness does not accumulate non-consecutively.
+        if ci_state != _CI_RED:
+            updated_pending.pop("transient_red_count", None)
         qual["promotion_pending"] = updated_pending
         locked.last_qualification = qual
         flag_modified(locked, "last_qualification")
@@ -266,6 +276,65 @@ async def _persist_managed_check_wait_snapshot(
                 version_id,
             )
         return False
+
+
+async def _reset_pending_transient_red_count(
+    session,
+    version_id: uuid.UUID,
+    *,
+    pr_number: int,
+) -> None:
+    """Reset ``promotion_pending.transient_red_count`` to 0 when CI is no longer red.
+
+    Called whenever CI transitions away from red (green or pending) so that
+    intermittent transient failures do not accumulate non-consecutively.
+    """
+    try:
+        session.expire_all()
+        locked: release_version.ReleaseVersion | None = (
+            (
+                await session.execute(
+                    select(release_version.ReleaseVersion)
+                    .where(release_version.ReleaseVersion.id == version_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if locked is None or locked.status != "open":
+            return
+        qual = dict(locked.last_qualification or {})
+        if qual.get("status") != "pending":
+            return
+        pending = qual.get("promotion_pending")
+        if not isinstance(pending, dict):
+            return
+        if pending.get("pr_number") != pr_number:
+            return
+        if not pending.get("transient_red_count"):
+            return
+        updated_pending = dict(pending)
+        updated_pending.pop("transient_red_count", None)
+        qual["promotion_pending"] = updated_pending
+        locked.last_qualification = qual
+        flag_modified(locked, "last_qualification")
+        session.add(locked)
+        await session.commit()
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] transient_red_count: reset failed for version %s",
+            version_id,
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] transient_red_count: rollback after reset "
+                "failed for version %s",
+                version_id,
+            )
 
 
 async def _increment_pending_transient_red_count(
@@ -1123,6 +1192,12 @@ async def _reconcile_if_pending_auto_merge_landed(
                                 treat_missing_as_success=False,
                             )
                             ci_state = _classify_check_runs(check_result)
+                            if ci_state != _CI_RED:
+                                await _reset_pending_transient_red_count(
+                                    session,
+                                    version.id,
+                                    pr_number=int(pr_number),
+                                )
                             if ci_state == _CI_RED:
                                 if not _check_result_has_genuine_failure(check_result):
                                     # Only transient conclusions (cancelled /
@@ -1639,7 +1714,9 @@ async def _reconcile_if_managed_check_wait(
                             for k in ("name", "status", "conclusion")
                             if d.get(k) is not None
                         }
-                        for d in check_details[:_MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT]
+                        for d in check_details[
+                            :_MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT
+                        ]
                         if isinstance(d, dict)
                     ]
                     if (
