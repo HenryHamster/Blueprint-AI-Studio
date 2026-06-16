@@ -4,7 +4,7 @@ Extracted from ``failure_classification.py`` to keep that module below its
 size cap. This module owns the self-contained residual subsystem:
 
   * the bounded in-memory residual-fingerprint store and its closed/reopen
-    bookkeeping,
+    bookkeeping (CODE_ERROR and VIEWPORT_REGRESSION lanes),
   * error-signature extraction and message-fingerprint normalization,
   * the ResidualRemediationCase DB upsert plumbing, and
   * the rolling per-account failure-class log with its record/get accessors.
@@ -447,6 +447,133 @@ def _schedule_residual_db_upsert(
     _spawn_bg_task(
         _upsert_residual_case_async(project_id, fingerprint, now_dt, sample_message)
     )
+
+
+# Bounded in-memory store for VIEWPORT_REGRESSION fingerprints.
+# record_viewport_regression_fingerprint() populates it when VIEWPORT_REGRESSION
+# is returned; get_top_viewport_residual_fingerprints() is the query API for the
+# remediation spawner in autonomous_research_residual.
+_viewport_residual_store: dict[str, dict] = {}
+_viewport_residual_seen_task_ids: set[str] = set()
+
+
+def record_viewport_regression_fingerprint(task: "Task") -> None:
+    """Record a VIEWPORT_REGRESSION in the viewport residual store.
+
+    Gate 1: task.status must be FAILED.
+    Fingerprint key: ``viewport:{component}:{assertion_type}`` — width is stripped to
+    collapse per-width variants into a single component+assertion_type cluster.
+
+    Component and assertion_type are extracted (in order):
+    1. From task.context keys matching ``viewport_regression:*`` via
+       parse_viewport_regression_class from failure_layer_classifier.
+    2. Fallback: task.latest_status_message is scanned for expectNoOverflowAt /
+       expectNoTextTruncationAt / expectMinTouchTargetAt patterns (assertion_type only).
+    Noop when neither component nor assertion_type can be resolved from any source.
+    """
+    from app.failure_layer_classifier import parse_viewport_regression_class
+    from app.models import TaskStatus
+
+    task_status = getattr(task, "status", None)
+    if task_status != TaskStatus.FAILED:
+        return
+
+    task_id = str(getattr(task, "id", "") or "")
+    if not task_id or task_id in _viewport_residual_seen_task_ids:
+        return
+
+    # Step 1: scan context for viewport_regression: keys.
+    context = getattr(task, "context", {}) or {}
+    component: str | None = None
+    assertion_type: str | None = None
+    for key in context:
+        if not isinstance(key, str):
+            continue
+        if key.startswith("viewport_regression:"):
+            parsed = parse_viewport_regression_class(key)
+            c = parsed.get("component")
+            if c:
+                component = c
+                assertion_type = parsed.get("assertion_type")
+                break
+
+    # Step 2: fallback to status message for assertion_type.
+    if assertion_type is None:
+        msg = (getattr(task, "latest_status_message", "") or "").lower()
+        if "expectnooverflowat" in msg:
+            assertion_type = "overflow"
+        elif "expectnotexttruncationat" in msg:
+            assertion_type = "text_truncation"
+        elif "expectmintouchtargetat" in msg:
+            assertion_type = "min_touch_target"
+
+    # Noop when no viewport signal found in any source.
+    if component is None and assertion_type is None:
+        return
+
+    fp_component = component or "unknown"
+    fp_assertion = assertion_type or "unknown"
+    fp = f"viewport:{fp_component}:{fp_assertion}"
+
+    if len(_viewport_residual_seen_task_ids) < _RESIDUAL_SEEN_MAX:
+        _viewport_residual_seen_task_ids.add(task_id)
+
+    now = time.time()
+    sample_message = (getattr(task, "latest_status_message", "") or "")[:500]
+
+    if fp in _viewport_residual_store:
+        entry = _viewport_residual_store[fp]
+        entry["count"] += 1
+        entry["last_seen"] = now
+        if task_id not in entry["task_ids"] and len(entry["task_ids"]) < 5:
+            entry["task_ids"].append(task_id)
+    else:
+        if len(_viewport_residual_store) >= _RESIDUAL_MAX_FINGERPRINTS:
+            oldest = min(
+                _viewport_residual_store,
+                key=lambda k: _viewport_residual_store[k]["last_seen"],
+            )
+            del _viewport_residual_store[oldest]
+        _viewport_residual_store[fp] = {
+            "count": 1,
+            "first_seen": now,
+            "last_seen": now,
+            "component": fp_component,
+            "assertion_type": fp_assertion,
+            "sample_message": sample_message,
+            "task_ids": [task_id],
+        }
+
+    project_id = getattr(task, "project_id", None)
+    if project_id is not None:
+        now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        _schedule_residual_db_upsert(project_id, fp, now_dt, sample_message or fp)
+
+
+def get_top_viewport_residual_fingerprints(
+    window_seconds: int = 86400, top_n: int = 10
+) -> list[dict]:
+    """Return the top-N viewport regression fingerprints within the time window.
+
+    Each result dict contains: fingerprint, count, last_seen (epoch float),
+    component, assertion_type, sample_message, task_ids (up to 5 examples).
+    """
+    cutoff = time.time() - window_seconds
+    results = [
+        {
+            "fingerprint": fp,
+            "count": entry["count"],
+            "last_seen": entry["last_seen"],
+            "component": entry.get("component", "unknown"),
+            "assertion_type": entry.get("assertion_type", "unknown"),
+            "sample_message": entry.get("sample_message", ""),
+            "task_ids": entry.get("task_ids", []),
+        }
+        for fp, entry in _viewport_residual_store.items()
+        if entry["last_seen"] >= cutoff
+    ]
+    results.sort(key=lambda x: x["count"], reverse=True)
+    return results[:top_n]
 
 
 def get_top_residual_fingerprints(

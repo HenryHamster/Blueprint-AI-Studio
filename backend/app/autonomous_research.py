@@ -2849,6 +2849,7 @@ async def _check_autonomous_research(owner: str, repo: str):
 # ---------------------------------------------------------------------------
 from app.autonomous_research_residual import (
     _spawn_residual_fingerprint_remediation,
+    _spawn_viewport_regression_remediation,
 )
 
 
@@ -2951,6 +2952,7 @@ async def _check_idle_research():
                     )
                 else:
                     await _spawn_residual_fingerprint_remediation(project, session)
+                    await _spawn_viewport_regression_remediation(project, session)
                 await session.commit()
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)

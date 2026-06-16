@@ -1144,6 +1144,28 @@ class TestClassifyFailureViewportGateInfra:
             == PROVISION_FAILURE
         )
 
+    def test_failed_viewport_task_records_viewport_fingerprint(self):
+        """FAILED task with viewport pattern populates _viewport_residual_store."""
+        import app.failure_residual as fr
+        from app.failure_residual import get_top_viewport_residual_fingerprints
+        from app.models import TaskStatus
+
+        fr._viewport_residual_store.clear()
+        fr._viewport_residual_seen_task_ids.clear()
+
+        t = MagicMock(spec=Task)
+        t.latest_status_message = "expectnooverflowat( failed at 375px"
+        t.context = {}
+        t.id = "task-vp-record-classify"
+        t.project_id = None
+        t.status = TaskStatus.FAILED
+
+        result = classify_failure(t)
+        assert result == VIEWPORT_REGRESSION
+
+        results = get_top_viewport_residual_fingerprints()
+        assert any("task-vp-record-classify" in r["task_ids"] for r in results)
+
 
 class TestClassifyFailureProvision:
     @pytest.mark.parametrize(

@@ -488,3 +488,211 @@ async def _spawn_residual_fingerprint_remediation(
         return 1
 
     return 0
+
+
+async def _spawn_viewport_regression_remediation(
+    project: Project, session: AsyncSession
+) -> int:
+    """Spawn a create-type remediation task for the top uncooled viewport regression fingerprint.
+
+    Mirrors _spawn_residual_fingerprint_remediation but for VIEWPORT_REGRESSION
+    fingerprints stored in get_top_viewport_residual_fingerprints(). Applies the
+    same cooldown, concurrency cap, blocked-fingerprint, and spend-ceiling checks.
+    Skips the CODE_ERROR re-classification step since the fingerprint directly
+    encodes component+assertion_type.
+
+    Returns the number of tasks spawned (0 or 1).
+    """
+    from app.failure_classification import get_top_viewport_residual_fingerprints
+    from app.models import ResidualCaseStatus, ResidualRemediationCase
+    from sqlalchemy import select
+
+    fingerprints = get_top_viewport_residual_fingerprints(
+        window_seconds=86400, top_n=10
+    )
+    if not fingerprints:
+        return 0
+
+    # Guard: per-project spend ceiling via canonical resource_envelope resolver.
+    from app.resource_envelope import (
+        get_project_recent_spend_usd,
+        resolve_project_spend_ceiling,
+        resolve_project_spend_window_days,
+    )
+
+    spend_ceiling = resolve_project_spend_ceiling(project)
+    if spend_ceiling is not None:
+        spend_window_days = resolve_project_spend_window_days(project)
+        spend_breakdown = await get_project_recent_spend_usd(
+            session,
+            project_id=project.id,
+            window_days=spend_window_days,
+        )
+        window_spend = spend_breakdown["total"]
+        if window_spend >= spend_ceiling:
+            from app.alert_dispatch import _maybe_create_spend_ceiling_alert
+
+            logger.info(
+                "[VIEWPORT REMEDIATION] Spend ceiling reached for project %s: "
+                "$%.4f >= $%.4f — skipping viewport remediation spawn",
+                project.id,
+                window_spend,
+                spend_ceiling,
+            )
+            await _maybe_create_spend_ceiling_alert(
+                project.id,
+                session,
+                window_spend_usd=window_spend,
+                ceiling_usd=spend_ceiling,
+            )
+            return 0
+
+    # Load case rows for spawn-side filters in one query:
+    # IGNORED + SUSPENDED block re-spawn; last_spawned_at drives per-fingerprint
+    # cooldown; REMEDIATING count drives the project-wide concurrency cap.
+    case_rows_result = await session.execute(
+        select(
+            ResidualRemediationCase.fingerprint,
+            ResidualRemediationCase.status,
+            ResidualRemediationCase.last_spawned_at,
+        ).where(ResidualRemediationCase.project_id == project.id)
+    )
+    case_rows = case_rows_result.all()
+    blocked_fingerprints: set[str] = {
+        fp
+        for fp, status, _ in case_rows
+        if status in (ResidualCaseStatus.IGNORED, ResidualCaseStatus.SUSPENDED)
+    }
+    last_spawned_by_fp: dict[str, datetime] = {
+        fp: ts for fp, _, ts in case_rows if ts is not None
+    }
+
+    # Project-wide concurrency cap (shared with CODE_ERROR lane; both write to the
+    # same ResidualRemediationCase table so REMEDIATING rows from either lane count).
+    max_concurrent = int(_runtime_config.get("max_concurrent_auto_remediations", 2))
+    active_count = sum(
+        1 for _, status, _ in case_rows if status == ResidualCaseStatus.REMEDIATING
+    )
+    if active_count >= max_concurrent:
+        logger.info(
+            "[VIEWPORT REMEDIATION] %d residual case(s) already REMEDIATING, "
+            "at or above cap (%d); skipping spawn (project %s).",
+            active_count,
+            max_concurrent,
+            project.id,
+        )
+        return 0
+
+    cooldown_hours = _runtime_config.get("residual_remediation_cooldown_hours", 24)
+    cooldown_seconds = cooldown_hours * 3600
+    now_dt = _utcnow()
+    cooldown_delta = timedelta(seconds=cooldown_seconds)
+
+    for fp_entry in fingerprints:
+        fp = fp_entry["fingerprint"]
+        if fp in blocked_fingerprints:
+            logger.debug(
+                "[VIEWPORT REMEDIATION] Skipping IGNORED/SUSPENDED fingerprint %s (project %s).",
+                fp[:32],
+                project.id,
+            )
+            continue
+        last_spawned = last_spawned_by_fp.get(fp)
+        if last_spawned is not None and (now_dt - last_spawned) < cooldown_delta:
+            continue
+
+        component = fp_entry.get("component", "unknown")
+        assertion_type = fp_entry.get("assertion_type", "unknown")
+        task_ids = fp_entry.get("task_ids") or []
+        task_ids_str = ", ".join(str(t) for t in task_ids[:5])
+        sample_message = fp_entry.get("sample_message", "")
+
+        prompt = (
+            f"You are spawned as an auto-remediation task. A VIEWPORT_REGRESSION "
+            f"fingerprint has been recurring on main for {fp_entry.get('count', '?')} "
+            f"task(s) in the last 24 hours and nothing in the pipeline has fixed it. "
+            f"Your job is to investigate and open a fix PR.\n\n"
+            f"Component: {component}\n"
+            f"Assertion type: {assertion_type}\n"
+            f"Fingerprint: '{fp}'\n\n"
+            f"IMPORTANT — read this carefully:\n"
+            f"- This visual regression exists on main TODAY. It is not caused by "
+            f"your changes. Your job is to fix it.\n"
+            f"- The default 'don't touch pre-existing failures' instinct DOES NOT "
+            f"APPLY here. You are EXPLICITLY authorized (and expected) to edit "
+            f"the component, its layout, test expectations, or Tailwind classes "
+            f"when the regression points there.\n"
+            f"- Common causes: a recent layout change introduced overflow, text "
+            f"clipping, or touch-target violations in the component.\n"
+            f"- First, run the viewport test suite and reproduce the failure "
+            f"locally before editing.\n"
+            f"- Do NOT fix by adding data-viewport-allow-* escape hatches or "
+            f"disabling viewport assertions. Find and fix the real layout cause.\n\n"
+            f"Sample message: {sample_message or '(none recorded)'}\n"
+            f"Affected task IDs (up to 5): {task_ids_str or '(none recorded)'}\n\n"
+            f"Open a fix PR that resolves the underlying layout defect."
+        )
+        payload = validate_internal_payload(
+            {
+                "type": "create",
+                "prompt": prompt,
+                "base_branch": _get_project_integration_branch(project),
+            },
+            "autonomous_research:viewport_regression_remediation",
+        )
+        remediation_context = {
+            "auto_remediation": True,
+            "spawned_by": "viewport_regression_remediation",
+            "viewport_fingerprint": fp,
+            "component": component,
+            "assertion_type": assertion_type,
+            "hit_count": fp_entry.get("count", 0),
+            "task_ids": task_ids,
+        }
+        new_task = Task(
+            project_id=project.id,
+            title=f"Fix viewport regression: {component} ({assertion_type})",
+            description=(
+                f"Auto-spawned remediation for viewport regression fingerprint {fp[:60]}"
+            ),
+            payloads=[payload],
+            context=remediation_context,
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(new_task)
+        session.add(
+            TaskHistory(
+                task_id=new_task.id,
+                action="SPAWNED",
+                details={
+                    "spawned_by": "VIEWPORT_REGRESSION_REMEDIATION",
+                    "viewport_fingerprint": fp,
+                },
+            )
+        )
+        from app.notification_dispatch import post_residual_fix_spawned_message
+
+        try:
+            await post_residual_fix_spawned_message(
+                session,
+                project.id,
+                fingerprint=fp,
+                sample_message=sample_message,
+                task_id=new_task.id,
+            )
+        except Exception as _spawn_msg_exc:  # noqa: BLE001
+            logger.warning(
+                "[VIEWPORT REMEDIATION] Failed to post spawned message for %s: %s",
+                fp[:32],
+                _spawn_msg_exc,
+            )
+        logger.info(
+            f"[VIEWPORT REMEDIATION] Spawned create task {new_task.id} for viewport "
+            f"fingerprint {fp[:60]} (project {project.id})"
+        )
+        await session.commit()
+        return 1
+
+    return 0

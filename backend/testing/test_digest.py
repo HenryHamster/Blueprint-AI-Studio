@@ -8355,6 +8355,86 @@ async def test_viewport_debt_coverage_summary_counts_full_set(
 
 
 @pytest.mark.asyncio
+async def test_viewport_debt_regression_cases_from_residual_records(
+    client: AsyncClient, db_session
+):
+    """regression_case_count/breakdown are populated from ResidualRemediationCase
+    viewport:* fingerprints; IGNORED/RESOLVED cases are excluded."""
+    from unittest.mock import patch
+
+    from app.models import ResidualCaseStatus, ResidualRemediationCase
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    membership = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(membership)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def _case(fingerprint, hit_count, status):
+        return ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint=fingerprint,
+            status=status,
+            hit_count=hit_count,
+            first_seen_at=now,
+            last_seen_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+
+    db_session.add_all(
+        [
+            _case("viewport:TestComp:overflow", 3, ResidualCaseStatus.ACTIVE),
+            _case("viewport:TestComp:text_truncation", 1, ResidualCaseStatus.ACTIVE),
+            # Excluded: IGNORED/RESOLVED cases must not contribute to counts.
+            # (distinct fingerprints — (project_id, fingerprint) is unique.)
+            _case("viewport:TestComp:blank_render", 99, ResidualCaseStatus.IGNORED),
+            _case("viewport:TestComp:small_target", 50, ResidualCaseStatus.RESOLVED),
+        ]
+    )
+    await db_session.commit()
+
+    top_rows = [
+        {
+            "component": "admin-ui/src/components/TestComp.tsx",
+            "eslint_disable_count": 1,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 1,
+            "has_viewport_test": False,
+            "regression_case_count": 0,
+            "regression_case_breakdown": {},
+            "source_url": None,
+        }
+    ]
+    summary = {
+        "total_components": 1,
+        "untested_count": 0,
+        "untested_components": [],
+    }
+
+    with patch(
+        "app.viewport_debt._scan_viewport_debt_rows",
+        return_value=(top_rows, [], summary),
+    ):
+        response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+    assert response.status_code == 200
+    row = next(
+        r
+        for r in response.json()["rows"]
+        if r["component"] == "admin-ui/src/components/TestComp.tsx"
+    )
+    assert row["regression_case_count"] == 4
+    assert row["regression_case_breakdown"] == {"overflow": 3, "text_truncation": 1}
+
+
+@pytest.mark.asyncio
 async def test_version_lifecycle_no_versions(client: AsyncClient, db_session):
     """Project with no release versions returns null current_version and empty history."""
     project = make_project()

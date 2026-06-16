@@ -33,12 +33,16 @@ from app.failure_residual import (  # noqa: F401
     _schedule_residual_db_upsert,
     _spawn_bg_task,
     _upsert_residual_case_async,
+    _viewport_residual_seen_task_ids,
+    _viewport_residual_store,
     get_account_failure_class_counts,
     get_account_failure_class_records,
     get_top_residual_fingerprints,
+    get_top_viewport_residual_fingerprints,
     normalize_error_fingerprint,
     record_account_failure_class,
     record_residual_fingerprint,
+    record_viewport_regression_fingerprint,
 )
 
 if TYPE_CHECKING:
@@ -2585,6 +2589,7 @@ def _classify_failure_class(
     # Viewport rendering regression — must be checked before the generic CODE_ERROR
     # fallthrough so it doesn't dissolve into residual fingerprints.
     if any(kw in combined for kw in _VIEWPORT_PATTERNS):
+        record_viewport_regression_fingerprint(task)
         return VIEWPORT_REGRESSION
 
     # Structured agent error report — a generic failure (no keywords matched

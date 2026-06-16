@@ -11415,6 +11415,218 @@ async def test_residual_resumes_spawn_when_system_exits_audit_mode(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _spawn_viewport_regression_remediation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture()
+def _clear_viewport_residual_state():
+    """Clear the viewport residual fingerprint store between tests."""
+    from app.failure_residual import _viewport_residual_store, _viewport_residual_seen_task_ids
+
+    _viewport_residual_store.clear()
+    _viewport_residual_seen_task_ids.clear()
+    yield
+    _viewport_residual_store.clear()
+    _viewport_residual_seen_task_ids.clear()
+
+
+@pytest.mark.asyncio
+async def test_viewport_regression_remediation_spawns_task(
+    db_session, _clear_viewport_residual_state
+):
+    """Top viewport fingerprint spawns exactly one create task with auto_remediation context."""
+    import time
+    from app.failure_residual import _viewport_residual_store
+    from app.autonomous_research_residual import _spawn_viewport_regression_remediation
+
+    project = Project(
+        name="Viewport Remediation Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-vprem001")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fp = "viewport:MyComponent:overflow"
+    sample_msg = "expectNoOverflowAt(375) failed for MyComponent"
+    task_id_str = str(uuid.uuid4())
+    _viewport_residual_store[fp] = {
+        "count": 4,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "component": "MyComponent",
+        "assertion_type": "overflow",
+        "sample_message": sample_msg,
+        "task_ids": [task_id_str],
+    }
+
+    spawned = await _spawn_viewport_regression_remediation(project, db_session)
+    assert spawned == 1
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    create_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "create"
+    ]
+    assert len(create_tasks) == 1
+    t = create_tasks[0]
+    assert t.context["auto_remediation"] is True
+    assert t.context["spawned_by"] == "viewport_regression_remediation"
+    assert t.context["viewport_fingerprint"] == fp
+    assert t.context["component"] == "MyComponent"
+    assert t.context["assertion_type"] == "overflow"
+    assert sample_msg in t.first_payload["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_viewport_regression_remediation_cooldown_blocks_respawn(
+    db_session, _clear_viewport_residual_state
+):
+    """Active cooldown (last_spawned_at within 24 h) prevents re-spawning the same fingerprint."""
+    import time
+    from datetime import timedelta as _td
+    from app.failure_residual import _viewport_residual_store
+    from app.autonomous_research_residual import _spawn_viewport_regression_remediation
+    from app.models import ResidualCaseStatus, ResidualRemediationCase, _utcnow
+
+    project = Project(
+        name="Viewport Cooldown Block",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-vpcool01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fp = "viewport:NavBar:overflow"
+    _viewport_residual_store[fp] = {
+        "count": 3,
+        "first_seen": time.time() - 7200,
+        "last_seen": time.time(),
+        "component": "NavBar",
+        "assertion_type": "overflow",
+        "sample_message": "overflow detected",
+        "task_ids": [],
+    }
+    # Seed a case row with a recent last_spawned_at (within 24-h cooldown)
+    case = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint=fp,
+        status=ResidualCaseStatus.ACTIVE,
+        last_spawned_at=_utcnow() - _td(minutes=30),
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    spawned = await _spawn_viewport_regression_remediation(project, db_session)
+    assert spawned == 0
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    assert len(result.scalars().all()) == 0
+
+
+@pytest.mark.asyncio
+async def test_viewport_regression_remediation_concurrent_cap_blocks_spawn(
+    db_session, _clear_viewport_residual_state
+):
+    """At or above max_concurrent_auto_remediations cap, no viewport task is spawned."""
+    import time
+    from app.failure_residual import _viewport_residual_store
+    from app.autonomous_research_residual import _spawn_viewport_regression_remediation
+    from app.models import ResidualCaseStatus, ResidualRemediationCase
+    import app.autonomous_research_residual as _rar_module
+
+    project = Project(
+        name="Viewport Concurrency Cap",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-vpconc01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fp = "viewport:Footer:text_truncation"
+    _viewport_residual_store[fp] = {
+        "count": 5,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "component": "Footer",
+        "assertion_type": "text_truncation",
+        "sample_message": "text truncated",
+        "task_ids": [],
+    }
+    # Add REMEDIATING rows equal to the cap (default 2) to saturate concurrency
+    cap = int(_rar_module._runtime_config.get("max_concurrent_auto_remediations", 2))
+    for i in range(cap):
+        db_session.add(
+            ResidualRemediationCase(
+                project_id=project.id,
+                fingerprint=f"viewport:OtherComp:overflow_{i}",
+                status=ResidualCaseStatus.REMEDIATING,
+            )
+        )
+    await db_session.commit()
+
+    spawned = await _spawn_viewport_regression_remediation(project, db_session)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_viewport_regression_remediation_skips_ignored_fingerprint(
+    db_session, _clear_viewport_residual_state
+):
+    """IGNORED fingerprints are skipped; SUSPENDED fingerprints are also skipped."""
+    import time
+    from app.failure_residual import _viewport_residual_store
+    from app.autonomous_research_residual import _spawn_viewport_regression_remediation
+    from app.models import ResidualCaseStatus, ResidualRemediationCase
+
+    project = Project(
+        name="Viewport Ignored Skip",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-vpign01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fp_ignored = "viewport:Sidebar:overflow"
+    fp_suspended = "viewport:Header:min_touch_target"
+    for fp, comp, at, status in [
+        (fp_ignored, "Sidebar", "overflow", ResidualCaseStatus.IGNORED),
+        (fp_suspended, "Header", "min_touch_target", ResidualCaseStatus.SUSPENDED),
+    ]:
+        _viewport_residual_store[fp] = {
+            "count": 6,
+            "first_seen": time.time() - 3600,
+            "last_seen": time.time(),
+            "component": comp,
+            "assertion_type": at,
+            "sample_message": f"failure in {comp}",
+            "task_ids": [],
+        }
+        db_session.add(
+            ResidualRemediationCase(
+                project_id=project.id,
+                fingerprint=fp,
+                status=status,
+            )
+        )
+    await db_session.commit()
+
+    spawned = await _spawn_viewport_regression_remediation(project, db_session)
+    assert spawned == 0
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    assert len(result.scalars().all()) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Failure Feedback Consumption — Coaching Suffix & Scope Override
 # ─────────────────────────────────────────────────────────────────────────────
 
