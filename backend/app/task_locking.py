@@ -29,6 +29,7 @@ context-manager variant for background / post-commit chains that need
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable
@@ -44,6 +45,8 @@ from app.database import resolve_dialect_name
 from app.models import DeploymentState, Project, Task
 
 logger = logging.getLogger(__name__)
+
+DESIGN_DOC_MAX_BYTES = 500_000
 
 
 @asynccontextmanager
@@ -265,7 +268,9 @@ async def acquire_direction_research_spawn_lock(
         return
     await session.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-        {"key": f"research-direction-spawn:{project_id}:{direction_id or 'cross-cutting'}"},
+        {
+            "key": f"research-direction-spawn:{project_id}:{direction_id or 'cross-cutting'}"
+        },
     )
 
 
@@ -547,7 +552,19 @@ async def with_design_doc_locked(
         if project is None:
             return False
         doc = dict(project.design_doc or {})
+        old_size = len(json.dumps(doc))
         mutate_fn(doc)
+        new_size = len(json.dumps(doc))
+        if new_size > DESIGN_DOC_MAX_BYTES and new_size > old_size:
+            logger.warning(
+                "[with_design_doc_locked] skipping write for project %s: "
+                "would grow design_doc from %d to %d bytes (ceiling %d)",
+                project_id,
+                old_size,
+                new_size,
+                DESIGN_DOC_MAX_BYTES,
+            )
+            return False
         project.design_doc = doc
         flag_modified(project, "design_doc")
         session.add(project)
