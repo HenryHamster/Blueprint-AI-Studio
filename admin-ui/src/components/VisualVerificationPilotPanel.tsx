@@ -1,10 +1,67 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { Project } from '../types/project';
-import { fetchVisualPilotStatus, type VisualPilotStatus } from '../api';
+import { API_BASE_URL, fetchVisualPilotStatus, type VisualPilotStatus } from '../api';
 
 interface Props {
   project: Project;
   onNavigateToTask?: (taskId: string) => void;
+}
+
+interface ShotPair {
+  key: string;
+  before?: string;
+  after?: string;
+}
+
+function buildShotPairs(names: string[]): ShotPair[] {
+  const map = new Map<string, ShotPair>();
+  for (const name of names) {
+    let key: string;
+    let phase: 'before' | 'after' | null = null;
+    if (name.endsWith('-before')) {
+      key = name.slice(0, -'-before'.length);
+      phase = 'before';
+    } else if (name.endsWith('-after')) {
+      key = name.slice(0, -'-after'.length);
+      phase = 'after';
+    } else {
+      key = name;
+    }
+    let pair = map.get(key);
+    if (!pair) {
+      pair = { key };
+      map.set(key, pair);
+    }
+    if (phase === 'before') pair.before = name;
+    else if (phase === 'after') pair.after = name;
+  }
+  return Array.from(map.values());
+}
+
+function PilotShotImage({
+  projectId,
+  taskId,
+  name,
+}: {
+  projectId: string;
+  taskId: string;
+  name: string;
+}) {
+  const [error, setError] = useState(false);
+  const src = `${API_BASE_URL}/api/admin/viewport-shots/download-url?${new URLSearchParams({
+    project_id: projectId,
+    task_id: taskId,
+    name,
+  }).toString()}`;
+  if (error) return <p className="text-[10px] text-red-400 break-words">Failed to load screenshot</p>;
+  return (
+    <img
+      src={src}
+      alt={name}
+      className="max-w-full rounded border border-neutral-700"
+      onError={() => setError(true)}
+    />
+  );
 }
 
 function PilotStatusBadge({ status }: { status: VisualPilotStatus }) {
@@ -65,6 +122,7 @@ export function VisualVerificationPilotPanel({ project, onNavigateToTask }: Prop
   const [status, setStatus] = useState<VisualPilotStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [expandedShots, setExpandedShots] = useState<Set<string>>(new Set());
 
   const load = useCallback(
     async (signal: AbortSignal) => {
@@ -171,18 +229,82 @@ export function VisualVerificationPilotPanel({ project, onNavigateToTask }: Prop
           </p>
         ) : (
           <div className="space-y-1">
-            {caught.map((entry) => (
-              <button
-                key={entry.task_id}
-                onClick={() => onNavigateToTask?.(entry.task_id)}
-                className="w-full text-left rounded border border-neutral-800/60 bg-neutral-900/50 px-2 py-1.5 hover:bg-neutral-800/60 transition-colors min-h-[44px] flex flex-col justify-center"
-              >
-                <span className="text-[11px] text-neutral-200 break-words">{entry.task_title}</span>
-                {entry.note && (
-                  <span className="text-[10px] text-neutral-500 break-words">{entry.note}</span>
-                )}
-              </button>
-            ))}
+            {caught.map((entry) => {
+              const hasShots = entry.viewport_shot_names.length > 0;
+              const shotsExpanded = expandedShots.has(entry.task_id);
+              const pairs = hasShots ? buildShotPairs(entry.viewport_shot_names) : [];
+              return (
+                <div
+                  key={entry.task_id}
+                  className="rounded border border-neutral-800/60 bg-neutral-900/50"
+                >
+                  <button
+                    onClick={() => onNavigateToTask?.(entry.task_id)}
+                    className="w-full text-left px-2 py-1.5 hover:bg-neutral-800/60 transition-colors min-h-[44px] flex flex-col justify-center"
+                  >
+                    <span className="text-[11px] text-neutral-200 break-words">{entry.task_title}</span>
+                    {entry.note && (
+                      <span className="text-[10px] text-neutral-500 break-words">{entry.note}</span>
+                    )}
+                  </button>
+                  {hasShots && (
+                    <div className="px-2 pb-1.5">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setExpandedShots((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(entry.task_id)) next.delete(entry.task_id);
+                            else next.add(entry.task_id);
+                            return next;
+                          });
+                        }}
+                        className="text-[10px] text-sky-400 hover:text-sky-300 transition-colors"
+                      >
+                        {shotsExpanded
+                          ? 'Hide screenshots'
+                          : `View ${entry.viewport_shot_names.length} screenshot${entry.viewport_shot_names.length !== 1 ? 's' : ''}`}
+                      </button>
+                      {shotsExpanded && (
+                        <div className="mt-1.5 space-y-2">
+                          {pairs.map((pair) => (
+                            <div key={pair.key} className="space-y-1">
+                              <p className="text-[10px] font-mono text-neutral-500 truncate">{pair.key}</p>
+                              {pair.before && pair.after ? (
+                                <div className="grid grid-cols-2 gap-2">
+                                  <div>
+                                    <p className="text-[10px] text-neutral-500 mb-0.5">Before</p>
+                                    <PilotShotImage
+                                      projectId={project.id}
+                                      taskId={entry.task_id}
+                                      name={pair.before}
+                                    />
+                                  </div>
+                                  <div>
+                                    <p className="text-[10px] text-neutral-500 mb-0.5">After</p>
+                                    <PilotShotImage
+                                      projectId={project.id}
+                                      taskId={entry.task_id}
+                                      name={pair.after}
+                                    />
+                                  </div>
+                                </div>
+                              ) : (
+                                <PilotShotImage
+                                  projectId={project.id}
+                                  taskId={entry.task_id}
+                                  name={pair.before ?? pair.after ?? pair.key}
+                                />
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

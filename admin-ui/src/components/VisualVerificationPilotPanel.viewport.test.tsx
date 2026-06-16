@@ -6,7 +6,9 @@ import type { Project } from '../types/project';
 import { expectNoOverflowAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
+  API_BASE_URL: 'http://localhost',
   fetchVisualPilotStatus: vi.fn(),
+  resolveViewportShotDownloadUrl: vi.fn().mockResolvedValue('https://example.com/shot.png'),
 }));
 
 import * as api from '../api';
@@ -45,12 +47,14 @@ const STATUS_WITH_CAUGHT = {
       task_title: 'feat: add VisualVerificationPilotPanel operator surface',
       note: 'Button label clipped on mobile — caught before merge',
       created_at: '2026-06-10T12:00:00Z',
+      viewport_shot_names: ['main-before', 'main-after'],
     },
     {
       task_id: 'task-def-456',
       task_title: 'fix: ImprovementLanesPanel overflow at 375px on narrow viewports',
       note: null,
       created_at: '2026-06-11T14:00:00Z',
+      viewport_shot_names: [],
     },
   ],
   thresholds: THRESHOLDS,
@@ -162,5 +166,36 @@ describe('VisualVerificationPilotPanel — viewport regression', () => {
 
   test('renders running state at 1024px without overflow', async () => {
     await expectNoOverflowAt(1024, () => renderWith(STATUS_RUNNING_NO_CATCHES));
+  });
+
+  test('renders expanded screenshots for caught entry at 375px without overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      await renderWith(STATUS_WITH_CAUGHT);
+      // Click the "View screenshots" toggle on the first caught entry.
+      const toggles = Array.from(host!.querySelectorAll('button')).filter(
+        (el) => el.textContent?.includes('View') && el.textContent?.includes('screenshot'),
+      );
+      if (toggles.length === 0) {
+        throw new Error('Expected a "View screenshots" toggle button but none was found');
+      }
+      await act(async () => {
+        (toggles[0] as HTMLButtonElement).click();
+      });
+    });
+  });
+
+  test('renders expanded screenshots for caught entry at 1024px without overflow', async () => {
+    await expectNoOverflowAt(1024, async () => {
+      await renderWith(STATUS_WITH_CAUGHT);
+      const toggles = Array.from(host!.querySelectorAll('button')).filter(
+        (el) => el.textContent?.includes('View') && el.textContent?.includes('screenshot'),
+      );
+      if (toggles.length === 0) {
+        throw new Error('Expected a "View screenshots" toggle button but none was found');
+      }
+      await act(async () => {
+        (toggles[0] as HTMLButtonElement).click();
+      });
+    });
   });
 });

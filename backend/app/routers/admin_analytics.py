@@ -289,7 +289,14 @@ async def get_direction_auto_pause_stats(
             (
                 await session.execute(
                     select(Project)
-                    .options(load_only(Project.id, Project.directions, Project.status, raiseload=True))
+                    .options(
+                        load_only(
+                            Project.id,
+                            Project.directions,
+                            Project.status,
+                            raiseload=True,
+                        )
+                    )
                     .limit(500)
                 )
             )
@@ -302,7 +309,13 @@ async def get_direction_auto_pause_stats(
             await session.execute(
                 select(ProjectMessage)
                 .where(*msg_filters)
-                .options(load_only(ProjectMessage.context, ProjectMessage.created_at, raiseload=True))
+                .options(
+                    load_only(
+                        ProjectMessage.context,
+                        ProjectMessage.created_at,
+                        raiseload=True,
+                    )
+                )
                 .order_by(ProjectMessage.created_at.desc())
                 .limit(10_000)
             )
@@ -508,7 +521,8 @@ async def get_task_cost_breakdown(
                         Task.vm_stopped_at,
                         Task.vm_spot,
                         Task.vm_runtime_cost_banked_db,
-                    raiseload=True,)
+                        raiseload=True,
+                    )
                 )
                 .where(*filters)
                 .order_by(Task.created_at.desc())
@@ -719,7 +733,8 @@ async def get_lane_diag(
         Task.vm_provisioned_at,
         Task.vm_started_at,
         Task.vm_stopped_at,
-    raiseload=True,)
+        raiseload=True,
+    )
 
     # Legacy surface query: COMPLETED-only, original form — the legacy aggregates
     # (lane_iteration_distribution, per_pr_phase_breakdown, task_count, pr_count,
@@ -911,7 +926,8 @@ async def get_task_duration_stats(
                             Task.vm_provisioned_at,
                             Task.vm_started_at,
                             Task.vm_stopped_at,
-                        raiseload=True,)
+                            raiseload=True,
+                        )
                     )
                     .where(*filters)
                     .limit(10000)
@@ -1294,7 +1310,8 @@ async def get_open_prs(
                         Task.title,
                         Task.payloads,
                         Task.created_at,
-                    raiseload=True,)
+                        raiseload=True,
+                    )
                 )
                 .where(
                     Task.project_id == project_id,
@@ -1547,7 +1564,8 @@ async def get_visual_pilot_status(
                         Task.context,
                         Task.created_at,
                         Task.title,
-                    raiseload=True,)
+                        raiseload=True,
+                    )
                 )
                 .where(
                     Task.project_id == project_id,
@@ -1593,6 +1611,11 @@ async def get_visual_pilot_status(
                 "task_title": t.get("title", ""),
                 "note": e.get("note"),
                 "created_at": t.get("created_at"),
+                "viewport_shot_names": [
+                    s.get("name")
+                    for s in (t.get("context") or {}).get("viewport_screenshots", [])
+                    if s.get("name")
+                ],
             }
             for t, e in agg.caught
         ],

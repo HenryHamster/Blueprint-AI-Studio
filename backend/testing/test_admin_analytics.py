@@ -2587,8 +2587,18 @@ class TestShadowLaneHealth:
             project.id,
             checkpoint_seq=2,
             checkpoints=[
-                {"seq": 1, "phase": "fix", "created_at": "2026-01-01T00:00:00", "sha": "a1"},
-                {"seq": 2, "phase": "review", "created_at": "2026-01-01T01:00:00", "sha": "a2"},
+                {
+                    "seq": 1,
+                    "phase": "fix",
+                    "created_at": "2026-01-01T00:00:00",
+                    "sha": "a1",
+                },
+                {
+                    "seq": 2,
+                    "phase": "review",
+                    "created_at": "2026-01-01T01:00:00",
+                    "sha": "a2",
+                },
             ],
             workspace_state="COLD",
             pilot_arm=None,
@@ -2641,7 +2651,9 @@ class TestShadowLaneHealth:
         assert abs(sh["miss_rate"] - 0.25) < 1e-6
 
     @pytest.mark.asyncio
-    async def test_shadow_health_exhausted_closes(self, client: AsyncClient, db_session):
+    async def test_shadow_health_exhausted_closes(
+        self, client: AsyncClient, db_session
+    ):
         """KILLED shadow lane with manifest.recovery.exhausted=True → exhausted_close_count=1."""
         project = make_project()
         db_session.add(project)
@@ -2653,7 +2665,9 @@ class TestShadowLaneHealth:
             status=ImprovementLaneStatus.KILLED.value,
             workspace_state="COLD",
             pilot_arm=None,
-            manifest={"recovery": {"exhausted": True, "attempt": 3, "reason": "no_checkpoint"}},
+            manifest={
+                "recovery": {"exhausted": True, "attempt": 3, "reason": "no_checkpoint"}
+            },
         )
         db_session.add(lane)
         await db_session.commit()
@@ -2664,7 +2678,9 @@ class TestShadowLaneHealth:
         assert sh["exhausted_close_count"] == 1
 
     @pytest.mark.asyncio
-    async def test_shadow_health_excludes_itt_lanes(self, client: AsyncClient, db_session):
+    async def test_shadow_health_excludes_itt_lanes(
+        self, client: AsyncClient, db_session
+    ):
         """Lanes with pilot_arm set are ITT arms and must NOT appear in the shadow rollup."""
         project = make_project()
         db_session.add(project)
@@ -3260,3 +3276,74 @@ class TestVisualPilotStatus:
         assert caught[0]["task_id"] == str(task.id)
         assert caught[0]["task_title"] == "Frontend update"
         assert caught[0]["note"] == "caught a layout shift"
+        assert caught[0]["viewport_shot_names"] == []
+
+    @pytest.mark.asyncio
+    async def test_caught_entry_includes_viewport_shot_names(
+        self, client: AsyncClient, db_session
+    ):
+        """viewport_shot_names lists shot names from task context; missing key → []."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # Task with viewport_screenshots in context.
+        task_with_shots = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            title="With screenshots",
+            context={
+                "_pr_changed_files": ["admin-ui/src/App.tsx"],
+                "_self_review_outcome": {
+                    "visual_verification": {
+                        "passed": True,
+                        "pairs_inspected": 2,
+                        "pairs_changed": 1,
+                        "caught_visual_issue": True,
+                        "note": "layout drift caught",
+                    }
+                },
+                "viewport_screenshots": [
+                    {
+                        "name": "main-before",
+                        "storage_uri": "gs://bucket/main-before.png",
+                    },
+                    {"name": "main-after", "storage_uri": "gs://bucket/main-after.png"},
+                ],
+            },
+        )
+        # Task without viewport_screenshots key in context.
+        task_no_shots = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            title="No screenshots",
+            context={
+                "_pr_changed_files": ["admin-ui/src/Other.tsx"],
+                "_self_review_outcome": {
+                    "visual_verification": {
+                        "passed": True,
+                        "pairs_inspected": 1,
+                        "pairs_changed": 0,
+                        "caught_visual_issue": True,
+                        "note": "caught something else",
+                    }
+                },
+            },
+        )
+        db_session.add(task_with_shots)
+        db_session.add(task_no_shots)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/visual-pilot-status?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["caught_count"] == 2
+
+        by_id = {e["task_id"]: e for e in body["caught"]}
+        entry_with = by_id[str(task_with_shots.id)]
+        assert entry_with["viewport_shot_names"] == ["main-before", "main-after"]
+
+        entry_without = by_id[str(task_no_shots.id)]
+        assert entry_without["viewport_shot_names"] == []

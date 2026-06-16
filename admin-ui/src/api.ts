@@ -3334,6 +3334,7 @@ export interface VisualPilotCaughtEntry {
   task_title: string;
   note: string | null;
   created_at: string;
+  viewport_shot_names: string[];
 }
 
 export interface VisualPilotStatus {
