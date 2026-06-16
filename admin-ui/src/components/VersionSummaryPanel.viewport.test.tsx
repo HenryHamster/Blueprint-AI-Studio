@@ -170,4 +170,83 @@ describe('VersionSummaryPanel — viewport regression', () => {
     );
     expect(spans.length).toBe(1);
   });
+
+  test('renders without horizontal overflow at 768px', async () => {
+    await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+      });
+    });
+  });
+
+  test('per-type count summary badges render at 768px', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+    const summary = host.querySelector('[data-testid="type-count-summary"]');
+    if (summary === null) {
+      throw new Error('Expected type-count-summary element to be present');
+    }
+    // SAMPLE_TASKS has create (2), fix (2), research (1)
+    const text = summary.textContent ?? '';
+    if (!text.includes('2') || !text.includes('create')) {
+      throw new Error('Expected type-count-summary to include count badges');
+    }
+  });
+
+  test('type section toggle collapses and expands entries', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+    const toggle = host.querySelector('[data-testid="type-section-toggle-create"]') as HTMLButtonElement | null;
+    if (toggle === null) {
+      throw new Error('Expected type-section-toggle-create button');
+    }
+    // Initially open (≤20 tasks)
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    // Collapse
+    await act(async () => {
+      toggle.click();
+    });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    // Expand again
+    await act(async () => {
+      toggle.click();
+    });
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  test('large version (>20 tasks) defaults sections to collapsed', async () => {
+    const manyTasks: ChangelogEntry[] = Array.from({ length: 25 }, (_, i) => ({
+      task_type: 'create',
+      title: `Task ${i}`,
+      pr_number: 10000 + i,
+      pr_url: null,
+    }));
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={manyTasks} />);
+    });
+    const toggle = host.querySelector('[data-testid="type-section-toggle-create"]') as HTMLButtonElement | null;
+    if (toggle === null) {
+      throw new Error('Expected type-section-toggle-create button');
+    }
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  });
 });

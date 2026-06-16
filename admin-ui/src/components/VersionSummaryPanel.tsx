@@ -62,21 +62,47 @@ function TaskRow({ entry }: { entry: ChangelogEntry }): JSX.Element {
 function TypeSection({
   taskType,
   entries,
+  defaultOpen,
 }: {
   taskType: string;
   entries: ChangelogEntry[];
+  defaultOpen?: boolean;
 }): JSX.Element {
+  const [open, setOpen] = useState(defaultOpen ?? true);
+
   return (
-    <div className="mb-3 last:mb-0">
-      <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
-        {taskType} <span className="text-slate-600 font-normal">({entries.length})</span>
-      </div>
-      <ul className="space-y-0.5 pl-1">
-        {entries.map((entry, i) => (
-          <TaskRow key={i} entry={entry} />
-        ))}
-      </ul>
+    <div className="mb-2 last:mb-0">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        data-testid={`type-section-toggle-${taskType}`}
+        className="flex items-center gap-1 w-full text-left min-h-[44px] py-0.5 group"
+        aria-expanded={open}
+      >
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 group-hover:text-slate-400 transition-colors">
+          {taskType}
+        </span>
+        <span className="text-slate-600 font-normal text-[10px]">({entries.length})</span>
+        <span className="ml-auto text-[10px] text-slate-600 group-hover:text-slate-400 transition-colors">
+          {open ? '▾' : '▸'}
+        </span>
+      </button>
+      {open && (
+        <ul className="space-y-0.5 pl-1 pb-1">
+          {entries.map((entry, i) => (
+            <TaskRow key={i} entry={entry} />
+          ))}
+        </ul>
+      )}
     </div>
+  );
+}
+
+function TypeCountBadge({ taskType, count }: { taskType: string; count: number }): JSX.Element {
+  return (
+    <span className="inline-flex items-center gap-0.5 rounded bg-slate-700/60 px-1.5 py-0.5 text-[10px] text-slate-400">
+      <span className="font-medium">{count}</span>
+      <span className="text-slate-500">{taskType}</span>
+    </span>
   );
 }
 
@@ -112,6 +138,9 @@ export function VersionSummaryPanel({
     }).catch(() => {});
   };
 
+  // Default: collapse sections when total tasks > 20 to keep the panel scannable
+  const defaultOpen = tasksMerged.length <= 20;
+
   return (
     <div
       data-testid="version-summary-panel"
@@ -130,9 +159,15 @@ export function VersionSummaryPanel({
           {copied ? 'Copied!' : 'Copy markdown'}
         </button>
       </div>
-      <div className="max-h-48 overflow-y-auto pr-1">
+      {/* Per-type count summary — lets operator grasp shape of release at a glance */}
+      <div className="flex flex-wrap gap-1 mb-2" data-testid="type-count-summary">
         {Array.from(groups.entries()).map(([type, entries]) => (
-          <TypeSection key={type} taskType={type} entries={entries} />
+          <TypeCountBadge key={type} taskType={type} count={entries.length} />
+        ))}
+      </div>
+      <div className="max-h-64 overflow-y-auto pr-1">
+        {Array.from(groups.entries()).map(([type, entries]) => (
+          <TypeSection key={type} taskType={type} entries={entries} defaultOpen={defaultOpen} />
         ))}
       </div>
     </div>
