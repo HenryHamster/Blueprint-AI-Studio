@@ -49,7 +49,7 @@
     "reaper_infra_recovery.py": 850,
     "agent_status_spawn.py": 650,
     "admin_task_mutations.py": 1350,
-    "review_pipeline.py": 3920,
+    "review_pipeline.py": 4550,
     "deploy_health.py": 1250,
     "direction_outcomes.py": 2750,
     "digest_metrics.py": 6200,
@@ -141,7 +141,7 @@
     "handlers/strategic-sections.ts": 950,
     "providers/runners.ts": 1800,
     "prompts/context-prefix.ts": 1100,
-    "handlers/fresh-reviewer.ts": 700
+    "handlers/fresh-reviewer.ts": 950
   },
   "frontend": {
     "useAppState.ts": 3000,

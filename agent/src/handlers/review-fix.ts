@@ -485,6 +485,40 @@ export async function handleReview(
     }
   } catch { /* best-effort, continue without PR metadata */ }
 
+  // Download viewport screenshots captured by the implementer for visual review.
+  // The payload carries `viewport_shot_entries` (list of {name, storage_uri} dicts)
+  // and `viewport_source_task_id` (the create/fix task that uploaded them).
+  // We fetch each PNG via the admin no-auth 302-redirect endpoint so we never need
+  // a cross-task JWT — this is the same path used by PR body screenshot links.
+  const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
+  const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
+  const reviewProjectMetaEarly = task.project_metadata as Record<string, unknown> | undefined;
+  const reviewProjectIdEarly = strVal(reviewProjectMetaEarly?.project_id as string | undefined);
+  const reviewOrchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
+  const downloadedShotPaths: string[] = [];
+  if (viewportShotEntries.length > 0 && viewportSourceTaskId && reviewProjectIdEarly) {
+    const shotDir = `/tmp/viewport_review_${taskId}`;
+    try { fs.mkdirSync(shotDir, { recursive: true }); } catch { /* ignore */ }
+    for (const entry of viewportShotEntries.slice(0, 8)) {
+      const name = strVal(entry.name);
+      if (!name) continue;
+      const downloadUrl = `${reviewOrchestratorUrl}/api/admin/viewport-shots/download-url` +
+        `?project_id=${encodeURIComponent(reviewProjectIdEarly)}` +
+        `&task_id=${encodeURIComponent(viewportSourceTaskId)}` +
+        `&name=${encodeURIComponent(name)}`;
+      const dest = `${shotDir}/${name}.png`;
+      try {
+        execFileSync('curl', ['-sfL', '--max-time', '30', '-o', dest, downloadUrl]);
+        downloadedShotPaths.push(dest);
+      } catch {
+        sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`);
+      }
+    }
+    if (downloadedShotPaths.length > 0) {
+      sendLog(ws, `[VIEWPORT] Downloaded ${downloadedShotPaths.length} screenshot(s) for visual review\n`);
+    }
+  }
+
   // Get a summary of changed files for context
   let changedFiles = '';
   try {
@@ -662,6 +696,35 @@ export async function handleReview(
     .filter(Boolean)
     .join('\n');
 
+  // Build a section pointing the reviewer at any downloaded viewport screenshots.
+  // Group by component/width prefix (strip trailing -before/-after/-diff suffix)
+  // so the reviewer sees paired sets rather than a flat list.
+  let viewportScreenshotSection = '';
+  if (downloadedShotPaths.length > 0) {
+    const pairs = new Map<string, { before?: string; after?: string; diff?: string }>();
+    for (const p of downloadedShotPaths) {
+      const base = p.replace(/\/((?:[^/]+-\d+)-(?:before|after|diff))\.png$/, '/$1');
+      const basename = p.replace(/^.*\//, '').replace(/\.png$/, '');
+      const key = basename.replace(/-(?:before|after|diff)$/, '');
+      if (!pairs.has(key)) pairs.set(key, {});
+      const entry = pairs.get(key);
+      if (!entry) continue;
+      if (basename.endsWith('-before')) entry.before = p;
+      else if (basename.endsWith('-after')) entry.after = p;
+      else if (basename.endsWith('-diff')) entry.diff = p;
+      void base;
+    }
+    const lines = ['## Viewport Screenshots (before/after/diff)'];
+    lines.push('The implementing agent captured these admin-ui viewport screenshots. Read them to check for visual regressions.');
+    for (const [key, entry] of pairs) {
+      lines.push(`\n**${key}**`);
+      if (entry.before) lines.push(`  - before: ${entry.before}`);
+      if (entry.after) lines.push(`  - after:  ${entry.after}`);
+      if (entry.diff) lines.push(`  - diff:   ${entry.diff}`);
+    }
+    viewportScreenshotSection = lines.join('\n') + '\n\n';
+  }
+
   const reviewPrompt = `${reviewStrategicFraming}${reviewStrategicFraming ? '\n\n' : ''}${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}${fixResponsesSection}${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
 
 ${iterationPreamble}
@@ -671,7 +734,7 @@ ${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}
 
 ${selfReviewBlindSpotsSection}
 ${plannedFilesSection}
-
+${viewportScreenshotSection}
 ${buildReviewDiffAccessHint(baseBranch)}
 ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCoreGuidance(reviewBuildConfig, taskId, baseBranch)}`;
 

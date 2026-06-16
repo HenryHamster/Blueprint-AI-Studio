@@ -285,6 +285,65 @@ function augmentCheckResultsWithFpRateHints(
   }
 }
 
+interface ViewportPair {
+  test_file?: unknown;
+  test?: unknown;
+  status?: unknown;
+  before?: unknown;
+  after?: unknown;
+  diff?: unknown;
+  change_pct?: unknown;
+}
+
+/**
+ * Reads the viewport manifest for the given task (written by viewport-snapshot.sh
+ * to /tmp/viewport_manifest_<taskId>.json) and returns a prompt section that
+ * directs the reviewer to Read the before/after/diff PNGs for changed or new pairs.
+ * Returns empty string when the manifest is absent, unreadable, or has no
+ * changed/new pairs — so non-UI tasks are unaffected.
+ */
+function buildViewportSection(taskId: string): string {
+  const manifestPath = `/tmp/viewport_manifest_${taskId}.json`;
+  let raw: string;
+  try {
+    raw = fs.readFileSync(manifestPath, 'utf-8');
+  } catch {
+    return '';
+  }
+  let manifest: { pairs?: ViewportPair[] };
+  try {
+    manifest = JSON.parse(raw) as { pairs?: ViewportPair[] };
+  } catch {
+    return '';
+  }
+  const pairs = manifest.pairs;
+  if (!Array.isArray(pairs) || pairs.length === 0) return '';
+  const inspectable = pairs.filter(p => p.status === 'changed' || p.status === 'new');
+  if (inspectable.length === 0) return '';
+
+  const lines: string[] = [
+    '',
+    'Viewport screenshots captured for this run. Use the Read tool to inspect each PNG listed',
+    'below and check for visual regressions (layout shifts, missing elements, broken styles).',
+    'Report any visual defect you find under the `correctness` category.',
+    '',
+  ];
+  for (const p of inspectable) {
+    const testFile = typeof p.test_file === 'string' ? p.test_file : '';
+    const testName = typeof p.test === 'string' ? p.test : '';
+    const label = `[${String(p.status)}] ${testFile} :: ${testName}`;
+    lines.push(label);
+    if (typeof p.before === 'string') lines.push(`  before: ${p.before}`);
+    if (typeof p.after === 'string') lines.push(`  after:  ${p.after}`);
+    if (typeof p.diff === 'string') {
+      const pct = typeof p.change_pct === 'number' ? ` (${p.change_pct.toFixed(1)}% changed)` : '';
+      lines.push(`  diff:   ${p.diff}${pct}`);
+    }
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
 /**
  * Runs a second read-only Claude session to review the current diff as an
  * adversarial reviewer. Findings are merged into /tmp/self_review_<taskId>.json:
@@ -329,6 +388,7 @@ export async function runFreshReviewerPass(
   const MAX_DIFF = 20_000;
   const diffSnippet = diff.length > MAX_DIFF ? diff.slice(0, MAX_DIFF) + '\n...[truncated]' : diff;
   const calibrationSection = formatFreshReviewerCalibrationSection(projectContext);
+  const viewportSection = buildViewportSection(taskId);
   const prompt = `You are reviewing a PR for a colleague. The author thinks it is done. Find what they missed.
 
 Task: ${taskTitle}
@@ -337,6 +397,7 @@ Declared scope: ${relatedFiles.join(', ') || 'unspecified'}
 
 ${calibrationSection}Diff:
 ${diffSnippet}
+${viewportSection}
 
 Check specifically for:
 - regression_risk: removed exports, changed defaults, removed null guards, broken contracts

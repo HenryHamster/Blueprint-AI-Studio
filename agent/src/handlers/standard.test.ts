@@ -2096,6 +2096,118 @@ describe('runFreshReviewerPass', () => {
   });
 });
 
+// ── fresh reviewer is given captured viewport screenshots to read ──────────────
+describe('runFreshReviewerPass viewport manifest injection', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('injects viewport PNG paths into reviewer prompt when manifest has changed pairs', async () => {
+    const idx = await import('../index.js');
+    const { default: fs } = await import('fs');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+      if (typeof p === 'string' && p.includes('viewport_manifest_vp1')) {
+        return JSON.stringify({
+          pairs: [
+            { test_file: 'TaskCard.viewport.test.tsx', test: 'renders default', status: 'changed',
+              before: '/tmp/viewport_shots/before/taskcard/renders-default-375px.png',
+              after: '/tmp/viewport_shots/after/taskcard/renders-default-375px.png',
+              diff: '/tmp/viewport_shots/diff/taskcard/renders-default-375px.png', change_pct: 3.2 },
+            { test_file: 'DashboardHome.viewport.test.tsx', test: 'renders empty state', status: 'unchanged',
+              before: '/tmp/viewport_shots/before/dashboard/renders-empty-state-375px.png',
+              after: '/tmp/viewport_shots/after/dashboard/renders-empty-state-375px.png',
+              diff: null, change_pct: null },
+          ],
+        });
+      }
+      return '';
+    });
+
+    await runFreshReviewerPass('vp1', 'Title', 'Desc', ['admin-ui/src/components/TaskCard.tsx'], null, { value: '' });
+
+    const prompt = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[0];
+    if (typeof prompt !== 'string') throw new Error('expected reviewer prompt');
+    expect(prompt).toContain('/tmp/viewport_shots/before/taskcard/renders-default-375px.png');
+    expect(prompt).toContain('/tmp/viewport_shots/after/taskcard/renders-default-375px.png');
+    expect(prompt).toContain('/tmp/viewport_shots/diff/taskcard/renders-default-375px.png');
+    expect(prompt).toContain('3.2% changed');
+    expect(prompt).toContain('Read tool');
+    // unchanged pair should NOT appear
+    expect(prompt).not.toContain('renders-empty-state-375px.png');
+  });
+
+  it('injects new-status pairs into reviewer prompt', async () => {
+    const idx = await import('../index.js');
+    const { default: fs } = await import('fs');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+      if (typeof p === 'string' && p.includes('viewport_manifest_vp2')) {
+        return JSON.stringify({
+          pairs: [
+            { test_file: 'NewWidget.viewport.test.tsx', test: 'renders widget', status: 'new',
+              before: null,
+              after: '/tmp/viewport_shots/after/newwidget/renders-widget-375px.png',
+              diff: null, change_pct: null },
+          ],
+        });
+      }
+      return '';
+    });
+
+    await runFreshReviewerPass('vp2', 'Title', 'Desc', ['admin-ui/src/components/NewWidget.tsx'], null, { value: '' });
+
+    const prompt = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[0];
+    if (typeof prompt !== 'string') throw new Error('expected reviewer prompt');
+    expect(prompt).toContain('/tmp/viewport_shots/after/newwidget/renders-widget-375px.png');
+    expect(prompt).toContain('[new]');
+  });
+
+  it('skips viewport section when manifest file is absent', async () => {
+    const idx = await import('../index.js');
+    const { default: fs } = await import('fs');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    // default mock returns '' (no manifest)
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+
+    await runFreshReviewerPass('vp3', 'Title', 'Desc', [], null, { value: '' });
+
+    const prompt = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[0];
+    if (typeof prompt !== 'string') throw new Error('expected reviewer prompt');
+    expect(prompt).not.toContain('Viewport screenshots');
+    expect(prompt).not.toContain('viewport_shots');
+  });
+
+  it('skips viewport section when all manifest pairs are unchanged', async () => {
+    const idx = await import('../index.js');
+    const { default: fs } = await import('fs');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+      if (typeof p === 'string' && p.includes('viewport_manifest_vp4')) {
+        return JSON.stringify({
+          pairs: [
+            { test_file: 'Foo.viewport.test.tsx', test: 'renders', status: 'unchanged',
+              before: '/tmp/viewport_shots/before/foo/renders-375px.png',
+              after: '/tmp/viewport_shots/after/foo/renders-375px.png',
+              diff: null, change_pct: null },
+          ],
+        });
+      }
+      return '';
+    });
+
+    await runFreshReviewerPass('vp4', 'Title', 'Desc', [], null, { value: '' });
+
+    const prompt = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[0];
+    if (typeof prompt !== 'string') throw new Error('expected reviewer prompt');
+    expect(prompt).not.toContain('Viewport screenshots');
+  });
+});
+
 // ── enable_fresh_reviewer flag integration ────────────────────────────────────
 describe('handleCreate — enable_fresh_reviewer flag', () => {
   const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
