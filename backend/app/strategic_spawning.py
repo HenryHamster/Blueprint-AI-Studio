@@ -984,6 +984,7 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
                     "drift_pct": rate_data.get("drift_pct"),
                 }
         if fc_trimmed:
+            fc_trimmed["repair_attempts"] = raw_fc.get("repair_attempts")
             result["format_compliance"] = fc_trimmed
     raw_atr = snapshot.get("agent_timeout_rate") or {}
     if raw_atr:
@@ -2733,7 +2734,8 @@ async def _build_recent_interventions(
                 # silently and the strategic cycle stalls.
                 Task.title,
                 Task.description,
-            raiseload=True,)
+                raiseload=True,
+            )
         )
         .order_by(Task.created_at.desc())
         .limit(500)
@@ -2753,7 +2755,9 @@ async def _build_recent_interventions(
             Task.project_id == project.id,
             Task.status.in_(_IN_FLIGHT_TASK_STATUSES),
         )
-        .options(load_only(Task.id, Task.status, Task.context, Task.payloads, raiseload=True))
+        .options(
+            load_only(Task.id, Task.status, Task.context, Task.payloads, raiseload=True)
+        )
     )
     active_tasks = list(active_tasks_result.scalars().all())
     held_tasks_result = await session.execute(
@@ -4173,9 +4177,7 @@ async def _spawn_strategic_review(
         _base_vision = dict(project.vision or {})
         _base_problem_model = dict(project.problem_model or {})
         _base_running_update = (
-            project.running_update
-            if isinstance(project.running_update, str)
-            else ""
+            project.running_update if isinstance(project.running_update, str) else ""
         )
 
     # Build direction stats with rich data. Include `active` + `paused` +
