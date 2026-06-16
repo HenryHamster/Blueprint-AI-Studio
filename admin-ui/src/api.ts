@@ -700,6 +700,25 @@ export interface ShadowLaneHealth {
   miss_rate: number | null;
 }
 
+export interface LanePilotTrialMetrics {
+  verdict: 'KILL' | 'ADOPT' | 'CONTINUE';
+  verdict_reason: string;
+  immediate_alert: boolean;
+  n_lane: number;
+  n_control: number;
+  lane_merge_rate: number | null;
+  control_merge_rate: number | null;
+  lane_cost_per_merged: number | null;
+  control_cost_per_merged: number | null;
+  checkpoint_loss_rate: number | null;
+  warm_resume_fraction: number | null;
+  checkpoint_fraction: number | null;
+  lane_fix_tasks_sampled: number;
+  control_warm_resume_count: number;
+  gate_integrity_violations: number;
+  [key: string]: unknown;
+}
+
 export interface ImprovementLanesResponse {
   lanes: ImprovementLaneRow[];
   total_returned: number;
@@ -707,6 +726,7 @@ export interface ImprovementLanesResponse {
   limit: number;
   project_id: string;
   shadow_health?: ShadowLaneHealth;
+  trial_metrics?: LanePilotTrialMetrics | null;
   [key: string]: unknown;
 }
 

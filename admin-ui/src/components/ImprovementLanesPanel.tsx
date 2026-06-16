@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, CircleDollarSign, GitBranch, RefreshCw, TimerReset, XCircle } from 'lucide-react';
-import { drainLanePilot, fetchImprovementLanes, fetchLanePilotPreflight, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse, type ShadowLaneHealth } from '../api';
+import { drainLanePilot, fetchImprovementLanes, fetchLanePilotPreflight, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse, type LanePilotTrialMetrics, type ShadowLaneHealth } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { formatAbsolute, formatDurationSec, parseTimestamp, timeAgo } from '../utils/time';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -69,6 +69,7 @@ function shadowClasses(shadow: boolean): string {
 export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps) {
   const [lanes, setLanes] = useState<ImprovementLaneRow[]>([]);
   const [shadowHealth, setShadowHealth] = useState<ShadowLaneHealth | null>(null);
+  const [trialMetrics, setTrialMetrics] = useState<LanePilotTrialMetrics | null>(null);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [collapsedPref, setCollapsedPref] = useState<boolean | null>(() => readCollapsedPreference());
@@ -97,6 +98,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
       if (signal?.aborted) return;
       setLanes(lanesData.lanes ?? []);
       setShadowHealth(lanesData.shadow_health ?? null);
+      setTrialMetrics(lanesData.trial_metrics ?? null);
       setPreflight(preflightData);
     } catch (e) {
       if (e instanceof Error && e.name === 'AbortError') return;
@@ -127,6 +129,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
   useEffect(() => {
     setLanes([]);
     setShadowHealth(null);
+    setTrialMetrics(null);
     setFetchError(null);
     setPreflight(null);
     setPreflightError(null);
@@ -257,6 +260,79 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                     </span>
                   </div>
                 ))}
+              </div>
+            </div>
+          )}
+          {trialMetrics && (
+            <div
+              data-testid="lane-pilot-trial-metrics"
+              className="mb-3 rounded border border-neutral-700 bg-neutral-950/60 p-2 text-xs"
+            >
+              <div className="mb-1.5 flex items-center gap-1.5">
+                <span className="font-semibold text-neutral-200">Trial metrics</span>
+                <span className={`ml-auto rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${trialMetrics.verdict === 'KILL' ? 'border-red-500/40 bg-red-500/15 text-red-300' : trialMetrics.verdict === 'ADOPT' ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : 'border-neutral-700 bg-neutral-800 text-neutral-300'}`}>
+                  {trialMetrics.verdict}
+                </span>
+                {trialMetrics.immediate_alert && (
+                  <span className="rounded border border-red-500/40 bg-red-500/15 px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none text-red-300">
+                    Alert
+                  </span>
+                )}
+              </div>
+              <div className="mb-1.5 text-[10px] text-neutral-500">
+                Reason: <span className="font-mono text-neutral-300">{trialMetrics.verdict_reason}</span>
+              </div>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-neutral-400 sm:grid-cols-4">
+                <div>
+                  <span className="text-neutral-500">Lane n </span>
+                  <span className="text-neutral-200">{trialMetrics.n_lane}</span>
+                </div>
+                <div>
+                  <span className="text-neutral-500">Control n </span>
+                  <span className="text-neutral-200">{trialMetrics.n_control}</span>
+                </div>
+                <div>
+                  <span className="text-neutral-500">Lane merge </span>
+                  <span className="text-neutral-200">
+                    {trialMetrics.lane_merge_rate != null ? `${(trialMetrics.lane_merge_rate * 100).toFixed(1)}%` : '—'}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-neutral-500">Control merge </span>
+                  <span className="text-neutral-200">
+                    {trialMetrics.control_merge_rate != null ? `${(trialMetrics.control_merge_rate * 100).toFixed(1)}%` : '—'}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-neutral-500">Lane $/merged </span>
+                  <span className="text-neutral-200">
+                    {trialMetrics.lane_cost_per_merged != null ? formatUsd(trialMetrics.lane_cost_per_merged) : '—'}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-neutral-500">Control $/merged </span>
+                  <span className="text-neutral-200">
+                    {trialMetrics.control_cost_per_merged != null ? formatUsd(trialMetrics.control_cost_per_merged) : '—'}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-neutral-500">Checkpoint loss </span>
+                  <span className={trialMetrics.checkpoint_loss_rate != null && trialMetrics.checkpoint_loss_rate > 0.05 ? 'text-red-300' : 'text-neutral-200'}>
+                    {trialMetrics.checkpoint_loss_rate != null ? `${(trialMetrics.checkpoint_loss_rate * 100).toFixed(1)}%` : '—'}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-neutral-500">Warm resume </span>
+                  <span className="text-neutral-200">
+                    {trialMetrics.warm_resume_fraction != null ? `${(trialMetrics.warm_resume_fraction * 100).toFixed(1)}%` : '—'}
+                  </span>
+                </div>
+                {trialMetrics.gate_integrity_violations > 0 && (
+                  <div className="col-span-2 sm:col-span-4">
+                    <span className="text-neutral-500">Gate violations </span>
+                    <span className="text-red-300">{trialMetrics.gate_integrity_violations}</span>
+                  </div>
+                )}
               </div>
             </div>
           )}

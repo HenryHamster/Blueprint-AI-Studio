@@ -1528,6 +1528,20 @@ async def get_improvement_lanes(
     # of the current page.
     shadow_health = await _compute_shadow_lane_health(project_id, session)
 
+    # Trial metrics: compute per-arm aggregates and evaluate the live verdict.
+    # Wrapped in try/except so an aggregation failure never breaks the lanes list.
+    trial_metrics: Dict[str, Any] | None = None
+    try:
+        from app.review_fix_lane_pilot import compute_lane_pilot_aggregates
+        from app.capability_trial_verdict import evaluate_lane_pilot_verdict
+
+        aggregates = await compute_lane_pilot_aggregates(session, project_id)
+        trial_metrics = evaluate_lane_pilot_verdict(aggregates)
+    except Exception:
+        logger.exception(
+            "Failed to compute lane pilot trial metrics for %s", project_id
+        )
+
     return {
         "lanes": rows,
         "total_returned": len(rows),
@@ -1535,6 +1549,7 @@ async def get_improvement_lanes(
         "limit": limit,
         "project_id": str(project_id),
         "shadow_health": shadow_health,
+        "trial_metrics": trial_metrics,
     }
 
 

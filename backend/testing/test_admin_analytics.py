@@ -2731,6 +2731,85 @@ class TestShadowLaneHealth:
         assert sh["miss_rate"] is None
 
 
+# ---------------------------------------------------------------------------
+# TestImprovementLanesTrialMetrics
+# ---------------------------------------------------------------------------
+
+
+class TestImprovementLanesTrialMetrics:
+    """Tests for trial_metrics field in GET /api/admin/improvement-lanes."""
+
+    @pytest.mark.asyncio
+    async def test_trial_metrics_present_with_zero_counts_when_no_pilot_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """No pilot tasks → trial_metrics has n_lane=0, n_control=0, verdict=CONTINUE."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "trial_metrics" in body
+        tm = body["trial_metrics"]
+        assert tm is not None
+        assert tm["n_lane"] == 0
+        assert tm["n_control"] == 0
+        assert tm["verdict"] == "CONTINUE"
+        assert tm["verdict_reason"] == "insufficient_data"
+        assert isinstance(tm["immediate_alert"], bool)
+
+    @pytest.mark.asyncio
+    async def test_trial_metrics_present_alongside_lanes_and_shadow_health(
+        self, client: AsyncClient, db_session
+    ):
+        """trial_metrics is returned alongside the lanes list and shadow_health keys."""
+        project = make_project()
+        db_session.add(project)
+        # Commit the project first so its row physically exists before the lane
+        # is inserted. ImprovementLane.project_id is a bare FK column with no ORM
+        # relationship() to Project, so a single flush has no unit-of-work
+        # dependency to order the project insert ahead of the lane — committing
+        # both together can insert the lane first and trip
+        # improvementlane_project_id_fkey. Mirrors every other lane test here.
+        await db_session.commit()
+        lane = _make_lane(project.id, status=ImprovementLaneStatus.ACTIVE.value)
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        # All three top-level fields must coexist.
+        assert "lanes" in body
+        assert "shadow_health" in body
+        assert "trial_metrics" in body
+
+    @pytest.mark.asyncio
+    async def test_trial_metrics_null_when_aggregation_raises(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Aggregation failure → trial_metrics is None, lanes list still returned."""
+        import app.review_fix_lane_pilot as _rlp
+
+        async def _bad_aggregates(session, project_id):
+            raise RuntimeError("simulated aggregation failure")
+
+        monkeypatch.setattr(_rlp, "compute_lane_pilot_aggregates", _bad_aggregates)
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "lanes" in body
+        # trial_metrics is null when aggregation fails.
+        assert body.get("trial_metrics") is None
+
+
 class TestLaneBaselines:
     """Tests for GET /api/admin/lane-baselines."""
 

@@ -618,9 +618,14 @@ async def checkpoint_and_reserve_on_phase_complete(
         return False
 
     if reachable is None:
+        # Transient GitHub API failure (rate limit, network, credentials) — do
+        # NOT call mark_checkpoint_missing, which would burn a phase_requeues
+        # budget slot.  Three transient failures must not kill a lane that has
+        # no genuine SHA-reachability problem.  The checkpoint is simply skipped
+        # for this phase; the lane stays ACTIVE and can be retried.
         logger.warning(
-            "[LANE-PILOT] SHA reachability indeterminate for lane %s sha=%s — "
-            "skipping checkpoint without burning requeue budget",
+            "[LANE-PILOT] SHA reachability indeterminate (transient) for lane %s "
+            "sha=%s — skipping checkpoint without consuming requeue budget",
             lane.id,
             str(sha)[:8],
         )

@@ -642,6 +642,72 @@ async def test_mark_checkpoint_missing_exhausted_budget(db: AsyncSession):
     assert updated.phase_requeues == _LANE_MAX_PHASE_REQUEUES + 1
 
 
+@pytest.mark.asyncio
+async def test_mark_checkpoint_missing_emits_pre_exhaustion_warning(
+    db: AsyncSession, caplog
+):
+    """When phase_requeues reaches _LANE_MAX_PHASE_REQUEUES - 1, emit WARNING alert."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/miss-pre-exhaust",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    # Start with phase_requeues at _LANE_MAX_PHASE_REQUEUES - 2, so after increment
+    # it will be at _LANE_MAX_PHASE_REQUEUES - 1 (two out of three used)
+    lane.phase_requeues = _LANE_MAX_PHASE_REQUEUES - 2
+    await db.commit()
+
+    with caplog.at_level("WARNING"):
+        updated, should_requeue = await mark_checkpoint_missing(
+            db, lane.id, reason="test_reason"
+        )
+    await db.commit()
+
+    assert should_requeue is True
+    assert updated.phase_requeues == _LANE_MAX_PHASE_REQUEUES - 1
+    # Verify that the pre-exhaustion warning was emitted
+    assert "approaching phase_requeues exhaustion" in caplog.text
+    assert "one more miss will trigger kill" in caplog.text
+    assert str(lane.id) in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mark_checkpoint_missing_no_warning_when_under_limit(
+    db: AsyncSession, caplog
+):
+    """When phase_requeues is below _LANE_MAX_PHASE_REQUEUES - 1, no pre-exhaustion warning."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/miss-under-limit",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    # Start with phase_requeues = 0, so after increment it will be 1
+    # (well under the _LANE_MAX_PHASE_REQUEUES - 1 threshold of 2)
+    lane.phase_requeues = 0
+    await db.commit()
+
+    with caplog.at_level("WARNING"):
+        updated, should_requeue = await mark_checkpoint_missing(db, lane.id)
+    await db.commit()
+
+    assert should_requeue is True
+    assert updated.phase_requeues == 1
+    # Verify that the pre-exhaustion warning was NOT emitted
+    assert "approaching phase_requeues exhaustion" not in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # manifest bounding
 # ---------------------------------------------------------------------------

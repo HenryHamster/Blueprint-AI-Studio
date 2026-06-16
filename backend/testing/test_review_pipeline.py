@@ -16102,7 +16102,7 @@ class TestLaneCheckpointShaVerification:
     async def test_lane_checkpoint_sha_verification_unavailable_degrades(
         self, db_session, mocker
     ):
-        """API returns None (indeterminate) → return False WITHOUT burning
+        """API returns None (transient) → skip checkpoint without burning
         phase_requeues budget; checkpoint_lane must NOT be called."""
         mocker.patch(
             "app.github_token_resolver.get_github_token_for_task",
@@ -16134,7 +16134,7 @@ class TestLaneCheckpointShaVerification:
         assert result is False
         mock_checkpoint_lane.assert_not_called()
         await db_session.refresh(lane)
-        # Transient/indeterminate must NOT increment phase_requeues.
+        # Transient unavailability must NOT burn a requeue slot.
         assert (lane.phase_requeues or 0) == initial_requeues
 
     @pytest.mark.asyncio
