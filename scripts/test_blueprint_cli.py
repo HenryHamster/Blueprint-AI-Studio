@@ -32,6 +32,7 @@ HELP_INVOCATIONS = [
     ["versions"],
     ["versions", "list"],
     ["versions", "show"],
+    ["versions", "export-changelog"],
     ["promote-recover"],
     ["logs"],
     ["logs", "errors"],
@@ -137,7 +138,12 @@ def mock_api(monkeypatch):
                 "recent_versions": [
                     {"id": "uuid-v11", "version_number": 11, "phase": "stabilize",
                      "status": "promoted", "promoted_sha": "deadbeef",
-                     "merged_task_count": 10},
+                     "merged_task_count": 10, "merged_count": 10,
+                     "highlights": {"headline": "promoted & serving",
+                                    "merged_count": 10, "proven": 8,
+                                    "total_merged_for_acceptance": 10,
+                                    "qualification_confidence": None,
+                                    "qualification_threshold": None}},
                 ],
                 "promotion_enabled_effective": True,
                 "promotion_enabled_source": "fleet",
@@ -798,6 +804,19 @@ def test_versions_list_shows_headline(mock_api, capsys):
     assert "promoted" in out
 
 
+def test_versions_list_uses_server_headline_for_past_versions(mock_api, capsys):
+    """versions list shows the server-supplied highlights.headline (not a local
+    re-derivation) for past versions, and shows a merged count."""
+    rc = blueprint.main(["versions", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The mock recent_versions entry has highlights.headline = "promoted & serving"
+    # and merged_count / merged_task_count = 10.
+    assert "promoted & serving" in out
+    # merged count from the row
+    assert "merged=10" in out
+
+
 def test_version_headline_derivation():
     """_version_headline mirrors the backend summary headline for each state."""
     assert (
@@ -962,3 +981,97 @@ def test_top_level_help_has_auth_epilog():
     parser = blueprint.build_parser()
     assert parser.epilog is not None
     assert "BLUEPRINT_API_KEY" in parser.epilog
+
+
+# ── versions export-changelog ─────────────────────────────────────────────────
+
+def test_versions_export_changelog_stdout(mock_api, capsys):
+    """versions export-changelog emits grouped markdown headers and PR links to stdout."""
+    rc = blueprint.main(["versions", "export-changelog"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "## What shipped in v12" in out
+    # tasks_merged has create and fix types
+    assert "### create" in out
+    assert "### fix" in out
+    assert "#101" in out
+    assert "Add widget feature" in out
+    assert "#102" in out
+    assert "Fix null pointer" in out
+
+
+def test_versions_export_changelog_historical(mock_api, capsys):
+    """versions export-changelog N fetches the named version's summary and renders markdown."""
+    rc = blueprint.main(["versions", "export-changelog", "11"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "## What shipped in v11" in out
+    assert "### create" in out
+    assert "#90" in out
+    assert "Shipped feature A" in out
+    assert "### refactor" in out
+    assert "#91" in out
+    # summary endpoint must have been called for v11
+    assert any("release-versions/uuid-v11/summary" in p for _, p, _ in mock_api)
+
+
+def test_versions_export_changelog_to_file(mock_api, capsys, tmp_path):
+    """versions export-changelog --out FILE writes markdown to the given path."""
+    out_file = tmp_path / "changelog.md"
+    rc = blueprint.main(["versions", "export-changelog", "--out", str(out_file)])
+    assert rc == 0
+    content = out_file.read_text(encoding="utf-8")
+    assert "## What shipped in v12" in content
+    assert "### create" in content
+    assert "#101" in content
+    # stdout should only have the "Wrote changelog to..." notice
+    out = capsys.readouterr().out
+    assert str(out_file) in out
+
+
+def test_versions_export_changelog_empty_version(mock_api, monkeypatch, capsys):
+    """versions export-changelog with no tasks_merged emits the no-tasks message."""
+    def fake_api(method, path, body=None, timeout=30):
+        if "version-lifecycle" in path:
+            return {
+                "current_version": {
+                    "version_number": 99, "phase": "build",
+                    "tasks_merged": [],
+                },
+                "recent_versions": [],
+            }
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["versions", "export-changelog"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "No tasks merged" in out
+
+
+def test_changelog_to_markdown_pure():
+    """_changelog_to_markdown groups by type and formats bullet lines correctly."""
+    tasks = [
+        {"task_type": "create", "title": "Add widget feature", "pr_number": 101},
+        {"task_type": "fix", "title": "Fix null pointer", "pr_number": 102},
+        {"task_type": "create", "title": "New dashboard", "pr_number": 103},
+    ]
+    md = blueprint._changelog_to_markdown(tasks, heading="What shipped in v42")
+    assert "## What shipped in v42" in md
+    # create section has 2 entries
+    assert "### create (2)" in md
+    assert "- #101 Add widget feature" in md
+    assert "- #103 New dashboard" in md
+    # fix section has 1 entry
+    assert "### fix (1)" in md
+    assert "- #102 Fix null pointer" in md
+
+
+def test_changelog_to_markdown_no_pr():
+    """_changelog_to_markdown omits PR prefix when pr_number is None."""
+    tasks = [{"task_type": "other", "title": "Internal cleanup", "pr_number": None}]
+    md = blueprint._changelog_to_markdown(tasks)
+    assert "- Internal cleanup" in md
+    assert "#" not in md

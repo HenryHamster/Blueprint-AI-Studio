@@ -681,7 +681,7 @@ async def test_all_surfaces_agree_serving_status(db_session):
     surface1_status = snap.version.serving.status
 
     # Surface 2: admin release-version serialization.
-    surface2_entry = _serialize_version_history_entry(version_row, project)
+    surface2_entry = await _serialize_version_history_entry(version_row, project)
     surface2_status = surface2_entry["aggregate_serving_status"]
 
     # Surface 3: strategic-spawning version entry.

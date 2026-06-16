@@ -1028,7 +1028,7 @@ function VersionHighlightsLine({
   status,
 }: {
   highlights: VersionSummaryHighlights;
-  phase: string;
+  phase?: string | null;
   status: string;
 }) {
   const conf =
@@ -1046,7 +1046,7 @@ function VersionHighlightsLine({
         <span>{highlights.merged_count} merged</span>
         <span>{highlights.proven}/{highlights.total_merged_for_acceptance} proven</span>
         {conf && thresh && <span>conf {conf} / thr {thresh}</span>}
-        <span className="text-neutral-500">{phase} · {status}</span>
+        {phase && <span className="text-neutral-500">{phase} · {status}</span>}
       </div>
     </div>
   );
@@ -1911,6 +1911,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     </div>
                     {v.out_of_band_promotion && (
                       <OutOfBandPromotionBadge oob={v.out_of_band_promotion} />
+                    )}
+                    {!isExpanded && v.highlights && (
+                      <VersionHighlightsLine highlights={v.highlights} phase={v.phase} status={v.status} />
                     )}
                     <ArtifactEvidenceList artifacts={v.artifacts} />
                     {isExpanded && v.id && <VersionHistorySummary versionId={v.id} />}

@@ -611,6 +611,52 @@ def cmd_versions(args: argparse.Namespace) -> None:
     recent = lifecycle.get("recent_versions") or []
     sub = getattr(args, "versions_cmd", None) or "list"
 
+    if sub == "export-changelog":
+        target = getattr(args, "version_number", None)
+        ver = cv
+        if target is not None:
+            ver = None
+            if cv and str(cv.get("version_number")) == str(target):
+                ver = cv
+            else:
+                for v in recent:
+                    if str(v.get("version_number")) == str(target):
+                        ver = v
+                        break
+        if not ver and target is not None:
+            ver_summary, _ = _safe_read(
+                f"/api/admin/projects/{pid}/release-versions/{target}/summary"
+            )
+            if ver_summary:
+                ver = ver_summary
+        if not ver:
+            msg = (f"version {target} not found"
+                   if target is not None else "no open version")
+            print(msg, file=sys.stderr)
+            return
+        ver_num = ver.get("version_number")
+        if ver is cv:
+            tasks_merged = cv.get("tasks_merged") or []
+        else:
+            ver_id = ver.get("id")
+            if ver_id:
+                ver_summary, _ = _safe_read(
+                    f"/api/admin/release-versions/{ver_id}/summary"
+                )
+                tasks_merged = (ver_summary or {}).get("tasks_merged") or []
+            else:
+                tasks_merged = ver.get("tasks_merged") or []
+        heading = f"What shipped in v{ver_num}"
+        md = _changelog_to_markdown(tasks_merged, heading=heading)
+        out_path = getattr(args, "out", None)
+        if out_path:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(md)
+            print(f"Wrote changelog to {out_path}")
+        else:
+            print(md, end="")
+        return
+
     if sub == "show":
         target = getattr(args, "version_number", None)
         ver = cv
@@ -718,11 +764,16 @@ def _version_line(v: dict, marker: str = " ") -> str:
     phase = v.get("phase", "?")
     status = v.get("status", "open")
     sha = (v.get("promoted_sha") or v.get("served_sha") or "-")[:12]
-    merged = v.get("merged_task_count")
+    merged = v.get("merged_task_count") or v.get("merged_count")
     merged_str = f"  merged={merged}" if merged is not None else ""
     tasks_merged = v.get("tasks_merged") or []
     tasks_str = f"  tasks={len(tasks_merged)}" if tasks_merged else ""
-    headline = _version_headline(v)
+    # Prefer the server-computed headline when present; fall back to local derivation.
+    server_highlights = v.get("highlights")
+    if isinstance(server_highlights, dict) and server_highlights.get("headline"):
+        headline = server_highlights["headline"]
+    else:
+        headline = _version_headline(v)
     return (f"  {marker} v{num}  [{status:9}] phase={phase:9} sha={sha}"
             f"{merged_str}{tasks_str}  — {headline}")
 
@@ -739,6 +790,34 @@ def _render_version_list(data: dict) -> None:
         print("\n  --- Recent ---")
         for v in recent:
             print(_version_line(v))
+
+
+def _changelog_to_markdown(tasks_merged: list, heading: str | None = None) -> str:
+    """Format a tasks_merged list as a Markdown release-notes block.
+
+    Groups entries by task_type (sorted alphabetically) and emits a
+    ``## heading`` (when provided) followed by ``### type (N)`` sections
+    with ``- #PR title`` bullet lines.
+    """
+    if not tasks_merged:
+        return "No tasks merged into this version.\n"
+    lines: list = []
+    if heading:
+        lines.append(f"## {heading}\n")
+    by_type: dict = {}
+    for t in tasks_merged:
+        ttype = t.get("task_type") or "other"
+        by_type.setdefault(ttype, []).append(t)
+    for ttype in sorted(by_type):
+        group = by_type[ttype]
+        lines.append(f"### {ttype} ({len(group)})")
+        for item in group:
+            pr = item.get("pr_number")
+            title = (item.get("title") or "").strip()
+            pr_str = f"#{pr} " if pr else ""
+            lines.append(f"- {pr_str}{title}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _render_version_summary(s: dict) -> None:
@@ -1115,6 +1194,13 @@ def build_parser() -> argparse.ArgumentParser:
                                               help="Show a version summary (current by default).")
     p_versions_show.add_argument("version_number", nargs="?", default=None,
                                  help="Version number (defaults to the open version).")
+    p_versions_export = versions_sub.add_parser(
+        "export-changelog", parents=[common],
+        help="Export the version changelog as Markdown (stdout or --out FILE).")
+    p_versions_export.add_argument("version_number", nargs="?", default=None,
+                                   help="Version number (defaults to the open version).")
+    p_versions_export.add_argument("--out", metavar="FILE", default=None,
+                                   help="Write output to FILE instead of stdout.")
 
     # promote-recover
     p_pr = sub.add_parser("promote-recover", parents=[common],

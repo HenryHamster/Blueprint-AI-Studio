@@ -208,14 +208,48 @@ def _closed_version_until(version: ReleaseVersion) -> Optional[datetime]:
     return None
 
 
-def _serialize_version_history_entry(
-    version: ReleaseVersion, project: Optional[Any] = None
+async def _serialize_version_history_entry(
+    version: ReleaseVersion,
+    project: Optional[Any] = None,
+    *,
+    session: Optional[AsyncSession] = None,
+    project_id: Optional[uuid.UUID] = None,
 ) -> dict[str, Any]:
+    from app.release_version import (  # noqa: PLC0415
+        count_merged_since,
+        compute_version_acceptance_aggregate,
+    )
+
     aggregate, artifacts = _version_serving_summary(version, project)
+
+    # Enrich each history entry with the same server-computed highlights and
+    # merged counts the per-version summary endpoint produces, bounded by the
+    # closed-version window so later-version merges are not double-counted.
+    highlights: Optional[dict[str, Any]] = None
+    merged_count: Optional[int] = None
+    merged_task_count: Optional[int] = None
+    acceptance_aggregate: Optional[dict[str, Any]] = None
+    if session is not None and project_id is not None:
+        version_until = _closed_version_until(version)
+        merged_count = await count_merged_since(
+            session, project_id, version.opened_at, until=version_until
+        )
+        merged_task_count = merged_count
+        acceptance_aggregate = await compute_version_acceptance_aggregate(
+            session, project_id, since=version.opened_at, until=version_until
+        )
+        highlights = _release_version.build_version_highlights(
+            version,
+            merged_count=merged_count,
+            aggregate_serving_status=aggregate["serving_status"],
+            acceptance_aggregate=acceptance_aggregate,
+        )
+
     return {
         "id": str(version.id),
         "version_number": version.version_number,
         "status": version.status,
+        "phase": version.phase,
         "opened_at": version.opened_at.isoformat(),
         "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
         "qualification_attempts": version.qualification_attempts,
@@ -262,6 +296,14 @@ def _serialize_version_history_entry(
         # this version outside the normal qualification flow. Degrades gracefully
         # when the model column is absent (sibling PR not yet on this branch).
         "out_of_band_promotion": getattr(version, "out_of_band_promotion", None),
+        # Server-computed highlights (headline + metrics) — additive; null when
+        # session/project_id not provided (older callers degrade gracefully).
+        "highlights": highlights,
+        # Merged-task count for this version's window (both keys for consistency:
+        # current_version uses merged_task_count, summary endpoint uses merged_count).
+        "merged_count": merged_count,
+        "merged_task_count": merged_task_count,
+        "acceptance_aggregate": acceptance_aggregate,
     }
 
 
@@ -674,12 +716,20 @@ async def get_version_lifecycle(
             session, project_id
         )
 
+        recent_versions = []
+        for version in history_rows:
+            recent_versions.append(
+                await _serialize_version_history_entry(
+                    version,
+                    project_row,
+                    session=session,
+                    project_id=project_id,
+                )
+            )
+
         return {
             "current_version": current_version_out,
-            "recent_versions": [
-                _serialize_version_history_entry(version, project_row)
-                for version in history_rows
-            ],
+            "recent_versions": recent_versions,
             "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
             # Per-project live-promotion enablement. ``promotion_enabled_effective``
             # is the value the promotion gate actually consults for THIS project (the

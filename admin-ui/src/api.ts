@@ -1742,6 +1742,7 @@ export interface RecentVersion {
   id?: string;
   version_number: number;
   status: string;
+  phase?: string | null;
   opened_at: string;
   promoted_at: string | null;
   qualification_attempts: number;
@@ -1768,6 +1769,12 @@ export interface RecentVersion {
   deploy_confirm_deadline?: string | null;
   // Out-of-band promotion provenance — see CurrentVersion.
   out_of_band_promotion?: OutOfBandPromotion | null;
+  // Server-computed highlights (headline + metrics) — additive; null on older backends.
+  highlights?: VersionSummaryHighlights | null;
+  // Merged-task count for this version's window. Both keys present for consistency.
+  merged_count?: number | null;
+  merged_task_count?: number | null;
+  acceptance_aggregate?: Record<string, number> | null;
 }
 
 export interface PromotionReadinessConfidence {

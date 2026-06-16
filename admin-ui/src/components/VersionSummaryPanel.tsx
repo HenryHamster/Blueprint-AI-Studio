@@ -1,4 +1,4 @@
-import type { JSX } from 'react';
+import { useState, type JSX } from 'react';
 import type { ChangelogEntry } from '../api';
 import { isSafeUrl } from './TaskCard';
 
@@ -15,6 +15,22 @@ function groupByType(entries: ChangelogEntry[]): Map<string, ChangelogEntry[]> {
     }
   }
   return groups;
+}
+
+function exportChangelogMarkdown(entries: ChangelogEntry[], heading?: string): string {
+  if (entries.length === 0) return 'No tasks merged into this version.\n';
+  const lines: string[] = [];
+  if (heading) lines.push(`## ${heading}\n`);
+  const groups = groupByType(entries);
+  for (const [type, group] of groups.entries()) {
+    lines.push(`### ${type} (${group.length})`);
+    for (const entry of group) {
+      const pr = entry.pr_number != null ? `#${entry.pr_number} ` : '';
+      lines.push(`- ${pr}${entry.title ?? ''}`);
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
 }
 
 function TaskRow({ entry }: { entry: ChangelogEntry }): JSX.Element {
@@ -71,6 +87,8 @@ export function VersionSummaryPanel({
   tasksMerged: ChangelogEntry[] | undefined;
   heading?: string;
 }): JSX.Element | null {
+  const [copied, setCopied] = useState(false);
+
   if (tasksMerged === undefined) return null;
 
   if (tasksMerged.length === 0) {
@@ -86,13 +104,31 @@ export function VersionSummaryPanel({
 
   const groups = groupByType(tasksMerged);
 
+  const handleCopyMarkdown = () => {
+    const md = exportChangelogMarkdown(tasksMerged, heading ?? 'What shipped');
+    navigator.clipboard.writeText(md).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
+  };
+
   return (
     <div
       data-testid="version-summary-panel"
       className="mt-3 rounded border border-slate-700/60 bg-slate-800/40 px-3 py-2"
     >
-      <div className="text-[11px] font-semibold text-slate-400 mb-2">
-        {heading ?? 'What shipped'} ({tasksMerged.length} task{tasksMerged.length !== 1 ? 's' : ''})
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[11px] font-semibold text-slate-400">
+          {heading ?? 'What shipped'} ({tasksMerged.length} task{tasksMerged.length !== 1 ? 's' : ''})
+        </div>
+        <button
+          onClick={handleCopyMarkdown}
+          data-testid="copy-markdown-button"
+          className="text-[10px] text-slate-500 hover:text-slate-300 transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center"
+          title="Copy changelog as Markdown"
+        >
+          {copied ? 'Copied!' : 'Copy markdown'}
+        </button>
       </div>
       <div className="max-h-48 overflow-y-auto pr-1">
         {Array.from(groups.entries()).map(([type, entries]) => (

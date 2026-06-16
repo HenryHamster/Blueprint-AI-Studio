@@ -11264,7 +11264,8 @@ class TestVersionLifecycleOutOfBandPromotion:
         v.out_of_band_promotion = oob
         return v
 
-    def test_serialize_history_entry_includes_oob_when_set(self):
+    @pytest.mark.asyncio
+    async def test_serialize_history_entry_includes_oob_when_set(self):
         """_serialize_version_history_entry passes out_of_band_promotion through
         verbatim when it is present on the version object."""
         from app.routers.admin_release_version import _serialize_version_history_entry
@@ -11280,11 +11281,12 @@ class TestVersionLifecycleOutOfBandPromotion:
                 return_value=None,
             ),
         ):
-            result = _serialize_version_history_entry(v)
+            result = await _serialize_version_history_entry(v)
 
         assert result["out_of_band_promotion"] == self._OOB
 
-    def test_serialize_history_entry_null_when_absent(self):
+    @pytest.mark.asyncio
+    async def test_serialize_history_entry_null_when_absent(self):
         """_serialize_version_history_entry emits null for out_of_band_promotion
         when the attribute is not set (degrades gracefully before column lands)."""
         from app.routers.admin_release_version import _serialize_version_history_entry
@@ -11300,7 +11302,7 @@ class TestVersionLifecycleOutOfBandPromotion:
                 return_value=None,
             ),
         ):
-            result = _serialize_version_history_entry(v)
+            result = await _serialize_version_history_entry(v)
 
         assert result["out_of_band_promotion"] is None
 
@@ -17568,3 +17570,166 @@ class TestGetReleaseVersionSummary:
         # But the headline should be "promoted & serving" because the aggregate is
         # serving_confirmed
         assert data["highlights"]["headline"] == "promoted & serving"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# recent_versions highlights + merged count (GET /api/admin/projects/{id}/version-lifecycle)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRecentVersionsHighlights:
+    """recent_versions entries carry server-computed highlights and merged counts."""
+
+    @pytest.mark.asyncio
+    async def test_recent_versions_highlights_match_summary_endpoint(
+        self, client: AsyncClient, db_session
+    ):
+        """recent_versions[].highlights.headline equals the per-version summary
+        endpoint headline for the same promoted version, and merged_count /
+        merged_task_count are present and correct over the bounded window."""
+        from app.time_utils import _utcnow
+        from datetime import timedelta
+
+        project = await _make_project(db_session)
+        opened = _utcnow() - timedelta(hours=2)
+        promoted_at = _utcnow() - timedelta(hours=1)
+
+        promoted = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=opened,
+            promoted_at=promoted_at,
+            serving_status="serving_confirmed",
+            served_sha="abc1234567890",
+            last_qualification={"status": "promoted", "confidence": 0.95},
+        )
+        # A second closed (abandoned) version exercises the multi-row enrichment
+        # path and ensures sequential session use doesn't race.
+        abandoned = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="abandoned",
+            opened_at=promoted_at,
+            promoted_at=None,
+        )
+        # Open version so the lifecycle endpoint finds a current_version.
+        open_ver = ReleaseVersion(
+            project_id=project.id,
+            version_number=3,
+            phase="build",
+            status="open",
+            opened_at=_utcnow(),
+        )
+        db_session.add_all([promoted, abandoned, open_ver])
+        await db_session.commit()
+        await db_session.refresh(promoted)
+
+        # Two tasks landed inside the promoted version's window (opened_at → promoted_at).
+        for _ in range(2):
+            task = Task(
+                project_id=project.id,
+                title="landed task",
+                prompt="do work",
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+                updated_at=opened + timedelta(minutes=30),
+            )
+            db_session.add(task)
+        await db_session.commit()
+
+        readiness = patch(
+            "app.release_qualifier.compute_promotion_readiness",
+            new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+        )
+        audit = patch(
+            "app.release_qualifier.resolve_lifecycle_audit_evidence",
+            new=AsyncMock(
+                return_value={
+                    "state": "none",
+                    "latest_audit": None,
+                    "stale_audit": None,
+                }
+            ),
+        )
+        with readiness, audit:
+            lifecycle_resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+        assert lifecycle_resp.status_code == 200, lifecycle_resp.text
+        recent = lifecycle_resp.json()["recent_versions"]
+        # Both closed versions must appear — this exercises the multi-row enrichment
+        # path that previously used asyncio.gather and could race on the session.
+        assert len(recent) >= 2, f"expected >=2 closed versions, got {len(recent)}"
+        row = next(r for r in recent if r["version_number"] == 1)
+
+        # Highlights and merged counts must be present.
+        assert row["highlights"] is not None, "highlights must be populated"
+        assert "headline" in row["highlights"]
+        assert row["merged_count"] is not None
+        assert row["merged_task_count"] is not None
+        assert row["merged_count"] == row["merged_task_count"]
+
+        # Fetch the per-version summary for the same closed version.
+        summary_resp = await client.get(
+            f"/api/admin/release-versions/{promoted.id}/summary"
+        )
+        assert summary_resp.status_code == 200, summary_resp.text
+        summary = summary_resp.json()
+
+        # The headline must match byte-for-byte between recent_versions and summary.
+        assert row["highlights"]["headline"] == summary["highlights"]["headline"], (
+            f"lifecycle headline {row['highlights']['headline']!r} != "
+            f"summary headline {summary['highlights']['headline']!r}"
+        )
+        # Both merged counts must equal the summary endpoint's merged_count.
+        assert row["merged_count"] == summary["merged_count"]
+        assert row["merged_task_count"] == summary["merged_count"]
+
+    @pytest.mark.asyncio
+    async def test_recent_versions_highlights_null_gracefully_without_session(
+        self, client: AsyncClient, db_session
+    ):
+        """recent_versions[] entries include highlights=null when the enrichment
+        path is skipped (no session/project_id), meaning older callers stay compatible.
+        Verified via unit-call of _serialize_version_history_entry without session."""
+        from datetime import datetime
+        from unittest.mock import MagicMock
+        from app.routers.admin_release_version import _serialize_version_history_entry
+
+        v = MagicMock(spec=ReleaseVersion)
+        v.id = uuid.uuid4()
+        v.version_number = 1
+        v.status = "promoted"
+        v.phase = "stabilize"
+        v.opened_at = datetime(2026, 1, 1)
+        v.promoted_at = datetime(2026, 6, 1)
+        v.qualification_attempts = 0
+        v.last_qualification = None
+        v.serving_status = None
+        v.served_sha = None
+        v.served_at = None
+        v.deploy_failure_reason = None
+        v.deploy_confirm_deadline = None
+        v.deploy_artifacts = []
+        v.out_of_band_promotion = None
+
+        with (
+            patch(
+                "app.routers.admin_release_version._version_serving_summary",
+                return_value=({"serving_status": None, "reason_code": None}, []),
+            ),
+            patch(
+                "app.release_version.summarize_qualification_state",
+                return_value=None,
+            ),
+        ):
+            result = await _serialize_version_history_entry(v)
+
+        # Without session/project_id the enrichment fields are null — safe degradation.
+        assert result["highlights"] is None
+        assert result["merged_count"] is None
+        assert result["merged_task_count"] is None
+        assert result["acceptance_aggregate"] is None
