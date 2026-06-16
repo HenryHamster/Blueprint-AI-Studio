@@ -13,6 +13,7 @@ on the local SQLite harness, mirroring
 fail-safe / determinism cases that need no scratch DB run everywhere.
 """
 
+import asyncio
 import contextlib
 import os
 from unittest.mock import AsyncMock
@@ -278,6 +279,57 @@ async def test_fetch_failure_defers(monkeypatch):
 
     assert verdict == "defer", detail
     assert "deadbeef" in detail
+
+
+# --- Concurrency safety (runs everywhere) ----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_applies_are_serialized():
+    """Alembic's runtime is PROCESS-GLOBAL — the ``op``/``context`` proxies are
+    module-level singletons rebound on every ``EnvironmentContext`` enter — so two
+    in-process migration applies running concurrently corrupt each other. That is
+    the flaky ``KeyError: 'config'`` that false-failed a release qualification to
+    ``infra_failure`` on 2026-06-16: the qualifier runs this gate PRE-LOCK, so two
+    overlapping finalize attempts genuinely invoke it at the same time.
+
+    ``_apply_candidate_migrations`` must therefore serialize the apply so no two
+    are ever live at once. The fake connection models the real apply, whose
+    greenlet-bridged DDL yields to the event loop at each statement — the exact
+    window a concurrent apply would interleave into and clobber the global proxy.
+    Without the lock, ``active`` would exceed 1."""
+    import app.migration_apply_gate as gate_mod
+
+    state = {"active": 0, "max": 0}
+
+    class _FakeConn:
+        async def run_sync(self, _fn):
+            state["active"] += 1
+            state["max"] = max(state["max"], state["active"])
+            await asyncio.sleep(0.02)  # yield: a concurrent apply could interleave
+            state["active"] -= 1
+
+    @contextlib.asynccontextmanager
+    async def _fake_connect():
+        yield _FakeConn()
+
+    class _FakeEngine:
+        def connect(self):
+            return _fake_connect()
+
+    sources = {"0001_init.py": "revision = '0001'\ndown_revision = None\n"}
+    await asyncio.gather(
+        *(
+            gate_mod._apply_candidate_migrations(_FakeEngine(), sources)
+            for _ in range(3)
+        )
+    )
+
+    assert state["max"] == 1, (
+        f"concurrent in-process Alembic applies observed (max={state['max']}); the "
+        "apply must be serialized to protect Alembic's process-global op/context "
+        "proxies"
+    )
 
 
 # --- Fail-safe cases that need no scratch DB (run everywhere) ---------------
