@@ -2500,9 +2500,7 @@ async def test_concurrent_spawn_ticks_create_exactly_one_research_task(
     # commit, which would make the second tick skip before reaching the race
     # window. Replace it with a lock-free eligibility read — the lifecycle is
     # not what's under test, the claim at INSERT time is.
-    async def _lockfree_lifecycle(
-        prj, _session, _cooldown_minutes, busy_direction_ids, _now
-    ):
+    async def _lockfree_lifecycle(prj, _session, busy_direction_ids, _now):
         return [
             d
             for d in (prj.directions or [])
@@ -8033,7 +8031,9 @@ async def test_already_fixed_deadlock_pivots_agent(client: AsyncClient, db_sessi
     assert resp.status_code == 200
 
     dc = resp.json().get("direction_context")
-    assert dc is not None, "direction_context must be present in research task claim response"
+    assert dc is not None, (
+        "direction_context must be present in research task claim response"
+    )
     assert dc.get("already_fixed_deadlock_detected") is True, (
         "A direction whose last 3 cycles all produced only SCOPE_EMPTY tasks "
         "must surface already_fixed_deadlock_detected=True in direction_context"
@@ -13511,7 +13511,8 @@ async def test_directed_completed_guard_explicit_key_overrides_operator_cooldown
 
 @pytest.mark.asyncio
 async def test_directed_completed_guard_falls_back_when_no_keys_set(db_session):
-    """With neither key configured the guard keeps the historical 120-min window."""
+    """With neither key configured the guard uses the 240-min fallback (matching
+    Gate 1's default) — a completion at 180 min is still within the window."""
     from app.autonomous_research import _directed_research_recently_completed
     from app.shared_state import runtime_config as _runtime_config
 
@@ -13532,12 +13533,249 @@ async def test_directed_completed_guard_falls_back_when_no_keys_set(db_session):
             project.id,
             "d-derive04",
             status=TaskStatus.COMPLETED,
-            age_minutes=90,  # inside the 120-min fallback
+            age_minutes=180,  # inside the 240-min fallback (was 120 before the fix)
         )
         result = await _directed_research_recently_completed(
             project.id, "d-derive04", db_session
         )
         assert result is True
+    finally:
+        if prior_operator is sentinel:
+            _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
+        else:
+            _runtime_config["autonomous_direction_cooldown_minutes"] = prior_operator
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_fallback_is_240_not_120(db_session):
+    """Fallback window is 240 min (Gate 1 default), not the old 120. A task
+    completed at 250 min must be outside the window; one at 130 min must be inside."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    sentinel = object()
+    prior_operator = _runtime_config.get(
+        "autonomous_direction_cooldown_minutes", sentinel
+    )
+    _runtime_config.pop("completed_research_cooldown_minutes", None)
+    _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # 250 min ago — outside both 120 and 240 windows → guard must return False
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-fallback-old",
+            status=TaskStatus.COMPLETED,
+            age_minutes=250,
+        )
+        result_old = await _directed_research_recently_completed(
+            project.id, "d-fallback-old", db_session
+        )
+        assert result_old is False, "250 min ago must be outside the 240-min fallback"
+
+        # 130 min ago — inside 240 but outside the old 120 → must return True
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-fallback-new",
+            status=TaskStatus.COMPLETED,
+            age_minutes=130,
+        )
+        result_new = await _directed_research_recently_completed(
+            project.id, "d-fallback-new", db_session
+        )
+        assert result_new is True, "130 min ago must be inside the 240-min fallback"
+    finally:
+        if prior_operator is sentinel:
+            _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
+        else:
+            _runtime_config["autonomous_direction_cooldown_minutes"] = prior_operator
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_uses_direction_productive_window(db_session):
+    """When a direction dict is passed, the guard uses resolve_direction_refractory_minutes
+    (productive path = 45 min by default). A completion at 30 min blocks; 50 min does not."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config.pop("completed_research_cooldown_minutes", None)
+    _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
+    _runtime_config.pop("productive_direction_cooldown_minutes", None)
+    try:
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        direction = {
+            "id": "d-prod01",
+            "status": "active",
+            "last_cycle_productive": True,
+        }
+
+        # 30 min ago — inside the productive 45-min window → should block
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-prod01",
+            status=TaskStatus.COMPLETED,
+            age_minutes=30,
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-prod01", db_session, direction=direction
+        )
+        assert result is True, "30 min ago is inside the 45-min productive window"
+
+        # 50 min ago — outside the productive 45-min window → should not block
+        project2 = Project(name="P2", user_id="test-user-123")
+        db_session.add(project2)
+        await db_session.commit()
+        await db_session.refresh(project2)
+
+        await _add_directed_research(
+            db_session,
+            project2.id,
+            "d-prod01",
+            status=TaskStatus.COMPLETED,
+            age_minutes=50,
+        )
+        result2 = await _directed_research_recently_completed(
+            project2.id, "d-prod01", db_session, direction=direction
+        )
+        assert result2 is False, "50 min ago is outside the 45-min productive window"
+    finally:
+        _runtime_config.pop("productive_direction_cooldown_minutes", None)
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_uses_direction_saturated_window(db_session):
+    """Saturated direction uses 2x the standard window. With autonomous_direction_cooldown_minutes=60
+    and 1 consecutive unproductive cycle (multiplier=0.375), the standard window is 22.5 min;
+    saturated doubles it to 45 min. A completion at 30 min blocks; 50 min does not."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    sentinel = object()
+    prior_operator = _runtime_config.get(
+        "autonomous_direction_cooldown_minutes", sentinel
+    )
+    _runtime_config.pop("completed_research_cooldown_minutes", None)
+    _runtime_config["autonomous_direction_cooldown_minutes"] = 60
+    try:
+        # consecutive_unproductive_cycles=1 → multiplier=0.375 → 60*0.375=22.5; saturated→45
+        direction = {
+            "id": "d-sat01",
+            "status": "active",
+            "possibly_saturated": True,
+            "last_cycle_productive": False,
+            "consecutive_unproductive_cycles": 1,
+        }
+
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # 30 min ago — inside the saturated 45-min window
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-sat01",
+            status=TaskStatus.COMPLETED,
+            age_minutes=30,
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-sat01", db_session, direction=direction
+        )
+        assert result is True, "30 min is inside the saturated 45-min window"
+
+        # 50 min ago — outside the saturated 45-min window
+        project2 = Project(name="P2", user_id="test-user-123")
+        db_session.add(project2)
+        await db_session.commit()
+        await db_session.refresh(project2)
+
+        await _add_directed_research(
+            db_session,
+            project2.id,
+            "d-sat01",
+            status=TaskStatus.COMPLETED,
+            age_minutes=50,
+        )
+        result2 = await _directed_research_recently_completed(
+            project2.id, "d-sat01", db_session, direction=direction
+        )
+        assert result2 is False, "50 min is outside the saturated 45-min window"
+    finally:
+        if prior_operator is sentinel:
+            _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
+        else:
+            _runtime_config["autonomous_direction_cooldown_minutes"] = prior_operator
+
+
+@pytest.mark.asyncio
+async def test_directed_completed_guard_uses_direction_unproductive_window(db_session):
+    """Unproductive direction (3+ cycles, multiplier=1.0) uses the full standard window.
+    With autonomous_direction_cooldown_minutes=60 the window is 60 min. A completion at
+    50 min blocks; 70 min does not."""
+    from app.autonomous_research import _directed_research_recently_completed
+    from app.shared_state import runtime_config as _runtime_config
+
+    sentinel = object()
+    prior_operator = _runtime_config.get(
+        "autonomous_direction_cooldown_minutes", sentinel
+    )
+    _runtime_config.pop("completed_research_cooldown_minutes", None)
+    _runtime_config["autonomous_direction_cooldown_minutes"] = 60
+    try:
+        direction = {
+            "id": "d-unprod01",
+            "status": "active",
+            "last_cycle_productive": False,
+            "consecutive_unproductive_cycles": 3,  # multiplier=1.0 → 60 min
+        }
+
+        project = Project(name="P", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # 50 min ago — inside the 60-min unproductive window
+        await _add_directed_research(
+            db_session,
+            project.id,
+            "d-unprod01",
+            status=TaskStatus.COMPLETED,
+            age_minutes=50,
+        )
+        result = await _directed_research_recently_completed(
+            project.id, "d-unprod01", db_session, direction=direction
+        )
+        assert result is True, "50 min is inside the 60-min unproductive window"
+
+        # 70 min ago — outside the 60-min unproductive window
+        project2 = Project(name="P2", user_id="test-user-123")
+        db_session.add(project2)
+        await db_session.commit()
+        await db_session.refresh(project2)
+
+        await _add_directed_research(
+            db_session,
+            project2.id,
+            "d-unprod01",
+            status=TaskStatus.COMPLETED,
+            age_minutes=70,
+        )
+        result2 = await _directed_research_recently_completed(
+            project2.id, "d-unprod01", db_session, direction=direction
+        )
+        assert result2 is False, "70 min is outside the 60-min unproductive window"
     finally:
         if prior_operator is sentinel:
             _runtime_config.pop("autonomous_direction_cooldown_minutes", None)
@@ -14290,7 +14528,9 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
 
     mock_spend = mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value={"total": 1.5, "compute": 1.5, "agent_vm": 0.0, "idle": 0.0}),
+        new=AsyncMock(
+            return_value={"total": 1.5, "compute": 1.5, "agent_vm": 0.0, "idle": 0.0}
+        ),
     )
 
     await _spawn_research_task(project, db_session)
@@ -14340,7 +14580,9 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
 
     mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value={"total": 2.0, "compute": 2.0, "agent_vm": 0.0, "idle": 0.0}),
+        new=AsyncMock(
+            return_value={"total": 2.0, "compute": 2.0, "agent_vm": 0.0, "idle": 0.0}
+        ),
     )
 
     await _spawn_research_task(project2, db_session)
@@ -14369,7 +14611,14 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
     # Re-patch to count calls cleanly for the no-ceiling assertion
     no_ceiling_mock = mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value={"total": 999.0, "compute": 999.0, "agent_vm": 0.0, "idle": 0.0}),
+        new=AsyncMock(
+            return_value={
+                "total": 999.0,
+                "compute": 999.0,
+                "agent_vm": 0.0,
+                "idle": 0.0,
+            }
+        ),
     )
     await _spawn_research_task(project3, db_session)
 

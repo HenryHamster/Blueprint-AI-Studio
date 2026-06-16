@@ -258,7 +258,6 @@ def _synthesize_outcome_scaffolding_memo(
 async def _process_direction_lifecycle(
     project: Project,
     session: AsyncSession,
-    cooldown_minutes: float,
     busy_direction_ids: set,
     now: datetime,
 ) -> list:
@@ -282,14 +281,13 @@ async def _process_direction_lifecycle(
         # the caller's outer project load and this lock acquisition.
         await session.refresh(project, attribute_names=["directions"])
         return await _process_direction_lifecycle_locked(
-            project, session, cooldown_minutes, busy_direction_ids, now
+            project, session, busy_direction_ids, now
         )
 
 
 async def _process_direction_lifecycle_locked(
     project: Project,
     session: AsyncSession,
-    cooldown_minutes: float,
     busy_direction_ids: set,
     now: datetime,
 ) -> list:

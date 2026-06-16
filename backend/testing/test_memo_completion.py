@@ -549,7 +549,6 @@ async def test_scaffolding_memo_synthesis_failure_leaves_no_queued_task(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )

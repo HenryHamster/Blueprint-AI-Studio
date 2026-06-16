@@ -311,7 +311,7 @@ async def _undirected_research_recently_active(project_id, session) -> bool:
 
 
 async def _directed_research_recently_completed(
-    project_id, direction_id: str, session
+    project_id, direction_id: str, session, direction: dict | None = None
 ) -> bool:
     """True when a directed research task for this direction COMPLETED within the
     cooldown window.
@@ -327,23 +327,24 @@ async def _directed_research_recently_completed(
     COMPLETED.  Set ``completed_research_cooldown_minutes`` <= 0 to disable.
 
     Absent an explicit ``completed_research_cooldown_minutes`` value the window
-    derives from the operator's ``autonomous_direction_cooldown_minutes`` knob
-    (same single-knob semantics as the refractory derivation in
-    research_direction_state.py) instead of a hardcoded constant — otherwise
-    this guard silently outlives every operator-tuned cooldown and holds all
-    recently-cycled directions at once.
+    derives from the direction's effective refractory window (via
+    ``resolve_direction_refractory_minutes``) when a direction dict is supplied,
+    or falls back to ``autonomous_direction_cooldown_minutes`` (default 240) —
+    matching Gate 1's fallback so both gates agree on the cooldown window.
     """
-    cooldown_minutes = _runtime_config.get("completed_research_cooldown_minutes")
-    if not isinstance(cooldown_minutes, (int, float)) or isinstance(
-        cooldown_minutes, bool
-    ):
-        cooldown_minutes = _runtime_config.get(
-            "autonomous_direction_cooldown_minutes", 120
-        )
-        if not isinstance(cooldown_minutes, (int, float)) or isinstance(
-            cooldown_minutes, bool
-        ):
-            cooldown_minutes = 120.0
+    from app.direction_refractory import resolve_direction_refractory_minutes
+
+    explicit = _runtime_config.get("completed_research_cooldown_minutes")
+    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+        cooldown_minutes = float(explicit)
+    elif direction is not None:
+        cooldown_minutes = resolve_direction_refractory_minutes(direction)
+    else:
+        base = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
+        if isinstance(base, (int, float)) and not isinstance(base, bool):
+            cooldown_minutes = float(base)
+        else:
+            cooldown_minutes = 240.0
     if cooldown_minutes <= 0:
         return False
     cutoff = _utcnow() - timedelta(minutes=cooldown_minutes)
@@ -681,7 +682,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         return
 
     # Guard: must have active directions that aren't in cooldown or mid-cycle
-    cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
     now = _utcnow()
 
     # Build set of direction IDs that already have an active research cycle.
@@ -884,7 +884,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     active_directions = await _process_direction_lifecycle(
         project,
         session,
-        cooldown_minutes,
         busy_direction_ids,
         now,
     )
@@ -1937,7 +1936,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # 80 min). Undirected research is already covered by
         # _undirected_research_recently_active above.
         if current_dir_id is not None and await _directed_research_recently_completed(
-            project.id, current_dir_id, session
+            project.id, current_dir_id, session, direction=chosen_direction
         ):
             logger.info(
                 "[AUTONOMOUS] Skipping research for project %s direction %s "

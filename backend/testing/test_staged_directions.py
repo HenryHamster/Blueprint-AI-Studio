@@ -110,7 +110,7 @@ async def test_staged_direction_inert_in_lifecycle(db_session):
     await db_session.refresh(project)
 
     active = await _process_direction_lifecycle(
-        project, db_session, cooldown_minutes=240, busy_direction_ids=set(), now=datetime.utcnow()
+        project, db_session, busy_direction_ids=set(), now=datetime.utcnow()
     )
 
     # Excluded from active/eligible → spawns no research.
