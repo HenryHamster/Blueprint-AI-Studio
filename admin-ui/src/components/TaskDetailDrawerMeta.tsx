@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { ChevronDown, ChevronRight, ExternalLink } from 'lucide-react';
 import { getHeartbeatStatus, useElapsedTime, ResearchFindings, useDurationStats } from './TaskCard';
 import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
@@ -53,6 +53,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
   }, []);
   const [rawContextExpanded, setRawContextExpanded] = useState(false);
   const [directionsCache, setDirectionsCache] = useState<Array<{ id: string; text: string }>>([]);
+  const taskById = useMemo(() => new Map((tasks ?? []).map(t => [t.id, t])), [tasks]);
 
   const provenanceCtx = task.context as Record<string, unknown> | undefined;
   const provenanceDirectionId = provenanceCtx?.direction_id as string | undefined;
@@ -295,7 +296,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         <>
           <SectionHeader>Dependencies</SectionHeader>
           <div className="space-y-1">
-            {task.depends_on.map((dep) => { const dt = tasks?.find(t => t.id === dep); return <DependencyItem key={dep} dep={dep} depTask={dt} hasCycle={hasTransitiveCycle(task.id, dep, tasks ?? [], 10)} onNavigateToTask={onNavigateToTask} />; })}
+            {task.depends_on.map((dep) => { const dt = taskById.get(dep); return <DependencyItem key={dep} dep={dep} depTask={dt} hasCycle={hasTransitiveCycle(task.id, dep, tasks ?? [], 10)} onNavigateToTask={onNavigateToTask} />; })}
           </div>
         </>
       )}

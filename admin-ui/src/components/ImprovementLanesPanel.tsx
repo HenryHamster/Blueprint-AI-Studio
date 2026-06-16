@@ -334,6 +334,40 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                   </div>
                 )}
               </div>
+              {trialMetrics.lane_relay_comparison && (() => {
+                const cmp = trialMetrics.lane_relay_comparison;
+                const fmtSec = (v: number | null) => v != null ? `${v.toFixed(0)}s` : '—';
+                const fmtDelta = (v: number | null) => {
+                  if (v == null) return '—';
+                  const sign = v < 0 ? '' : '+';
+                  return `${sign}${v.toFixed(0)}s`;
+                };
+                return (
+                  <div className="mt-2 border-t border-neutral-700/60 pt-2">
+                    <div className="mb-1 text-[10px] text-neutral-500">
+                      Relay comparison vs v{cmp.source_version.version_number}
+                    </div>
+                    <div className="grid grid-cols-4 gap-x-4 gap-y-0.5 text-[10px] text-neutral-400">
+                      <div className="text-neutral-600" />
+                      <div className="text-neutral-500">Wall clock</div>
+                      <div className="text-neutral-500">Active</div>
+                      <div className="text-neutral-500">Gap</div>
+                      <div className="text-neutral-500">Relay</div>
+                      <div className="text-neutral-300">{fmtSec(cmp.relay.wall_clock_seconds)}</div>
+                      <div className="text-neutral-300">{fmtSec(cmp.relay.active_seconds)}</div>
+                      <div className="text-neutral-300">{fmtSec(cmp.relay.gap_seconds)}</div>
+                      <div className="text-neutral-500">Lane</div>
+                      <div className="text-neutral-300">{fmtSec(cmp.lane.wall_clock_seconds)}</div>
+                      <div className="text-neutral-300">{fmtSec(cmp.lane.active_seconds)}</div>
+                      <div className="text-neutral-300">{fmtSec(cmp.lane.gap_seconds)}</div>
+                      <div className="text-neutral-500">Delta</div>
+                      <div className={cmp.deltas.wall_clock_seconds != null && cmp.deltas.wall_clock_seconds < 0 ? 'text-emerald-400' : 'text-neutral-300'}>{fmtDelta(cmp.deltas.wall_clock_seconds)}</div>
+                      <div className={cmp.deltas.active_seconds != null && cmp.deltas.active_seconds < 0 ? 'text-emerald-400' : 'text-neutral-300'}>{fmtDelta(cmp.deltas.active_seconds)}</div>
+                      <div className={cmp.deltas.gap_seconds != null && cmp.deltas.gap_seconds < 0 ? 'text-emerald-400' : 'text-neutral-300'}>{fmtDelta(cmp.deltas.gap_seconds)}</div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
           {shadowHealth && shadowHealth.shadow_lane_count > 0 && (

@@ -2990,3 +2990,57 @@ async def test_sweep_stranded_lanes_class1_recovery_dispatch_emits_operator_mess
         f"{[m.content for m in msgs]}"
     )
     assert str(lane_id) in (recover_msgs[0].context or {}).get("dedupe_key", "")
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class1_recovery_task_carries_lane_chain_id(
+    db: AsyncSession,
+):
+    """Recovery task spawned by Class-1 sweep must carry LANE_CHAIN_ID_KEY equal to
+    lane.id even when the stranded task's context lacked that key."""
+    from app.models import Task, TaskStatus
+    from app.review_fix_lane_pilot import LANE_CHAIN_ID_KEY
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+
+    # Stranded task has NO _review_fix_lane_id in its context
+    task = Task(
+        project_id=project_id,
+        title="fix PR 99",
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix it",
+                "pr_number": 99,
+                "branch": "feat/no-chain-id",
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.FAILED,
+        context={},  # deliberately empty — no LANE_CHAIN_ID_KEY
+    )
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=task.id, phase_requeues=0
+    )
+    lane_id = lane.id
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(db, datetime.utcnow(), runtime_config={})
+    await db.commit()
+
+    assert count == 1
+
+    refreshed_lane = await db.get(ImprovementLane, lane_id)
+    assert refreshed_lane.status == ImprovementLaneStatus.ACTIVE.value
+
+    recovery_task = await db.get(Task, refreshed_lane.current_task_id)
+    assert recovery_task is not None
+    assert (recovery_task.context or {}).get(LANE_CHAIN_ID_KEY) == str(lane_id)

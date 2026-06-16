@@ -2872,6 +2872,85 @@ class TestImprovementLanesTrialMetrics:
         # trial_metrics is null when aggregation fails.
         assert body.get("trial_metrics") is None
 
+    @pytest.mark.asyncio
+    async def test_trial_metrics_includes_relay_comparison_when_stored(
+        self, client: AsyncClient, db_session
+    ):
+        """When capability_adoption_verdicts stores a lane_relay_comparison blob for
+        the lane-pilot capability, it is surfaced under trial_metrics."""
+        from app.capability_trial_verdict import LANE_PILOT_CAP_NAME
+
+        relay_cmp = {
+            "source_version": {
+                "version_number": 7,
+                "captured_at": "2026-01-01T00:00:00",
+                "terminal_status": "promoted",
+            },
+            "relay": {
+                "wall_clock_seconds": 3600.0,
+                "active_seconds": 1800.0,
+                "gap_seconds": 1800.0,
+            },
+            "lane": {
+                "wall_clock_seconds": 2800.0,
+                "active_seconds": 1600.0,
+                "gap_seconds": 1200.0,
+            },
+            "deltas": {
+                "wall_clock_seconds": -800.0,
+                "active_seconds": -200.0,
+                "gap_seconds": -600.0,
+            },
+        }
+        project = make_project(
+            capability_adoption_verdicts={
+                LANE_PILOT_CAP_NAME: {
+                    "verdict": "CONTINUE",
+                    "verdict_reason": "insufficient_data",
+                    "lane_relay_comparison": relay_cmp,
+                }
+            }
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        tm = body.get("trial_metrics")
+        assert tm is not None
+        assert "lane_relay_comparison" in tm
+        cmp_out = tm["lane_relay_comparison"]
+        assert cmp_out["source_version"]["version_number"] == 7
+        assert cmp_out["relay"]["wall_clock_seconds"] == 3600.0
+        assert cmp_out["deltas"]["wall_clock_seconds"] == -800.0
+
+    @pytest.mark.asyncio
+    async def test_trial_metrics_omits_relay_comparison_when_absent(
+        self, client: AsyncClient, db_session
+    ):
+        """When capability_adoption_verdicts has no lane_relay_comparison, the key
+        is absent from trial_metrics (not set to null)."""
+        from app.capability_trial_verdict import LANE_PILOT_CAP_NAME
+
+        project = make_project(
+            capability_adoption_verdicts={
+                LANE_PILOT_CAP_NAME: {
+                    "verdict": "CONTINUE",
+                    "verdict_reason": "insufficient_data",
+                }
+            }
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        tm = body.get("trial_metrics")
+        assert tm is not None
+        assert "lane_relay_comparison" not in tm
+
 
 class TestLaneBaselines:
     """Tests for GET /api/admin/lane-baselines."""

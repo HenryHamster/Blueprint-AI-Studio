@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { memo, useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { TAXONOMY_ORDER, TAXONOMY_LABELS, TAXONOMY_COLORS, STAGE_ORDER, STAGE_COLORS } from './taxonomyConstants';
@@ -111,6 +111,73 @@ export interface DirectionProgress {
 type DirectionSortKey = 'default' | 'acceptance_asc' | 'cost_desc' | 'first_attempt_asc';
 
 const DIRECTION_SORT_STORAGE_KEY = 'catchup.directionProgress.sort';
+
+const DirectionCostBreakdown = memo(function DirectionCostBreakdown({ dp }: { dp: DirectionProgress }) {
+  const total = dp.estimated_cost_usd ?? 0;
+  const breakdown = useMemo(() =>
+    dp.cost_by_scope
+      ? Object.entries(dp.cost_by_scope)
+          .filter(([, v]) => typeof v === 'number' && v > 0)
+          .sort((a, b) => b[1] - a[1])
+          .map(([scope, v]) => `${scope} $${(v as number).toFixed(2)}`)
+          .join(' · ')
+      : '',
+    [dp.cost_by_scope]
+  );
+  const typeBreakdown = useMemo(() =>
+    dp.cost_by_type
+      ? Object.entries(dp.cost_by_type)
+          .filter(([, v]) => typeof v === 'number' && v > 0)
+          .sort((a, b) => b[1] - a[1])
+          .map(([t, v]) => `${t} $${(v as number).toFixed(2)}`)
+          .join(' · ')
+      : '',
+    [dp.cost_by_type]
+  );
+  const statusEntries = useMemo(() =>
+    dp.cost_by_status
+      ? Object.entries(dp.cost_by_status)
+          .filter(([, v]) => typeof v === 'number' && v > 0)
+          .sort((a, b) => b[1] - a[1])
+      : [],
+    [dp.cost_by_status]
+  );
+
+  if (!total) return null;
+  const failedAmt = dp.cost_by_status?.FAILED ?? 0;
+  const failedHigh = total > 0 && failedAmt / total > 0.3;
+
+  return (
+    <>
+      <span className="text-[9px] text-neutral-500 font-mono">
+        Cost: ${total.toFixed(2)}{breakdown ? ` — ${breakdown}` : ''}
+      </span>
+      {typeBreakdown && (
+        <span className="text-[9px] text-neutral-500 font-mono">
+          By type: {typeBreakdown}
+        </span>
+      )}
+      {statusEntries.length > 0 && (
+        <span className="text-[9px] text-neutral-500 font-mono">
+          By status:{' '}
+          {statusEntries.map(([status, v], i) => {
+            const isFailed = status === 'FAILED';
+            const highlight = isFailed && failedHigh;
+            return (
+              <span
+                key={status}
+                className={highlight ? 'text-amber-600 font-semibold' : ''}
+              >
+                {i > 0 ? ' · ' : ''}
+                {status} ${(v as number).toFixed(2)}
+              </span>
+            );
+          })}
+        </span>
+      )}
+    </>
+  );
+});
 
 export function DirectionProgressSection({ directions, medianCostPerMergedPr }: { directions: DirectionProgress[]; medianCostPerMergedPr?: number | null }) {
   const [expandedDirections, setExpandedDirections] = useState<Set<string>>(new Set());
@@ -637,62 +704,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                     </span>
                   );
                 })()}
-                {(() => {
-                  const total = dp.estimated_cost_usd ?? 0;
-                  if (!total) return null;
-                  const breakdown = dp.cost_by_scope
-                    ? Object.entries(dp.cost_by_scope)
-                        .filter(([, v]) => typeof v === 'number' && v > 0)
-                        .sort((a, b) => b[1] - a[1])
-                        .map(([scope, v]) => `${scope} $${v.toFixed(2)}`)
-                        .join(' · ')
-                    : '';
-                  const typeBreakdown = dp.cost_by_type
-                    ? Object.entries(dp.cost_by_type)
-                        .filter(([, v]) => typeof v === 'number' && v > 0)
-                        .sort((a, b) => b[1] - a[1])
-                        .map(([t, v]) => `${t} $${v.toFixed(2)}`)
-                        .join(' · ')
-                    : '';
-                  return (
-                    <>
-                      <span className="text-[9px] text-neutral-500 font-mono">
-                        Cost: ${total.toFixed(2)}{breakdown ? ` — ${breakdown}` : ''}
-                      </span>
-                      {typeBreakdown && (
-                        <span className="text-[9px] text-neutral-500 font-mono">
-                          By type: {typeBreakdown}
-                        </span>
-                      )}
-                      {dp.cost_by_status && (() => {
-                        const entries = Object.entries(dp.cost_by_status)
-                          .filter(([, v]) => typeof v === 'number' && v > 0)
-                          .sort((a, b) => b[1] - a[1]);
-                        if (entries.length === 0) return null;
-                        const failedAmt = dp.cost_by_status.FAILED ?? 0;
-                        const failedHigh = total > 0 && failedAmt / total > 0.3;
-                        return (
-                          <span className="text-[9px] text-neutral-500 font-mono">
-                            By status:{' '}
-                            {entries.map(([status, v], i) => {
-                              const isFailed = status === 'FAILED';
-                              const highlight = isFailed && failedHigh;
-                              return (
-                                <span
-                                  key={status}
-                                  className={highlight ? 'text-amber-600 font-semibold' : ''}
-                                >
-                                  {i > 0 ? ' · ' : ''}
-                                  {status} ${v.toFixed(2)}
-                                </span>
-                              );
-                            })}
-                          </span>
-                        );
-                      })()}
-                    </>
-                  );
-                })()}
+                <DirectionCostBreakdown dp={dp} />
                 {dp.rejection_reasons && dp.rejection_reasons.length > 0 && (
                   <div className="flex flex-col gap-0.5">
                     <span className="text-[9px] text-neutral-600 uppercase tracking-wide">rejections:</span>

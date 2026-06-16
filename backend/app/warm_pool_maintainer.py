@@ -1442,10 +1442,13 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                     for key in (
                         "review_loop",
                         LANE_PILOT_ASSIGNMENT_KEY,
-                        LANE_CHAIN_ID_KEY,
                     ):
                         if task_ctx.get(key) is not None:
                             recovery_ctx[key] = task_ctx[key]
+                    # Always stamp the lane id — the stranded task's context may
+                    # have been cleared, which would leave get_chain_lane() unable
+                    # to find the lane when the recovery task completes.
+                    recovery_ctx[LANE_CHAIN_ID_KEY] = str(lane.id)
                     strip_transient_lane_context(recovery_ctx)
                     recovery_ctx[LANE_RECOVERY_REASON_KEY] = "stranded_terminal_task"
                     recovery_ctx[LANE_RECOVERY_ATTEMPT_KEY] = attempt

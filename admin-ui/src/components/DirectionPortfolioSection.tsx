@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle, ChevronLeft, ChevronRight, RefreshCw, X } from 'lucide-react';
 import { STAGE_DROPOUT_LABELS, TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { StrategicAuditPanel } from './StrategicAuditPanel';
@@ -98,6 +98,36 @@ function priorityBadge(p: string) {
     default: return 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
   }
 }
+
+type ScopeBreakdownMap = Record<string, { merged: number; failed: number; failed_infra?: number; failed_code_error?: number; failed_scope_overflow?: number }>;
+
+const ScopeBreakdownPills = memo(function ScopeBreakdownPills({ scope_breakdown }: { scope_breakdown: ScopeBreakdownMap }) {
+  return (
+    <div className="flex gap-1 mt-1 flex-wrap">
+      {(['small', 'medium', 'large'] as const).map(sz => {
+        const s = scope_breakdown[sz];
+        if (!s || (!s.merged && !s.failed)) return null;
+        const total = s.merged + s.failed;
+        const rate = total > 0 ? s.merged / total : 0;
+        const color = rate >= 0.7 ? 'border-emerald-700 bg-emerald-900/40 text-emerald-300' : rate >= 0.4 ? 'border-amber-700 bg-amber-900/40 text-amber-300' : 'border-red-700 bg-red-900/40 text-red-300';
+        const subtypes = [[s.failed_code_error, 'code'], [s.failed_infra, 'infra'], [s.failed_scope_overflow, 'scope']]
+          .filter(([v]) => typeof v === 'number' && (v as number) > 0)
+          .map(([v, l]) => `${v} ${l}`)
+          .join(', ');
+        const subtypeStr = subtypes ? ` (${subtypes})` : '';
+        return (
+          <span
+            key={sz}
+            title={`${sz}: ${s.merged} merged / ${s.failed} failed${subtypeStr} (${Math.round(rate * 100)}%)`}
+            className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}
+          >
+            {sz[0].toUpperCase()} {s.merged}/{s.failed}
+          </span>
+        );
+      })}
+    </div>
+  );
+});
 
 function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
   const [open, setOpen] = useState(false);
@@ -678,7 +708,7 @@ export function DirectionPortfolioSection({
                     );
                   })()}
                   {taxonomyVisibleKeysByDir.has(d.direction_id) && <div className="flex gap-1 mt-1 flex-wrap">{(taxonomyVisibleKeysByDir.get(d.direction_id) ?? []).map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span>; })}</div>}
-                  {d.scope_breakdown && Object.keys(d.scope_breakdown).length > 0 && <div className="flex gap-1 mt-1 flex-wrap">{(['small', 'medium', 'large'] as const).map(sz => { const s = d.scope_breakdown?.[sz]; if (!s || (!s.merged && !s.failed)) return null; const total = s.merged + s.failed; const rate = total > 0 ? s.merged / total : 0; const color = rate >= 0.7 ? 'border-emerald-700 bg-emerald-900/40 text-emerald-300' : rate >= 0.4 ? 'border-amber-700 bg-amber-900/40 text-amber-300' : 'border-red-700 bg-red-900/40 text-red-300'; const subtypes = [[s.failed_code_error, 'code'], [s.failed_infra, 'infra'], [s.failed_scope_overflow, 'scope']].filter(([v]) => typeof v === 'number' && (v as number) > 0).map(([v, l]) => `${v} ${l}`).join(', '); const subtypeStr = subtypes ? ` (${subtypes})` : ''; return <span key={sz} title={`${sz}: ${s.merged} merged / ${s.failed} failed${subtypeStr} (${Math.round(rate * 100)}%)`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}>{sz[0].toUpperCase()} {s.merged}/{s.failed}</span>; })}</div>}
+                  {d.scope_breakdown && Object.keys(d.scope_breakdown).length > 0 && <ScopeBreakdownPills scope_breakdown={d.scope_breakdown} />}
                   {showGeneralized && (
                     <div className="flex gap-1 mt-1 flex-wrap">
                       {outcomeRows.map(row => {

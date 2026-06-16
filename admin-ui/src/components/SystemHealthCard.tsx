@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { AlertTriangle, CheckCircle } from 'lucide-react';
 import { Skeleton } from './DashboardMetricCards';
 import { snapshotFreshness } from '../utils/time';
@@ -67,6 +68,7 @@ export function SystemHealthCard({
   onViewTask: (task: Task) => void;
   onOpenDirections?: () => void;
 }) {
+  const taskById = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
   const status = data?.overall_status ?? 'healthy';
   const statusStyle = _HEALTH_STATUS_STYLE[status] ?? _HEALTH_STATUS_STYLE.healthy;
   const sr = data?.success_rate;
@@ -177,7 +179,7 @@ export function SystemHealthCard({
                 const borderCls = _HEALTH_SEV_BORDER[issue.severity] ?? 'border-l-neutral-500';
                 const iconCls = _HEALTH_SEV_ICON[issue.severity] ?? 'text-neutral-400';
                 const linkedTasks = issue.task_ids.slice(0, 3)
-                  .map(id => tasks.find(t => t.id === id))
+                  .map(id => taskById.get(id))
                   .filter((t): t is Task => t != null);
                 return (
                   <div key={i} className={`bg-neutral-900/50 border border-neutral-800/50 border-l-2 ${borderCls} rounded-lg p-3`}>

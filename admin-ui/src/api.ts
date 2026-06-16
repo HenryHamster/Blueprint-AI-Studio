@@ -702,6 +702,23 @@ export interface ShadowLaneHealth {
   miss_rate: number | null;
 }
 
+export interface LaneRelayTimingFields {
+  wall_clock_seconds: number | null;
+  active_seconds: number | null;
+  gap_seconds: number | null;
+}
+
+export interface LaneRelayComparison {
+  source_version: {
+    version_number: number;
+    captured_at: string | null;
+    terminal_status: string | null;
+  };
+  relay: LaneRelayTimingFields;
+  lane: LaneRelayTimingFields;
+  deltas: LaneRelayTimingFields;
+}
+
 export interface LanePilotTrialMetrics {
   verdict: 'KILL' | 'ADOPT' | 'CONTINUE';
   verdict_reason: string;
@@ -718,6 +735,7 @@ export interface LanePilotTrialMetrics {
   lane_fix_tasks_sampled: number;
   control_warm_resume_count: number;
   gate_integrity_violations: number;
+  lane_relay_comparison?: LaneRelayComparison | null;
   [key: string]: unknown;
 }
 

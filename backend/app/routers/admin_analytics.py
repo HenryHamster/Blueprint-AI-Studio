@@ -1534,7 +1534,10 @@ async def get_improvement_lanes(
     trial_metrics: Dict[str, Any] | None = None
     try:
         from app.review_fix_lane_pilot import compute_lane_pilot_aggregates
-        from app.capability_trial_verdict import evaluate_lane_pilot_verdict
+        from app.capability_trial_verdict import (
+            evaluate_lane_pilot_verdict,
+            LANE_PILOT_CAP_NAME,
+        )
 
         aggregates = await compute_lane_pilot_aggregates(session, project_id)
         trial_metrics = evaluate_lane_pilot_verdict(aggregates)
@@ -1542,6 +1545,25 @@ async def get_improvement_lanes(
         logger.exception(
             "Failed to compute lane pilot trial metrics for %s", project_id
         )
+
+    # Merge stored lane_relay_comparison from capability_adoption_verdicts into
+    # trial_metrics so operators see timing deltas without switching panels.
+    if trial_metrics is not None:
+        try:
+            _verdicts_row = (
+                await session.execute(
+                    select(Project.capability_adoption_verdicts).where(
+                        Project.id == project_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if _verdicts_row:
+                _cap_entry = (_verdicts_row or {}).get(LANE_PILOT_CAP_NAME) or {}
+                _relay_cmp = _cap_entry.get("lane_relay_comparison")
+                if _relay_cmp is not None:
+                    trial_metrics["lane_relay_comparison"] = _relay_cmp
+        except Exception:
+            logger.exception("Failed to fetch lane_relay_comparison for %s", project_id)
 
     return {
         "lanes": rows,
