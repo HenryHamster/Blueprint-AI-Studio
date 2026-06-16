@@ -1601,6 +1601,9 @@ async def get_release_version_summary(
         "serving_status": version.serving_status,
         "served_sha": version.served_sha,
         "deploy_failure_reason": version.deploy_failure_reason,
+        "aggregate_serving_status": aggregate_serving["serving_status"],
+        "artifacts": artifacts,
+        "serving": _compose_serving_block(aggregate_serving, artifacts, version),
         # Human-readable summary for display/CLI
         "highlights": highlights,
         # Per-task changelog: type, title, and PR number for each merged task,

@@ -9,7 +9,9 @@ import {
 } from '../test/viewport';
 import type {
   VersionLifecycleResponse,
+  VersionSummaryResponse,
 } from '../api';
+import { fetchVersionSummary } from '../api';
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
@@ -282,6 +284,104 @@ const HISTORICAL_VERDICT_DATA: VersionLifecycleResponse = {
   staged_directions: [],
 };
 
+const EXPANDED_HISTORY_DATA: VersionLifecycleResponse = {
+  current_version: {
+    version_number: 10,
+    phase: 'stabilize',
+    phase_changed_at: '2026-06-10T08:00:00Z',
+    phase_reasoning: 'operator advance',
+    goal: 'Stabilize v10 by completing the qualification cycle and promoting to main',
+    opened_at: '2026-06-01T00:00:00Z',
+    qualification_attempts: 3,
+    merged_task_count: 47,
+    in_flight_task_count: 2,
+    active_candidate_sha: 'abc1234def5678901234567890123456789012ab',
+    qualification_state: {
+      state: 'qualifying',
+      summary: 'Qualification in progress — audit task spawned, awaiting verdict',
+    },
+    last_qualification: null,
+    latest_audit: null,
+    audit_evidence_state: 'none',
+  },
+  recent_versions: [
+    {
+      id: 'ver-uuid-9',
+      version_number: 9,
+      status: 'promoted',
+      opened_at: '2026-05-15T00:00:00Z',
+      promoted_at: '2026-05-30T12:00:00Z',
+      qualification_attempts: 2,
+      last_qualification: {
+        id: 'verdict-9',
+        candidate_sha: 'def5678901234567890123456789012abcdef01',
+        confidence: 0.92,
+        threshold: 0.8,
+        sub_scores: null,
+        ci_resolution: null,
+        would_promote: true,
+        promotion_enabled: true,
+        terminal_status: 'promoted',
+        started_at: '2026-05-29T10:00:00Z',
+        finalized_at: '2026-05-29T11:00:00Z',
+        created_at: '2026-05-29T10:00:00Z',
+        status: 'promoted',
+        blocker: null,
+        audit_missing_reason: null,
+        audit_reconciliation: null,
+      },
+      serving_status: 'serving_confirmed',
+    },
+  ],
+  promotion_enabled: false,
+  staged_directions: [],
+};
+
+const EXPANDED_SUMMARY_RESPONSE: VersionSummaryResponse = {
+  version_number: 9,
+  phase: 'stabilize',
+  status: 'promoted',
+  goal: 'Ship v9 reliability improvements and complete qualification cycle',
+  opened_at: '2026-05-15T00:00:00Z',
+  promoted_at: '2026-05-30T12:00:00Z',
+  served_at: '2026-05-30T12:10:00Z',
+  phase_changed_at: '2026-05-20T08:00:00Z',
+  merged_count: 23,
+  acceptance_aggregate: {},
+  qualification_state: null,
+  serving_status: 'serving_confirmed',
+  served_sha: 'def5678901234567890123456789012abcdef01',
+  deploy_failure_reason: null,
+  highlights: {
+    headline: 'v9 promoted — 23 tasks merged, 20/23 proven, confidence 92%',
+    merged_count: 23,
+    proven: 20,
+    total_merged_for_acceptance: 23,
+    qualification_confidence: 0.92,
+    qualification_threshold: 0.8,
+  },
+  tasks_merged: [
+    {
+      task_type: 'fix',
+      title: 'Fix race condition in task locking under concurrent reaper sweeps',
+      pr_number: 9901,
+      pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/9901',
+    },
+    {
+      task_type: 'feat',
+      title: 'Add aggregate_serving_status to version history list entries',
+      pr_number: 9887,
+      pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/9887',
+    },
+    {
+      task_type: 'fix',
+      title: 'Resolve stranded-lane detection false positives on warm-pool restart',
+      pr_number: 9872,
+      pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/9872',
+    },
+  ],
+};
+
 const SERVING_DISAGREE_DATA: VersionLifecycleResponse = {
   current_version: {
     version_number: 12,
@@ -423,5 +523,58 @@ describe('VersionLifecyclePanel — viewport regression', () => {
     if (badges.length === 0) {
       throw new Error('Expected at least one serving-disagree-badge when aggregate and scalar serving statuses differ');
     }
+  });
+
+  describe('expanded VersionHistorySummary with highlights and changelog', () => {
+    function makeExpandedRender() {
+      return async function renderExpandedPanel() {
+        vi.mocked(fetchVersionSummary).mockResolvedValue(EXPANDED_SUMMARY_RESPONSE);
+
+        host = document.createElement('div');
+        host.style.padding = '16px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(
+            <VersionLifecyclePanel
+              data={EXPANDED_HISTORY_DATA}
+              loading={false}
+              projectId="proj-1"
+              onRefresh={() => {}}
+              userRole="admin"
+            />,
+          );
+        });
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        });
+
+        // Click the expand button on the recent version entry to load VersionHistorySummary
+        const expandBtn = host?.querySelector('button[title="What\'s new"]') as HTMLButtonElement | null;
+        if (!expandBtn) throw new Error('Expand button not found — ensure EXPANDED_HISTORY_DATA has recent_versions[0].id set');
+        await act(async () => {
+          expandBtn.click();
+        });
+        // Wait for fetchVersionSummary to resolve and VersionHistorySummary to render
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        });
+      };
+    }
+
+    test('no overflow at 375px', async () => {
+      await expectNoOverflowAt(375, makeExpandedRender());
+    });
+
+    test('no text truncation at 375px', async () => {
+      await expectNoTextTruncationAt(375, makeExpandedRender());
+    });
+
+    test('touch targets at 375px', async () => {
+      // Check buttons only: the PR reference links in the changelog are intentionally
+      // compact inline elements (30×14px) and not primary touch targets.
+      await expectMinTouchTargetAt(375, makeExpandedRender(), { selector: 'button' });
+    });
   });
 });

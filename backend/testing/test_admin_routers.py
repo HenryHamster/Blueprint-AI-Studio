@@ -16946,6 +16946,9 @@ class TestGetReleaseVersionSummary:
             "serving_status",
             "served_sha",
             "deploy_failure_reason",
+            "aggregate_serving_status",
+            "artifacts",
+            "serving",
             "highlights",
         ):
             assert key in data, f"missing key: {key}"
