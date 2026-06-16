@@ -687,6 +687,32 @@ def cmd_versions(args: argparse.Namespace) -> None:
     _emit(args, data, _render_version_list)
 
 
+def _version_headline(v: dict) -> str:
+    """Derive the human-readable phase-context headline for a version row.
+
+    Mirrors the backend summary endpoint's headline derivation
+    (admin_release_version.py ~L1566) from fields already present in the
+    version-lifecycle response, so ``versions list`` shows the same
+    at-a-glance phrasing the UI does instead of bare numeric counts.
+    """
+    status = v.get("status") or "open"
+    phase = v.get("phase") or "?"
+    merged = v.get("merged_task_count")
+    if merged is None:
+        merged = v.get("merged_count")
+    serving_raw = v.get("aggregate_serving_status") or v.get("serving_status") or ""
+    is_serving = str(serving_raw).lower() in ("serving_confirmed", "serving")
+    if status == "promoted" and is_serving:
+        return "promoted & serving"
+    if status == "promoted":
+        return "promoted"
+    if status == "abandoned":
+        return "abandoned"
+    if not merged:
+        return f"open in {phase} with no merged work yet"
+    return f"open in {phase} with {merged} merged"
+
+
 def _version_line(v: dict, marker: str = " ") -> str:
     num = v.get("version_number", "?")
     phase = v.get("phase", "?")
@@ -696,7 +722,9 @@ def _version_line(v: dict, marker: str = " ") -> str:
     merged_str = f"  merged={merged}" if merged is not None else ""
     tasks_merged = v.get("tasks_merged") or []
     tasks_str = f"  tasks={len(tasks_merged)}" if tasks_merged else ""
-    return f"  {marker} v{num}  [{status:9}] phase={phase:9} sha={sha}{merged_str}{tasks_str}"
+    headline = _version_headline(v)
+    return (f"  {marker} v{num}  [{status:9}] phase={phase:9} sha={sha}"
+            f"{merged_str}{tasks_str}  — {headline}")
 
 
 def _render_version_list(data: dict) -> None:

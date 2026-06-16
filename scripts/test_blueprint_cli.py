@@ -787,6 +787,42 @@ def test_versions_list_shows_task_count(mock_api, capsys):
     assert "tasks=3" in out
 
 
+def test_versions_list_shows_headline(mock_api, capsys):
+    """versions list renders the human-readable phase-context headline per row."""
+    rc = blueprint.main(["versions", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Current (open) version: phase build, 3 merged tasks.
+    assert "open in build with 3 merged" in out
+    # Recent promoted version (no serving signal) -> plain "promoted".
+    assert "promoted" in out
+
+
+def test_version_headline_derivation():
+    """_version_headline mirrors the backend summary headline for each state."""
+    assert (
+        blueprint._version_headline(
+            {"status": "promoted", "aggregate_serving_status": "serving_confirmed"}
+        )
+        == "promoted & serving"
+    )
+    # Lifecycle endpoint may use the upper-case "SERVING" vocabulary.
+    assert (
+        blueprint._version_headline({"status": "promoted", "serving_status": "SERVING"})
+        == "promoted & serving"
+    )
+    assert blueprint._version_headline({"status": "promoted"}) == "promoted"
+    assert blueprint._version_headline({"status": "abandoned"}) == "abandoned"
+    assert (
+        blueprint._version_headline({"phase": "stabilize", "merged_task_count": 0})
+        == "open in stabilize with no merged work yet"
+    )
+    assert (
+        blueprint._version_headline({"phase": "build", "merged_count": 7})
+        == "open in build with 7 merged"
+    )
+
+
 def test_versions_show_recent_no_id_graceful(monkeypatch, capsys):
     """versions show N for a closed version without an id skips the summary call gracefully."""
     def fake_api(method, path, body=None, timeout=30):
