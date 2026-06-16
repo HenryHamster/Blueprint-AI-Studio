@@ -371,11 +371,46 @@ def _reconcile_then_upgrade(sync_conn: sa.Connection, script_location: str) -> N
     _alembic_upgrade_head(sync_conn, script_location)
 
 
+# Serializes the in-process Alembic apply. Alembic's runtime is PROCESS-GLOBAL:
+# the ``alembic.op`` / ``alembic.context`` module-level proxies are rebound on
+# every ``EnvironmentContext`` enter, so two migration applies running
+# concurrently in THIS process clobber each other's bindings — surfacing as a
+# flaky ``KeyError``/aborted-transaction rather than a deterministic failure.
+# The release qualifier runs this gate PRE-LOCK (before the ReleaseVersion row
+# ``FOR UPDATE``), so two overlapping finalize attempts — e.g. the reaper sweep
+# starting a second finalize while the first is still inside its slow
+# GitHub+scratch-DB gate — execute concurrent applies. On 2026-06-16 that race
+# false-failed a healthy release qualification to ``infra_failure`` (the gate
+# logged "ok (applies cleanly)" on one attempt and ``KeyError: 'config'`` on the
+# overlapping one, minutes apart, for the identical candidate). The lock is
+# recreated whenever the running loop changes (``asyncio.Lock`` binds to the loop
+# it is first awaited on and raises if reused from another loop — every
+# pytest-asyncio test gets a fresh loop); in production the loop is stable, so the
+# same lock serializes every apply. Mirrors ``migration_reservations._project_lock``.
+_APPLY_LOCK_BY_LOOP: tuple[object, asyncio.Lock] | None = None
+
+
+def _apply_lock() -> asyncio.Lock:
+    global _APPLY_LOCK_BY_LOOP
+    loop = asyncio.get_running_loop()
+    entry = _APPLY_LOCK_BY_LOOP
+    if entry is None or entry[0] is not loop:
+        lock = asyncio.Lock()
+        _APPLY_LOCK_BY_LOOP = (loop, lock)
+        return lock
+    return entry[1]
+
+
 async def _apply_candidate_migrations(
     scratch_engine: AsyncEngine, candidate_sources: dict[str, str]
 ) -> None:
     """Materialize the candidate's migration files into a temp ``versions/`` dir
-    and apply them (reconcile pre-step + upgrade head) against the scratch DB."""
+    and apply them (reconcile pre-step + upgrade head) against the scratch DB.
+
+    The apply itself is serialized process-wide via :func:`_apply_lock` because
+    Alembic's runtime is global and not safe for concurrent in-process runs (see
+    that lock's note). Writing the throwaway temp files is per-call and stays
+    outside the lock; only the EnvironmentContext-driven apply is serialized."""
     try:
         with tempfile.TemporaryDirectory() as tmp:
             versions_dir = os.path.join(tmp, "versions")
@@ -383,7 +418,7 @@ async def _apply_candidate_migrations(
             for filename, text in candidate_sources.items():
                 with open(os.path.join(versions_dir, filename), "w") as handle:
                     handle.write(text)
-            async with scratch_engine.connect() as conn:
+            async with _apply_lock(), scratch_engine.connect() as conn:
                 await conn.run_sync(
                     lambda sync_conn: _reconcile_then_upgrade(sync_conn, tmp)
                 )
