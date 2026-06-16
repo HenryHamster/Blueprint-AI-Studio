@@ -9747,3 +9747,147 @@ def test_serialize_compute_job_response_safe_redacts_command_log():
     text = data["polling_metadata"]["command_log"]["text"]
     assert "TOP_SECRET" not in text
     assert "result: 42" in text
+
+
+def test_command_runner_redacts_credentials(tmp_path):
+    """command_runner.py redacts credentials at capture time before writing command.log.json.
+
+    Runs the actual script (subprocess) so the test exercises the production
+    code path, not a re-implementation.  Verifies that every major credential
+    family is scrubbed while ordinary experiment output survives verbatim.
+    """
+    import pathlib
+    import subprocess
+    import sys
+
+    script = (
+        pathlib.Path(__file__).parent.parent
+        / "app"
+        / "_compute_scripts"
+        / "command_runner.py"
+    )
+    log_file = tmp_path / "command.log.json"
+
+    # Build a shell command that echoes representative credential formats to stdout.
+    credential_lines = [
+        # GitHub tokens
+        "echo ghp_ABCDEF1234567890abcdefGHIJKLMNOPQRST",
+        "echo ghs_SECRETTOKEN123456789012",
+        "echo ghu_SomeGitHubUserToken123456",
+        # Embedded git URL credential
+        "echo https://x-access-token:ghp_SECRETTOKEN123@github.com/org/repo",
+        # Generic user:pass URL
+        "echo https://myuser:mypassword@example.com/repo",
+        # Anthropic key
+        "echo sk-ant-api03-SUPERSECRETKEYVALUE1234567890",
+        # OpenAI project key (>=10 suffix chars)
+        "echo sk-proj-PROJECTKEYVALUE1234567890abcdef",
+        # Google AIza key (>=20 suffix chars)
+        "echo AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ01234567",
+        # Google OAuth token
+        "echo ya29.A0ARrdaM-GOOGLEOAUTHTOKEN1234",
+        # Bearer token
+        "echo 'Authorization: Bearer MYSECRETBEARERTOKEN'",
+        # Named field — access_token
+        "echo 'access_token=FIELDTOKEN1234567890'",
+        # Benign output that must survive
+        "echo 'metric: loss=0.042'",
+        "echo 'step 100 complete'",
+    ]
+    command = " && ".join(credential_lines)
+
+    proc = subprocess.run(
+        [sys.executable, str(script), command, str(log_file)],
+        capture_output=True,
+        text=True,
+    )
+    # Script exits with the command exit code (0 for all echoes)
+    assert proc.returncode == 0, f"command_runner failed: {proc.stderr}"
+    assert log_file.exists(), "command.log.json was not written"
+
+    record = json.loads(log_file.read_text())
+    text = record["text"]
+
+    # --- credentials must be absent ---
+    assert "ghp_ABCDEF1234567890abcdefGHIJKLMNOPQRST" not in text, (
+        "ghp_ must be redacted"
+    )
+    assert "ghs_SECRETTOKEN123456789012" not in text, "ghs_ must be redacted"
+    assert "ghu_SomeGitHubUserToken123456" not in text, "ghu_ must be redacted"
+    assert "ghp_SECRETTOKEN123" not in text, "embedded git URL token must be redacted"
+    assert "mypassword" not in text, "user:pass URL must be redacted"
+    assert "sk-ant-api03-SUPERSECRETKEYVALUE1234567890" not in text, (
+        "sk-ant- must be redacted"
+    )
+    assert "sk-proj-PROJECTKEYVALUE1234567890abcdef" not in text, (
+        "sk-proj- must be redacted"
+    )
+    assert "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ01234567" not in text, (
+        "AIza key must be redacted"
+    )
+    assert "ya29.A0ARrdaM-GOOGLEOAUTHTOKEN1234" not in text, "ya29. must be redacted"
+    assert "MYSECRETBEARERTOKEN" not in text, "Bearer token must be redacted"
+    assert "FIELDTOKEN1234567890" not in text, (
+        "named access_token field must be redacted"
+    )
+
+    # --- benign output must survive verbatim ---
+    assert "metric: loss=0.042" in text, "benign metric line must survive"
+    assert "step 100 complete" in text, "benign log line must survive"
+
+
+def test_terminal_record_b64_file_redacts_command_log(tmp_path):
+    """_b64_file with redact_command_log=True redacts credentials in the text field.
+
+    Imports and calls the production function directly so the defense-in-depth path
+    and its fail-soft branch are exercised, not a re-implementation.
+    """
+    import base64
+    import importlib.util
+    import json as json_mod
+    import pathlib
+
+    script_path = (
+        pathlib.Path(__file__).parent.parent
+        / "app"
+        / "_compute_scripts"
+        / "terminal_record.py"
+    )
+    spec = importlib.util.spec_from_file_location("terminal_record", script_path)
+    assert spec is not None
+    tr = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(tr)  # type: ignore[attr-defined]
+
+    # --- normal case: credential is redacted; benign text and other fields survive ---
+    log_file = tmp_path / "command.log.json"
+    payload = {
+        "text": "cloning https://x-access-token:ghp_SECRETTOKEN123@github.com/org/repo\nstep 1 done",
+        "truncated": False,
+        "byte_count": 77,
+    }
+    log_file.write_text(json_mod.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    b64 = tr._b64_file(str(log_file), redact_command_log=True)
+    decoded = json_mod.loads(base64.b64decode(b64).decode("utf-8"))
+
+    assert "ghp_SECRETTOKEN123" not in decoded["text"], "credential must be redacted"
+    assert "step 1 done" in decoded["text"], "benign text must survive"
+    assert decoded["truncated"] is False, "truncated field must survive"
+    assert decoded["byte_count"] == 77, "byte_count field must survive"
+
+    # --- fail-soft: non-JSON input is base64-encoded verbatim (no crash) ---
+    bad_file = tmp_path / "bad.log.json"
+    bad_file.write_bytes(b"not-json-at-all")
+    b64_bad = tr._b64_file(str(bad_file), redact_command_log=True)
+    assert base64.b64decode(b64_bad) == b"not-json-at-all", (
+        "non-JSON input must pass through verbatim"
+    )
+
+    # --- fail-soft: dict with non-str text is encoded verbatim (no crash) ---
+    non_str_file = tmp_path / "non_str.log.json"
+    non_str_payload = {"text": 42, "truncated": False, "byte_count": 2}
+    non_str_file.write_text(json_mod.dumps(non_str_payload), encoding="utf-8")
+    b64_non_str = tr._b64_file(str(non_str_file), redact_command_log=True)
+    decoded_non_str = json_mod.loads(base64.b64decode(b64_non_str).decode("utf-8"))
+    assert decoded_non_str["text"] == 42, "non-str text field must be encoded verbatim"

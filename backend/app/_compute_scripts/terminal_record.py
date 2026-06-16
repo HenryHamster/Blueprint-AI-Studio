@@ -29,13 +29,80 @@ import base64
 import json
 import os
 import pathlib
+import re
 import sys
 
 TERMINAL_RECORD_FILENAME = "terminal.json"
 
+# ---------------------------------------------------------------------------
+# Credential redaction — stdlib-only, inlined here as defense-in-depth before
+# base64-encoding the command-log file, in case command.log.json is ever
+# populated by another writer.  command_runner.py carries an independent copy
+# of the same patterns (both scripts are shipped standalone to VMs).
+# Patterns mirror failure_classification._CRED_REDACT_SUBS / _CRED_FIELD_RE.
+# ---------------------------------------------------------------------------
 
-def _b64_file(path_str):
-    """Base64 of a file's bytes, or "" when the path is empty/missing/unreadable."""
+_CRED_REDACT_SUBS = (
+    (re.compile(r"https://x-access-token:[^@]+@"), "https://x-access-token:***@"),
+    (re.compile(r"https://[^:]+:[^@]+@"), "https://***:***@"),
+    (re.compile(r"ghp_[A-Za-z0-9_]+"), "ghp_***"),
+    (re.compile(r"ghs_[A-Za-z0-9_]+"), "ghs_***"),
+    (re.compile(r"ghu_[A-Za-z0-9_]+"), "ghu_***"),
+    (re.compile(r"gho_[A-Za-z0-9_]+"), "gho_***"),
+    (re.compile(r"ghr_[A-Za-z0-9_]+"), "ghr_***"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]+"), "github_pat_***"),
+    (re.compile(r"sk-ant-[A-Za-z0-9_-]+"), "sk-ant-***"),
+    (re.compile(r"sk-proj-[A-Za-z0-9_-]{10,}"), "sk-proj-***"),
+    (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "sk-***"),
+    (re.compile(r"AIza[A-Za-z0-9_-]{20,}"), "AIza***"),
+    (re.compile(r"ya29\.[A-Za-z0-9_.\-]+"), "ya29***"),
+    (re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"), "eyJ***"),
+    (re.compile(r"Bearer\s+[^\s,'\"]+", re.IGNORECASE), "Bearer ***"),
+    (re.compile(r"oauth_token[=:]\s*[^\s&'\"]+", re.IGNORECASE), "oauth_token=***"),
+    (
+        re.compile(
+            r"-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----"
+        ),
+        "***PRIVATE KEY***",
+    ),
+)
+
+_CRED_FIELD_NAMES = (
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "api_key",
+    "client_secret",
+    "private_key",
+    "token",
+)
+
+_CRED_FIELD_RE = re.compile(
+    r'(["\']?\b(?:'
+    + "|".join(_CRED_FIELD_NAMES)
+    + r")"
+    + r'\b["\']?\s*[:=]\s*["\']?)([A-Za-z0-9_.+=\-/@]{8,})(["\']?)',
+    re.IGNORECASE,
+)
+
+
+def _redact_credentials(text: str) -> str:
+    for pattern, replacement in _CRED_REDACT_SUBS:
+        text = pattern.sub(replacement, text)
+    text = _CRED_FIELD_RE.sub(r"\1***\3", text)
+    return text
+
+
+# ---------------------------------------------------------------------------
+
+
+def _b64_file(path_str, *, redact_command_log: bool = False):
+    """Base64 of a file's bytes, or "" when the path is empty/missing/unreadable.
+
+    When redact_command_log=True the file is treated as a JSON command-log
+    record ({text, truncated, byte_count}) and the text field is redacted
+    before re-encoding — defense-in-depth for writers other than command_runner.
+    """
     if not path_str:
         return ""
     try:
@@ -44,6 +111,16 @@ def _b64_file(path_str):
         return ""
     if not data:
         return ""
+    if redact_command_log:
+        try:
+            record = json.loads(data.decode("utf-8", "replace"))
+            if isinstance(record, dict) and isinstance(record.get("text"), str):
+                record["text"] = _redact_credentials(record["text"])
+                data = json.dumps(record, ensure_ascii=False, sort_keys=True).encode(
+                    "utf-8"
+                )
+        except Exception:
+            pass
     return base64.b64encode(data).decode("ascii")
 
 
@@ -75,7 +152,7 @@ def main():
         "exit_code": exit_code,
         "reason": reason,
         "metrics_b64": _b64_file(result_file),
-        "command_log_b64": _b64_file(command_log),
+        "command_log_b64": _b64_file(command_log, redact_command_log=True),
         "release_echo_b64": release_echo_b64,
     }
 
