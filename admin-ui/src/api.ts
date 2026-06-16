@@ -683,6 +683,7 @@ export interface ImprovementLaneRow {
   reservation_force_expired_count: number | null;
   pilot_arm: string | null;
   phase_requeues: number;
+  at_risk: boolean;
   recovery: { reason: string; attempt: number; exhausted: boolean; at: string } | null;
   llm_input_tokens_total: number | null;
   llm_output_tokens_total: number | null;
@@ -875,6 +876,7 @@ export interface ImprovementLaneDetail {
   last_checkpoint_phase: string | null;
   checkpoint_seq: number;
   phase_requeues: number;
+  at_risk: boolean;
   checkpoints: ImprovementLaneCheckpoint[];
   manifest: ImprovementLaneManifest;
   workspace_state: string | null;

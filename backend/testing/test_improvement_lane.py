@@ -3350,3 +3350,122 @@ class TestImprovementLaneDetail:
 
         assert body["current_task_id"] is None
         assert body["current_task"] is None
+
+    @pytest.mark.asyncio
+    async def test_at_risk_false_when_phase_requeues_below_threshold(
+        self, client: AsyncClient, db_session
+    ):
+        """at_risk=False when phase_requeues < _LANE_MAX_PHASE_REQUEUES - 1."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane = _make_lane_detail(project.id, phase_requeues=1)
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/{lane.id}?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["phase_requeues"] == 1
+        assert body["at_risk"] is False
+
+    @pytest.mark.asyncio
+    async def test_at_risk_true_when_phase_requeues_at_threshold(
+        self, client: AsyncClient, db_session
+    ):
+        """at_risk=True when phase_requeues >= _LANE_MAX_PHASE_REQUEUES - 1 (i.e., >= 2)."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # Test at threshold (phase_requeues = 2, which is _LANE_MAX_PHASE_REQUEUES - 1)
+        lane = _make_lane_detail(project.id, phase_requeues=2)
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/{lane.id}?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["phase_requeues"] == 2
+        assert body["at_risk"] is True
+
+    @pytest.mark.asyncio
+    async def test_at_risk_true_when_phase_requeues_above_threshold(
+        self, client: AsyncClient, db_session
+    ):
+        """at_risk=True when phase_requeues > _LANE_MAX_PHASE_REQUEUES - 1."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # Test above threshold (phase_requeues = 3, which is _LANE_MAX_PHASE_REQUEUES)
+        lane = _make_lane_detail(project.id, phase_requeues=3)
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes/{lane.id}?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["phase_requeues"] == 3
+        assert body["at_risk"] is True
+
+
+# ---------------------------------------------------------------------------
+# TestImprovementLaneDrain
+# ---------------------------------------------------------------------------
+
+
+class TestImprovementLaneDrain:
+    """Tests for kill_single_lane: operator kill of a single stuck lane."""
+
+    @pytest.mark.asyncio
+    async def test_kill_single_lane_transitions_to_killed_and_releases_reservation(
+        self, db: AsyncSession
+    ):
+        """kill_single_lane should CAS an ACTIVE lane to KILLED and release any
+        PoolVm reservation so the member rejoins the general pool immediately."""
+        from app.review_fix_lane_pilot import kill_single_lane
+        from app.time_utils import _utcnow
+
+        project_id = await _make_project(db)
+        lane = await create_lane(
+            db,
+            project_id=project_id,
+            direction_id="d-kill1",
+            title="Kill single lane",
+            goal="Test operator kill",
+            branch_name="lane/kill1",
+            base_branch="main",
+        )
+        lane.status = ImprovementLaneStatus.ACTIVE.value
+        # A warm-pool member reserved for this lane.
+        member = PoolVm(
+            vm_instance_id="pool-vm-kill-test-1",
+            project_id=project_id,
+            state=PoolVmState.IDLE,
+            reserved_lane_id=lane.id,
+            reservation_expires_at=_utcnow(),
+            reservation_hard_expires_at=_utcnow(),
+        )
+        db.add(member)
+        await db.commit()
+
+        report = await kill_single_lane(db, lane.id)
+        await db.commit()
+
+        assert report["lanes_killed"] == 1
+        assert report["reservations_cleared"] == 1
+        refreshed = await db.get(ImprovementLane, lane.id)
+        assert refreshed.status == ImprovementLaneStatus.KILLED.value
+        # Reservation must be released so the member is immediately available.
+        await db.refresh(member)
+        assert member.reserved_lane_id is None
+        assert member.reservation_expires_at is None
+        assert member.reservation_hard_expires_at is None

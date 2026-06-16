@@ -27,6 +27,7 @@ from app.models import (
     PoolVm,
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
+    _LANE_MAX_PHASE_REQUEUES,
 )
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user, require_admin
@@ -1476,6 +1477,8 @@ async def get_improvement_lanes(
             )
             reserved_vm_instance_id = pvm.vm_instance_id
 
+        at_risk = (lane.phase_requeues or 0) >= (_LANE_MAX_PHASE_REQUEUES - 1)
+
         rows.append(
             {
                 "id": str(lane.id),
@@ -1494,6 +1497,7 @@ async def get_improvement_lanes(
                 "reserved_vm_instance_id": reserved_vm_instance_id,
                 "pilot_arm": lane.pilot_arm,
                 "phase_requeues": lane.phase_requeues,
+                "at_risk": at_risk,
                 # Operator-visible checkpoint-recovery state (reason/attempt/
                 # exhausted) so a requeued or KILLED lane explains *why* rather
                 # than surfacing only a phase_requeues counter. None until a
@@ -1631,6 +1635,8 @@ async def get_improvement_lane_detail(
                 "task_type": task_row.first_payload.get("type"),
             }
 
+    at_risk = (lane.phase_requeues or 0) >= (_LANE_MAX_PHASE_REQUEUES - 1)
+
     return {
         "id": str(lane.id),
         "title": lane.title,
@@ -1651,6 +1657,7 @@ async def get_improvement_lane_detail(
         "last_checkpoint_phase": lane.last_checkpoint_phase,
         "checkpoint_seq": lane.checkpoint_seq,
         "phase_requeues": lane.phase_requeues,
+        "at_risk": at_risk,
         "checkpoints": lane.checkpoints or [],
         "manifest": lane.manifest or {},
         "workspace_state": lane.workspace_state,
@@ -1886,6 +1893,55 @@ async def drain_improvement_lane_pilot(
 
     return {
         "project_id": str(project_id),
+        **report,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/improvement-lanes/{lane_id}/kill
+# ---------------------------------------------------------------------------
+
+
+@router.post("/improvement-lanes/{lane_id:uuid}/kill")
+async def kill_improvement_lane(
+    lane_id: uuid.UUID,
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Kill a single stuck improvement lane.
+
+    Operator-triggered kill for an individual lane: transitions the lane to
+    KILLED state and releases any warm-pool reservation so the member rejoins
+    the general pool immediately. The lane must belong to the specified project.
+
+    Idempotent: killing an already-terminal lane returns zero counts and
+    succeeds. Returns the kill report (lanes_killed, reservations_cleared).
+    """
+    from app.review_fix_lane_pilot import kill_single_lane  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    lane = await session.get(ImprovementLane, lane_id)
+    if lane is None or lane.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Lane not found in this project")
+
+    report = await kill_single_lane(session, lane_id)
+    await session.commit()
+
+    logger.info(
+        "[LANE-PILOT] operator kill lane=%s project=%s killed=%s reservations=%s",
+        lane_id,
+        project_id,
+        report["lanes_killed"],
+        report["reservations_cleared"],
+    )
+
+    return {
+        "project_id": str(project_id),
+        "lane_id": str(lane_id),
         **report,
     }
 
