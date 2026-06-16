@@ -1632,6 +1632,18 @@ async def get_visual_pilot_status(
                     for s in (t.get("context") or {}).get("viewport_screenshots", [])
                     if s.get("name")
                 ],
+                "viewport_shot_entries": [
+                    {
+                        "name": s["name"],
+                        **(
+                            {"magnitude": s["magnitude"]}
+                            if s.get("magnitude") is not None
+                            else {}
+                        ),
+                    }
+                    for s in (t.get("context") or {}).get("viewport_screenshots", [])
+                    if s.get("name")
+                ],
             }
             for t, e in agg.caught
         ],

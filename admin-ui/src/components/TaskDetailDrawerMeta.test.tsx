@@ -1822,4 +1822,23 @@ describe('DetailsTab — ViewportScreenshotsPanel', () => {
     await waitFor(() => expect(screen.getByText('Storage unavailable')).toBeInTheDocument());
     expect(screen.queryByRole('img')).toBeNull();
   });
+
+  it('renders magnitude badge and Show diff toggle when after entry carries magnitude', async () => {
+    vi.mocked(resolveViewportShotDownloadUrl).mockResolvedValue('https://cdn.example.com/shot.png');
+    const task = makeTask({
+      id: 'task-vs-mag',
+      project_id: 'proj-mag' as unknown as Task['project_id'],
+      context: {
+        viewport_screenshots: [
+          { name: 'comp-375-before', storage_uri: 'gs://bucket/a.png' },
+          { name: 'comp-375-after', magnitude: 0.42, storage_uri: 'gs://bucket/b.png' },
+          { name: 'comp-375-diff', storage_uri: 'gs://bucket/d.png' },
+        ],
+      },
+    });
+    render(<DetailsTab task={task} />);
+    fireEvent.click(screen.getByText(/View 3 screenshots/));
+    expect(screen.getByText('42.0% changed')).toBeInTheDocument();
+    expect(screen.getByText('Show diff')).toBeInTheDocument();
+  });
 });

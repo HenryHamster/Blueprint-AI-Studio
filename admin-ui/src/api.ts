@@ -3351,12 +3351,18 @@ export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSet
   }
 }
 
+export interface VisualPilotShotEntry {
+  name: string;
+  magnitude?: number;
+}
+
 export interface VisualPilotCaughtEntry {
   task_id: string;
   task_title: string;
   note: string | null;
   created_at: string;
   viewport_shot_names: string[];
+  viewport_shot_entries?: VisualPilotShotEntry[];
 }
 
 export interface VisualPilotStatus {

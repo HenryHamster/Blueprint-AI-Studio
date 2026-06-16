@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'child_process';
-import { readFileSync, mkdtempSync, rmSync } from 'fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
@@ -58,10 +58,52 @@ describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
     expect(src).toContain('X-Agent-Token: ${AGENT_API_TOKEN}');
     // Body matches ViewportScreenshotUploadUrlRequest {task_id, name, width, phase}.
     expect(src).toContain('\\"phase\\":\\"${_phase}\\"');
-    // Only changed/new pairs with a known width are uploaded, capped at 12 pairs.
-    expect(src).toContain('select((.status == "changed" or .status == "new") and .width != null))[0:12]');
+    // Only changed/new pairs with a known width are uploaded, capped at 8 pairs
+    // (8 × before+after+diff = 24 PNGs, matching the backend 24-entry context cap).
+    expect(src).toContain('select((.status == "changed" or .status == "new") and .width != null))[0:8]');
     // Publishes the manifest at the path pr-helper.ts reads.
     expect(src).toContain('/tmp/viewport_manifest_${TASK_ID}.json');
+  });
+
+  it('scales change_pct to a 0-1 magnitude on the "after" row only', () => {
+    // Run the REAL jq filter embedded in the script against a sample manifest so a
+    // regression in the change_pct/100 scaling (or in which rows carry magnitude)
+    // is caught here, not in production. The backend rejects magnitude > 1.0, so
+    // emitting an unscaled 0-100 change_pct would silently drop every upload.
+    const src = readFileSync(SNAPSHOT_SH, 'utf-8');
+    const m = src.match(/jq -r '(\.pairs[\s\S]*?)' "\$MANIFEST"/);
+    if (!m) throw new Error('jq filter not found in viewport-snapshot.sh');
+    const filter = m[1];
+
+    const manifest = {
+      pairs: [
+        { status: 'changed', test: 'TaskCard', width: 375, before: '/b.png', after: '/a.png', diff: '/d.png', change_pct: 23.0 },
+        { status: 'new', test: 'NewComp', width: 375, after: '/n.png', change_pct: 100.0 },
+        { status: 'changed', test: 'NoPct', width: 375, before: '/b2.png', after: '/a2.png', diff: '/d2.png' },
+      ],
+    };
+    const manifestPath = path.join(os.tmpdir(), `vp-manifest-test-${process.pid}.json`);
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    let out: string;
+    try {
+      out = execFileSync('jq', ['-r', filter, manifestPath], { encoding: 'utf-8' });
+    } finally {
+      rmSync(manifestPath, { force: true });
+    }
+    const rows = out.split('\n').filter((r) => r.length > 0).map((r) => r.split('\t'));
+
+    // 5th column (index 4) is the magnitude. before/diff rows always carry an empty
+    // magnitude; the "after" row carries change_pct/100 (or empty when absent).
+    const byKey = (phase: string, test: string): string[] => {
+      const row = rows.find((r) => r[0] === phase && r[1] === test);
+      if (!row) throw new Error(`no ${phase} row for ${test} in jq output`);
+      return row;
+    };
+    expect(byKey('after', 'TaskCard')[4]).toBe('0.23'); // 23.0 / 100
+    expect(byKey('after', 'NewComp')[4]).toBe('1'); // 100.0 / 100
+    expect(byKey('after', 'NoPct')[4]).toBe(''); // change_pct absent -> empty
+    expect(byKey('before', 'TaskCard')[4]).toBe('');
+    expect(byKey('diff', 'TaskCard')[4]).toBe('');
   });
 });
 

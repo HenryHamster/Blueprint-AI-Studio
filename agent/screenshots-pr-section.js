@@ -21,9 +21,12 @@ const taskId = process.argv[5] || '';
 
 const MO = '<!-- blueprint:screenshots -->';
 const MC = '<!-- /blueprint:screenshots -->';
-// Cap rows so a runaway manifest can't bloat the PR body. 12 pairs = 24 images,
-// matching the backend upload cap (24 context entries, agent.py:4033).
-const MAX_ROWS = 12;
+// Cap rows so a runaway manifest can't bloat the PR body. 8 pairs = 24 images
+// (before+after+diff per changed pair), matching the backend upload cap and the
+// viewport-snapshot.sh [0:8] upload slice (24 context entries, agent.py:4033).
+// Keeping this in lockstep with the upload cap avoids rendering dead links for
+// pairs that were never uploaded.
+const MAX_ROWS = 8;
 
 if (!manifestPath || !fs.existsSync(manifestPath)) process.exit(0);
 
@@ -73,6 +76,10 @@ function downloadUrl(test, width, phase) {
   );
 }
 
+function diffUrl(test, width) {
+  return downloadUrl(test, width, 'diff');
+}
+
 // Escape `|` so a component/test name can never break the markdown table.
 function cell(text) {
   return String(text).replace(/\|/g, '\\|');
@@ -84,8 +91,8 @@ const truncated = shown.length - rows.length;
 const lines = ['## Viewport Screenshots'];
 if (summaryParts.length > 0) lines.push(summaryParts.join(', '));
 lines.push('');
-lines.push('| Component | Width | Status | Before | After |');
-lines.push('| --- | --- | --- | --- | --- |');
+lines.push('| Component | Width | Status | Before | After | Diff% |');
+lines.push('| --- | --- | --- | --- | --- | --- |');
 rows.forEach(function (p) {
   const test = p.test != null ? String(p.test) : '(unknown)';
   const width = p.width != null ? String(p.width) : '?';
@@ -94,9 +101,17 @@ rows.forEach(function (p) {
     ? ''
     : '[view](' + downloadUrl(test, width, 'before') + ')';
   const after = '[view](' + downloadUrl(test, width, 'after') + ')';
+  // Diff%: show percentage and link to highlighted diff image when available.
+  let diffCell = '';
+  if (p.status === 'changed' && p.diff != null) {
+    const pctStr = p.change_pct != null ? p.change_pct.toFixed(1) + '%' : '';
+    diffCell = '[' + (pctStr || 'diff') + '](' + diffUrl(test, width) + ')';
+  } else if (p.status === 'changed' && p.change_pct != null) {
+    diffCell = p.change_pct.toFixed(1) + '%';
+  }
   lines.push(
     '| ' + cell(test) + ' | ' + cell(width) + ' | ' + cell(p.status) +
-    ' | ' + before + ' | ' + after + ' |',
+    ' | ' + before + ' | ' + after + ' | ' + diffCell + ' |',
   );
 });
 if (truncated > 0) {

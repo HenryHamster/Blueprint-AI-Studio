@@ -18935,6 +18935,94 @@ async def test_viewport_screenshot_upload_url(client: AsyncClient, db_session, m
     assert len(screenshots) == 1
     assert screenshots[0]["name"] == "TaskCard-long-title-375-before"
     assert screenshots[0]["storage_uri"] == body["storage_uri"]
+    # No magnitude in the request body -> the key is omitted entirely (not stored
+    # as None), so the badge consumers can rely on `"magnitude" in entry`.
+    assert "magnitude" not in screenshots[0]
+
+
+@pytest.mark.asyncio
+async def test_viewport_screenshot_upload_url_persists_magnitude(
+    client: AsyncClient, db_session, mocker
+):
+    """A magnitude in [0,1] is persisted into the task context entry verbatim."""
+    import asyncio
+
+    project = Project(name="VP Shot Magnitude Test", user_id="user-vpshot-mag")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add feature"}],
+        vm_instance_id="vm-vpshot-mag",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/signed?X-Goog-Signature=abc"
+    mocker.patch.object(asyncio, "to_thread", new=AsyncMock(return_value=fake_url))
+
+    token = create_agent_token(str(task.id), "vm-vpshot-mag")
+    resp = await client.post(
+        "/api/agent/viewport/screenshot-upload-url",
+        json={
+            "task_id": str(task.id),
+            "name": "TaskCard",
+            "width": 375,
+            "phase": "after",
+            "magnitude": 0.23,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    screenshots = task.context["viewport_screenshots"]
+    assert len(screenshots) == 1
+    # change_pct/100 (0-1 fraction) round-trips so the badge renders the real value.
+    assert screenshots[0]["magnitude"] == 0.23
+
+
+@pytest.mark.asyncio
+async def test_viewport_screenshot_upload_url_rejects_out_of_range_magnitude(
+    client: AsyncClient, db_session
+):
+    """magnitude > 1.0 (e.g. an unscaled 0-100 change_pct) is rejected with 422."""
+    project = Project(name="VP Shot Bad Magnitude Test", user_id="user-vpshot-badmag")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-vpshot-badmag",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-vpshot-badmag")
+    resp = await client.post(
+        "/api/agent/viewport/screenshot-upload-url",
+        json={
+            "task_id": str(task.id),
+            "name": "TaskCard",
+            "width": 375,
+            "phase": "after",
+            "magnitude": 23.0,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 422
+
+    # Nothing was persisted for the rejected request.
+    await db_session.refresh(task)
+    assert (task.context or {}).get("viewport_screenshots", []) == []
 
 
 @pytest.mark.asyncio

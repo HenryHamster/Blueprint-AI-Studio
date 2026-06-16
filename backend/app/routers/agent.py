@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Literal
+from typing import Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
@@ -4018,7 +4018,8 @@ class ViewportScreenshotUploadUrlRequest(BaseModel):
     task_id: uuid.UUID
     name: str = Field(max_length=200)
     width: int = Field(ge=1, le=4096)
-    phase: Literal["before", "after"]
+    phase: Literal["before", "after", "diff"]
+    magnitude: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
 @router.post("/viewport/screenshot-upload-url")
@@ -4086,7 +4087,10 @@ async def get_viewport_screenshot_upload_url(
 
     ctx = dict(task.context or {})
     entry_name = f"{safe_name}-{req.width}-{req.phase}"
-    screenshots.append({"name": entry_name, "storage_uri": storage_uri})
+    entry: dict = {"name": entry_name, "storage_uri": storage_uri}
+    if req.magnitude is not None:
+        entry["magnitude"] = req.magnitude
+    screenshots.append(entry)
     ctx["viewport_screenshots"] = screenshots
     task.context = ctx
     flag_modified(task, "context")

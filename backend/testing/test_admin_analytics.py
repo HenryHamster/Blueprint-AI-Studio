@@ -3486,6 +3486,62 @@ class TestVisualPilotStatus:
         by_id = {e["task_id"]: e for e in body["caught"]}
         entry_with = by_id[str(task_with_shots.id)]
         assert entry_with["viewport_shot_names"] == ["main-before", "main-after"]
+        assert entry_with["viewport_shot_entries"] == [
+            {"name": "main-before"},
+            {"name": "main-after"},
+        ]
 
         entry_without = by_id[str(task_no_shots.id)]
         assert entry_without["viewport_shot_names"] == []
+        assert entry_without["viewport_shot_entries"] == []
+
+    @pytest.mark.asyncio
+    async def test_caught_entry_viewport_shot_entries_includes_magnitude(
+        self, client: AsyncClient, db_session
+    ):
+        """viewport_shot_entries exposes magnitude from diff screenshots."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            title="With diff magnitude",
+            context={
+                "_pr_changed_files": ["admin-ui/src/App.tsx"],
+                "_self_review_outcome": {
+                    "visual_verification": {
+                        "passed": True,
+                        "pairs_inspected": 1,
+                        "pairs_changed": 1,
+                        "caught_visual_issue": True,
+                        "note": "drift caught",
+                    }
+                },
+                "viewport_screenshots": [
+                    {"name": "main-before", "storage_uri": "gs://b/main-before.png"},
+                    {"name": "main-after", "storage_uri": "gs://b/main-after.png"},
+                    {
+                        "name": "main-diff",
+                        "storage_uri": "gs://b/main-diff.png",
+                        "magnitude": 0.23,
+                    },
+                ],
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/visual-pilot-status?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["caught_count"] == 1
+        entry = body["caught"][0]
+        entries_by_name = {e["name"]: e for e in entry["viewport_shot_entries"]}
+        assert "main-diff" in entries_by_name
+        assert entries_by_name["main-diff"]["magnitude"] == pytest.approx(0.23)
+        assert "magnitude" not in entries_by_name.get("main-before", {})
+        assert "magnitude" not in entries_by_name.get("main-after", {})

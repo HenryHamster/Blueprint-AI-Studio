@@ -1673,12 +1673,15 @@ export function ChildTasksSection({ task, onNavigateToTask }: { task: Task; onNa
 interface ViewportShotEntry {
   name: string;
   storage_uri: string;
+  magnitude?: number;
 }
 
 interface ViewportShotPair {
   key: string;
   before?: ViewportShotEntry;
   after?: ViewportShotEntry;
+  diff?: ViewportShotEntry;
+  magnitude?: number;
 }
 
 function ViewportShotImage({ projectId, taskId, entry }: { projectId: string; taskId: string; entry: ViewportShotEntry }) {
@@ -1702,6 +1705,74 @@ function ViewportShotImage({ projectId, taskId, entry }: { projectId: string; ta
   return <img src={url} alt={entry.name} className="max-w-full rounded border border-neutral-700" />;
 }
 
+function ViewportMagnitudeBadge({ magnitude }: { magnitude: number }) {
+  const pct = (magnitude * 100).toFixed(1);
+  const color =
+    magnitude >= 0.5
+      ? 'bg-red-500/15 text-red-300 border-red-500/30'
+      : magnitude >= 0.1
+        ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+        : 'bg-neutral-500/15 text-neutral-400 border-neutral-500/30';
+  return (
+    <span className={`inline-flex items-center rounded px-1 py-0 text-[9px] font-semibold border ${color}`}>
+      {pct}% changed
+    </span>
+  );
+}
+
+function ViewportShotPairBlock({
+  pair,
+  projectId,
+  taskId,
+}: {
+  pair: ViewportShotPair;
+  projectId: string;
+  taskId: string;
+}) {
+  const [diffExpanded, setDiffExpanded] = useState(false);
+  return (
+    <div className="rounded-lg border border-neutral-800 bg-neutral-900/50 p-3 space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <p className="text-xs font-mono text-neutral-400 truncate flex-1 min-w-0">{pair.key}</p>
+        {pair.magnitude !== undefined && <ViewportMagnitudeBadge magnitude={pair.magnitude} />}
+        {pair.diff && (
+          <button
+            data-viewport-allow-small-target
+            className="text-xs text-blue-400 hover:text-blue-300 transition-colors shrink-0"
+            onClick={() => setDiffExpanded((v) => !v)}
+          >
+            {diffExpanded ? 'Hide diff' : 'Show diff'}
+          </button>
+        )}
+      </div>
+      {diffExpanded && pair.diff && (
+        <div>
+          <p className="text-xs text-neutral-500 mb-1">Diff</p>
+          <ViewportShotImage projectId={projectId} taskId={taskId} entry={pair.diff} />
+        </div>
+      )}
+      {pair.before && pair.after ? (
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <p className="text-xs text-neutral-500 mb-1">Before</p>
+            <ViewportShotImage projectId={projectId} taskId={taskId} entry={pair.before} />
+          </div>
+          <div>
+            <p className="text-xs text-neutral-500 mb-1">After</p>
+            <ViewportShotImage projectId={projectId} taskId={taskId} entry={pair.after} />
+          </div>
+        </div>
+      ) : pair.before || pair.after ? (
+        <ViewportShotImage
+          projectId={projectId}
+          taskId={taskId}
+          entry={(pair.before ?? pair.after) as ViewportShotEntry}
+        />
+      ) : null}
+    </div>
+  );
+}
+
 export function ViewportScreenshotsPanel({ task }: { task: Task }) {
   const [expanded, setExpanded] = useState(false);
   const raw = task.context?.viewport_screenshots as ViewportShotEntry[] | undefined;
@@ -1710,20 +1781,28 @@ export function ViewportScreenshotsPanel({ task }: { task: Task }) {
   const pairsMap = new Map<string, ViewportShotPair>();
   for (const entry of raw) {
     let key: string;
-    let phase: 'before' | 'after' | null = null;
+    let phase: 'before' | 'after' | 'diff' | null = null;
     if (entry.name.endsWith('-before')) {
       key = entry.name.slice(0, -'-before'.length);
       phase = 'before';
     } else if (entry.name.endsWith('-after')) {
       key = entry.name.slice(0, -'-after'.length);
       phase = 'after';
+    } else if (entry.name.endsWith('-diff')) {
+      key = entry.name.slice(0, -'-diff'.length);
+      phase = 'diff';
     } else {
       key = entry.name;
     }
     if (!pairsMap.has(key)) pairsMap.set(key, { key });
     const pair = pairsMap.get(key) ?? { key };
     if (phase === 'before') pair.before = entry;
-    else if (phase === 'after') pair.after = entry;
+    else if (phase === 'after') {
+      pair.after = entry;
+      if (entry.magnitude !== undefined) pair.magnitude = entry.magnitude;
+    } else if (phase === 'diff') {
+      pair.diff = entry;
+    }
   }
   const pairs = Array.from(pairsMap.values());
 
@@ -1740,27 +1819,12 @@ export function ViewportScreenshotsPanel({ task }: { task: Task }) {
           {expanded ? 'Hide screenshots' : `View ${raw.length} screenshot${raw.length !== 1 ? 's' : ''}`}
         </button>
         {expanded && pairs.map(pair => (
-          <div key={pair.key} className="rounded-lg border border-neutral-800 bg-neutral-900/50 p-3 space-y-2">
-            <p className="text-xs font-mono text-neutral-400 truncate">{pair.key}</p>
-            {pair.before && pair.after ? (
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <p className="text-xs text-neutral-500 mb-1">Before</p>
-                  <ViewportShotImage projectId={task.project_id as string} taskId={task.id} entry={pair.before} />
-                </div>
-                <div>
-                  <p className="text-xs text-neutral-500 mb-1">After</p>
-                  <ViewportShotImage projectId={task.project_id as string} taskId={task.id} entry={pair.after} />
-                </div>
-              </div>
-            ) : pair.before || pair.after ? (
-              <ViewportShotImage
-                projectId={task.project_id as string}
-                taskId={task.id}
-                entry={(pair.before ?? pair.after) as ViewportShotEntry}
-              />
-            ) : null}
-          </div>
+          <ViewportShotPairBlock
+            key={pair.key}
+            pair={pair}
+            projectId={task.project_id as string}
+            taskId={task.id}
+          />
         ))}
       </div>
     </>

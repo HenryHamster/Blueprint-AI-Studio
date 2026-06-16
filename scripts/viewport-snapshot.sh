@@ -224,8 +224,9 @@ python3 "$REPO_ROOT/scripts/viewport_manifest.py" "$BEFORE_DIR" "$AFTER_DIR" "${
 # render the <!-- blueprint:screenshots --> block. The upload `name` is the
 # pair's `test` slug; the backend stores the object under
 # sanitize(name)-<width>-<phase>.png, and the PR renderer reconstructs the same
-# download name, so the two paths always agree. Bounded to 12 pairs (24 PNGs),
-# mirroring the backend's 24-entry context cap. Every failure is non-fatal:
+# download name, so the two paths always agree. Bounded to 8 pairs (24 PNGs:
+# before+after+diff per changed pair), mirroring the backend's 24-entry context
+# cap. Every failure is non-fatal:
 # snapshotting stays informational and never gates ./pr.
 if [ "$UPLOAD" = "1" ]; then
   if [ ! -f "$MANIFEST" ]; then
@@ -235,19 +236,26 @@ if [ "$UPLOAD" = "1" ]; then
     : "${AGENT_API_TOKEN:?viewport-snapshot: --upload requires AGENT_API_TOKEN}"
     UP_OK=0
     UP_FAIL=0
-    # One TSV row (phase<TAB>test<TAB>width<TAB>png) per PNG to upload:
-    # changed pairs contribute before+after; new pairs contribute after only.
+    # One TSV row (phase<TAB>test<TAB>width<TAB>png<TAB>magnitude) per PNG to upload:
+    # changed pairs contribute before+after+diff; new pairs contribute after only.
+    # magnitude is change_pct/100 (0–1 fraction) attached to the "after" entry so the
+    # badge renders; "before" and "diff" rows carry an empty 5th field.
     # Heredoc (not a pipe) so the counters survive in this shell.
-    while IFS="$(printf '\t')" read -r _phase _test _width _png; do
+    while IFS="$(printf '\t')" read -r _phase _test _width _png _magnitude; do
       [ -z "$_png" ] && continue
       if [ ! -f "$_png" ]; then
         echo "viewport-snapshot: --upload: PNG not found, skipping: $_png" >&2
         UP_FAIL=$((UP_FAIL + 1)); continue
       fi
+      if [ -n "$_magnitude" ]; then
+        _payload="{\"task_id\":\"${TASK_ID}\",\"name\":\"${_test}\",\"width\":${_width},\"phase\":\"${_phase}\",\"magnitude\":${_magnitude}}"
+      else
+        _payload="{\"task_id\":\"${TASK_ID}\",\"name\":\"${_test}\",\"width\":${_width},\"phase\":\"${_phase}\"}"
+      fi
       _resp=$(curl -sf -X POST \
         -H "X-Agent-Token: ${AGENT_API_TOKEN}" \
         -H "Content-Type: application/json" \
-        -d "{\"task_id\":\"${TASK_ID}\",\"name\":\"${_test}\",\"width\":${_width},\"phase\":\"${_phase}\"}" \
+        -d "$_payload" \
         "${ORCHESTRATOR_URL}/api/agent/viewport/screenshot-upload-url") || _resp=""
       _url=$(printf '%s' "$_resp" | jq -r '.upload_url // empty' 2>/dev/null || true)
       if [ -z "$_url" ]; then
@@ -263,9 +271,10 @@ if [ "$UPLOAD" = "1" ]; then
       fi
     done <<EOF
 $(jq -r '.pairs
-  | map(select((.status == "changed" or .status == "new") and .width != null))[0:12][]
-  | (if .status == "changed" and .before then "before\t\(.test)\t\(.width)\t\(.before)" else empty end),
-    (if .after then "after\t\(.test)\t\(.width)\t\(.after)" else empty end)' "$MANIFEST" 2>/dev/null)
+  | map(select((.status == "changed" or .status == "new") and .width != null))[0:8][]
+  | (if .status == "changed" and .before then "before\t\(.test)\t\(.width)\t\(.before)\t" else empty end),
+    (if .after then "after\t\(.test)\t\(.width)\t\(.after)\t\(if .change_pct != null then (.change_pct / 100 | tostring) else "" end)" else empty end),
+    (if .status == "changed" and .diff then "diff\t\(.test)\t\(.width)\t\(.diff)\t" else empty end)' "$MANIFEST" 2>/dev/null)
 EOF
     # Publish the manifest at the path pr-helper.ts reads (task-deterministic).
     if cp "$MANIFEST" "/tmp/viewport_manifest_${TASK_ID}.json" 2>/dev/null; then

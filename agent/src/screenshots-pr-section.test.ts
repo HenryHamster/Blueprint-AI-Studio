@@ -70,6 +70,8 @@ function changedPair(over: Record<string, unknown> = {}) {
     before: '/tmp/b/a.png',
     after: '/tmp/a/a.png',
     status: 'changed',
+    change_pct: 5.3,
+    diff: '/tmp/viewport_shots/1/diff/a.png',
     ...over,
   };
 }
@@ -111,9 +113,10 @@ describe('screenshots-pr-section.js renderer', () => {
     expect(out).toContain('<!-- /blueprint:screenshots -->');
     expect(out).toContain('## Viewport Screenshots');
     expect(out).toContain('1 changed, 1 new, 1 unchanged');
-    expect(out).toContain('| Component | Width | Status | Before | After |');
-    // Changed row carries both before and after links.
+    expect(out).toContain('| Component | Width | Status | Before | After | Diff% |');
+    // Changed row carries both before and after links, plus change percentage.
     expect(out).toContain('| taskcard-default | 375 | changed |');
+    expect(out).toContain('5.3%');
     // New row omits the before link (empty cell) but keeps after.
     expect(out).toMatch(/\| newcomp-empty \| 768 \| new \|\s*\|/);
   });
@@ -147,7 +150,7 @@ describe('screenshots-pr-section.js renderer', () => {
     expect(out).not.toContain('https://x.example//api');
   });
 
-  it('caps the table at 12 changed/new pairs and notes the truncation', () => {
+  it('caps the table at 8 changed/new pairs and notes the truncation', () => {
     const pairs = Array.from({ length: 15 }, (_, i) => ({
       test: `comp-${i}`,
       width: 375,
@@ -156,11 +159,12 @@ describe('screenshots-pr-section.js renderer', () => {
       after: `/a/${i}.png`,
     }));
     const out = runScript({ pairs, summary: { changed: 15 } });
-    // 12 rendered rows + the two header rows.
+    // 8 rendered rows + the two header rows — matches the upload cap so no row
+    // links to a PNG that was never uploaded.
     expect(out).toContain('| comp-0 | 375 | changed |');
-    expect(out).toContain('| comp-11 | 375 | changed |');
-    expect(out).not.toContain('| comp-12 |');
-    expect(out).toContain('+3 more changed/new pair(s) not shown (capped at 12)');
+    expect(out).toContain('| comp-7 | 375 | changed |');
+    expect(out).not.toContain('| comp-8 |');
+    expect(out).toContain('+7 more changed/new pair(s) not shown (capped at 8)');
   });
 
   it('escapes pipe characters in the component name so the table stays valid', () => {

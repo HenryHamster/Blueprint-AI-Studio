@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { Project } from '../types/project';
-import { API_BASE_URL, fetchVisualPilotStatus, type VisualPilotStatus } from '../api';
+import { API_BASE_URL, fetchVisualPilotStatus, type VisualPilotShotEntry, type VisualPilotStatus } from '../api';
 
 interface Props {
   project: Project;
@@ -11,19 +11,25 @@ interface ShotPair {
   key: string;
   before?: string;
   after?: string;
+  diff?: string;
+  magnitude?: number;
 }
 
-function buildShotPairs(names: string[]): ShotPair[] {
+function buildShotPairs(entries: VisualPilotShotEntry[]): ShotPair[] {
   const map = new Map<string, ShotPair>();
-  for (const name of names) {
+  for (const entry of entries) {
+    const { name, magnitude } = entry;
     let key: string;
-    let phase: 'before' | 'after' | null = null;
+    let phase: 'before' | 'after' | 'diff' | null = null;
     if (name.endsWith('-before')) {
       key = name.slice(0, -'-before'.length);
       phase = 'before';
     } else if (name.endsWith('-after')) {
       key = name.slice(0, -'-after'.length);
       phase = 'after';
+    } else if (name.endsWith('-diff')) {
+      key = name.slice(0, -'-diff'.length);
+      phase = 'diff';
     } else {
       key = name;
     }
@@ -33,7 +39,12 @@ function buildShotPairs(names: string[]): ShotPair[] {
       map.set(key, pair);
     }
     if (phase === 'before') pair.before = name;
-    else if (phase === 'after') pair.after = name;
+    else if (phase === 'after') {
+      pair.after = name;
+      if (magnitude !== undefined) pair.magnitude = magnitude;
+    } else if (phase === 'diff') {
+      pair.diff = name;
+    }
   }
   return Array.from(map.values());
 }
@@ -61,6 +72,73 @@ function PilotShotImage({
       className="max-w-full rounded border border-neutral-700"
       onError={() => setError(true)}
     />
+  );
+}
+
+function MagnitudeBadge({ magnitude }: { magnitude: number }) {
+  const pct = (magnitude * 100).toFixed(1);
+  const color =
+    magnitude >= 0.5
+      ? 'bg-red-500/15 text-red-300 border-red-500/30'
+      : magnitude >= 0.1
+        ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+        : 'bg-neutral-500/15 text-neutral-400 border-neutral-500/30';
+  return (
+    <span className={`inline-flex items-center rounded px-1 py-0 text-[9px] font-semibold border ${color}`}>
+      {pct}% changed
+    </span>
+  );
+}
+
+function PairBlock({
+  pair,
+  projectId,
+  taskId,
+}: {
+  pair: ShotPair;
+  projectId: string;
+  taskId: string;
+}) {
+  const [diffExpanded, setDiffExpanded] = useState(false);
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <p className="text-[10px] font-mono text-neutral-500 truncate flex-1 min-w-0">{pair.key}</p>
+        {pair.magnitude !== undefined && <MagnitudeBadge magnitude={pair.magnitude} />}
+        {pair.diff && (
+          <button
+            onClick={() => setDiffExpanded((v) => !v)}
+            className="text-[9px] text-sky-400 hover:text-sky-300 transition-colors shrink-0"
+          >
+            {diffExpanded ? 'Hide diff' : 'Diff'}
+          </button>
+        )}
+      </div>
+      {diffExpanded && pair.diff && (
+        <div className="mb-1">
+          <p className="text-[10px] text-neutral-500 mb-0.5">Diff</p>
+          <PilotShotImage projectId={projectId} taskId={taskId} name={pair.diff} />
+        </div>
+      )}
+      {pair.before && pair.after ? (
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <p className="text-[10px] text-neutral-500 mb-0.5">Before</p>
+            <PilotShotImage projectId={projectId} taskId={taskId} name={pair.before} />
+          </div>
+          <div>
+            <p className="text-[10px] text-neutral-500 mb-0.5">After</p>
+            <PilotShotImage projectId={projectId} taskId={taskId} name={pair.after} />
+          </div>
+        </div>
+      ) : (
+        <PilotShotImage
+          projectId={projectId}
+          taskId={taskId}
+          name={pair.before ?? pair.after ?? pair.key}
+        />
+      )}
+    </div>
   );
 }
 
@@ -230,9 +308,11 @@ export function VisualVerificationPilotPanel({ project, onNavigateToTask }: Prop
         ) : (
           <div className="space-y-1">
             {caught.map((entry) => {
-              const hasShots = entry.viewport_shot_names.length > 0;
+              const shotEntries: VisualPilotShotEntry[] = entry.viewport_shot_entries
+                ?? entry.viewport_shot_names.map((n) => ({ name: n }));
+              const hasShots = shotEntries.length > 0;
               const shotsExpanded = expandedShots.has(entry.task_id);
-              const pairs = hasShots ? buildShotPairs(entry.viewport_shot_names) : [];
+              const pairs = hasShots ? buildShotPairs(shotEntries) : [];
               return (
                 <div
                   key={entry.task_id}
@@ -263,40 +343,17 @@ export function VisualVerificationPilotPanel({ project, onNavigateToTask }: Prop
                       >
                         {shotsExpanded
                           ? 'Hide screenshots'
-                          : `View ${entry.viewport_shot_names.length} screenshot${entry.viewport_shot_names.length !== 1 ? 's' : ''}`}
+                          : `View ${shotEntries.length} screenshot${shotEntries.length !== 1 ? 's' : ''}`}
                       </button>
                       {shotsExpanded && (
                         <div className="mt-1.5 space-y-2">
                           {pairs.map((pair) => (
-                            <div key={pair.key} className="space-y-1">
-                              <p className="text-[10px] font-mono text-neutral-500 truncate">{pair.key}</p>
-                              {pair.before && pair.after ? (
-                                <div className="grid grid-cols-2 gap-2">
-                                  <div>
-                                    <p className="text-[10px] text-neutral-500 mb-0.5">Before</p>
-                                    <PilotShotImage
-                                      projectId={project.id}
-                                      taskId={entry.task_id}
-                                      name={pair.before}
-                                    />
-                                  </div>
-                                  <div>
-                                    <p className="text-[10px] text-neutral-500 mb-0.5">After</p>
-                                    <PilotShotImage
-                                      projectId={project.id}
-                                      taskId={entry.task_id}
-                                      name={pair.after}
-                                    />
-                                  </div>
-                                </div>
-                              ) : (
-                                <PilotShotImage
-                                  projectId={project.id}
-                                  taskId={entry.task_id}
-                                  name={pair.before ?? pair.after ?? pair.key}
-                                />
-                              )}
-                            </div>
+                            <PairBlock
+                              key={pair.key}
+                              pair={pair}
+                              projectId={project.id}
+                              taskId={entry.task_id}
+                            />
                           ))}
                         </div>
                       )}

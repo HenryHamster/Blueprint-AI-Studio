@@ -47,7 +47,12 @@ const STATUS_WITH_CAUGHT = {
       task_title: 'feat: add VisualVerificationPilotPanel operator surface',
       note: 'Button label clipped on mobile — caught before merge',
       created_at: '2026-06-10T12:00:00Z',
-      viewport_shot_names: ['main-before', 'main-after'],
+      viewport_shot_names: ['main-before', 'main-after', 'main-diff'],
+      viewport_shot_entries: [
+        { name: 'main-before' },
+        { name: 'main-after', magnitude: 0.23 },
+        { name: 'main-diff' },
+      ],
     },
     {
       task_id: 'task-def-456',
@@ -55,6 +60,7 @@ const STATUS_WITH_CAUGHT = {
       note: null,
       created_at: '2026-06-11T14:00:00Z',
       viewport_shot_names: [],
+      viewport_shot_entries: [],
     },
   ],
   thresholds: THRESHOLDS,
@@ -196,6 +202,23 @@ describe('VisualVerificationPilotPanel — viewport regression', () => {
       await act(async () => {
         (toggles[0] as HTMLButtonElement).click();
       });
+    });
+  });
+
+  test('renders magnitude badge when viewport_shot_entries carries magnitude at 375px without overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      await renderWith(STATUS_WITH_CAUGHT);
+      // Expand screenshots for first caught entry.
+      const toggles = Array.from(host!.querySelectorAll('button')).filter(
+        (el) => el.textContent?.includes('View') && el.textContent?.includes('screenshot'),
+      );
+      if (toggles.length === 0) throw new Error('Expected a "View screenshots" toggle button');
+      await act(async () => { (toggles[0] as HTMLButtonElement).click(); });
+      // Magnitude badge should be visible (23.0% changed).
+      const badge = Array.from(host!.querySelectorAll('span')).find(
+        (el) => el.textContent?.includes('% changed'),
+      );
+      if (!badge) throw new Error('Expected a magnitude badge (e.g. "23.0% changed") but none was found');
     });
   });
 });
