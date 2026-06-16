@@ -16573,6 +16573,10 @@ class TestGetVersionSummary:
                 "app.release_version.compute_version_acceptance_aggregate",
                 new=AsyncMock(return_value={"proven": 2, "unproven": 1, "total": 3}),
             ),
+            patch(
+                "app.release_version.list_merged_tasks_for_version",
+                new=AsyncMock(return_value=[]),
+            ),
         ):
             resp = await client.get(
                 self.URL.format(project_id=project.id, version_number=1)
@@ -16586,11 +16590,14 @@ class TestGetVersionSummary:
         assert data["promoted_sha"] is None
         assert data["promoted_at"] is None
         assert data["merged_task_count"] == 3
+        assert data["merged_count"] == 3
         assert data["acceptance_aggregate"]["proven"] == 2
         assert data["acceptance_aggregate"]["total"] == 3
         assert data["qualification_attempts"] == 0
-        assert isinstance(data["highlights"], list)
-        assert any("3 tasks merged" in h for h in data["highlights"])
+        assert isinstance(data["highlights"], dict)
+        assert "3" in data["highlights"].get("headline", "")
+        assert isinstance(data["tasks_merged"], list)
+        assert "qualification_state" in data
 
     @pytest.mark.asyncio
     async def test_version_summary_promoted_version(
@@ -16622,6 +16629,10 @@ class TestGetVersionSummary:
                 "app.release_version.compute_version_acceptance_aggregate",
                 new=AsyncMock(return_value={"proven": 4, "unproven": 1, "total": 5}),
             ),
+            patch(
+                "app.release_version.list_merged_tasks_for_version",
+                new=AsyncMock(return_value=[]),
+            ),
         ):
             resp = await client.get(
                 self.URL.format(project_id=project.id, version_number=2)
@@ -16632,7 +16643,8 @@ class TestGetVersionSummary:
         assert data["status"] == "promoted"
         assert data["promoted_sha"] == "abc1234def5678"
         assert data["promoted_at"] is not None
-        assert any("abc1234" in h for h in data["highlights"])
+        assert isinstance(data["highlights"], dict)
+        assert "promoted" in data["highlights"].get("headline", "")
 
     @pytest.mark.asyncio
     async def test_version_summary_404_for_nonexistent_version(
@@ -16680,6 +16692,89 @@ class TestGetVersionSummary:
 
         # Non-member gets 403 or 404 depending on implementation.
         assert resp.status_code in (403, 404)
+
+    @pytest.mark.asyncio
+    async def test_version_summary_matches_canonical_for_closed_version(
+        self, client: AsyncClient, db_session
+    ):
+        """Project-scoped endpoint returns window-bounded merged_count for a promoted
+        version — matching the canonical UUID endpoint behavior.
+
+        Verifies the acceptance-evidence proof: the endpoint calls
+        count_merged_since with an until bound equal to promoted_at, so tasks
+        that merged after promotion are excluded (no overcount).
+        """
+        from unittest.mock import AsyncMock, patch
+
+        project = await _make_project(db_session)
+        opened = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        promoted = datetime(2026, 1, 10, 0, 0, 0, tzinfo=timezone.utc)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=3,
+            phase="stabilize",
+            status="promoted",
+            opened_at=opened,
+            promoted_at=promoted,
+            promoted_sha="deadbeef1234",
+            qualification_attempts=2,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        count_mock = AsyncMock(return_value=4)
+        tasks_mock = AsyncMock(
+            return_value=[
+                {
+                    "task_id": "t1",
+                    "title": "Fix login",
+                    "pr_number": 101,
+                    "task_type": "fix",
+                },
+            ]
+        )
+        aggregate_mock = AsyncMock(
+            return_value={"proven": 3, "unproven": 1, "total": 4}
+        )
+
+        with (
+            patch("app.release_version.count_merged_since", new=count_mock),
+            patch("app.release_version.list_merged_tasks_for_version", new=tasks_mock),
+            patch(
+                "app.release_version.compute_version_acceptance_aggregate",
+                new=aggregate_mock,
+            ),
+        ):
+            resp = await client.get(
+                self.URL.format(project_id=project.id, version_number=3)
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        # Window is bounded: count_merged_since must be called with until=promoted_at
+        assert count_mock.call_count == 1
+        call_kwargs = count_mock.call_args
+        # until arg must be set (not None) for a promoted version
+        until_arg = call_kwargs.kwargs.get("until") or (
+            call_kwargs.args[3] if len(call_kwargs.args) > 3 else None
+        )
+        assert until_arg is not None, (
+            "count_merged_since must be called with until= bound for promoted version"
+        )
+
+        # Rich payload fields present
+        assert data["merged_count"] == 4
+        assert data["merged_task_count"] == 4  # backward-compat alias
+        assert isinstance(data["tasks_merged"], list)
+        assert len(data["tasks_merged"]) == 1
+        assert data["tasks_merged"][0]["pr_number"] == 101
+        assert isinstance(data["highlights"], dict)
+        assert "headline" in data["highlights"]
+        assert "promoted" in data["highlights"]["headline"]
+        assert "qualification_state" in data
+        assert data["status"] == "promoted"
+        assert data["promoted_sha"] == "deadbeef1234"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

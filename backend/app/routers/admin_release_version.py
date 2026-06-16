@@ -82,7 +82,9 @@ def _compose_serving_block(
         "status": aggregate_status,
         "sha": serving_sha,
         "confirmed_at": confirmed_at,
-        "failure_reason": aggregate.get("reason_code") if aggregate_status == "deploy_failed" else None,
+        "failure_reason": aggregate.get("reason_code")
+        if aggregate_status == "deploy_failed"
+        else None,
         "artifacts": artifacts,
     }
 
@@ -204,7 +206,6 @@ def _closed_version_until(version: ReleaseVersion) -> Optional[datetime]:
             except (ValueError, TypeError):
                 pass
     return None
-
 
 
 def _serialize_version_history_entry(
@@ -1175,30 +1176,29 @@ async def get_version_summary(
     UI already displays.  Returns 404 when no matching version row exists for this
     project.
 
-    Path uses ``project_id`` so membership can be enforced; ``/release-versions/{id}``
-    (bare UUID) would carry no project context and cannot gate access.
+    Returns the same window-bounded payload as GET /release-versions/{id}/summary
+    (the UUID endpoint) — including tasks_merged changelog, structured highlights
+    dict, qualification_state, and serving fields — so the CLI fallback path for
+    older versions receives the same rich data as the admin UI.
 
-    Response fields (stable contract for the VersionSummaryPanel):
-    - ``version_number``, ``phase``, ``status``, ``promoted_sha``, ``opened_at``,
-      ``promoted_at``, ``qualification_attempts``: direct version columns.
-    - ``merged_task_count``: tasks merged since the version opened.
-    - ``acceptance_aggregate``: bucket → count dict from the acceptance layer.
-    - ``highlights``: short human-readable strings derived from the above data
-      (no additional DB queries).
+    Backward-compat alias: ``merged_task_count`` mirrors ``merged_count``.
     """
     from app.release_version import (  # noqa: PLC0415
         count_merged_since,
         compute_version_acceptance_aggregate,
+        list_merged_tasks_for_version,
     )
 
-    await _get_user_project_with_role(
+    project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
 
     version = (
         (
             await session.execute(
-                select(ReleaseVersion).where(
+                select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
+                .where(
                     ReleaseVersion.project_id == project_id,
                     ReleaseVersion.version_number == version_number,
                 )
@@ -1213,37 +1213,70 @@ async def get_version_summary(
             detail=f"Release version {version_number} not found for this project.",
         )
 
-    merged_count = await count_merged_since(session, project_id, version.opened_at)
+    # Bound closed versions to their own span so tasks that merged in a later
+    # version are not counted here.  Open versions have no upper bound (until=None).
+    version_until = _closed_version_until(version)
+    merged_count = await count_merged_since(
+        session, project_id, version.opened_at, until=version_until
+    )
+    tasks_merged = await list_merged_tasks_for_version(
+        session, project_id, version.opened_at, until=version_until
+    )
     acceptance_aggregate = await compute_version_acceptance_aggregate(
-        session, project_id, since=version.opened_at
+        session, project_id, since=version.opened_at, until=version_until
     )
 
-    # Derive human-readable highlights from already-gathered data (no new queries).
-    highlights: list[str] = []
-    highlights.append(f"{merged_count} task{'s' if merged_count != 1 else ''} merged")
-    highlights.append(f"Phase: {version.phase}")
-    if version.status == "promoted" and version.promoted_sha:
-        highlights.append(f"Promoted at {version.promoted_sha[:8]}")
-    elif version.status == "open":
-        highlights.append("Status: open")
-    elif version.status == "abandoned":
-        highlights.append("Status: abandoned")
-    proven = acceptance_aggregate.get("proven", 0)
-    total = acceptance_aggregate.get("total", 0)
-    if total > 0:
-        highlights.append(f"{proven}/{total} tasks proven")
+    aggregate_serving, artifacts = _version_serving_summary(version, project)
+
+    qualification_state = _release_version.summarize_qualification_state(
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
+        aggregate_serving_status=aggregate_serving["serving_status"],
+        aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
+        artifact_evidence=artifacts,
+    )
+
+    highlights = _release_version.build_version_highlights(
+        version,
+        merged_count=merged_count,
+        aggregate_serving_status=aggregate_serving["serving_status"],
+        acceptance_aggregate=acceptance_aggregate,
+    )
 
     return {
+        # Version identity
         "version_number": version.version_number,
         "phase": version.phase,
         "status": version.status,
-        "promoted_sha": version.promoted_sha,
-        "opened_at": version.opened_at.isoformat(),
+        "goal": version.goal,
+        # Timestamps (isoformat, null-safe)
+        "opened_at": version.opened_at.isoformat() if version.opened_at else None,
         "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
-        "merged_task_count": merged_count,
+        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "phase_changed_at": version.phase_changed_at.isoformat()
+        if version.phase_changed_at
+        else None,
+        # Merged work
+        "merged_count": merged_count,
+        "merged_task_count": merged_count,  # backward-compat alias
         "acceptance_aggregate": acceptance_aggregate,
+        # Qualification
+        "qualification_state": qualification_state,
         "qualification_attempts": version.qualification_attempts,
+        # Serving fields
+        "serving_status": version.serving_status,
+        "served_sha": version.served_sha,
+        "deploy_failure_reason": version.deploy_failure_reason,
+        "aggregate_serving_status": aggregate_serving["serving_status"],
+        "artifacts": artifacts,
+        "serving": _compose_serving_block(aggregate_serving, artifacts, version),
+        # Human-readable summary for display/CLI
         "highlights": highlights,
+        # Per-task changelog
+        "tasks_merged": tasks_merged,
+        # Legacy fields
+        "promoted_sha": version.promoted_sha,
     }
 
 
