@@ -10,7 +10,9 @@ from pathlib import Path
 from app.broadcast import _sanitize_log
 
 CORPUS_PATH = (
-    Path(__file__).resolve().parent / "__fixtures__" / "credential_redaction_corpus.json"
+    Path(__file__).resolve().parent
+    / "__fixtures__"
+    / "credential_redaction_corpus.json"
 )
 
 
@@ -68,7 +70,9 @@ def test_openai_generic_key():
 
 
 def test_google_api_key():
-    out = _sanitize_log("gemini stderr: api key AIzaSyabcdefghijklmnopqrstuvwxyz123456789")
+    out = _sanitize_log(
+        "gemini stderr: api key AIzaSyabcdefghijklmnopqrstuvwxyz123456789"
+    )
     assert "AIzaSyabcdefghijklmnopqrstuvwxyz123456789" not in out
     assert "AIza***" in out
 
@@ -184,6 +188,63 @@ def test_empty_string_returned_as_is():
 def test_none_input_returned_as_is():
     # Falsy short-circuit returns input unchanged
     assert _sanitize_log(None) is None
+
+
+def test_aws_iam_key_redacted():
+    out = _sanitize_log("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE")
+    assert "AKIAIOSFODNN7EXAMPLE" not in out
+    assert "AKIA***" in out
+
+
+def test_aws_iam_key_too_short_not_redacted():
+    # 15 chars after AKIA — one short of the required 16
+    out = _sanitize_log("AKIA123456789AB")
+    assert "AKIA123456789AB" in out
+
+
+def test_stripe_live_key_redacted():
+    out = _sanitize_log("STRIPE_SECRET=sk_live_abcdef123456")
+    assert "sk_live_abcdef123456" not in out
+    assert "sk_live_***" in out
+
+
+def test_stripe_test_key_redacted():
+    out = _sanitize_log("STRIPE_SECRET=sk_test_abcdef123456")
+    assert "sk_test_abcdef123456" not in out
+    assert "sk_test_***" in out
+
+
+def test_stripe_restricted_key_redacted():
+    out = _sanitize_log("key=rk_live_abcdef123456")
+    assert "rk_live_abcdef123456" not in out
+    assert "rk_live_***" in out
+
+
+def test_stripe_webhook_secret_redacted():
+    out = _sanitize_log("WEBHOOK_SECRET=whsec_abcdef123456")
+    assert "whsec_abcdef123456" not in out
+    assert "whsec_***" in out
+
+
+def test_postgresql_url_credentials_redacted():
+    dsn = "postgresql://dbuser:s3cr3t@db.host/mydb"
+    out = _sanitize_log(dsn)
+    assert "s3cr3t" not in out
+    assert "postgresql://***:***@db.host/mydb" in out
+
+
+def test_postgres_alias_url_credentials_redacted():
+    dsn = "postgres://dbuser:s3cr3t@db.host/mydb"
+    out = _sanitize_log(dsn)
+    assert "s3cr3t" not in out
+    assert "postgres://***:***@db.host/mydb" in out
+
+
+def test_postgresql_asyncpg_url_credentials_redacted():
+    dsn = "postgresql+asyncpg://dbuser:s3cr3t@db.host/mydb"
+    out = _sanitize_log(dsn)
+    assert "s3cr3t" not in out
+    assert "postgresql://***:***@db.host/mydb" in out
 
 
 def test_redaction_corpus_parity():

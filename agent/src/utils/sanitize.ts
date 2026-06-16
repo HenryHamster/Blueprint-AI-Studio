@@ -5,6 +5,10 @@
  * - Anthropic API keys (sk-ant-...)
  * - OpenAI API keys (sk-..., sk-proj-...)
  * - Google API keys (AIza...)
+ * - AWS IAM access keys (AKIA...)
+ * - Stripe API keys (sk_live_, sk_test_, rk_live_) and webhook secrets (whsec_)
+ * - Database connection strings with embedded passwords (postgresql://, postgres://,
+ *   and SQLAlchemy +driver variants like postgresql+asyncpg://)
  * - Bearer tokens and OAuth tokens
  * - JSON/key-value credential fields
  * - JWT tokens
@@ -26,6 +30,13 @@ export function sanitize(text: string): string {
     .replace(/sk-ant-[A-Za-z0-9_-]+/g, 'sk-ant-***')
     .replace(/sk-proj-[A-Za-z0-9_-]{20,}/g, 'sk-proj-***')
     .replace(/sk-(?!ant-|proj-)[A-Za-z0-9_-]{20,}/g, 'sk-***')
+    .replace(/AKIA[0-9A-Z]{16}/g, 'AKIA***')
+    .replace(/sk_live_[A-Za-z0-9_-]+/g, 'sk_live_***')
+    .replace(/sk_test_[A-Za-z0-9_-]+/g, 'sk_test_***')
+    .replace(/rk_live_[A-Za-z0-9_-]+/g, 'rk_live_***')
+    .replace(/whsec_[A-Za-z0-9_-]+/g, 'whsec_***')
+    // Postgres DSNs, incl. SQLAlchemy +driver variants (postgresql+asyncpg://, etc.)
+    .replace(/(postgres(?:ql)?(?:\+\w+)?):\/\/[^:/@]+:[^@]+@/g, '$1://***:***@')
     .replace(/AIza[A-Za-z0-9_-]{20,}/g, 'AIza***')
     .replace(/ya29\.[A-Za-z0-9_.-]+/g, 'ya29***')
     .replace(

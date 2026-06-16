@@ -9790,6 +9790,13 @@ def test_command_runner_redacts_credentials(tmp_path):
         "echo 'Authorization: Bearer MYSECRETBEARERTOKEN'",
         # Named field — access_token
         "echo 'access_token=FIELDTOKEN1234567890'",
+        # AWS IAM access key
+        "echo AKIAIOSFODNN7EXAMPLE",
+        # Stripe keys
+        "echo sk_live_STRIPELIVEKEY1234567890",
+        "echo whsec_STRIPEWEBHOOKSECRET123456",
+        # PostgreSQL DSN with embedded password
+        "echo postgresql://dbuser:DBPASSWORD123@db.host:5432/mydb",
         # Benign output that must survive
         "echo 'metric: loss=0.042'",
         "echo 'step 100 complete'",
@@ -9830,6 +9837,12 @@ def test_command_runner_redacts_credentials(tmp_path):
     assert "FIELDTOKEN1234567890" not in text, (
         "named access_token field must be redacted"
     )
+    assert "AKIAIOSFODNN7EXAMPLE" not in text, "AWS IAM access key must be redacted"
+    assert "STRIPELIVEKEY1234567890" not in text, "Stripe live key must be redacted"
+    assert "STRIPEWEBHOOKSECRET123456" not in text, (
+        "Stripe webhook secret must be redacted"
+    )
+    assert "DBPASSWORD123" not in text, "PostgreSQL DSN password must be redacted"
 
     # --- benign output must survive verbatim ---
     assert "metric: loss=0.042" in text, "benign metric line must survive"

@@ -387,6 +387,40 @@ describe('sanitize', () => {
     expect(result).toContain('sk-ant-***');
     expect(result).toContain('Bearer ***');
   });
+
+  it('redacts AWS IAM access keys (AKIA + 16 uppercase alphanumeric)', () => {
+    expect(sanitize('AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE')).toBe(
+      'AWS_ACCESS_KEY_ID=AKIA***',
+    );
+    // 15 chars after AKIA — one short of required 16, must NOT be redacted
+    expect(sanitize('AKIA123456789AB')).toBe('AKIA123456789AB');
+  });
+
+  it('redacts Stripe live secret keys (sk_live_)', () => {
+    expect(sanitize('STRIPE_SECRET=sk_live_abcdef123456')).toBe('STRIPE_SECRET=sk_live_***');
+  });
+
+  it('redacts Stripe test secret keys (sk_test_)', () => {
+    expect(sanitize('STRIPE_SECRET=sk_test_abcdef123456')).toBe('STRIPE_SECRET=sk_test_***');
+  });
+
+  it('redacts Stripe restricted keys (rk_live_) and webhook secrets (whsec_)', () => {
+    expect(sanitize('key=rk_live_abcdef123456')).toBe('key=rk_live_***');
+    expect(sanitize('WEBHOOK_SECRET=whsec_abcdef123456')).toBe('WEBHOOK_SECRET=whsec_***');
+  });
+
+  it('redacts postgresql:// and postgres:// DSNs with embedded passwords', () => {
+    expect(sanitize('postgresql://dbuser:s3cr3t@db.host/mydb')).toBe(
+      'postgresql://***:***@db.host/mydb',
+    );
+    expect(sanitize('postgres://dbuser:s3cr3t@db.host/mydb')).toBe(
+      'postgres://***:***@db.host/mydb',
+    );
+    // SQLAlchemy +driver variant must redact while preserving the scheme
+    expect(sanitize('postgresql+asyncpg://dbuser:s3cr3t@db.host/mydb')).toBe(
+      'postgresql+asyncpg://***:***@db.host/mydb',
+    );
+  });
 });
 
 // ── _crashReport token redaction ─────────────────────────────────────────────

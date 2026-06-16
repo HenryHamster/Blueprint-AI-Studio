@@ -1192,6 +1192,16 @@ _CRED_REDACT_SUBS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"sk-proj-[A-Za-z0-9_-]{10,}"), "sk-proj-***"),
     # OpenAI generic API keys (sk-…); minimum 20 chars to avoid false positives
     (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "sk-***"),
+    # AWS IAM access keys (AKIA + exactly 16 uppercase alphanumeric)
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA***"),
+    # Stripe API keys (sk_live_, sk_test_, rk_live_) and webhook signing secrets (whsec_)
+    (re.compile(r"sk_live_[A-Za-z0-9_-]+"), "sk_live_***"),
+    (re.compile(r"sk_test_[A-Za-z0-9_-]+"), "sk_test_***"),
+    (re.compile(r"rk_live_[A-Za-z0-9_-]+"), "rk_live_***"),
+    (re.compile(r"whsec_[A-Za-z0-9_-]+"), "whsec_***"),
+    # Database connection strings with embedded user:password (including driver-qualified forms)
+    (re.compile(r"postgresql(?:\+\w+)?://[^:/@]+:[^@]+@"), "postgresql://***:***@"),
+    (re.compile(r"postgres://[^:/@]+:[^@]+@"), "postgres://***:***@"),
     # Google AIza API keys (AIza + 20+ alphanumeric — open-ended to catch truncated or over-length keys)
     (re.compile(r"AIza[A-Za-z0-9_-]{20,}"), "AIza***"),
     # Google OAuth access tokens (ya29.…)
@@ -1218,10 +1228,13 @@ _CRED_REDACT_SUBS: tuple[tuple[re.Pattern, str], ...] = (
 def _redact_credentials(text: str) -> str:
     """Redact known credential patterns from *text* before storage.
 
-    Covers GitHub tokens, Anthropic/OpenAI/Google API keys, JWTs, Bearer and
-    OAuth tokens, PEM private keys, and named credential fields in JSON/key-value
-    pairs (access_token, refresh_token, id_token, api_key, client_secret,
-    private_key, token). Preserves field names; replaces values with ``***``.
+    Covers GitHub tokens, Anthropic/OpenAI/Google API keys, AWS IAM access keys
+    (AKIA…), Stripe API keys (sk_live_, sk_test_, rk_live_) and webhook secrets
+    (whsec_), database connection strings with embedded passwords
+    (postgresql:// and postgres://), JWTs, Bearer and OAuth tokens, PEM private
+    keys, and named credential fields in JSON/key-value pairs (access_token,
+    refresh_token, id_token, api_key, client_secret, private_key, token).
+    Preserves field names; replaces values with ``***``.
     """
     if not text:
         return text

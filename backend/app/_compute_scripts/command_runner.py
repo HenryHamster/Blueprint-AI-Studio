@@ -29,6 +29,16 @@ _CRED_REDACT_SUBS = (
     (re.compile(r"sk-ant-[A-Za-z0-9_-]+"), "sk-ant-***"),
     (re.compile(r"sk-proj-[A-Za-z0-9_-]{10,}"), "sk-proj-***"),
     (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "sk-***"),
+    # AWS IAM access keys (AKIA + exactly 16 uppercase alphanumeric)
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA***"),
+    # Stripe API keys
+    (re.compile(r"sk_live_[A-Za-z0-9_-]+"), "sk_live_***"),
+    (re.compile(r"sk_test_[A-Za-z0-9_-]+"), "sk_test_***"),
+    (re.compile(r"rk_live_[A-Za-z0-9_-]+"), "rk_live_***"),
+    (re.compile(r"whsec_[A-Za-z0-9_-]+"), "whsec_***"),
+    # Database connection strings with embedded user:password
+    (re.compile(r"postgresql(?:\+\w+)?://[^:/@]+:[^@]+@"), "postgresql://***:***@"),
+    (re.compile(r"postgres://[^:/@]+:[^@]+@"), "postgres://***:***@"),
     (re.compile(r"AIza[A-Za-z0-9_-]{20,}"), "AIza***"),
     (re.compile(r"ya29\.[A-Za-z0-9_.\-]+"), "ya29***"),
     (re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"), "eyJ***"),

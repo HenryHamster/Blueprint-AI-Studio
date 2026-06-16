@@ -3323,6 +3323,78 @@ class TestRedactCredentials:
         text = "No credentials here, just a normal error message."
         assert _redact_credentials(text) == text
 
+    # ── AWS IAM access keys ──────────────────────────────────────────────────
+
+    def test_aws_iam_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE")
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+        assert "AKIA***" in out
+
+    def test_aws_iam_key_too_short_not_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        # 15 chars after AKIA — one short of the required 16
+        out = _redact_credentials("AKIA123456789AB")
+        assert "AKIA123456789AB" in out
+
+    # ── Stripe keys ──────────────────────────────────────────────────────────
+
+    def test_stripe_live_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("STRIPE_SECRET=sk_live_abcdef123456")
+        assert "sk_live_abcdef123456" not in out
+        assert "sk_live_***" in out
+
+    def test_stripe_test_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("STRIPE_SECRET=sk_test_abcdef123456")
+        assert "sk_test_abcdef123456" not in out
+        assert "sk_test_***" in out
+
+    def test_stripe_restricted_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("key=rk_live_abcdef123456")
+        assert "rk_live_abcdef123456" not in out
+        assert "rk_live_***" in out
+
+    def test_stripe_webhook_secret_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("WEBHOOK_SECRET=whsec_abcdef123456")
+        assert "whsec_abcdef123456" not in out
+        assert "whsec_***" in out
+
+    # ── Database DSNs with embedded credentials ──────────────────────────────
+
+    def test_postgresql_url_credentials_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        dsn = "postgresql://dbuser:s3cr3t@db.host/mydb"
+        out = _redact_credentials(dsn)
+        assert "s3cr3t" not in out
+        assert "postgresql://***:***@db.host/mydb" in out
+
+    def test_postgres_alias_url_credentials_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        dsn = "postgres://dbuser:s3cr3t@db.host/mydb"
+        out = _redact_credentials(dsn)
+        assert "s3cr3t" not in out
+        assert "postgres://***:***@db.host/mydb" in out
+
+    def test_postgresql_asyncpg_url_credentials_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        dsn = "postgresql+asyncpg://dbuser:s3cr3t@db.host/mydb"
+        out = _redact_credentials(dsn)
+        assert "s3cr3t" not in out
+        assert "postgresql://***:***@db.host/mydb" in out
+
     # ── Multiple patterns in one string ─────────────────────────────────────
 
     def test_multiple_credentials_all_redacted(self):
