@@ -4170,3 +4170,105 @@ async def test_sweep_idle_pool_vms_candidate_scan_carries_limit(db_session, mock
     assert any("LIMIT" in s for s in pool_vm_scans), (
         "sweep_idle_pool_vms must apply LIMIT 500 to the PoolVm candidate scan"
     )
+
+
+# ---------------------------------------------------------------------------
+# Transient SHA verification failures must NOT burn phase_requeues budget.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc_or_none",
+    [
+        Exception("rate limit hit"),
+        None,
+    ],
+    ids=["exception", "none"],
+)
+async def test_transient_is_ancestor_of_does_not_burn_phase_requeues(
+    db_session, lanes_on, mocker, exc_or_none
+):
+    """A transient is_ancestor_of failure (exception OR None return) must return
+    False from checkpoint_and_reserve_on_phase_complete WITHOUT incrementing
+    lane.phase_requeues — three transient hiccups must not permanently close the lane.
+
+    Selector: backend/testing/test_warm_pool_maintainer.py
+    """
+    from app.improvement_lane_ops import cas_transition, create_lane
+    from app.models import ImprovementLaneStatus
+    from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+
+    project = await _make_project(db_session, name="Transient SHA Test")
+    project.is_self_repo = True
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    lane = await create_lane(
+        db_session,
+        project_id=project.id,
+        direction_id=None,
+        title="transient-sha-test",
+        goal="verify transient does not burn budget",
+        branch_name="feat/transient-sha",
+        base_branch="main",
+        pilot_arm="lane",
+    )
+    await db_session.flush()
+    await cas_transition(
+        db_session,
+        lane.id,
+        ImprovementLaneStatus.PROPOSED,
+        ImprovementLaneStatus.ACTIVE,
+        current_task_id=None,
+    )
+
+    source_task = Task(
+        project_id=project.id,
+        title="fix task",
+        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
+        context={"head_sha": "deadbeef1234"},
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    lane.current_task_id = source_task.id
+    db_session.add(lane)
+    await db_session.commit()
+    await db_session.refresh(lane)
+
+    if exc_or_none is None:
+        mocker.patch(
+            "app.github_token_resolver.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("gh-token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github_refs.is_ancestor_of",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+    else:
+        mocker.patch(
+            "app.github_token_resolver.get_github_token_for_task",
+            new_callable=AsyncMock,
+            side_effect=exc_or_none,
+        )
+
+    initial_requeues = lane.phase_requeues or 0
+
+    result = await checkpoint_and_reserve_on_phase_complete(
+        db_session,
+        source_task,
+        lane,
+        sha="deadbeef1234",
+        summary="phase summary",
+    )
+
+    assert result is False, "transient failure must return False"
+    await db_session.refresh(lane)
+    assert (lane.phase_requeues or 0) == initial_requeues, (
+        "transient is_ancestor_of failure must NOT increment phase_requeues"
+    )

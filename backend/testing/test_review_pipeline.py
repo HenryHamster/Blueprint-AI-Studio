@@ -16102,8 +16102,8 @@ class TestLaneCheckpointShaVerification:
     async def test_lane_checkpoint_sha_verification_unavailable_degrades(
         self, db_session, mocker
     ):
-        """API returns None (unavailable) → mark_checkpoint_missing with
-        reason='sha_verification_unavailable' and return False."""
+        """API returns None (indeterminate) → return False WITHOUT burning
+        phase_requeues budget; checkpoint_lane must NOT be called."""
         mocker.patch(
             "app.github_token_resolver.get_github_token_for_task",
             new_callable=AsyncMock,
@@ -16134,12 +16134,13 @@ class TestLaneCheckpointShaVerification:
         assert result is False
         mock_checkpoint_lane.assert_not_called()
         await db_session.refresh(lane)
-        assert (lane.phase_requeues or 0) == initial_requeues + 1
+        # Transient/indeterminate must NOT increment phase_requeues.
+        assert (lane.phase_requeues or 0) == initial_requeues
 
     @pytest.mark.asyncio
     async def test_lane_checkpoint_sha_token_error_degrades(self, db_session, mocker):
-        """Token fetch failure (credentials missing, etc.) → degrade to
-        mark_checkpoint_missing(reason='sha_verification_unavailable'), return False."""
+        """Token fetch failure (credentials missing, etc.) → return False WITHOUT
+        burning phase_requeues budget; checkpoint_lane must NOT be called."""
         mocker.patch(
             "app.github_token_resolver.get_github_token_for_task",
             new_callable=AsyncMock,
@@ -16165,7 +16166,8 @@ class TestLaneCheckpointShaVerification:
         assert result is False
         mock_checkpoint_lane.assert_not_called()
         await db_session.refresh(lane)
-        assert (lane.phase_requeues or 0) == initial_requeues + 1
+        # Transient exception must NOT increment phase_requeues.
+        assert (lane.phase_requeues or 0) == initial_requeues
 
     @pytest.mark.asyncio
     async def test_lane_checkpoint_sha_reachable_proceeds(self, db_session, mocker):

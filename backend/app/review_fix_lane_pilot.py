@@ -566,11 +566,11 @@ async def checkpoint_and_reserve_on_phase_complete(
     # Verify the SHA is actually reachable on the lane branch before recording
     # it as the durable checkpoint. An unverified SHA causes the agent's warm-
     # resume hard-reset to fail and silently degrades to a cold clone —
-    # defeating the measurement. Policy: verification failure (both False and
-    # None) degrades to mark_checkpoint_missing so the sweep can requeue;
-    # verification unavailability (credentials missing, transient API failure)
-    # is treated identically to not-reachable to avoid recording a
-    # potentially-stale SHA. Neither case blocks the review spawn path.
+    # defeating the measurement. Policy: confirmed False (SHA not reachable)
+    # calls mark_checkpoint_missing so the sweep can requeue. Transient/
+    # indeterminate outcomes (exception or None) return False WITHOUT calling
+    # mark_checkpoint_missing — a transient hiccup must not burn the
+    # phase_requeues budget; the review spawn path is unaffected either way.
     try:
         from app.github_refs import is_ancestor_of
         from app.github_token_resolver import get_github_token_for_task
@@ -588,22 +588,12 @@ async def checkpoint_and_reserve_on_phase_complete(
         )
     except Exception as exc:  # noqa: BLE001 - verification is best-effort
         logger.warning(
-            "[LANE-PILOT] SHA verification unavailable for lane %s sha=%s: %s",
+            "[LANE-PILOT] SHA verification unavailable for lane %s sha=%s: %s — "
+            "skipping checkpoint without burning requeue budget",
             lane.id,
             str(sha)[:8],
             exc,
         )
-        with contextlib.suppress(LaneCheckpointError):
-            missed_lane, _ = await mark_checkpoint_missing(
-                session, lane.id, reason="sha_verification_unavailable"
-            )
-            if record_miss_marker:
-                _record_lane_recovery_state(
-                    missed_lane,
-                    reason="sha_verification_unavailable",
-                    attempt=missed_lane.phase_requeues or 0,
-                    exhausted=False,
-                )
         return False
 
     if reachable is False:
@@ -630,21 +620,10 @@ async def checkpoint_and_reserve_on_phase_complete(
     if reachable is None:
         logger.warning(
             "[LANE-PILOT] SHA reachability indeterminate for lane %s sha=%s — "
-            "skipping checkpoint",
+            "skipping checkpoint without burning requeue budget",
             lane.id,
             str(sha)[:8],
         )
-        with contextlib.suppress(LaneCheckpointError):
-            missed_lane, _ = await mark_checkpoint_missing(
-                session, lane.id, reason="sha_verification_unavailable"
-            )
-            if record_miss_marker:
-                _record_lane_recovery_state(
-                    missed_lane,
-                    reason="sha_verification_unavailable",
-                    attempt=missed_lane.phase_requeues or 0,
-                    exhausted=False,
-                )
         return False
 
     _tokens_in, _tokens_out, _ = get_task_total_llm_totals(source_task)

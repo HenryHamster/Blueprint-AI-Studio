@@ -2855,6 +2855,93 @@ class TestDigestMetricsModuleSeams:
                     )
 
 
+# ── Auto-pause epidemic summary ────────────────────────────────────────────
+
+
+def test_auto_pause_epidemic_summary_zero_when_no_pauses():
+    """Directions with no auto_pause_count produce zeroed summary."""
+    from app.digest_direction_progress import _compute_auto_pause_epidemic_summary
+
+    directions = [
+        {"id": "d-aaa", "text": "Direction A"},
+        {"id": "d-bbb", "text": "Direction B"},
+        {"id": "d-ccc", "text": "Direction C", "auto_pause_count": 0},
+    ]
+    result = _compute_auto_pause_epidemic_summary(directions)
+    assert result["total_cycles"] == 0
+    assert result["affected_directions"] == 0
+    assert result["top_offenders"] == []
+
+
+def test_auto_pause_epidemic_summary_aggregates_correctly():
+    """Epidemic summary correctly sums cycles and ranks top offenders."""
+    from app.digest_direction_progress import _compute_auto_pause_epidemic_summary
+
+    directions = [
+        {"id": "d-aaa", "text": "Alpha direction", "auto_pause_count": 10},
+        {"id": "d-bbb", "text": "Beta direction", "auto_pause_count": 3},
+        {"id": "d-ccc", "text": "Gamma direction", "auto_pause_count": 0},
+        {"id": "d-ddd", "text": "Delta direction"},
+        {"id": "d-eee", "text": "Epsilon direction", "auto_pause_count": 7},
+    ]
+    result = _compute_auto_pause_epidemic_summary(directions)
+
+    assert result["total_cycles"] == 20
+    assert result["affected_directions"] == 3
+    # Top offenders sorted descending by auto_pause_count
+    offenders = result["top_offenders"]
+    assert len(offenders) == 3
+    assert offenders[0]["direction_id"] == "d-aaa"
+    assert offenders[0]["auto_pause_count"] == 10
+    assert offenders[1]["direction_id"] == "d-eee"
+    assert offenders[1]["auto_pause_count"] == 7
+    assert offenders[2]["direction_id"] == "d-bbb"
+    assert offenders[2]["auto_pause_count"] == 3
+    # Each offender entry has required keys
+    for entry in offenders:
+        assert "direction_id" in entry
+        assert "direction_text" in entry
+        assert "auto_pause_count" in entry
+
+
+def test_auto_pause_epidemic_summary_caps_top_offenders_at_five():
+    """top_offenders list is capped at 5 entries even with many paused directions."""
+    from app.digest_direction_progress import _compute_auto_pause_epidemic_summary
+
+    directions = [
+        {"id": f"d-{i}", "text": f"Direction {i}", "auto_pause_count": i + 1}
+        for i in range(8)
+    ]
+    result = _compute_auto_pause_epidemic_summary(directions)
+    assert result["total_cycles"] == sum(range(1, 9))
+    assert result["affected_directions"] == 8
+    assert len(result["top_offenders"]) == 5
+    # Highest counts appear first
+    assert result["top_offenders"][0]["auto_pause_count"] == 8
+
+
+def test_auto_pause_epidemic_summary_direction_text_truncated_to_80():
+    """direction_text in top_offenders is truncated to 80 characters."""
+    from app.digest_direction_progress import _compute_auto_pause_epidemic_summary
+
+    long_text = "X" * 120
+    directions = [{"id": "d-long", "text": long_text, "auto_pause_count": 5}]
+    result = _compute_auto_pause_epidemic_summary(directions)
+    assert len(result["top_offenders"][0]["direction_text"]) == 80
+
+
+def test_auto_pause_epidemic_summary_uses_direction_id_fallback():
+    """Directions using direction_id instead of id are correctly handled."""
+    from app.digest_direction_progress import _compute_auto_pause_epidemic_summary
+
+    directions = [
+        {"direction_id": "d-old-style", "text": "Old style", "auto_pause_count": 4}
+    ]
+    result = _compute_auto_pause_epidemic_summary(directions)
+    assert result["total_cycles"] == 4
+    assert result["top_offenders"][0]["direction_id"] == "d-old-style"
+
+
 # ── Dependency-health observability signals ────────────────────────────────
 
 
