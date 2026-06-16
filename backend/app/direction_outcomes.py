@@ -16,6 +16,7 @@ from sqlmodel import select
 from app.failure_stage import _derive_failure_stage
 from app.failure_classification import (
     CODE_ERROR,
+    CO_DEFERRED_SHELVED,
     INFRA_CLASSES,
     REASSIGNED,
     SCOPE_EMPTY,
@@ -124,6 +125,10 @@ def _is_non_genuine_cancelled(task: Task) -> bool:
         return True
     ctx = task.context or {}
     if ctx.get("failure_detail") in _NON_GENUINE_CANCELLED_DETAILS:
+        return True
+    if ctx.get("prerequisite_escalated_to_parent"):
+        return True
+    if ctx.get(CO_DEFERRED_SHELVED):
         return True
     return ctx.get("failure_category") in (REASSIGNED, SCOPE_EMPTY)
 

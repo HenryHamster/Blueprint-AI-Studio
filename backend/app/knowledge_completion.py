@@ -1458,6 +1458,7 @@ async def _gather_compute_evidence(
     artifact_uri: str | None = None
     storage_uri: str | None = None
     file_count = 0
+    art_logs: dict | None = None
     if job.artifact_id is not None:
         try:
             artifact = await session.get(Artifact, job.artifact_id)
@@ -1546,6 +1547,27 @@ async def _gather_compute_evidence(
 
     log_excerpt = (logs or "")[:_COMPUTE_LOG_TEXT_CAP]
 
+    # Extract the bounded command log text (stdout/stderr from the experiment
+    # command) from the COMPUTE_RESULT artifact text so the LLM can find metrics
+    # and results that live in command output rather than in $BLUEPRINT_RESULT_FILE.
+    # build_compute_result_logs() embeds command_log_text directly in the artifact
+    # JSON; fall back to reading from the Artifact row's logs if absent there.
+    command_log_text: str | None = None
+    try:
+        result_obj = json.loads(logs) if logs else None
+        if isinstance(result_obj, dict):
+            cl = str(result_obj.get("command_log_text") or "").strip()
+            if cl:
+                command_log_text = cl[:_COMPUTE_LOG_TEXT_CAP]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if not command_log_text and isinstance(art_logs, dict):
+        raw_cl = art_logs.get("command_log")
+        if isinstance(raw_cl, dict):
+            cl = str(raw_cl.get("text") or "").strip()
+            if cl:
+                command_log_text = cl[:_COMPUTE_LOG_TEXT_CAP]
+
     return {
         "job_id": str(job.id),
         "artifact_uri": artifact_uri,
@@ -1554,6 +1576,7 @@ async def _gather_compute_evidence(
         "citations": citations,
         "real_evidence": real_evidence,
         "log_excerpt": log_excerpt,
+        "command_log_text": command_log_text,
     }
 
 
@@ -1583,6 +1606,19 @@ def _build_compute_analysis_prompt(
         if criterion is not None
         else "(none declared)"
     )
+    # Prefer the embedded command-output log (where non-scalar results often
+    # live); when absent, fall back to the truncated terminal result log so the
+    # job's logs are never dropped from the analysis prompt.
+    command_log_section = ""
+    command_log_text = evidence.get("command_log_text")
+    log_excerpt = evidence.get("log_excerpt")
+    if command_log_text:
+        command_log_section = (
+            "Command output log (may contain results not in scalar metrics):\n"
+            f"{command_log_text}\n"
+        )
+    elif log_excerpt:
+        command_log_section = f"Terminal result log (truncated):\n{log_excerpt}\n"
     return (
         "You are analysing the durable outputs of a finished compute experiment. "
         "Write a grounded, factual knowledge document about what the experiment "
@@ -1596,7 +1632,7 @@ def _build_compute_analysis_prompt(
         f"Declared success criterion: {criterion_line}\n"
         "Preserved numeric metrics:\n"
         f"{metrics_lines}\n"
-        f"Terminal result log (truncated):\n{evidence['log_excerpt']}\n\n"
+        f"{command_log_section}"
         "You MUST choose source_citations ONLY from this allowed evidence list "
         "(copy the strings verbatim); cite at least one artifact or metric "
         "reference, not only the result reference:\n"
@@ -1660,9 +1696,7 @@ async def _call_compute_analysis_llm(
             if attempt == 0:
                 logger.info("[COMPUTE] analysis parse error %s, retrying once", exc)
                 continue
-            logger.info(
-                "[COMPUTE] analysis parse error on retry; analysis unavailable"
-            )
+            logger.info("[COMPUTE] analysis parse error on retry; analysis unavailable")
             return None
         except Exception as exc:  # noqa: BLE001 — any API error ⇒ unavailable
             logger.info(
@@ -1842,7 +1876,11 @@ async def _latest_compute_live_release_evidence(
     """Return (evidence, echo_sha) from the most-recent compute job, or None."""
     if job_id is not None:
         job = await session.get(ComputeJob, job_id)
-        if job is None or job.task_id != task.id or not isinstance(job.polling_metadata, dict):
+        if (
+            job is None
+            or job.task_id != task.id
+            or not isinstance(job.polling_metadata, dict)
+        ):
             return None
     else:
         result = await session.execute(

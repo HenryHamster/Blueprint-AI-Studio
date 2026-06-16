@@ -92,7 +92,6 @@ export function useAppState() {
     showSettings, setShowSettings,
     showDirections, setShowDirections,
     showMetrics, setShowMetrics,
-    showDiagnostics, setShowDiagnostics,
     showShortcutHelp, setShowShortcutHelp,
     showUserManagement, setShowUserManagement,
     settingsRef, shortcutHelpRef,
@@ -691,7 +690,7 @@ export function useAppState() {
     orchestratorHealth,
     detailedHealth,
     // Diagnostics
-    diagnostics, showDiagnostics, setShowDiagnostics,
+    diagnostics,
     pipelineThrottle,
     // User management
     allowedUsers, showUserManagement, setShowUserManagement,

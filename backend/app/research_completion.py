@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.context_bounds import bound_deferred_findings
 from app.depends_on_provenance import remember_structural_depends_on
 from app.findings_index import (  # noqa: F401 — re-exported for callers/tests
     lookup_findings_by_source_ref,
@@ -887,10 +888,19 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
         target["possibly_saturated"] = new_consec >= 3
         stamp_direction_refractory(target)
 
-        # Auto-complete if saturated and proven by merged PRs — same criteria as
-        # apply_post_spawn_state, applied here so the most exhausted directions
-        # (those producing zero findings) are retired rather than looping forever.
+        # Auto-complete the most exhausted directions (those producing zero
+        # findings) rather than looping forever — same criteria as
+        # apply_post_spawn_state:
+        #   * PROVEN route: saturated AND >= 3 verified PRs merged.
+        #   * ADDITIVE exhaustion route: genuinely exhausted (saturated with no
+        #     recent output / deadlocked) with < 3 merges, under the code-failing
+        #     and externally-frozen guardrails.
         if target.get("status") == "active" and target.get("possibly_saturated"):
+            from app.strategic_completion import (
+                _exhaustion_complete_reason,
+                _should_autocomplete_exhausted,
+            )
+
             history = target.get("research_history", [])
             agg = target.get("history_aggregate", {})
             total_merged = sum(verified_merged_count(e) for e in history) + int(
@@ -900,8 +910,8 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 )
                 or 0
             )
+            total_cycles = len(history) + (agg.get("total_cycles") or 0)
             if total_merged >= 3:
-                total_cycles = len(history) + (agg.get("total_cycles") or 0)
                 target["status"] = "completed"
                 target["completed_at"] = now_iso
                 target["auto_completed"] = True
@@ -913,6 +923,20 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                     {
                         "text": target.get("text", direction_id),
                         "reason": target["auto_completed_reason"],
+                        "total_merged": total_merged,
+                        "total_cycles": total_cycles,
+                    }
+                )
+            elif _should_autocomplete_exhausted(target):
+                reason = _exhaustion_complete_reason(target)
+                target["status"] = "completed"
+                target["completed_at"] = now_iso
+                target["auto_completed"] = True
+                target["auto_completed_reason"] = reason
+                _auto_complete_info.append(
+                    {
+                        "text": target.get("text", direction_id),
+                        "reason": reason,
                         "total_merged": total_merged,
                         "total_cycles": total_cycles,
                     }
@@ -932,8 +956,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 title="Direction auto-completed",
                 message=(
                     f"Direction '{info['text'][:80]}' was auto-completed: "
-                    f"saturated with {info['total_merged']} PRs merged "
-                    f"across {info['total_cycles']} cycles."
+                    f"{info['reason']}."
                 ),
             )
         )
@@ -2822,6 +2845,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             TaskStatus.IN_PROGRESS,
                             TaskStatus.EVALUATING,
                             TaskStatus.PROVISIONING,
+                            # A BLOCKED task is in-flight work waiting for a precondition
+                            # to be met — dedup against it so we don't re-spawn a
+                            # near-duplicate of work that's waiting on prerequisites.
+                            TaskStatus.BLOCKED,
                             # A PARKED task is in-flight work that deterministically
                             # resumes on its wake — dedup against it so we don't
                             # re-spawn a near-duplicate of work that's merely parked.
@@ -3157,6 +3184,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     type_filtered_count = 0
     type_filtered_by_dir: dict[str, int] = {}
     empty_prompt_count = 0
+
+    # Hashes of findings that survived parsing into `findings` but were dropped
+    # from the SPAWN set by deduplicate_findings (duplicate of existing in-flight,
+    # recently-terminal, or already-shipped work — word/hash/file/evidence
+    # overlap). Every finding either survives into `deduplicated` or is filtered,
+    # disjointly, so the dropped set is exactly {all hashes} − {survivor hashes}.
+    # Consumed at spawn-wiring (the depends_on_indices missing-sibling loop): a
+    # SURVIVING dependent that declared an edge to one of these duplicates spawns
+    # standalone instead of cancelling on a dead prerequisite.
+    _survivor_finding_hashes = {h for (_idx, _f, h) in _dedup_outcome.deduplicated}
+    _deduped_dropped_hashes = {
+        h for h in _title_to_fhash.values() if h not in _survivor_finding_hashes
+    }
 
     # Assess pipeline health once before spawning implementation tasks.
     # Metadata findings (design_doc_observation, direction_update) are processed
@@ -4896,7 +4936,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     ):
         ctx = dict(task.context or {})
         if _all_deferred:
-            ctx["deferred_findings"] = _all_deferred
+            ctx["deferred_findings"] = bound_deferred_findings(_all_deferred)
         if _finding_give_up:
             ctx["finding_structural_give_up"] = _finding_give_up
         if _scope_skip_counts:
@@ -5208,6 +5248,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         needs: list = []
         unresolved_entries: list = []
         structurally_dead_entries: list = []
+        # depends_on edges dropped because the named sibling was deduped away as a
+        # duplicate of existing/covered work (recorded for observability; the
+        # dependent spawns standalone — see the missing-sibling loop below).
+        dropped_duplicate_prereqs: list = []
 
         dep_indices = findings[fi].get("depends_on_indices", [])
         missing_dep_indices = [j for j in dep_indices if j not in finding_to_child]
@@ -5275,6 +5319,33 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     prereq_label=f"task:{missing_hash}",
                 )
                 continue
+            # The named sibling survived parsing into `findings` but was dropped
+            # from the SPAWN set by deduplicate_findings — it duplicates work that
+            # already exists, is in-flight, or has shipped. resolve_prerequisite_task
+            # could not wire an edge because the duplicate is matched fuzzily (title /
+            # files / evidence), not by the exact finding_hash this loop recomputes,
+            # so the two identities diverge across independent research runs. The
+            # foundation IS covered, though, so the declared edge is ORPHANED, not a
+            # real unmet dependency: drop it and let the dependent spawn standalone
+            # rather than cancelling it as a dead need (no_live_or_deferred_provider)
+            # and failing the whole research task. Serialization against the
+            # duplicate was only a merge-order optimization the pipeline tolerates.
+            if missing_hash in _deduped_dropped_hashes:
+                logger.info(
+                    "[RESEARCH] Finding '%s' depends_on sibling '%s' that was deduped "
+                    "as a duplicate of existing/covered work — dropping the orphaned "
+                    "edge and spawning standalone (no dead need)",
+                    finding_title,
+                    missing_title,
+                )
+                dropped_duplicate_prereqs.append(
+                    {
+                        "finding_index": missing_fi,
+                        "title": missing_title,
+                        "finding_hash": missing_hash,
+                    }
+                )
+                continue
             unresolved_entries.append(
                 {
                     "finding_index": missing_fi,
@@ -5285,6 +5356,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             sibling_need = build_need("task", missing_hash, label=missing_title)
             if sibling_need:
                 needs.append(sibling_need)
+
+        # Stamp the orphaned-edge drops on the child context for observability:
+        # operators can see WHY a declared depends_on edge is absent (its sibling
+        # was a duplicate) without re-deriving it from logs.
+        if dropped_duplicate_prereqs:
+            _dd_ctx = dict(ct.context or {})
+            _dd_ctx["_spawn_prereq_dropped_duplicate"] = (
+                list(_dd_ctx.get("_spawn_prereq_dropped_duplicate") or [])
+                + dropped_duplicate_prereqs
+            )
+            ct.context = _dd_ctx
+            flag_modified(ct, "context")
+            session.add(ct)
 
         # Explicit {kind, ref} prerequisite: wire a real edge if it resolved to an
         # in-flight / sibling foundation this cycle, otherwise add it to the needs
@@ -5531,7 +5615,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # prerequisites so autonomous_research re-injects the coupled set next cycle.
     if _codeferred_findings:
         _cd_ctx = dict(task.context or {})
-        _cd_ctx["deferred_findings"] = (
+        _cd_ctx["deferred_findings"] = bound_deferred_findings(
             list(_cd_ctx.get("deferred_findings") or []) + _codeferred_findings
         )
         task.context = _cd_ctx

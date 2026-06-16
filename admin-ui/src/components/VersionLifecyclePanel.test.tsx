@@ -90,6 +90,7 @@ describe('VersionLifecyclePanel', () => {
     vi.clearAllMocks();
     mockRefresh.mockClear();
     vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
   });
 
   it('renders the promotion policy source and fallback reason', () => {
@@ -676,6 +677,56 @@ describe('VersionLifecyclePanel', () => {
 
       expect(screen.getByText('promoted')).toBeInTheDocument();
       expect(screen.queryByText(/cut by /)).not.toBeInTheDocument();
+    });
+  });
+
+  describe("current version what's-new headline", () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    const HIGHLIGHTS: api.VersionSummaryHighlights = {
+      headline: 'open in stabilize with 7 merged',
+      merged_count: 7,
+      proven: 4,
+      total_merged_for_acceptance: 7,
+      qualification_confidence: 0.84,
+      qualification_threshold: 0.9,
+    };
+
+    it('renders the headline + at-a-glance metrics for the current version when highlights are present', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ phase: 'stabilize', highlights: HIGHLIGHTS }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const headline = screen.getByTestId('version-headline');
+      expect(headline).toHaveTextContent('open in stabilize with 7 merged');
+      expect(headline).toHaveTextContent('4/7 proven');
+      expect(headline).toHaveTextContent('conf 84% / thr 90%');
+      // Status for the current (open) version is always 'open'.
+      expect(headline).toHaveTextContent('stabilize · open');
+    });
+
+    it('omits the headline when the current version has no highlights (older backend)', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ phase: 'build' }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.queryByTestId('version-headline')).not.toBeInTheDocument();
     });
   });
 
@@ -2048,7 +2099,7 @@ describe('VersionLifecyclePanel', () => {
                 promoted_at: '2026-01-02T00:00:00Z',
                 qualification_attempts: 1,
                 last_qualification: null,
-                serving_status: 'unconfirmed',
+                serving: { status: 'unconfirmed' },
                 deploy_confirm_deadline: deadline,
               },
             ],
@@ -2108,8 +2159,7 @@ describe('VersionLifecyclePanel', () => {
                 promoted_at: '2026-01-02T00:00:00Z',
                 qualification_attempts: 1,
                 last_qualification: null,
-                serving_status: 'deploy_failed',
-                deploy_failure_reason: 'never stabilized',
+                serving: { status: 'deploy_failed', failure_reason: 'never stabilized' },
               },
             ],
           })}
@@ -2331,10 +2381,8 @@ describe('VersionLifecyclePanel', () => {
                 summary: 'Promoted but not every required artifact confirms serving yet.',
                 serving_status: 'serving_confirmed',
               },
-              // Backend-only scalar says serving — the aggregate must override it.
-              serving_status: 'serving_confirmed',
-              served_sha: 'abcdef1234567890',
-              aggregate_serving_status: 'unconfirmed',
+              // Backend resolves the aggregate into `serving.status` — overrides the scalar.
+              serving: { status: 'unconfirmed' },
               artifacts: [
                 { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
                 { artifact_kind: 'frontend_bundle', required: true, serving_status: 'unconfirmed', served_identifier: null, served_at: null, reason_code: null },
@@ -2362,9 +2410,7 @@ describe('VersionLifecyclePanel', () => {
                 summary: 'A required artifact failed to confirm serving.',
                 serving_status: 'serving_confirmed',
               },
-              serving_status: 'serving_confirmed',
-              aggregate_serving_status: 'deploy_failed',
-              aggregate_deploy_failure_reason: 'frontend bundle 502 on canary',
+              serving: { status: 'deploy_failed', failure_reason: 'frontend bundle 502 on canary' },
               artifacts: [
                 { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abcdef1234567890', served_at: '2026-01-02T00:00:00Z', reason_code: null },
                 { artifact_kind: 'frontend_bundle', required: true, serving_status: 'deploy_failed', served_identifier: null, served_at: null, reason_code: 'frontend bundle 502 on canary' },
@@ -2517,9 +2563,7 @@ describe('VersionLifecyclePanel', () => {
                 promoted_at: '2026-01-02T00:00:00Z',
                 qualification_attempts: 1,
                 last_qualification: null,
-                serving_status: 'serving_confirmed',
-                aggregate_serving_status: 'deploy_failed',
-                aggregate_deploy_failure_reason: 'bundle never confirmed',
+                serving: { status: 'deploy_failed', failure_reason: 'bundle never confirmed' },
                 artifacts: [
                   { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abc1234', served_at: '2026-01-02T00:00:00Z', reason_code: null },
                   { artifact_kind: 'frontend_bundle', required: true, serving_status: 'deploy_failed', served_identifier: null, served_at: null, reason_code: 'bundle never confirmed' },

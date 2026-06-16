@@ -374,8 +374,7 @@ _UNVERIFIED_REASON_LABELS = {
     ),
     "undetected_runtime": "the detected test suite produced no usable verdict",
     "suite_all_skipped": (
-        "a test suite was present but every test was skipped "
-        "(no real verification ran)"
+        "a test suite was present but every test was skipped (no real verification ran)"
     ),
     "verify_setup_failed": (
         "the detected test suite exists but could not be run "
@@ -800,6 +799,57 @@ async def _maybe_create_spend_ceiling_alert(
     )
 
 
+_SPEND_APPROACHING_ALERT_TITLE = (
+    "Spend ceiling approaching: autonomous spawning may pause soon"
+)
+
+
+async def _maybe_create_approaching_ceiling_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    window_spend_usd: float,
+    ceiling_usd: float,
+    warning_fraction: float,
+) -> None:
+    """Create a deduplicated WARNING alert when a project's spend approaches its ceiling.
+
+    Fires when rolling spend is in the configured band below the ceiling
+    (spend >= ceiling * warning_fraction AND spend < ceiling). When spend reaches
+    the ceiling, _maybe_create_spend_ceiling_alert fires instead — these two alerts
+    are mutually exclusive per tick. Caller owns the commit.
+    """
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.severity == AlertSeverity.WARNING,
+            Alert.dismissed_at.is_(None),
+            Alert.title == _SPEND_APPROACHING_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title=_SPEND_APPROACHING_ALERT_TITLE,
+        message=(
+            f"Rolling window spend ${window_spend_usd:.4f} has reached "
+            f"{warning_fraction * 100:.0f}% of the per-project ceiling "
+            f"${ceiling_usd:.4f}. Autonomous spawning will pause when spend "
+            f"reaches the ceiling."
+        ),
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+    )
+
+
 # Human-readable labels for the review-fix early-escalation reasons. The reason
 # key is part of the deduplicated alert title, so keep these stable.
 _ESCALATION_REASON_LABELS = {
@@ -1140,9 +1190,7 @@ async def _maybe_create_stale_staged_direction_alert(
     (the reaper staleness sweep) wrap it best-effort so an alert failure can never
     abort the sweep.
     """
-    title = (
-        f"{_STALE_STAGED_DIRECTION_TITLE_PREFIX}: {str(direction_id)[:64]}"
-    )[:200]
+    title = (f"{_STALE_STAGED_DIRECTION_TITLE_PREFIX}: {str(direction_id)[:64]}")[:200]
     existing = await session.execute(
         select(Alert).where(
             Alert.project_id == project_id,
@@ -1167,7 +1215,7 @@ async def _maybe_create_stale_staged_direction_alert(
         else "no open version is recorded"
     )
     message = (
-        f"Staged direction {direction_id} (\"{label}\") has waited "
+        f'Staged direction {direction_id} ("{label}") has waited '
         f"{waited_days} day(s) for its target version ({target}) to promote, "
         f"but {open_desc} — the version has not promoted, so the staged work "
         f"is stalled. Retarget, force-activate, or cancel it."
@@ -1420,9 +1468,7 @@ async def _maybe_create_cascade_cancel_alert(
 # Stable title for the per-project wake-delivery-stall alert. Kept CONSTANT
 # (the drifting stall_cycles count lives in the message) so a persistent stall
 # dedups to exactly ONE alert per project across reaper ticks.
-_WAKE_DELIVERY_STALL_ALERT_TITLE = (
-    "Wake delivery stalled — parked tasks not waking"
-)
+_WAKE_DELIVERY_STALL_ALERT_TITLE = "Wake delivery stalled — parked tasks not waking"
 
 
 async def _maybe_create_wake_delivery_stall_alert(

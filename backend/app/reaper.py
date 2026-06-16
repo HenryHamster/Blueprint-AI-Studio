@@ -81,6 +81,7 @@ from app.retry_budget import append_failure_class_history
 from app.task_blocked import strip_fresh_attempt_context
 from app.time_utils import _utcnow, set_retry_after
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
+from app.schemas import redact_command_log_text
 
 logger = logging.getLogger(__name__)
 
@@ -819,7 +820,7 @@ def _extract_tool_trace_tail(task) -> str:
             continue
         t_str = entry.get("t", "").split("T")[-1][:8]  # HH:MM:SS from ISO-8601
         tool_name = entry.get("tool", "?")[:20]
-        input_preview = entry.get("input_preview", "")[:80]
+        input_preview = redact_command_log_text(entry.get("input_preview", ""))[:80]
         # Compact format: timestamp + tool + input
         part = f"{t_str} {tool_name}: {input_preview}"
         if total_len + len(part) + 3 > max_total:  # +3 for " | "
@@ -1194,7 +1195,8 @@ async def reaper_service():
                             Task.previous_error_fingerprint,
                             Task.requeue_in_flight,
                             Task.description,
-                        raiseload=True,)
+                            raiseload=True,
+                        )
                     )
                     .where(
                         Task.status.in_(
@@ -3601,7 +3603,9 @@ async def reaper_service():
                         # verdict in task_lifecycle_requeue.py, review cap handler) are
                         # tracked as follow-up work — they require broader DB queries
                         # and separate review to fix safely.
-                        from app.failure_classification import is_recoverable_infra_terminal
+                        from app.failure_classification import (
+                            is_recoverable_infra_terminal,
+                        )
 
                         if is_recoverable_infra_terminal(task):
                             logger.info(
@@ -3705,7 +3709,8 @@ async def reaper_service():
                                         Task.status_log,
                                         Task.attempt_count,
                                         Task.created_at,
-                                    raiseload=True,)
+                                        raiseload=True,
+                                    )
                                 )
                                 .where(
                                     Task.status == TaskStatus.EVALUATING,
@@ -3749,7 +3754,8 @@ async def reaper_service():
                                             Task.status_log,
                                             Task.latest_status_message,
                                             Task.payloads,
-                                        raiseload=True,)
+                                            raiseload=True,
+                                        )
                                     )
                                     .where(Task.parent_task_id.in_(_parent_ids))
                                 )
@@ -4321,6 +4327,26 @@ async def reaper_service():
                     logger.error(
                         f"[REAPER] Stale-bug-message resolve sweep error: {e}",
                         exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 19: Lane-pilot KILL verdict sweep — evaluate pilot safety
+                # conditions for all projects with active lane work; apply KILL
+                # (flag flip + force-expire reservations + kill lanes + alert) when
+                # warranted. Owns the KILL safety guarantee independently of digest.
+                _mark_reaper_progress()
+                try:
+                    from app.review_fix_lane_pilot import sweep_lane_pilot_kill_verdict
+
+                    _pilot_kills = await sweep_lane_pilot_kill_verdict(session)
+                    if _pilot_kills:
+                        logger.info(
+                            f"[REAPER] Step 19: applied lane-pilot KILL to {_pilot_kills} project(s)"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Lane-pilot kill sweep error: {e}", exc_info=True
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()

@@ -51,7 +51,13 @@ from app.release_promotion import (
     _resolve_github_with_session,
 )
 from app.rollup_migration_validation import _validate_migration_chain_post_merge
-from app.release_scoring import _CI_GREEN, _CI_NO_CHECKS, _CI_PENDING, _CI_RED, _classify_check_runs
+from app.release_scoring import (
+    _CI_GREEN,
+    _CI_NO_CHECKS,
+    _CI_PENDING,
+    _CI_RED,
+    _classify_check_runs,
+)
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -90,6 +96,10 @@ _MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT = 160
 # (cancelled/timed_out) before the reconciler escalates to the normal terminal
 # path.  Overridable via runtime_config["max_transient_ci_red_sweeps"].
 _TRANSIENT_CI_RED_SWEEP_DEFAULT = 5
+# Number of consecutive sweeps where the GitHub check-runs API returns an
+# error before the reconciler surfaces a distinct warning so operators know
+# that a green-but-stuck appearance may be an API-error masquerade.
+_API_ERROR_SWEEP_WARN_THRESHOLD = 3
 
 
 _TERMINAL_405_SUBSTRINGS = (
@@ -146,6 +156,8 @@ def _managed_check_wait_snapshot(
     check_result: dict | None = None,
     reason: str | None = None,
     detail: str | None = None,
+    from_api_error: bool = False,
+    api_error_sweep_count: int = 0,
 ) -> dict:
     """Build a bounded operator snapshot for a non-terminal check-wait sweep."""
 
@@ -182,6 +194,9 @@ def _managed_check_wait_snapshot(
         snapshot["reason"] = reason
     if detail:
         snapshot["detail"] = detail[:_MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT]
+    if from_api_error:
+        snapshot["api_error"] = True
+        snapshot["api_error_sweep_count"] = api_error_sweep_count
     return snapshot
 
 
@@ -228,6 +243,18 @@ async def _persist_managed_check_wait_snapshot(
         updated_pending["ci_state"] = ci_state
         updated_pending["ci_classified_at"] = snapshot.get("classified_at")
         updated_pending["check_snapshot"] = snapshot
+        # Track consecutive API-error sweeps so the reconciler can distinguish
+        # an api-error masquerade from genuine in-progress CI.
+        if snapshot.get("api_error"):
+            updated_pending["api_error_sweep_count"] = snapshot.get(
+                "api_error_sweep_count", 1
+            )
+        else:
+            updated_pending.pop("api_error_sweep_count", None)
+        # Reset consecutive-transient-red counter whenever CI leaves the red
+        # state so intermittent flakiness does not accumulate non-consecutively.
+        if ci_state != _CI_RED:
+            updated_pending.pop("transient_red_count", None)
         qual["promotion_pending"] = updated_pending
         locked.last_qualification = qual
         flag_modified(locked, "last_qualification")
@@ -249,6 +276,65 @@ async def _persist_managed_check_wait_snapshot(
                 version_id,
             )
         return False
+
+
+async def _reset_pending_transient_red_count(
+    session,
+    version_id: uuid.UUID,
+    *,
+    pr_number: int,
+) -> None:
+    """Reset ``promotion_pending.transient_red_count`` to 0 when CI is no longer red.
+
+    Called whenever CI transitions away from red (green or pending) so that
+    intermittent transient failures do not accumulate non-consecutively.
+    """
+    try:
+        session.expire_all()
+        locked: release_version.ReleaseVersion | None = (
+            (
+                await session.execute(
+                    select(release_version.ReleaseVersion)
+                    .where(release_version.ReleaseVersion.id == version_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if locked is None or locked.status != "open":
+            return
+        qual = dict(locked.last_qualification or {})
+        if qual.get("status") != "pending":
+            return
+        pending = qual.get("promotion_pending")
+        if not isinstance(pending, dict):
+            return
+        if pending.get("pr_number") != pr_number:
+            return
+        if not pending.get("transient_red_count"):
+            return
+        updated_pending = dict(pending)
+        updated_pending.pop("transient_red_count", None)
+        qual["promotion_pending"] = updated_pending
+        locked.last_qualification = qual
+        flag_modified(locked, "last_qualification")
+        session.add(locked)
+        await session.commit()
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] transient_red_count: reset failed for version %s",
+            version_id,
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] transient_red_count: rollback after reset "
+                "failed for version %s",
+                version_id,
+            )
 
 
 async def _increment_pending_transient_red_count(
@@ -1106,6 +1192,12 @@ async def _reconcile_if_pending_auto_merge_landed(
                                 treat_missing_as_success=False,
                             )
                             ci_state = _classify_check_runs(check_result)
+                            if ci_state != _CI_RED:
+                                await _reset_pending_transient_red_count(
+                                    session,
+                                    version.id,
+                                    pr_number=int(pr_number),
+                                )
                             if ci_state == _CI_RED:
                                 if not _check_result_has_genuine_failure(check_result):
                                     # Only transient conclusions (cancelled /
@@ -1595,6 +1687,66 @@ async def _reconcile_if_managed_check_wait(
                     # Checks pending or no-checks on a CI-gated repo — leave
                     # pending for the next sweep.
                     classified_at = _utcnow()
+                    from_api_error = bool(
+                        isinstance(check_result, dict)
+                        and check_result.get("_from_api_error")
+                    )
+                    # Compute api_error_sweep_count from the pre-lock read; this
+                    # value is written verbatim into the snapshot by
+                    # _persist_managed_check_wait_snapshot (no re-derive under lock).
+                    stale_pending = (version.last_qualification or {}).get(
+                        "promotion_pending"
+                    ) or {}
+                    old_api_error_count = int(
+                        stale_pending.get("api_error_sweep_count") or 0
+                    )
+                    api_error_sweep_count = (
+                        old_api_error_count + 1 if from_api_error else 0
+                    )
+                    check_details = (
+                        check_result.get("details", [])
+                        if isinstance(check_result, dict)
+                        else []
+                    )
+                    check_summary = [
+                        {
+                            k: d.get(k)
+                            for k in ("name", "status", "conclusion")
+                            if d.get(k) is not None
+                        }
+                        for d in check_details[
+                            :_MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT
+                        ]
+                        if isinstance(d, dict)
+                    ]
+                    if (
+                        from_api_error
+                        and api_error_sweep_count >= _API_ERROR_SWEEP_WARN_THRESHOLD
+                    ):
+                        logger.warning(
+                            "[RELEASE_QUALIFIER] reconcile managed_check_wait: "
+                            "PR #%s for v%d has %d consecutive GitHub API-error "
+                            "sweeps — GitHub may be degraded; cannot distinguish "
+                            "api-error pending from genuine in-progress CI. "
+                            "head_sha=%s",
+                            pr_number,
+                            version.version_number,
+                            api_error_sweep_count,
+                            pr_head_sha[:8] if pr_head_sha else "unknown",
+                        )
+                    else:
+                        logger.info(
+                            "[RELEASE_QUALIFIER] reconcile managed_check_wait: "
+                            "PR #%s for v%d leaving pending — ci_state=%s, "
+                            "head_sha=%s, api_error=%s, check_count=%d, checks=%s",
+                            pr_number,
+                            version.version_number,
+                            ci_state,
+                            pr_head_sha[:8] if pr_head_sha else "unknown",
+                            from_api_error,
+                            len(check_details),
+                            check_summary,
+                        )
                     await _persist_managed_check_wait_snapshot(
                         session,
                         version.id,
@@ -1605,6 +1757,8 @@ async def _reconcile_if_managed_check_wait(
                             classified_at=classified_at,
                             head_sha=pr_head_sha,
                             check_result=check_result,
+                            from_api_error=from_api_error,
+                            api_error_sweep_count=api_error_sweep_count,
                         ),
                     )
                     return False

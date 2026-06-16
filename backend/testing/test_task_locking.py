@@ -19,6 +19,7 @@ from sqlmodel import select
 
 from app.models import Project, ProjectMember, Task, TaskStatus
 from app.task_locking import (
+    DESIGN_DOC_MAX_BYTES,
     acquire_pr_spawn_lock,
     lock_project_or_429,
     project_lock,
@@ -1300,3 +1301,112 @@ async def test_auto_remediation_recovery_serializes_concurrent_writers(db_sessio
     assert meta.get("feat/b", {}).get("recovery_attempts") == 1, (
         f"feat/b recovery attempt lost from {doc}"
     )
+
+
+# ── design_doc 500KB ceiling enforcement ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_background_write_rejects_growth_over_ceiling_but_allows_shrink(
+    db_session,
+):
+    """Core acceptance test: with_design_doc_locked must reject a mutate_fn
+    that would grow design_doc past DESIGN_DOC_MAX_BYTES, but must allow a
+    shrinking write even when the doc is already over the ceiling.
+
+    Growth over ceiling → returns False, doc unchanged.
+    Shrink from over-ceiling → returns True, doc is written (recovery path).
+    """
+    # Build a doc that is just under the ceiling so a small addition pushes it over.
+    padding = "x" * (DESIGN_DOC_MAX_BYTES - 30)
+    project = Project(name="ceiling-test", user_id="user")
+    project.design_doc = {"pad": padding}
+    db_session.add(project)
+    await db_session.commit()
+
+    # Attempt a growing write that pushes the doc over the ceiling.
+    def _grow(doc: dict) -> None:
+        doc["new_key"] = "y" * 100  # adds ~100 bytes, crossing the ceiling
+
+    result = await with_design_doc_locked(db_session, project.id, _grow)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert result is False, "growing write over ceiling must return False"
+    assert "new_key" not in project.design_doc, "growing write must not be persisted"
+
+    # Now set the doc to over-ceiling so we can verify the shrink path.
+    bloated_padding = "x" * (DESIGN_DOC_MAX_BYTES + 100)
+    project.design_doc = {"pad": bloated_padding}
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    _flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    # A shrinking write (removes the bloated padding) must succeed even though
+    # the doc is currently over the ceiling — this is the recovery path.
+    def _shrink(doc: dict) -> None:
+        doc["pad"] = "small"
+
+    result = await with_design_doc_locked(db_session, project.id, _shrink)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert result is True, "shrinking write from over-ceiling must return True"
+    assert project.design_doc.get("pad") == "small", "shrink must be persisted"
+
+
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_allows_write_at_ceiling_boundary(db_session):
+    """A write that lands exactly at DESIGN_DOC_MAX_BYTES must succeed."""
+    import json as _json
+
+    project = Project(name="ceiling-boundary", user_id="user")
+    project.design_doc = {}
+    db_session.add(project)
+    await db_session.commit()
+
+    # Compute padding so final doc JSON is exactly DESIGN_DOC_MAX_BYTES bytes.
+    # The final doc will be {"pad": "<padding>"}.
+    wrapper_overhead = len(_json.dumps({"pad": ""}))
+    padding = "x" * (DESIGN_DOC_MAX_BYTES - wrapper_overhead)
+
+    def _set_pad(doc: dict) -> None:
+        doc["pad"] = padding
+
+    result = await with_design_doc_locked(db_session, project.id, _set_pad)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert result is True, "write at exact ceiling must be allowed"
+    final_size = len(_json.dumps(project.design_doc))
+    assert final_size == DESIGN_DOC_MAX_BYTES, (
+        f"expected exactly {DESIGN_DOC_MAX_BYTES} bytes, got {final_size}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_skips_when_doc_already_over_ceiling_and_grows(
+    db_session,
+):
+    """When the existing doc is already over the ceiling and mutate_fn would
+    grow it further, the write must be skipped (False returned)."""
+    bloated = "x" * (DESIGN_DOC_MAX_BYTES + 50)
+    project = Project(name="ceiling-already-over", user_id="user")
+    project.design_doc = {"pad": bloated}
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    _flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    def _grow_more(doc: dict) -> None:
+        doc["extra"] = "y" * 100
+
+    result = await with_design_doc_locked(db_session, project.id, _grow_more)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert result is False, "growing an already-over-ceiling doc must return False"
+    assert "extra" not in project.design_doc, "growth must not be persisted"

@@ -37,6 +37,7 @@ from app.models import (
     TaskStatus,
     get_task_total_vm_cost_usd_or_none,
 )
+from app.max_plan_pool import filter_user_task_context
 from app.payload_schemas import validate_task_payload
 from app.research_completion import resolve_research_findings_for_surface
 from app.schemas import DeployPayload
@@ -171,7 +172,9 @@ async def deploy_blueprint(
         try:
             p = validate_task_payload(p)
         except ValueError as exc:
-            logger.warning("Validation error in task payload: %s: %s", type(exc).__name__, exc)
+            logger.warning(
+                "Validation error in task payload: %s: %s", type(exc).__name__, exc
+            )
             raise HTTPException(status_code=422, detail="Invalid request")
         # GCP instance names must match a specific regex (lowercase, hyphens, numbers)
         vm_name = f"agent-vm-{uuid.uuid4().hex}"
@@ -399,11 +402,7 @@ async def get_project_tasks(
             "payloads": t.payloads,
             "created_at": t.created_at,
             "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
-            "context": {
-                k: v
-                for k, v in (t.context or {}).items()
-                if not k.startswith("max_plan_")
-            },
+            "context": filter_user_task_context(t.context),
             "artifacts": artifacts_by_task.get(t.id, []),
             "research_findings": resolve_research_findings_for_surface(
                 t.plan_output, research_map.get(t.id)

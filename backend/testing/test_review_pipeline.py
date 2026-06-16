@@ -865,6 +865,118 @@ async def test_review_spawn_defers_when_blocked_fix_active(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_review_spawn_defers_to_ci_waiting_fix_and_does_not_churn(
+    db_session, mocker
+):
+    """Rollup PR #10389 regression: a same-PR fix parked in CI-wait
+    (review_loop.ci_waiting) with a stale heartbeat must make a review spawn
+    DEFER — not stale-supersede the fix. A CI-waiting task's silence is by
+    design (the orchestrator, not the VM, polls CI from here) and a multi-shard
+    CI run outlasts the 15-min stale threshold, so superseding it both cancels a
+    task making authoritative progress AND counts toward the supersession-churn
+    halt that terminalized research b2231dd0.
+
+    Pre-fix: the CI-waiting fix was stale-superseded → CANCELLED, churn counter
+    incremented, a fresh review spawned. MUST FAIL pre-fix.
+    """
+    from datetime import datetime
+
+    from app.review_pipeline import (
+        SPAWN_REASON_DEFERRED,
+        PIPELINE_TASK_STALE_MINUTES,
+        _review_supersede_churn_count,
+    )
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # A fix on the SAME PR/chain, EVALUATING + ci_waiting, with a stale heartbeat
+    # (a 12-shard CI run easily exceeds the 15-min stale threshold).
+    ci_waiting_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        last_heartbeat=datetime.utcnow()
+        - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES + 5),
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 10389,
+                "branch": "research/x",
+                "base_branch": "automain",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "review_loop": {
+                "iteration": 1,
+                "ci_waiting": True,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(ci_waiting_fix)
+    await db_session.commit()
+    await db_session.refresh(ci_waiting_fix)
+
+    # The originating task tries to (re)spawn a review for the same PR (e.g. a
+    # rollup resume pass).
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 10389,
+                "branch": "research/x",
+                "base_branch": "automain",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 1, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=10389,
+        branch="research/x",
+        base_branch="automain",
+        original_task_id=str(original_task.id),
+    )
+
+    # Cross-type defer: no review spawned, deferral marker set.
+    assert result is None
+    assert created is False
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_DEFERRED
+
+    # The CI-waiting fix must NOT have been stale-superseded (still EVALUATING).
+    await db_session.refresh(ci_waiting_fix)
+    assert ci_waiting_fix.status == TaskStatus.EVALUATING
+
+    # And the supersession-churn counter must NOT have advanced — a deferral is
+    # not a supersession, so it can never feed the churn halt.
+    await db_session.refresh(original_task)
+    assert _review_supersede_churn_count(original_task) == 0
+
+
+@pytest.mark.asyncio
 async def test_review_spawn_defers_when_in_progress_fix_active(db_session, mocker):
     """Cross-type regression lock: an IN_PROGRESS same-PR fix must also defer a
     review spawn (the in-flight fix must finish first). This pins that adding
@@ -16102,8 +16214,8 @@ class TestLaneCheckpointShaVerification:
     async def test_lane_checkpoint_sha_verification_unavailable_degrades(
         self, db_session, mocker
     ):
-        """API returns None (unavailable) → mark_checkpoint_missing with
-        reason='sha_verification_unavailable' and return False."""
+        """API returns None (transient) → skip checkpoint without burning
+        phase_requeues budget; checkpoint_lane must NOT be called."""
         mocker.patch(
             "app.github_token_resolver.get_github_token_for_task",
             new_callable=AsyncMock,
@@ -16134,12 +16246,13 @@ class TestLaneCheckpointShaVerification:
         assert result is False
         mock_checkpoint_lane.assert_not_called()
         await db_session.refresh(lane)
-        assert (lane.phase_requeues or 0) == initial_requeues + 1
+        # Transient unavailability must NOT burn a requeue slot.
+        assert (lane.phase_requeues or 0) == initial_requeues
 
     @pytest.mark.asyncio
     async def test_lane_checkpoint_sha_token_error_degrades(self, db_session, mocker):
-        """Token fetch failure (credentials missing, etc.) → degrade to
-        mark_checkpoint_missing(reason='sha_verification_unavailable'), return False."""
+        """Token fetch failure (credentials missing, etc.) → return False WITHOUT
+        burning phase_requeues budget; checkpoint_lane must NOT be called."""
         mocker.patch(
             "app.github_token_resolver.get_github_token_for_task",
             new_callable=AsyncMock,
@@ -16165,7 +16278,8 @@ class TestLaneCheckpointShaVerification:
         assert result is False
         mock_checkpoint_lane.assert_not_called()
         await db_session.refresh(lane)
-        assert (lane.phase_requeues or 0) == initial_requeues + 1
+        # Transient exception must NOT increment phase_requeues.
+        assert (lane.phase_requeues or 0) == initial_requeues
 
     @pytest.mark.asyncio
     async def test_lane_checkpoint_sha_reachable_proceeds(self, db_session, mocker):

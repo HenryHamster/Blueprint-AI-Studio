@@ -196,6 +196,7 @@ from app.release_stall_alerts import (
     _check_version_build_stall,  # noqa: F401 — re-exported for tests
     _check_version_calcification,  # noqa: F401 — re-exported for tests
     _check_version_ci_unresolved_stall,  # noqa: F401 — re-exported for tests
+    _check_version_managed_check_wait_stall,  # noqa: F401 — re-exported for tests
     _check_version_promotion_readiness,  # noqa: F401 — re-exported for tests
     _check_version_stabilize_stall,  # noqa: F401 — re-exported for tests
     _is_build_stalled,  # noqa: F401 — re-exported for back-compat
@@ -212,6 +213,7 @@ from app.release_qualifier_sweep import (
     _force_finalize_sweep_crash_loop,  # noqa: F401 — re-exported for tests
     _force_finalize_timed_out_qualification,
     _parse_started_at,
+    _redrive_deferred_unsynced_qualification,  # noqa: F401 — re-exported for tests
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
 from app.migration_apply_gate import run_migration_apply_gate
@@ -1935,24 +1937,53 @@ async def _guard_ci_unresolved_promotion_in_flight(
         version.version_number,
         auto_merge_enabled,
     )
-    q = dict(version.last_qualification or {})
-    q.update(_recover_confidence_from_ci_unresolved(base_record))
-    q["status"] = "pending"
-    q["promotion_pending"] = {
+    # Detect whether the open release PR carries Alembic migrations.  The
+    # fail-safe default is True (migration-carrying): if the file-list fetch
+    # fails we must NOT route to the native-auto-merge path that bypasses
+    # Blueprint's re-entry guard.
+    from app.rollup_migration_validation import pr_touches_migrations
+
+    is_migration_pr = True
+    try:
+        is_migration_pr = await pr_touches_migrations(token, owner, repo, pr_number)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[RELEASE_QUALIFIER] ci_unresolved guard: could not determine "
+            "migration status for PR #%s (v%d) (%s) — defaulting to "
+            "migration_carrying=True",
+            pr_number,
+            version.version_number,
+            exc,
+        )
+
+    promotion_pending: dict[str, Any] = {
         "pr_number": pr_number,
         "pr_url": pr_url,
         "auto_merge_enabled": auto_merge_enabled,
         "enabled_at": _utcnow().isoformat(),
         "restored_by_ci_unresolved_guard": True,
     }
+    if is_migration_pr:
+        promotion_pending["migration_carrying"] = True
+        promotion_pending["managed_check_wait"] = True
+        promotion_pending["why_not_native_automerge"] = "migration_guard_deferred"
+
+    q = dict(version.last_qualification or {})
+    q.update(_recover_confidence_from_ci_unresolved(base_record))
+    q["status"] = "pending"
+    q["promotion_pending"] = promotion_pending
     version.last_qualification = q
     flag_modified(version, "last_qualification")
     session.add(version)
+    result_status = (
+        "pending_managed_check_wait" if is_migration_pr else "pending_auto_merge"
+    )
     return {
-        "status": "pending_auto_merge",
+        "status": result_status,
         "pr_number": pr_number,
         "pr_url": pr_url,
         "auto_merge_enabled": auto_merge_enabled,
+        "managed_check_wait": is_migration_pr,
     }
 
 
@@ -3781,7 +3812,7 @@ async def _finalize_locked_version(
                 )
                 await session.commit()
                 return {
-                    "status": "not_promoted",
+                    "status": "infra_failure",
                     "blocker": "qualification_timeout",
                 }
 

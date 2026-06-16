@@ -20,10 +20,11 @@ from typing import Dict, Any
 from fastapi import (
     FastAPI,
     Depends,
+    Header,
     HTTPException,
     Request,
 )
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,7 +40,7 @@ from app.models import (
 )
 from app.compute import provision_agent_vm  # noqa: F401  (re-exported for test patches; see main.py:108 docstring)
 from app.deployed_sha import resolve_deployed_sha
-from app.auth import get_current_user
+from app.auth import get_current_user, get_current_user_optional, verify_agent_jwt
 from app.admin_helpers import _get_user_project, _get_user_task
 from app.schemas import ArtifactDownloadResponse
 from app.admin import router as admin_router
@@ -79,6 +80,7 @@ from app.routers.agent_status import router as agent_status_router
 from app.routers.admin_onboard import router as admin_onboard_router
 from app.routers.admin_agent_ops import router as admin_agent_ops_router
 from app.routers.admin_agent_ops import _bump_size_limit  # noqa: F401  re-exported for test patches (test_agent_annotate.py)
+from app.routers.admin_state import router as admin_state_router
 from app.shared_state import limiter
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -91,7 +93,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0277"
+EXPECTED_SCHEMA_REVISION = "0289"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -794,6 +796,7 @@ app.include_router(admin_digest_router)
 app.include_router(admin_metrics_router)
 app.include_router(admin_activity_router)
 app.include_router(admin_health_router)
+app.include_router(admin_state_router)
 app.include_router(admin_evergreen_router)
 app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)
@@ -1203,9 +1206,16 @@ async def get_viewport_failure_screenshot_download_url(
     component: str,
     width: int,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict | None = Depends(get_current_user_optional),
+    x_agent_token: str | None = Header(None),
 ):
     """Generate a 1-hour signed download URL for a viewport failure screenshot.
+
+    Accepts either an admin/Firebase bearer token (existing path) or an agent
+    JWT via the ``x-agent-token`` header.  Agent tokens are scoped to the
+    uploading task: the reconstructed object URI must match the URI stamped on
+    the task's context (``viewport_failure_screenshot_uri``) and the project
+    must match the token's ``project_id`` claim.
 
     The GCS object path is reconstructed to exactly mirror what the agent
     uploads via POST /api/agent/viewport/failure-screenshot-upload-url
@@ -1225,9 +1235,33 @@ async def get_viewport_failure_screenshot_download_url(
     )
     from app.viewport_evidence import viewport_object_name
 
-    await _get_user_project(project_id, current_user["user_id"], session)
+    if x_agent_token is not None:
+        claims = verify_agent_jwt(x_agent_token)
+        task_id = claims.get("sub")
+        token_project_id = claims.get("project_id")
+        if not task_id:
+            raise HTTPException(status_code=403, detail="Agent token has no task scope")
+        if str(token_project_id) != str(project_id):
+            raise HTTPException(status_code=403, detail="Project mismatch")
+        result = await session.execute(
+            select(Task).where(Task.id == uuid.UUID(task_id))
+        )
+        task = result.scalar_one_or_none()
+        if task is None:
+            raise HTTPException(status_code=403, detail="Task not found")
+        object_name = viewport_object_name(project_id, component, width)
+        stamped_uri = (task.context or {}).get("viewport_failure_screenshot_uri", "")
+        if not stamped_uri or not stamped_uri.endswith(object_name):
+            raise HTTPException(
+                status_code=403,
+                detail="Agent may only download its own uploaded screenshot",
+            )
+    elif current_user is not None:
+        await _get_user_project(project_id, current_user["user_id"], session)
+        object_name = viewport_object_name(project_id, component, width)
+    else:
+        raise HTTPException(status_code=401, detail="Authentication required")
 
-    object_name = viewport_object_name(project_id, component, width)
     storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
 
     try:
@@ -1250,16 +1284,20 @@ async def get_viewport_screenshot_download_url(
     project_id: uuid.UUID,
     task_id: uuid.UUID,
     name: str,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    x_agent_token: str | None = Header(None),
 ):
-    """Generate a 1-hour signed download URL for a task-scoped viewport screenshot.
+    """Signed download URL for a task-scoped viewport screenshot.
 
-    The GCS object path is reconstructed to exactly mirror what the agent uploads via
+    Two access paths:
+    - Agent JWT (x-agent-token header): validates that the token's sub (task_id)
+      and project_id claims match the query parameters, then returns JSON {"url": ...}.
+    - No token: returns a 302 redirect to the signed URL so operators can click
+      links from GitHub PR bodies without a bearer token. The signed URL itself
+      is the security boundary.
+
+    The GCS object path mirrors what the agent uploads via
     POST /api/agent/viewport/screenshot-upload-url
-    (viewport-shots/{project_id}/{task_id}/{name}.png), so the PR renderer can display
-    the screenshot by passing the stored context name directly.  The name is sanitized
-    with the same rule the upload endpoint applies so the two paths always agree.
+    (viewport-shots/{project_id}/{task_id}/{name}.png).
     """
     import re as _re
 
@@ -1269,13 +1307,18 @@ async def get_viewport_screenshot_download_url(
         generate_download_signed_url,
     )
 
-    await _get_user_project(project_id, current_user["user_id"], session)
+    if x_agent_token is not None:
+        claims = verify_agent_jwt(x_agent_token)
+        token_task_id = claims.get("sub")
+        token_project_id = claims.get("project_id")
+        if not token_task_id:
+            raise HTTPException(status_code=403, detail="Agent token has no task scope")
+        if str(token_task_id) != str(task_id):
+            raise HTTPException(status_code=403, detail="Task mismatch")
+        if str(token_project_id) != str(project_id):
+            raise HTTPException(status_code=403, detail="Project mismatch")
 
     _SAFE_NAME_RE = _re.compile(r"[^A-Za-z0-9._-]")
-    # The `name` param is the stored entry_name: "{sanitize(component)[:100]}-{width}-{phase}".
-    # Truncating the full string to 100 chars would cut the -width-phase suffix for long
-    # component names.  Sanitize the characters but do not re-truncate, since the value
-    # was already bounded and sanitized by the upload endpoint.
     safe_name = _SAFE_NAME_RE.sub("_", name)
 
     object_name = f"viewport-shots/{project_id}/{task_id}/{safe_name}.png"
@@ -1291,7 +1334,10 @@ async def get_viewport_screenshot_download_url(
             "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
         )
         raise HTTPException(status_code=503, detail="Artifact storage unavailable")
-    return {"url": url}
+
+    if x_agent_token is not None:
+        return {"url": url}
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.get(

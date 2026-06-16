@@ -2376,6 +2376,69 @@ class TestImprovementLanes:
         assert abs(row["vm_cost_usd_total"] - 0.12) < 1e-5
         assert abs(row["reserved_idle_cost_usd_total"] - 0.03) < 1e-5
         assert row["shadow"] is False
+        assert row["title"] == "Test lane"
+        assert row["recovery"] is None
+
+    @pytest.mark.asyncio
+    async def test_title_included_in_lane_row(self, client: AsyncClient, db_session):
+        """Lane title is returned as a top-level field in the row."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane = _make_lane(project.id, title="My custom lane title")
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        row = resp.json()["lanes"][0]
+        assert row["title"] == "My custom lane title"
+
+    @pytest.mark.asyncio
+    async def test_recovery_field_included_when_manifest_has_recovery(
+        self, client: AsyncClient, db_session
+    ):
+        """Recovery state from lane manifest is surfaced in the row."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        recovery_payload = {
+            "reason": "checkpoint_miss",
+            "attempt": 2,
+            "exhausted": False,
+            "at": "2026-06-01T12:00:00",
+        }
+        lane = _make_lane(project.id, manifest={"recovery": recovery_payload})
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        row = resp.json()["lanes"][0]
+        assert row["recovery"] == recovery_payload
+        assert row["recovery"]["reason"] == "checkpoint_miss"
+        assert row["recovery"]["attempt"] == 2
+        assert row["recovery"]["exhausted"] is False
+
+    @pytest.mark.asyncio
+    async def test_recovery_field_null_when_manifest_empty(
+        self, client: AsyncClient, db_session
+    ):
+        """Recovery is None when lane manifest has no recovery key."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane = _make_lane(project.id, manifest={"other_key": "value"})
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        row = resp.json()["lanes"][0]
+        assert row["recovery"] is None
 
     @pytest.mark.asyncio
     async def test_pagination_limit_offset(self, client: AsyncClient, db_session):
@@ -2587,8 +2650,18 @@ class TestShadowLaneHealth:
             project.id,
             checkpoint_seq=2,
             checkpoints=[
-                {"seq": 1, "phase": "fix", "created_at": "2026-01-01T00:00:00", "sha": "a1"},
-                {"seq": 2, "phase": "review", "created_at": "2026-01-01T01:00:00", "sha": "a2"},
+                {
+                    "seq": 1,
+                    "phase": "fix",
+                    "created_at": "2026-01-01T00:00:00",
+                    "sha": "a1",
+                },
+                {
+                    "seq": 2,
+                    "phase": "review",
+                    "created_at": "2026-01-01T01:00:00",
+                    "sha": "a2",
+                },
             ],
             workspace_state="COLD",
             pilot_arm=None,
@@ -2641,7 +2714,9 @@ class TestShadowLaneHealth:
         assert abs(sh["miss_rate"] - 0.25) < 1e-6
 
     @pytest.mark.asyncio
-    async def test_shadow_health_exhausted_closes(self, client: AsyncClient, db_session):
+    async def test_shadow_health_exhausted_closes(
+        self, client: AsyncClient, db_session
+    ):
         """KILLED shadow lane with manifest.recovery.exhausted=True → exhausted_close_count=1."""
         project = make_project()
         db_session.add(project)
@@ -2653,7 +2728,9 @@ class TestShadowLaneHealth:
             status=ImprovementLaneStatus.KILLED.value,
             workspace_state="COLD",
             pilot_arm=None,
-            manifest={"recovery": {"exhausted": True, "attempt": 3, "reason": "no_checkpoint"}},
+            manifest={
+                "recovery": {"exhausted": True, "attempt": 3, "reason": "no_checkpoint"}
+            },
         )
         db_session.add(lane)
         await db_session.commit()
@@ -2664,7 +2741,9 @@ class TestShadowLaneHealth:
         assert sh["exhausted_close_count"] == 1
 
     @pytest.mark.asyncio
-    async def test_shadow_health_excludes_itt_lanes(self, client: AsyncClient, db_session):
+    async def test_shadow_health_excludes_itt_lanes(
+        self, client: AsyncClient, db_session
+    ):
         """Lanes with pilot_arm set are ITT arms and must NOT appear in the shadow rollup."""
         project = make_project()
         db_session.add(project)
@@ -2713,6 +2792,85 @@ class TestShadowLaneHealth:
         assert sh["checkpoints_written"] == 0
         assert sh["checkpoint_miss_count"] == 0
         assert sh["miss_rate"] is None
+
+
+# ---------------------------------------------------------------------------
+# TestImprovementLanesTrialMetrics
+# ---------------------------------------------------------------------------
+
+
+class TestImprovementLanesTrialMetrics:
+    """Tests for trial_metrics field in GET /api/admin/improvement-lanes."""
+
+    @pytest.mark.asyncio
+    async def test_trial_metrics_present_with_zero_counts_when_no_pilot_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """No pilot tasks → trial_metrics has n_lane=0, n_control=0, verdict=CONTINUE."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "trial_metrics" in body
+        tm = body["trial_metrics"]
+        assert tm is not None
+        assert tm["n_lane"] == 0
+        assert tm["n_control"] == 0
+        assert tm["verdict"] == "CONTINUE"
+        assert tm["verdict_reason"] == "insufficient_data"
+        assert isinstance(tm["immediate_alert"], bool)
+
+    @pytest.mark.asyncio
+    async def test_trial_metrics_present_alongside_lanes_and_shadow_health(
+        self, client: AsyncClient, db_session
+    ):
+        """trial_metrics is returned alongside the lanes list and shadow_health keys."""
+        project = make_project()
+        db_session.add(project)
+        # Commit the project first so its row physically exists before the lane
+        # is inserted. ImprovementLane.project_id is a bare FK column with no ORM
+        # relationship() to Project, so a single flush has no unit-of-work
+        # dependency to order the project insert ahead of the lane — committing
+        # both together can insert the lane first and trip
+        # improvementlane_project_id_fkey. Mirrors every other lane test here.
+        await db_session.commit()
+        lane = _make_lane(project.id, status=ImprovementLaneStatus.ACTIVE.value)
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        # All three top-level fields must coexist.
+        assert "lanes" in body
+        assert "shadow_health" in body
+        assert "trial_metrics" in body
+
+    @pytest.mark.asyncio
+    async def test_trial_metrics_null_when_aggregation_raises(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Aggregation failure → trial_metrics is None, lanes list still returned."""
+        import app.review_fix_lane_pilot as _rlp
+
+        async def _bad_aggregates(session, project_id):
+            raise RuntimeError("simulated aggregation failure")
+
+        monkeypatch.setattr(_rlp, "compute_lane_pilot_aggregates", _bad_aggregates)
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "lanes" in body
+        # trial_metrics is null when aggregation fails.
+        assert body.get("trial_metrics") is None
 
 
 class TestLaneBaselines:
@@ -3260,3 +3418,130 @@ class TestVisualPilotStatus:
         assert caught[0]["task_id"] == str(task.id)
         assert caught[0]["task_title"] == "Frontend update"
         assert caught[0]["note"] == "caught a layout shift"
+        assert caught[0]["viewport_shot_names"] == []
+
+    @pytest.mark.asyncio
+    async def test_caught_entry_includes_viewport_shot_names(
+        self, client: AsyncClient, db_session
+    ):
+        """viewport_shot_names lists shot names from task context; missing key → []."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # Task with viewport_screenshots in context.
+        task_with_shots = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            title="With screenshots",
+            context={
+                "_pr_changed_files": ["admin-ui/src/App.tsx"],
+                "_self_review_outcome": {
+                    "visual_verification": {
+                        "passed": True,
+                        "pairs_inspected": 2,
+                        "pairs_changed": 1,
+                        "caught_visual_issue": True,
+                        "note": "layout drift caught",
+                    }
+                },
+                "viewport_screenshots": [
+                    {
+                        "name": "main-before",
+                        "storage_uri": "gs://bucket/main-before.png",
+                    },
+                    {"name": "main-after", "storage_uri": "gs://bucket/main-after.png"},
+                ],
+            },
+        )
+        # Task without viewport_screenshots key in context.
+        task_no_shots = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            title="No screenshots",
+            context={
+                "_pr_changed_files": ["admin-ui/src/Other.tsx"],
+                "_self_review_outcome": {
+                    "visual_verification": {
+                        "passed": True,
+                        "pairs_inspected": 1,
+                        "pairs_changed": 0,
+                        "caught_visual_issue": True,
+                        "note": "caught something else",
+                    }
+                },
+            },
+        )
+        db_session.add(task_with_shots)
+        db_session.add(task_no_shots)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/visual-pilot-status?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["caught_count"] == 2
+
+        by_id = {e["task_id"]: e for e in body["caught"]}
+        entry_with = by_id[str(task_with_shots.id)]
+        assert entry_with["viewport_shot_names"] == ["main-before", "main-after"]
+        assert entry_with["viewport_shot_entries"] == [
+            {"name": "main-before"},
+            {"name": "main-after"},
+        ]
+
+        entry_without = by_id[str(task_no_shots.id)]
+        assert entry_without["viewport_shot_names"] == []
+        assert entry_without["viewport_shot_entries"] == []
+
+    @pytest.mark.asyncio
+    async def test_caught_entry_viewport_shot_entries_includes_magnitude(
+        self, client: AsyncClient, db_session
+    ):
+        """viewport_shot_entries exposes magnitude from diff screenshots."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            title="With diff magnitude",
+            context={
+                "_pr_changed_files": ["admin-ui/src/App.tsx"],
+                "_self_review_outcome": {
+                    "visual_verification": {
+                        "passed": True,
+                        "pairs_inspected": 1,
+                        "pairs_changed": 1,
+                        "caught_visual_issue": True,
+                        "note": "drift caught",
+                    }
+                },
+                "viewport_screenshots": [
+                    {"name": "main-before", "storage_uri": "gs://b/main-before.png"},
+                    {"name": "main-after", "storage_uri": "gs://b/main-after.png"},
+                    {
+                        "name": "main-diff",
+                        "storage_uri": "gs://b/main-diff.png",
+                        "magnitude": 0.23,
+                    },
+                ],
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/visual-pilot-status?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["caught_count"] == 1
+        entry = body["caught"][0]
+        entries_by_name = {e["name"]: e for e in entry["viewport_shot_entries"]}
+        assert "main-diff" in entries_by_name
+        assert entries_by_name["main-diff"]["magnitude"] == pytest.approx(0.23)
+        assert "magnitude" not in entries_by_name.get("main-before", {})
+        assert "magnitude" not in entries_by_name.get("main-after", {})

@@ -2123,6 +2123,59 @@ class TestDeleteProject:
         assert remaining == []
 
     @pytest.mark.asyncio
+    async def test_delete_project_with_knowledge_document_succeeds(
+        self, client: AsyncClient, db_session
+    ):
+        """A project that produced a KnowledgeDocument can be force-deleted.
+
+        Regression for the latent FK violation: knowledgedocument.source_task_id
+        had no ON DELETE action, so deleting the project cascaded to tasks but
+        then blocked on the KnowledgeDocument → task FK (constraint
+        knowledgedocument_source_task_id_fkey).  Migration 0289 adds CASCADE;
+        this test proves the end-to-end delete succeeds and both the task and
+        the knowledge document row are gone.
+        """
+        from app.models import KnowledgeDocument
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "web_research", "topic": "auth", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        doc = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            title="Auth design",
+            summary="Summary of auth design.",
+            body="# Auth\n\nBody text.",
+            source_kind="web_research",
+        )
+        db_session.add(doc)
+        await db_session.commit()
+        doc_id = doc.id
+
+        resp = await client.delete(f"/api/admin/projects/{project.id}?force=true")
+        assert resp.status_code == 200, (
+            f"project delete must cascade knowledgedocument rows, not FK-violate; "
+            f"got {resp.status_code}: {resp.text}"
+        )
+
+        db_session.expire_all()
+        remaining_doc = (
+            await db_session.execute(
+                select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
+            )
+        ).scalar_one_or_none()
+        assert remaining_doc is None, (
+            "KnowledgeDocument must be removed with its source task"
+        )
+
+    @pytest.mark.asyncio
     async def test_delete_project_force_populates_deny_list(
         self, client: AsyncClient, db_session, mocker
     ):
@@ -7365,6 +7418,98 @@ class TestSrCatchRateTrendsDirectionExamples:
 
 
 # ---------------------------------------------------------------------------
+# Accrual alternative-projection tests
+# ---------------------------------------------------------------------------
+
+
+class TestAccrualAlternativeProjections:
+    """Digest accrual_projection includes alternative_projections at 0.1/0.3/0.5 holdback fractions."""
+
+    @pytest.mark.asyncio
+    async def test_alternative_projections_present_with_nonzero_holdback(
+        self, client: AsyncClient, db_session
+    ):
+        """accrual_projection.alternative_projections maps fraction strings to float|None."""
+        from unittest.mock import AsyncMock, patch
+
+        project = await _make_project(db_session)
+        # Pre-populate a verdict for repo_map so the accrual path activates.
+        verdict_entry = {
+            "verdict": "continue-trial",
+            "lift": None,
+            "n_with": 5,
+            "n_without": 5,
+            "thresholds": {"min_n_per_arm": 30},
+            "arm_composition": {
+                "with_assigned": 5,
+                "without_assigned": 5,
+            },
+        }
+        # Stub persist to return our pre-set verdict (avoids a full session-within-session open).
+        persisted = {"repo_map": dict(verdict_entry)}
+
+        with (
+            patch(
+                "app.routers.admin_digest.persist_trial_verdicts_in_transaction",
+                new=AsyncMock(return_value=persisted),
+            ),
+            patch(
+                "app.routers.admin_digest.compute_trial_arm_accrual",
+                new=AsyncMock(
+                    # with_7d/without_7d proportional to (1-0.3)/0.3 so rates are
+                    # consistent with holdback_fraction=0.3, enabling the
+                    # self-consistency check below.
+                    return_value={"with_7d": 49, "without_7d": 21, "window_days": 7}
+                ),
+            ),
+            patch(
+                "app.routers.admin_digest._runtime_config",
+                {"repo_map_holdback_fraction": 0.3},
+                create=True,
+            ) as _,
+        ):
+            # Inject holdback fraction via shared_state so the digest reads it.
+            import app.shared_state as _shared_state
+
+            orig = dict(_shared_state.runtime_config)
+            _shared_state.runtime_config["repo_map_holdback_fraction"] = 0.3
+            try:
+                resp = await client.get(f"/api/admin/digest?project_id={project.id}")
+            finally:
+                _shared_state.runtime_config.clear()
+                _shared_state.runtime_config.update(orig)
+
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json().get("capability_adoption_verdicts") or {}
+        rm = verdicts.get("repo_map")
+        assert rm is not None, "repo_map verdict missing from digest response"
+        proj = rm.get("accrual_projection")
+        assert proj is not None, "accrual_projection missing from repo_map verdict"
+        alt = proj.get("alternative_projections")
+        assert alt is not None, (
+            "alternative_projections missing from accrual_projection"
+        )
+        # Exactly the three standard fractions must be present.
+        assert set(alt.keys()) == {"0.1", "0.3", "0.5"}
+        for frac_key, days_val in alt.items():
+            assert days_val is None or isinstance(days_val, (int, float)), (
+                f"alternative_projections[{frac_key!r}] must be float|None, got {days_val!r}"
+            )
+        # Self-consistency: alt projection at the CURRENT holdback fraction should
+        # approximately equal days_to_min_n, because mock rates are proportional to
+        # holdback (with_7d/without_7d = 49/21 ≈ 0.7/0.3), so redistributing at the
+        # same fraction reproduces the original arm rates exactly.
+        days_to_min_n = proj.get("days_to_min_n")
+        assert days_to_min_n is not None
+        alt_at_current = alt.get("0.3")
+        assert alt_at_current is not None
+        assert abs(alt_at_current - days_to_min_n) < 0.5, (
+            f"alt_projection at current holdback ({alt_at_current}) should ≈ "
+            f"days_to_min_n ({days_to_min_n})"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Viewport debt endpoint tests
 # ---------------------------------------------------------------------------
 
@@ -8782,6 +8927,73 @@ class TestClearDeployFailed:
         await db_session.refresh(version)
         assert version.serving_status == "deploy_failed"
 
+    @pytest.mark.asyncio
+    async def test_version_lock_released_before_provider_check(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """The version row lock must be released before provider.check (network I/O).
+
+        clear_deploy_failed previously held with_for_update() across the entire
+        _refresh_release_artifact_rows call, which calls provider.check() — a GitHub
+        or Cloud Run network operation.  The fix commits (releasing the lock) before
+        the network I/O, matching the reconcile pattern.
+
+        This test patches _refresh_release_artifact_rows so that, during the call, it
+        attempts a nowait FOR UPDATE lock on the version row from a separate DB session.
+        If the endpoint already committed (releasing its lock), the probe succeeds.
+        If the endpoint still holds the lock, the probe raises an OperationalError.
+        """
+        from sqlalchemy import select as sa_select
+        from sqlalchemy.exc import OperationalError
+
+        from app.database import AsyncSessionLocal
+        from app.models import ReleaseVersion as RVModel
+
+        project = await _make_project(db_session)
+        version = await self._make_deploy_failed_version(
+            db_session,
+            project.id,
+            deploy_failure_reason="serving_sha_unobservable",
+        )
+        version_id = version.id
+
+        lock_probe_results: list[bool] = []
+
+        async def _probe_then_return(session, ver, now, **kwargs):
+            # Attempt a no-wait lock on the version row from a SEPARATE session.
+            # Succeeds only if clear_deploy_failed already committed its initial lock.
+            async with AsyncSessionLocal() as probe_session:
+                try:
+                    await probe_session.execute(
+                        sa_select(RVModel)
+                        .where(RVModel.id == version_id)
+                        .with_for_update(nowait=True)
+                    )
+                    lock_probe_results.append(True)
+                except OperationalError:
+                    lock_probe_results.append(False)
+                await probe_session.rollback()
+            # Return empty provider_rows and no backend artifact so the endpoint
+            # proceeds to the force-check branch (payload.force=False → 409).
+            return [], False, False, None
+
+        mocker.patch(
+            "app.release_reconciliation._refresh_release_artifact_rows",
+            side_effect=_probe_then_return,
+        )
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/clear-deploy-failed",
+            json={},
+        )
+        # 409 is expected: empty provider_rows → non_backend_status serving_confirmed,
+        # backend_artifact=None → serving_sha_unobservable path → force=False → 409.
+        assert resp.status_code == 409, resp.text
+        assert lock_probe_results == [True], (
+            "Version row lock must be released (committed) before "
+            "_refresh_release_artifact_rows is called; probe could not acquire lock"
+        )
+
 
 class TestAgentServingShas:
     """GET /agent-serving-shas exposes read-only agent image provenance."""
@@ -9680,6 +9892,116 @@ class TestVersionLifecycleArtifactServingState:
         assert recent[1]["aggregate_serving_status"] == "serving_confirmed"
         assert recent[1]["qualification_state"]["state"] == "promoted"
 
+    @pytest.mark.asyncio
+    async def test_serving_block_present_on_current_and_recent_versions(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """The resolved 'serving' block is present on both current_version and
+        recent_versions, exposing status/sha/failure_reason/artifacts so the UI
+        can read one field instead of the three-field precedence chain."""
+        from app import release_artifacts as artifact_registry
+        from app.models import ReleaseDeployArtifact
+        from app.release_artifacts import (
+            BACKEND_REVISION_ARTIFACT_KIND,
+            ReleaseArtifactProvider,
+        )
+
+        backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+            BACKEND_REVISION_ARTIFACT_KIND
+        ]
+
+        async def _check_synthetic(_session, _version, _artifact, _now):
+            return None
+
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+                "synthetic_required": ReleaseArtifactProvider(
+                    artifact_kind="synthetic_required",
+                    check=_check_synthetic,
+                    required=True,
+                ),
+            },
+            clear=True,
+        )
+
+        project = await _make_project(db_session)
+        promoted = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=datetime(2026, 5, 1, 0, 0, 0),
+            promoted_at=datetime(2026, 5, 2, 0, 0, 0),
+            last_qualification={"status": "promoted", "confidence": 0.95},
+            serving_status="serving_confirmed",
+            served_sha="deadbeef1234",
+        )
+        open_version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=datetime(2026, 5, 3, 0, 0, 0),
+        )
+        db_session.add_all([promoted, open_version])
+        await db_session.commit()
+        await db_session.refresh(promoted)
+
+        db_session.add_all(
+            [
+                ReleaseDeployArtifact(
+                    version_id=promoted.id,
+                    artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                    serving_status="serving_confirmed",
+                    served_identifier="deadbeef1234",
+                    served_at=datetime(2026, 5, 2, 0, 5, 0),
+                ),
+                ReleaseDeployArtifact(
+                    version_id=promoted.id,
+                    artifact_kind="synthetic_required",
+                    serving_status="serving_confirmed",
+                    served_identifier="synth-id-abc",
+                    served_at=datetime(2026, 5, 2, 0, 6, 0),
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        readiness, audit, merged = self._lifecycle_patches()
+        with readiness, audit, merged:
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        # current_version (open, no artifacts) exposes the serving block.
+        cv_serving = body["current_version"]["serving"]
+        assert isinstance(cv_serving, dict)
+        assert "status" in cv_serving
+        assert "sha" in cv_serving
+        assert "failure_reason" in cv_serving
+        assert "artifacts" in cv_serving
+
+        # recent_version (promoted, serving_confirmed) exposes the resolved block.
+        recent = body["recent_versions"][0]
+        rv_serving = recent["serving"]
+        assert isinstance(rv_serving, dict)
+        assert rv_serving["status"] == "serving_confirmed"
+        # sha derives from confirmed artifact evidence (not the legacy scalar).
+        assert rv_serving["sha"] == "deadbeef1234"
+        # failure_reason is None when not deploy_failed.
+        assert rv_serving["failure_reason"] is None
+        # artifacts is the full per-artifact list.
+        assert isinstance(rv_serving["artifacts"], list)
+        assert len(rv_serving["artifacts"]) == 2
+        artifact_kinds = {a["artifact_kind"] for a in rv_serving["artifacts"]}
+        assert BACKEND_REVISION_ARTIFACT_KIND in artifact_kinds
+        assert "synthetic_required" in artifact_kinds
+
 
 class TestVersionLifecycleAuditEvidence:
     """GET /version-lifecycle scopes audit evidence to the open candidate SHA."""
@@ -10226,6 +10548,292 @@ class TestVersionLifecycleInFlightCount:
         assert resp.json()["current_version"]["in_flight_task_count"] == 2
 
 
+class TestVersionLifecycleTasksMerged:
+    """GET /version-lifecycle exposes tasks_merged on current_version."""
+
+    @pytest.mark.asyncio
+    async def test_tasks_merged_lists_landed_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """tasks_merged includes type, title, and pr_number for each landed task."""
+        from app.landed_signal import mark_landed_on_integration
+
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        task = Task(
+            project_id=project.id,
+            title="fix: resolve race condition in deploy",
+            payloads=[{"type": "fix", "pr_number": 42}],
+            status=TaskStatus.COMPLETED,
+            context={},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        mark_landed_on_integration(task)
+        db_session.add(task)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=1),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert "tasks_merged" in current
+        tasks = current["tasks_merged"]
+        assert len(tasks) == 1
+        assert tasks[0]["task_type"] == "fix"
+        assert tasks[0]["title"] == "fix: resolve race condition in deploy"
+        assert tasks[0]["pr_number"] == 42
+        assert tasks[0]["pr_url"] is None  # no Artifact row created
+
+    @pytest.mark.asyncio
+    async def test_tasks_merged_includes_pr_url_from_artifact(
+        self, client: AsyncClient, db_session
+    ):
+        """tasks_merged includes pr_url when a PULL_REQUEST artifact exists."""
+        from app.landed_signal import mark_landed_on_integration
+
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        task = Task(
+            project_id=project.id,
+            title="fix: add feature",
+            payloads=[{"type": "fix", "pr_number": 99}],
+            status=TaskStatus.COMPLETED,
+            context={},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        mark_landed_on_integration(task)
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/org/repo/pull/99",
+        )
+        db_session.add(artifact)
+        db_session.add(task)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=1),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        tasks = current["tasks_merged"]
+        assert len(tasks) == 1
+        assert tasks[0]["pr_number"] == 99
+        assert tasks[0]["pr_url"] == "https://github.com/org/repo/pull/99"
+
+    @pytest.mark.asyncio
+    async def test_tasks_merged_empty_when_no_landed_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """tasks_merged is an empty list when no tasks have landed in the window."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="build")
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["tasks_merged"] == []
+
+
+class TestVersionLifecycleCurrentVersionHighlights:
+    """GET /version-lifecycle exposes a what's-new ``highlights`` block (headline +
+    at-a-glance metrics) on current_version, built by the SAME shared helper the
+    per-version summary endpoint uses so the open version renders an identical
+    headline. The headline's 'serving' determination is aggregate-driven; the
+    current/open version is never 'promoted', so the promoted/serving headline cases
+    are covered by TestGetReleaseVersionSummary and the release_version unit tests."""
+
+    @pytest.mark.asyncio
+    async def test_current_version_exposes_highlights_headline(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version.highlights carries all six keys and an 'open in <phase>
+        with <N> merged' headline reflecting the merged-work count."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=3),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert "highlights" in current, "current_version must expose highlights"
+        h = current["highlights"]
+        for key in (
+            "merged_count",
+            "proven",
+            "total_merged_for_acceptance",
+            "qualification_confidence",
+            "qualification_threshold",
+            "headline",
+        ):
+            assert key in h, f"highlights missing key: {key}"
+        # Open version with merged work -> phase-context headline reflecting the count.
+        assert h["headline"] == "open in build with 3 merged"
+        assert h["merged_count"] == 3
+        # No qualification verdict yet -> confidence/threshold are null, not fabricated.
+        assert h["qualification_confidence"] is None
+        assert h["qualification_threshold"] is None
+
+    @pytest.mark.asyncio
+    async def test_current_version_highlights_no_merged_work(
+        self, client: AsyncClient, db_session
+    ):
+        """An open version with zero merged work yields the 'no merged work yet'
+        headline for its phase."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert (
+            current["highlights"]["headline"]
+            == "open in stabilize with no merged work yet"
+        )
+        assert current["highlights"]["merged_count"] == 0
+
+
 class TestVersionLifecycleAcceptanceAggregate:
     """The version-lifecycle current_version and qualification-verdicts rows
     expose the additive ``acceptance_aggregate`` key (proven-vs-merged) ALONGSIDE
@@ -10656,7 +11264,8 @@ class TestVersionLifecycleOutOfBandPromotion:
         v.out_of_band_promotion = oob
         return v
 
-    def test_serialize_history_entry_includes_oob_when_set(self):
+    @pytest.mark.asyncio
+    async def test_serialize_history_entry_includes_oob_when_set(self):
         """_serialize_version_history_entry passes out_of_band_promotion through
         verbatim when it is present on the version object."""
         from app.routers.admin_release_version import _serialize_version_history_entry
@@ -10672,11 +11281,12 @@ class TestVersionLifecycleOutOfBandPromotion:
                 return_value=None,
             ),
         ):
-            result = _serialize_version_history_entry(v)
+            result = await _serialize_version_history_entry(v)
 
         assert result["out_of_band_promotion"] == self._OOB
 
-    def test_serialize_history_entry_null_when_absent(self):
+    @pytest.mark.asyncio
+    async def test_serialize_history_entry_null_when_absent(self):
         """_serialize_version_history_entry emits null for out_of_band_promotion
         when the attribute is not set (degrades gracefully before column lands)."""
         from app.routers.admin_release_version import _serialize_version_history_entry
@@ -10692,7 +11302,7 @@ class TestVersionLifecycleOutOfBandPromotion:
                 return_value=None,
             ),
         ):
-            result = _serialize_version_history_entry(v)
+            result = await _serialize_version_history_entry(v)
 
         assert result["out_of_band_promotion"] is None
 
@@ -14487,10 +15097,16 @@ class TestComputeExperimentTaskLaunch:
         assert payload["benchmark"] == "tokens-per-second"
         assert payload["hypothesis"] == "L4 throughput exceeds the acceptance floor."
         assert payload["metric"] == "tokens_per_second"
+        # The criterion now carries an explicit kind discriminator (defaulting to
+        # "metric" for backward compatibility) plus the min_file_count field used
+        # by the artifact_produced kind; the metric/operator/threshold trio is
+        # unchanged for a metric criterion.
         assert payload["success_criterion"] == {
+            "kind": "metric",
             "metric": "tokens_per_second",
             "operator": ">=",
             "threshold": 100.0,
+            "min_file_count": 1,
         }
 
     @pytest.mark.asyncio
@@ -14791,6 +15407,69 @@ class TestComputeExperimentTaskLaunch:
         ).scalar_one()
         payload = task.payloads[0]
         assert "require_durable_artifact" not in payload
+
+    @pytest.mark.asyncio
+    async def test_auto_created_project_is_dispatchable(
+        self, client: AsyncClient, db_session
+    ):
+        """A compute_experiment on a fresh repo auto-creates a project that is
+        immediately dispatchable: autonomous_enabled=False (no autonomous
+        research cycles) and bootstrap_completed_at set (bootstrap-recovery
+        sweep will not spawn a competing repo_bootstrap task).
+        """
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                # Use a repo that has no pre-existing project so the endpoint
+                # auto-creates one.
+                json=self._valid_payload(repo="fresh-repo-no-project"),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        # Retrieve the auto-created project.
+        project = (
+            await db_session.execute(
+                select(Project).where(
+                    Project.github_owner == "acme",
+                    Project.github_repo == "fresh-repo-no-project",
+                )
+            )
+        ).scalar_one()
+
+        # The task must be QUEUED and not held for approval.
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        assert task.status == TaskStatus.QUEUED
+        assert task.requires_approval is False
+
+        # The auto-created project must be marked non-autonomous so the
+        # orchestrator does not try to run research cycles on it.
+        assert project.autonomous_enabled is False, (
+            "auto-created compute-experiment project must have autonomous_enabled=False "
+            "so autonomous research cycles do not compete for dispatch slots"
+        )
+
+        # bootstrap_completed_at must be set so the bootstrap-recovery sweep
+        # does not spawn a competing repo_bootstrap task.
+        build_cfg = project.build_config or {}
+        assert build_cfg.get("bootstrap_completed_at"), (
+            "auto-created compute-experiment project must have bootstrap_completed_at "
+            "set so the bootstrap-recovery sweep skips it"
+        )
 
 
 class TestBugReportCitationGate:
@@ -15479,6 +16158,12 @@ class TestImprovementLaneSettings:
         assert "improvement_lanes_enabled" in data
         assert "review_fix_lane_pilot_enabled" in data
 
+        # warm_pool_enabled is required; enable it first.
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_pool_enabled": True}
+        )
+        assert resp.status_code == 200
+
         # Enable improvement_lanes_enabled.
         resp = await client.patch(
             "/api/admin/settings", json={"improvement_lanes_enabled": True}
@@ -15531,6 +16216,50 @@ class TestImprovementLaneSettings:
             "unknown settings key" in resp.text.lower()
             or "improvement_lanes_enabld" in resp.text
         )
+
+    @pytest.mark.asyncio
+    async def test_improvement_lanes_enforces_warm_pool_enabled(
+        self, client: AsyncClient
+    ):
+        """Enabling improvement_lanes_enabled fails if warm_pool_enabled is false."""
+        # First disable warm_pool_enabled.
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_pool_enabled": False}
+        )
+        assert resp.status_code == 200
+
+        # Attempt to enable improvement_lanes_enabled should fail with 422.
+        resp = await client.patch(
+            "/api/admin/settings", json={"improvement_lanes_enabled": True}
+        )
+        assert resp.status_code == 422
+        data = resp.json()
+        error_msg = data.get("error", {}).get("message", {})
+        assert isinstance(error_msg, dict)
+        assert error_msg.get("warm_pool_enabled") == "not met"
+        assert "warm_pool_enabled=true" in error_msg.get("fix_hint", "")
+
+    @pytest.mark.asyncio
+    async def test_review_fix_lane_pilot_enforces_warm_pool_enabled(
+        self, client: AsyncClient
+    ):
+        """Enabling review_fix_lane_pilot_enabled fails if warm_pool_enabled is false."""
+        # First disable warm_pool_enabled.
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_pool_enabled": False}
+        )
+        assert resp.status_code == 200
+
+        # Attempt to enable review_fix_lane_pilot_enabled should fail with 422.
+        resp = await client.patch(
+            "/api/admin/settings", json={"review_fix_lane_pilot_enabled": True}
+        )
+        assert resp.status_code == 422
+        data = resp.json()
+        error_msg = data.get("error", {}).get("message", {})
+        assert isinstance(error_msg, dict)
+        assert error_msg.get("warm_pool_enabled") == "not met"
+        assert "warm_pool_enabled=true" in error_msg.get("fix_hint", "")
 
 
 # ---------------------------------------------------------------------------
@@ -15752,7 +16481,10 @@ class TestCanaryAdversarialChallenge:
         canary = make_task(
             project_id=project.id,
             status=TaskStatus.EVALUATING,
-            context={"_is_canary": True, "awaiting_adversarial_grader": str(uuid.uuid4())},
+            context={
+                "_is_canary": True,
+                "awaiting_adversarial_grader": str(uuid.uuid4()),
+            },
         )
         db_session.add(canary)
         await db_session.commit()
@@ -15772,16 +16504,17 @@ class TestCanaryAdversarialChallenge:
         self, client: AsyncClient, db_session
     ):
         """GET includes grader_task_id from the canary context in the response."""
-        from app.task_evaluators import ADVERSARIAL_GATE_VERDICT_KEY, ADVERSARIAL_PARSE_OK
+        from app.task_evaluators import (
+            ADVERSARIAL_GATE_VERDICT_KEY,
+            ADVERSARIAL_PARSE_OK,
+        )
         from testing.factories import make_task
 
         project = await _make_project(db_session)
         grader_id = str(uuid.uuid4())
         gate_record = {
             "parse_outcome": ADVERSARIAL_PARSE_OK,
-            "finding_verdicts": {
-                "hash-abc": {"explicit": True, "verdict": "pass"}
-            },
+            "finding_verdicts": {"hash-abc": {"explicit": True, "verdict": "pass"}},
             "grader_task_id": grader_id,
         }
         canary = make_task(
@@ -15805,3 +16538,1198 @@ class TestCanaryAdversarialChallenge:
         assert data["explicit_count"] == 1
         assert data["grader_task_id"] == grader_id
         assert data["canary_task_id"] == str(canary.id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_release_version.py — Get Version Summary
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGetVersionSummary:
+    """Tests for GET /api/admin/projects/{project_id}/release-versions/{version_number}/summary."""
+
+    URL = "/api/admin/projects/{project_id}/release-versions/{version_number}/summary"
+
+    @pytest.mark.asyncio
+    async def test_version_summary_endpoint(self, client: AsyncClient, db_session):
+        """Returns summary fields for an open version."""
+        project = await _make_project(db_session)
+        opened = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+            opened_at=opened,
+            qualification_attempts=0,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=3),
+            ),
+            patch(
+                "app.release_version.compute_version_acceptance_aggregate",
+                new=AsyncMock(return_value={"proven": 2, "unproven": 1, "total": 3}),
+            ),
+            patch(
+                "app.release_version.list_merged_tasks_for_version",
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            resp = await client.get(
+                self.URL.format(project_id=project.id, version_number=1)
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["version_number"] == 1
+        assert data["phase"] == "build"
+        assert data["status"] == "open"
+        assert data["promoted_sha"] is None
+        assert data["promoted_at"] is None
+        assert data["merged_task_count"] == 3
+        assert data["merged_count"] == 3
+        assert data["acceptance_aggregate"]["proven"] == 2
+        assert data["acceptance_aggregate"]["total"] == 3
+        assert data["qualification_attempts"] == 0
+        assert isinstance(data["highlights"], dict)
+        assert "3" in data["highlights"].get("headline", "")
+        assert isinstance(data["tasks_merged"], list)
+        assert "qualification_state" in data
+
+    @pytest.mark.asyncio
+    async def test_version_summary_promoted_version(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns promoted_sha and promoted_at for a promoted version."""
+        project = await _make_project(db_session)
+        opened = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        promoted = datetime(2026, 1, 10, 0, 0, 0, tzinfo=timezone.utc)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="promoted",
+            opened_at=opened,
+            promoted_at=promoted,
+            promoted_sha="abc1234def5678",
+            qualification_attempts=1,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=5),
+            ),
+            patch(
+                "app.release_version.compute_version_acceptance_aggregate",
+                new=AsyncMock(return_value={"proven": 4, "unproven": 1, "total": 5}),
+            ),
+            patch(
+                "app.release_version.list_merged_tasks_for_version",
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            resp = await client.get(
+                self.URL.format(project_id=project.id, version_number=2)
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "promoted"
+        assert data["promoted_sha"] == "abc1234def5678"
+        assert data["promoted_at"] is not None
+        assert isinstance(data["highlights"], dict)
+        assert "promoted" in data["highlights"].get("headline", "")
+
+    @pytest.mark.asyncio
+    async def test_version_summary_404_for_nonexistent_version(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when the version_number does not exist for this project."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            self.URL.format(project_id=project.id, version_number=99)
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_version_summary_404_for_non_member(
+        self, override_get_session, db_session
+    ):
+        """Returns 404 when the user is not a member of the project."""
+        project = await _make_project(db_session, owner_id="owner-user")
+        opened = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+            opened_at=opened,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        non_member_id = "non-member-999"
+
+        def non_member():
+            return {"user_id": non_member_id, "email": "other@example.com"}
+
+        app.dependency_overrides[get_current_user] = non_member
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(
+                    self.URL.format(project_id=project.id, version_number=1)
+                )
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+        # Non-member gets 403 or 404 depending on implementation.
+        assert resp.status_code in (403, 404)
+
+    @pytest.mark.asyncio
+    async def test_version_summary_matches_canonical_for_closed_version(
+        self, client: AsyncClient, db_session
+    ):
+        """Project-scoped endpoint returns window-bounded merged_count for a promoted
+        version — matching the canonical UUID endpoint behavior.
+
+        Verifies the acceptance-evidence proof: the endpoint calls
+        count_merged_since with an until bound equal to promoted_at, so tasks
+        that merged after promotion are excluded (no overcount).
+        """
+        from unittest.mock import AsyncMock, patch
+
+        project = await _make_project(db_session)
+        opened = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        promoted = datetime(2026, 1, 10, 0, 0, 0, tzinfo=timezone.utc)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=3,
+            phase="stabilize",
+            status="promoted",
+            opened_at=opened,
+            promoted_at=promoted,
+            promoted_sha="deadbeef1234",
+            qualification_attempts=2,
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        count_mock = AsyncMock(return_value=4)
+        tasks_mock = AsyncMock(
+            return_value=[
+                {
+                    "task_id": "t1",
+                    "title": "Fix login",
+                    "pr_number": 101,
+                    "task_type": "fix",
+                },
+            ]
+        )
+        aggregate_mock = AsyncMock(
+            return_value={"proven": 3, "unproven": 1, "total": 4}
+        )
+
+        with (
+            patch("app.release_version.count_merged_since", new=count_mock),
+            patch("app.release_version.list_merged_tasks_for_version", new=tasks_mock),
+            patch(
+                "app.release_version.compute_version_acceptance_aggregate",
+                new=aggregate_mock,
+            ),
+        ):
+            resp = await client.get(
+                self.URL.format(project_id=project.id, version_number=3)
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        # Window is bounded: count_merged_since must be called with until=promoted_at
+        assert count_mock.call_count == 1
+        call_kwargs = count_mock.call_args
+        # until arg must be set (not None) for a promoted version
+        until_arg = call_kwargs.kwargs.get("until") or (
+            call_kwargs.args[3] if len(call_kwargs.args) > 3 else None
+        )
+        assert until_arg is not None, (
+            "count_merged_since must be called with until= bound for promoted version"
+        )
+
+        # Rich payload fields present
+        assert data["merged_count"] == 4
+        assert data["merged_task_count"] == 4  # backward-compat alias
+        assert isinstance(data["tasks_merged"], list)
+        assert len(data["tasks_merged"]) == 1
+        assert data["tasks_merged"][0]["pr_number"] == 101
+        assert isinstance(data["highlights"], dict)
+        assert "headline" in data["highlights"]
+        assert "promoted" in data["highlights"]["headline"]
+        assert "qualification_state" in data
+        assert data["status"] == "promoted"
+        assert data["promoted_sha"] == "deadbeef1234"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_state.py — GET /api/admin/state
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGetSystemState:
+    @pytest.mark.asyncio
+    async def test_fleet_wide_returns_deploy_fleet_no_version(
+        self, client: AsyncClient, db_session
+    ):
+        """Admin GET /api/admin/state (no project_id) returns deploy+fleet, version=None."""
+        from app.models import DeploymentState, DeploymentStatus
+
+        db_session.add(
+            DeploymentState(
+                id=1,
+                status=DeploymentStatus.STABLE,
+                current_sha="abc1234",
+                current_revision="rev-1",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/state")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "deploy" in data
+        assert "fleet" in data
+        assert "generated_at" in data
+        assert data["version"] is None
+        assert data["deploy"]["current_sha"] == "abc1234"
+        assert isinstance(data["fleet"]["active"], int)
+        assert isinstance(data["fleet"]["queued"], int)
+
+    @pytest.mark.asyncio
+    async def test_project_scoped_returns_version_block(
+        self, client: AsyncClient, db_session
+    ):
+        """GET /api/admin/state?project_id=<id> returns a version block for open version."""
+        from unittest.mock import AsyncMock, patch
+        from app.system_state import (
+            SystemStateSnapshot,
+            DeployStateSnapshot,
+            FleetSnapshot,
+            VersionSnapshot,
+            ServingSnapshot,
+        )
+        from datetime import datetime, timezone
+
+        project = await _make_project(db_session)
+
+        fake_snap = SystemStateSnapshot(
+            deploy=DeployStateSnapshot(
+                status="active",
+                current_sha="abc",
+                current_revision="r1",
+                deployed_at=None,
+                pause_reason=None,
+                rollback_reason=None,
+                rollback_count=0,
+                last_known_good_sha="",
+                halted=False,
+            ),
+            version=VersionSnapshot(
+                version_number=12,
+                phase="BUILD",
+                status="open",
+                opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                phase_changed_at=None,
+                goal="EXPERIENCE",
+                merged_task_count=5,
+                in_flight_task_count=2,
+                qualification_state=None,
+                serving=ServingSnapshot(
+                    status="serving_confirmed",
+                    sha="abc",
+                    confirmed_at=None,
+                    failure_reason=None,
+                    artifacts=[],
+                ),
+            ),
+            fleet=FleetSnapshot(
+                active=3,
+                queued=1,
+                evaluating=0,
+                parked=0,
+                stale_heartbeat_count=0,
+            ),
+            generated_at="2026-01-01T00:00:00Z",
+        )
+
+        with patch(
+            "app.routers.admin_state.compute_system_state",
+            new_callable=AsyncMock,
+            return_value=fake_snap,
+        ):
+            resp = await client.get(f"/api/admin/state?project_id={project.id}")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["version"] is not None
+        assert data["version"]["version_number"] == 12
+        assert data["version"]["phase"] == "BUILD"
+        assert data["version"]["serving"]["status"] == "serving_confirmed"
+        assert data["fleet"]["active"] == 3
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_returns_403(self, override_get_session, db_session):
+        """Unauthenticated request returns 403 (no valid user)."""
+        from fastapi import HTTPException
+
+        async def no_user():
+            raise HTTPException(status_code=403, detail="Not authenticated")
+
+        app.dependency_overrides[get_current_user] = no_user
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get("/api/admin/state")
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+    @pytest.mark.asyncio
+    async def test_non_admin_fleet_wide_returns_403(
+        self, override_get_session, db_session
+    ):
+        """Non-admin user requesting fleet-wide state (no project_id) gets 403."""
+
+        async def non_admin():
+            return {
+                "user_id": "viewer-user",
+                "email": "viewer@example.com",
+                "role": "user",
+            }
+
+        app.dependency_overrides[get_current_user] = non_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get("/api/admin/state")
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_on_second_call(self, client: AsyncClient, db_session):
+        """compute_system_state is only called once when called twice (cache hit)."""
+        from unittest.mock import AsyncMock, patch
+        from app.system_state import (
+            SystemStateSnapshot,
+            DeployStateSnapshot,
+            FleetSnapshot,
+        )
+
+        fake_snap = SystemStateSnapshot(
+            deploy=DeployStateSnapshot(
+                status="active",
+                current_sha="sha123",
+                current_revision="rev-1",
+                deployed_at=None,
+                pause_reason=None,
+                rollback_reason=None,
+                rollback_count=0,
+                last_known_good_sha="",
+                halted=False,
+            ),
+            version=None,
+            fleet=FleetSnapshot(
+                active=0,
+                queued=0,
+                evaluating=0,
+                parked=0,
+                stale_heartbeat_count=0,
+            ),
+            generated_at="2026-01-01T00:00:00Z",
+        )
+
+        with patch(
+            "app.routers.admin_state.compute_system_state",
+            new_callable=AsyncMock,
+            return_value=fake_snap,
+        ) as mock_compute:
+            r1 = await client.get("/api/admin/state")
+            r2 = await client.get("/api/admin/state")
+
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        # Should only compute once; second call hits cache
+        mock_compute.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_generated_at_is_iso_string(self, client: AsyncClient, db_session):
+        """generated_at field in the response is a string (ISO-formatted datetime)."""
+        resp = await client.get("/api/admin/state")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data["generated_at"], str)
+        # Must parse as a valid datetime
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(data["generated_at"].rstrip("Z"))
+        assert parsed is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GET /api/admin/release-versions/{version_id}/summary
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGetReleaseVersionSummary:
+    """Tests for the per-version what's-new summary endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_summary_404_on_unknown_version_id(
+        self, client: AsyncClient, db_session
+    ):
+        """Unknown version id returns 404."""
+        unknown_id = uuid.uuid4()
+        resp = await client.get(f"/api/admin/release-versions/{unknown_id}/summary")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_summary_returns_200_with_required_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """Happy-path open version returns 200 with all required top-level keys."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+            goal="ship the widget",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=0),
+        ):
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        for key in (
+            "version_number",
+            "phase",
+            "status",
+            "goal",
+            "opened_at",
+            "promoted_at",
+            "served_at",
+            "phase_changed_at",
+            "merged_count",
+            "acceptance_aggregate",
+            "qualification_state",
+            "serving_status",
+            "served_sha",
+            "deploy_failure_reason",
+            "aggregate_serving_status",
+            "artifacts",
+            "serving",
+            "highlights",
+        ):
+            assert key in data, f"missing key: {key}"
+        assert data["version_number"] == 1
+        assert data["phase"] == "build"
+        assert data["status"] == "open"
+        assert data["goal"] == "ship the widget"
+        assert data["highlights"]["headline"] == "open in build with no merged work yet"
+
+    @pytest.mark.asyncio
+    async def test_summary_merged_count_reflects_landed_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """merged_count reflects tasks that landed since the version opened."""
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Create 2 merged tasks
+        for _ in range(2):
+            task = Task(
+                project_id=project.id,
+                title="merged task",
+                prompt="do stuff",
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+                updated_at=_utcnow(),
+            )
+            db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["merged_count"] == 2
+        assert data["highlights"]["merged_count"] == 2
+        assert "2 merged" in data["highlights"]["headline"]
+
+    @pytest.mark.asyncio
+    async def test_summary_promoted_version_returns_200(
+        self, client: AsyncClient, db_session
+    ):
+        """Promoted version (non-open) returns 200 with promoted status fields."""
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        now = _utcnow()
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            promoted_at=now,
+            promoted_sha="abc1234",
+            serving_status="serving_confirmed",
+            served_sha="abc1234",
+            served_at=now,
+            last_qualification={"status": "promoted", "confidence": 0.9},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=5),
+        ):
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "promoted"
+        assert data["serving_status"] == "serving_confirmed"
+        assert data["promoted_at"] is not None
+        assert data["served_at"] is not None
+        assert data["highlights"]["headline"] == "promoted & serving"
+
+    @pytest.mark.asyncio
+    async def test_summary_abandoned_version_returns_200(
+        self, client: AsyncClient, db_session
+    ):
+        """Abandoned version returns 200 with abandoned headline."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="abandoned",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=0),
+        ):
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "abandoned"
+        assert data["highlights"]["headline"] == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_summary_promoted_version_excludes_tasks_merged_after_promotion(
+        self, client: AsyncClient, db_session
+    ):
+        """A promoted version's merged_count / tasks_merged / acceptance_aggregate
+        exclude tasks that landed AFTER promoted_at — those belong to the next
+        version and must not be double-counted (until=promoted_at upper bound)."""
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        opened_at = _utcnow() - timedelta(hours=3)
+        promoted_at = _utcnow() - timedelta(hours=1)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=opened_at,
+            promoted_at=promoted_at,
+            promoted_sha="abc1234",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Landed inside the version span (before promotion) — counted.
+        inside = Task(
+            project_id=project.id,
+            title="in-span task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            created_at=promoted_at - timedelta(minutes=30),
+            updated_at=promoted_at - timedelta(minutes=30),
+        )
+        # Landed after promotion (belongs to the next version) — excluded.
+        after = Task(
+            project_id=project.id,
+            title="post-promotion task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            created_at=promoted_at + timedelta(minutes=30),
+            updated_at=promoted_at + timedelta(minutes=30),
+        )
+        db_session.add_all([inside, after])
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["merged_count"] == 1, "post-promotion task must be excluded"
+        assert data["acceptance_aggregate"]["total"] == 1
+
+    @pytest.mark.asyncio
+    async def test_summary_abandoned_version_excludes_tasks_merged_after_abandonment(
+        self, client: AsyncClient, db_session
+    ):
+        """An abandoned version bounds its window by last_qualification.abandoned_at,
+        excluding tasks that landed after the version was abandoned."""
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        opened_at = _utcnow() - timedelta(hours=3)
+        abandoned_at = _utcnow() - timedelta(hours=1)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="abandoned",
+            opened_at=opened_at,
+            last_qualification={"abandoned_at": abandoned_at.isoformat()},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        inside = Task(
+            project_id=project.id,
+            title="in-span task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            created_at=abandoned_at - timedelta(minutes=30),
+            updated_at=abandoned_at - timedelta(minutes=30),
+        )
+        after = Task(
+            project_id=project.id,
+            title="post-abandon task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            created_at=abandoned_at + timedelta(minutes=30),
+            updated_at=abandoned_at + timedelta(minutes=30),
+        )
+        db_session.add_all([inside, after])
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["merged_count"] == 1, "post-abandonment task must be excluded"
+        assert data["acceptance_aggregate"]["total"] == 1
+
+    @pytest.mark.asyncio
+    async def test_summary_acceptance_aggregate_buckets_present(
+        self, client: AsyncClient, db_session
+    ):
+        """acceptance_aggregate includes the standard six buckets plus total."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=0),
+        ):
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+
+        assert resp.status_code == 200, resp.text
+        agg = resp.json()["acceptance_aggregate"]
+        assert "total" in agg
+        assert isinstance(agg["total"], int)
+
+    @pytest.mark.asyncio
+    async def test_summary_qualification_state_included(
+        self, client: AsyncClient, db_session
+    ):
+        """qualification_state is non-null when a qualification verdict exists."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "pending",
+                "candidate_sha": "abc1234",
+                "confidence": 0.75,
+                "threshold": 0.8,
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=3),
+        ):
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["qualification_state"] is not None
+        qs = data["qualification_state"]
+        assert "state" in qs
+        assert data["highlights"]["qualification_confidence"] == 0.75
+        assert data["highlights"]["qualification_threshold"] == 0.8
+
+    @pytest.mark.asyncio
+    async def test_summary_tasks_merged_included(self, client: AsyncClient, db_session):
+        """tasks_merged is a list with task_type, title, pr_number for each merged task."""
+        from app.landed_signal import mark_landed_on_integration
+
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        task = Task(
+            project_id=project.id,
+            title="feat: add changelog surface",
+            payloads=[{"type": "feat", "pr_number": 42}],
+            status=TaskStatus.COMPLETED,
+            context={},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(version)
+        await db_session.refresh(task)
+        mark_landed_on_integration(task)
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "tasks_merged" in data
+        tasks = data["tasks_merged"]
+        assert isinstance(tasks, list)
+        assert len(tasks) == 1
+        assert tasks[0]["title"] == "feat: add changelog surface"
+        assert tasks[0]["task_type"] == "feat"
+        assert tasks[0]["pr_number"] == 42
+
+    @pytest.mark.asyncio
+    async def test_summary_headline_reflects_aggregate_not_scalar_serving(
+        self, client: AsyncClient, db_session
+    ):
+        """Headline uses aggregate serving status, not scalar version.serving_status.
+
+        A promoted version with scalar serving_status='serving_confirmed' but an
+        artifact row reporting 'deploy_failed' must produce headline='promoted'
+        (not 'promoted & serving') and a qualification_state consistent with the
+        deploy_failed aggregate.
+        """
+        from app.models import ReleaseDeployArtifact
+        from app.release_artifacts import PROMOTION_MERGE_ARTIFACT_KIND
+        from app.time_utils import _utcnow
+
+        # Project with GitHub credentials so the promotion_merge artifact provider
+        # is observable, making the artifact row participate in the aggregate.
+        project = Project(
+            name="External Project",
+            user_id=TEST_USER_ID,
+            github_owner="test-owner",
+            github_repo="test-repo",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        member = ProjectMember(
+            project_id=project.id, user_id=TEST_USER_ID, role="owner"
+        )
+        db_session.add(member)
+        await db_session.commit()
+
+        now = _utcnow()
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            promoted_at=now,
+            promoted_sha="abc1234",
+            # Scalar says serving_confirmed — the bug would use this for the headline.
+            serving_status="serving_confirmed",
+            served_sha="abc1234",
+            served_at=now,
+            last_qualification={"status": "promoted", "confidence": 0.95},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Artifact row for the promotion_merge provider reports deploy_failed —
+        # aggregate diverges from the scalar.
+        artifact = ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind=PROMOTION_MERGE_ARTIFACT_KIND,
+            serving_status="deploy_failed",
+            reason_code="merge_not_detected",
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=3),
+        ):
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        # Headline must NOT claim serving when the aggregate says deploy_failed.
+        assert data["highlights"]["headline"] == "promoted", (
+            f"Expected 'promoted' but got {data['highlights']['headline']!r} — "
+            "headline should use aggregate serving_status, not the scalar"
+        )
+        # qualification_state must be consistent with deploy_failed aggregate.
+        qs = data["qualification_state"]
+        assert qs is not None
+        assert qs["state"] == "promotion_deploy_failed", (
+            f"Expected 'promotion_deploy_failed' but got {qs['state']!r} — "
+            "qualification_state must reflect the deploy_failed aggregate"
+        )
+
+    @pytest.mark.asyncio
+    async def test_summary_abandoned_version_malformed_abandoned_at_falls_back_unbounded(
+        self, client: AsyncClient, db_session
+    ):
+        """An abandoned version with a malformed abandoned_at ISO string in
+        last_qualification degrades gracefully to an unbounded window (returns
+        200, not 500).  The except (ValueError, TypeError) branch in
+        _closed_version_until must return None rather than raising."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="abandoned",
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_qualification={"abandoned_at": "not-a-date"},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+
+    @pytest.mark.asyncio
+    async def test_summary_abandoned_version_missing_abandoned_at_falls_back_unbounded(
+        self, client: AsyncClient, db_session
+    ):
+        """An abandoned version with no abandoned_at key in last_qualification
+        returns 200 and falls back to an unbounded merged-task window."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="abandoned",
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_qualification={},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+
+    @pytest.mark.asyncio
+    async def test_summary_promoted_version_null_promoted_at_falls_back_unbounded(
+        self, client: AsyncClient, db_session
+    ):
+        """A promoted version with promoted_at=None degrades to an unbounded
+        merged-task window (returns 200, not 500).  _closed_version_until must
+        return None rather than raising when promoted_at is absent."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            promoted_at=None,
+            promoted_sha="abc1234",
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+        assert resp.status_code == 200, resp.text
+
+    @pytest.mark.asyncio
+    async def test_release_version_summary_headline_uses_aggregate_serving(
+        self, client: AsyncClient, db_session
+    ):
+        """Headline should use aggregate serving status, not the scalar."""
+        from app.models import ReleaseDeployArtifact
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        now = _utcnow()
+        # Create a promoted version with scalar serving_status="unconfirmed"
+        # (not "serving_confirmed")
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            promoted_at=now,
+            promoted_sha="abc1234",
+            serving_status="unconfirmed",  # Scalar is NOT serving_confirmed
+            served_sha=None,
+            served_at=None,
+            last_qualification={"status": "promoted", "confidence": 0.9},
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Create a backend_revision artifact with serving_status="serving_confirmed"
+        # to make the aggregate say "serving_confirmed"
+        artifact = ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind="backend_revision",
+            serving_status="serving_confirmed",
+            served_identifier="abc1234",
+            served_at=now,
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+
+        with patch(
+            "app.release_version.count_merged_since",
+            new=AsyncMock(return_value=5),
+        ):
+            resp = await client.get(f"/api/admin/release-versions/{version.id}/summary")
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "promoted"
+        assert data["serving_status"] == "unconfirmed"  # The scalar remains unconfirmed
+        # But the headline should be "promoted & serving" because the aggregate is
+        # serving_confirmed
+        assert data["highlights"]["headline"] == "promoted & serving"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# recent_versions highlights + merged count (GET /api/admin/projects/{id}/version-lifecycle)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRecentVersionsHighlights:
+    """recent_versions entries carry server-computed highlights and merged counts."""
+
+    @pytest.mark.asyncio
+    async def test_recent_versions_highlights_match_summary_endpoint(
+        self, client: AsyncClient, db_session
+    ):
+        """recent_versions[].highlights.headline equals the per-version summary
+        endpoint headline for the same promoted version, and merged_count /
+        merged_task_count are present and correct over the bounded window."""
+        from app.time_utils import _utcnow
+        from datetime import timedelta
+
+        project = await _make_project(db_session)
+        opened = _utcnow() - timedelta(hours=2)
+        promoted_at = _utcnow() - timedelta(hours=1)
+
+        promoted = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=opened,
+            promoted_at=promoted_at,
+            serving_status="serving_confirmed",
+            served_sha="abc1234567890",
+            last_qualification={"status": "promoted", "confidence": 0.95},
+        )
+        # A second closed (abandoned) version exercises the multi-row enrichment
+        # path and ensures sequential session use doesn't race.
+        abandoned = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="abandoned",
+            opened_at=promoted_at,
+            promoted_at=None,
+        )
+        # Open version so the lifecycle endpoint finds a current_version.
+        open_ver = ReleaseVersion(
+            project_id=project.id,
+            version_number=3,
+            phase="build",
+            status="open",
+            opened_at=_utcnow(),
+        )
+        db_session.add_all([promoted, abandoned, open_ver])
+        await db_session.commit()
+        await db_session.refresh(promoted)
+
+        # Two tasks landed inside the promoted version's window (opened_at → promoted_at).
+        for _ in range(2):
+            task = Task(
+                project_id=project.id,
+                title="landed task",
+                prompt="do work",
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+                updated_at=opened + timedelta(minutes=30),
+            )
+            db_session.add(task)
+        await db_session.commit()
+
+        readiness = patch(
+            "app.release_qualifier.compute_promotion_readiness",
+            new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+        )
+        audit = patch(
+            "app.release_qualifier.resolve_lifecycle_audit_evidence",
+            new=AsyncMock(
+                return_value={
+                    "state": "none",
+                    "latest_audit": None,
+                    "stale_audit": None,
+                }
+            ),
+        )
+        with readiness, audit:
+            lifecycle_resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+        assert lifecycle_resp.status_code == 200, lifecycle_resp.text
+        recent = lifecycle_resp.json()["recent_versions"]
+        # Both closed versions must appear — this exercises the multi-row enrichment
+        # path that previously used asyncio.gather and could race on the session.
+        assert len(recent) >= 2, f"expected >=2 closed versions, got {len(recent)}"
+        row = next(r for r in recent if r["version_number"] == 1)
+
+        # Highlights and merged counts must be present.
+        assert row["highlights"] is not None, "highlights must be populated"
+        assert "headline" in row["highlights"]
+        assert row["merged_count"] is not None
+        assert row["merged_task_count"] is not None
+        assert row["merged_count"] == row["merged_task_count"]
+
+        # Fetch the per-version summary for the same closed version.
+        summary_resp = await client.get(
+            f"/api/admin/release-versions/{promoted.id}/summary"
+        )
+        assert summary_resp.status_code == 200, summary_resp.text
+        summary = summary_resp.json()
+
+        # The headline must match byte-for-byte between recent_versions and summary.
+        assert row["highlights"]["headline"] == summary["highlights"]["headline"], (
+            f"lifecycle headline {row['highlights']['headline']!r} != "
+            f"summary headline {summary['highlights']['headline']!r}"
+        )
+        # Both merged counts must equal the summary endpoint's merged_count.
+        assert row["merged_count"] == summary["merged_count"]
+        assert row["merged_task_count"] == summary["merged_count"]
+
+    @pytest.mark.asyncio
+    async def test_recent_versions_highlights_null_gracefully_without_session(
+        self, client: AsyncClient, db_session
+    ):
+        """recent_versions[] entries include highlights=null when the enrichment
+        path is skipped (no session/project_id), meaning older callers stay compatible.
+        Verified via unit-call of _serialize_version_history_entry without session."""
+        from datetime import datetime
+        from unittest.mock import MagicMock
+        from app.routers.admin_release_version import _serialize_version_history_entry
+
+        v = MagicMock(spec=ReleaseVersion)
+        v.id = uuid.uuid4()
+        v.version_number = 1
+        v.status = "promoted"
+        v.phase = "stabilize"
+        v.opened_at = datetime(2026, 1, 1)
+        v.promoted_at = datetime(2026, 6, 1)
+        v.qualification_attempts = 0
+        v.last_qualification = None
+        v.serving_status = None
+        v.served_sha = None
+        v.served_at = None
+        v.deploy_failure_reason = None
+        v.deploy_confirm_deadline = None
+        v.deploy_artifacts = []
+        v.out_of_band_promotion = None
+
+        with (
+            patch(
+                "app.routers.admin_release_version._version_serving_summary",
+                return_value=({"serving_status": None, "reason_code": None}, []),
+            ),
+            patch(
+                "app.release_version.summarize_qualification_state",
+                return_value=None,
+            ),
+        ):
+            result = await _serialize_version_history_entry(v)
+
+        # Without session/project_id the enrichment fields are null — safe degradation.
+        assert result["highlights"] is None
+        assert result["merged_count"] is None
+        assert result["merged_task_count"] is None
+        assert result["acceptance_aggregate"] is None

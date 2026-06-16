@@ -383,12 +383,13 @@ Rules:
       status: 'FAILED',
       artifact_type: 'ERROR_LOG',
       failure_category: failureCategory,
-      logs:
+      logs: sanitize(
         `Memo handler could not extract a JSON object with all required keys ` +
         `(summary, reasoning, citations, tags). exitCode=${exitCode}, ` +
         `allOutput=${(allOutput || '').length}b, ` +
         `lastResultText=${(lastResultText || '').length}b${retrySuffix}${codexSuffix}\n` +
-        `--- output tail ---\n${tail}${stderrSuffix}${recoveredSuffix}`,
+        `--- output tail ---\n${tail}${stderrSuffix}${recoveredSuffix}`
+      ),
     });
     return;
   }

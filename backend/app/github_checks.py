@@ -336,7 +336,10 @@ async def get_check_runs(
     statuses = [cr.get("status", "") for cr in check_runs]
     agg_status = (
         "in_progress"
-        if any(s in ("queued", "in_progress") for s in statuses)
+        if any(
+            s in ("queued", "in_progress", "waiting", "requested", "pending")
+            for s in statuses
+        )
         else "completed"
     )
 
@@ -589,9 +592,7 @@ async def get_workflow_run_for_sha(
     }
 
 
-async def rerun_failed_jobs(
-    token: str, owner: str, repo: str, run_id: int
-) -> bool:
+async def rerun_failed_jobs(token: str, owner: str, repo: str, run_id: int) -> bool:
     """Re-run only the failed jobs of a workflow run (GitHub Actions API).
 
     Used to absorb transient setup-phase infra failures (container/runner init)
@@ -701,5 +702,3 @@ async def get_check_runs_cached(
         for k in [k for k, (_, ts) in _check_runs_cache.items() if ts < cutoff]:
             _check_runs_cache.pop(k, None)
     return result
-
-

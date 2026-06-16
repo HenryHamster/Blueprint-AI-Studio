@@ -28,6 +28,10 @@ CONFIG_FILE = ".blueprint-config.json"
 _config_cache: dict | None = None
 
 
+class APIError(RuntimeError):
+    """Raised by api() on HTTP or network errors; caught by main() to exit cleanly."""
+
+
 def _config_search_paths() -> list[Path]:
     """Config-file locations checked in priority order (keeps secrets out of the repo)."""
     paths: list[Path] = []
@@ -174,8 +178,27 @@ def api(method: str, path: str, body: dict | None = None, timeout: int = 30) -> 
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        print(f"API error {e.code}: {e.read().decode()[:500]}")
-        raise
+        body = e.read().decode()[:500]
+        if e.code == 401:
+            print(
+                "HTTP 401 Unauthorized — your credential is invalid or expired.\n"
+                "  If using AGENT_SECRET_TOKEN, the token may have expired; "
+                "re-authenticate or request a new token.\n"
+                "  If using BLUEPRINT_API_KEY or .blueprint-config.json, "
+                "verify the key is correct.",
+                file=sys.stderr,
+            )
+        elif e.code == 403 and cfg.get("read_only"):
+            print(
+                "HTTP 403 Forbidden — this action requires admin credentials "
+                "(current config is read-only / agent-JWT).",
+                file=sys.stderr,
+            )
+        print(f"API error {e.code}: {body}", file=sys.stderr)
+        raise APIError(f"HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        print(f"Error: cannot reach API at {url}: {e.reason}", file=sys.stderr)
+        raise APIError(f"cannot reach API at {url}: {e.reason}")
 
 
 # ── Convenience helpers ─────────────────────────────────────────────────────
@@ -246,6 +269,11 @@ def get_project_id(project_id: str | None = None) -> str:
         sys.exit(1)
     _project_id_cache = projects[0]["id"]
     return _project_id_cache
+
+
+def get_version_summary(version_id: str) -> dict:
+    """Fetch the what's-new summary for a single release version by id."""
+    return api("GET", f"/api/admin/release-versions/{version_id}/summary")
 
 
 def fmt_task(t: dict, verbose: bool = False) -> str:

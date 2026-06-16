@@ -5310,6 +5310,155 @@ async def test_reconcile_pending_auto_merge_transient_red_escalates_after_cap(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_pending_auto_merge_transient_red_count_resets_on_green(
+    db_session, mocker
+):
+    """transient_red_count must be reset to 0 when CI transitions from
+    transient-red to green/pending, so intermittent spot-preemption cancellations
+    interspersed with green sweeps do not accumulate toward the force-fail cap."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "fee1dead" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    # CI is now green — a prior transient-red sweep should not have accumulated.
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "success",
+                "details": [
+                    {
+                        "name": "ci/backend",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                ],
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_reconciliation._max_transient_ci_red_sweeps",
+        return_value=5,
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "confidence": 0.95,
+        "promotion_pending": {
+            "pr_number": 46,
+            "pr_url": "https://github.com/acme/widget/pull/46",
+            "auto_merge_enabled": True,
+            "enabled_at": _utcnow().isoformat(),
+            "transient_red_count": 1,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_auto_merge_landed(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    pending = version.last_qualification["promotion_pending"]
+    # Count must be reset so a second transient-red sweep reads count=1, not 2.
+    assert not pending.get("transient_red_count")
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_transient_red_count_resets_on_pending(
+    db_session, mocker
+):
+    """transient_red_count must be reset when CI leaves the red state in the
+    managed_check_wait reconciler (via _persist_managed_check_wait_snapshot)."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "cafebabe" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    # CI is pending (in_progress) — should reset counter.
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "in_progress",
+                "conclusion": None,
+                "details": [
+                    {
+                        "name": "ci/backend",
+                        "status": "in_progress",
+                        "conclusion": None,
+                    },
+                ],
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_reconciliation._max_transient_ci_red_sweeps",
+        return_value=5,
+    )
+    mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "feed" * 10
+    qual = _managed_check_wait_qual(candidate_sha)
+    qual["promotion_pending"]["transient_red_count"] = 1
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    pending = version.last_qualification["promotion_pending"]
+    # Counter must be cleared so the next transient-red sweep starts fresh at 1.
+    assert not pending.get("transient_red_count")
+
+
+@pytest.mark.asyncio
 async def test_managed_check_wait_defers_on_migration_metadata_unfetchable(
     db_session, mocker
 ):
@@ -6352,3 +6501,276 @@ async def test_managed_check_wait_405_retriable_vs_terminal(db_session, mocker):
     assert version2.status == "open"
     assert version2.last_qualification["status"] == "pending"
     assert "promotion_pending" in version2.last_qualification
+
+
+# ===========================================================================
+# API-error sweep tracking — consecutive _from_api_error results increment
+# api_error_sweep_count and surface a warning at the threshold.
+# ===========================================================================
+
+from app.release_reconciliation import _API_ERROR_SWEEP_WARN_THRESHOLD  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_api_error_sweep_count_increments(
+    db_session, mocker, caplog
+):
+    """Consecutive _from_api_error check-run results increment api_error_sweep_count
+    in the snapshot, and a WARNING-level log fires once count reaches the threshold."""
+    import logging
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "deadbeef" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    # get_check_runs_cached returns an api-error response (status=pending + _from_api_error=True)
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "pending",
+                "conclusion": None,
+                "_from_api_error": True,
+                "details": [],
+            }
+        ),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    # Pre-seed with count just below the threshold so one more sweep crosses it.
+    qual = _managed_check_wait_qual(candidate_sha)
+    qual["promotion_pending"]["api_error_sweep_count"] = (
+        _API_ERROR_SWEEP_WARN_THRESHOLD - 1
+    )
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    with caplog.at_level(logging.WARNING, logger="app.release_reconciliation"):
+        reconciled = await _reconcile_if_managed_check_wait(
+            version.id, session_factory=_shared_session_factory(db_session)
+        )
+
+    assert reconciled is False
+    await db_session.refresh(version)
+    pending = version.last_qualification["promotion_pending"]
+    assert pending.get("api_error_sweep_count") == _API_ERROR_SWEEP_WARN_THRESHOLD
+    # The warning log must mention "api-error" so operators can distinguish it
+    # from genuine in-progress CI.
+    assert any(
+        "api-error" in record.message.lower() or "api_error" in record.message.lower()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ), "expected a WARNING log mentioning api-error sweeps"
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_api_error_count_resets_on_real_check(
+    db_session, mocker
+):
+    """A non-api-error response resets api_error_sweep_count to 0."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "cafebabe" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    # A real in-progress response (no _from_api_error flag).
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "in_progress",
+                "conclusion": None,
+                "details": [],
+            }
+        ),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    qual = _managed_check_wait_qual(candidate_sha)
+    qual["promotion_pending"]["api_error_sweep_count"] = 5
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    await db_session.refresh(version)
+    pending = version.last_qualification["promotion_pending"]
+    assert not pending.get("api_error_sweep_count")
+
+
+# ===========================================================================
+# ci_unresolved restore-shape — Lead #4: _guard_ci_unresolved_promotion_in_flight
+# must restore managed_check_wait + migration_carrying for migration PRs.
+# ===========================================================================
+
+from app.release_qualifier import _guard_ci_unresolved_promotion_in_flight  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_ci_unresolved_guard_restores_managed_check_wait_for_migration_pr(
+    db_session, mocker
+):
+    """When the open release PR touches Alembic migrations, the restored
+    promotion_pending must include managed_check_wait=True and migration_carrying=True
+    so the reconciler routes it through the managed path (not native auto-merge)."""
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_open_pull_requests",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 101,
+                    "html_url": "https://github.com/acme/widget/pull/101",
+                    "auto_merge": None,
+                    "head": {"ref": "release-v1"},
+                }
+            ]
+        ),
+    )
+    # PR touches migrations → pr_touches_migrations returns True
+    mocker.patch(
+        "app.rollup_migration_validation.pr_touches_migrations",
+        new=AsyncMock(return_value=True),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": "abcd" * 10,
+        "blocker": "ci_unresolved",
+        "confidence": 0.0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    base_record = {
+        "confidence": 0.0,
+        "blocker": "ci_unresolved",
+        "candidate_sha": "abcd" * 10,
+    }
+
+    result = await _guard_ci_unresolved_promotion_in_flight(
+        session=db_session,
+        version=version,
+        candidate_sha="abcd" * 10,
+        base_record=base_record,
+        token="tok",
+        owner="acme",
+        repo="widget",
+        project=_project,
+    )
+
+    assert result is not None
+    assert result.get("managed_check_wait") is True
+
+    await db_session.refresh(version)
+    pending = version.last_qualification["promotion_pending"]
+    assert pending.get("managed_check_wait") is True
+    assert pending.get("migration_carrying") is True
+    assert pending.get("why_not_native_automerge") is not None
+    assert pending.get("restored_by_ci_unresolved_guard") is True
+
+
+@pytest.mark.asyncio
+async def test_ci_unresolved_guard_does_not_set_managed_check_wait_for_non_migration_pr(
+    db_session, mocker
+):
+    """When the open release PR does NOT touch Alembic migrations, the restored
+    promotion_pending must NOT have managed_check_wait so native auto-merge can proceed."""
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_open_pull_requests",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 202,
+                    "html_url": "https://github.com/acme/widget/pull/202",
+                    "auto_merge": {"enabled_by": "user"},
+                    "head": {"ref": "release-v1"},
+                }
+            ]
+        ),
+    )
+    # PR does NOT touch migrations.
+    mocker.patch(
+        "app.rollup_migration_validation.pr_touches_migrations",
+        new=AsyncMock(return_value=False),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": "cafe" * 10,
+        "blocker": "ci_unresolved",
+        "confidence": 0.0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    base_record = {
+        "confidence": 0.0,
+        "blocker": "ci_unresolved",
+        "candidate_sha": "cafe" * 10,
+    }
+
+    result = await _guard_ci_unresolved_promotion_in_flight(
+        session=db_session,
+        version=version,
+        candidate_sha="cafe" * 10,
+        base_record=base_record,
+        token="tok",
+        owner="acme",
+        repo="widget",
+        project=_project,
+    )
+
+    assert result is not None
+    assert not result.get("managed_check_wait")
+
+    await db_session.refresh(version)
+    pending = version.last_qualification["promotion_pending"]
+    assert not pending.get("managed_check_wait")
+    assert not pending.get("migration_carrying")
+    assert pending.get("restored_by_ci_unresolved_guard") is True

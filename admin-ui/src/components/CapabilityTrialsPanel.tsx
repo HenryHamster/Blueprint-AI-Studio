@@ -14,7 +14,15 @@ function fmtAccrual(p: NonNullable<AccrualProjection>): string {
   const days = p.window_days ?? 7;
   const eta = p.days_to_min_n == null ? '—' : `${p.days_to_min_n}d`;
   const holdbackPct = ((p.holdback_fraction ?? 0) * 100).toFixed(0);
-  return `${p.with_7d ?? 0} with / ${p.without_7d ?? 0} without in last ${days}d · est. ${eta} to threshold at ${holdbackPct}% holdback`;
+  let result = `${p.with_7d ?? 0} with / ${p.without_7d ?? 0} without in last ${days}d · est. ${eta} to threshold at ${holdbackPct}% holdback`;
+  if (p.alternative_projections && Object.keys(p.alternative_projections).length > 0) {
+    const altParts = Object.entries(p.alternative_projections)
+      .sort(([a], [b]) => parseFloat(a) - parseFloat(b))
+      .map(([f, d]) => `${(parseFloat(f) * 100).toFixed(0)}%→${d == null ? '—' : `${d}d`}`)
+      .join(', ');
+    result += ` · alt: ${altParts}`;
+  }
+  return result;
 }
 
 function hasLaneMetrics(v: CapabilityVerdict): boolean {

@@ -306,6 +306,15 @@ async def mark_checkpoint_missing(
     lane.updated_at = _utcnow()
 
     should_requeue = lane.phase_requeues <= _LANE_MAX_PHASE_REQUEUES
+    if lane.phase_requeues == _LANE_MAX_PHASE_REQUEUES - 1:
+        logger.warning(
+            "lane %s approaching phase_requeues exhaustion (%d/%d) reason=%s; "
+            "one more miss will trigger kill",
+            lane_id,
+            lane.phase_requeues,
+            _LANE_MAX_PHASE_REQUEUES,
+            reason,
+        )
     if not should_requeue:
         logger.warning(
             "lane %s exhausted phase_requeues budget (%d/%d) reason=%s; "

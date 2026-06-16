@@ -642,6 +642,72 @@ async def test_mark_checkpoint_missing_exhausted_budget(db: AsyncSession):
     assert updated.phase_requeues == _LANE_MAX_PHASE_REQUEUES + 1
 
 
+@pytest.mark.asyncio
+async def test_mark_checkpoint_missing_emits_pre_exhaustion_warning(
+    db: AsyncSession, caplog
+):
+    """When phase_requeues reaches _LANE_MAX_PHASE_REQUEUES - 1, emit WARNING alert."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/miss-pre-exhaust",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    # Start with phase_requeues at _LANE_MAX_PHASE_REQUEUES - 2, so after increment
+    # it will be at _LANE_MAX_PHASE_REQUEUES - 1 (two out of three used)
+    lane.phase_requeues = _LANE_MAX_PHASE_REQUEUES - 2
+    await db.commit()
+
+    with caplog.at_level("WARNING"):
+        updated, should_requeue = await mark_checkpoint_missing(
+            db, lane.id, reason="test_reason"
+        )
+    await db.commit()
+
+    assert should_requeue is True
+    assert updated.phase_requeues == _LANE_MAX_PHASE_REQUEUES - 1
+    # Verify that the pre-exhaustion warning was emitted
+    assert "approaching phase_requeues exhaustion" in caplog.text
+    assert "one more miss will trigger kill" in caplog.text
+    assert str(lane.id) in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mark_checkpoint_missing_no_warning_when_under_limit(
+    db: AsyncSession, caplog
+):
+    """When phase_requeues is below _LANE_MAX_PHASE_REQUEUES - 1, no pre-exhaustion warning."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/miss-under-limit",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    # Start with phase_requeues = 0, so after increment it will be 1
+    # (well under the _LANE_MAX_PHASE_REQUEUES - 1 threshold of 2)
+    lane.phase_requeues = 0
+    await db.commit()
+
+    with caplog.at_level("WARNING"):
+        updated, should_requeue = await mark_checkpoint_missing(db, lane.id)
+    await db.commit()
+
+    assert should_requeue is True
+    assert updated.phase_requeues == 1
+    # Verify that the pre-exhaustion warning was NOT emitted
+    assert "approaching phase_requeues exhaustion" not in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # manifest bounding
 # ---------------------------------------------------------------------------
@@ -2074,6 +2140,73 @@ async def test_activate_lane_for_fix_no_restamp_when_hard_ceiling_elapsed(
 
 
 # ---------------------------------------------------------------------------
+# activate_lane_for_fix — workspace_state branch contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_activate_lane_for_fix_full_pilot_sets_workspace_state_leased(
+    db: AsyncSession,
+):
+    """Full-pilot path (lease_workspace=True) must flip workspace_state to LEASED
+    after PARKED->ACTIVE transition.  A stale COLD value here means the fix task
+    cannot claim a warm workspace, so this is a correctness invariant."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/ws-leased-contract",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    await db.commit()
+
+    task_id = uuid.uuid4()
+    await activate_lane_for_fix(db, lane, task_id=task_id, lease_workspace=True)
+    await db.commit()
+
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
+    assert refreshed.workspace_state == "LEASED", (
+        "full-pilot activate_lane_for_fix must set workspace_state=LEASED"
+    )
+
+
+@pytest.mark.asyncio
+async def test_activate_lane_for_fix_shadow_mode_does_not_set_workspace_leased(
+    db: AsyncSession,
+):
+    """Shadow path (lease_workspace=False) must NOT flip workspace_state to LEASED.
+    A stray LEASED value in the shadow arm contaminates the control arm — itself a
+    pilot KILL condition — so the cold state must be preserved."""
+    project_id = await _make_project(db)
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id=None,
+        title="T",
+        goal="G",
+        branch_name="lane/ws-shadow-contract",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.PARKED.value
+    await db.commit()
+
+    task_id = uuid.uuid4()
+    await activate_lane_for_fix(db, lane, task_id=task_id, lease_workspace=False)
+    await db.commit()
+
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.status == ImprovementLaneStatus.ACTIVE.value
+    assert refreshed.workspace_state == "COLD", (
+        "shadow activate_lane_for_fix must NOT set workspace_state=LEASED"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Reservation-expiry while lane is in LEASED state (end-to-end seam)
 # ---------------------------------------------------------------------------
 
@@ -2625,7 +2758,9 @@ async def test_recovery_rebind_releases_reserved_vm(db: AsyncSession):
     from app.time_utils import _utcnow
 
     project_id = await _make_project(db)
-    lane = await _make_active_lane(db, project_id, current_task_id=None, phase_requeues=1)
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=None, phase_requeues=1
+    )
 
     now = _utcnow()
     member = PoolVm(
@@ -2656,3 +2791,202 @@ async def test_recovery_rebind_releases_reserved_vm(db: AsyncSession):
     assert member.reserved_lane_id is None
     assert member.reservation_expires_at is None
     assert member.reservation_hard_expires_at is None
+
+
+# ---------------------------------------------------------------------------
+# checkpoint_or_recover_phase — operator board emit on RECOVER path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_or_recover_phase_emits_pre_exhaustion_operator_message(
+    db: AsyncSession,
+):
+    """RECOVER path must post a ProjectMessage so the operator board shows the miss.
+
+    Previously only logger.warning was emitted; this verifies that
+    emit_lane_event_message now writes a deduplicated ProjectMessage with
+    event_type='lane_checkpoint_recover' when the checkpoint budget is not yet
+    exhausted.
+    """
+    from app.models import ProjectMessage, TaskStatus
+    from app.review_fix_lane_pilot import (
+        CHECKPOINT_PHASE_RECOVER,
+        checkpoint_or_recover_phase,
+    )
+
+    project_id = await _make_project(db)
+    task = await _make_task(db, project_id, TaskStatus.EVALUATING)
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=task.id, phase_requeues=0
+    )
+
+    # sha=None triggers mark_checkpoint_missing (miss recorded, budget intact → RECOVER)
+    result = await checkpoint_or_recover_phase(
+        db,
+        task,
+        lane,
+        sha=None,
+        summary="test summary",
+        reserve_workspace=False,
+        enable_recovery=True,
+    )
+    await db.flush()
+
+    assert result == CHECKPOINT_PHASE_RECOVER
+
+    msgs = (
+        (
+            await db.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    recover_msgs = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "lane_checkpoint_recover"
+    ]
+    assert len(recover_msgs) == 1, (
+        f"expected 1 lane_checkpoint_recover message, got {len(recover_msgs)}: "
+        f"{[m.content for m in msgs]}"
+    )
+    assert (
+        str(lane.id) in recover_msgs[0].content or lane.title in recover_msgs[0].content
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_or_recover_phase_emits_pre_exhaustion_budget_alert(
+    db: AsyncSession,
+):
+    """At penultimate requeue slot, a lane_budget_near_exhausted message must be emitted.
+
+    Start a lane with phase_requeues = _LANE_MAX_PHASE_REQUEUES - 2 so that after one
+    checkpoint miss it reaches _LANE_MAX_PHASE_REQUEUES - 1 (the penultimate slot).
+    The function must emit both the regular lane_checkpoint_recover message AND a
+    distinct lane_budget_near_exhausted message.
+    """
+    from app.models import ProjectMessage, TaskStatus, _LANE_MAX_PHASE_REQUEUES
+    from app.review_fix_lane_pilot import (
+        CHECKPOINT_PHASE_RECOVER,
+        checkpoint_or_recover_phase,
+    )
+
+    project_id = await _make_project(db)
+    task = await _make_task(db, project_id, TaskStatus.EVALUATING)
+    lane = await _make_active_lane(
+        db,
+        project_id,
+        current_task_id=task.id,
+        phase_requeues=_LANE_MAX_PHASE_REQUEUES - 2,
+    )
+
+    result = await checkpoint_or_recover_phase(
+        db,
+        task,
+        lane,
+        sha=None,
+        summary="test summary",
+        reserve_workspace=False,
+        enable_recovery=True,
+    )
+    await db.flush()
+
+    assert result == CHECKPOINT_PHASE_RECOVER
+
+    msgs = (
+        (
+            await db.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    event_types = [(m.context or {}).get("event_type") for m in msgs]
+    assert "lane_checkpoint_recover" in event_types, (
+        f"expected lane_checkpoint_recover message, got event_types={event_types}"
+    )
+    assert "lane_budget_near_exhausted" in event_types, (
+        f"expected lane_budget_near_exhausted message at penultimate slot, got event_types={event_types}"
+    )
+    near_exhausted = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "lane_budget_near_exhausted"
+    ]
+    assert len(near_exhausted) == 1
+    assert "next checkpoint miss will kill" in near_exhausted[0].content
+
+
+# ---------------------------------------------------------------------------
+# sweep_stranded_lanes — operator board emit on recovery dispatch path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lanes_class1_recovery_dispatch_emits_operator_message(
+    db: AsyncSession,
+):
+    """Stranded ACTIVE lane with dispatch context spawns a recovery task AND emits
+    a ProjectMessage on the operator board."""
+    from app.models import ProjectMessage, Task, TaskStatus
+    from app.warm_pool_maintainer import sweep_stranded_lanes
+    from datetime import datetime
+
+    project_id = await _make_project(db)
+
+    # Task with pr_number in payload so the recovery-dispatch branch is taken
+    task = Task(
+        project_id=project_id,
+        title="fix PR 42",
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix the issue",
+                "pr_number": 42,
+                "branch": "feat/test-branch",
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.FAILED,
+    )
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+
+    lane = await _make_active_lane(
+        db, project_id, current_task_id=task.id, phase_requeues=0
+    )
+    lane_id = lane.id
+
+    with patch(
+        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    ):
+        count = await sweep_stranded_lanes(db, datetime.utcnow(), runtime_config={})
+    await db.commit()
+
+    assert count == 1
+
+    msgs = (
+        (
+            await db.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    recover_msgs = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "lane_checkpoint_recover"
+    ]
+    assert len(recover_msgs) == 1, (
+        f"expected 1 lane_checkpoint_recover message, got {len(recover_msgs)}: "
+        f"{[m.content for m in msgs]}"
+    )
+    assert str(lane_id) in (recover_msgs[0].context or {}).get("dedupe_key", "")

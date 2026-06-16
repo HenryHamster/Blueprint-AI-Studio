@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import type { JSX } from 'react';
+import { VersionSummaryPanel } from './VersionSummaryPanel';
 import {
   clearDeployFailed,
   cutVersion,
   fetchQualificationVerdicts,
+  fetchVersionSummary,
   patchAdminSettings,
   setProjectPromotionEnabled,
   setVersionPhase,
@@ -18,9 +20,12 @@ import {
   type OutOfBandPromotion,
   type QualificationVerdictRecord,
   type ReleaseArtifactEvidence,
+  type RecentVersion,
   type StagedDirection,
   type VersionLifecycleResponse,
   type VersionQualification,
+  type VersionSummaryHighlights,
+  type VersionSummaryResponse,
   type PromotionPolicySource,
   type PromotionReadiness,
   type QualificationState,
@@ -1012,6 +1017,66 @@ interface VersionLifecyclePanelProps {
   refreshing?: boolean;
 }
 
+/** Shared italic what's-new headline + at-a-glance metric line (merged / proven /
+ *  conf-thr / phase·status). Rendered for both the current (open) version and the
+ *  expanded past versions so they present an identical summary. The headline string
+ *  itself is computed server-side (release_version.build_version_highlights) and its
+ *  'serving' word reflects the aggregate required-artifact serving truth. */
+function VersionHighlightsLine({
+  highlights,
+  phase,
+  status,
+}: {
+  highlights: VersionSummaryHighlights;
+  phase?: string | null;
+  status: string;
+}) {
+  const conf =
+    highlights.qualification_confidence != null
+      ? `${Math.round(highlights.qualification_confidence * 100)}%`
+      : null;
+  const thresh =
+    highlights.qualification_threshold != null
+      ? `${Math.round(highlights.qualification_threshold * 100)}%`
+      : null;
+  return (
+    <div className="space-y-0.5 text-[10px]" data-testid="version-headline">
+      <p className="text-neutral-300 italic">{highlights.headline}</p>
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-neutral-400">
+        <span>{highlights.merged_count} merged</span>
+        <span>{highlights.proven}/{highlights.total_merged_for_acceptance} proven</span>
+        {conf && thresh && <span>conf {conf} / thr {thresh}</span>}
+        {phase && <span className="text-neutral-500">{phase} · {status}</span>}
+      </div>
+    </div>
+  );
+}
+
+function VersionHistorySummary({ versionId }: { versionId: string }) {
+  const [summary, setSummary] = useState<VersionSummaryResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // loading is derived: no data and no error yet
+  const loading = summary === null && error === null;
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchVersionSummary(versionId)
+      .then(data => { if (!cancelled) setSummary(data); })
+      .catch(err => { if (!cancelled) setError(String(err)); });
+    return () => { cancelled = true; };
+  }, [versionId]);
+
+  if (loading) return <p className="text-[10px] text-neutral-500 pl-2">Loading…</p>;
+  if (error || !summary) return <p className="text-[10px] text-red-400 pl-2">Failed to load summary</p>;
+
+  return (
+    <div className="mt-1 pl-2 border-l-2 border-neutral-700/40 space-y-0.5 text-[10px]">
+      <VersionHighlightsLine highlights={summary.highlights} phase={summary.phase} status={summary.status} />
+      <VersionSummaryPanel tasksMerged={summary.tasks_merged} />
+    </div>
+  );
+}
+
 function VersionLifecycleRefreshBanner({
   kind,
   message,
@@ -1069,6 +1134,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const [promotionEnabledOverride, setPromotionEnabledOverride] = useState<boolean | null>(null);
   const [cuttingVersion, setCuttingVersion] = useState<boolean>(false);
   const [cutReason, setCutReason] = useState<string>('');
+  const [expandedVersionId, setExpandedVersionId] = useState<string | null>(null);
   // One idempotency key per confirmed cut: generated on confirm, reused across
   // a lost-response retry, cleared on success so the next cut gets a fresh key.
   const cutIdempotencyKeyRef = useRef<string | null>(null);
@@ -1142,8 +1208,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // Keep this predicate on that same backend-owned latch; aggregate-only
   // required-artifact failures still surface in the badges/breakdown, but the
   // clear endpoint cannot currently recover them directly.
-  const hasDeployFailed = cv?.serving_status === 'deploy_failed'
-    || recent.some(v => v.serving_status === 'deploy_failed');
+  const hasDeployFailed = (cv?.serving?.status ?? cv?.serving_status) === 'deploy_failed'
+    || recent.some(v => (v.serving?.status ?? v.serving_status) === 'deploy_failed');
 
   const handleSetPhase = async (phase: 'build' | 'stabilize') => {
     if (!projectId) return;
@@ -1420,6 +1486,13 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 </span>
               )}
             </div>
+            {/* What's-new headline for the CURRENT (open) version, matching the
+                summary line past versions get when expanded. Gated on highlights so
+                older backends that don't emit it degrade gracefully. Status is
+                always 'open' here — the lifecycle query only returns the open row. */}
+            {cv.highlights && (
+              <VersionHighlightsLine highlights={cv.highlights} phase={cv.phase} status="open" />
+            )}
             {editingGoal && projectId ? (
               <div className="flex flex-col gap-1.5">
                 <textarea
@@ -1521,12 +1594,21 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     {cv.qualification_state.state.replace(/_/g, ' ')}
                   </span>
                   <ServingStatusBadge
-                    servingStatus={cv.aggregate_serving_status ?? cv.serving_status ?? cv.qualification_state.serving_status}
-                    servedSha={cv.served_sha}
-                    servedAt={cv.served_at}
-                    deployFailureReason={cv.aggregate_deploy_failure_reason ?? cv.deploy_failure_reason ?? cv.qualification_state.deploy_failure_reason}
+                    servingStatus={cv.serving?.status ?? cv.qualification_state?.serving_status}
+                    servedSha={cv.serving?.sha ?? cv.served_sha}
+                    servedAt={cv.serving?.confirmed_at ?? cv.served_at}
+                    deployFailureReason={cv.serving?.failure_reason ?? cv.qualification_state?.deploy_failure_reason}
                     deployConfirmDeadline={cv.deploy_confirm_deadline}
                   />
+                  {cv.aggregate_serving_status != null && cv.serving_status != null && cv.aggregate_serving_status !== cv.serving_status && (
+                    <span
+                      data-testid="serving-disagree-badge"
+                      title={`Artifact consensus (aggregate_serving_status: ${cv.aggregate_serving_status}) differs from backend scalar (serving_status: ${cv.serving_status}) — artifact value takes precedence.`}
+                      className="text-amber-500 text-[10px] cursor-help"
+                    >
+                      ⚠
+                    </span>
+                  )}
                 </div>
                 {cv.qualification_state.state === 'promotion_in_flight' && promotionFreshness && (
                   <p
@@ -1556,7 +1638,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   </p>
                 )}
                 <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
-                <ArtifactEvidenceList artifacts={cv.artifacts} />
+                <ArtifactEvidenceList artifacts={cv.serving?.artifacts ?? cv.artifacts} />
               </div>
             )}
             {cv.last_qualification && (
@@ -1638,6 +1720,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 <HistoricalAuditContext audit={cv.stale_audit} activeCandidateSha={cv.active_candidate_sha} />
               </div>
             )}
+            <VersionSummaryPanel tasksMerged={cv.tasks_merged} />
             {projectId && (
               <div data-testid="phase-controls" className="flex flex-wrap items-center gap-2 pt-1">
                 {cv.phase === 'build' ? (
@@ -1784,34 +1867,59 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         {recent.length > 0 && (
           <div>
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
-            <div className="space-y-0.5">
-              {recent.slice(0, 4).map(v => (
-                <div key={v.version_number} className="space-y-0.5">
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
-                    <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
-                    <span className="text-neutral-500">{v.status}</span>
-                    <ServingStatusBadge
-                      servingStatus={v.aggregate_serving_status ?? v.serving_status ?? v.qualification_state?.serving_status}
-                      servedSha={v.served_sha}
-                      servedAt={v.served_at}
-                      deployFailureReason={v.aggregate_deploy_failure_reason ?? v.deploy_failure_reason ?? v.qualification_state?.deploy_failure_reason}
-                      deployConfirmDeadline={v.deploy_confirm_deadline}
-                    />
-                    <QualSummary q={v.last_qualification} />
-                    {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
-                      <span className="text-neutral-400">
-                        cut by {v.abandoned_by ?? 'unknown'}
-                        {v.abandon_reason ? `: ${v.abandon_reason}` : ''}
-                        {v.abandoned_at ? ` · ${timeAgo(v.abandoned_at)}` : ''}
-                      </span>
+            <div className="space-y-1">
+              {recent.slice(0, 4).map((v: RecentVersion) => {
+                const isExpanded = !!v.id && expandedVersionId === v.id;
+                return (
+                  <div key={v.version_number} className="space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
+                      <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
+                      <span className="text-neutral-500">{v.status}</span>
+                      <ServingStatusBadge
+                        servingStatus={v.serving?.status ?? v.qualification_state?.serving_status}
+                        servedSha={v.serving?.sha ?? v.served_sha}
+                        servedAt={v.serving?.confirmed_at ?? v.served_at}
+                        deployFailureReason={v.serving?.failure_reason ?? v.qualification_state?.deploy_failure_reason}
+                        deployConfirmDeadline={v.deploy_confirm_deadline}
+                      />
+                      {v.aggregate_serving_status != null && v.serving_status != null && v.aggregate_serving_status !== v.serving_status && (
+                        <span
+                          data-testid="serving-disagree-badge"
+                          title={`Artifact consensus (aggregate_serving_status: ${v.aggregate_serving_status}) differs from backend scalar (serving_status: ${v.serving_status}) — artifact value takes precedence.`}
+                          className="text-amber-500 text-[10px] cursor-help"
+                        >
+                          ⚠
+                        </span>
+                      )}
+                      <QualSummary q={v.last_qualification} />
+                      {v.status === 'abandoned' && (v.abandoned_by || v.abandon_reason || v.abandoned_at) && (
+                        <span className="text-neutral-400">
+                          cut by {v.abandoned_by ?? 'unknown'}
+                          {v.abandon_reason ? `: ${v.abandon_reason}` : ''}
+                          {v.abandoned_at ? ` · ${timeAgo(v.abandoned_at)}` : ''}
+                        </span>
+                      )}
+                      {v.id && (
+                        <button
+                          onClick={() => setExpandedVersionId(isExpanded ? null : v.id!)}
+                          className="min-h-[44px] min-w-[44px] flex items-center justify-center text-neutral-600 hover:text-neutral-300 transition-colors"
+                          title={isExpanded ? 'Hide summary' : "What's new"}
+                        >
+                          {isExpanded ? '▲' : '▼'}
+                        </button>
+                      )}
+                    </div>
+                    {v.out_of_band_promotion && (
+                      <OutOfBandPromotionBadge oob={v.out_of_band_promotion} />
                     )}
+                    {!isExpanded && v.highlights && (
+                      <VersionHighlightsLine highlights={v.highlights} phase={v.phase} status={v.status} />
+                    )}
+                    <ArtifactEvidenceList artifacts={v.artifacts} />
+                    {isExpanded && v.id && <VersionHistorySummary versionId={v.id} />}
                   </div>
-                  {v.out_of_band_promotion && (
-                    <OutOfBandPromotionBadge oob={v.out_of_band_promotion} />
-                  )}
-                  <ArtifactEvidenceList artifacts={v.artifacts} />
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}

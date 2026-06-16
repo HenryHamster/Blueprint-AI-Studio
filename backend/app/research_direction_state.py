@@ -271,18 +271,79 @@ def direction_saturation_refractory_minutes() -> float:
     return 2.0 * direction_refractory_minutes()
 
 
-def direction_dedup_deadlock_recovery_hours() -> float:
-    """Cooldown for dedup-deadlocked directions before auto-recovery.
 
-    Shorter than the general ``direction_auto_recovery_hours`` (48h default)
-    because dedup-deadlocks often resolve as soon as in-flight tasks drain —
-    a shorter cooldown lets the direction re-enter rotation sooner.  The
-    general 48h floor applies if this value is not explicitly configured.
+async def _maybe_autocomplete_exhausted_direction(
+    session: AsyncSession,
+    task: Task,
+    d: Dict[str, Any],
+    did: str,
+    pending_archived: list,
+    *,
+    exhausted: bool | None = None,
+) -> bool:
+    """Route a genuinely-exhausted direction to terminal COMPLETED under the
+    shared guardrails. Returns True iff the direction was completed.
+
+    Supersedes the #10112 dedup-deadlock auto-pause and the #10113 already-fixed
+    -deadlock alert-only no-op: a direction with no new work left (saturated /
+    dedup-deadlocked / already-fixed-deadlocked) that is NOT externally frozen and
+    NOT code-failing is retired terminally instead of looping forever. The proven
+    >=3-verified-merge completion route stays a separate, additive path.
+
+    Preserves the same completion side-effects as the proven-merge route:
+    ``auto_completed`` / ``auto_completed_reason`` / ``completed_at`` stamps, an
+    INFO Alert, the deferred diagnosis archive, and the milestone message. The
+    ``exhausted`` override lets a caller that has already detected a specific
+    deadlock signal pass it in (see ``_should_autocomplete_exhausted``).
     """
-    value = _runtime_config.get("dedup_deadlock_auto_recovery_hours")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    return 8.0
+    from app.strategic_completion import (
+        _exhaustion_complete_reason,
+        _should_autocomplete_exhausted,
+    )
+
+    if not _should_autocomplete_exhausted(d, exhausted=exhausted):
+        return False
+
+    reason = _exhaustion_complete_reason(d)
+    d["status"] = "completed"
+    d["completed_at"] = _utcnow().isoformat()
+    d["auto_completed"] = True
+    d["auto_completed_reason"] = reason
+    # Capture diagnosis info for the deferred design_doc archive write (same as the
+    # proven-merge route), performed after the directions commit.
+    pending_archived.append((dict(d), did))
+    session.add(
+        Alert(
+            project_id=task.project_id,
+            severity=AlertSeverity.INFO,
+            title="Direction auto-completed",
+            message=(
+                f"Direction '{d.get('text', did)[:80]}' was auto-completed: {reason}."
+            ),
+        )
+    )
+    try:
+        from app.notification_dispatch import (
+            post_direction_milestone_message,
+        )
+
+        await post_direction_milestone_message(
+            session,
+            task.project_id,
+            direction_text=d.get("text", ""),
+            milestone="auto-completed",
+            reason=reason,
+            direction_id=did,
+        )
+    except Exception as _notify_exc:
+        logger.warning(
+            f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
+        )
+    logger.info(
+        f"[RESEARCH] Auto-completed exhausted direction {did} "
+        f"(reason: {reason!r}, task {task.id})"
+    )
+    return True
 
 
 async def apply_post_spawn_state(
@@ -493,6 +554,10 @@ async def apply_post_spawn_state(
                         for ct in child_tasks
                         if (ct.context or {}).get("direction_id") == did
                     ]
+                    # Clear deadlock_filtered_titles when the cycle is productive so
+                    # we don't keep surfacing stale rejected titles after recovery.
+                    if len(dir_child_tasks) > 0 and d.get("deadlock_filtered_titles"):
+                        del d["deadlock_filtered_titles"]
                     # Compact history entry — just counters and a short summary.
                     # Full details available via task API using task_id.
                     titles = finding_titles_by_dir.get(did, [])[:3]
@@ -571,6 +636,23 @@ async def apply_post_spawn_state(
 
                     # Deadlock detection: 3+ consecutive 0-task cycles driven by dedup
                     _deadlocked, _consec = _detect_dedup_deadlock(d["research_history"])
+                    if _deadlocked and d.get("status") == "active":
+                        # #10112 superseded: retire a genuinely-exhausted dedup-
+                        # deadlocked direction terminally instead of auto-pausing-and
+                        # -recovering, UNLESS an external freeze or code-failure pattern
+                        # means it is not truly exhausted — in which case completion
+                        # is declined and the existing auto-pause + time-based recovery
+                        # path below still fires.
+                        await _maybe_autocomplete_exhausted_direction(
+                            session,
+                            task,
+                            d,
+                            did,
+                            _pending_archived_diagnoses,
+                            exhausted=True,
+                        )
+                    # Existing auto-pause path: only when the direction was NOT just
+                    # completed above (status flips to 'completed' on completion).
                     if _deadlocked and d.get("status") == "active":
                         _blocked_titles = [
                             f.get("title", "")[:60]
@@ -666,12 +748,44 @@ async def apply_post_spawn_state(
                             f"[RESEARCH] Auto-paused direction {did} (dedup_deadlock, "
                             f"{_consec} consecutive empty cycles, task {task.id})"
                         )
+                        # Collect rejected finding titles from the deadlocked window so
+                        # the next research cycle's prompt can exclude them explicitly.
+                        _dft_seen: set = set()
+                        _dft: list = []
+                        for _he in d["research_history"][-_consec:]:
+                            for _ff in _he.get("filtered_findings") or []:
+                                _t = (_ff.get("title") or "").strip()
+                                if _t and _t not in _dft_seen:
+                                    _dft_seen.add(_t)
+                                    _dft.append(_t)
+                                    if len(_dft) >= 15:
+                                        break
+                            if len(_dft) >= 15:
+                                break
+                        if _dft:
+                            d["deadlock_filtered_titles"] = _dft
 
                     # Already-fixed deadlock detection: check prior completed cycles
                     # (exclude the just-added entry — its children haven't resolved yet).
                     _af_deadlocked, _af_consec = _detect_already_fixed_deadlock(
                         d["research_history"][:-1]
                     )
+                    if _af_deadlocked and d.get("status") == "active":
+                        # #10113 superseded: route a genuinely-exhausted already-fixed
+                        # -deadlocked direction to terminal COMPLETED instead of the
+                        # alert-only no-op. Detection uses history[:-1] (the just-added
+                        # cycle's children have not resolved yet), so pass exhausted=True
+                        # rather than re-deriving from the full history. If an external
+                        # freeze / code-failure pattern blocks completion, fall through
+                        # to the existing advisory alert below.
+                        await _maybe_autocomplete_exhausted_direction(
+                            session,
+                            task,
+                            d,
+                            did,
+                            _pending_archived_diagnoses,
+                            exhausted=True,
+                        )
                     if _af_deadlocked and d.get("status") == "active":
                         _existing_af_alert = (
                             (
@@ -728,6 +842,7 @@ async def apply_post_spawn_state(
                                 f"{_af_consec} consecutive scope-empty cycles (task {task.id})"
                             )
 
+
                     _evicted_out: list = []
                     d["research_context"] = _build_research_context(
                         prior_context=d.get("research_context"),
@@ -761,10 +876,13 @@ async def apply_post_spawn_state(
 
                     record_outcome_progress_snapshot(d)
 
-                    # Auto-complete direction if saturated with sufficient merged PRs.
-                    # The tasks_created guard is intentionally omitted: a fully-exhausted
-                    # direction (all findings deduped, zero tasks spawned) is exactly the
-                    # case that should trigger auto-completion, not escape it.
+                    # Auto-complete if saturated and proven by merged PRs.
+                    # Require >= 3 merged PRs for the PROVEN route (retires a
+                    # productive saturated direction with a 'verified PRs merged'
+                    # reason). When fewer than 3 are proven, fall back to the ADDITIVE
+                    # exhaustion route: a genuinely-exhausted direction (saturated with
+                    # no recent output) completes regardless of merge count under the
+                    # code-failing / externally-frozen guardrails.
                     if d.get("status") == "active" and d.get("possibly_saturated"):
                         history = d.get("research_history", [])
                         agg = d.get("history_aggregate", {})
@@ -777,7 +895,15 @@ async def apply_post_spawn_state(
                             )
                             or 0
                         )
-                        if total_merged >= 3:
+                        if total_merged < 3:
+                            await _maybe_autocomplete_exhausted_direction(
+                                session,
+                                task,
+                                d,
+                                did,
+                                _pending_archived_diagnoses,
+                            )
+                        elif total_merged >= 3:
                             total_cycles = len(history) + (agg.get("total_cycles") or 0)
                             d["status"] = "completed"
                             d["completed_at"] = _utcnow().isoformat()
@@ -864,6 +990,10 @@ async def apply_post_spawn_state(
                 for fresh_d in dirs:
                     snap = _dir_mutations.get(fresh_d.get("id"))
                     if snap is not None:
+                        # Remove keys deleted in the in-memory snapshot (e.g.
+                        # deadlock_filtered_titles cleared on productive cycles).
+                        for k in [k for k in list(fresh_d) if k not in snap]:
+                            del fresh_d[k]
                         fresh_d.update(snap)
 
             await with_directions_locked(

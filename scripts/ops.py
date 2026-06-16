@@ -1,13 +1,19 @@
-"""Blueprint operations CLI — deploy state, pool health, settings, and system ops.
+"""Blueprint operations CLI — pool health, settings, and system ops.
 
-Usage:
-    python scripts/ops.py status                    — full system overview
-    python scripts/ops.py resume                    — resume pipeline (unpause)
-    python scripts/ops.py pause                     — pause pipeline
+Several subcommands have been superseded by ``python scripts/blueprint.py``
+and are now deprecated stubs that print a pointer and exit non-zero:
+
+    DEPRECATED — use blueprint.py instead:
+        status       → python scripts/blueprint.py status
+        qualify      → python scripts/blueprint.py promote-recover qualify
+        rollback     → python scripts/blueprint.py promote-recover rollback
+        mark-stable  → python scripts/blueprint.py promote-recover mark-stable
+        resume       → python scripts/blueprint.py promote-recover resume
+        pause        → python scripts/blueprint.py promote-recover <action>
+
+Active subcommands (not covered by blueprint.py):
     python scripts/ops.py repair                    — repair stuck tasks, orphaned parents
     python scripts/ops.py reset-health              — force-reset health checks
-    python scripts/ops.py mark-stable               — mark current deploy as stable
-    python scripts/ops.py rollback                  — rollback to last known good revision
     python scripts/ops.py settings                  — show runtime settings
     python scripts/ops.py settings --set KEY=VAL    — update a runtime setting
     python scripts/ops.py pool                      — show Max Plan account pool
@@ -42,73 +48,26 @@ from blueprint_api import api, load_config, list_tasks, all_tasks_by_status, fmt
 
 
 def cmd_status(_args):
-    """Full system overview: deploy state, pool, task counts."""
-    # Deploy state
-    try:
-        ds = api("GET", "/api/admin/deploy-state")
-        print("=== DEPLOY STATE ===")
-        print(f"  Status:      {ds.get('status', '?')}")
-        print(f"  Revision:    {ds.get('current_revision', '?')}")
-        print(f"  Max VMs:     {ds.get('max_concurrent_vms', '?')}")
-        print(f"  Failure rate:{ds.get('failure_rate', '?')}")
-        fr = ds.get('rollback_count', 0)
-        if fr:
-            print(f"  Rollbacks:   {fr}")
-        rr = ds.get('rollback_reason')
-        if rr:
-            print(f"  Rollback:    {rr}")
-        pr = ds.get('pause_reason')
-        if pr:
-            print(f"  Pause reason:{pr}")
-        eh = ds.get('external_health', {})
-        if eh:
-            errs = eh.get('errors', {})
-            for dep in ['github_api', 'db', 'dispatch_api', 'anthropic_api', 'openai_api', 'gemini_api', 'gcp']:
-                val = eh.get(dep)
-                if val is not None:
-                    status = 'OK' if val else 'DOWN'
-                    err = errs.get(dep, '')
-                    suffix = f" ({err})" if err else ""
-                    print(f"  {dep:12}: {status}{suffix}")
-    except Exception as e:
-        print(f"Deploy state: error ({e})")
-
-    # Settings
-    print()
-    try:
-        s = api("GET", "/api/admin/settings")
-        print("=== SETTINGS ===")
-        for k in ['max_concurrent_vms', 'max_retries', 'max_autonomous_tasks_per_hour',
-                   'autonomous_research_interval_minutes']:
-            print(f"  {k}: {s.get(k, '?')}")
-    except Exception as e:
-        print(f"Settings: error ({e})")
-
-    # Pool
-    print()
-    cmd_pool([])
-
-    # Task counts
-    print()
-    print("=== TASK COUNTS ===")
-    for status in ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED']:
-        try:
-            data = api("GET", f"/api/admin/tasks?limit=1&status={status}")
-            print(f"  {status}: {data.get('total', '?')}")
-        except:
-            print(f"  {status}: ?")
+    """DEPRECATED — use: python scripts/blueprint.py status"""
+    print("DEPRECATED: use python scripts/blueprint.py status")
+    sys.exit(1)
 
 
 def cmd_resume(_args):
-    """Resume pipeline."""
-    result = api("POST", "/api/admin/deploy-state/resume", {})
-    print(f"Resumed: {json.dumps(result, indent=2)}")
+    """DEPRECATED — use: python scripts/blueprint.py promote-recover resume"""
+    print("DEPRECATED: use python scripts/blueprint.py promote-recover resume")
+    sys.exit(1)
 
 
 def cmd_pause(_args):
-    """Pause pipeline."""
-    result = api("POST", "/api/admin/deploy-state/pause", {})
-    print(f"Paused: {json.dumps(result, indent=2)}")
+    """DEPRECATED — use: python scripts/blueprint.py promote-recover <action>"""
+    print(
+        "DEPRECATED: scripts/ops.py pause is superseded.\n"
+        "Use: python scripts/blueprint.py promote-recover <action>\n"
+        "Available actions: arm, hold, clear-override, cut, qualify, "
+        "clear-deploy-failed, rollback, mark-stable, resume"
+    )
+    sys.exit(1)
 
 
 def cmd_repair(_args):
@@ -129,23 +88,15 @@ def cmd_reset_health(_args):
 
 
 def cmd_mark_stable(_args):
-    """Mark current deploy as stable."""
-    result = api("POST", "/api/admin/deploy-state/mark-stable", {})
-    print(f"Marked stable: {json.dumps(result, indent=2)}")
+    """DEPRECATED — use: python scripts/blueprint.py promote-recover mark-stable"""
+    print("DEPRECATED: use python scripts/blueprint.py promote-recover mark-stable")
+    sys.exit(1)
 
 
 def cmd_rollback(_args):
-    """Rollback to last known good revision. Pauses pipeline."""
-    result = api("POST", "/api/admin/deploy-state/rollback", {})
-    status = result.get('status', '?')
-    print(f"Rollback: {status}")
-    print(f"  From: {result.get('from_sha', '?')}")
-    print(f"  To:   {result.get('to_sha', '?')} ({result.get('to_revision', '?')})")
-    print(f"  Reason: {result.get('reason', '?')}")
-    if result.get('gcloud_error'):
-        print(f"  ERROR: {result['gcloud_error']}")
-    if result.get('pipeline_paused'):
-        print("  Pipeline paused — use 'resume' after verifying.")
+    """DEPRECATED — use: python scripts/blueprint.py promote-recover rollback"""
+    print("DEPRECATED: use python scripts/blueprint.py promote-recover rollback")
+    sys.exit(1)
 
 
 def cmd_settings(args):
@@ -496,48 +447,9 @@ def cmd_health(_args):
 
 
 def cmd_diagnostics(_args):
-    """Pipeline diagnostics: stuck tasks, circuit breakers, queue depth."""
-    data = api("GET", "/api/admin/diagnostics")
-    print("=== PIPELINE DIAGNOSTICS ===")
-    print(f"  Queued:      {data.get('queued_count', '?')}")
-    print(f"  In progress: {data.get('in_progress_count', '?')}")
-    print(f"  Stuck:       {data.get('total_stuck_count', '?')}")
-
-    stuck = data.get('stuck_tasks', [])
-    if stuck:
-        print("\n--- Stuck Tasks ---")
-        for s in stuck:
-            tid = s.get('task_id', '?')[:8] if s.get('task_id') else '?'
-            title = (s.get('title') or '?')[:55]
-            reason = s.get('reason', '?')
-            print(f"  {tid}  {title:<55}  {reason}")
-
-    projects = data.get('projects', [])
-    if projects:
-        print("\n--- Projects ---")
-        for p in projects:
-            pid = p.get('project_id', '?')[:8]
-            cb = p.get('circuit_breaker_state', 'CLOSED')
-            q = p.get('queued_count', 0)
-            ip = p.get('in_progress_count', 0)
-            stuck_ct = p.get('stuck_count', 0)
-            print(f"  {pid}  queued={q}  running={ip}  stuck={stuck_ct}  breaker={cb}")
-
-    cbs = data.get('circuit_breakers', {})
-    if cbs:
-        print("\n--- Circuit Breakers ---")
-        for pid, cb in cbs.items():
-            state = cb.get('state', '?')
-            fails = cb.get('failure_count', 0)
-            cooldown = cb.get('cooldown_ends_at', '')
-            suffix = f"  cooldown_until={cooldown}" if cooldown else ""
-            print(f"  {pid[:8]}  state={state}  failures={fails}{suffix}")
-
-    zh = data.get('zone_health', {})
-    if zh:
-        avail = zh.get('available', '?')
-        exhausted = zh.get('exhausted', [])
-        print(f"\n  Zones: {avail} available" + (f", exhausted: {', '.join(exhausted)}" if exhausted else ""))
+    """DEPRECATED — use: python scripts/blueprint.py diagnostics"""
+    print("DEPRECATED: use python scripts/blueprint.py diagnostics")
+    sys.exit(1)
 
 
 def cmd_alerts(args):
@@ -1246,69 +1158,9 @@ def cmd_regression_cases(args):
 
 
 def cmd_qualify(args):
-    """Show the release-version qualifier state + the latest audit's findings.
-
-    Usage:
-        ops.py qualify          — current version, last verdict, and WHY
-                                  (the latest release_audit's score + findings)
-        ops.py qualify --run    — manually TRIGGER a qualification of the open
-                                  version (member+; spawns the release_audit
-                                  child), then show the state. Used to seed a
-                                  fresh verdict during calibration.
-    """
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    pid = get_project_id()
-    if args and args[0] == "--run":
-        print("=== TRIGGERING QUALIFICATION ===")
-        result = api("POST", f"/api/admin/projects/{pid}/qualify")
-        print(f"  {json.dumps(result)}\n")
-    data = api("GET", f"/api/admin/projects/{pid}/version-lifecycle")
-    cv = data.get("current_version")
-    print("=== RELEASE VERSION ===")
-    if not cv:
-        print("  (no open version)")
-        return
-    print(f"  v{cv.get('version_number')}  phase={cv.get('phase')}  "
-          f"attempts={cv.get('qualification_attempts')}  merged_tasks={cv.get('merged_task_count')}")
-    print(f"  goal: {(cv.get('goal') or '')[:200]}")
-    lq = cv.get("last_qualification") or {}
-    if lq:
-        print("\n=== LAST VERDICT ===")
-        print(f"  status={lq.get('status')}  confidence={lq.get('confidence')}  "
-              f"threshold={lq.get('threshold')}  blocker={lq.get('blocker')}")
-        print(f"  sub_scores: {json.dumps(lq.get('sub_scores') or {})}")
-        if lq.get("ci_resolution"):
-            print(f"  ci_resolution: {json.dumps(lq.get('ci_resolution'))}")
-    audit = cv.get("latest_audit")
-    print("\n=== LATEST AUDIT (why) ===")
-    if not audit:
-        print("  (no release_audit task yet)")
-    else:
-        print(f"  task={audit.get('audit_task_id')}  status={audit.get('task_status')}  "
-              f"candidate={(audit.get('candidate_sha') or '')[:12]}  at={audit.get('created_at')}")
-        rep = audit.get("report")
-        if not rep:
-            print("  report: (none — audit posted no parseable RELEASE_AUDIT_REPORT)")
-        else:
-            print(f"  audit_score: {rep.get('audit_score')}")
-            te = rep.get("test_erosion") or {}
-            print(f"  test_erosion: deleted={te.get('deleted_test_files')} "
-                  f"assertion_delta={te.get('assertion_delta')} test_count_delta={te.get('test_count_delta')}")
-            findings = rep.get("findings") or rep.get("issues") or []
-            print(f"  findings ({len(findings)}):")
-            for f in findings[:20]:
-                if isinstance(f, dict):
-                    sev = f.get("severity") or f.get("level") or ""
-                    txt = f.get("description") or f.get("title") or f.get("text") or json.dumps(f)
-                    print(f"    - [{sev}] {str(txt)[:200]}")
-                else:
-                    print(f"    - {str(f)[:200]}")
-            for k in ("summary", "reasoning", "assessment", "rationale"):
-                if rep.get(k):
-                    print(f"  {k}: {str(rep[k])[:500]}")
-    rd = data.get("promotion_readiness") or {}
-    print(f"\n=== READINESS === ready={rd.get('ready')} reason={(rd.get('reason') or '')[:120]}")
+    """DEPRECATED — use: python scripts/blueprint.py promote-recover qualify"""
+    print("DEPRECATED: use python scripts/blueprint.py promote-recover qualify")
+    sys.exit(1)
 
 
 COMMANDS = {

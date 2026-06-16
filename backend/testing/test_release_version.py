@@ -332,6 +332,224 @@ async def test_count_merged_since_zero_when_no_tasks(db_session):
 
 
 # ===========================================================================
+# until upper bound — closed (promoted/abandoned) version windows must NOT
+# double-count tasks that merged after the version closed.  Each of the three
+# window helpers accepts an optional ``until=`` and must exclude tasks whose
+# stable terminal timestamp is strictly after it.
+# ===========================================================================
+
+
+async def _make_merged_task_at(db_session, project, *, completed_at, context=None):
+    """Insert a merged COMPLETED task whose stable terminal timestamp is
+    ``completed_at``.
+
+    Both ``created_at`` and ``updated_at`` are pinned to ``completed_at``: with
+    no status-transition entry in ``status_log``, ``_task_completed_at`` falls
+    back to ``created_at``, while the SQL pre-filter keys off ``updated_at``.
+    Pinning both keeps the window boundary deterministic.
+    """
+    task = Task(
+        project_id=project.id,
+        title="merge-test-task",
+        payloads=[{"type": "create", "prompt": "x", "pr_number": 42}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, **(context or {})},
+        created_at=completed_at,
+        updated_at=completed_at,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_count_merged_since_until_excludes_tasks_after_upper_bound(db_session):
+    """A merged task completed after ``until`` is excluded; one inside the
+    [since, until] window is counted."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=2)
+    until = _utcnow() - timedelta(hours=1)
+
+    await _make_merged_task_at(
+        db_session, project, completed_at=until - timedelta(minutes=10)
+    )  # inside window
+    await _make_merged_task_at(
+        db_session, project, completed_at=until + timedelta(minutes=10)
+    )  # after the upper bound
+
+    bounded = await rv.count_merged_since(db_session, project.id, since, until=until)
+    unbounded = await rv.count_merged_since(db_session, project.id, since)
+    assert bounded == 1, "task merged after until must be excluded"
+    assert unbounded == 2, "without until both tasks fall in the window"
+
+
+@pytest.mark.asyncio
+async def test_count_merged_since_until_includes_task_exactly_at_bound(db_session):
+    """``until`` is inclusive — a task completed exactly at the bound counts."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=2)
+    until = _utcnow() - timedelta(hours=1)
+
+    await _make_merged_task_at(db_session, project, completed_at=until)
+
+    count = await rv.count_merged_since(db_session, project.id, since, until=until)
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_list_merged_tasks_for_version_until_excludes_later_tasks(db_session):
+    """list_merged_tasks_for_version drops tasks completed after ``until``."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=2)
+    until = _utcnow() - timedelta(hours=1)
+
+    await _make_merged_task_at(
+        db_session, project, completed_at=until - timedelta(minutes=10)
+    )
+    await _make_merged_task_at(
+        db_session, project, completed_at=until + timedelta(minutes=10)
+    )
+
+    bounded = await rv.list_merged_tasks_for_version(
+        db_session, project.id, since, until=until
+    )
+    unbounded = await rv.list_merged_tasks_for_version(db_session, project.id, since)
+    assert len(bounded) == 1, "task merged after until must be excluded from listing"
+    assert len(unbounded) == 2
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_until_excludes_later_tasks(db_session):
+    """compute_version_acceptance_aggregate honors the ``until`` upper bound."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=2)
+    until = _utcnow() - timedelta(hours=1)
+
+    await _make_merged_task_at(
+        db_session, project, completed_at=until - timedelta(minutes=10)
+    )
+    await _make_merged_task_at(
+        db_session, project, completed_at=until + timedelta(minutes=10)
+    )
+
+    bounded = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since, until=until
+    )
+    unbounded = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since
+    )
+    assert bounded["total"] == 1, "task merged after until must not be aggregated"
+    assert unbounded["total"] == 2
+
+
+# ===========================================================================
+# Post-terminal-write upper-bound: a task that completed before ``until`` but
+# received a post-terminal write bumping updated_at past ``until`` must still
+# be INCLUDED in the bounded window.  The old buggy `updated_at <= until` SQL
+# prefilter would have dropped it before the precise Python re-check ran.
+# ===========================================================================
+
+
+async def _make_merged_task_post_terminal_write(
+    db_session, project, *, completed_at, post_write_at
+):
+    """Insert a merged COMPLETED task with a post-terminal write.
+
+    ``created_at`` is pinned to ``completed_at`` so ``_task_completed_at``
+    returns ``completed_at`` (no status_log entry, falls back to created_at).
+    ``updated_at`` is set to ``post_write_at`` to simulate a write that
+    happened after the task was already in a terminal state.
+    """
+    task = Task(
+        project_id=project.id,
+        title="post-terminal-write task",
+        payloads=[{"type": "create", "prompt": "x", "pr_number": 99}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        created_at=completed_at,
+        updated_at=post_write_at,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_count_merged_since_until_includes_task_with_post_terminal_write(
+    db_session,
+):
+    """A task that completed before ``until`` but has updated_at > until
+    (post-terminal write) must still be counted — the SQL prefilter must not
+    drop it before the precise _task_completed_at re-check."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=2)
+    until = _utcnow() - timedelta(hours=1)
+
+    # completed before until, but updated_at is after until
+    await _make_merged_task_post_terminal_write(
+        db_session,
+        project,
+        completed_at=until - timedelta(minutes=10),
+        post_write_at=until + timedelta(minutes=30),
+    )
+
+    bounded = await rv.count_merged_since(db_session, project.id, since, until=until)
+    assert bounded == 1, (
+        "task completed before until must be counted even if updated_at > until"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_merged_tasks_for_version_includes_task_with_post_terminal_write(
+    db_session,
+):
+    """list_merged_tasks_for_version must not drop a task completed before
+    ``until`` that received a post-terminal write bumping updated_at past it."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=2)
+    until = _utcnow() - timedelta(hours=1)
+
+    await _make_merged_task_post_terminal_write(
+        db_session,
+        project,
+        completed_at=until - timedelta(minutes=10),
+        post_write_at=until + timedelta(minutes=30),
+    )
+
+    bounded = await rv.list_merged_tasks_for_version(
+        db_session, project.id, since, until=until
+    )
+    assert len(bounded) == 1, (
+        "task completed before until must appear in listing even if updated_at > until"
+    )
+
+
+@pytest.mark.asyncio
+async def test_acceptance_aggregate_includes_task_with_post_terminal_write(db_session):
+    """compute_version_acceptance_aggregate must count a task completed before
+    ``until`` that received a post-terminal write bumping updated_at past it."""
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=2)
+    until = _utcnow() - timedelta(hours=1)
+
+    await _make_merged_task_post_terminal_write(
+        db_session,
+        project,
+        completed_at=until - timedelta(minutes=10),
+        post_write_at=until + timedelta(minutes=30),
+    )
+
+    bounded = await rv.compute_version_acceptance_aggregate(
+        db_session, project.id, since=since, until=until
+    )
+    assert bounded["total"] == 1, (
+        "task completed before until must be aggregated even if updated_at > until"
+    )
+
+
+# ===========================================================================
 # compute_version_acceptance_aggregate — canonical acceptance bucket
 # classification of version-window merged tasks
 # ===========================================================================
@@ -1096,6 +1314,156 @@ def test_to_phase_block_acceptance_aggregate_none_on_legacy():
     block = rv.to_phase_block(version)
     assert "acceptance_aggregate" in block
     assert block["acceptance_aggregate"] is None
+
+
+# ===========================================================================
+# build_version_highlights — shared what's-new headline + at-a-glance metrics
+# ===========================================================================
+
+
+def test_build_version_highlights_open_no_merged_work():
+    """An open version with zero merged work yields the phase-context
+    'no merged work yet' headline and zeroed metrics."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=0,
+        aggregate_serving_status=None,
+        acceptance_aggregate=None,
+    )
+    assert h["headline"] == "open in build with no merged work yet"
+    assert h["merged_count"] == 0
+    assert h["proven"] == 0
+    assert h["total_merged_for_acceptance"] == 0
+    assert h["qualification_confidence"] is None
+    assert h["qualification_threshold"] is None
+
+
+def test_build_version_highlights_open_with_merged():
+    """An open version with merged work names the count in its phase context and
+    surfaces the proven/total acceptance metrics plus qualification conf/threshold."""
+    version = ReleaseVersion(
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"confidence": 0.82, "threshold": 0.9},
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=3,
+        aggregate_serving_status=None,
+        acceptance_aggregate={"proven": 2, "total": 3},
+    )
+    assert h["headline"] == "open in stabilize with 3 merged"
+    assert h["merged_count"] == 3
+    assert h["proven"] == 2
+    assert h["total_merged_for_acceptance"] == 3
+    assert h["qualification_confidence"] == 0.82
+    assert h["qualification_threshold"] == 0.9
+
+
+def test_build_version_highlights_promoted_and_serving_when_aggregate_confirmed():
+    """A promoted version reads 'promoted & serving' only when the AGGREGATE
+    serving status is serving_confirmed."""
+    version = ReleaseVersion(
+        version_number=4,
+        phase="stabilize",
+        status="promoted",
+        opened_at=_utcnow(),
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=12,
+        aggregate_serving_status="serving_confirmed",
+        acceptance_aggregate={"proven": 10, "total": 12},
+    )
+    assert h["headline"] == "promoted & serving"
+
+
+def test_build_version_highlights_promoted_uses_aggregate_not_scalar():
+    """A promoted version whose scalar serving_status would say 'serving_confirmed'
+    but whose AGGREGATE serving status is deploy_failed reads 'promoted' — the
+    helper drives the 'serving' word off the aggregate argument, never the scalar
+    column. This is the truthful-state guarantee the shared helper exists to keep."""
+    version = ReleaseVersion(
+        version_number=5,
+        phase="stabilize",
+        status="promoted",
+        opened_at=_utcnow(),
+        # Scalar column lies — a naive read would claim serving.
+        serving_status="serving_confirmed",
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=8,
+        aggregate_serving_status="deploy_failed",
+        acceptance_aggregate=None,
+    )
+    assert h["headline"] == "promoted"
+
+
+def test_build_version_highlights_promoted_unconfirmed_aggregate_is_just_promoted():
+    """A promoted version with an unconfirmed/absent aggregate reads 'promoted',
+    not 'promoted & serving'."""
+    version = ReleaseVersion(
+        version_number=6,
+        phase="stabilize",
+        status="promoted",
+        opened_at=_utcnow(),
+    )
+    for agg in ("unconfirmed", None):
+        h = rv.build_version_highlights(
+            version,
+            merged_count=1,
+            aggregate_serving_status=agg,
+            acceptance_aggregate=None,
+        )
+        assert h["headline"] == "promoted", f"aggregate={agg!r}"
+
+
+def test_build_version_highlights_abandoned():
+    """An abandoned version reads 'abandoned' regardless of merged count or serving."""
+    version = ReleaseVersion(
+        version_number=7,
+        phase="build",
+        status="abandoned",
+        opened_at=_utcnow(),
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=5,
+        aggregate_serving_status="serving_confirmed",
+        acceptance_aggregate={"proven": 1, "total": 5},
+    )
+    assert h["headline"] == "abandoned"
+
+
+def test_build_version_highlights_legacy_none_acceptance_defaults_zero():
+    """A legacy version with no acceptance aggregate and no verdict yields proven/
+    total 0 and null conf/threshold without crashing."""
+    version = ReleaseVersion(
+        version_number=8,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification=None,
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=2,
+        aggregate_serving_status=None,
+        acceptance_aggregate=None,
+    )
+    assert h["proven"] == 0
+    assert h["total_merged_for_acceptance"] == 0
+    assert h["qualification_confidence"] is None
+    assert h["qualification_threshold"] is None
 
 
 # ===========================================================================

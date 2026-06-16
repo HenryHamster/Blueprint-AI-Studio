@@ -103,7 +103,7 @@ export interface WorkspacePrepOutcome {
 
 // Module-level recorder: written by prepareWorkspaceForRole, read by
 // enrichStatusPayload (via getLastWorkspacePrepOutcome). Reset between roles.
-let _lastWorkspacePrepOutcome: WorkspacePrepOutcome | null = null;
+let _lastWorkspacePrepOutcome: WorkspacePrepOutcome | null = null; // @per-role
 
 /** Returns the outcome of the most recent prepareWorkspaceForRole call, or
  *  null if the function has not been called since the last reset. */

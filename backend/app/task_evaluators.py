@@ -841,6 +841,14 @@ def _declared_success_criterion(task: Task) -> tuple[str, str, float] | None:
     criterion is declared OR the declared shape is malformed — in both cases the
     gate keeps its presence-based behavior rather than fail a task on a
     criterion it cannot interpret.
+
+    Handles two criterion kinds:
+      * ``kind="metric"`` (default): reads ``metric``/``operator``/``threshold``
+        and returns them directly.
+      * ``kind="artifact_produced"``: translates to a ``durable_file_count >= N``
+        check so the existing numeric evaluation pipeline applies unchanged.
+        ``durable_file_count`` is a backend-derived key always present in the
+        COMPUTE_RESULT when a durable artifact exists (from ``_link_terminal_artifact``).
     """
     payload = task.first_payload or {}
     if not isinstance(payload, dict):
@@ -848,6 +856,15 @@ def _declared_success_criterion(task: Task) -> tuple[str, str, float] | None:
     raw = payload.get("success_criterion")
     if not isinstance(raw, dict):
         return None
+
+    kind = str(raw.get("kind") or "metric")
+    if kind == "artifact_produced":
+        try:
+            min_count = int(raw.get("min_file_count") or 1)
+        except (TypeError, ValueError):
+            min_count = 1
+        return ("durable_file_count", ">=", float(max(1, min_count)))
+
     metric = raw.get("metric")
     op = raw.get("operator")
     threshold = _coerce_number(raw.get("threshold"))

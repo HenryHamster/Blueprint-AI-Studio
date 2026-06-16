@@ -1,4 +1,4 @@
-"""Regression tests for /api/deploy project creation."""
+"""Regression tests for /api/deploy project creation and project API responses."""
 
 import uuid
 import pytest
@@ -7,6 +7,18 @@ from unittest.mock import AsyncMock, patch
 from app.models import Project, ProjectMember
 
 TEST_USER_ID = "test-user-123"
+
+
+async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project", build_config=None):
+    """Create a project with owner membership, optionally with build_config."""
+    project = Project(name=name, user_id=owner_id, build_config=build_config or {})
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    member = ProjectMember(project_id=project.id, user_id=owner_id, role="owner")
+    session.add(member)
+    await session.commit()
+    return project
 
 
 class TestDeployBranchColumnInit:
@@ -103,3 +115,64 @@ class TestCancelProjectRoleGuard:
             resp = await client.post(f"/api/projects/{project.id}/cancel")
         assert resp.status_code == 200
         assert resp.json()["status"] == "cancelled"
+
+
+class TestOnboardingProofField:
+    """GET /api/admin/projects and /api/admin/projects/{id} must include onboarding_proof."""
+
+    @pytest.mark.asyncio
+    async def test_get_project_includes_onboarding_proof(self, client, db_session):
+        """Detail endpoint returns onboarding_proof block with repo_added_at set."""
+        project = await _make_project(db_session)
+
+        resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "onboarding_proof" in data
+        proof = data["onboarding_proof"]
+        assert proof is not None
+        assert proof["repo_added_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_get_projects_list_includes_onboarding_proof(self, client, db_session):
+        """List endpoint returns onboarding_proof block on every item."""
+        await _make_project(db_session, name="List Project")
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        assert len(items) >= 1
+        for item in items:
+            assert "onboarding_proof" in item
+            assert item["onboarding_proof"] is not None
+
+    @pytest.mark.asyncio
+    async def test_onboarding_proof_milestones_null_when_unset(self, client, db_session):
+        """Milestones not yet reached are null; repo_added_at is always set."""
+        project = await _make_project(db_session, build_config={})
+
+        resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200
+        proof = resp.json()["onboarding_proof"]
+        assert proof["repo_added_at"] is not None
+        assert proof["bootstrap_completed_at"] is None
+        assert proof["first_task_spawned_at"] is None
+        assert proof["first_pr_opened_at"] is None
+        assert proof["first_merge_gate_verdict_at"] is None
+        assert proof["first_pr_merged_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_onboarding_proof_milestones_populated(self, client, db_session):
+        """Stamped build_config milestones surface in the onboarding_proof block."""
+        bc = {
+            "bootstrap_completed_at": "2026-01-01T00:00:00",
+            "first_pr_merged_at": "2026-02-15T12:00:00",
+        }
+        project = await _make_project(db_session, build_config=bc)
+
+        resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200
+        proof = resp.json()["onboarding_proof"]
+        assert proof["bootstrap_completed_at"] == "2026-01-01T00:00:00"
+        assert proof["first_pr_merged_at"] == "2026-02-15T12:00:00"
+        assert proof["first_task_spawned_at"] is None

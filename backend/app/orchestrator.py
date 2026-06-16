@@ -1045,11 +1045,12 @@ async def _project_resource_dispatch_defer_message(
     if spend_cache is not None and task.project_id in spend_cache:
         recent_spend, spend_ceiling, spend_window_days = spend_cache[task.project_id]
     else:
-        recent_spend = await get_project_recent_spend_usd(
+        spend_breakdown = await get_project_recent_spend_usd(
             session,
             project_id=task.project_id,
             window_days=spend_window_days,
         )
+        recent_spend = spend_breakdown["total"]
         if spend_cache is not None:
             spend_cache[task.project_id] = (
                 recent_spend,
@@ -1855,7 +1856,9 @@ async def orchestrator_worker():
                 # via _is_migration_task -> task.first_payload.
                 # Without them, attribute access triggers a sync lazy-load from an
                 # async context and crashes the whole dispatch cycle.
-                _active_light_cols = load_only(*ACTIVE_TASKS_LIGHT_COLUMNS, raiseload=True)
+                _active_light_cols = load_only(
+                    *ACTIVE_TASKS_LIGHT_COLUMNS, raiseload=True
+                )
                 active_tasks_result = (
                     (
                         await session.execute(
@@ -2903,7 +2906,11 @@ async def orchestrator_worker():
                                     Task.status == TaskStatus.BLOCKED,
                                     Task.blocker_kind == "file_conflict",
                                 )
-                                .options(load_only(*BLOCKED_CONFLICT_LIGHT_COLUMNS, raiseload=True))
+                                .options(
+                                    load_only(
+                                        *BLOCKED_CONFLICT_LIGHT_COLUMNS, raiseload=True
+                                    )
+                                )
                             )
                         )
                         .scalars()
@@ -3122,7 +3129,7 @@ async def orchestrator_worker():
                                 Task.status_log,
                                 Task.latest_status_message,
                                 Task.parent_task_id,  # see candidate_stmt comment above,
-                                raiseload=True
+                                raiseload=True,
                             )
                         )
                     )
@@ -6278,6 +6285,22 @@ async def orchestrator_worker():
                         # Kill-switch (no_ci_test_gate_enabled) was checked in the
                         # no_checks branch; when off, _no_ci_verify_gate is never
                         # set and today's immediate-pass applies.
+                        #
+                        # Escalation backstop continuation: a prior poll's
+                        # no-checks escalation may have promoted this no-CI strand
+                        # to the verify gate even though strict resolution never
+                        # returned a definitive no_checks (it stayed transient /
+                        # pending). Honor that sticky decision so the gate runs on
+                        # subsequent polls — otherwise the promotion would be lost
+                        # the moment we leave the no_checks branch.
+                        if not _no_ci_verify_gate and ci_loop.get(
+                            "no_ci_escalation_verify_gate"
+                        ):
+                            _no_ci_verify_gate = True
+                            _no_ci_verify_base = (
+                                ci_loop.get("no_ci_escalation_base")
+                                or _no_ci_verify_base
+                            )
                         if _no_ci_verify_gate:
                             from sqlalchemy.orm.attributes import flag_modified
                             from app.review_pipeline import _spawn_pipeline_task
@@ -6707,35 +6730,164 @@ async def orchestrator_worker():
                                         "no_checks_escalated"
                                     ):
                                         ci_loop["no_checks_escalated"] = True
-                                        ci_task.latest_status_message = (
-                                            f"No CI checks appeared on PR #{ci_pr_number} after "
-                                            f"{int(_no_checks_elapsed / 60)}min — may need manual trigger"
-                                        )
-                                        ci_task.context = {
-                                            **(ci_task.context or {}),
-                                            "review_loop": ci_loop,
-                                        }
-                                        session.add(ci_task)
-                                        await _maybe_create_failure_alert(
-                                            ci_task,
-                                            session,
-                                            f"PR #{ci_pr_number}: no CI checks after {int(_no_checks_elapsed / 60)}min",
-                                        )
-                                        await session.commit()
-                                        ci_task = await _lock_task_for_mutation(
-                                            session,
-                                            ci_task_id,
-                                            allowed_statuses=(TaskStatus.EVALUATING,),
-                                            reason="CI polling after no-checks alert",
-                                        )
-                                        if ci_task is None:
-                                            continue
-                                        ci_loop = dict(
-                                            (ci_task.context or {}).get(
-                                                "review_loop", {}
+                                        _mins = int(_no_checks_elapsed / 60)
+                                        # ── No-checks escalation backstop ──────
+                                        # Instead of resigning to wait forever for
+                                        # a manual merge, try to AUTO-RESOLVE a
+                                        # no-CI strand. Strictly gated on
+                                        # proceed_on_no_checks so a CI-gated repo
+                                        # (has_ci=True or has_ci=None/unknown) is
+                                        # never auto-merged — it keeps today's
+                                        # alert-and-wait.
+                                        from app import ci_resolution as _ci_res
+
+                                        _esc_base = (pr_data.get("base") or {}).get(
+                                            "ref", ""
+                                        ) or ci_loop.get("base_branch", "")
+                                        _esc_proj = (
+                                            await session.get(
+                                                Project, ci_task.project_id
                                             )
-                                            or {}
+                                            if ci_task.project_id
+                                            else None
                                         )
+                                        _gate_on = _rt_cfg.get(
+                                            "no_ci_test_gate_enabled", True
+                                        )
+                                        # Self-heal stale has_ci=None: a genuine
+                                        # no-CI repo whose onboarding detection was
+                                        # incomplete stores has_ci=None, so
+                                        # proceed_on_no_checks is False and it
+                                        # strands forever. Attempt ONE bounded
+                                        # best-effort re-detect; if it flips has_ci
+                                        # to a definitive False the action below
+                                        # resolves the strand on this very poll.
+                                        if (
+                                            _esc_proj is not None
+                                            and not _esc_proj.is_staging_branch(
+                                                _esc_base
+                                            )
+                                            and not _ci_res.proceed_on_no_checks(
+                                                _esc_proj, _esc_base
+                                            )
+                                            and (_esc_proj.build_config or {}).get(
+                                                "has_ci"
+                                            )
+                                            is None
+                                        ):
+                                            from app.build_config_detection import (
+                                                maybe_redetect_ci_presence,
+                                            )
+
+                                            await maybe_redetect_ci_presence(
+                                                _esc_proj,
+                                                session,
+                                                ref=_esc_base,
+                                            )
+                                        _esc_action = (
+                                            _ci_res.resolve_no_checks_escalation(
+                                                _esc_proj,
+                                                _esc_base,
+                                                gate_enabled=_gate_on,
+                                            )
+                                            if _esc_proj is not None
+                                            else "keep_polling"
+                                        )
+                                        from sqlalchemy.orm.attributes import (
+                                            flag_modified as _esc_flag_modified,
+                                        )
+
+                                        if _esc_action == "verify_tests":
+                                            # Promote to the no-CI verify gate; the
+                                            # sticky marker is honored by the gate
+                                            # block on the next poll.
+                                            ci_loop["no_ci_escalation_verify_gate"] = (
+                                                True
+                                            )
+                                            ci_loop["no_ci_escalation_base"] = _esc_base
+                                            ci_task.latest_status_message = (
+                                                f"No CI checks on PR #{ci_pr_number} "
+                                                f"after {_mins}min — auto-resolving "
+                                                f"no-CI strand via verify_tests"
+                                            )
+                                            ci_task.context = {
+                                                **(ci_task.context or {}),
+                                                "review_loop": ci_loop,
+                                            }
+                                            _esc_flag_modified(ci_task, "context")
+                                            session.add(ci_task)
+                                            await session.commit()
+                                            continue
+                                        elif _esc_action == "merge_unverified":
+                                            # Truly test-less (or kill-switch off /
+                                            # staging base): merge UNVERIFIED,
+                                            # mirroring the definitive-no_checks
+                                            # immediate-pass reason keys.
+                                            if _esc_proj.is_staging_branch(_esc_base):
+                                                _unverified_merge_reason = (
+                                                    "internal_staging_base"
+                                                )
+                                            elif not _gate_on:
+                                                _unverified_merge_reason = (
+                                                    "kill_switch_off"
+                                                )
+                                            else:
+                                                _unverified_merge_reason = (
+                                                    "no_detectable_test_command"
+                                                )
+                                            ci_result = {
+                                                "status": "completed",
+                                                "conclusion": "success",
+                                                "details": [],
+                                                "failed_logs": "",
+                                            }
+                                            ci_task.latest_status_message = (
+                                                f"No CI checks on PR #{ci_pr_number} "
+                                                f"after {_mins}min — auto-resolving "
+                                                f"no-CI strand (merging UNVERIFIED)"
+                                            )
+                                            ci_task.context = {
+                                                **(ci_task.context or {}),
+                                                "review_loop": ci_loop,
+                                            }
+                                            _esc_flag_modified(ci_task, "context")
+                                            session.add(ci_task)
+                                            # Fall through: ci_result is completed
+                                            # so handle_ci_completion merges below.
+                                        else:
+                                            # keep_polling — CI-gated repo: preserve
+                                            # today's alert-once-and-wait behavior.
+                                            ci_task.latest_status_message = (
+                                                f"No CI checks appeared on PR #{ci_pr_number} after "
+                                                f"{_mins}min — may need manual trigger"
+                                            )
+                                            ci_task.context = {
+                                                **(ci_task.context or {}),
+                                                "review_loop": ci_loop,
+                                            }
+                                            session.add(ci_task)
+                                            await _maybe_create_failure_alert(
+                                                ci_task,
+                                                session,
+                                                f"PR #{ci_pr_number}: no CI checks after {_mins}min",
+                                            )
+                                            await session.commit()
+                                            ci_task = await _lock_task_for_mutation(
+                                                session,
+                                                ci_task_id,
+                                                allowed_statuses=(
+                                                    TaskStatus.EVALUATING,
+                                                ),
+                                                reason="CI polling after no-checks alert",
+                                            )
+                                            if ci_task is None:
+                                                continue
+                                            ci_loop = dict(
+                                                (ci_task.context or {}).get(
+                                                    "review_loop", {}
+                                                )
+                                                or {}
+                                            )
                                 except (ValueError, TypeError):
                                     pass
 
@@ -6777,6 +6929,92 @@ async def orchestrator_worker():
                                 {"task_id": str(ci_task.id), "status": ci_task.status},
                             )
                             continue
+
+                        # ── Opt-in honest-block for DEGRADED unverified merges ──
+                        # Default-OFF per-project policy
+                        # (build_config.block_degraded_unverified_merge). When ON
+                        # and the no-CI gate fell open with a DEGRADED reason (it
+                        # EXPECTED to verify but could NOT run the suite), HOLD the
+                        # PR open instead of merging it UNVERIFIED. Benign
+                        # fall-opens (nothing to verify) and policy-OFF projects
+                        # take no branch here and merge exactly as today, so
+                        # default behavior is byte-for-byte unchanged. We do NOT
+                        # spawn a fix (no suite ran → there is no failing test to
+                        # fix) — we park the gate and surface a distinct,
+                        # operator-visible degraded-block signal (a recorded block
+                        # reason on merge_gate_runtime plus one alert). Subsequent
+                        # polls re-evaluate, re-park, and do NOT re-alert (sticky
+                        # ci_loop marker), so the PR stays held without spam.
+                        if _unverified_merge_reason:
+                            from app import ci_resolution as _blk_ci_res
+
+                            _block_proj = (
+                                await session.get(Project, ci_task.project_id)
+                                if ci_task.project_id
+                                else None
+                            )
+                            if _blk_ci_res.should_block_degraded_unverified_merge(
+                                _block_proj, _unverified_merge_reason
+                            ):
+                                from sqlalchemy.orm.attributes import (
+                                    flag_modified as _blk_flag_modified,
+                                )
+
+                                # Record the block + raise the alert ONCE per PR
+                                # strand. Subsequent parking polls re-enter here
+                                # (the verdict stays degraded) but must not inflate
+                                # the block tally or re-alert — the sticky marker
+                                # gates both.
+                                _already_blocked = bool(
+                                    ci_loop.get("no_ci_degraded_blocked")
+                                )
+                                if not _already_blocked:
+                                    _blk_ci_res.record_no_ci_gate_degraded_block(
+                                        session,
+                                        _block_proj,
+                                        unverified_reason=_unverified_merge_reason,
+                                        when=_utcnow(),
+                                    )
+                                ci_loop["no_ci_degraded_blocked"] = True
+                                ci_loop["no_ci_degraded_block_reason"] = (
+                                    _unverified_merge_reason
+                                )
+                                ci_task.latest_status_message = (
+                                    f"PR #{ci_pr_number}: no-CI merge gate could "
+                                    f"not verify the suite "
+                                    f"({_unverified_merge_reason}); the project's "
+                                    f"block-degraded-unverified-merge policy is ON "
+                                    f"— holding the PR open instead of merging "
+                                    f"UNVERIFIED"
+                                )
+                                ci_task.context = {
+                                    **(ci_task.context or {}),
+                                    "review_loop": ci_loop,
+                                }
+                                _blk_flag_modified(ci_task, "context")
+                                session.add(ci_task)
+                                if not _already_blocked:
+                                    await _maybe_create_failure_alert(
+                                        ci_task,
+                                        session,
+                                        f"PR #{ci_pr_number}: no-CI merge gate "
+                                        f"BLOCKED an unverified merge (degraded "
+                                        f"reason: {_unverified_merge_reason}) per "
+                                        f"the project's opt-in honest-block "
+                                        f"policy — the suite could not run, so "
+                                        f"the PR is held open for operator "
+                                        f"attention",
+                                    )
+                                await session.commit()
+                                await broadcast_to_project(
+                                    str(ci_task.project_id),
+                                    "task_updated",
+                                    {
+                                        "task_id": str(ci_task.id),
+                                        "status": ci_task.status,
+                                    },
+                                )
+                                continue
 
                         # CI completed — delegate to shared handler
                         from app.ci_completion import handle_ci_completion
@@ -7107,7 +7345,9 @@ async def orchestrator_worker():
                 await asyncio.sleep(5)
             # Check autonomous research every cycle — interval gate inside handles throttling.
             # Spawns only when VM slots are available (not tied to queue being empty).
-            await _bounded_leader_step("idle_research", _check_idle_research(), budget=60)
+            await _bounded_leader_step(
+                "idle_research", _check_idle_research(), budget=60
+            )
             # Utilization-triggered evergreen backlog auto-fill (d-2877ddc7).
             # Defaulted OFF; interval gate + mode gate handled inside. Additive
             # idle-fill parallelism — never competes with the release-critical path.

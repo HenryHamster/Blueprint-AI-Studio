@@ -2137,6 +2137,20 @@ def _classify_failure_class(
     if any(marker in _status_msg_lower for marker in _ORCHESTRATOR_DEFER_MARKERS):
         return BLOCKED_PRECONDITION
 
+    # Prerequisite-escalation / co-defer cancellations — research_completion stamps
+    # ``prerequisite_escalated_to_parent=True`` or ``CO_DEFERRED_SHELVED`` on a
+    # CANCELLED child task when a finding's declared prerequisite has no live/deferred
+    # provider this cycle, or when a dependent is co-deferred alongside its same-cycle-
+    # deferred foundation. These are recoverable orchestration sequencing conditions
+    # (the work re-surfaces in a later cycle) — NOT code defects. Checked before the
+    # persisted-class short-circuit so they override any erroneously persisted
+    # ``failure_class=CODE_ERROR`` written before this classification branch existed.
+    _ctx_check = task.context if isinstance(task.context, dict) else {}
+    if _ctx_check.get("prerequisite_escalated_to_parent"):
+        return BLOCKED_PRECONDITION
+    if _ctx_check.get(CO_DEFERRED_SHELVED):
+        return BLOCKED_PRECONDITION
+
     # Authoritative LLM rate-limit signal from the Claude Code CLI: the agent
     # emits a structured ``{"type":"rate_limit_event", ...}`` line in its output
     # when the provider rate-limits the request. Must run before both the

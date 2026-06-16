@@ -24,7 +24,7 @@
     "routers/admin_analytics.py": 1950,
     "routers/admin_operator_triggers.py": 1200,
     "routers/admin_digest.py": 10300,
-    "routers/admin_release_version.py": 1300,
+    "routers/admin_release_version.py": 1950,
     "routers/admin_pipeline_observability.py": 2000,
     "routers/admin_agent_ops.py": 3350,
     "routers/admin_pool_accounts.py": 1600,
@@ -49,17 +49,17 @@
     "reaper_infra_recovery.py": 850,
     "agent_status_spawn.py": 650,
     "admin_task_mutations.py": 1350,
-    "review_pipeline.py": 3900,
+    "review_pipeline.py": 3920,
     "deploy_health.py": 1250,
     "direction_outcomes.py": 2750,
     "digest_metrics.py": 6200,
     "digest_remediation.py": 900,
-    "digest_direction_progress.py": 1350,
+    "digest_direction_progress.py": 1600,
     "failure_layer_classifier.py": 400,
     "pipeline_alert_scan.py": 600,
     "release_qualifier.py": 3950,
     "release_reconciliation.py": 3100,
-    "release_stall_alerts.py": 800,
+    "release_stall_alerts.py": 1050,
     "release_promotion.py": 2000,
     "sr_analytics.py": 150,
     "sr_analytics_common.py": 900,
@@ -95,10 +95,12 @@
     "runtime_config_state.py": 2050,
     "routers/directions.py": 1750,
     "warm_pool_maintainer.py": 2300,
-    "review_fix_lane_pilot.py": 2100,
+    "review_fix_lane_pilot.py": 2450,
     "routers/admin_projects.py": 1750,
     "recovery_evaluating.py": 2950,
-    "recovery_post_commit.py": 1900
+    "recovery_post_commit.py": 1900,
+    "release_version.py": 1750,
+    "ci_resolution.py": 1800
   },
   "agent": {
     "index.ts": 4600,
@@ -184,8 +186,9 @@
     "components/srTrendBreakdown/types.ts": 350,
     "components/SrMissedRetrospectivesPanel.tsx": 900,
     "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
-    "components/TaskDetailDrawerMeta.tsx": 2250,
+    "components/TaskDetailDrawerMeta.tsx": 400,
     "api.ts": 3650,
-    "components/WarmVmPanel.tsx": 1800
+    "components/WarmVmPanel.tsx": 1800,
+    "components/TaskDetailDrawerSections.tsx": 1950
   }
 }

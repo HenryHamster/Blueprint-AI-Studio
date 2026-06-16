@@ -1013,6 +1013,144 @@ async def test_warm_pool_non_owner_terminal_and_checkpoint_do_not_release_or_res
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_sha_verification_none_does_not_increment_phase_requeues(
+    db_session, mocker
+):
+    """is_ancestor_of returning None (transient API failure) must NOT burn a
+    phase_requeues budget slot — the lane stays ACTIVE with requeues=0."""
+    from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=mocker.AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    # Simulate transient API failure: is_ancestor_of returns None
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=mocker.AsyncMock,
+        return_value=None,
+    )
+
+    with _warm_pool_enabled():
+        project = Project(name="SHA None Guard", user_id="test-user-sha-none")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="SHA None Task",
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "p",
+                    "base_branch": "main",
+                    "branch": "feat/sha-none",
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="SHA None Lane",
+            goal="goal",
+            status=ImprovementLaneStatus.ACTIVE.value,
+            branch_name="feat/sha-none",
+            base_branch="main",
+            current_task_id=task.id,
+            phase_requeues=0,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        result = await checkpoint_and_reserve_on_phase_complete(
+            db_session, task, lane, sha="deadbeef1234", summary="transient test"
+        )
+
+        assert result is False
+        await db_session.refresh(lane)
+        assert lane.phase_requeues == 0, (
+            "Transient is_ancestor_of=None must not increment phase_requeues"
+        )
+        assert lane.status == ImprovementLaneStatus.ACTIVE.value
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_sha_verification_false_increments_phase_requeues(
+    db_session, mocker
+):
+    """is_ancestor_of returning False (genuine SHA unreachable) MUST call
+    mark_checkpoint_missing and increment phase_requeues."""
+    from app.review_fix_lane_pilot import checkpoint_and_reserve_on_phase_complete
+
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=mocker.AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github_refs.is_ancestor_of",
+        new_callable=mocker.AsyncMock,
+        return_value=False,
+    )
+
+    with _warm_pool_enabled():
+        project = Project(name="SHA False Guard", user_id="test-user-sha-false")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="SHA False Task",
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "p",
+                    "base_branch": "main",
+                    "branch": "feat/sha-false",
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        lane = ImprovementLane(
+            project_id=project.id,
+            title="SHA False Lane",
+            goal="goal",
+            status=ImprovementLaneStatus.ACTIVE.value,
+            branch_name="feat/sha-false",
+            base_branch="main",
+            current_task_id=task.id,
+            phase_requeues=0,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+        await db_session.refresh(lane)
+
+        result = await checkpoint_and_reserve_on_phase_complete(
+            db_session, task, lane, sha="deadbeef5678", summary="false test"
+        )
+
+        assert result is False
+        await db_session.refresh(lane)
+        assert lane.phase_requeues == 1, (
+            "Genuine SHA unreachability (is_ancestor_of=False) must increment phase_requeues"
+        )
+
+
+@pytest.mark.asyncio
 async def test_warm_pool_miss_paths_record_lease_miss_by_reason(
     client: AsyncClient, db_session, mocker
 ):

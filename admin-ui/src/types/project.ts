@@ -35,6 +35,7 @@ export interface ResourceEnvelopeConfig {
   max_concurrent_vms?: number | null;
   spend_ceiling_usd?: number | null;
   spend_window_days?: number;
+  max_concurrent_compute_jobs?: number | null;
 }
 
 export interface BuildConfig {
@@ -223,6 +224,10 @@ export interface ProjectResourceEnvelopeResponse extends ResourceEnvelopeConfig 
   project_id: string;
   active_vm_count: number;
   recent_spend_usd: number;
+  recent_spend_compute_usd: number;
+  recent_spend_agent_vm_usd: number;
+  recent_spend_idle_usd: number;
+  is_throttled: boolean;
 }
 
 /**

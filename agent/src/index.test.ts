@@ -104,6 +104,7 @@ import {
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
+import * as discovery from './prompts/discovery.js';
 
 /** Asserts a value is defined and returns it (narrowed). Replaces unsafe `x!` in tests. */
 function defined<T>(v: T | undefined | null, msg = 'expected value to be defined'): T {
@@ -826,6 +827,80 @@ describe('resetPerRoleModuleState (warm-VM isolation)', () => {
     expect(snapshotLogBuffer().length).toBe(2);
     resetPerRoleModuleState();
     expect(snapshotLogBuffer().length).toBe(0);
+  });
+
+  it('clears the test convention cache so a warm VM role does not serve stale conventions', () => {
+    const spy = vi.spyOn(discovery, 'clearTestConventionCache');
+    try {
+      resetPerRoleModuleState();
+      expect(spy).toHaveBeenCalledOnce();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('reset invariant guard fails when a per-role variable is left unreset', async () => {
+    // Static guard: every @per-role-tagged variable declared in index.ts must
+    // appear in the resetPerRoleModuleState function body (directly or via a
+    // single-depth helper it calls). This test fails CI when someone adds a new
+    // per-role `let` without wiring it into the reset — the root cause of the
+    // 12-cycle warm-VM state-leak whack-a-mole.
+    // fs is mocked in this file; use vi.importActual to get the real module.
+    const actualFs = await vi.importActual<typeof import('fs')>('fs');
+    const nodeUrl = await import('node:url');
+    const nodePath = await import('node:path');
+
+    const dir = nodePath.dirname(nodeUrl.fileURLToPath(import.meta.url));
+    const src = (actualFs as { readFileSync: (p: string, enc: string) => string })
+      .readFileSync(nodePath.join(dir, 'index.ts'), 'utf-8');
+
+    const perRoleVars: string[] = [];
+    for (const line of src.split('\n')) {
+      if (line.includes('// @per-role')) {
+        const m = line.match(/(?:let|const)\s+(\w+)/);
+        if (m) perRoleVars.push(m[1]);
+      }
+    }
+    expect(perRoleVars.length).toBeGreaterThan(0);
+
+    function extractFnBody(source: string, fn: string): string {
+      const pat = new RegExp(`(?:export\\s+)?function\\s+${fn}\\s*\\(`);
+      const idx = source.search(pat);
+      if (idx === -1) return '';
+      // Skip past the full parameter list to avoid mistaking default-arg
+      // braces like `= {}` for the function body's opening brace.
+      const parenStart = source.indexOf('(', idx);
+      if (parenStart === -1) return '';
+      let pd = 1; let pi = parenStart + 1;
+      while (pi < source.length && pd > 0) {
+        if (source[pi] === '(') pd++;
+        else if (source[pi] === ')') pd--;
+        pi++;
+      }
+      const braceIdx = source.indexOf('{', pi);
+      if (braceIdx === -1) return '';
+      let depth = 1; let i = braceIdx + 1;
+      while (i < source.length && depth > 0) {
+        if (source[i] === '{') depth++;
+        else if (source[i] === '}') depth--;
+        i++;
+      }
+      return source.slice(braceIdx + 1, i - 1);
+    }
+
+    const resetBody = extractFnBody(src, 'resetPerRoleModuleState');
+    const calledFns = [...resetBody.matchAll(/\b(\w+)\(\)/g)].map(m => m[1]);
+    const helperBodies = calledFns
+      .map(fn => extractFnBody(src, fn))
+      .filter(b => b.length > 0)
+      .join('\n');
+    const fullScope = resetBody + '\n' + helperBodies;
+
+    for (const v of perRoleVars) {
+      expect(fullScope, `@per-role var "${v}" not cleared in resetPerRoleModuleState`).toMatch(
+        new RegExp(`\\b${v}\\b`),
+      );
+    }
   });
 });
 
@@ -2908,6 +2983,14 @@ describe('recordToolUse', () => {
     const trace = snapshotToolTrace();
     const entry = trace[trace.length - 1];
     expect(entry.input_preview).toBe('raw string value');
+  });
+
+  it('sanitizes credential patterns in input_preview', () => {
+    recordToolUse('Bash', { command: 'curl -H "Authorization: token ghp_abc123secretXYZ" https://api.github.com' });
+    const trace = snapshotToolTrace();
+    const entry = trace[trace.length - 1];
+    expect(entry.input_preview).not.toContain('ghp_abc123secretXYZ');
+    expect(entry.input_preview).toContain('ghp_***');
   });
 
   it('can refresh the latest entry timestamp without adding a new tool use', () => {

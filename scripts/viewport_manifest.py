@@ -26,6 +26,7 @@ import filecmp
 import json
 import os
 import re
+import subprocess
 import sys
 
 _WIDTH_RE = re.compile(r"-(\d+)px\.png$")
@@ -71,9 +72,33 @@ def _test_name(rel: str) -> str:
     return _WIDTH_RE.sub("", base)
 
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DIFF_HELPER = os.path.join(_SCRIPT_DIR, "..", "admin-ui", "scripts", "viewport-diff.mjs")
+
+
+def _run_diff(before_path: str, after_path: str, diff_out: str) -> dict[str, object] | None:
+    """Run the Node diff helper and return its parsed JSON, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["node", _DIFF_HELPER, before_path, after_path, diff_out],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=os.path.join(_SCRIPT_DIR, "..", "admin-ui"),
+        )
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout.strip())
+    except Exception:
+        return None
+
+
 def build(before_dir: str, after_dir: str, base: str, run_id: str, out_path: str) -> None:
     before = _collect(before_dir)
     after = _collect(after_dir)
+
+    # Diff images go under a sibling `diff/` dir relative to the before/after dirs.
+    diff_root = os.path.join(os.path.dirname(before_dir), "diff")
 
     pairs: list[dict[str, object]] = []
     for rel in sorted(set(before) | set(after)):
@@ -86,6 +111,17 @@ def build(before_dir: str, after_dir: str, base: str, run_id: str, out_path: str
         else:
             status = "removed"
         file_slug = rel.split(os.sep, 1)[0]
+
+        change_pct: float | None = None
+        diff_path: str | None = None
+
+        if status == "changed" and b and a:
+            diff_out = os.path.join(diff_root, rel)
+            diff_result = _run_diff(b, a, diff_out)
+            if diff_result is not None:
+                change_pct = diff_result.get("change_pct")
+                diff_path = diff_out
+
         pairs.append(
             {
                 "test_file": _unslug_test_file(file_slug),
@@ -94,6 +130,8 @@ def build(before_dir: str, after_dir: str, base: str, run_id: str, out_path: str
                 "before": b,
                 "after": a,
                 "status": status,
+                "change_pct": change_pct,
+                "diff": diff_path,
             }
         )
 
@@ -130,7 +168,10 @@ def _print_report(
     print("  " + "-" * 60)
     for p in ordered:
         width = p["width"] if p["width"] is not None else "?"
-        print(f"  {str(p['status']):<10} {str(width):>5}  {p['test_file']} :: {p['test']}")
+        pct = ""
+        if p.get("change_pct") is not None:
+            pct = f"  ({p['change_pct']:.1f}% changed)"
+        print(f"  {str(p['status']):<10} {str(width):>5}  {p['test_file']} :: {p['test']}{pct}")
 
     # Read paths for the pairs worth inspecting (changed + new).
     inspect = [p for p in ordered if p["status"] in ("changed", "new")]
@@ -142,6 +183,9 @@ def _print_report(
                 print(f"    before: {p['before']}")
             if p["after"]:
                 print(f"    after:  {p['after']}")
+            if p.get("diff"):
+                pct = f" ({p['change_pct']:.1f}% changed)" if p.get("change_pct") is not None else ""
+                print(f"    diff:   {p['diff']}{pct}")
     else:
         print("\nNo changed or new pairs to inspect.")
 

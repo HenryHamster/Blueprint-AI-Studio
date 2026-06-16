@@ -70,6 +70,7 @@ from app.direction_refractory import get_direction_refractory_info
 from app.resource_envelope import (
     get_project_recent_spend_usd,
     resolve_project_spend_ceiling,
+    resolve_project_spend_warning_fraction,
     resolve_project_spend_window_days,
 )
 
@@ -117,20 +118,44 @@ def _direction_in_refractory(d: dict, now: datetime) -> bool:
 async def _project_spend_ceiling_spawn_defer_reason(
     project: Project, session: AsyncSession
 ) -> str | None:
-    """Return a spawn deferral reason when the project spend ceiling is reached."""
+    """Return a spawn deferral reason when the project spend ceiling is reached.
+
+    Also emits a spend-ceiling alert when the ceiling is hit so operators are
+    notified regardless of which spawn gate triggers the check.
+    """
     spend_ceiling = resolve_project_spend_ceiling(project)
     if spend_ceiling is None:
         return None
     spend_window_days = resolve_project_spend_window_days(project)
-    recent_spend = await get_project_recent_spend_usd(
+    spend_breakdown = await get_project_recent_spend_usd(
         session,
         project_id=project.id,
         window_days=spend_window_days,
     )
+    recent_spend = spend_breakdown["total"]
     if recent_spend >= spend_ceiling:
+        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
+
+        await _maybe_create_spend_ceiling_alert(
+            project.id,
+            session,
+            window_spend_usd=recent_spend,
+            ceiling_usd=spend_ceiling,
+        )
         return (
             f"project spend ceiling reached: ${recent_spend:.2f}/${spend_ceiling:.2f} "
             f"in the last {spend_window_days} day(s)"
+        )
+    warning_fraction = resolve_project_spend_warning_fraction(project)
+    if recent_spend >= spend_ceiling * warning_fraction:
+        from app.alert_dispatch import _maybe_create_approaching_ceiling_alert
+
+        await _maybe_create_approaching_ceiling_alert(
+            project.id,
+            session,
+            window_spend_usd=recent_spend,
+            ceiling_usd=spend_ceiling,
+            warning_fraction=warning_fraction,
         )
     return None
 
@@ -518,26 +543,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # re-enabled.
     if not project.autonomous_enabled or project.archived:
         return
-
-    # Guard: per-project 24h spend ceiling (opt-in; no ceiling = today's behavior)
-    spend_ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd")
-    if spend_ceiling_usd:
-        from app.efficiency_snapshot import compute_project_window_spend_usd
-        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
-
-        window_spend = await compute_project_window_spend_usd(session, project.id)
-        if window_spend >= spend_ceiling_usd:
-            logger.info(
-                f"[AUTONOMOUS] Spend ceiling reached for project {project.id}: "
-                f"${window_spend:.4f} >= ${spend_ceiling_usd:.4f} — pausing spawning"
-            )
-            await _maybe_create_spend_ceiling_alert(
-                project.id,
-                session,
-                window_spend_usd=window_spend,
-                ceiling_usd=spend_ceiling_usd,
-            )
-            return
 
     # Playbook auto-seed removed: the hardcoded seed entries were specific to the
     # Blueprint pipeline repo and polluted new projects with wrong build/test
@@ -1973,6 +1978,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             if agg_compact:
                 summary["history_aggregate"] = agg_compact
             if d.get("id") == current_dir_id:
+                # Inject rejected finding titles from the prior dedup-deadlock window
+                # so the agent does not re-propose them on recovery.
+                _dft = d.get("deadlock_filtered_titles")
+                if _dft:
+                    summary["deadlock_filtered_titles"] = _dft
                 # Current direction: last 3 cycles with numeric fields only
                 compact_history = [
                     {k: entry[k] for k in _HISTORY_NUMERIC_FIELDS if k in entry}
@@ -2597,6 +2607,20 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             continue
         spawned_tasks.append(new_task)
 
+    # Onboarding-proof: record the first non-bootstrap autonomous task spawn for
+    # this project. Best-effort and idempotent — only the first spawn stamps —
+    # and it must never gate the spawn commit, so it is wrapped defensively.
+    if spawned_tasks:
+        try:
+            from app.onboarding_proof import stamp_first_task_spawned
+
+            stamp_first_task_spawned(project, session, when=_utcnow())
+        except Exception:  # noqa: BLE001 — observability stamp never blocks spawn
+            logger.warning(
+                "[AUTONOMOUS] onboarding first-task-spawned stamp failed",
+                exc_info=True,
+            )
+
     await session.commit()
 
     # Track first task for HALF_OPEN → CLOSED transition
@@ -2676,26 +2700,6 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
                     f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
                 )
                 return
-
-    # Guard: per-project 24h spend ceiling (opt-in; no ceiling = today's behavior)
-    spend_ceiling_usd = (project.build_config or {}).get("daily_spend_ceiling_usd")
-    if spend_ceiling_usd:
-        from app.efficiency_snapshot import compute_project_window_spend_usd
-        from app.alert_dispatch import _maybe_create_spend_ceiling_alert
-
-        window_spend = await compute_project_window_spend_usd(session, project.id)
-        if window_spend >= spend_ceiling_usd:
-            logger.info(
-                f"[AUTONOMOUS] Spend ceiling reached for project {project.id}: "
-                f"${window_spend:.4f} >= ${spend_ceiling_usd:.4f} — skipping periodic spawn (type={task_type})"
-            )
-            await _maybe_create_spend_ceiling_alert(
-                project.id,
-                session,
-                window_spend_usd=window_spend,
-                ceiling_usd=spend_ceiling_usd,
-            )
-            return
 
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(
         task_type, {}

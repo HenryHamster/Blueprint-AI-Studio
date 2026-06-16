@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import io
 import json
 import logging
 import math
@@ -24,6 +25,7 @@ import os
 import shlex
 import signal
 import subprocess
+import tarfile
 import tempfile
 import uuid
 from dataclasses import dataclass, field
@@ -45,6 +47,9 @@ _COMMAND_RUNNER_B64 = base64.b64encode(
 ).decode("ascii")
 _ARTIFACT_UPLOAD_B64 = base64.b64encode(
     (_COMPUTE_SCRIPTS_DIR / "artifact_upload.py").read_bytes()
+).decode("ascii")
+_TERMINAL_RECORD_B64 = base64.b64encode(
+    (_COMPUTE_SCRIPTS_DIR / "terminal_record.py").read_bytes()
 ).decode("ascii")
 
 logger = logging.getLogger(__name__)
@@ -78,6 +83,16 @@ _GCP_RESULT_FILE_PATH = "/tmp/blueprint_compute_result.json"
 # On-VM artifact directory the GCP startup script provisions and uploads.
 _GCP_ARTIFACT_DIR_PATH = "/tmp/blueprint_compute_artifacts"
 _GCP_ARTIFACT_BUNDLE_PATH = "/tmp/blueprint_compute_artifacts.tar.gz"
+# Durable terminal record the startup script writes into the artifact dir right
+# before poweroff. It carries the authoritative outcome (status/exit/reason +
+# the same base64 metric/log/release payloads as the serial markers) so a job
+# whose serial marker is lost to the poweroff-vs-serial-read race can still be
+# reconciled to its real SUCCEEDED/FAILED result from the durable GCS bundle.
+_GCP_TERMINAL_RECORD_FILENAME = "terminal.json"
+# Defensive ceiling on the durable terminal.json read out of the bundle — the
+# record is small (metrics + a bounded log), so anything larger is treated as
+# absent rather than parsed.
+_MAX_TERMINAL_RECORD_DECODED_BYTES = 131072
 # Hard ceiling on the artifact upload so an oversized tree can never wedge
 # poweroff — the upload is abandoned (best-effort) once it elapses.
 _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS = 180
@@ -457,6 +472,14 @@ class GcpComputeBackend:
                 message="compute-job VM still provisioning",
             )
         if vm_status in {"TERMINATED", "STOPPING", "DELETED"}:
+            # The serial marker was absent (checked above), but a fast job can
+            # power off before its serial SUCCEEDED/FAILED marker is captured.
+            # Its authoritative outcome still lands durably in terminal.json
+            # inside the GCS artifact bundle — reconcile from it before declaring
+            # a blind FAILURE; only fall through when no durable record exists.
+            reconciled = await _reconcile_from_durable_terminal_record(job)
+            if reconciled is not None:
+                return reconciled
             return ComputeStatusResult(
                 status=ComputeJobStatus.FAILED,
                 message="compute-job VM stopped without a terminal marker",
@@ -959,6 +982,13 @@ def _build_gcp_startup_script(
         env_lines.append(f"export {key}={shlex.quote(value)}")
     env_block = "\n".join(env_lines)
     cwd_line = f"cd {shlex.quote(spec.cwd)}" if spec.cwd else ""
+    # Quoted on-VM paths the durable terminal record and the clone-fail branch
+    # both reference, so assign them before repo_setup_block is built below.
+    result_file = shlex.quote(_GCP_RESULT_FILE_PATH)
+    artifact_dir = shlex.quote(_GCP_ARTIFACT_DIR_PATH)
+    command_log_path = shlex.quote(
+        os.path.join(_GCP_ARTIFACT_DIR_PATH, "command.log.json")
+    )
     # Optional repo checkout: clone the project repo at the requested ref into a
     # scratch dir, cd into it, and put it on PYTHONPATH so the command can import
     # the project's packages. Runs BEFORE cwd_line (an explicit cwd still wins).
@@ -982,6 +1012,9 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_REASON_PREFIX}repo_clone_failed"\n'
             f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
+            f"  python3 /tmp/blueprint_terminal_record.py "
+            f"{artifact_dir} FAILED 1 repo_clone_failed "
+            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
             f'  kill "$TTL_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
@@ -1000,22 +1033,19 @@ def _build_gcp_startup_script(
     else:
         deadline_seconds = 3600
     command = shlex.quote(spec.command)
-    result_file = shlex.quote(_GCP_RESULT_FILE_PATH)
-    artifact_dir = shlex.quote(_GCP_ARTIFACT_DIR_PATH)
     artifact_bundle = shlex.quote(_GCP_ARTIFACT_BUNDLE_PATH)
-    command_log_path = shlex.quote(
-        os.path.join(_GCP_ARTIFACT_DIR_PATH, "command.log.json")
-    )
     artifact_upload_url = shlex.quote(artifact_upload_url)
     upload_timeout = _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS
     max_log_bytes = _MAX_COMMAND_LOG_BYTES
     command_runner_b64 = _COMMAND_RUNNER_B64
     artifact_upload_b64 = _ARTIFACT_UPLOAD_B64
+    terminal_record_b64 = _TERMINAL_RECORD_B64
     return f"""#!/bin/bash
 set -u -o pipefail
 TTL_SECONDS={deadline_seconds}
 echo '{command_runner_b64}' | base64 -d > /tmp/blueprint_command_runner.py
 echo '{artifact_upload_b64}' | base64 -d > /tmp/blueprint_artifact_upload.py
+echo '{terminal_record_b64}' | base64 -d > /tmp/blueprint_terminal_record.py
 ARTIFACTS_UPLOADED=0
 upload_artifacts() {{
   if [ "$ARTIFACTS_UPLOADED" -ne 0 ]; then
@@ -1049,9 +1079,13 @@ upload_artifacts() {{
 trap upload_artifacts EXIT HUP INT TERM QUIT
 (
   sleep "$TTL_SECONDS"
+  python3 /tmp/blueprint_terminal_record.py \
+    {artifact_dir} FAILED 124 runtime_ttl {result_file} {command_log_path} \
+    >/dev/null 2>&1 || true
   echo "{_SERIAL_REASON_PREFIX}runtime_ttl"
   echo "{_SERIAL_STATUS_PREFIX}FAILED"
   echo "{_SERIAL_EXIT_PREFIX}124"
+  upload_artifacts
   poweroff || shutdown -h now || true
 ) &
 TTL_PID=$!
@@ -1070,13 +1104,15 @@ if python3 /tmp/blueprint_command_runner.py \
   {command_log_path} \
   {max_log_bytes}; then
   EXIT_CODE=0
-  echo "{_SERIAL_REASON_PREFIX}completed"
-  echo "{_SERIAL_STATUS_PREFIX}SUCCEEDED"
+  STATUS=SUCCEEDED
+  REASON=completed
 else
   EXIT_CODE=$?
-  echo "{_SERIAL_REASON_PREFIX}command_failed"
-  echo "{_SERIAL_STATUS_PREFIX}FAILED"
+  STATUS=FAILED
+  REASON=command_failed
 fi
+echo "{_SERIAL_REASON_PREFIX}$REASON"
+echo "{_SERIAL_STATUS_PREFIX}$STATUS"
 echo "{_SERIAL_EXIT_PREFIX}$EXIT_CODE"
 if [ -f {result_file} ]; then
   METRICS_B64=$(base64 -w0 < {result_file} 2>/dev/null || true)
@@ -1097,6 +1133,9 @@ if [ -n "${{BLUEPRINT_RELEASE_SHA:-}}" ]; then
     echo "{_SERIAL_RELEASE_ECHO_PREFIX}$RELEASE_ECHO_B64"
   fi
 fi
+python3 /tmp/blueprint_terminal_record.py \
+  {artifact_dir} "$STATUS" "$EXIT_CODE" "$REASON" {result_file} {command_log_path} \
+  >/dev/null 2>&1 || true
 upload_artifacts
 kill "$TTL_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true
@@ -1251,3 +1290,116 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
         command_log=command_log,
         echoed_release_sha=echoed_release_sha,
     )
+
+
+def _extract_terminal_record_from_bundle(raw: bytes) -> dict[str, Any] | None:
+    """Pull ``terminal.json`` out of a durable ``.tar.gz`` artifact bundle.
+
+    The bundle is produced by ``tar -C <artifact_dir> -czf - .`` so members are
+    named ``./terminal.json`` etc.; we match on the basename and read ONLY that
+    one member (never extracting to disk, so a crafted member path cannot
+    traverse). Defensive by contract: a missing member, an oversized record, a
+    non-gzip/non-tar blob, or any parse error yields ``None`` — reconciliation
+    treats that identically to 'no durable record'.
+    """
+    if not raw:
+        return None
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+            member = None
+            for candidate in tar:
+                if not candidate.isfile():
+                    continue
+                if os.path.basename(candidate.name) == _GCP_TERMINAL_RECORD_FILENAME:
+                    member = candidate
+                    break
+            if member is None:
+                return None
+            if member.size > _MAX_TERMINAL_RECORD_DECODED_BYTES:
+                return None
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                return None
+            data = extracted.read(_MAX_TERMINAL_RECORD_DECODED_BYTES + 1)
+    except (tarfile.TarError, OSError, EOFError, ValueError):
+        return None
+    if len(data) > _MAX_TERMINAL_RECORD_DECODED_BYTES:
+        return None
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _reconcile_terminal_record_to_status(
+    record: dict[str, Any],
+) -> ComputeStatusResult | None:
+    """Convert a durable ``terminal.json`` record into a ``ComputeStatusResult``.
+
+    Mirrors the SUCCEEDED/FAILED branches of :func:`_parse_serial_status` exactly
+    — same base64 decoders for metrics / command-log / release-echo — so a job
+    reconciled from its durable record is indistinguishable from one finalized
+    via the serial fast-path. Returns ``None`` when ``status`` is absent or not a
+    recognized terminal value (the record is then treated as no durable record).
+    """
+    raw_status = record.get("status")
+    if raw_status not in {"SUCCEEDED", "FAILED"}:
+        return None
+    raw_exit = record.get("exit_code")
+    # bool is an int subclass — exclude it so a stray ``true`` isn't read as 1.
+    exit_code = (
+        raw_exit
+        if isinstance(raw_exit, int) and not isinstance(raw_exit, bool)
+        else None
+    )
+    reason = record.get("reason")
+    if not isinstance(reason, str):
+        reason = None
+    metrics = _decode_result_metrics(record.get("metrics_b64"))
+    command_log = _decode_command_log(record.get("command_log_b64"))
+    echoed_release_sha = _decode_release_echo_sha(record.get("release_echo_b64"))
+    if raw_status == "SUCCEEDED":
+        return ComputeStatusResult(
+            status=ComputeJobStatus.SUCCEEDED,
+            message=reason,
+            exit_code=0 if exit_code is None else exit_code,
+            finished_at=_utcnow(),
+            metrics=metrics,
+            command_log=command_log,
+            echoed_release_sha=echoed_release_sha,
+        )
+    return ComputeStatusResult(
+        status=ComputeJobStatus.FAILED,
+        message=reason or "compute-job startup script failed",
+        exit_code=exit_code,
+        finished_at=_utcnow(),
+        metrics=metrics,
+        command_log=command_log,
+        echoed_release_sha=echoed_release_sha,
+    )
+
+
+async def _reconcile_from_durable_terminal_record(
+    job: ComputeJob,
+) -> ComputeStatusResult | None:
+    """Recover a terminal GCP job's outcome from its durable GCS terminal record.
+
+    A fast job can power off in the gap between emitting its serial
+    ``BLUEPRINT_COMPUTE_STATUS=`` marker and the orchestrator's next serial poll
+    — and GCP serial output goes empty once the VM is TERMINATED — so a
+    successful run is otherwise misclassified FAILURE. The authoritative outcome
+    still lives in ``terminal.json`` inside the durable artifact bundle: download
+    the bundle, extract the record, and reconcile to the real SUCCEEDED/FAILED
+    result. Returns ``None`` when no durable terminal record exists (the caller
+    then falls back to the blind 'stopped without a terminal marker' FAILURE).
+    """
+    raw = await storage.download_compute_job_artifact_bundle(job.id)
+    if not raw:
+        return None
+    record = _extract_terminal_record_from_bundle(raw)
+    if not record:
+        return None
+    return _reconcile_terminal_record_to_status(record)

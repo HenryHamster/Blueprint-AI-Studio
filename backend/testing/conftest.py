@@ -31,7 +31,7 @@ _SQLiteTypeCompiler.visit_JSONB = _sqlite_visit_JSONB
 
 from app.main import app  # noqa: E402
 from app.database import get_session  # noqa: E402
-from app.auth import get_current_user, require_admin  # noqa: E402
+from app.auth import get_current_user, get_current_user_optional, require_admin  # noqa: E402
 
 # --- Database engine selection ---
 # CI explicitly sets USE_TEST_POSTGRES=true to use real PostgreSQL.
@@ -130,9 +130,7 @@ async def db_session():
         if ordered_tables:
             async with engine.begin() as conn:
                 for table in ordered_tables:
-                    await conn.execute(
-                        sqlalchemy.text(f'DELETE FROM "{table.name}"')
-                    )
+                    await conn.execute(sqlalchemy.text(f'DELETE FROM "{table.name}"'))
     else:
         async with engine.begin() as conn:
             await conn.run_sync(SQLModel.metadata.create_all)
@@ -218,6 +216,7 @@ def override_get_current_user():
         }
 
     app.dependency_overrides[get_current_user] = _override_get_current_user
+    app.dependency_overrides[get_current_user_optional] = _override_get_current_user
     # Also bypass the require_admin router-level dependency directly
     app.dependency_overrides[require_admin] = lambda: {
         "user_id": "test-user-123",
@@ -226,6 +225,7 @@ def override_get_current_user():
     }
     yield
     app.dependency_overrides.pop(get_current_user, None)
+    app.dependency_overrides.pop(get_current_user_optional, None)
     app.dependency_overrides.pop(require_admin, None)
 
 

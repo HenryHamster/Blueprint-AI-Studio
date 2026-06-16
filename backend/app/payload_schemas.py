@@ -603,27 +603,49 @@ class MemoPayload(BasePayload):
 class ComputeSuccessCriterion(BaseModel):
     """A cheap, machine-checkable acceptance criterion for a compute_experiment.
 
-    Declares WHAT success means for the experiment: a numeric ``metric`` (a key
-    read by name out of the terminal COMPUTE_RESULT artifact), one of a small,
-    closed set of comparison ``operator`` values, and a numeric ``threshold``.
-    Deliberately minimal — no expression framework, just enough to express a
-    single numeric/threshold goal the metric gate can check at completion. When
-    absent, the gate keeps its presence-only behavior (terminal outcome + cost).
+    Two kinds are supported:
 
-    The ``metric`` may name a reserved job-level field (final_cost_usd, …) OR
-    any experiment-domain metric the command reports (accuracy, tokens_per_sec,
-    final_loss, …): the compute substrate now carries reported metrics through
+    ``kind="metric"`` (default — backward-compatible): a numeric threshold check.
+    Declares a ``metric`` (a key read by name out of the terminal COMPUTE_RESULT
+    artifact), a comparison ``operator``, and a numeric ``threshold``. The metric
+    may name a reserved job-level field (final_cost_usd, durable_file_count, …)
+    OR any experiment-domain metric the command reports (accuracy, tokens_per_sec,
+    final_loss, …): the compute substrate carries reported metrics through
     ``ComputeJob.polling_metadata.result_metrics``, which the agent flattens to
     top-level numeric keys on the COMPUTE_RESULT, so the gate enforces them by
     name. A declared metric the experiment does not report fails the gate
     closed at completion (it is not silently treated as unmeasurable).
+
+    ``kind="artifact_produced"``: artifact-existence check. The criterion is met
+    when the job produced at least ``min_file_count`` durable artifact files. Use
+    this when the experiment's value IS its durable output (a trained model,
+    dataset, checkpoint) and a numeric scalar does not express success. The gate
+    checks ``durable_file_count >= min_file_count`` at completion; the artifact
+    bundle is always preserved regardless of this criterion.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    metric: str
-    operator: Literal[">=", "<=", ">", "<", "==", "!="]
-    threshold: float
+    kind: Literal["metric", "artifact_produced"] = "metric"
+
+    # kind="metric" fields (required when kind="metric"):
+    metric: str | None = None
+    operator: Literal[">=", "<=", ">", "<", "==", "!="] | None = None
+    threshold: float | None = None
+
+    # kind="artifact_produced" field (ignored for kind="metric"):
+    min_file_count: int = 1
+
+    @model_validator(mode="after")
+    def _check_kind_fields(self) -> "ComputeSuccessCriterion":
+        if self.kind == "metric":
+            if not isinstance(self.metric, str) or not self.metric.strip():
+                raise ValueError("metric is required and non-empty when kind='metric'")
+            if self.operator is None:
+                raise ValueError("operator is required when kind='metric'")
+            if self.threshold is None:
+                raise ValueError("threshold is required when kind='metric'")
+        return self
 
 
 class PlanAcceptanceEvidence(BaseModel):
@@ -846,6 +868,22 @@ class RepoBootstrapOverview(BaseModel):
     key_conventions: str | None = None
     environment_requirements: str | None = None
     source_revision: str | None = None
+
+
+class RepoDomainOverview(BaseModel):
+    """Product-domain summary extracted from README/docs during repo_bootstrap.
+
+    Persisted as a KnowledgeDocument with source_kind='repo_domain'.
+    All fields are bounded to keep the document lean (total ≤4000 chars).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    purpose: str = Field(..., max_length=2000)
+    key_concepts: dict[str, str] = Field(default_factory=dict)
+    critical_user_flows: list[str] = Field(default_factory=list)
+    architectural_gotchas: list[str] = Field(default_factory=list)
+    source: str = Field(default="none-found", max_length=500)
 
 
 # ---------------------------------------------------------------------------

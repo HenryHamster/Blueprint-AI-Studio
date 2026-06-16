@@ -566,11 +566,11 @@ async def checkpoint_and_reserve_on_phase_complete(
     # Verify the SHA is actually reachable on the lane branch before recording
     # it as the durable checkpoint. An unverified SHA causes the agent's warm-
     # resume hard-reset to fail and silently degrades to a cold clone —
-    # defeating the measurement. Policy: verification failure (both False and
-    # None) degrades to mark_checkpoint_missing so the sweep can requeue;
-    # verification unavailability (credentials missing, transient API failure)
-    # is treated identically to not-reachable to avoid recording a
-    # potentially-stale SHA. Neither case blocks the review spawn path.
+    # defeating the measurement. Policy: confirmed False (SHA not reachable)
+    # calls mark_checkpoint_missing so the sweep can requeue. Transient/
+    # indeterminate outcomes (exception or None) return False WITHOUT calling
+    # mark_checkpoint_missing — a transient hiccup must not burn the
+    # phase_requeues budget; the review spawn path is unaffected either way.
     try:
         from app.github_refs import is_ancestor_of
         from app.github_token_resolver import get_github_token_for_task
@@ -588,22 +588,12 @@ async def checkpoint_and_reserve_on_phase_complete(
         )
     except Exception as exc:  # noqa: BLE001 - verification is best-effort
         logger.warning(
-            "[LANE-PILOT] SHA verification unavailable for lane %s sha=%s: %s",
+            "[LANE-PILOT] SHA verification unavailable for lane %s sha=%s: %s — "
+            "skipping checkpoint without burning requeue budget",
             lane.id,
             str(sha)[:8],
             exc,
         )
-        with contextlib.suppress(LaneCheckpointError):
-            missed_lane, _ = await mark_checkpoint_missing(
-                session, lane.id, reason="sha_verification_unavailable"
-            )
-            if record_miss_marker:
-                _record_lane_recovery_state(
-                    missed_lane,
-                    reason="sha_verification_unavailable",
-                    attempt=missed_lane.phase_requeues or 0,
-                    exhausted=False,
-                )
         return False
 
     if reachable is False:
@@ -628,23 +618,17 @@ async def checkpoint_and_reserve_on_phase_complete(
         return False
 
     if reachable is None:
+        # Transient GitHub API failure (rate limit, network, credentials) — do
+        # NOT call mark_checkpoint_missing, which would burn a phase_requeues
+        # budget slot.  Three transient failures must not kill a lane that has
+        # no genuine SHA-reachability problem.  The checkpoint is simply skipped
+        # for this phase; the lane stays ACTIVE and can be retried.
         logger.warning(
-            "[LANE-PILOT] SHA reachability indeterminate for lane %s sha=%s — "
-            "skipping checkpoint",
+            "[LANE-PILOT] SHA reachability indeterminate (transient) for lane %s "
+            "sha=%s — skipping checkpoint without consuming requeue budget",
             lane.id,
             str(sha)[:8],
         )
-        with contextlib.suppress(LaneCheckpointError):
-            missed_lane, _ = await mark_checkpoint_missing(
-                session, lane.id, reason="sha_verification_unavailable"
-            )
-            if record_miss_marker:
-                _record_lane_recovery_state(
-                    missed_lane,
-                    reason="sha_verification_unavailable",
-                    attempt=missed_lane.phase_requeues or 0,
-                    exhausted=False,
-                )
         return False
 
     _tokens_in, _tokens_out, _ = get_task_total_llm_totals(source_task)
@@ -887,6 +871,24 @@ async def checkpoint_or_recover_phase(
             session, lane, reason="checkpoint_recovery_exhausted"
         )
         return CHECKPOINT_PHASE_EXHAUSTED
+    lane_title = getattr(lane, "title", None) or str(lane.id)
+    await emit_lane_event_message(
+        session,
+        lane.project_id,
+        lane.id,
+        "lane_checkpoint_recover",
+        f"lane '{lane_title}' checkpoint miss — recovery queued "
+        f"(phase_requeues={lane.phase_requeues or 0})",
+    )
+    if (lane.phase_requeues or 0) == _LANE_MAX_PHASE_REQUEUES - 1:
+        await emit_lane_event_message(
+            session,
+            lane.project_id,
+            lane.id,
+            "lane_budget_near_exhausted",
+            f"lane '{lane_title}' budget near exhausted — next checkpoint miss will kill this lane "
+            f"(phase_requeues={lane.phase_requeues or 0}/{_LANE_MAX_PHASE_REQUEUES})",
+        )
     return CHECKPOINT_PHASE_RECOVER
 
 
@@ -1868,6 +1870,32 @@ async def compute_lane_pilot_aggregates(
         )
     gate_integrity_violations = int((await session.execute(_gate_stmt)).scalar() or 0)
 
+    # ── Control-arm contamination: warm-resume receipts on control fix tasks ──
+    # Under correct operation control-arm fix tasks NEVER carry a warm-resume
+    # receipt — they always run cold.  Any non-zero count means the gate that
+    # guards confirm_lane_warm_resume was bypassed and the control baseline is
+    # contaminated.  Even one such task invalidates the comparison.
+    if is_sqlite:
+        _ctrl_warm_stmt = select(func.count(Task.id)).where(
+            Task.project_id == project_id,
+            func.json_extract(Task.context, f"$.{LANE_PILOT_ASSIGNMENT_KEY}")
+            == "control",
+            func.json_extract(
+                Task.context, f"$.{LANE_PILOT_WARM_RESUME_RECEIPT_KEY}"
+            ).isnot(None),
+            func.json_extract(Task.payloads, "$[0].type").in_(["fix", "implement"]),
+        )
+    else:
+        _ctrl_warm_stmt = select(func.count(Task.id)).where(
+            Task.project_id == project_id,
+            Task.context[LANE_PILOT_ASSIGNMENT_KEY].astext == "control",
+            Task.context[LANE_PILOT_WARM_RESUME_RECEIPT_KEY].isnot(None),
+            Task.payloads[0]["type"].as_string().in_(["fix", "implement"]),
+        )
+    control_warm_resume_count = int(
+        (await session.execute(_ctrl_warm_stmt)).scalar() or 0
+    )
+
     # ── Treatment-engagement receipts (warm-resume + checkpoint) ─────────────
     # Among terminal lane-arm fix-phase tasks, count chains where at least one
     # fix task in the chain carried each durable receipt.  Grouping by chain
@@ -1995,6 +2023,7 @@ async def compute_lane_pilot_aggregates(
         "lane_reserved_idle_cost_per_merged": lane_reserved_idle_cost_per_merged,
         "control_reserved_idle_cost_per_merged": control_reserved_idle_cost_per_merged,
         "gate_integrity_violations": gate_integrity_violations,
+        "control_warm_resume_count": control_warm_resume_count,
         "checkpoint_loss_rate": checkpoint_loss_rate,
         "checkpoint_attempts_total": checkpoint_attempts_total,
         "checkpoint_requeues_total": checkpoint_requeues_total,
@@ -2004,3 +2033,77 @@ async def compute_lane_pilot_aggregates(
         "lane_visual": lane_visual,
         "control_visual": control_visual,
     }
+
+
+async def sweep_lane_pilot_kill_verdict(session: AsyncSession) -> int:
+    """Evaluate KILL conditions for all projects with active lane work.
+
+    Runs on every reaper cycle, independently of digest computation, so the
+    safety KILL (flag flip + force-expire reservations + kill lanes + alert)
+    is not gated on a leader-only precompute timer or an operator GET.
+
+    Returns the count of projects where KILL was applied this cycle.
+    """
+    if not is_review_fix_lane_pilot_enabled():
+        return 0
+
+    from app.capability_trial_verdict import evaluate_lane_pilot_verdict
+    from app.improvement_lane_ops import _TERMINAL_STATUSES
+    from app.models import ImprovementLane, Project
+
+    # Enumerate distinct project IDs that have non-terminal lane rows.
+    rows = (
+        await session.execute(
+            select(ImprovementLane.project_id).where(
+                ImprovementLane.status.not_in(list(_TERMINAL_STATUSES))
+            )
+        )
+    ).all()
+    project_ids = list({row[0] for row in rows})
+
+    kills_applied = 0
+    for project_id in project_ids:
+        try:
+            # Skip projects that already have a durable KILL recorded.
+            project = await session.get(Project, project_id)
+            if project is None:
+                continue
+            verdicts = getattr(project, "capability_adoption_verdicts", None)
+            if isinstance(verdicts, dict):
+                entry = verdicts.get(LANE_PILOT_CAP_NAME)
+                if isinstance(entry, dict) and entry.get("verdict") == "KILL":
+                    continue
+
+            aggregates = await compute_lane_pilot_aggregates(session, project_id)
+            verdict = evaluate_lane_pilot_verdict(aggregates)
+            if verdict.get("verdict") != "KILL":
+                continue
+
+            alert_detail: str | None = None
+            if verdict.get("immediate_alert"):
+                alert_detail = (
+                    verdict.get("verdict_reason") or "gate_integrity_violation"
+                )
+
+            await apply_lane_pilot_kill_in_transaction(
+                session,
+                project_id,
+                verdict_entry=verdict,
+                reason="reaper_sweep",
+                alert_detail=alert_detail,
+            )
+            kills_applied += 1
+            logger.info(
+                "[LANE-PILOT] reaper sweep applied KILL to project %s reason=%s",
+                project_id,
+                verdict.get("verdict_reason"),
+            )
+        except Exception as exc:
+            logger.error(
+                "[LANE-PILOT] reaper sweep error for project %s: %s",
+                project_id,
+                exc,
+                exc_info=True,
+            )
+
+    return kills_applied

@@ -2218,450 +2218,93 @@ def test_detect_already_fixed_deadlock_stops_at_legacy_entry():
 
 
 @pytest.mark.asyncio
-async def test_already_satisfied_noop_deadlock_quiesces_direction(db_session, mocker):
-    """3 consecutive prior cycles with all tasks SCOPE_EMPTY triggers alert + BUG_REPORT."""
+async def test_already_fixed_deadlock_auto_completes_via_apply_post_spawn(db_session):
+    """#10113 superseded: an already-fixed-deadlocked direction completes terminally
+    via apply_post_spawn_state instead of the old alert-only no-op.
 
-    from sqlmodel import select
-
-    from app.models import Alert, AlertSeverity, MessageType, ProjectMessage
-    from app.research_direction_state import apply_post_spawn_state
-
-    direction_id = "d-afxd0001"
-    # 3 prior completed cycles: each spawned 1 task, all resolved as SCOPE_EMPTY
-    prior_history = [
-        {
-            "timestamp": "2026-01-10T00:00:00",
-            "task_id": "00000000-0000-0000-0000-000000000001",
-            "tasks_created": 1,
-            "scope_empty_noop_count": 1,
-            "summary": "all already fixed",
-            "filter_breakdown": {
-                "hash_dedup": 0,
-                "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0,
-                "type_filtered": 0,
-                "empty_prompt": 0,
-            },
-        },
-        {
-            "timestamp": "2026-01-11T00:00:00",
-            "task_id": "00000000-0000-0000-0000-000000000002",
-            "tasks_created": 1,
-            "scope_empty_noop_count": 1,
-            "summary": "all already fixed",
-            "filter_breakdown": {
-                "hash_dedup": 0,
-                "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0,
-                "type_filtered": 0,
-                "empty_prompt": 0,
-            },
-        },
-        {
-            "timestamp": "2026-01-12T00:00:00",
-            "task_id": "00000000-0000-0000-0000-000000000003",
-            "tasks_created": 1,
-            "scope_empty_noop_count": 1,
-            "summary": "all already fixed",
-            "filter_breakdown": {
-                "hash_dedup": 0,
-                "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0,
-                "type_filtered": 0,
-                "empty_prompt": 0,
-            },
-        },
-    ]
-    direction = {
-        "id": direction_id,
-        "text": "Audit already-shipped workspace safety fixes",
-        "status": "active",
-        "priority": "medium",
-        "paths": [],
-        "added_at": "2026-01-01T00:00:00",
-        "research_history": prior_history,
-    }
-    project = Project(
-        name="Already-Fixed Deadlock Test",
-        user_id="test-user-af01",
-        autonomous_enabled=True,
-        directions=[direction],
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    research_task = Task(
-        project_id=project.id,
-        title="Research: Audit already-shipped fixes",
-        payloads=[
-            {
-                "type": "research",
-                "directions": [direction],
-                "base_branch": "main",
-                "current_direction_id": direction_id,
-            }
-        ],
-        context={"research_depth": 0, "direction_id": direction_id},
-        status=TaskStatus.IN_PROGRESS,
-        created_by="ORCHESTRATOR",
-        vm_instance_id="agent-vm-af-test",
-    )
-    db_session.add(research_task)
-    await db_session.commit()
-    await db_session.refresh(research_task)
-
-    child_task = Task(
-        project_id=project.id,
-        title="Fix: already fixed workspace issue",
-        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
-        context={"direction_id": direction_id},
-        status=TaskStatus.IN_PROGRESS,
-        created_by="ORCHESTRATOR",
-        parent_task_id=research_task.id,
-        vm_instance_id="agent-vm-af-child",
-    )
-    db_session.add(child_task)
-    await db_session.commit()
-
-    finding = {
-        "title": "Fix already-fixed workspace issue",
-        "description": "Already done on HEAD",
-        "prompt": "Fix it",
-        "type": "create",
-        "scope": "small",
-        "priority": "medium",
-        "direction_id": direction_id,
-    }
-    deduplicated = [(0, finding, "aabbccdd")]
-
-    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch(
-        "app.strategic_completion.record_outcome_progress_snapshot",
-        return_value=None,
-    )
-    mocker.patch(
-        "app.research_direction_state._apply_terminal_transition",
-        new=AsyncMock(return_value=None),
-    )
-
-    await apply_post_spawn_state(
-        session=db_session,
-        task=research_task,
-        findings=[finding],
-        child_tasks=[child_task],
-        deduplicated=deduplicated,
-        insights=[],
-        direction_notes=[],
-        direction_proposals=[],
-        hash_dedup_count=0,
-        word_overlap_count=0,
-        file_overlap_count=0,
-        evidence_overlap_count=0,
-        type_filtered_count=0,
-        empty_prompt_count=0,
-        research_branch="research/af-test",
-        original_base="main",
-        research_depth=0,
-        parent_research_task_id=None,
-    )
-
-    alerts = (
-        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
-        .scalars()
-        .all()
-    )
-    af_alerts = [a for a in alerts if "already-fixed" in a.title.lower()]
-    assert len(af_alerts) >= 1, (
-        "Expected a WARNING Alert for already-fixed deadlock after 3 consecutive SCOPE_EMPTY cycles"
-    )
-    assert af_alerts[0].severity == AlertSeverity.WARNING
-    assert direction_id in af_alerts[0].message
-
-    messages = (
-        (
-            await db_session.execute(
-                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    bug_reports = [m for m in messages if m.message_type == MessageType.BUG_REPORT]
-    assert len(bug_reports) >= 1, (
-        "Expected a BUG_REPORT ProjectMessage for already-fixed deadlock"
-    )
-    assert bug_reports[0].context.get("source") == "already_fixed_deadlock"
-    assert bug_reports[0].context.get("consecutive_noop_cycles") == 3
-
-
-@pytest.mark.asyncio
-async def test_already_satisfied_deadlock_no_quiesce_when_merged_pr_in_window(
-    db_session, mocker
-):
-    """A direction with a merged PR in the recent window is NOT quiesced."""
-
-    from sqlmodel import select
-
+    Three prior cycles whose spawned tasks all resolved SCOPE_EMPTY (work already on
+    HEAD) make the direction genuinely exhausted. When a fresh no-findings cycle is
+    applied and the direction is neither code-failing nor externally frozen, it is
+    routed to terminal status='completed' with an exhaustion reason and an INFO
+    'Direction auto-completed' alert.
+    """
     from app.models import Alert
     from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
 
-    direction_id = "d-afxd0002"
-    # Prior history: 2 scope_empty cycles, then 1 cycle with a merged PR
-    prior_history = [
+    direction_id = "d-af-complete"
+    # Prior cycles: tasks_created >= 1 and scope_empty_noop_count >= tasks_created
+    # (already-fixed deadlock signal), zero merges.
+    noop_history = [
         {
-            "timestamp": "2026-01-10T00:00:00",
-            "task_id": "00000000-0000-0000-0000-000000000011",
-            "tasks_created": 1,
-            "scope_empty_noop_count": 1,
-            "summary": "all already fixed",
-            "filter_breakdown": {
-                "hash_dedup": 0,
-                "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0,
-                "type_filtered": 0,
-                "empty_prompt": 0,
-            },
-        },
-        {
-            "timestamp": "2026-01-11T00:00:00",
-            "task_id": "00000000-0000-0000-0000-000000000012",
+            "timestamp": (datetime.utcnow() - timedelta(hours=h)).isoformat(),
+            "task_id": f"t-af-{h}",
             "tasks_created": 2,
-            "scope_empty_noop_count": 0,  # a PR was merged this cycle
-            "prs_merged": 1,
-            "summary": "merged a fix",
+            "scope_empty_noop_count": 2,
+            "prs_merged": 0,
             "filter_breakdown": {
-                "hash_dedup": 0,
-                "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0,
-                "type_filtered": 0,
-                "empty_prompt": 0,
+                "hash_dedup": 0, "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
+                "type_filtered": 0, "empty_prompt": 0,
             },
-        },
-        {
-            "timestamp": "2026-01-12T00:00:00",
-            "task_id": "00000000-0000-0000-0000-000000000013",
-            "tasks_created": 1,
-            "scope_empty_noop_count": 1,
-            "summary": "all already fixed",
-            "filter_breakdown": {
-                "hash_dedup": 0,
-                "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0,
-                "type_filtered": 0,
-                "empty_prompt": 0,
-            },
-        },
+            "summary": "all tasks no-op — work already on HEAD",
+        }
+        for h in (15, 10, 5)
     ]
     direction = {
-        "id": direction_id,
-        "text": "Mixed outcome direction",
-        "status": "active",
-        "priority": "medium",
-        "paths": [],
-        "added_at": "2026-01-01T00:00:00",
-        "research_history": prior_history,
+        **_active_direction(direction_id, "Already-fixed deadlock completion"),
+        "research_history": noop_history,
     }
     project = Project(
-        name="No Quiesce When Merged PR",
-        user_id="test-user-af02",
+        name="AF Deadlock Complete Test",
+        user_id="u-af-complete",
         autonomous_enabled=True,
         directions=[direction],
+        vision={"purpose": "test"},
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    research_task = Task(
-        project_id=project.id,
-        title="Research: Mixed outcome",
-        payloads=[
-            {
-                "type": "research",
-                "directions": [direction],
-                "base_branch": "main",
-                "current_direction_id": direction_id,
-            }
-        ],
-        context={"research_depth": 0, "direction_id": direction_id},
-        status=TaskStatus.IN_PROGRESS,
-        created_by="ORCHESTRATOR",
-        vm_instance_id="agent-vm-af-test2",
-    )
-    db_session.add(research_task)
-    await db_session.commit()
-    await db_session.refresh(research_task)
-
-    child_task = Task(
-        project_id=project.id,
-        title="Fix: another workspace issue",
-        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
-        context={"direction_id": direction_id},
-        status=TaskStatus.IN_PROGRESS,
-        created_by="ORCHESTRATOR",
-        parent_task_id=research_task.id,
-        vm_instance_id="agent-vm-af-child2",
-    )
-    db_session.add(child_task)
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
     await db_session.commit()
 
-    finding = {
-        "title": "Another workspace fix",
-        "description": "Maybe already done",
-        "prompt": "Fix it",
-        "type": "create",
-        "scope": "small",
-        "priority": "medium",
-        "direction_id": direction_id,
-    }
-    deduplicated = [(0, finding, "11223344")]
-
-    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch(
-        "app.strategic_completion.record_outcome_progress_snapshot",
-        return_value=None,
-    )
-    mocker.patch(
-        "app.research_direction_state._apply_terminal_transition",
-        new=AsyncMock(return_value=None),
-    )
-
+    # Fresh no-findings cycle — the appended entry is excluded by the af site's
+    # history[:-1] detection, which still sees the 3 SCOPE_EMPTY cycles.
     await apply_post_spawn_state(
-        session=db_session,
-        task=research_task,
-        findings=[finding],
-        child_tasks=[child_task],
-        deduplicated=deduplicated,
-        insights=[],
-        direction_notes=[],
-        direction_proposals=[],
-        hash_dedup_count=0,
-        word_overlap_count=0,
-        file_overlap_count=0,
-        evidence_overlap_count=0,
-        type_filtered_count=0,
-        empty_prompt_count=0,
-        research_branch="research/af-test2",
-        original_base="main",
-        research_depth=0,
-        parent_research_task_id=None,
-    )
-
-    alerts = (
-        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
-        .scalars()
-        .all()
-    )
-    af_alerts = [a for a in alerts if "already-fixed" in a.title.lower()]
-    assert len(af_alerts) == 0, (
-        "Direction with a merged PR in the recent window must NOT be quiesced as already-fixed"
-    )
-
-
-@pytest.mark.asyncio
-async def test_dedup_deadlock_auto_recovery_uses_shorter_cooldown(db_session, mocker):
-    """Dedup-deadlocked directions recover after 8h (shorter cooldown), not 48h.
-
-    A direction paused with paused_reason='dedup_deadlock:...' should be
-    reactivated after direction_dedup_deadlock_recovery_hours() (default 8h),
-    not the generic direction_auto_recovery_hours (48h default). At ~10h (past
-    8h but under 48h), the direction must transition back to active.
-    """
-    now = datetime.utcnow()
-    # Paused 10 hours ago — past the 8h dedup-deadlock cooldown, under 48h generic cooldown
-    paused_at = now - timedelta(hours=10)
-
-    direction = {
-        "id": "d-dedup-deadlock-recovery",
-        "text": "Dedup-deadlocked direction",
-        "status": "paused",
-        "auto_paused": True,
-        "paused_reason": "dedup_deadlock: 3 consecutive empty cycles",
-        "paused_at": paused_at.isoformat(),
-        "priority": "medium",
-        "paths": [],
-        "added_at": "2026-01-01T00:00:00",
-        "research_history": [],
-    }
-
-    project = Project(
-        name="Dedup Deadlock Recovery Test",
-        user_id="u-dedup-recovery",
-        autonomous_enabled=True,
-        directions=[direction],
-        vision={"purpose": "test"},
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    await _process_direction_lifecycle(
-        project,
         db_session,
-        cooldown_minutes=0.0,
-        busy_direction_ids=set(),
-        now=now,
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
     )
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "active", (
-        "Dedup-deadlocked direction should be reactivated after 8h cooldown "
-        f"(was paused 10h ago); got status={d['status']!r}"
+    assert d["status"] == "completed", (
+        f"already-fixed-deadlocked direction should be terminally completed, got {d['status']!r}"
     )
-    assert not d.get("auto_paused"), "auto_paused should be cleared on recovery"
-    assert not d.get("paused_reason"), "paused_reason should be cleared on recovery"
-    assert d.get("auto_recovered_at") is not None, (
-        "auto_recovered_at should be stamped on recovery"
+    assert d.get("auto_completed") is True, "auto_completed must be set"
+    assert d.get("completed_at") is not None, "completed_at must be stamped"
+    assert "exhausted" in (d.get("auto_completed_reason") or ""), (
+        f"auto_completed_reason must reflect exhaustion, got {d.get('auto_completed_reason')!r}"
     )
 
-
-@pytest.mark.asyncio
-async def test_dedup_deadlock_not_recovered_before_cooldown(db_session, mocker):
-    """Dedup-deadlocked direction does NOT recover before the 8h cooldown expires.
-
-    At 5h (past the typical generic checks but under the 8h dedup-deadlock
-    cooldown), the direction must remain paused.
-    """
-    now = datetime.utcnow()
-    # Paused 5 hours ago — under the 8h dedup-deadlock cooldown
-    paused_at = now - timedelta(hours=5)
-
-    direction = {
-        "id": "d-dedup-deadlock-no-recovery",
-        "text": "Dedup-deadlocked direction still in cooldown",
-        "status": "paused",
-        "auto_paused": True,
-        "paused_reason": "dedup_deadlock: 3 consecutive empty cycles",
-        "paused_at": paused_at.isoformat(),
-        "priority": "medium",
-        "paths": [],
-        "added_at": "2026-01-01T00:00:00",
-        "research_history": [],
-    }
-
-    project = Project(
-        name="Dedup Deadlock No Recovery Test",
-        user_id="u-dedup-no-recovery",
-        autonomous_enabled=True,
-        directions=[direction],
-        vision={"purpose": "test"},
+    result = await db_session.execute(
+        select(Alert).where(
+            Alert.project_id == project.id,
+            Alert.title == "Direction auto-completed",
+            Alert.dismissed_at.is_(None),
+        )
     )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    await _process_direction_lifecycle(
-        project,
-        db_session,
-        cooldown_minutes=0.0,
-        busy_direction_ids=set(),
-        now=now,
+    assert result.scalars().first() is not None, (
+        "expected a 'Direction auto-completed' alert"
     )
-    await db_session.refresh(project)
 
-    d = project.directions[0]
-    assert d["status"] == "paused", (
-        "Dedup-deadlocked direction should remain paused within the 8h cooldown "
-        f"(paused 5h ago); got status={d['status']!r}"
-    )

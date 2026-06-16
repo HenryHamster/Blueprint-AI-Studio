@@ -6,7 +6,9 @@ import type { Project } from '../types/project';
 import { expectNoOverflowAt } from '../test/viewport';
 
 vi.mock('../api', () => ({
+  API_BASE_URL: 'http://localhost',
   fetchVisualPilotStatus: vi.fn(),
+  resolveViewportShotDownloadUrl: vi.fn().mockResolvedValue('https://example.com/shot.png'),
 }));
 
 import * as api from '../api';
@@ -45,12 +47,20 @@ const STATUS_WITH_CAUGHT = {
       task_title: 'feat: add VisualVerificationPilotPanel operator surface',
       note: 'Button label clipped on mobile — caught before merge',
       created_at: '2026-06-10T12:00:00Z',
+      viewport_shot_names: ['main-before', 'main-after', 'main-diff'],
+      viewport_shot_entries: [
+        { name: 'main-before' },
+        { name: 'main-after', magnitude: 0.23 },
+        { name: 'main-diff' },
+      ],
     },
     {
       task_id: 'task-def-456',
       task_title: 'fix: ImprovementLanesPanel overflow at 375px on narrow viewports',
       note: null,
       created_at: '2026-06-11T14:00:00Z',
+      viewport_shot_names: [],
+      viewport_shot_entries: [],
     },
   ],
   thresholds: THRESHOLDS,
@@ -146,11 +156,69 @@ describe('VisualVerificationPilotPanel — viewport regression', () => {
     await expectNoOverflowAt(375, () => renderWith(STATUS_EMPTY));
   });
 
+  test('renders NOT STARTED badge when entry_count and admin_task_count are zero', async () => {
+    await renderWith(STATUS_EMPTY);
+    const badgeByText = Array.from(host!.querySelectorAll('span')).find(
+      (el) => el.textContent === 'NOT STARTED',
+    );
+    if (!badgeByText) {
+      throw new Error('Expected a "NOT STARTED" badge but none was found');
+    }
+  });
+
   test('renders caught entries at 1024px without overflow', async () => {
     await expectNoOverflowAt(1024, () => renderWith(STATUS_WITH_CAUGHT));
   });
 
   test('renders running state at 1024px without overflow', async () => {
     await expectNoOverflowAt(1024, () => renderWith(STATUS_RUNNING_NO_CATCHES));
+  });
+
+  test('renders expanded screenshots for caught entry at 375px without overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      await renderWith(STATUS_WITH_CAUGHT);
+      // Click the "View screenshots" toggle on the first caught entry.
+      const toggles = Array.from(host!.querySelectorAll('button')).filter(
+        (el) => el.textContent?.includes('View') && el.textContent?.includes('screenshot'),
+      );
+      if (toggles.length === 0) {
+        throw new Error('Expected a "View screenshots" toggle button but none was found');
+      }
+      await act(async () => {
+        (toggles[0] as HTMLButtonElement).click();
+      });
+    });
+  });
+
+  test('renders expanded screenshots for caught entry at 1024px without overflow', async () => {
+    await expectNoOverflowAt(1024, async () => {
+      await renderWith(STATUS_WITH_CAUGHT);
+      const toggles = Array.from(host!.querySelectorAll('button')).filter(
+        (el) => el.textContent?.includes('View') && el.textContent?.includes('screenshot'),
+      );
+      if (toggles.length === 0) {
+        throw new Error('Expected a "View screenshots" toggle button but none was found');
+      }
+      await act(async () => {
+        (toggles[0] as HTMLButtonElement).click();
+      });
+    });
+  });
+
+  test('renders magnitude badge when viewport_shot_entries carries magnitude at 375px without overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      await renderWith(STATUS_WITH_CAUGHT);
+      // Expand screenshots for first caught entry.
+      const toggles = Array.from(host!.querySelectorAll('button')).filter(
+        (el) => el.textContent?.includes('View') && el.textContent?.includes('screenshot'),
+      );
+      if (toggles.length === 0) throw new Error('Expected a "View screenshots" toggle button');
+      await act(async () => { (toggles[0] as HTMLButtonElement).click(); });
+      // Magnitude badge should be visible (23.0% changed).
+      const badge = Array.from(host!.querySelectorAll('span')).find(
+        (el) => el.textContent?.includes('% changed'),
+      );
+      if (!badge) throw new Error('Expected a magnitude badge (e.g. "23.0% changed") but none was found');
+    });
   });
 });

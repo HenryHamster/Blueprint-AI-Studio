@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import uuid
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Query, HTTPException
@@ -25,7 +26,8 @@ from app.shared_state import (
     resolve_project_promotion_enabled,
     runtime_config as _runtime_config,
 )
-from app.release_artifacts import summarize_release_artifacts
+from app.release_artifacts import version_serving_summary as _version_serving_summary
+from app.time_utils import _coerce_naive_utc
 from app import release_version as _release_version
 from app import compute as _compute
 from app.digest_cache import DigestCache
@@ -44,6 +46,47 @@ _agent_serving_shas_cache = DigestCache(default_ttl=300.0, stale_retry_ttl=60.0)
 _version_lifecycle_cache = DigestCache(default_ttl=30.0, stale_retry_ttl=15.0)
 
 _MAX_RETIREMENT_CRITIQUES = 100
+
+
+def _compose_serving_block(
+    aggregate: dict,
+    artifacts: list,
+    version: "ReleaseVersion",
+) -> dict:
+    """Build the resolved serving block from aggregate + artifact evidence.
+
+    Mirrors system_state.compute_system_state so every read site resolves
+    serving state identically: sha from the first confirmed artifact
+    (fallback to the legacy scalar), confirmed_at from that same artifact,
+    failure_reason only when the aggregate status is deploy_failed.
+    """
+    aggregate_status = aggregate.get("serving_status")
+    serving_sha = next(
+        (
+            e["served_identifier"]
+            for e in artifacts
+            if e.get("serving_status") == "serving_confirmed"
+            and e.get("served_identifier") is not None
+        ),
+        getattr(version, "served_sha", None),
+    )
+    confirmed_at = next(
+        (
+            e["served_at"]
+            for e in artifacts
+            if e.get("serving_status") == "serving_confirmed" and e.get("served_at")
+        ),
+        version.served_at.isoformat() if version.served_at else None,
+    )
+    return {
+        "status": aggregate_status,
+        "sha": serving_sha,
+        "confirmed_at": confirmed_at,
+        "failure_reason": aggregate.get("reason_code")
+        if aggregate_status == "deploy_failed"
+        else None,
+        "artifacts": artifacts,
+    }
 
 
 @router.get("/projects/{project_id}/retirement-critiques")
@@ -70,7 +113,8 @@ async def get_retirement_critiques(
                 StrategicCycle.id,
                 StrategicCycle.cycle_metadata,
                 StrategicCycle.created_at,
-            raiseload=True,)
+                raiseload=True,
+            )
         )
         .where(StrategicCycle.project_id == project_id)
         .order_by(StrategicCycle.created_at.desc())
@@ -114,47 +158,100 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
     from app.release_readiness import format_qualification_for_api  # noqa: PLC0415
 
     out = format_qualification_for_api(qual)
-    out.update({
-        "status": qual.get("status"),
-        "confidence": qual.get("confidence"),
-        "threshold": qual.get("threshold"),
-        "sub_scores": qual.get("sub_scores"),
-        "ci_resolution": qual.get("ci_resolution"),
-        "blocker": qual.get("blocker"),
-        "finalized_at": qual.get("finalized_at"),
-        # The candidate commit this qualification was evaluated against. Lets the
-        # operator UI detect when the latest release_audit's findings were computed
-        # against a different (older) commit than the version's evaluated candidate.
-        "candidate_sha": qual.get("candidate_sha"),
-        # Infra-failure context (populated only when status=infra_failure).
-        "error": qual.get("error"),
-        "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
-        # Audit observability: why the audit sub-score is missing/unscoreable.
-        "audit_missing_reason": qual.get("audit_missing_reason"),
-        # Audit reconciliation: model-reported vs findings-derived score delta
-        # and excluded findings count (populated by _compute_audit_reconciliation).
-        "audit_reconciliation": qual.get("audit_reconciliation"),
-    })
+    out.update(
+        {
+            "status": qual.get("status"),
+            "confidence": qual.get("confidence"),
+            "threshold": qual.get("threshold"),
+            "sub_scores": qual.get("sub_scores"),
+            "ci_resolution": qual.get("ci_resolution"),
+            "blocker": qual.get("blocker"),
+            "finalized_at": qual.get("finalized_at"),
+            # The candidate commit this qualification was evaluated against. Lets the
+            # operator UI detect when the latest release_audit's findings were computed
+            # against a different (older) commit than the version's evaluated candidate.
+            "candidate_sha": qual.get("candidate_sha"),
+            # Infra-failure context (populated only when status=infra_failure).
+            "error": qual.get("error"),
+            "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
+            # Audit observability: why the audit sub-score is missing/unscoreable.
+            "audit_missing_reason": qual.get("audit_missing_reason"),
+            # Audit reconciliation: model-reported vs findings-derived score delta
+            # and excluded findings count (populated by _compute_audit_reconciliation).
+            "audit_reconciliation": qual.get("audit_reconciliation"),
+        }
+    )
     return out
 
 
-def _version_serving_summary(version: ReleaseVersion) -> tuple[dict[str, Any], list[dict]]:
-    aggregate, artifacts = summarize_release_artifacts(
-        version,
-        getattr(version, "deploy_artifacts", None),
+def _closed_version_until(version: ReleaseVersion) -> Optional[datetime]:
+    """Return the upper-bound timestamp for a closed version's merged-task window.
+
+    For promoted versions returns ``promoted_at``.  For abandoned versions
+    returns the ``abandoned_at`` ISO string stored in ``last_qualification``.
+    Returns ``None`` for open versions (unbounded window).
+    """
+    if version.status == "promoted" and version.promoted_at is not None:
+        return version.promoted_at
+    if version.status == "abandoned":
+        lq = version.last_qualification or {}
+        raw = lq.get("abandoned_at")
+        if isinstance(raw, str):
+            try:
+                # _coerce_naive_utc converts any stored offset (including a
+                # 'Z'-suffix from a tz-aware writer) to naive UTC rather than
+                # dropping it, keeping the window bound consistent with the
+                # naive-UTC timestamps the merged-task queries compare against.
+                return _coerce_naive_utc(datetime.fromisoformat(raw))
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+async def _serialize_version_history_entry(
+    version: ReleaseVersion,
+    project: Optional[Any] = None,
+    *,
+    session: Optional[AsyncSession] = None,
+    project_id: Optional[uuid.UUID] = None,
+) -> dict[str, Any]:
+    from app.release_version import (  # noqa: PLC0415
+        count_merged_since,
+        compute_version_acceptance_aggregate,
     )
-    return aggregate, artifacts
 
+    aggregate, artifacts = _version_serving_summary(version, project)
 
-def _serialize_version_history_entry(version: ReleaseVersion) -> dict[str, Any]:
-    aggregate, artifacts = _version_serving_summary(version)
+    # Enrich each history entry with the same server-computed highlights and
+    # merged counts the per-version summary endpoint produces, bounded by the
+    # closed-version window so later-version merges are not double-counted.
+    highlights: Optional[dict[str, Any]] = None
+    merged_count: Optional[int] = None
+    merged_task_count: Optional[int] = None
+    acceptance_aggregate: Optional[dict[str, Any]] = None
+    if session is not None and project_id is not None:
+        version_until = _closed_version_until(version)
+        merged_count = await count_merged_since(
+            session, project_id, version.opened_at, until=version_until
+        )
+        merged_task_count = merged_count
+        acceptance_aggregate = await compute_version_acceptance_aggregate(
+            session, project_id, since=version.opened_at, until=version_until
+        )
+        highlights = _release_version.build_version_highlights(
+            version,
+            merged_count=merged_count,
+            aggregate_serving_status=aggregate["serving_status"],
+            acceptance_aggregate=acceptance_aggregate,
+        )
+
     return {
+        "id": str(version.id),
         "version_number": version.version_number,
         "status": version.status,
+        "phase": version.phase,
         "opened_at": version.opened_at.isoformat(),
-        "promoted_at": version.promoted_at.isoformat()
-        if version.promoted_at
-        else None,
+        "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
         "qualification_attempts": version.qualification_attempts,
         "last_qualification": _format_qualification(version.last_qualification)
         if version.last_qualification
@@ -171,6 +268,7 @@ def _serialize_version_history_entry(version: ReleaseVersion) -> dict[str, Any]:
         "aggregate_serving_status": aggregate["serving_status"],
         "aggregate_deploy_failure_reason": aggregate["reason_code"],
         "artifacts": artifacts,
+        "serving": _compose_serving_block(aggregate, artifacts, version),
         "qualification_state": _release_version.summarize_qualification_state(
             version.last_qualification,
             version.serving_status,
@@ -198,6 +296,14 @@ def _serialize_version_history_entry(version: ReleaseVersion) -> dict[str, Any]:
         # this version outside the normal qualification flow. Degrades gracefully
         # when the model column is absent (sibling PR not yet on this branch).
         "out_of_band_promotion": getattr(version, "out_of_band_promotion", None),
+        # Server-computed highlights (headline + metrics) — additive; null when
+        # session/project_id not provided (older callers degrade gracefully).
+        "highlights": highlights,
+        # Merged-task count for this version's window (both keys for consistency:
+        # current_version uses merged_task_count, summary endpoint uses merged_count).
+        "merged_count": merged_count,
+        "merged_task_count": merged_task_count,
+        "acceptance_aggregate": acceptance_aggregate,
     }
 
 
@@ -353,6 +459,7 @@ async def get_version_lifecycle(
     from app.release_version import (  # noqa: PLC0415
         count_merged_since,
         count_in_flight_tasks,
+        list_merged_tasks_for_version,
     )
     from app.release_qualifier import (  # noqa: PLC0415
         compute_promotion_readiness,
@@ -372,7 +479,9 @@ async def get_version_lifecycle(
         project_row = (
             await session.execute(select(Project).where(Project.id == project_id))
         ).scalar_one_or_none()
-        _, promotion_policy_source, promotion_policy_error = _resolve_policy_with_provenance()
+        _, promotion_policy_source, promotion_policy_error = (
+            _resolve_policy_with_provenance()
+        )
 
         open_row = (
             (
@@ -416,10 +525,17 @@ async def get_version_lifecycle(
 
         current_version_out: Optional[Dict[str, Any]] = None
         if open_row is not None:
-            merged_count = await count_merged_since(session, project_id, open_row.opened_at)
+            merged_count = await count_merged_since(
+                session, project_id, open_row.opened_at
+            )
             in_flight_count = await count_in_flight_tasks(session, project_id)
+            tasks_merged = await list_merged_tasks_for_version(
+                session, project_id, open_row.opened_at
+            )
             qual = open_row.last_qualification or {}
-            aggregate_serving, artifact_evidence = _version_serving_summary(open_row)
+            aggregate_serving, artifact_evidence = _version_serving_summary(
+                open_row, project_row
+            )
             acceptance_aggregate = None
             if isinstance(qual, dict):
                 acceptance_aggregate = qual.get("acceptance_aggregate")
@@ -496,6 +612,18 @@ async def get_version_lifecycle(
                 # replacing it). Computed/stored by the acceptance layer; ``None`` on
                 # legacy open versions that predate the aggregate.
                 "acceptance_aggregate": acceptance_aggregate,
+                # Human-readable what's-new headline + at-a-glance metrics, built by
+                # the SAME shared helper the per-version summary endpoint uses so the
+                # current (open) version renders an identical headline. Additive and
+                # derived from data already loaded above — no extra I/O. The 'serving'
+                # word in the headline derives from the aggregate serving status, not
+                # the scalar serving_status column.
+                "highlights": _release_version.build_version_highlights(
+                    open_row,
+                    merged_count=merged_count,
+                    aggregate_serving_status=aggregate_serving["serving_status"],
+                    acceptance_aggregate=acceptance_aggregate,
+                ),
                 # Tasks merged AT/AFTER the last qualification verdict's finalized_at
                 # (verdict-staleness signal). None when no verdict/finalized_at.
                 "merged_since_verdict": merged_since_verdict,
@@ -543,13 +671,22 @@ async def get_version_lifecycle(
                 "aggregate_serving_status": aggregate_serving["serving_status"],
                 "aggregate_deploy_failure_reason": aggregate_serving["reason_code"],
                 "artifacts": artifact_evidence,
+                "serving": _compose_serving_block(
+                    aggregate_serving, artifact_evidence, open_row
+                ),
                 "deploy_confirm_deadline": open_row.deploy_confirm_deadline.isoformat()
                 if open_row.deploy_confirm_deadline
                 else None,
                 # Out-of-band promotion provenance (nullable). Non-null only when an
                 # operator force-merged this version outside normal qualification flow.
                 # Degrades gracefully when the model column is absent on this branch.
-                "out_of_band_promotion": getattr(open_row, "out_of_band_promotion", None),
+                "out_of_band_promotion": getattr(
+                    open_row, "out_of_band_promotion", None
+                ),
+                # Per-task changelog for this version window: type, title, and PR
+                # number for each merged task, newest-first. Allows operators to see
+                # exactly what shipped without manual release notes.
+                "tasks_merged": tasks_merged,
             }
 
         history_rows = (
@@ -579,11 +716,20 @@ async def get_version_lifecycle(
             session, project_id
         )
 
+        recent_versions = []
+        for version in history_rows:
+            recent_versions.append(
+                await _serialize_version_history_entry(
+                    version,
+                    project_row,
+                    session=session,
+                    project_id=project_id,
+                )
+            )
+
         return {
             "current_version": current_version_out,
-            "recent_versions": [
-                _serialize_version_history_entry(version) for version in history_rows
-            ],
+            "recent_versions": recent_versions,
             "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
             # Per-project live-promotion enablement. ``promotion_enabled_effective``
             # is the value the promotion gate actually consults for THIS project (the
@@ -591,7 +737,9 @@ async def get_version_lifecycle(
             # is the explicit per-project value (None when the project rides the fleet
             # default), and ``promotion_enabled_source`` tells the operator which one
             # is in effect.
-            "promotion_enabled_effective": resolve_project_promotion_enabled(project_id),
+            "promotion_enabled_effective": resolve_project_promotion_enabled(
+                project_id
+            ),
             "promotion_enabled_override": promotion_enabled_by_project_map().get(
                 str(project_id)
             ),
@@ -680,7 +828,10 @@ async def set_version_phase(
     _qual_state = _release_version.summarize_qualification_state(
         open_ver.last_qualification
     )
-    if _qual_state and _qual_state.get("state") in _release_version.PROMOTION_BLOCKING_STATES:
+    if (
+        _qual_state
+        and _qual_state.get("state") in _release_version.PROMOTION_BLOCKING_STATES
+    ):
         if _qual_state.get("state") == "promotion_check_wait":
             detail = (
                 "a migration-carrying promotion PR is open and waiting for "
@@ -771,9 +922,7 @@ async def set_version_goal(
         )
 
     operator_id = current_user.get("email") or current_user["user_id"]
-    _release_version.set_version_goal(
-        open_ver, payload.goal, editor_id=operator_id
-    )
+    _release_version.set_version_goal(open_ver, payload.goal, editor_id=operator_id)
     session.add(open_ver)
     await session.commit()
     await session.refresh(open_ver)
@@ -1064,6 +1213,123 @@ async def list_qualification_verdicts(
     }
 
 
+@router.get("/projects/{project_id}/release-versions/{version_number}/summary")
+async def get_version_summary(
+    project_id: uuid.UUID,
+    version_number: int,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return a synthesized 'what's new' summary for a single release version.
+
+    Viewer+ role required.  Keyed by the per-project ``version_number`` that the
+    UI already displays.  Returns 404 when no matching version row exists for this
+    project.
+
+    Returns the same window-bounded payload as GET /release-versions/{id}/summary
+    (the UUID endpoint) — including tasks_merged changelog, structured highlights
+    dict, qualification_state, and serving fields — so the CLI fallback path for
+    older versions receives the same rich data as the admin UI.
+
+    Backward-compat alias: ``merged_task_count`` mirrors ``merged_count``.
+    """
+    from app.release_version import (  # noqa: PLC0415
+        count_merged_since,
+        compute_version_acceptance_aggregate,
+        list_merged_tasks_for_version,
+    )
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+
+    version = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.version_number == version_number,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if version is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Release version {version_number} not found for this project.",
+        )
+
+    # Bound closed versions to their own span so tasks that merged in a later
+    # version are not counted here.  Open versions have no upper bound (until=None).
+    version_until = _closed_version_until(version)
+    merged_count = await count_merged_since(
+        session, project_id, version.opened_at, until=version_until
+    )
+    tasks_merged = await list_merged_tasks_for_version(
+        session, project_id, version.opened_at, until=version_until
+    )
+    acceptance_aggregate = await compute_version_acceptance_aggregate(
+        session, project_id, since=version.opened_at, until=version_until
+    )
+
+    aggregate_serving, artifacts = _version_serving_summary(version, project)
+
+    qualification_state = _release_version.summarize_qualification_state(
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
+        aggregate_serving_status=aggregate_serving["serving_status"],
+        aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
+        artifact_evidence=artifacts,
+    )
+
+    highlights = _release_version.build_version_highlights(
+        version,
+        merged_count=merged_count,
+        aggregate_serving_status=aggregate_serving["serving_status"],
+        acceptance_aggregate=acceptance_aggregate,
+    )
+
+    return {
+        # Version identity
+        "version_number": version.version_number,
+        "phase": version.phase,
+        "status": version.status,
+        "goal": version.goal,
+        # Timestamps (isoformat, null-safe)
+        "opened_at": version.opened_at.isoformat() if version.opened_at else None,
+        "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
+        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "phase_changed_at": version.phase_changed_at.isoformat()
+        if version.phase_changed_at
+        else None,
+        # Merged work
+        "merged_count": merged_count,
+        "merged_task_count": merged_count,  # backward-compat alias
+        "acceptance_aggregate": acceptance_aggregate,
+        # Qualification
+        "qualification_state": qualification_state,
+        "qualification_attempts": version.qualification_attempts,
+        # Serving fields
+        "serving_status": version.serving_status,
+        "served_sha": version.served_sha,
+        "deploy_failure_reason": version.deploy_failure_reason,
+        "aggregate_serving_status": aggregate_serving["serving_status"],
+        "artifacts": artifacts,
+        "serving": _compose_serving_block(aggregate_serving, artifacts, version),
+        # Human-readable summary for display/CLI
+        "highlights": highlights,
+        # Per-task changelog
+        "tasks_merged": tasks_merged,
+        # Legacy fields
+        "promoted_sha": version.promoted_sha,
+    }
+
+
 class _ClearDeployFailedBody(BaseModel):
     # Operator override: clear a stale deploy_failed even when the live serving
     # SHA is unobservable (the pre-Cloud-Run-API interim). Without it, the clear
@@ -1142,20 +1408,25 @@ async def clear_deploy_failed(
     from app.time_utils import _utcnow  # noqa: PLC0415
 
     version = None
+    project_row = await session.get(Project, project_id)
     promoted_versions = (
-        await session.execute(
-            select(ReleaseVersion)
-            .options(selectinload(ReleaseVersion.deploy_artifacts))
-            .where(
-                ReleaseVersion.project_id == project_id,
-                ReleaseVersion.status == "promoted",
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "promoted",
+                )
+                .order_by(ReleaseVersion.promoted_at.desc())
+                .limit(20)
             )
-            .order_by(ReleaseVersion.promoted_at.desc())
-            .limit(20)
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for candidate in promoted_versions:
-        aggregate, _ = _version_serving_summary(candidate)
+        aggregate, _ = _version_serving_summary(candidate, project_row)
         if (
             candidate.serving_status == "deploy_failed"
             or aggregate["serving_status"] == "deploy_failed"
@@ -1172,6 +1443,13 @@ async def clear_deploy_failed(
             status_code=404,
             detail="No promoted version in deploy_failed state for this project.",
         )
+
+    version_id = version.id
+
+    # Release the row lock before network I/O, following the established reconcile
+    # pattern in release_reconciliation.py.  The session uses expire_on_commit=False
+    # so version attrs remain accessible after the commit.
+    await session.commit()
 
     now = _utcnow()
     (
@@ -1205,16 +1483,11 @@ async def clear_deploy_failed(
         and backend_artifact.serving_status == "serving_confirmed"
         and backend_artifact.served_identifier is not None
     ):
-        # Independently confirmed serving — clear with the OBSERVED served SHA.
-        await _recover_serving_confirmed(
-            session,
-            version,
-            backend_artifact.served_identifier,
-            backend_artifact.served_at,
-            now,
-        )
         clear_mode = "verified"
         attestation_reason = None
+        # Capture before expire_all() invalidates the identity-map entry.
+        verified_served_identifier = backend_artifact.served_identifier
+        verified_served_at = backend_artifact.served_at
     else:
         # Force override is ONLY valid when the failure reason is
         # serving_sha_unobservable: a revision went STABLE but the live SHA
@@ -1260,6 +1533,41 @@ async def clear_deploy_failed(
                 status_code=400,
                 detail="A force clear requires a non-empty operator reason.",
             )
+        clear_mode = "operator_attested"
+
+    # Re-acquire the row lock for the write phase.  All validation is complete;
+    # _recover_serving_confirmed requires an already-locked session.
+    # Expire the identity-map copy before re-locking so we evaluate current DB
+    # state, not the cached pre-I/O instance (matches reconcile pattern in
+    # release_reconciliation.py lines 208-224).
+    session.expire_all()
+    version = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(ReleaseVersion.id == version_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    if version is None:
+        raise HTTPException(status_code=404, detail="Release version not found.")
+
+    if clear_mode == "verified":
+        # Independently confirmed serving — clear with the OBSERVED served SHA.
+        # Use pre-captured locals: backend_artifact was expired by expire_all().
+        await _recover_serving_confirmed(
+            session,
+            version,
+            verified_served_identifier,
+            verified_served_at,
+            now,
+        )
+    else:
         # Operator attestation: clear using the promoted SHA as the served SHA and
         # record the provenance in the durable audit trail.
         await _recover_serving_confirmed(
@@ -1268,7 +1576,6 @@ async def clear_deploy_failed(
         _record_deploy_failed_clear_attestation(
             version, operator_id, attestation_reason, now
         )
-        clear_mode = "operator_attested"
 
     await session.commit()
     await session.refresh(version)
@@ -1281,4 +1588,108 @@ async def clear_deploy_failed(
         "clear_mode": clear_mode,
         "operator_attested": clear_mode == "operator_attested",
         "attestation_reason": attestation_reason,
+    }
+
+
+@router.get("/release-versions/{version_id}/summary")
+async def get_release_version_summary(
+    version_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return a structured 'what's new' summary for a single release version.
+
+    Works for any version status (open, promoted, or abandoned). Synthesizes
+    merged-work count, acceptance quality, qualification state, and a human-
+    readable headline into a single response — no need to stitch several
+    existing endpoints together.
+
+    Access is enforced per the owning project (viewer role or above).
+    """
+    from app.release_version import (  # noqa: PLC0415
+        count_merged_since,
+        compute_version_acceptance_aggregate,
+        list_merged_tasks_for_version,
+    )
+
+    version = (
+        await session.execute(
+            select(ReleaseVersion)
+            .options(selectinload(ReleaseVersion.deploy_artifacts))
+            .where(ReleaseVersion.id == version_id)
+        )
+    ).scalar_one_or_none()
+
+    if version is None:
+        raise HTTPException(status_code=404, detail="Release version not found.")
+
+    project = await _get_user_project_with_role(
+        version.project_id, current_user["user_id"], session, min_role="viewer"
+    )
+
+    # Bound closed versions to their own span so tasks that merged in a later
+    # version are not counted here.  Open versions have no upper bound (until=None).
+    version_until = _closed_version_until(version)
+    merged_count = await count_merged_since(
+        session, version.project_id, version.opened_at, until=version_until
+    )
+    tasks_merged = await list_merged_tasks_for_version(
+        session, version.project_id, version.opened_at, until=version_until
+    )
+    acceptance_aggregate = await compute_version_acceptance_aggregate(
+        session, version.project_id, since=version.opened_at, until=version_until
+    )
+
+    aggregate_serving, artifacts = _version_serving_summary(version, project)
+
+    qualification_state = _release_version.summarize_qualification_state(
+        version.last_qualification,
+        version.serving_status,
+        version.deploy_failure_reason,
+        aggregate_serving_status=aggregate_serving["serving_status"],
+        aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
+        artifact_evidence=artifacts,
+    )
+
+    # Derive highlights from the data above — no extra I/O. Shared helper so the
+    # version-lifecycle current_version block renders an identical headline; the
+    # 'serving' determination is driven off the aggregate serving status, not the
+    # scalar serving_status column.
+    highlights = _release_version.build_version_highlights(
+        version,
+        merged_count=merged_count,
+        aggregate_serving_status=aggregate_serving["serving_status"],
+        acceptance_aggregate=acceptance_aggregate,
+    )
+
+    return {
+        # Version identity
+        "version_number": version.version_number,
+        "phase": version.phase,
+        "status": version.status,
+        "goal": version.goal,
+        # Timestamps (isoformat, null-safe)
+        "opened_at": version.opened_at.isoformat() if version.opened_at else None,
+        "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
+        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "phase_changed_at": version.phase_changed_at.isoformat()
+        if version.phase_changed_at
+        else None,
+        # Merged work
+        "merged_count": merged_count,
+        "acceptance_aggregate": acceptance_aggregate,
+        # Qualification state
+        "qualification_state": qualification_state,
+        # Serving fields
+        "serving_status": version.serving_status,
+        "served_sha": version.served_sha,
+        "deploy_failure_reason": version.deploy_failure_reason,
+        "aggregate_serving_status": aggregate_serving["serving_status"],
+        "artifacts": artifacts,
+        "serving": _compose_serving_block(aggregate_serving, artifacts, version),
+        # Human-readable summary for display/CLI
+        "highlights": highlights,
+        # Per-task changelog: type, title, and PR number for each merged task,
+        # newest-first. Allows operators and the CLI to see what shipped.
+        "tasks_merged": tasks_merged,
     }

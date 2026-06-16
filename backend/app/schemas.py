@@ -7,8 +7,9 @@ from typing import Any, Dict, List, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.failure_classification import _CRED_FIELD_RE, _CRED_REDACT_SUBS
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
-from app.payload_schemas import RepoBootstrapOverview
+from app.payload_schemas import RepoDomainOverview, RepoBootstrapOverview
 from app.task_blocked import (
     NEED_KINDS,
     NEED_LABEL_MAX_LEN,
@@ -288,6 +289,11 @@ class AgentStatusPayload(BaseModel):
     # today (older agents omit it, and completion degrades command memory to
     # "unknown" rather than claiming success).
     command_memory: CommandMemoryOutcome | None = None
+    # Optional product-domain overview extracted from README/docs during
+    # repo_bootstrap. Persisted into task.context["domain_overview"] by the
+    # status endpoint, then upserted as a KnowledgeDocument by the completion
+    # handler. Absent payloads are a clean no-op — domain capture is best-effort.
+    domain_overview: RepoDomainOverview | None = None
 
     @field_validator("blocked_need", mode="before")
     @classmethod
@@ -499,6 +505,33 @@ _BEARER_LIKE_RE = re.compile(
     r"\s*[=:]\s*\S+",
 )
 _RPC_MSG_SAFE_LIMIT = 400
+# Matches ``Bearer <token>`` (space-separated) — _BEARER_LIKE_RE only handles
+# ``keyword=value`` / ``keyword: value`` forms and would leave the actual token
+# value dangling when the full form is ``Authorization: Bearer <token>``.
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+\S+")
+_ENV_EXPORT_RE = re.compile(r"(?i)export\s+\w+=\S+")
+
+
+def redact_command_log_text(text: str) -> str:
+    """Redact credential-bearing patterns from command stdout/stderr text.
+
+    Applies the broad _CRED_REDACT_SUBS table (bare GitHub tokens, Anthropic/
+    OpenAI/Google API keys, JWTs, embedded git-URL credentials, etc.) first,
+    then the URL-query, bearer-token, and shell-export scrubbers used for RPC
+    diagnostics — so raw stdout/stderr never reaches operator-facing surfaces
+    or KnowledgeDocuments with credentials intact.
+    """
+    for pattern, replacement in _CRED_REDACT_SUBS:
+        text = pattern.sub(replacement, text)
+    text = _CRED_FIELD_RE.sub(r"\1***\3", text)
+    text = _URL_QUERY_RE.sub("?[redacted]", text)
+    # Apply Bearer-value pattern BEFORE _BEARER_LIKE_RE so that
+    # ``Authorization: Bearer TOKEN`` loses TOKEN before the header itself
+    # is collapsed — otherwise TOKEN survives as a dangling word.
+    text = _BEARER_TOKEN_RE.sub("Bearer [redacted]", text)
+    text = _BEARER_LIKE_RE.sub(r"\1=[redacted]", text)
+    text = _ENV_EXPORT_RE.sub("[export redacted]", text)
+    return text
 
 
 def sanitize_rpc_diagnostic(raw: Dict[str, Any] | None) -> Dict[str, Any] | None:
@@ -546,6 +579,15 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
     if isinstance(metadata, dict):
         for key in _POLLING_METADATA_LAUNCH_SPEC_KEYS:
             metadata.pop(key, None)
+
+    # Redact credential-bearing patterns from command_log text so raw stdout/stderr
+    # captured on the VM never reaches operator-facing API responses.
+    if isinstance(metadata, dict):
+        command_log = metadata.get("command_log")
+        if isinstance(command_log, dict) and isinstance(command_log.get("text"), str):
+            command_log = dict(command_log)
+            command_log["text"] = redact_command_log_text(command_log["text"])
+            metadata["command_log"] = command_log
 
     # Sanitize the promoted diagnostic — may carry raw provider exception text
     # with signed URLs or credential values.  Overwrite both the top-level
@@ -761,6 +803,11 @@ class ResourceEnvelope(BaseModel):
     spend_ceiling_usd: float | None = Field(None, gt=0)
     # Rolling window length in days for spend aggregation. Default 30.
     spend_window_days: int = Field(30, ge=1)
+    # Maximum concurrent compute jobs allowed for this project (stored in runtime_config).
+    max_concurrent_compute_jobs: int | None = Field(None, ge=1)
+    # Fraction of spend_ceiling_usd at which to fire a proactive approaching-ceiling alert.
+    # e.g. 0.8 fires when rolling spend reaches 80% of the ceiling. Default 0.8 when absent.
+    spend_warning_fraction: float | None = Field(None, gt=0, le=1)
 
 
 class BuildConfig(BaseModel):
@@ -834,6 +881,16 @@ class BuildConfig(BaseModel):
     # round-trip unchanged. This is detection/guidance only — it never auto-flips
     # ``requires_ci_checks``.
     has_ci: bool | None = None
+    # Per-project, DEFAULT-OFF opt-in policy for external no-CI repos. When ON,
+    # the no-CI merge gate BLOCKS a PR (holds it open) instead of merging it
+    # UNVERIFIED whenever the gate EXPECTED to verify the code but could NOT run
+    # the repo's suite — i.e. a DEGRADED fall-open reason (see
+    # ``ci_resolution.DEGRADED_UNVERIFIED_REASONS``). Benign fall-opens (there
+    # was honestly nothing to verify) still merge UNVERIFIED exactly as today.
+    # Absent/False == today's behavior for every existing project, so this is
+    # fully additive and backward-compatible; onboarding never turns it on.
+    # Read by ``ci_resolution.should_block_degraded_unverified_merge``.
+    block_degraded_unverified_merge: bool = False
     # Per-project alembic versions directory path. None means "use the project default".
     # NOTE: this single string feeds only the backend-side migration-file guard;
     # it is NOT the agent's full layout resolver — see ``migration`` below.

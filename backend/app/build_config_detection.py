@@ -13,9 +13,18 @@ import cycle.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+# In-memory per-project cooldown for expensive tree-walk re-detections.
+# Keyed by str(project.id); value = monotonic timestamp of last attempt.
+# Resets on process restart (rare, acceptable: burn is measured in minutes).
+_redetect_no_test_cooldown: Dict[str, float] = {}
+_redetect_empty_cooldown: Dict[str, float] = {}
+# 6-hour window: a no-test repo walks the tree at most once per window.
+_REDETECT_COOLDOWN_S: float = 6 * 3600.0
 
 
 def _normalize_dir_path(path: Any) -> str:
@@ -217,6 +226,15 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
         ):
             return False
 
+        # Cooldown: avoid repeated BFS walks within the same window.
+        _proj_id_key = str(getattr(project, "id", None) or "")
+        _now_mono = time.monotonic()
+        _last_attempt = _redetect_empty_cooldown.get(_proj_id_key)
+        if _last_attempt is not None and (_now_mono - _last_attempt) < _REDETECT_COOLDOWN_S:
+            return False
+        if _proj_id_key:
+            _redetect_empty_cooldown[_proj_id_key] = _now_mono
+
         from pydantic import ValidationError
         from sqlalchemy.orm.attributes import flag_modified
 
@@ -286,6 +304,9 @@ async def maybe_redetect_missing_test_command(project, session, *, ref=None) -> 
     it never competes with that path) and the project currently has no
     detectable test command.
 
+    A 6-hour in-memory cooldown prevents the BFS tree walk from re-running on
+    every orchestrator cycle for repos that genuinely have no test command.
+
     Returns True iff re-detection found a test command and persisted it.
     Best-effort: never raises into the caller; logs, rolls back the session on
     failure, and returns False.
@@ -300,6 +321,30 @@ async def maybe_redetect_missing_test_command(project, session, *, ref=None) -> 
         if not getattr(project, "github_owner", None) or not getattr(
             project, "github_repo", None
         ):
+            return False
+
+        # Cooldown: skip if last attempt was within _REDETECT_COOLDOWN_S.
+        # Prevents the BFS tree walk from firing on every orchestrator cycle
+        # for repos that genuinely have no test command.
+        _proj_id_key = str(getattr(project, "id", None) or "")
+        _now_mono = time.monotonic()
+        _last_attempt = _redetect_no_test_cooldown.get(_proj_id_key)
+        if _last_attempt is not None and (_now_mono - _last_attempt) < _REDETECT_COOLDOWN_S:
+            return False
+        # Stamp before any API call so concurrent callers in the same window
+        # skip rather than duplicate the expensive walk.
+        if _proj_id_key:
+            _redetect_no_test_cooldown[_proj_id_key] = _now_mono
+
+        # Quota reserve: skip when the install-bucket is near exhaustion so
+        # advisory re-detection never starves critical PR/merge/CI machinery.
+        from app.github_repo_snapshot import _quota_reserve_active
+
+        if _quota_reserve_active():
+            logger.debug(
+                "[BUILD_CONFIG] Skipping no-test redetect for project %s — quota reserve active",
+                getattr(project, "id", None),
+            )
             return False
 
         from app import ci_resolution
@@ -363,6 +408,105 @@ async def maybe_redetect_missing_test_command(project, session, *, ref=None) -> 
         logger.warning(
             "[BUILD_CONFIG] Re-detection of missing test command failed for "
             "project %s; leaving config unchanged",
+            getattr(project, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 — keep the caller's session usable
+            pass
+        return False
+
+
+async def maybe_redetect_ci_presence(project, session, *, ref=None) -> bool:
+    """Best-effort re-detection of CI presence for a project whose stored
+    ``build_config.has_ci`` is None/absent.
+
+    A stale ``has_ci=None`` (onboarding detection was incomplete, or the project
+    predates the ``has_ci`` tri-state) makes :func:`ci_resolution.proceed_on_no_checks`
+    return False, so a project that genuinely has no CI strands every
+    main-targeting PR forever — the no-checks poll never resolves and each rollup
+    must be hand-merged.  This helper attempts a single bounded re-detection using
+    the same detector and operator-override-preserving path as
+    :func:`maybe_redetect_missing_test_command`, then persists the freshly-detected
+    ``has_ci`` so ``proceed_on_no_checks`` can resolve the strand on this or the
+    next poll.  Because it self-backfills stuck projects on the next poll, a
+    separate data-migration backfill is unnecessary.
+
+    Fires ONLY when stored ``has_ci`` is None/absent; a project that already
+    carries a DEFINITIVE ``has_ci`` (True or False) is left untouched.  Persists
+    ONLY when re-detection yields a definitive ``has_ci`` (True or False) — a
+    still-incomplete read (``has_ci`` None) leaves the config unchanged so a
+    guessed value is never recorded and the strand keeps polling.
+
+    Returns True iff re-detection yielded a definitive ``has_ci`` and persisted it.
+    Best-effort: never raises into the caller; logs, rolls back the session on
+    failure, and returns False.
+    """
+    try:
+        existing = project.build_config or {}
+        # Only fire for a stale/absent tri-state; never overwrite a definitive
+        # has_ci (True or False) already on the config.
+        if existing.get("has_ci") is not None:
+            return False
+        if not getattr(project, "github_owner", None) or not getattr(
+            project, "github_repo", None
+        ):
+            return False
+
+        from pydantic import ValidationError
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.github import get_repo_installation_token
+        from app.routers.admin_onboard import _detect_build_config
+        from app.schemas import BuildConfig as BuildConfigSchema
+        from app.shared_state import get_project_integration_branch
+
+        integration_branch = ref or get_project_integration_branch(project)
+
+        token = await get_repo_installation_token(
+            project.github_owner, project.github_repo
+        )
+        if not token:
+            return False
+
+        detected = await _detect_build_config(
+            token,
+            project.github_owner,
+            project.github_repo,
+            ref=integration_branch,
+        )
+        if not detected:
+            return False
+
+        detected = apply_operator_build_config_overrides(detected, existing)
+
+        # Only persist when detection produced a DEFINITIVE has_ci. A still
+        # incomplete read (has_ci None) must not overwrite the stored config —
+        # the strand keeps polling rather than recording a guessed value.
+        if detected.get("has_ci") is None:
+            return False
+
+        try:
+            validated = BuildConfigSchema(**detected)
+            project.build_config = validated.model_dump(exclude_none=True)
+        except ValidationError:
+            # Detection produced a shape the schema rejects — store raw so the
+            # operator can fix it in the UI (mirrors the manual re-detect path).
+            project.build_config = detected
+        flag_modified(project, "build_config")
+        await session.commit()
+        logger.info(
+            "[BUILD_CONFIG] Re-detected CI presence for project %s (has_ci=%s) — "
+            "no-CI strand can now resolve",
+            getattr(project, "id", None),
+            detected.get("has_ci"),
+        )
+        return True
+    except Exception:  # noqa: BLE001 — best-effort, must never block a merge path
+        logger.warning(
+            "[BUILD_CONFIG] CI-presence re-detection failed for project %s; "
+            "leaving config unchanged",
             getattr(project, "id", None),
             exc_info=True,
         )

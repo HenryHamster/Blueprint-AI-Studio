@@ -21,6 +21,7 @@ vi.mock('../api', () => ({
   fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
   resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
   resolveViewportFailureDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport/screenshot.png'),
+  resolveViewportShotDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport/shot.png'),
   fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
 }));
 

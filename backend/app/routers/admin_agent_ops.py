@@ -82,6 +82,7 @@ from app.task_capabilities import (
 )
 from app.auth import require_admin
 from app.task_locking import (
+    DESIGN_DOC_MAX_BYTES,
     lock_project_or_429 as _lock_project_or_429,
     with_directions_locked as _with_directions_locked,
 )
@@ -220,7 +221,7 @@ async def update_design_doc(
             )
         doc[key] = payload.value
         total_size = len(_json.dumps(doc))
-        if total_size > 500_000:
+        if total_size > DESIGN_DOC_MAX_BYTES:
             del doc[key]  # rollback
             raise HTTPException(
                 status_code=400,

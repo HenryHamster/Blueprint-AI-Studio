@@ -205,7 +205,7 @@ export interface CapabilityTrialVerdict {
   };
   accumulation_basis?: string;
   arm_composition?: { with_assigned?: number; with_receipt?: number; without_assigned?: number; without_receipt?: number; without_contaminated?: number };
-  accrual_projection?: { with_7d?: number; without_7d?: number; window_days?: number; holdback_fraction?: number; days_to_min_n?: number | null };
+  accrual_projection?: { with_7d?: number; without_7d?: number; window_days?: number; holdback_fraction?: number; days_to_min_n?: number | null; alternative_projections?: Record<string, number | null> };
   lane_relay_comparison?: LaneRelayComparison | null;
 }
 

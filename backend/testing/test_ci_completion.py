@@ -4088,3 +4088,416 @@ async def test_no_precomputed_guard_calls_enforce_inline(db_session, mocker):
     )
 
     guard_mock.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Onboarding-proof: first merge-gate terminal verdict stamp
+#
+# Verifies the truthfulness invariant wired at the merge-success site:
+#   * a verified merge (no unverified_merge_reason) stamps
+#     first_merge_gate_executed_tests = True and no fall-open reason;
+#   * an unverified merge (gate fell open) stamps
+#     first_merge_gate_executed_tests = False AND the honest reason;
+#   * the stamp is idempotent — a later verdict never overwrites the first.
+# ---------------------------------------------------------------------------
+
+
+def _patch_merge_success(mocker):
+    """Patch the merge hot path so a single merge call lands successfully."""
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_unverified_merge_alert",
+        AsyncMock(return_value=None),
+    )
+    return mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True, "sha": "deadbeef"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_merge_gate_verdict_stamped_when_real_tests_executed(
+    db_session, mocker
+):
+    """A verified merge (no unverified reason) stamps executed_tests=True."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    _patch_merge_success(mocker)
+
+    project = Project(name="gate verdict verified", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    bc = project.build_config or {}
+    assert bc.get("first_merge_gate_verdict_at") is not None
+    assert bc.get("first_merge_gate_executed_tests") is True
+    # No fall-open reason recorded when the gate ran real tests.
+    assert bc.get("first_merge_gate_unverified_reason") is None
+
+
+@pytest.mark.asyncio
+async def test_first_merge_gate_verdict_stamped_false_when_gate_fell_open(
+    db_session, mocker
+):
+    """An unverified merge stamps executed_tests=False AND the honest reason."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    _patch_merge_success(mocker)
+
+    project = Project(name="gate verdict unverified", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"unverified_merge_reason": "no_test_command"},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    bc = project.build_config or {}
+    assert bc.get("first_merge_gate_verdict_at") is not None
+    # Truthfulness invariant: gate fell open ⇒ executed_tests must be False.
+    assert bc.get("first_merge_gate_executed_tests") is False
+    assert bc.get("first_merge_gate_unverified_reason") == "no_test_command"
+
+
+@pytest.mark.asyncio
+async def test_first_merge_gate_verdict_is_idempotent(db_session, mocker):
+    """A later verdict never overwrites the first stamp's truthful values."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    _patch_merge_success(mocker)
+
+    # Pre-stamp a prior VERIFIED verdict; the merge below carries an unverified
+    # reason. Idempotency must preserve the original True verdict and timestamp.
+    project = Project(
+        name="gate verdict idempotent",
+        user_id="test-user",
+        build_config={
+            "first_merge_gate_verdict_at": "2020-01-01T00:00:00",
+            "first_merge_gate_executed_tests": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"unverified_merge_reason": "no_test_command"},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    bc = project.build_config or {}
+    assert bc.get("first_merge_gate_verdict_at") == "2020-01-01T00:00:00"
+    assert bc.get("first_merge_gate_executed_tests") is True
+    # The fall-open reason from the second (skipped) verdict was NOT recorded.
+    assert bc.get("first_merge_gate_unverified_reason") is None
+
+
+# ---------------------------------------------------------------------------
+# Review-wait throttle and orphan backstop (handle_ci_completion parked path)
+# ---------------------------------------------------------------------------
+
+
+def _make_task_no_review_approved(
+    db_session, project, pr_number: int = 42, ci_loop_extra: dict | None = None
+):
+    """Like _make_task but WITHOUT review_approved — forces the review-wait parked path."""
+    loop = {
+        "pr_number": pr_number,
+        "branch": "blueprint/test-branch",
+        "base_branch": "main",
+        "ci_waiting": True,
+        "iteration": 1,
+    }
+    if ci_loop_extra:
+        loop.update(ci_loop_extra)
+    task = Task(
+        project_id=project.id,
+        title="CI review-wait test task",
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "branch": "blueprint/test-branch",
+                "base_branch": "main",
+            }
+        ],
+        context={"review_loop": loop},
+        vm_instance_id=f"agent-vm-rw-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_review_wait_stamps_ci_last_polled_and_raises_poll_interval(
+    db_session, mocker
+):
+    """When CI passes but review is not yet approved, the parked path must
+    stamp ci_last_polled and raise ci_poll_interval to >= 120s."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+
+    project = Project(name="Review wait throttle", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task_no_review_approved(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_last_polled") is not None, (
+        "ci_last_polled must be stamped when parked in review-wait"
+    )
+    assert (review_loop.get("ci_poll_interval") or 0) >= 120, (
+        "ci_poll_interval must be raised to >= 120s when parked in review-wait"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_wait_started_set_on_first_entry_not_overwritten(
+    db_session, mocker
+):
+    """review_wait_started is stamped on first entry into the parked path and
+    must NOT be overwritten on subsequent polls."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+
+    project = Project(name="Review wait started idempotent", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task_no_review_approved(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+
+    # First poll — review_wait_started should be stamped.
+    await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+    rw_started_first = (
+        (task.context or {}).get("review_loop", {}).get("review_wait_started")
+    )
+    assert rw_started_first is not None, (
+        "review_wait_started must be set on first entry"
+    )
+
+    # Second poll — simulate a fresh handle_ci_completion call.  We keep the
+    # same task object (context already has review_wait_started) and call again.
+    result2 = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+    assert result2 is True
+    rw_started_second = (
+        (task.context or {}).get("review_loop", {}).get("review_wait_started")
+    )
+    assert rw_started_second == rw_started_first, (
+        "review_wait_started must NOT be overwritten on subsequent polls"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_wait_backstop_fires_after_timeout(db_session, mocker):
+    """After the 60-minute backstop threshold, requires_approval and
+    review_wait_escalated are set, and a failure alert is created."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name="Review wait backstop", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # _utcnow() returns naive UTC; review_wait_started must match so the
+    # subtraction doesn't raise TypeError (caught → silent backstop skip).
+    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_wait_escalated") is True, (
+        "review_wait_escalated must be set after 60-minute backstop"
+    )
+    assert task.requires_approval is True, (
+        "requires_approval must be set after 60-minute backstop"
+    )
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_review_wait_backstop_does_not_refire(db_session, mocker):
+    """Once review_wait_escalated=True, the backstop must NOT fire again."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name="Review wait backstop idempotent", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Naive UTC timestamp matching _utcnow() format.
+    old_started = (datetime.utcnow() - timedelta(minutes=120)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={
+            "review_wait_started": old_started,
+            "review_wait_escalated": True,
+        },
+    )
+    task.requires_approval = True
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    # handle_ci_completion's review-wait park path always returns True (an action
+    # was taken: the poll signal is persisted). The "does not refire" property is
+    # asserted by alert_mock.assert_not_called() below — because review_wait_escalated
+    # is already True, the backstop block is skipped and no second alert fires.
+    # (Do NOT flip this to False: there is no requires_approval early-return in
+    # handle_ci_completion; that gate lives in the separate merge helper.)
+    assert result is True
+    alert_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Non-terminal check-run status: waiting / requested / pending
+# ---------------------------------------------------------------------------
+
+
+class _MockResponse:
+    """Minimal httpx response mock for standalone get_check_runs tests."""
+
+    def __init__(self, status_code, json_data=None, links=None):
+        self.status_code = status_code
+        self._json_data = json_data if json_data is not None else {}
+        self.text = ""
+        self.headers = {}
+        self.links = links or {}
+
+    def json(self):
+        return self._json_data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "non_terminal_status",
+    ["waiting", "requested", "pending"],
+)
+async def test_waiting_check_run_does_not_resolve_green(mocker, non_terminal_status):
+    """A check-run in waiting/requested/pending must not make the aggregate green.
+
+    GitHub Actions uses these statuses for deployment-protection gates and queued
+    reusable workflows.  Previously only 'queued' and 'in_progress' were treated as
+    non-terminal, so a single passing sibling would yield a green aggregate while a
+    required check had not run.
+    """
+    from app.github import get_check_runs
+
+    payload = {
+        "check_runs": [
+            {
+                "id": 1,
+                "name": "deploy-gate",
+                "status": non_terminal_status,
+                "conclusion": None,
+            },
+            {
+                "id": 2,
+                "name": "unit-tests",
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+    }
+
+    async def mock_request(method, *args, **kwargs):
+        return _MockResponse(200, payload, links={})
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+
+    result = await get_check_runs("token", "owner", "repo", "abc123sha")
+
+    # The non-terminal check-run must keep the aggregate in "in_progress",
+    # not allow a false-green "completed/success" verdict.
+    assert result["status"] == "in_progress", (
+        f"status '{non_terminal_status}' must be treated as non-terminal "
+        f"but got aggregate status={result['status']!r}"
+    )
+    # Conclusion should not be 'success' while a check has not completed
+    assert result["conclusion"] != "success" or result["status"] != "completed", (
+        "aggregate must not resolve green while a check-run is still non-terminal"
+    )

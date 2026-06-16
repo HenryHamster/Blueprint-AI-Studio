@@ -53,9 +53,13 @@ from app.ci_resolution import (
     merge_gate_runtime_block,
     probe_is_clear_failure,
     proceed_on_no_checks,
+    record_no_ci_gate_degraded_block,
     record_no_ci_gate_runtime,
+    resolve_no_checks_escalation,
+    should_block_degraded_unverified_merge,
     should_run_no_ci_test_gate,
 )
+from app.build_config_detection import maybe_redetect_ci_presence
 from app.models import Alert, Artifact, ArtifactType, Project, Task, TaskStatus
 from app.orchestrator import _VERIFY_TESTS_MAX_RETRIES
 from app.release_qualifier_audit import _latest_artifact_logs
@@ -78,7 +82,9 @@ def _default_no_migration_pr(mocker):
     """
     from unittest.mock import AsyncMock
 
-    mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
+    mocker.patch(
+        "app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}])
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -250,9 +256,9 @@ async def test_no_ci_failing_suite_blocks_merge_and_spawns_fix_with_output(
 
     # (1) Decision: this external no-CI repo with a detectable suite gates on a
     #     verify_tests verdict rather than taking the legacy immediate-pass.
-    assert (
-        should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is True
-    ), "external no-CI repo with a test_cmd must gate the merge on verify_tests"
+    assert should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is True, (
+        "external no-CI repo with a test_cmd must gate the merge on verify_tests"
+    )
 
     # (2) Spawn: the orchestrator spawns verify_tests on the PR head.
     verify_task, was_created = await _spawn_pipeline_task(
@@ -407,9 +413,9 @@ async def test_no_ci_passing_suite_proceeds_to_merge(db_session, mocker):
 
     # PASS verdict gates correctly: no UNVERIFIED-merge alert is raised because
     # the orchestrator never set review_loop["unverified_merge_reason"].
-    assert (
-        await _unverified_merge_alerts(db_session, project.id) == []
-    ), "a verified (passing) merge must not raise an UNVERIFIED-merge alert"
+    assert await _unverified_merge_alerts(db_session, project.id) == [], (
+        "a verified (passing) merge must not raise an UNVERIFIED-merge alert"
+    )
 
     # Runtime readiness: a real suite ran to a PASS verdict → executed_real_tests
     # True and the UNVERIFIED fields are NOT stamped.
@@ -711,7 +717,9 @@ async def test_no_ci_setup_failed_verify_task_exhausted_retry_merges_unverified_
     db_session.add(verify_task)
     await db_session.commit()
 
-    verdict = None  # mirrors the orchestrator: FAILED verify tasks do not feed a verdict
+    verdict = (
+        None  # mirrors the orchestrator: FAILED verify tasks do not feed a verdict
+    )
     outcome, detail = classify_merge_test_verdict(verdict)
     assert outcome == "undetected"
     assert _is_verify_crash(outcome, verdict) is True
@@ -762,8 +770,14 @@ async def test_no_ci_setup_failed_with_clear_probe_failure_blocks_merge(
     await db_session.refresh(parent)
 
     verify_task, was_created = await _spawn_pipeline_task(
-        parent, "verify_tests", db_session, PR_NUMBER, BRANCH, BASE,
-        original_task_id=str(parent.id), suppress_warm_handoff=True,
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
         attempt=_VERIFY_TESTS_MAX_RETRIES,
     )
     assert was_created is True and verify_task is not None
@@ -825,7 +839,8 @@ async def test_no_ci_setup_failed_with_clear_probe_failure_blocks_merge(
 
     all_tasks = (
         (await db_session.execute(select(Task).where(Task.project_id == project.id)))
-        .scalars().all()
+        .scalars()
+        .all()
     )
     fix_tasks = [t for t in all_tasks if t.first_payload.get("type") == "fix"]
     assert len(fix_tasks) == 1, "a clear probe failure must spawn exactly one fix task"
@@ -840,7 +855,12 @@ def test_setup_failed_with_could_not_run_probe_keeps_crash_retry():
     could_not_run = {
         "detected": False,
         "setupFailed": True,
-        "probe": {"ran": True, "passed": False, "could_not_run": True, "ecosystem": "node"},
+        "probe": {
+            "ran": True,
+            "passed": False,
+            "could_not_run": True,
+            "ecosystem": "node",
+        },
     }
     assert probe_is_clear_failure(could_not_run["probe"]) is False
     # No probe at all (older agent) likewise never redirects.
@@ -873,9 +893,9 @@ async def test_no_ci_no_detectable_tests_falls_back_to_proceed_without_checks(
 
     # Decision: no runnable test command → the gate does NOT run; the legacy
     # immediate-pass applies, so no verify_tests task is ever spawned.
-    assert (
-        should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is False
-    ), "a repo with no detectable test_cmd must not gate on verify_tests"
+    assert should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is False, (
+        "a repo with no detectable test_cmd must not gate on verify_tests"
+    )
 
     # An agent that did run and reported detected=false maps to 'undetected',
     # which the gate routes to proceed-without-checks (merge UNVERIFIED).
@@ -954,7 +974,10 @@ async def test_no_ci_all_skipped_records_distinct_runtime_reason(db_session):
     # Recording the all-skipped key stamps the distinct reason on the project.
     skipped_project = await _make_no_ci_project(db_session, with_test_cmd=True)
     await _record_gate_runtime(
-        db_session, skipped_project, outcome=skipped_outcome, unverified_reason=skipped_key
+        db_session,
+        skipped_project,
+        outcome=skipped_outcome,
+        unverified_reason=skipped_key,
     )
     skipped_runtime = merge_gate_runtime_block(skipped_project)
     assert skipped_runtime["executed_real_tests"] is False
@@ -963,7 +986,10 @@ async def test_no_ci_all_skipped_records_distinct_runtime_reason(db_session):
     # A genuine no-suite repo still records the generic reason, unchanged.
     no_suite_project = await _make_no_ci_project(db_session, with_test_cmd=True)
     await _record_gate_runtime(
-        db_session, no_suite_project, outcome=no_suite_outcome, unverified_reason=no_suite_key
+        db_session,
+        no_suite_project,
+        outcome=no_suite_outcome,
+        unverified_reason=no_suite_key,
     )
     no_suite_runtime = merge_gate_runtime_block(no_suite_project)
     assert no_suite_runtime["last_unverified_reason"] == "undetected_runtime"
@@ -989,8 +1015,14 @@ async def test_no_ci_probe_failure_blocks_merge_and_spawns_fix(db_session, mocke
     await db_session.refresh(parent)
 
     verify_task, was_created = await _spawn_pipeline_task(
-        parent, "verify_tests", db_session, PR_NUMBER, BRANCH, BASE,
-        original_task_id=str(parent.id), suppress_warm_handoff=True,
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
     )
     assert was_created is True
 
@@ -1001,7 +1033,8 @@ async def test_no_ci_probe_failure_blocks_merge_and_spawns_fix(db_session, mocke
         "SyntaxError: invalid syntax"
     )
     await _plant_verdict(
-        db_session, verify_task,
+        db_session,
+        verify_task,
         {
             "detected": False,
             "passed": False,
@@ -1040,7 +1073,8 @@ async def test_no_ci_probe_failure_blocks_merge_and_spawns_fix(db_session, mocke
 
     all_tasks = (
         (await db_session.execute(select(Task).where(Task.project_id == project.id)))
-        .scalars().all()
+        .scalars()
+        .all()
     )
     fix_tasks = [t for t in all_tasks if t.first_payload.get("type") == "fix"]
     assert len(fix_tasks) == 1, "a probe failure must spawn exactly one fix task"
@@ -1074,7 +1108,12 @@ async def test_no_ci_probe_could_not_run_falls_open_with_distinct_reason(
     cnr_verdict = {
         "detected": False,
         "noTestsReason": "no_suite",
-        "probe": {"ran": True, "passed": False, "could_not_run": True, "ecosystem": "node"},
+        "probe": {
+            "ran": True,
+            "passed": False,
+            "could_not_run": True,
+            "ecosystem": "node",
+        },
     }
     cnr_outcome, cnr_detail = classify_merge_test_verdict(cnr_verdict)
     _, cnr_key = classify_unverified_fall_open_reason(cnr_verdict)
@@ -1084,7 +1123,12 @@ async def test_no_ci_probe_could_not_run_falls_open_with_distinct_reason(
     # Probe-passed verdict → still undetected (no unit suite), positive reason.
     pass_verdict = {
         "detected": False,
-        "probe": {"ran": True, "passed": True, "could_not_run": False, "ecosystem": "python"},
+        "probe": {
+            "ran": True,
+            "passed": True,
+            "could_not_run": False,
+            "ecosystem": "python",
+        },
     }
     pass_outcome, _ = classify_merge_test_verdict(pass_verdict)
     _, pass_key = classify_unverified_fall_open_reason(pass_verdict)
@@ -1138,8 +1182,14 @@ async def test_no_ci_documented_command_failure_blocks_merge_even_with_passing_s
     await db_session.refresh(parent)
 
     verify_task, was_created = await _spawn_pipeline_task(
-        parent, "verify_tests", db_session, PR_NUMBER, BRANCH, BASE,
-        original_task_id=str(parent.id), suppress_warm_handoff=True,
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
     )
     assert was_created is True
 
@@ -1152,7 +1202,8 @@ async def test_no_ci_documented_command_failure_blocks_merge_even_with_passing_s
         "1 problem (1 error, 0 warnings)"
     )
     await _plant_verdict(
-        db_session, verify_task,
+        db_session,
+        verify_task,
         {
             "detected": True,
             "passed": True,
@@ -1173,7 +1224,9 @@ async def test_no_ci_documented_command_failure_blocks_merge_even_with_passing_s
         db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
     )
     outcome, detail = classify_merge_test_verdict(verdict)
-    assert outcome == "fail", "a documented-command failure blocks even when the suite passed"
+    assert outcome == "fail", (
+        "a documented-command failure blocks even when the suite passed"
+    )
     assert "no-undef" in detail
     assert "npm run lint" in detail
 
@@ -1190,7 +1243,8 @@ async def test_no_ci_documented_command_failure_blocks_merge_even_with_passing_s
 
     all_tasks = (
         (await db_session.execute(select(Task).where(Task.project_id == project.id)))
-        .scalars().all()
+        .scalars()
+        .all()
     )
     fix_tasks = [t for t in all_tasks if t.first_payload.get("type") == "fix"]
     assert len(fix_tasks) == 1, "a documented-command failure must spawn one fix task"
@@ -1496,12 +1550,12 @@ async def test_unverified_merge_alert_severity_degraded_vs_benign(db_session, mo
         )
 
         alerts = await _unverified_merge_alerts(db_session, project.id)
-        assert (
-            len(alerts) == 1
-        ), f"degraded reason {degraded_reason} must raise exactly one alert"
-        assert (
-            alerts[0].severity == AlertSeverity.ERROR
-        ), f"degraded reason {degraded_reason} must escalate to ERROR severity"
+        assert len(alerts) == 1, (
+            f"degraded reason {degraded_reason} must raise exactly one alert"
+        )
+        assert alerts[0].severity == AlertSeverity.ERROR, (
+            f"degraded reason {degraded_reason} must escalate to ERROR severity"
+        )
 
     # --- Test WARNING reasons (benign: no verification expected or positive-only signals) ---
     for benign_reason in [
@@ -1522,12 +1576,132 @@ async def test_unverified_merge_alert_severity_degraded_vs_benign(db_session, mo
         )
 
         alerts = await _unverified_merge_alerts(db_session, project.id)
-        assert (
-            len(alerts) == 1
-        ), f"benign reason {benign_reason} must raise exactly one alert"
-        assert (
-            alerts[0].severity == AlertSeverity.WARNING
-        ), f"benign reason {benign_reason} must stay at WARNING severity"
+        assert len(alerts) == 1, (
+            f"benign reason {benign_reason} must raise exactly one alert"
+        )
+        assert alerts[0].severity == AlertSeverity.WARNING, (
+            f"benign reason {benign_reason} must stay at WARNING severity"
+        )
+
+
+async def _enable_block_policy(db_session, project):
+    """Turn ON the per-project opt-in honest-block policy (default OFF)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await db_session.get(Project, project.id)
+    bc = dict(project.build_config or {})
+    bc["block_degraded_unverified_merge"] = True
+    project.build_config = bc
+    flag_modified(project, "build_config")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_no_ci_optin_honest_block_blocks_degraded_fall_open(db_session, mocker):
+    """Opt-in honest-block policy: with the flag ON a DEGRADED external no-CI
+    fall-open is BLOCKED (PR held, block signal raised); with the flag OFF (the
+    default) the SAME degraded fall-open still merges UNVERIFIED exactly as
+    today. A BENIGN reason is never blocked even with the policy ON.
+
+    This pins BOTH halves of the default-off invariant by exercising the real
+    production decision helper ``should_block_degraded_unverified_merge`` and the
+    real block recorder ``record_no_ci_gate_degraded_block``, then mirroring the
+    orchestrator branch: block ⇒ do NOT call the merge primitive; no block ⇒ the
+    existing ``handle_ci_completion`` merges UNVERIFIED unchanged.
+    """
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    # The fall-open ci_result the orchestrator hands downstream is identical in
+    # both halves — only the policy flag differs.
+    ci_result = build_no_ci_gate_ci_result("undetected", "")
+    assert ci_result["conclusion"] == "success"
+    degraded_reason = (
+        "verify_setup_failed"  # gate expected to verify, suite could not run
+    )
+
+    # ── Half 1: policy ON + degraded reason ⇒ BLOCK (no merge) ───────────────
+    on_project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    on_project = await _enable_block_policy(db_session, on_project)
+    on_parent = _make_parent_task(db_session, on_project)
+    await db_session.commit()
+    await db_session.refresh(on_parent)
+    on_parent = await _set_unverified_reason(db_session, on_parent, degraded_reason)
+
+    assert (
+        should_block_degraded_unverified_merge(on_project, degraded_reason) is True
+    ), "policy ON + degraded reason must block"
+
+    # Mirror the orchestrator's block branch: record the honest block and do NOT
+    # invoke the merge primitive (the PR is held open).
+    record_no_ci_gate_degraded_block(
+        db_session, on_project, unverified_reason=degraded_reason, when=_RUNTIME_WHEN
+    )
+    await db_session.commit()
+    merge_mock.assert_not_called()
+
+    on_project = await db_session.get(Project, on_project.id)
+    runtime = merge_gate_runtime_block(on_project)
+    assert runtime is not None
+    assert runtime["last_degraded_block_reason"] == degraded_reason
+    assert runtime["last_degraded_block_at"] is not None
+    assert runtime["degraded_block_counts"][degraded_reason] == 1
+    # The block is a fall-open that did NOT run a real suite.
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_reason"] == degraded_reason
+
+    # ── Half 2: policy OFF (default) + SAME degraded reason ⇒ merge UNVERIFIED ─
+    off_project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    off_parent = _make_parent_task(db_session, off_project)
+    await db_session.commit()
+    await db_session.refresh(off_parent)
+    off_parent = await _set_unverified_reason(db_session, off_parent, degraded_reason)
+
+    assert (
+        should_block_degraded_unverified_merge(off_project, degraded_reason) is False
+    ), "policy OFF must never block — today's behavior is preserved"
+
+    # Mirror the orchestrator's merge branch: handle_ci_completion merges
+    # UNVERIFIED and raises exactly one operator alert, exactly as today.
+    acted = await handle_ci_completion(
+        off_parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()
+    alerts = await _unverified_merge_alerts(db_session, off_project.id)
+    assert len(alerts) == 1, "policy-OFF degraded fall-open merges unverified as today"
+
+    # ── Half 3: policy ON + BENIGN reason ⇒ never blocked ────────────────────
+    assert (
+        should_block_degraded_unverified_merge(on_project, "no_detectable_test_command")
+        is False
+    ), "a benign reason must never block, even with the policy ON"
+
+
+def test_orchestrator_consults_degraded_block_helper():
+    """Drift guard: the orchestrator's no-CI gate must still consult
+    ``should_block_degraded_unverified_merge`` and, when it returns True, BLOCK
+    (record the block and ``continue`` without calling ``handle_ci_completion``).
+    If a refactor drops this call the e2e mirror above stays green while
+    production silently regresses to merging degraded fall-opens unverified."""
+    src = _orchestrator_source()
+    required = [
+        "should_block_degraded_unverified_merge",
+        "record_no_ci_gate_degraded_block",
+        'ci_loop["no_ci_degraded_blocked"] = True',
+    ]
+    missing = [needle for needle in required if needle not in src]
+    assert not missing, (
+        "orchestrator no-CI honest-block wiring changed — missing: "
+        f"{missing}. The degraded-block branch must consult "
+        "should_block_degraded_unverified_merge and park the PR; update "
+        "orchestrator.py AND this guard together."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1537,9 +1711,7 @@ async def test_unverified_merge_alert_severity_degraded_vs_benign(db_session, mo
 
 
 @pytest.mark.asyncio
-async def test_no_ci_makefile_detected_repo_blocks_merge_on_failure(
-    db_session, mocker
-):
+async def test_no_ci_makefile_detected_repo_blocks_merge_on_failure(db_session, mocker):
     """An external no-CI repo whose tests run via a Makefile ``test:`` target
     (no python/node/go/rust manifest) is auto-detected at onboarding and the
     gate runs that suite as the merge verdict — a failing run blocks the merge.
@@ -1573,9 +1745,9 @@ async def test_no_ci_makefile_detected_repo_blocks_merge_on_failure(
     ):
         detected = await _detect_build_config("ghs_test", "acme", "widget")
 
-    assert any(
-        d.get("test_cmd") == "make test" for d in detected["directories"]
-    ), "Makefile-with-test-target repo must detect a `make test` command"
+    assert any(d.get("test_cmd") == "make test" for d in detected["directories"]), (
+        "Makefile-with-test-target repo must detect a `make test` command"
+    )
 
     # --- Build a no-CI project from the DETECTED config. ---
     project = Project(
@@ -1684,9 +1856,9 @@ async def test_no_ci_package_json_with_test_script_detected_repo_passes_and_merg
     ):
         detected = await _detect_build_config("ghs_test", "acme", "widget")
 
-    assert any(
-        d.get("test_cmd") == "npm test" for d in detected["directories"]
-    ), "package.json with scripts.test must detect an `npm test` command"
+    assert any(d.get("test_cmd") == "npm test" for d in detected["directories"]), (
+        "package.json with scripts.test must detect an `npm test` command"
+    )
 
     project = Project(
         name="Node no-CI repo",
@@ -1923,9 +2095,9 @@ async def test_no_ci_pytest_ini_detected_repo_merges_on_pass(db_session, mocker)
     )
     assert acted is True
     merge_mock.assert_called_once()
-    assert (
-        await _unverified_merge_alerts(db_session, project.id) == []
-    ), "a verified (passing) pytest.ini merge must not raise an UNVERIFIED alert"
+    assert await _unverified_merge_alerts(db_session, project.id) == [], (
+        "a verified (passing) pytest.ini merge must not raise an UNVERIFIED alert"
+    )
 
 
 @pytest.mark.asyncio
@@ -1946,9 +2118,9 @@ async def test_failing_verdict_raises_no_unverified_alert(db_session, mocker):
         parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
     )
     merge_mock.assert_not_called()
-    assert (
-        await _unverified_merge_alerts(db_session, project.id) == []
-    ), "a blocked (failing) merge must not raise an UNVERIFIED-merge alert"
+    assert await _unverified_merge_alerts(db_session, project.id) == [], (
+        "a blocked (failing) merge must not raise an UNVERIFIED-merge alert"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2110,9 +2282,9 @@ async def test_no_ci_recovered_passing_suite_merges_and_persists_command(
         db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
     )
     outcome, detail = classify_merge_test_verdict(verdict)
-    assert (
-        outcome == "pass"
-    ), "recovered passing suite must classify as pass, not undetected"
+    assert outcome == "pass", (
+        "recovered passing suite must classify as pass, not undetected"
+    )
 
     # Mirror the orchestrator: persist the recovered command before merging.
     persisted = await persist_recovered_test_command(
@@ -2131,9 +2303,9 @@ async def test_no_ci_recovered_passing_suite_merges_and_persists_command(
     # (a) Merge decision honors the REAL replacement-suite verdict — not an
     #     UNVERIFIED fall-open.
     merge_mock.assert_called_once()
-    assert (
-        await _unverified_merge_alerts(db_session, project.id) == []
-    ), "a recovered+passing merge is verified, not UNVERIFIED"
+    assert await _unverified_merge_alerts(db_session, project.id) == [], (
+        "a recovered+passing merge is verified, not UNVERIFIED"
+    )
 
     # (b) build_config converged to the recovered command; operator-owned fields
     #     are preserved.
@@ -2220,9 +2392,7 @@ async def test_no_ci_recovered_failing_suite_blocks_merge_and_persists_command(
         .all()
     )
     fix_tasks = [t for t in all_tasks if t.first_payload.get("type") == "fix"]
-    assert (
-        len(fix_tasks) == 1
-    ), "a recovered+failing suite must block and spawn a fix"
+    assert len(fix_tasks) == 1, "a recovered+failing suite must block and spawn a fix"
 
     # (b) build_config still converged to the recovered command.
     await db_session.refresh(project)
@@ -2418,7 +2588,9 @@ async def test_no_ci_recorded_fail_verdict_fastpath_blocks_carrying_loop_output(
     await db_session.commit()
     await db_session.refresh(parent)
 
-    failing_output = "FAILED tests/test_math.py::test_recorded - assert 3 == 4\n1 failed"
+    failing_output = (
+        "FAILED tests/test_math.py::test_recorded - assert 3 == 4\n1 failed"
+    )
     parent = await _set_review_loop_keys(
         db_session,
         parent,
@@ -2598,9 +2770,9 @@ async def test_no_ci_kill_switch_off_bypass_merges_unverified_with_kill_switch_r
 
     # Decision: gate_enabled=False short-circuits the gate to the immediate-pass
     # branch even on a real base with a detectable suite.
-    assert (
-        should_run_no_ci_test_gate(project, BASE, gate_enabled=False) is False
-    ), "the kill-switch off must bypass the verify_tests gate"
+    assert should_run_no_ci_test_gate(project, BASE, gate_enabled=False) is False, (
+        "the kill-switch off must bypass the verify_tests gate"
+    )
     assert proceed_on_no_checks(project, BASE) is True
 
     parent = _make_parent_task(db_session, project)
@@ -2721,8 +2893,14 @@ async def test_no_ci_pr_self_suppressed_suite_blocks_merge_and_spawns_fix(
     await db_session.refresh(parent)
 
     verify_task, was_created = await _spawn_pipeline_task(
-        parent, "verify_tests", db_session, PR_NUMBER, BRANCH, BASE,
-        original_task_id=str(parent.id), suppress_warm_handoff=True,
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
     )
     assert was_created is True and verify_task is not None
 
@@ -2740,7 +2918,11 @@ async def test_no_ci_pr_self_suppressed_suite_blocks_merge_and_spawns_fix(
             "disabledTests": {
                 "count": 12,
                 "markers": [
-                    {"file": "tests/test_math.py", "marker": "@pytest.mark.skip", "line": "1"}
+                    {
+                        "file": "tests/test_math.py",
+                        "marker": "@pytest.mark.skip",
+                        "line": "1",
+                    }
                 ],
             },
         },
@@ -2766,7 +2948,8 @@ async def test_no_ci_pr_self_suppressed_suite_blocks_merge_and_spawns_fix(
     merge_mock.assert_not_called()
     all_tasks = (
         (await db_session.execute(select(Task).where(Task.project_id == project.id)))
-        .scalars().all()
+        .scalars()
+        .all()
     )
     fix_tasks = [t for t in all_tasks if t.first_payload.get("type") == "fix"]
     assert len(fix_tasks) == 1, "self-suppressed suite must spawn exactly one fix task"
@@ -2798,3 +2981,314 @@ def test_no_ci_self_suppression_preservation_cases_unchanged():
     assert outcome == "pass"
     assert "disables 3 test(s)" in detail
     assert build_no_ci_gate_ci_result(outcome, detail)["conclusion"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# 10. No-checks escalation auto-resolution backstop + self-heal re-detect.
+#
+# The orchestrator's escalation block (after ~600s with no checks ever seen)
+# historically raised ONE alert and then waited forever for a manual merge, so
+# every rollup PR on a no-CI repo had to be hand-merged. The backstop now calls
+# ci_resolution.resolve_no_checks_escalation to AUTO-RESOLVE a no-CI strand —
+# strictly gated on proceed_on_no_checks so a CI-gated repo is never
+# auto-merged. The self-heal helper maybe_redetect_ci_presence flips a stale
+# has_ci=None to a definitive value so legacy/incomplete-detection projects stop
+# stranding. These compose the SAME production helpers the orchestrator calls.
+# ---------------------------------------------------------------------------
+
+
+async def _make_definitive_no_ci_project(
+    db_session, *, with_test_cmd, has_ci=False, requires_ci_checks=False
+):
+    """A project with an explicit tri-state ``has_ci`` in its build_config.
+
+    ``has_ci=False`` is a DEFINITIVE no-CI repo (detection completed, found no
+    workflows); ``has_ci=True`` is CI-gated; ``has_ci=None`` is the
+    stale/incomplete-detection state that strands legacy projects.
+    """
+    directories = [{"path": ".", "test_cmd": "pytest" if with_test_cmd else ""}]
+    build_config = {
+        "requires_ci_checks": requires_ci_checks,
+        "directories": directories,
+    }
+    if has_ci is not None:
+        build_config["has_ci"] = has_ci
+    project = Project(
+        name="Definitive no-CI repo",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch=BASE,
+        build_config=build_config,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_no_checks_escalation_auto_resolves_for_definitive_no_ci_repo(
+    db_session, mocker
+):
+    """A PR on a DEFINITIVE no-CI repo (``has_ci=False``) WITH a detectable suite
+    that stranded with no checks for >600s must AUTO-RESOLVE at escalation rather
+    than wait forever — routing through the SAME verify_tests gate so a real
+    MERGE_TEST_RESULT verdict gates the merge."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    project = await _make_definitive_no_ci_project(
+        db_session, with_test_cmd=True, has_ci=False
+    )
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # The NEW backstop decision the orchestrator's escalation block calls: a
+    # definitive has_ci=False repo WITH a runnable suite routes through the
+    # verify_tests gate (NOT keep_polling, NOT an unverified immediate-merge).
+    assert (
+        resolve_no_checks_escalation(project, BASE, gate_enabled=True) == "verify_tests"
+    )
+
+    # Promote → the verify gate runs the repo's suite; a real PASSING verdict
+    # gates the merge through the same path the definitive-no_checks branch uses.
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+    )
+    assert was_created is True and verify_task is not None
+    await _plant_verdict(
+        db_session,
+        verify_task,
+        {
+            "detected": True,
+            "passed": True,
+            "tests": [{"name": "tests/test_x.py::test_ok", "passed": True}],
+            "output": "1 passed in 0.05s",
+        },
+    )
+
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "pass"
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()
+    await db_session.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_no_checks_escalation_auto_resolves_unverified_for_testless_no_ci_repo(
+    db_session, mocker
+):
+    """A DEFINITIVE no-CI repo (``has_ci=False``) with NO detectable suite must
+    auto-resolve to an UNVERIFIED merge at escalation — never keep waiting."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    project = await _make_definitive_no_ci_project(
+        db_session, with_test_cmd=False, has_ci=False
+    )
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # Test-less definitive no-CI repo → merge UNVERIFIED (NOT verify_tests).
+    assert (
+        resolve_no_checks_escalation(project, BASE, gate_enabled=True)
+        == "merge_unverified"
+    )
+
+    # The escalation merge_unverified path builds a success ci_result (matching
+    # build_no_ci_gate_ci_result's undetected→success mapping) and merges.
+    ci_result = build_no_ci_gate_ci_result("undetected", "")
+    assert ci_result["conclusion"] == "success"
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()
+    await db_session.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_no_checks_escalation_keeps_polling_for_ci_gated_repo(db_session):
+    """A CI-gated repo (``has_ci=True``) that has not yet seen its checks must
+    NEVER auto-merge — the backstop keeps polling exactly as today."""
+    project = await _make_definitive_no_ci_project(
+        db_session, with_test_cmd=True, has_ci=True, requires_ci_checks=True
+    )
+    assert proceed_on_no_checks(project, BASE) is False
+    assert (
+        resolve_no_checks_escalation(project, BASE, gate_enabled=True) == "keep_polling"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_checks_escalation_keeps_polling_for_unknown_has_ci(db_session):
+    """A repo with ``has_ci=None`` (incomplete/legacy detection) is treated as
+    possibly-CI-gated and must NOT auto-merge — checks may still register."""
+    project = await _make_definitive_no_ci_project(
+        db_session, with_test_cmd=False, has_ci=None, requires_ci_checks=True
+    )
+    assert proceed_on_no_checks(project, BASE) is False
+    assert (
+        resolve_no_checks_escalation(project, BASE, gate_enabled=True) == "keep_polling"
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_heal_redetect_flips_stale_has_ci_none_to_false_and_resolves(
+    db_session, mocker
+):
+    """Mechanism 2: a stale ``has_ci=None`` strands a genuine no-CI repo. A bounded
+    re-detect that confirms zero workflows flips ``has_ci`` to a definitive False,
+    so proceed_on_no_checks (and thus the backstop) resolves the strand."""
+    project = await _make_definitive_no_ci_project(
+        db_session, with_test_cmd=False, has_ci=None, requires_ci_checks=True
+    )
+    # Before re-detect: stale has_ci=None keeps polling forever.
+    assert (
+        resolve_no_checks_escalation(project, BASE, gate_enabled=True) == "keep_polling"
+    )
+
+    mocker.patch(
+        "app.github.get_repo_installation_token", AsyncMock(return_value="ghs_tok")
+    )
+    mocker.patch(
+        "app.routers.admin_onboard._detect_build_config",
+        AsyncMock(
+            return_value={
+                "language": "python",
+                "directories": [{"path": ".", "test_cmd": ""}],
+                "has_ci": False,
+            }
+        ),
+    )
+
+    flipped = await maybe_redetect_ci_presence(project, db_session, ref=BASE)
+    assert flipped is True
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("has_ci") is False
+    # Now the strand resolves (test-less → merge UNVERIFIED).
+    assert proceed_on_no_checks(project, BASE) is True
+    assert (
+        resolve_no_checks_escalation(project, BASE, gate_enabled=True)
+        == "merge_unverified"
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_heal_redetect_finds_has_ci_true_keeps_polling(db_session, mocker):
+    """Mechanism 2 safety: if the re-detect finds the repo REALLY has CI
+    (``has_ci=True`` — checks just not registered yet), it persists True but the
+    backstop keeps polling and never auto-merges."""
+    project = await _make_definitive_no_ci_project(
+        db_session, with_test_cmd=False, has_ci=None, requires_ci_checks=True
+    )
+    mocker.patch(
+        "app.github.get_repo_installation_token", AsyncMock(return_value="ghs_tok")
+    )
+    mocker.patch(
+        "app.routers.admin_onboard._detect_build_config",
+        AsyncMock(
+            return_value={"language": "python", "directories": [], "has_ci": True}
+        ),
+    )
+
+    flipped = await maybe_redetect_ci_presence(project, db_session, ref=BASE)
+    assert flipped is True
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("has_ci") is True
+    # has_ci=True is CI-gated → still keep polling, never auto-merge.
+    assert proceed_on_no_checks(project, BASE) is False
+    assert (
+        resolve_no_checks_escalation(project, BASE, gate_enabled=True) == "keep_polling"
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_heal_redetect_incomplete_read_leaves_config_untouched(
+    db_session, mocker
+):
+    """Mechanism 2 conservatism: a re-detect that is still incomplete
+    (``has_ci=None``) persists NOTHING — a guessed value is never recorded and
+    the strand keeps polling."""
+    project = await _make_definitive_no_ci_project(
+        db_session, with_test_cmd=False, has_ci=None, requires_ci_checks=True
+    )
+    mocker.patch(
+        "app.github.get_repo_installation_token", AsyncMock(return_value="ghs_tok")
+    )
+    mocker.patch(
+        "app.routers.admin_onboard._detect_build_config",
+        AsyncMock(
+            return_value={"language": "python", "directories": [], "has_ci": None}
+        ),
+    )
+
+    flipped = await maybe_redetect_ci_presence(project, db_session, ref=BASE)
+    assert flipped is False
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("has_ci") is None
+
+
+@pytest.mark.asyncio
+async def test_self_heal_redetect_noop_when_has_ci_already_definitive(
+    db_session, mocker
+):
+    """The self-heal helper fires ONLY for a stale ``has_ci=None``; a project that
+    already carries a definitive ``has_ci`` (here True) is left untouched and the
+    detector is never even called."""
+    project = await _make_definitive_no_ci_project(
+        db_session, with_test_cmd=False, has_ci=True, requires_ci_checks=True
+    )
+    detect_mock = mocker.patch(
+        "app.routers.admin_onboard._detect_build_config",
+        AsyncMock(return_value={"has_ci": False}),
+    )
+    flipped = await maybe_redetect_ci_presence(project, db_session, ref=BASE)
+    assert flipped is False
+    detect_mock.assert_not_called()
+
+
+# Static wiring: the orchestrator's escalation block must thread the backstop
+# decision and the verify-gate continuation marker the composed flows mirror.
+def test_orchestrator_no_checks_escalation_backstop_wiring():
+    src = _orchestrator_source()
+    required = [
+        "resolve_no_checks_escalation",
+        "maybe_redetect_ci_presence",
+        # The escalation block sets the sticky verify-gate marker...
+        'ci_loop["no_ci_escalation_verify_gate"] = (',
+        # ...and the gate block honors it on the next poll via the base marker.
+        'ci_loop.get("no_ci_escalation_base")',
+    ]
+    missing = [needle for needle in required if needle not in src]
+    assert not missing, (
+        "orchestrator no-checks escalation backstop wiring changed — missing: "
+        f"{missing}. Update orchestrator.py AND the mirroring tests together."
+    )

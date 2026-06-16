@@ -7,12 +7,16 @@ would adopt. The end-to-end review-loop spawn-path coverage lives in
 test_review_pipeline.py::test_review_history_feedback_is_bounded.
 """
 
+import logging
+
 from app.context_bounds import (
     CONTEXT_SOFT_WARN_BYTES,
     DEFERRED_FINDING_MAX_CHARS,
+    DEFERRED_FINDINGS_MAX_ENTRIES,
     REVIEW_FEEDBACK_MAX_CHARS,
     REVIEW_HISTORY_MAX_ENTRIES,
     _TRUNCATION_MARKER,
+    bound_deferred_findings,
     bound_history_entries,
     bound_review_history,
     context_size_bytes,
@@ -197,6 +201,76 @@ def test_bound_review_history_noop_for_normal_history():
     ]
     out = bound_review_history(history)
     assert out == history
+
+
+# ── bound_deferred_findings wrapper ──────────────────────────────────────────
+
+
+def test_bound_deferred_findings_empty_and_none_safe():
+    assert bound_deferred_findings(None) == []
+    assert bound_deferred_findings([]) == []
+
+
+def test_bound_deferred_findings_truncates_text_fields():
+    """title, description, and body are truncated; structured routing fields preserved."""
+    entry = {
+        "title": "t" * 20_000,
+        "description": "d" * 20_000,
+        "body": "b" * 20_000,
+        "finding_hash": "abc123",
+        "type": "BUG",
+        "deferred_count": 2,
+        "depends_on": "some-dep",
+    }
+    out = bound_deferred_findings([entry])
+    assert len(out) == 1
+    result = out[0]
+    assert len(result["title"]) == DEFERRED_FINDING_MAX_CHARS
+    assert result["title"].endswith(_TRUNCATION_MARKER)
+    assert len(result["description"]) == DEFERRED_FINDING_MAX_CHARS
+    assert result["description"].endswith(_TRUNCATION_MARKER)
+    assert len(result["body"]) == DEFERRED_FINDING_MAX_CHARS
+    assert result["body"].endswith(_TRUNCATION_MARKER)
+    # Structured fields preserved verbatim.
+    assert result["finding_hash"] == "abc123"
+    assert result["type"] == "BUG"
+    assert result["deferred_count"] == 2
+    assert result["depends_on"] == "some-dep"
+
+
+def test_bound_deferred_findings_short_fields_unchanged():
+    """Below-cap text passes through byte-identical — common case is a no-op."""
+    entry = {
+        "title": "short title",
+        "description": "short description",
+        "body": "short body",
+        "finding_hash": "xyz",
+    }
+    out = bound_deferred_findings([entry])
+    assert out[0]["title"] == "short title"
+    assert out[0]["description"] == "short description"
+    assert out[0]["body"] == "short body"
+    assert _TRUNCATION_MARKER not in out[0]["title"]
+
+
+def test_bound_deferred_findings_count_cap_evicts_oldest(caplog):
+    """When len > DEFERRED_FINDINGS_MAX_ENTRIES, oldest entries are dropped and a
+    warning is emitted — never silent."""
+    entries = [{"title": f"finding {i}", "finding_hash": f"h{i}"} for i in range(DEFERRED_FINDINGS_MAX_ENTRIES + 10)]
+    with caplog.at_level(logging.WARNING, logger="app.context_bounds"):
+        out = bound_deferred_findings(entries)
+    assert len(out) == DEFERRED_FINDINGS_MAX_ENTRIES
+    # Most-recent kept — last entry should be the last input.
+    assert out[-1]["finding_hash"] == f"h{DEFERRED_FINDINGS_MAX_ENTRIES + 9}"
+    # Eviction was logged explicitly, never silent.
+    assert any("deferred_findings count cap" in r.message for r in caplog.records)
+
+
+def test_bound_deferred_findings_no_count_cap_for_normal_size():
+    """Under the backstop, all entries are kept (work items must not be dropped)."""
+    entries = [{"title": "ok", "finding_hash": f"h{i}"} for i in range(30)]
+    out = bound_deferred_findings(entries)
+    assert len(out) == 30
 
 
 # ── telemetry ─────────────────────────────────────────────────────────────────

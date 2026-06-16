@@ -8,7 +8,9 @@ Covers:
 
 import asyncio
 import base64
+import io
 import json
+import tarfile
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -29,6 +31,7 @@ from app import compute
 from app import compute_backends as compute_backends_module
 from app import compute_jobs
 from app import provision_error_scope
+from app import schemas
 from app import storage
 from app.compute_backends import (
     ComputeCostResult,
@@ -1242,6 +1245,308 @@ def test_decode_result_metrics_filters_non_numeric_and_bounds():
     # Empty / None markers are absent.
     assert compute_backends_module._decode_result_metrics(None) is None
     assert compute_backends_module._decode_result_metrics("") is None
+
+
+# ── Durable terminal record (terminal.json) — closes the poweroff-vs-serial
+# race where a fast successful GCP job powers off before its serial SUCCEEDED
+# marker is captured and is misclassified FAILURE. ──────────────────────────
+
+
+def _b64_text(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _terminal_record_bytes(
+    *,
+    status: str = "SUCCEEDED",
+    exit_code=0,
+    reason: str = "completed",
+    metrics: dict | None = None,
+    command_log: dict | None = None,
+    release_sha: str = "",
+    schema_version: int = 1,
+) -> bytes:
+    """terminal.json bytes exactly as the on-VM terminal_record.py would write."""
+    record = {
+        "schema_version": schema_version,
+        "status": status,
+        "exit_code": exit_code,
+        "reason": reason,
+        "metrics_b64": _b64_text(json.dumps(metrics)) if metrics is not None else "",
+        "command_log_b64": (
+            _b64_text(json.dumps(command_log)) if command_log is not None else ""
+        ),
+        "release_echo_b64": _b64_text(release_sha) if release_sha else "",
+    }
+    return json.dumps(record).encode("utf-8")
+
+
+def _make_tar_gz_bundle(members: dict[str, bytes]) -> bytes:
+    """Build a gzip tar bundle mirroring the on-VM ``tar -C dir -czf - .`` layout."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def test_gcp_startup_script_writes_durable_terminal_record():
+    """The startup script must decode terminal_record.py and invoke it before
+    poweroff in the success/failure, runtime-TTL, and repo-clone-fail branches —
+    so a lost serial marker can always be reconciled from the durable bundle."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        repo_clone={"owner": "o", "repo": "r", "ref": "main"},
+        repo_token="tok",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # The embedded script is decoded to disk alongside the other helpers.
+    assert "base64 -d > /tmp/blueprint_terminal_record.py" in script, (
+        "terminal_record.py must be base64-decoded onto the VM"
+    )
+    # Main success/failure branch threads the computed STATUS/EXIT/REASON through.
+    assert (
+        "python3 /tmp/blueprint_terminal_record.py" in script
+        and '"$STATUS" "$EXIT_CODE" "$REASON"' in script
+    )
+    # The record is written BEFORE the bundle is uploaded so it lands in the GCS
+    # bundle the reconcile path reads.
+    record_idx = script.index('"$STATUS" "$EXIT_CODE" "$REASON"')
+    # The final upload_artifacts call follows the terminal-record write.
+    assert "upload_artifacts" in script[record_idx:]
+    # Runtime-TTL and repo-clone-fail branches each write their own record.
+    assert "FAILED 124 runtime_ttl" in script
+    assert "FAILED 1 repo_clone_failed" in script
+    # The write must never block poweroff — every invocation is guarded `|| true`.
+    assert "/tmp/blueprint_terminal_record.py" in script
+    assert "|| true" in script
+
+
+def test_extract_terminal_record_from_bundle_roundtrips_and_failsoft():
+    extract = compute_backends_module._extract_terminal_record_from_bundle
+    # A faithful multi-file bundle: terminal.json is picked out by basename even
+    # with the production ``./`` prefix and a sibling command.log.json present.
+    bundle = _make_tar_gz_bundle(
+        {
+            "./command.log.json": b'{"text":"hi","truncated":false,"byte_count":2}',
+            "./terminal.json": _terminal_record_bytes(reason="completed"),
+        }
+    )
+    record = extract(bundle)
+    assert record is not None
+    assert record["status"] == "SUCCEEDED"
+    assert record["reason"] == "completed"
+    # A bundle with no terminal.json → None (not an error).
+    no_terminal = _make_tar_gz_bundle({"./other.txt": b"x"})
+    assert extract(no_terminal) is None
+    # Non-tar / garbage bytes degrade to None, never raise.
+    assert extract(b"not-a-tar-gz") is None
+    assert extract(b"") is None
+    # A terminal.json that isn't a JSON object → None.
+    bad = _make_tar_gz_bundle({"./terminal.json": b"[1,2,3]"})
+    assert extract(bad) is None
+
+
+def test_reconcile_terminal_record_to_status_succeeded_and_failed():
+    reconcile = compute_backends_module._reconcile_terminal_record_to_status
+    # SUCCEEDED record carries exit code + decoded metrics + command log.
+    record = json.loads(
+        _terminal_record_bytes(
+            status="SUCCEEDED",
+            exit_code=0,
+            reason="completed",
+            metrics={"mean_act_gain": 0.16, "ok": True},
+            command_log={"text": "done\n", "truncated": False, "byte_count": 5},
+        ).decode("utf-8")
+    )
+    status = reconcile(record)
+    assert status is not None
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    assert status.exit_code == 0
+    assert status.metrics == {"mean_act_gain": 0.16, "ok": 1.0}
+    assert status.command_log == {
+        "text": "done\n",
+        "truncated": False,
+        "byte_count": 5,
+    }
+    # FAILED record preserves the non-zero exit code and reason.
+    failed = json.loads(
+        _terminal_record_bytes(
+            status="FAILED", exit_code=3, reason="command_failed"
+        ).decode("utf-8")
+    )
+    fstatus = reconcile(failed)
+    assert fstatus is not None
+    assert fstatus.status == ComputeJobStatus.FAILED
+    assert fstatus.exit_code == 3
+    assert fstatus.message == "command_failed"
+    # A record without a recognized status is treated as no durable record.
+    assert reconcile({"reason": "completed"}) is None
+    assert reconcile({"status": "RUNNING"}) is None
+    # A boolean exit_code must NOT be read as 1 (bool is an int subclass).
+    boolish = reconcile({"status": "SUCCEEDED", "exit_code": True})
+    assert boolish is not None
+    assert boolish.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_gcp_poll_status_reconciles_terminated_vm_from_durable_success(
+    monkeypatch,
+):
+    """The bug: a fast successful job powers off before its serial SUCCEEDED
+    marker is captured; the VM reads TERMINATED with no marker. poll_status must
+    reconcile to SUCCEEDED from the durable terminal.json, NOT report FAILURE."""
+    backend = GcpComputeBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id="compute-job-vm-fast0001",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"zone": "us-central1-f"},
+    )
+
+    # Serial output carries NO terminal marker (lost to the poweroff race).
+    monkeypatch.setattr(
+        compute, "get_vm_serial_output", lambda *_a, **_k: "boot noise only"
+    )
+    monkeypatch.setattr(compute, "get_vm_status", lambda *_a, **_k: "TERMINATED")
+
+    bundle = _make_tar_gz_bundle(
+        {
+            "./terminal.json": _terminal_record_bytes(
+                status="SUCCEEDED",
+                exit_code=0,
+                reason="completed",
+                metrics={"mean_act_gain": 0.16},
+            )
+        }
+    )
+    download_calls: list = []
+
+    async def fake_download(job_id):
+        download_calls.append(job_id)
+        return bundle
+
+    monkeypatch.setattr(storage, "download_compute_job_artifact_bundle", fake_download)
+
+    status = await backend.poll_status(job)
+
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    assert status.exit_code == 0
+    assert status.metrics == {"mean_act_gain": 0.16}
+    assert download_calls == [job.id]
+
+
+@pytest.mark.asyncio
+async def test_gcp_poll_status_terminated_without_durable_record_still_fails(
+    monkeypatch,
+):
+    """Fallback preserved: a TERMINATED VM with neither a serial marker nor a
+    durable terminal record is still a blind FAILURE."""
+    backend = GcpComputeBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id="compute-job-vm-nodurable",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"zone": "us-central1-f"},
+    )
+    monkeypatch.setattr(compute, "get_vm_serial_output", lambda *_a, **_k: "")
+    monkeypatch.setattr(compute, "get_vm_status", lambda *_a, **_k: "TERMINATED")
+
+    async def fake_download(_job_id):
+        return None
+
+    monkeypatch.setattr(storage, "download_compute_job_artifact_bundle", fake_download)
+
+    status = await backend.poll_status(job)
+    assert status.status == ComputeJobStatus.FAILED
+    assert status.message == "compute-job VM stopped without a terminal marker"
+
+
+@pytest.mark.asyncio
+async def test_gcp_poll_status_reconciles_terminated_vm_to_failure(monkeypatch):
+    """A genuinely-failed job whose serial marker was also lost reconciles to
+    FAILED (with its real exit code), not to a vague 'no terminal marker'."""
+    backend = GcpComputeBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id="compute-job-vm-failrec",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"zone": "us-central1-f"},
+    )
+    monkeypatch.setattr(compute, "get_vm_serial_output", lambda *_a, **_k: "noise")
+    monkeypatch.setattr(compute, "get_vm_status", lambda *_a, **_k: "TERMINATED")
+
+    bundle = _make_tar_gz_bundle(
+        {
+            "./terminal.json": _terminal_record_bytes(
+                status="FAILED", exit_code=2, reason="command_failed"
+            )
+        }
+    )
+
+    async def fake_download(_job_id):
+        return bundle
+
+    monkeypatch.setattr(storage, "download_compute_job_artifact_bundle", fake_download)
+
+    status = await backend.poll_status(job)
+    assert status.status == ComputeJobStatus.FAILED
+    assert status.exit_code == 2
+    assert status.message == "command_failed"
+
+
+@pytest.mark.asyncio
+async def test_gcp_poll_status_serial_marker_skips_durable_reconcile(monkeypatch):
+    """The serial fast-path still wins: when the serial SUCCEEDED marker IS
+    present, poll_status finalizes from it and never downloads the bundle."""
+    backend = GcpComputeBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id="compute-job-vm-serialwin",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"zone": "us-central1-f"},
+    )
+    monkeypatch.setattr(
+        compute,
+        "get_vm_serial_output",
+        lambda *_a, **_k: "\n".join(
+            [
+                "BLUEPRINT_COMPUTE_REASON=completed",
+                "BLUEPRINT_COMPUTE_STATUS=SUCCEEDED",
+                "BLUEPRINT_COMPUTE_EXIT_CODE=0",
+            ]
+        ),
+    )
+
+    async def forbid_download(_job_id):
+        raise AssertionError(
+            "durable reconcile must not run when serial marker present"
+        )
+
+    monkeypatch.setattr(
+        storage, "download_compute_job_artifact_bundle", forbid_download
+    )
+
+    status = await backend.poll_status(job)
+    assert status.status == ComputeJobStatus.SUCCEEDED
+    assert status.exit_code == 0
 
 
 @pytest.mark.asyncio
@@ -6048,6 +6353,67 @@ def test_build_compute_result_logs_shape_metrics_and_disposition():
     assert "ignored" not in result
 
 
+def test_build_compute_result_logs_embeds_command_log_text():
+    """The builder embeds the bounded command-output log so downstream analysis can
+    find results that live in stdout/stderr rather than in $BLUEPRINT_RESULT_FILE."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="g2-standard-4",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+        polling_metadata={
+            "command_log": {
+                "text": "act-1-clear improvement: +0.16\n",
+                "truncated": True,
+            },
+        },
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert "act-1-clear improvement: +0.16" in result["command_log_text"]
+    assert result["command_log_truncated"] is True
+
+
+def test_build_compute_result_logs_caps_command_log_text():
+    """A noisy command log is truncated to the embed cap so it cannot bloat the JSON."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="g2-standard-4",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+        polling_metadata={"command_log": {"text": "x" * 20000, "truncated": False}},
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert len(result["command_log_text"]) == 8000
+
+
+def test_build_compute_result_logs_omits_command_log_when_absent():
+    """No command_log in polling_metadata ⇒ no command_log_text key (backward-compat)."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="local",
+        machine_type="e2-standard-2",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.1,
+        final_cost_usd=0.1,
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert "command_log_text" not in result
+    assert "command_log_truncated" not in result
+
+
 def test_build_compute_result_logs_falls_back_to_accrued_cost():
     """When final_cost_usd is unset, the builder falls back to accrued cost."""
     job = ComputeJob(
@@ -8185,7 +8551,7 @@ def _make_project_with_ceiling(ceiling_usd: float) -> Project:
     return Project(
         name=f"Ceiling Project {ceiling_usd}",
         user_id="test-user",
-        build_config={"daily_spend_ceiling_usd": ceiling_usd},
+        build_config={"resource_envelope": {"spend_ceiling_usd": ceiling_usd}},
     )
 
 
@@ -8262,6 +8628,73 @@ async def test_create_compute_job_respects_project_daily_spend_ceiling(db_sessio
         .all()
     )
     assert jobs == [], "no compute job should be created when ceiling is exceeded"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_respects_resource_envelope_spend_ceiling(db_session):
+    """Ceiling set via resource_envelope key blocks launch when rolling spend >= ceiling."""
+    project = Project(
+        name="Resource Envelope Ceiling Project",
+        user_id="test-user",
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 5.0,
+                "spend_window_days": 30,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Settled spend: $4.50 within the 30-day window.
+    await _make_terminal_job(db_session, project_id=project.id, final_cost_usd=4.50)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Requesting $1.00 cap: 4.50 + 1.00 = 5.50 >= 5.00 → should raise.
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc_info:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo ceiling via resource_envelope",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+
+    detail = exc_info.value.detail
+    assert detail["error"] == "project_spend_ceiling_exceeded"
+    assert detail["ceiling_usd"] == pytest.approx(5.0)
+    assert detail["rolling_spend_usd"] == pytest.approx(4.50)
+    assert detail["requested_cap_usd"] == pytest.approx(1.0)
+
+    # No active job row should have been created.
+    jobs = (
+        (
+            await db_session.execute(
+                select(ComputeJob).where(
+                    ComputeJob.project_id == project.id,
+                    ComputeJob.status.in_(
+                        [
+                            ComputeJobStatus.QUEUED,
+                            ComputeJobStatus.STARTING,
+                            ComputeJobStatus.RUNNING,
+                            ComputeJobStatus.POLLING,
+                        ]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert jobs == [], (
+        "no compute job should be created when resource_envelope ceiling is exceeded"
+    )
 
 
 @pytest.mark.asyncio
@@ -8471,6 +8904,58 @@ async def test_create_compute_job_ceiling_counts_agent_vm_spend(db_session):
     )
     assert jobs == [], (
         "no compute job should be created when agent-VM spend exceeds ceiling"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_ceiling_task_spend_uses_correct_window(db_session):
+    """compute_project_window_spend_usd is called with window_hours=window_days*24.
+
+    When resource_envelope.spend_window_days=30, the agent-VM/LLM spend helper
+    must be queried with window_hours=720 (not the default 24), so both compute
+    and task spend are measured over the same rolling window.
+    """
+    project = Project(
+        name="Window Match Project",
+        user_id="test-user",
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 30,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    captured_kwargs: dict = {}
+
+    async def capture_call(session, pid, *, window_hours=24):
+        captured_kwargs["window_hours"] = window_hours
+        return 0.0  # well below ceiling — we only care about the kwarg
+
+    with patch(
+        "app.efficiency_snapshot.compute_project_window_spend_usd",
+        new=capture_call,
+    ):
+        # Should succeed (0.0 spend + 1.0 cap = 1.0 < 100.0 ceiling).
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo window match",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+
+    assert captured_kwargs.get("window_hours") == 30 * 24, (
+        f"expected window_hours=720 (30-day window), got {captured_kwargs.get('window_hours')}"
     )
 
 
@@ -8859,9 +9344,7 @@ def test_gcp_startup_script_clones_repo_when_repo_clone_present():
         spec, artifact_upload_url="https://storage.example.com/upload"
     )
     assert "git clone --depth 1 --branch release-x" in script
-    assert (
-        "https://x-access-token:ghs_FAKETOKEN123@github.com/octo/demo.git" in script
-    )
+    assert "https://x-access-token:ghs_FAKETOKEN123@github.com/octo/demo.git" in script
     assert "cd /tmp/blueprint_repo" in script
     assert "export PYTHONPATH=/tmp/blueprint_repo:${PYTHONPATH:-}" in script
     # A clone failure must terminate the job LOUDLY (parseable markers), not leave
@@ -8950,7 +9433,9 @@ async def test_attach_repo_clone_sets_repo_and_token(db_session, monkeypatch):
     assert spec.repo_token == "ghs_FAKE"
 
 
-async def test_attach_repo_clone_skips_when_project_has_no_repo(db_session, monkeypatch):
+async def test_attach_repo_clone_skips_when_project_has_no_repo(
+    db_session, monkeypatch
+):
     """A repo-less project ⇒ no checkout and the token path is never touched."""
     project = Project(name="no-repo", user_id="u")
     db_session.add(project)
@@ -9092,3 +9577,173 @@ async def test_provision_local_does_not_inherit_orchestrator_secrets(
     assert "AGENT_JWT_SECRET" not in child_env
     assert child_env.get("PAYLOAD_URI") == "payload://test"
     assert child_env.get("VM_INSTANCE_ID") == vm_instance_id
+
+
+# ---------------------------------------------------------------------------
+# Credential redaction: command_log
+# ---------------------------------------------------------------------------
+
+
+def _make_job_with_command_log(text: str, truncated: bool = False) -> ComputeJob:
+    return ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="g2-standard-4",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+        polling_metadata={
+            "command_log": {
+                "text": text,
+                "truncated": truncated,
+                "byte_count": len(text.encode()),
+            },
+        },
+    )
+
+
+def test_command_log_credentials_redacted_on_operator_and_knowledge_surfaces():
+    """Bearer tokens and signed-URL query strings in command_log are scrubbed on
+    every durable surface: admin API (serialize_compute_job_response_safe),
+    artifact JSON (build_compute_result_logs), and artifact Logs
+    (_link_terminal_artifact via redact_command_log_text applied before storage).
+
+    This is the named acceptance test for the fix-redact-credentials-command-log task.
+    """
+    raw = (
+        "Fetching artifact from https://storage.example.com/bucket/obj?X-Goog-Signature=SECRETVAL&expires=999\n"
+        "Authorization: Bearer ghp_SUPERSECRETTOKEN\n"
+        "export AWS_SECRET_KEY=MY_SECRET_VALUE\n"
+        "result: ok\n"
+    )
+    job = _make_job_with_command_log(raw)
+
+    # --- operator API surface ---
+    api_data = schemas.serialize_compute_job_response_safe(job)
+    api_text = api_data["polling_metadata"]["command_log"]["text"]
+    assert "SECRETVAL" not in api_text, (
+        "signed URL query value must be redacted from API"
+    )
+    assert "ghp_SUPERSECRETTOKEN" not in api_text, (
+        "bearer token must be redacted from API"
+    )
+    assert "MY_SECRET_VALUE" not in api_text, "export value must be redacted from API"
+    assert "result: ok" in api_text, "benign output must survive redaction"
+
+    # --- artifact JSON / knowledge document surface ---
+    result = compute_jobs.build_compute_result_logs(job)
+    import json as _json
+
+    artifact = _json.loads(result)
+    cl_text = artifact["command_log_text"]
+    assert "SECRETVAL" not in cl_text, (
+        "signed URL query value must be redacted from artifact JSON"
+    )
+    assert "ghp_SUPERSECRETTOKEN" not in cl_text, (
+        "bearer token must be redacted from artifact JSON"
+    )
+    assert "MY_SECRET_VALUE" not in cl_text, (
+        "export value must be redacted from artifact JSON"
+    )
+    assert "result: ok" in cl_text, (
+        "benign output must survive redaction in artifact JSON"
+    )
+
+    # --- direct helper ---
+    clean = schemas.redact_command_log_text(raw)
+    assert "SECRETVAL" not in clean
+    assert "ghp_SUPERSECRETTOKEN" not in clean
+    assert "MY_SECRET_VALUE" not in clean
+    assert "result: ok" in clean
+
+
+def test_redact_command_log_text_strips_bearer_tokens():
+    """redact_command_log_text removes Authorization headers and bearer-like values."""
+    text = "Authorization: Bearer abc123\ntoken=mysecret\nok\n"
+    result = schemas.redact_command_log_text(text)
+    assert "abc123" not in result
+    assert "mysecret" not in result
+    assert "ok" in result
+
+
+def test_redact_command_log_text_strips_url_query_strings():
+    """redact_command_log_text strips URL query parameters (signed URLs etc.)."""
+    text = "GET https://example.com/file?X-Goog-Signature=abc&Expires=123\ndone\n"
+    result = schemas.redact_command_log_text(text)
+    assert "abc" not in result
+    assert "X-Goog-Signature" not in result
+    assert "done" in result
+
+
+def test_redact_command_log_text_strips_shell_exports():
+    """redact_command_log_text redacts shell export statements."""
+    text = "export SECRET_KEY=supersecret\nexport PATH=/usr/bin\nrunning\n"
+    result = schemas.redact_command_log_text(text)
+    assert "supersecret" not in result
+    assert "running" in result
+
+
+def test_redact_command_log_text_covers_bare_token_formats():
+    """redact_command_log_text covers bare token formats not prefixed by 'Bearer'.
+
+    This is the named acceptance test: ghp_***, sk-ant-***, ya29***, embedded
+    git URL credential, and JSON access_token field must all be redacted even
+    when no 'Authorization: Bearer' header is present.
+    """
+    raw = (
+        # bare GitHub PAT — no Bearer prefix
+        "fatal: repository 'https://github.com/org/repo.git/' not found\n"
+        "token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123\n"
+        # embedded git URL credential
+        "Cloning into '/tmp/work'... (token=https://x-access-token:ghs_SECRETTOKEN123@github.com/org/repo)\n"
+        # Anthropic key
+        "api_key=sk-ant-api03-SUPERSECRETKEYVALUE\n"
+        # Google OAuth access token
+        "oauth: ya29.A0ARrdaM-GOOGLEOAUTHTOKEN\n"
+        # JSON access_token field (caught by _CRED_FIELD_RE in _redact_credentials)
+        '{"access_token": "ACCESS_TOKEN_VALUE_HERE", "expires_in": 3600}\n'
+        # benign output
+        "exit code: 1\n"
+    )
+    result = schemas.redact_command_log_text(raw)
+    assert "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123" not in result, (
+        "bare ghp_ token must be redacted"
+    )
+    assert "ghs_SECRETTOKEN123" not in result, (
+        "embedded git URL ghs_ token must be redacted"
+    )
+    assert "sk-ant-api03-SUPERSECRETKEYVALUE" not in result, (
+        "sk-ant- key must be redacted"
+    )
+    assert "ya29.A0ARrdaM-GOOGLEOAUTHTOKEN" not in result, (
+        "ya29. token must be redacted"
+    )
+    assert "ACCESS_TOKEN_VALUE_HERE" not in result, (
+        "JSON access_token value must be redacted"
+    )
+    assert "exit code: 1" in result, "benign output must survive"
+    assert "expires_in" in result, "benign JSON field must survive"
+
+
+def test_build_compute_result_logs_redacts_command_log_text():
+    """build_compute_result_logs scrubs credentials before embedding command_log_text."""
+    raw = "token=leaked_secret\nnormal output\n"
+    job = _make_job_with_command_log(raw)
+    import json as _json
+
+    result = _json.loads(compute_jobs.build_compute_result_logs(job))
+    assert "leaked_secret" not in result["command_log_text"]
+    assert "normal output" in result["command_log_text"]
+
+
+def test_serialize_compute_job_response_safe_redacts_command_log():
+    """serialize_compute_job_response_safe scrubs command_log.text for operator API."""
+    raw = "Bearer token=TOP_SECRET\nresult: 42\n"
+    job = _make_job_with_command_log(raw)
+    data = schemas.serialize_compute_job_response_safe(job)
+    text = data["polling_metadata"]["command_log"]["text"]
+    assert "TOP_SECRET" not in text
+    assert "result: 42" in text

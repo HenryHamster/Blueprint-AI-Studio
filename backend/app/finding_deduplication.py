@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
@@ -627,13 +628,23 @@ def _normalize_source_ref(ref: str) -> str:
     Handles formats like:
       - path/to/file.py
       - path/to/file.py:42
+      - path/to/file.py:42-50
       - path/to/file.py#L10-L20
     Returns the base file path only.
+
+    Typed refs (pr:123, message:abc) and URL schemes (https://...) are
+    preserved because they have no path separator or extension before the
+    colon, so they are not mistaken for file-path line-number suffixes.
     """
     if not ref:
         return ""
-    # Strip line numbers (e.g., :42) and line ranges (e.g., #L10-L20)
-    ref = ref.split(":")[0].split("#")[0]
+    # Strip fragment-based line ranges (e.g., #L10-L20)
+    ref = ref.split("#")[0]
+    # Strip numeric line-number suffixes (e.g., :42, :42-50) only when the ref
+    # looks like a file path (contains a / or . before the colon). This preserves
+    # typed refs like pr:123, message:abc, and URL schemes like https://.
+    if re.search(r"[/.].*:", ref):
+        ref = re.sub(r":\d+(?:-\d+)?$", "", ref)
     return ref.strip()
 
 
@@ -780,8 +791,12 @@ def deduplicate_findings(
     recent_terminal_findings = [
         f for f in (recent_terminal_findings or []) if isinstance(f, dict)
     ]
-    # Build evidence list from already-deduped findings for evidence-overlap check
-    evidence_list: list[tuple[str, list, list]] = []
+    # Build evidence list seeded from recent terminal findings (cross-cycle dedup),
+    # then extended with surviving findings from the current batch.
+    evidence_list: list[tuple[str, list, list]] = [
+        (f.get("title", ""), f.get("sources", []), f.get("claims", []))
+        for f in recent_terminal_findings
+    ]
 
     for orig_i, finding in indexed_findings:
         title = finding.get("title", f"Research finding #{orig_i + 1}")
@@ -920,43 +935,6 @@ def deduplicate_findings(
                 }
             )
             continue
-
-        if recent_terminal_findings:
-            recent_terminal_evidence = [
-                (
-                    f.get("title", ""),
-                    f.get("sources", []),
-                    f.get("claims", []),
-                )
-                for f in recent_terminal_findings
-                if not finding_dir_id
-                or not f.get("direction_id")
-                or f.get("direction_id") == finding_dir_id
-            ]
-            is_terminal_evidence_dup, matched_terminal_evidence_title = (
-                _check_evidence_overlap(
-                    finding.get("sources", []),
-                    finding.get("claims", []),
-                    recent_terminal_evidence,
-                )
-            )
-            if is_terminal_evidence_dup:
-                logger.info(
-                    f"[RESEARCH] Skipping finding '{title}' — evidence overlap with recent terminal '{matched_terminal_evidence_title}'"
-                )
-                outcome.evidence_overlap_count += 1
-                reason = (
-                    f"recent terminal evidence overlap with: "
-                    f"{matched_terminal_evidence_title[:60]}"
-                )
-                outcome.filtered.append(
-                    {
-                        "title": title[:120],
-                        "direction_id": finding_dir_id,
-                        "reason": reason[:80],
-                    }
-                )
-                continue
 
         outcome.deduplicated.append((orig_i, finding, fhash))
         # Add to evidence list for future comparisons in this cycle

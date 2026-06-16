@@ -388,6 +388,32 @@ export async function resolveViewportFailureDownloadUrl(
   return data.url;
 }
 
+export async function resolveViewportShotDownloadUrl(
+  projectId: string,
+  taskId: string,
+  name: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const query = new URLSearchParams({ project_id: projectId, task_id: taskId, name });
+  const res = await apiFetch(
+    `/api/admin/viewport-shots/download-url?${query.toString()}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to resolve viewport shot: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to resolve viewport shot: ${res.status}`);
+  }
+  const data = await res.json().catch(() => ({})) as Partial<ViewportFailureDownloadUrlResponse>;
+  if (typeof data.url !== 'string' || data.url.length === 0) {
+    throw new Error('Viewport shot resolver returned an empty URL');
+  }
+  return data.url;
+}
+
 export async function fetchTaskSerialConsole(taskId: string): Promise<import('./types/task').SerialConsoleResponse> {
   const res = await apiFetch(`/api/admin/tasks/${encodeURIComponent(taskId)}/serial-console`);
   if (!res.ok) throw new Error(`Failed to fetch serial console: ${res.status}`);
@@ -639,6 +665,7 @@ export async function fetchPipelineRegressions(
 
 export interface ImprovementLaneRow {
   id: string;
+  title: string | null;
   status: string;
   direction_id: string | null;
   branch: string | null;
@@ -656,6 +683,7 @@ export interface ImprovementLaneRow {
   reservation_force_expired_count: number | null;
   pilot_arm: string | null;
   phase_requeues: number;
+  recovery: { reason: string; attempt: number; exhausted: boolean; at: string } | null;
   llm_input_tokens_total: number | null;
   llm_output_tokens_total: number | null;
   vm_cost_usd_total: number;
@@ -674,6 +702,25 @@ export interface ShadowLaneHealth {
   miss_rate: number | null;
 }
 
+export interface LanePilotTrialMetrics {
+  verdict: 'KILL' | 'ADOPT' | 'CONTINUE';
+  verdict_reason: string;
+  immediate_alert: boolean;
+  n_lane: number;
+  n_control: number;
+  lane_merge_rate: number | null;
+  control_merge_rate: number | null;
+  lane_cost_per_merged: number | null;
+  control_cost_per_merged: number | null;
+  checkpoint_loss_rate: number | null;
+  warm_resume_fraction: number | null;
+  checkpoint_fraction: number | null;
+  lane_fix_tasks_sampled: number;
+  control_warm_resume_count: number;
+  gate_integrity_violations: number;
+  [key: string]: unknown;
+}
+
 export interface ImprovementLanesResponse {
   lanes: ImprovementLaneRow[];
   total_returned: number;
@@ -681,6 +728,7 @@ export interface ImprovementLanesResponse {
   limit: number;
   project_id: string;
   shadow_health?: ShadowLaneHealth;
+  trial_metrics?: LanePilotTrialMetrics | null;
   [key: string]: unknown;
 }
 
@@ -1525,6 +1573,18 @@ export interface VersionQualification {
   promotion_error_detail?: string | null;
 }
 
+/** Single resolved serving block — the canonical answer to "is this version live?"
+ *  Derived by the backend from the aggregate artifact evidence so every read site
+ *  (UI panel, CLI) reads one field instead of re-implementing the three-field
+ *  precedence chain (aggregate_serving_status ?? serving_status ?? qual_state.serving_status). */
+export interface ResolvedServing {
+  status?: string | null;
+  sha?: string | null;
+  confirmed_at?: string | null;
+  failure_reason?: string | null;
+  artifacts?: ReleaseArtifactEvidence[];
+}
+
 /** Per-artifact serving evidence for a release version. One entry per registered
  *  deploy artifact (e.g. the backend Cloud Run revision, plus any other required
  *  artifact). serving_status is one of 'unconfirmed' | 'serving_confirmed' |
@@ -1597,6 +1657,13 @@ export interface OutOfBandPromotion {
   promoted_sha: string;
 }
 
+export interface ChangelogEntry {
+  task_type: string | null;
+  title: string;
+  pr_number: number | null;
+  pr_url?: string | null;
+}
+
 export interface CurrentVersion {
   version_number: number;
   phase: string;
@@ -1609,6 +1676,12 @@ export interface CurrentVersion {
   opened_at: string;
   qualification_attempts: number;
   merged_task_count: number;
+  /** Human-readable what's-new headline + at-a-glance metrics (merged / proven /
+   *  conf-thr) for the current version, mirroring the per-version summary
+   *  endpoint's highlights. The 'serving' word in the headline derives from the
+   *  aggregate required-artifact serving truth, not the scalar serving_status.
+   *  Optional/additive — absent on older backends. */
+  highlights?: VersionSummaryHighlights | null;
   /** Tasks merged at/after the last qualification verdict's finalized_at — a
    *  verdict-staleness signal. >0 means work landed since the verdict was
    *  computed, so the displayed confidence no longer reflects the current tree.
@@ -1649,6 +1722,9 @@ export interface CurrentVersion {
   aggregate_serving_status?: string | null;
   aggregate_deploy_failure_reason?: string | null;
   artifacts?: ReleaseArtifactEvidence[];
+  /** Single resolved serving block — prefer this over the three peer fields.
+   *  Absent on older backends (optional for zero-downtime mixed deploys). */
+  serving?: ResolvedServing | null;
   // Post-promotion deploy-confirmation window deadline (ISO string). The sweep
   // resolves serving_status to confirmed/failed when this elapses; the panel
   // computes remaining/overdue at render time.
@@ -1656,11 +1732,17 @@ export interface CurrentVersion {
   // Out-of-band promotion provenance. Non-null only when an operator force-merged
   // this version outside the normal qualification flow.
   out_of_band_promotion?: OutOfBandPromotion | null;
+  /** Per-task changelog for this version window: type, title, and PR number for
+   *  each merged task, newest-first. Allows operators to see what shipped without
+   *  manual release notes. */
+  tasks_merged?: ChangelogEntry[];
 }
 
 export interface RecentVersion {
+  id?: string;
   version_number: number;
   status: string;
+  phase?: string | null;
   opened_at: string;
   promoted_at: string | null;
   qualification_attempts: number;
@@ -1678,12 +1760,21 @@ export interface RecentVersion {
   aggregate_serving_status?: string | null;
   aggregate_deploy_failure_reason?: string | null;
   artifacts?: ReleaseArtifactEvidence[];
+  /** Single resolved serving block — prefer this over the three peer fields.
+   *  Absent on older backends (optional for zero-downtime mixed deploys). */
+  serving?: ResolvedServing | null;
   // Post-promotion deploy-confirmation window deadline (ISO string) — see
   // CurrentVersion. Present on the recently-promoted history row whose
   // serving_status is still 'unconfirmed'.
   deploy_confirm_deadline?: string | null;
   // Out-of-band promotion provenance — see CurrentVersion.
   out_of_band_promotion?: OutOfBandPromotion | null;
+  // Server-computed highlights (headline + metrics) — additive; null on older backends.
+  highlights?: VersionSummaryHighlights | null;
+  // Merged-task count for this version's window. Both keys present for consistency.
+  merged_count?: number | null;
+  merged_task_count?: number | null;
+  acceptance_aggregate?: Record<string, number> | null;
 }
 
 export interface PromotionReadinessConfidence {
@@ -1846,6 +1937,40 @@ export async function setProjectPromotionEnabled(
 export async function fetchVersionLifecycle(projectId: string): Promise<VersionLifecycleResponse> {
   const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-lifecycle`);
   if (!res.ok) throw new Error(`Failed to fetch version lifecycle: ${res.status}`);
+  return res.json();
+}
+
+export interface VersionSummaryHighlights {
+  headline: string;
+  merged_count: number;
+  proven: number;
+  total_merged_for_acceptance: number;
+  qualification_confidence: number | null;
+  qualification_threshold: number | null;
+}
+
+export interface VersionSummaryResponse {
+  version_number: number;
+  phase: string;
+  status: string;
+  goal: string | null;
+  opened_at: string | null;
+  promoted_at: string | null;
+  served_at: string | null;
+  phase_changed_at: string | null;
+  merged_count: number;
+  acceptance_aggregate: Record<string, number>;
+  qualification_state: QualificationState | null;
+  serving_status: string | null;
+  served_sha: string | null;
+  deploy_failure_reason: string | null;
+  highlights: VersionSummaryHighlights;
+  tasks_merged?: ChangelogEntry[];
+}
+
+export async function fetchVersionSummary(versionId: string): Promise<VersionSummaryResponse> {
+  const res = await apiFetch(`/api/admin/release-versions/${encodeURIComponent(versionId)}/summary`);
+  if (!res.ok) throw new Error(`Failed to fetch version summary: ${res.status}`);
   return res.json();
 }
 
@@ -3233,11 +3358,18 @@ export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSet
   }
 }
 
+export interface VisualPilotShotEntry {
+  name: string;
+  magnitude?: number;
+}
+
 export interface VisualPilotCaughtEntry {
   task_id: string;
   task_title: string;
   note: string | null;
   created_at: string;
+  viewport_shot_names: string[];
+  viewport_shot_entries?: VisualPilotShotEntry[];
 }
 
 export interface VisualPilotStatus {

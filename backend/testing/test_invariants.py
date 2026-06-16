@@ -314,19 +314,39 @@ def test_all_admin_routes_require_auth():
     """Every admin-surface route must resolve an auth dependency somewhere."""
     from fastapi.routing import APIRoute
 
-    from app.auth import get_current_user, get_metrics_reader, require_admin
+    from app.auth import (
+        get_current_user,
+        get_current_user_optional,
+        get_metrics_reader,
+        require_admin,
+    )
     from app.main import app
     from app.routers.agent import verify_agent_token
 
     # Intentional exceptions — should stay empty. If a route is intentionally
     # public (for example, a monitored liveness probe), add its path here with
     # a short comment explaining why the public surface is deliberate.
-    public_allowlist: dict[str, str] = {}
+    public_allowlist: dict[str, str] = {
+        "/api/admin/viewport-shots/download-url": (
+            "Intentionally unauthenticated: endpoint returns a 302 redirect to a "
+            "time-limited GCS signed URL. Operators click these links from GitHub PR "
+            "bodies without a bearer token; the signed URL itself is the security boundary."
+        ),
+    }
 
     # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
     # JWTs; it is a valid auth callable for metrics-only endpoints.
+    # get_current_user_optional is used on endpoints that accept EITHER an admin
+    # bearer token OR an agent JWT via x-agent-token; the endpoint enforces
+    # auth itself when the optional dep returns None.
     auth_callables = frozenset(
-        {get_current_user, require_admin, verify_agent_token, get_metrics_reader}
+        {
+            get_current_user,
+            get_current_user_optional,
+            require_admin,
+            verify_agent_token,
+            get_metrics_reader,
+        }
     )
     scanned_routes: list[str] = []
     offenders: list[str] = []
@@ -9215,4 +9235,196 @@ def test_all_load_only_projection_sites_require_raiseload():
         "omit raiseload=True. Add raiseload=True to each site so that accessing "
         "an un-projected column raises synchronously at test time instead of "
         "triggering a MissingGreenlet 500 in production.\n" + "\n".join(violations)
+    )
+
+
+def test_stall_alert_functions_reachable_from_canonical_import_path():
+    """Every _check_/_alert_/_resolve_ function in release_stall_alerts.py must be
+    reachable via at least one canonical import path.
+
+    When a new stall-alert function is extracted into release_stall_alerts.py it
+    must be either (a) directly imported in test_release_stall_alerts.py, or (b)
+    re-exported from release_qualifier.py via a ``from app.release_stall_alerts
+    import ...`` block.  A function that is neither tested directly nor re-exported
+    is silently unreachable — callers who import from the old location
+    (release_qualifier) won't see it, and the test suite won't exercise it.
+    """
+    testing_dir = Path(__file__).resolve().parent
+    backend_dir = testing_dir.parent
+    app_dir = backend_dir / "app"
+
+    stall_alerts_path = app_dir / "release_stall_alerts.py"
+    qualifier_path = app_dir / "release_qualifier.py"
+    test_path = testing_dir / "test_release_stall_alerts.py"
+
+    stall_source = stall_alerts_path.read_text(encoding="utf-8")
+    qualifier_source = qualifier_path.read_text(encoding="utf-8")
+    test_source = test_path.read_text(encoding="utf-8")
+
+    stall_tree = ast.parse(stall_source, filename=str(stall_alerts_path))
+    qualifier_tree = ast.parse(qualifier_source, filename=str(qualifier_path))
+    test_tree = ast.parse(test_source, filename=str(test_path))
+
+    # Collect all top-level function names matching the _check_/_alert_/_resolve_ prefix
+    import re as _re
+
+    _STALL_FUNC_PATTERN = _re.compile(r"^(_check_|_alert_|_resolve_)")
+    stall_functions: set[str] = set()
+    for node in ast.walk(stall_tree):
+        if isinstance(node, ast.FunctionDef) and _STALL_FUNC_PATTERN.match(node.name):
+            stall_functions.add(node.name)
+
+    def _collect_imports_from(tree: ast.Module, module_name: str) -> set[str]:
+        """Collect names imported via 'from <module_name> import ...' in tree."""
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == module_name:
+                for alias in node.names:
+                    names.add(alias.name)
+        return names
+
+    # Names directly imported in the test file
+    test_imports = _collect_imports_from(test_tree, "app.release_stall_alerts")
+
+    # Names re-exported from release_qualifier.py
+    qualifier_reexports = _collect_imports_from(
+        qualifier_tree, "app.release_stall_alerts"
+    )
+
+    reachable = test_imports | qualifier_reexports
+    unreachable = sorted(stall_functions - reachable)
+
+    assert not unreachable, (
+        "The following functions in release_stall_alerts.py are not reachable "
+        "from any canonical import path — they are neither directly imported in "
+        "test_release_stall_alerts.py nor re-exported from release_qualifier.py.\n"
+        "Fix by adding them to one of:\n"
+        "  (a) the 'from app.release_stall_alerts import ...' block in "
+        "test_release_stall_alerts.py (for alert/resolve functions that need "
+        "direct test coverage), OR\n"
+        "  (b) the 'from app.release_stall_alerts import ...' block in "
+        "release_qualifier.py (for check functions re-exported for callers).\n\n"
+        "Unreachable functions:\n" + "\n".join(f"  {f}" for f in unreachable)
+    )
+
+
+def test_summarize_release_artifacts_callers_always_pass_project():
+    """Every call to summarize_release_artifacts in backend/app/ passes project=.
+
+    Omitting project= silently enables the legacy scalar fallback that invents
+    a backend_revision contribution for external projects, causing a serving-status
+    divergence across UI / CLI / system-state surfaces. This invariant enforces
+    that all production call sites opt in to the project-aware path.
+
+    The definition file (release_artifacts.py) is excluded — the function's own
+    default parameter ``project=None`` is not a missing-keyword violation.
+    """
+    backend_dir = Path(__file__).resolve().parent.parent
+    app_dir = backend_dir / "app"
+
+    violations: list[str] = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        # Exclude the definition file itself — `project=None` in the signature
+        # is intentional and is not a call-site violation.
+        if py_file.name == "release_artifacts.py":
+            continue
+        # Exclude routers sub-directory traversal already captured by rglob,
+        # but include them — they are production call sites too.
+
+        try:
+            source = py_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        if "summarize_release_artifacts" not in source:
+            continue
+
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                fname = func.id
+            elif isinstance(func, ast.Attribute):
+                fname = func.attr
+            else:
+                continue
+            if fname != "summarize_release_artifacts":
+                continue
+
+            has_project_kwarg = any(kw.arg == "project" for kw in node.keywords)
+            if not has_project_kwarg:
+                rel = py_file.relative_to(backend_dir.parent)
+                violations.append(
+                    f"  {rel}:{node.lineno} — "
+                    "call to summarize_release_artifacts() missing project= keyword"
+                )
+
+    assert not violations, (
+        "The following call sites omit project= from summarize_release_artifacts(). "
+        "Omitting project= enables a legacy scalar fallback that synthesises a "
+        "spurious backend_revision contribution for external projects and causes "
+        "serving-status divergence across surfaces. Pass project=<project_row> at "
+        "each site (or project=None if the call is known-safe and intentional — but "
+        "prefer the explicit keyword so the invariant stays informative).\n"
+        + "\n".join(violations)
+    )
+
+
+def test_serving_status_reads_route_through_aggregate():
+    """All read-path files must use version_serving_summary, not private copies.
+
+    The canonical serving resolver is ``release_artifacts.version_serving_summary``.
+    Private copies of ``_version_serving_summary`` in other modules diverge silently:
+    they bypass project= threading, fall back to legacy scalars, or drift from the
+    aggregate-first algorithm over time.  This guard asserts that no file outside
+    ``release_artifacts.py`` defines a ``FunctionDef`` named ``_version_serving_summary``
+    or ``version_serving_summary`` — new read sites must import the canonical one.
+    """
+    backend_dir = Path(__file__).resolve().parent.parent
+    app_dir = backend_dir / "app"
+
+    duplicates: list[str] = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        if py_file.name == "release_artifacts.py":
+            continue
+
+        try:
+            source = py_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        # Quick text filter before expensive parse.
+        if "_version_serving_summary" not in source and "version_serving_summary" not in source:
+            continue
+
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in (
+                "_version_serving_summary",
+                "version_serving_summary",
+            ):
+                rel = py_file.relative_to(backend_dir.parent)
+                duplicates.append(
+                    f"  {rel}:{node.lineno} — "
+                    f"defines {node.name!r} (should import from release_artifacts)"
+                )
+
+    assert not duplicates, (
+        "The following files define a private serving-summary resolver instead of "
+        "importing ``version_serving_summary`` from ``release_artifacts``.  "
+        "Duplicate definitions diverge from the aggregate-first algorithm and "
+        "cause serving-status inconsistency across UI/CLI/strategist surfaces.\n"
+        + "\n".join(duplicates)
     )

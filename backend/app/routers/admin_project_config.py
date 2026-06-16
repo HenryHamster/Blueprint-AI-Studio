@@ -23,6 +23,7 @@ from pydantic import ValidationError
 
 from app.database import get_session
 from app.models import (
+    DeploymentState,
     Task,
     TaskStatus,
     _utcnow,
@@ -35,6 +36,10 @@ from app.resource_envelope import (
     resolve_project_spend_ceiling,
     resolve_project_spend_window_days,
     resolve_project_vm_cap,
+)
+from app.runtime_config_state import (
+    resolve_project_compute_job_concurrency_cap,
+    runtime_config as _runtime_config,
 )
 from app.schemas import ResourceEnvelope as ResourceEnvelopeSchema
 from app.task_locking import lock_project_or_429, with_design_doc_locked
@@ -78,7 +83,8 @@ async def cost_summary(
                         Task.vm_provisioned_at,
                         Task.vm_stopped_at,
                         Task.created_at,
-                    raiseload=True,)
+                        raiseload=True,
+                    )
                 )
                 .where(
                     Task.created_at >= cutoff,
@@ -172,8 +178,12 @@ async def get_auto_remediation_config(
                 )
                 .options(
                     load_only(
-                        Task.id, Task.status, Task.title, Task.context, Task.created_at,
-                        raiseload=True
+                        Task.id,
+                        Task.status,
+                        Task.title,
+                        Task.context,
+                        Task.created_at,
+                        raiseload=True,
                     )
                 )
                 .order_by(Task.created_at.desc())
@@ -793,21 +803,36 @@ def _resource_envelope_response(
     project,
     *,
     active_vm_count: int,
-    recent_spend_usd: float,
+    spend_breakdown: dict,
 ) -> Dict[str, Any]:
+    spend_ceiling_usd = resolve_project_spend_ceiling(project)
+    recent_spend_usd = spend_breakdown["total"]
     return {
         "project_id": str(project.id),
         "max_concurrent_vms": resolve_project_vm_cap(project),
-        "spend_ceiling_usd": resolve_project_spend_ceiling(project),
+        "spend_ceiling_usd": spend_ceiling_usd,
         "spend_window_days": resolve_project_spend_window_days(project),
+        "max_concurrent_compute_jobs": resolve_project_compute_job_concurrency_cap(
+            project.id
+        ),
         "active_vm_count": active_vm_count,
         "recent_spend_usd": float(recent_spend_usd),
+        "recent_spend_compute_usd": float(spend_breakdown["compute"]),
+        "recent_spend_agent_vm_usd": float(spend_breakdown["agent_vm"]),
+        "recent_spend_idle_usd": float(spend_breakdown["idle"]),
+        "is_throttled": (
+            spend_ceiling_usd is not None and recent_spend_usd >= spend_ceiling_usd
+        ),
     }
 
 
-async def _get_project_active_vm_count(session: AsyncSession, project_id: uuid.UUID) -> int:
+async def _get_project_active_vm_count(
+    session: AsyncSession, project_id: uuid.UUID
+) -> int:
     result = await session.execute(
-        select(func.count()).select_from(Task).where(
+        select(func.count())
+        .select_from(Task)
+        .where(
             Task.project_id == project_id,
             Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
         )
@@ -953,6 +978,94 @@ async def update_task_branch_prefix_config(
 
 
 # ---------------------------------------------------------------------------
+# No-CI honest-block policy config endpoints
+#
+# DEFAULT-OFF per-project opt-in: when ON, the no-CI merge gate BLOCKS a PR
+# (holds it open) instead of merging it UNVERIFIED whenever the gate EXPECTED to
+# verify the code but could NOT run the repo's suite (a DEGRADED fall-open
+# reason). Absent/False == today's behavior. Member-read / owner-write, stored
+# in the build_config JSONB column (migration-free) alongside requires_ci_checks.
+# ---------------------------------------------------------------------------
+
+
+def _block_degraded_unverified_merge_value(project) -> bool:
+    return bool(
+        (project.build_config or {}).get("block_degraded_unverified_merge", False)
+    )
+
+
+@router.get("/projects/{project_id}/block-degraded-unverified-merge")
+async def get_block_degraded_unverified_merge_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project no-CI honest-block policy flag (default OFF)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "block_degraded_unverified_merge": _block_degraded_unverified_merge_value(
+            project
+        ),
+        "is_default": not _build_config_has_key(
+            project, "block_degraded_unverified_merge"
+        ),
+    }
+
+
+@router.patch("/projects/{project_id}/block-degraded-unverified-merge")
+async def update_block_degraded_unverified_merge_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project no-CI honest-block policy. Pass false to revert to the
+    default (merge UNVERIFIED on a degraded fall-open, today's behavior)."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "block_degraded_unverified_merge" not in body:
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must include 'block_degraded_unverified_merge'",
+        )
+
+    enabled = body["block_degraded_unverified_merge"]
+    if not isinstance(enabled, bool):
+        raise HTTPException(
+            status_code=422,
+            detail="'block_degraded_unverified_merge' must be a boolean",
+        )
+
+    project = await lock_project_or_429(session, project_id)
+    build_config = dict(project.build_config or {})
+    if enabled:
+        build_config["block_degraded_unverified_merge"] = True
+    else:
+        # Pop on False so absent == default == OFF (keeps build_config lean and
+        # is_default semantically correct).
+        build_config.pop("block_degraded_unverified_merge", None)
+    project.build_config = build_config
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "block_degraded_unverified_merge": _block_degraded_unverified_merge_value(
+            project
+        ),
+        "is_default": not _build_config_has_key(
+            project, "block_degraded_unverified_merge"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Staging-branch-prefixes config endpoints
 # ---------------------------------------------------------------------------
 
@@ -1057,7 +1170,7 @@ async def get_resource_envelope_config(
         project_id, current_user["user_id"], session, "member"
     )
     active_vm_count = await _get_project_active_vm_count(session, project_id)
-    recent_spend_usd = await get_project_recent_spend_usd(
+    spend_breakdown = await get_project_recent_spend_usd(
         session,
         project_id=project_id,
         window_days=resolve_project_spend_window_days(project),
@@ -1065,7 +1178,7 @@ async def get_resource_envelope_config(
     return _resource_envelope_response(
         project,
         active_vm_count=active_vm_count,
-        recent_spend_usd=recent_spend_usd,
+        spend_breakdown=spend_breakdown,
     )
 
 
@@ -1081,7 +1194,12 @@ async def update_resource_envelope_config(
         project_id, current_user["user_id"], session, "owner"
     )
 
-    allowed = {"max_concurrent_vms", "spend_ceiling_usd", "spend_window_days"}
+    allowed = {
+        "max_concurrent_vms",
+        "spend_ceiling_usd",
+        "spend_window_days",
+        "max_concurrent_compute_jobs",
+    }
     if not body:
         raise HTTPException(
             status_code=422,
@@ -1106,10 +1224,44 @@ async def update_resource_envelope_config(
     try:
         validated = ResourceEnvelopeSchema(**merged)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail="Invalid resource envelope") from exc
+        raise HTTPException(
+            status_code=422, detail="Invalid resource envelope"
+        ) from exc
+
+    # max_concurrent_compute_jobs lives in runtime_config, not build_config.
+    # Update in-memory and persist to DeploymentState.runtime_config_json.
+    if "max_concurrent_compute_jobs" in body:
+        job_cap = validated.max_concurrent_compute_jobs
+        job_caps = dict(
+            _runtime_config.get("max_concurrent_compute_jobs_by_project") or {}
+        )
+        sid = str(project_id)
+        if job_cap is None:
+            job_caps.pop(sid, None)
+        else:
+            job_caps[sid] = job_cap
+        _runtime_config["max_concurrent_compute_jobs_by_project"] = job_caps
+        # Persist so the cap survives restarts.
+        state_result = await session.execute(
+            select(DeploymentState).where(DeploymentState.id == 1)
+        )
+        state = state_result.scalar_one_or_none()
+        if state is not None:
+            existing_json = dict(state.runtime_config_json or {})
+            existing_json["max_concurrent_compute_jobs_by_project"] = {
+                k: v for k, v in job_caps.items() if v and int(v) > 0
+            }
+            state.runtime_config_json = existing_json
+            flag_modified(state, "runtime_config_json")
+            session.add(state)
+
+    # Strip max_concurrent_compute_jobs from the build_config envelope —
+    # it is stored in runtime_config, not build_config.
+    envelope_dump = validated.model_dump(exclude_none=True)
+    envelope_dump.pop("max_concurrent_compute_jobs", None)
 
     build_config = dict(project.build_config or {})
-    build_config["resource_envelope"] = validated.model_dump(exclude_none=True)
+    build_config["resource_envelope"] = envelope_dump
     project.build_config = build_config
     flag_modified(project, "build_config")
     session.add(project)
@@ -1117,7 +1269,7 @@ async def update_resource_envelope_config(
     await session.refresh(project)
 
     active_vm_count = await _get_project_active_vm_count(session, project_id)
-    recent_spend_usd = await get_project_recent_spend_usd(
+    spend_breakdown = await get_project_recent_spend_usd(
         session,
         project_id=project_id,
         window_days=resolve_project_spend_window_days(project),
@@ -1125,7 +1277,7 @@ async def update_resource_envelope_config(
     return _resource_envelope_response(
         project,
         active_vm_count=active_vm_count,
-        recent_spend_usd=recent_spend_usd,
+        spend_breakdown=spend_breakdown,
     )
 
 

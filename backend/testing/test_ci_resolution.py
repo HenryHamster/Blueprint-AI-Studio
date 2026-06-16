@@ -275,6 +275,89 @@ def test_gate_none_project():
     )
 
 
+# resolve_no_checks_escalation — the no-checks escalation backstop decision
+
+
+def test_escalation_verify_tests_for_definitive_no_ci_with_suite():
+    # has_ci=False + detectable suite → route through the verify_tests gate.
+    p = _proj(
+        {
+            "requires_ci_checks": False,
+            "has_ci": False,
+            "directories": [{"path": ".", "test_cmd": "pytest"}],
+        }
+    )
+    assert (
+        ci_resolution.resolve_no_checks_escalation(p, "main", gate_enabled=True)
+        == "verify_tests"
+    )
+
+
+def test_escalation_merge_unverified_for_definitive_no_ci_without_suite():
+    # has_ci=False + no detectable suite → merge UNVERIFIED.
+    p = _proj({"requires_ci_checks": False, "has_ci": False, "directories": []})
+    assert (
+        ci_resolution.resolve_no_checks_escalation(p, "main", gate_enabled=True)
+        == "merge_unverified"
+    )
+
+
+def test_escalation_merge_unverified_when_kill_switch_off_with_suite():
+    # Kill-switch off forces the immediate-pass equivalent even with a suite.
+    p = _proj(
+        {
+            "requires_ci_checks": False,
+            "has_ci": False,
+            "directories": [{"path": ".", "test_cmd": "pytest"}],
+        }
+    )
+    assert (
+        ci_resolution.resolve_no_checks_escalation(p, "main", gate_enabled=False)
+        == "merge_unverified"
+    )
+
+
+def test_escalation_merge_unverified_on_internal_staging_base():
+    # A staging rollup never runs repo tests → merge_unverified (proceed).
+    p = _proj(
+        {
+            "requires_ci_checks": False,
+            "directories": [{"path": ".", "test_cmd": "pytest"}],
+        }
+    )
+    assert (
+        ci_resolution.resolve_no_checks_escalation(
+            p, "research/cycle-1", gate_enabled=True
+        )
+        == "merge_unverified"
+    )
+
+
+def test_escalation_keep_polling_for_ci_gated_repo_has_ci_true():
+    # has_ci=True (CI-gated) → never auto-merge; keep polling.
+    p = _proj({"has_ci": True, "directories": [{"path": ".", "test_cmd": "pytest"}]})
+    assert (
+        ci_resolution.resolve_no_checks_escalation(p, "main", gate_enabled=True)
+        == "keep_polling"
+    )
+
+
+def test_escalation_keep_polling_for_unknown_has_ci_none():
+    # has_ci=None (legacy/incomplete detection) → possibly CI-gated; keep polling.
+    p = _proj({"has_ci": None, "directories": []})
+    assert (
+        ci_resolution.resolve_no_checks_escalation(p, "main", gate_enabled=True)
+        == "keep_polling"
+    )
+
+
+def test_escalation_keep_polling_for_none_project():
+    assert (
+        ci_resolution.resolve_no_checks_escalation(None, "main", gate_enabled=True)
+        == "keep_polling"
+    )
+
+
 # classify_merge_test_verdict — MERGE_TEST_RESULT artifact → merge-gate outcome
 
 

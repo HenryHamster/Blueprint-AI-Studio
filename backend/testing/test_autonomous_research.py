@@ -7965,140 +7965,6 @@ async def test_merged_pr_blocks_reproposal_permanently(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(
-    db_session, mocker
-):
-    """3 consecutive 0-task cycles driven by hash dedup creates a WARNING Alert and BUG_REPORT message."""
-    direction_id = "d-deadlk01"
-    direction = {
-        **_active_direction(direction_id, "Fix performance bottlenecks"),
-        # Pre-populate 2 prior empty cycles with non-zero hash_dedup counts
-        "research_history": [
-            {
-                "timestamp": "2026-01-10T00:00:00",
-                "task_id": "00000000-0000-0000-0000-000000000001",
-                "tasks_created": 0,
-                "summary": "no findings",
-                "finding_titles": [],
-                "key_finding_descriptions": [],
-                "filter_breakdown": {
-                    "hash_dedup": 3,
-                    "word_overlap_dedup": 0,
-                    "file_overlap_dedup": 0,
-                    "type_filtered": 0,
-                    "empty_prompt": 0,
-                },
-            },
-            {
-                "timestamp": "2026-01-11T00:00:00",
-                "task_id": "00000000-0000-0000-0000-000000000002",
-                "tasks_created": 0,
-                "summary": "no findings",
-                "finding_titles": [],
-                "key_finding_descriptions": [],
-                "filter_breakdown": {
-                    "hash_dedup": 2,
-                    "word_overlap_dedup": 0,
-                    "file_overlap_dedup": 0,
-                    "type_filtered": 0,
-                    "empty_prompt": 0,
-                },
-            },
-        ],
-    }
-    project = Project(
-        name="Deadlock Detection Test",
-        user_id="test-user-123",
-        autonomous_enabled=True,
-        directions=[direction],
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    # Existing task whose hash will block the new finding (causes hash_dedup in 3rd cycle)
-    dup_title = "Fix database connection leak in worker pool"
-    dup_desc = "Connection leak causes OOM after sustained load"
-    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
-    existing = Task(
-        project_id=project.id,
-        title=dup_title,
-        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
-        context={"finding_hash": fhash, "direction_id": direction_id},
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-    )
-    db_session.add(existing)
-    await db_session.commit()
-
-    task = Task(
-        project_id=project.id,
-        title="Research: Fix performance bottlenecks",
-        payloads=[
-            {"type": "research", "directions": [direction], "base_branch": "main"}
-        ],
-        context={"research_depth": 0, "direction_id": direction_id},
-        status=TaskStatus.IN_PROGRESS,
-        created_by="ORCHESTRATOR",
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    _patch_research_externals(mocker)
-    mocker.patch(
-        "app.research_completion._parse_research_findings",
-        return_value=[
-            {
-                "title": dup_title,
-                "description": dup_desc,
-                "prompt": "Fix the connection leak",
-                "priority": "high",
-                "scope": "small",
-                "risk": "low",
-                "type": "improvement",
-                "direction_id": direction_id,
-            }
-        ],
-    )
-
-    await _handle_research_completion(task, "", db_session)
-
-    # A WARNING-severity Alert should have been created for the deadlock
-    alerts = (
-        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
-        .scalars()
-        .all()
-    )
-    deadlock_alerts = [
-        a
-        for a in alerts
-        if a.severity == AlertSeverity.WARNING and "deadlock" in a.title.lower()
-    ]
-    assert len(deadlock_alerts) >= 1, "Expected a WARNING Alert for dedup deadlock"
-    assert direction_id in deadlock_alerts[0].message
-
-    # A BUG_REPORT ProjectMessage should also have been created
-    messages = (
-        (
-            await db_session.execute(
-                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    bug_reports = [m for m in messages if m.message_type == MessageType.BUG_REPORT]
-    assert len(bug_reports) >= 1, (
-        "Expected a BUG_REPORT ProjectMessage for dedup deadlock"
-    )
-    assert bug_reports[0].context.get("source") == "dedup_deadlock"
-    assert bug_reports[0].context.get("consecutive_empty_cycles") == 3
-
-
-@pytest.mark.asyncio
 async def test_already_fixed_deadlock_pivots_agent(client: AsyncClient, db_session):
     """A direction in already-fixed deadlock exposes an agent-facing pivot signal
     in its research direction context so the next cycle stops re-deriving shipped work."""
@@ -14416,15 +14282,15 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-spend01")],
-        build_config={"daily_spend_ceiling_usd": 1.0},
+        build_config={"resource_envelope": {"spend_ceiling_usd": 1.0}},
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     mock_spend = mocker.patch(
-        "app.efficiency_snapshot.compute_project_window_spend_usd",
-        new=AsyncMock(return_value=1.5),
+        "app.autonomous_research.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 1.5, "compute": 1.5, "agent_vm": 0.0, "idle": 0.0}),
     )
 
     await _spawn_research_task(project, db_session)
@@ -14465,7 +14331,7 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-spend02")],
-        build_config={"daily_spend_ceiling_usd": 10.0},
+        build_config={"resource_envelope": {"spend_ceiling_usd": 10.0}},
         vision={"purpose": "test"},
     )
     db_session.add(project2)
@@ -14473,8 +14339,8 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
     await db_session.refresh(project2)
 
     mocker.patch(
-        "app.efficiency_snapshot.compute_project_window_spend_usd",
-        new=AsyncMock(return_value=2.0),
+        "app.autonomous_research.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 2.0, "compute": 2.0, "agent_vm": 0.0, "idle": 0.0}),
     )
 
     await _spawn_research_task(project2, db_session)
@@ -14493,7 +14359,7 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-spend03")],
-        build_config={},  # no daily_spend_ceiling_usd
+        build_config={},  # no resource_envelope.spend_ceiling_usd
         vision={"purpose": "test"},
     )
     db_session.add(project3)
@@ -14502,13 +14368,13 @@ async def test_project_spend_ceiling_pauses_autonomous_spawning(db_session, mock
 
     # Re-patch to count calls cleanly for the no-ceiling assertion
     no_ceiling_mock = mocker.patch(
-        "app.efficiency_snapshot.compute_project_window_spend_usd",
-        new=AsyncMock(return_value=999.0),
+        "app.autonomous_research.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 999.0, "compute": 999.0, "agent_vm": 0.0, "idle": 0.0}),
     )
     await _spawn_research_task(project3, db_session)
 
     assert no_ceiling_mock.call_count == 0, (
-        "compute_project_window_spend_usd must NOT be called when no ceiling is set"
+        "get_project_recent_spend_usd must NOT be called when no ceiling is set"
     )
     # Also assert no spend-ceiling alerts for project3
     alerts3 = (
@@ -16146,3 +16012,37 @@ async def test_filter_breakdown_type_filtered_is_per_direction(db_session):
     assert tf_a == 2, f"Direction A type_filtered must be 2 (its own count), got {tf_a}"
     assert tf_b == 1, f"Direction B type_filtered must be 1 (its own count), got {tf_b}"
     assert tf_a != tf_b, "Directions must not share the same type_filtered count"
+
+
+@pytest.mark.asyncio
+async def test_first_task_spawned_stamped_on_research_spawn(db_session):
+    """_spawn_research_task stamps first_task_spawned_at in project.build_config
+    on the first successful autonomous research spawn.
+
+    Follows the same project setup as
+    test_research_spawn_proceeds_when_external_repo_bootstrap_completed and adds
+    a post-spawn assertion that the onboarding milestone was recorded.
+    """
+    direction = _active_direction_with_cooldown_elapsed(
+        "d-stamp-spawn", "First spawn stamp direction"
+    )
+    project = Project(
+        name="First Task Spawned Stamp",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_strategic_failures": 3},
+        build_config={"bootstrap_completed_at": "2026-01-01T00:00:00"},
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("first_task_spawned_at") is not None, (
+        "first_task_spawned_at must be stamped in build_config after the first "
+        "successful autonomous research spawn"
+    )

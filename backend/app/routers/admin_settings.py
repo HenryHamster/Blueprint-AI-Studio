@@ -1591,6 +1591,16 @@ async def _apply_settings(
                 status_code=400,
                 detail="improvement_lanes_enabled must be a boolean",
             )
+        if val:
+            from app.warm_pool import is_warm_pool_enabled as _is_warm_pool_enabled
+            if not _is_warm_pool_enabled():
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "warm_pool_enabled": "not met",
+                        "fix_hint": "Set warm_pool_enabled=true via PATCH /api/admin/settings.",
+                    },
+                )
         _runtime_config["improvement_lanes_enabled"] = val
     if "review_fix_lane_pilot_enabled" in payload:
         val = payload["review_fix_lane_pilot_enabled"]
@@ -1599,6 +1609,16 @@ async def _apply_settings(
                 status_code=400,
                 detail="review_fix_lane_pilot_enabled must be a boolean",
             )
+        if val:
+            from app.warm_pool import is_warm_pool_enabled as _is_warm_pool_enabled2
+            if not _is_warm_pool_enabled2():
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "warm_pool_enabled": "not met",
+                        "fix_hint": "Set warm_pool_enabled=true via PATCH /api/admin/settings.",
+                    },
+                )
         _runtime_config["review_fix_lane_pilot_enabled"] = val
     if "drift_stall_min_claims" in payload:
         try:

@@ -22,12 +22,14 @@ Public API:
       resolve the project's configured deploy branch explicitly.
       Idempotent: no-op if any version row already exists.  Caller must commit.
 
-  count_merged_since(session, project_id, since)
+  count_merged_since(session, project_id, since, until=None)
       Count tasks whose PR was merged after ``since`` for a project.
+      Optional ``until`` closes the upper bound (for closed versions).
 
-  compute_version_acceptance_aggregate(session, project_id, *, since)
+  compute_version_acceptance_aggregate(session, project_id, *, since, until=None)
       Classify merged-since tasks by acceptance-evidence outcome
       using the canonical acceptance aggregate buckets.
+      Optional ``until`` closes the upper bound (for closed versions).
 
   recent_closed_versions(session, project_id, limit=5)
       Return the most recently closed/promoted versions for a project,
@@ -41,6 +43,13 @@ Public API:
   to_phase_block(version)
       Return a compact dict for embedding the version's phase state in the
       strategic agent's payload.
+
+  build_version_highlights(version, *, merged_count, aggregate_serving_status, acceptance_aggregate)
+      Build the shared human-readable ``highlights`` block (headline plus
+      at-a-glance metrics) for a version.  The 'serving' word in the headline is
+      driven off the aggregate required-artifact serving status, not the scalar
+      column.  Used by both the per-version summary endpoint and the
+      version-lifecycle current-version block so they render identical text.
 """
 
 from __future__ import annotations
@@ -60,7 +69,7 @@ from app.acceptance_gate import (
     classify_merged_acceptance_context,
 )
 from app.landed_signal import landed_signal_predicate
-from app.models import Project, ReleaseVersion, Task, TaskStatus
+from app.models import Artifact, ArtifactType, Project, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _coerce_naive_utc, _utcnow
 
 logger = logging.getLogger(__name__)
@@ -103,7 +112,9 @@ class VersionCutBlockedByPromotion(RuntimeError):
         # Additive freshness context (age / auto-timeout) so the version-cut 409
         # can surface elapsed age and near/past-timeout state. ``None`` when the
         # promotion_pending record had no usable ``enabled_at``.
-        self.promotion_freshness = dict(promotion_freshness) if promotion_freshness else None
+        self.promotion_freshness = (
+            dict(promotion_freshness) if promotion_freshness else None
+        )
 
 
 async def open_version(
@@ -259,11 +270,11 @@ async def ensure_initial_release_version(
     )
 
 
-
 async def count_merged_since(
     session: AsyncSession,
     project_id: uuid.UUID,
     since: datetime,
+    until: datetime | None = None,
 ) -> int:
     """Count tasks for ``project_id`` whose PR was merged at or after ``since``.
 
@@ -274,19 +285,109 @@ async def count_merged_since(
     ``status_log`` when available, with ``created_at`` as the legacy fallback.
     That keeps post-terminal writes (for example consumption-proof updates to
     a merged producer task) from re-opening the version window.
+
+    ``until`` (optional) closes the upper bound — tasks whose stable terminal
+    timestamp is strictly after ``until`` are excluded.  Used to bound closed
+    (promoted/abandoned) versions to their own span so tasks that merged in
+    later versions are not double-counted.
     """
+    filters = [
+        Task.project_id == project_id,
+        Task.status == TaskStatus.COMPLETED,
+        landed_signal_predicate(session),
+        Task.updated_at >= since,
+    ]
     stmt = (
         select(Task)
         .options(load_only(Task.id, Task.status_log, Task.created_at, raiseload=True))
-        .where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
-            landed_signal_predicate(session),
-            Task.updated_at >= since,
-        )
+        .where(*filters)
     )
     rows = (await session.execute(stmt)).scalars().all()
-    return sum(1 for task in rows if _task_completed_at(task) >= since)
+    return sum(
+        1
+        for task in rows
+        if _task_completed_at(task) >= since
+        and (until is None or _task_completed_at(task) <= until)
+    )
+
+
+async def list_merged_tasks_for_version(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    since: datetime,
+    until: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """List tasks merged in the version window, newest-completion-first.
+
+    Operates over the same predicate as :func:`count_merged_since` —
+    ``COMPLETED`` tasks carrying the canonical landing signal whose stable
+    terminal timestamp is at or after ``since`` (and at or before ``until``
+    when supplied).
+
+    Returns a list of dicts with ``task_type``, ``title``, and ``pr_number``
+    per landed task.  Empty when no tasks have merged in the window.
+    """
+    filters = [
+        Task.project_id == project_id,
+        Task.status == TaskStatus.COMPLETED,
+        landed_signal_predicate(session),
+        Task.updated_at >= since,
+    ]
+    stmt = (
+        select(Task)
+        .options(
+            load_only(
+                Task.id,
+                Task.title,
+                Task.payloads,
+                Task.status_log,
+                Task.created_at,
+                raiseload=True,
+            )
+        )
+        .where(*filters)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    # Filter to the version window first so the artifact query is scoped to
+    # only the tasks that will appear in the changelog.
+    windowed: list[tuple[datetime, Task]] = []
+    for task in rows:
+        completed_at = _task_completed_at(task)
+        if completed_at < since:
+            continue
+        if until is not None and completed_at > until:
+            continue
+        windowed.append((completed_at, task))
+
+    # Batch-fetch PULL_REQUEST artifacts for the windowed task set so each
+    # changelog entry can carry a clickable pr_url without N+1 queries.
+    pr_url_by_task: dict = {}
+    if windowed:
+        task_ids = [task.id for _, task in windowed]
+        artifact_stmt = select(Artifact.task_id, Artifact.pr_url).where(
+            Artifact.task_id.in_(task_ids),
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+        )
+        artifact_rows = (await session.execute(artifact_stmt)).all()
+        pr_url_by_task = {row.task_id: row.pr_url for row in artifact_rows}
+
+    entries: list[tuple[datetime, dict[str, Any]]] = []
+    for completed_at, task in windowed:
+        payload = task.first_payload
+        entries.append(
+            (
+                completed_at,
+                {
+                    "task_type": payload.get("type"),
+                    "title": task.title,
+                    "pr_number": payload.get("pr_number"),
+                    "pr_url": pr_url_by_task.get(task.id),
+                },
+            )
+        )
+    entries.sort(key=lambda pair: pair[0], reverse=True)
+    return [entry for _, entry in entries]
 
 
 async def compute_version_acceptance_aggregate(
@@ -294,13 +395,15 @@ async def compute_version_acceptance_aggregate(
     project_id: uuid.UUID,
     *,
     since: datetime,
+    until: datetime | None = None,
 ) -> dict[str, int]:
     """Classify version-window merged tasks by acceptance-evidence outcome.
 
     Operates over the same merged-since window as :func:`count_merged_since`
     (``COMPLETED`` tasks carrying the canonical landing signal whose stable
-    terminal timestamp is at or after ``since``).  For each landed task it
-    reads the durable ``Task.context`` and delegates to
+    terminal timestamp is at or after ``since``, and at or before ``until``
+    when supplied).  For each landed task it reads the durable ``Task.context``
+    and delegates to
     :func:`app.acceptance_gate.classify_merged_acceptance_context`, so the
     version-window aggregate uses the same bucket vocabulary as the Task-object
     classifier used by final qualification storage.
@@ -309,21 +412,25 @@ async def compute_version_acceptance_aggregate(
     recorded verdict is surfaced as ``malformed`` for visibility, but readiness
     treats it as advisory only.
     """
-    stmt = select(Task).where(
+    filters = [
         Task.project_id == project_id,
         Task.status == TaskStatus.COMPLETED,
         landed_signal_predicate(session),
         Task.updated_at >= since,
-    )
+    ]
+    stmt = select(Task).where(*filters)
     rows = [
         task
         for task in (await session.execute(stmt)).scalars().all()
         if _task_completed_at(task) >= since
+        and (until is None or _task_completed_at(task) <= until)
     ]
 
     aggregate: dict[str, int] = {bucket: 0 for bucket in ACCEPTANCE_AGGREGATE_BUCKETS}
     for task in rows:
-        bucket = classify_merged_acceptance_context(task.context if isinstance(task.context, dict) else {})
+        bucket = classify_merged_acceptance_context(
+            task.context if isinstance(task.context, dict) else {}
+        )
         aggregate[bucket] += 1
 
     aggregate["total"] = len(rows)
@@ -482,7 +589,9 @@ def _promotion_in_flight_freshness(promo: dict[str, Any]) -> dict[str, Any]:
         "promotion_enabled_at": enabled_at.isoformat(),
         "promotion_age_seconds": age_seconds,
         "promotion_timeout_seconds": cap_seconds,
-        "promotion_timeout_at": (enabled_at + timedelta(seconds=cap_seconds)).isoformat(),
+        "promotion_timeout_at": (
+            enabled_at + timedelta(seconds=cap_seconds)
+        ).isoformat(),
         "promotion_past_timeout": past_timeout,
         "promotion_nearing_timeout": nearing_timeout,
     }
@@ -633,8 +742,7 @@ def summarize_qualification_state(
                     )
                 elif freshness["promotion_nearing_timeout"]:
                     summary += (
-                        " It is NEARING the auto-timeout that reverts it to "
-                        "stabilize."
+                        " It is NEARING the auto-timeout that reverts it to stabilize."
                     )
             result: dict[str, Any] = {
                 "state": "promotion_check_wait",
@@ -672,8 +780,7 @@ def summarize_qualification_state(
                     )
                 elif freshness["promotion_nearing_timeout"]:
                     summary += (
-                        " It is NEARING the auto-timeout that reverts it to "
-                        "stabilize."
+                        " It is NEARING the auto-timeout that reverts it to stabilize."
                     )
             return {
                 "state": "promotion_in_flight",
@@ -758,11 +865,7 @@ def summarize_qualification_state(
             "state": "not_promoted",
             "summary": (
                 "Candidate scored BELOW the promotion threshold"
-                + (
-                    f" (confidence {conf}, threshold {thr})"
-                    if conf is not None
-                    else ""
-                )
+                + (f" (confidence {conf}, threshold {thr})" if conf is not None else "")
                 + ". Resolve the binding blocker, then re-qualify."
             ),
             "blocker": lq.get("blocker"),
@@ -941,6 +1044,62 @@ def to_phase_block(
     if artifact_evidence is not None:
         block["artifacts"] = artifact_evidence
     return block
+
+
+def build_version_highlights(
+    version: ReleaseVersion,
+    *,
+    merged_count: int,
+    aggregate_serving_status: str | None,
+    acceptance_aggregate: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the human-readable ``highlights`` block for a release version.
+
+    Single source of truth for the version ``headline`` string and its
+    at-a-glance metrics, shared by the per-version summary endpoint
+    (``get_release_version_summary``) and the version-lifecycle endpoint's
+    ``current_version`` block so both surfaces render byte-identical text.
+
+    The 'serving' determination drives off ``aggregate_serving_status`` — the
+    truthful required-artifact aggregate read — NOT the scalar
+    ``version.serving_status`` column: a promoted version reads
+    ``"promoted & serving"`` only when every required artifact confirms,
+    otherwise ``"promoted"``.
+
+    ``acceptance_aggregate`` is the proven-vs-merged bucket mapping (keys
+    ``"proven"`` / ``"total"``); ``None`` on legacy versions that predate the
+    aggregate, in which case both counts default to 0.
+
+    Returns a dict with keys ``merged_count``, ``proven``,
+    ``total_merged_for_acceptance``, ``qualification_confidence``,
+    ``qualification_threshold`` and ``headline``.
+    """
+    acceptance = acceptance_aggregate or {}
+    proven = acceptance.get("proven", 0)
+    total_merged = acceptance.get("total", 0)
+    qual = version.last_qualification or {}
+    confidence = qual.get("confidence")
+    threshold = qual.get("threshold")
+
+    if version.status == "promoted" and aggregate_serving_status == "serving_confirmed":
+        headline = "promoted & serving"
+    elif version.status == "promoted":
+        headline = "promoted"
+    elif version.status == "abandoned":
+        headline = "abandoned"
+    elif merged_count == 0:
+        headline = f"open in {version.phase} with no merged work yet"
+    else:
+        headline = f"open in {version.phase} with {merged_count} merged"
+
+    return {
+        "merged_count": merged_count,
+        "proven": proven,
+        "total_merged_for_acceptance": total_merged,
+        "qualification_confidence": confidence,
+        "qualification_threshold": threshold,
+        "headline": headline,
+    }
 
 
 def set_version_phase(

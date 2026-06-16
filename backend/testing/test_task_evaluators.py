@@ -25,6 +25,7 @@ from app.task_evaluators import (
     MetricStrategy,
     NoneStrategy,
     StructuredVerdictStrategy,
+    _declared_success_criterion,
     evaluate_terminal_output,
     record_failed_gate,
     resolve_evaluation_strategy,
@@ -359,6 +360,43 @@ def _criterion_task(metric: str, op: str, threshold: float) -> Task:
             }
         ]
     )
+
+
+def test_declared_success_criterion_metric_kind_returns_trio():
+    """A kind='metric' criterion is read back as its (metric, op, threshold) trio."""
+    task = _criterion_task("accuracy", ">=", 0.9)
+    assert _declared_success_criterion(task) == ("accuracy", ">=", 0.9)
+
+
+def test_declared_success_criterion_artifact_produced_translates_to_file_count():
+    """kind='artifact_produced' translates to a durable_file_count >= N check so the
+    existing numeric pipeline evaluates non-scalar (model/dataset) experiments."""
+    task = Task(
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "success_criterion": {"kind": "artifact_produced"},
+            }
+        ]
+    )
+    assert _declared_success_criterion(task) == ("durable_file_count", ">=", 1.0)
+
+
+def test_declared_success_criterion_artifact_produced_custom_min_count():
+    task = Task(
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "success_criterion": {
+                    "kind": "artifact_produced",
+                    "min_file_count": 3,
+                },
+            }
+        ]
+    )
+    assert _declared_success_criterion(task) == ("durable_file_count", ">=", 3.0)
 
 
 def test_compute_criterion_met_passes_with_reason():

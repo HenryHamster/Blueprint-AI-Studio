@@ -5479,7 +5479,7 @@ async def test_step9_sweep_times_out_qualification_with_unparseable_started_at(
         # The timeout backstop fired via the updated_at fallback, even though
         # started_at was unparseable.
         assert version.last_qualification is not None
-        assert version.last_qualification.get("status") == "not_promoted", (
+        assert version.last_qualification.get("status") == "infra_failure", (
             "Step 9 timeout must force-finalize a pending qualification with "
             "an unparseable started_at — falling back to updated_at"
         )

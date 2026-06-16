@@ -170,11 +170,12 @@ async def test_parent_terminal_parity_all_co_deferred_cancelled(cleanup_db, mock
     """Every child co-deferred shelved (_co_deferred_shelved): BOTH finalizers must
     reach CANCELLED with NO direction-health ding and NO failure alert.
 
-    Co-deferred children are NOT recognized by _is_non_genuine_cancelled (they lack
-    _replaced_by_task_id, REASSIGNED, or SCOPE_EMPTY markers), so the old path
-    would have counted them as genuine deaths and produced FAILED + AGENT_TIMEOUT.
-    The is_non_death_cancellation check in _resolve_terminal_parent_verdict catches
-    them first and prevents the false failure signal.
+    Co-deferred children ARE now recognized by _is_non_genuine_cancelled (via the
+    CO_DEFERRED_SHELVED context key), so they do not count as genuine deaths.
+    Before that fix was added, the old path lacked the CO_DEFERRED_SHELVED check
+    and would have counted them as genuine deaths, producing FAILED + AGENT_TIMEOUT.
+    The is_non_death_cancellation check in _resolve_terminal_parent_verdict also
+    catches them as a belt-and-suspenders guard against the false failure signal.
 
     This test locks the fix for the real incident: research task 5a6bac51 whose
     only child plan was co-deferred was incorrectly FAILED + AGENT_TIMEOUT.

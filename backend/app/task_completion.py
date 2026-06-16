@@ -4438,6 +4438,107 @@ def _stamp_command_memory_status(build_config: Dict[str, Any], task: Task) -> No
         build_config.pop("bootstrap_command_memory_paths", None)
 
 
+async def _upsert_domain_knowledge_document(
+    session: AsyncSession,
+    task: Task,
+    github_owner: str,
+    github_repo: str,
+    now_iso: str,
+) -> None:
+    """Upsert a KnowledgeDocument for product-domain knowledge from bootstrap.
+
+    Reads domain_overview from task.context and persists it as a singleton
+    KnowledgeDocument (source_kind='repo_domain', topic='domain-knowledge').
+    Skipped silently if domain_overview is absent or lacks a meaningful purpose.
+    Never raises — domain capture is best-effort and must not block bootstrap.
+    """
+    from app.models import KnowledgeDocument, SourceKind
+
+    try:
+        ctx_domain = (task.context or {}).get("domain_overview")
+        if not isinstance(ctx_domain, dict):
+            return
+        purpose = ctx_domain.get("purpose") or ""
+        if not isinstance(purpose, str) or len(purpose.strip()) < 20:
+            return
+
+        key_concepts = ctx_domain.get("key_concepts") or {}
+        critical_user_flows = ctx_domain.get("critical_user_flows") or []
+        architectural_gotchas = ctx_domain.get("architectural_gotchas") or []
+        source = ctx_domain.get("source") or "none-found"
+
+        lines: list[str] = [f"## Product Purpose\n{purpose}\n"]
+        if key_concepts:
+            lines.append("## Key Domain Concepts")
+            for term, definition in key_concepts.items():
+                lines.append(f"- **{term}**: {definition}")
+            lines.append("")
+        if critical_user_flows:
+            lines.append("## Critical User Flows")
+            for flow in critical_user_flows:
+                lines.append(f"- {flow}")
+            lines.append("")
+        if architectural_gotchas:
+            lines.append("## Architectural Gotchas")
+            for gotcha in architectural_gotchas:
+                lines.append(f"- {gotcha}")
+            lines.append("")
+        lines.append(
+            f"*Source: {source} | {github_owner}/{github_repo} | Captured {now_iso}*"
+        )
+        body = "\n".join(lines)
+
+        title = f"{github_owner}/{github_repo} — Product Domain Knowledge"
+        first_sentence = purpose.split(".")[0] if "." in purpose else purpose
+        summary = first_sentence.strip()[:500] or purpose[:500]
+
+        result = await session.execute(
+            select(KnowledgeDocument)
+            .where(
+                KnowledgeDocument.project_id == task.project_id,
+                KnowledgeDocument.topic == "domain-knowledge",
+                KnowledgeDocument.source_kind == SourceKind.REPO_DOMAIN.value,
+            )
+            .order_by(KnowledgeDocument.updated_at.desc())
+            .limit(1)
+        )
+        existing = result.scalar_one_or_none()
+
+        source_citations = [f"file:{source}"] if source != "none-found" else []
+        if existing is not None:
+            existing.title = title
+            existing.summary = summary
+            existing.body = body
+            existing.source_citations = source_citations
+            existing.source_task_id = task.id
+            session.add(existing)
+        else:
+            doc = KnowledgeDocument(
+                project_id=task.project_id,
+                source_task_id=task.id,
+                source_kind=SourceKind.REPO_DOMAIN.value,
+                title=title,
+                summary=summary,
+                body=body,
+                topic="domain-knowledge",
+                tags=["bootstrap", "domain", "product"],
+                source_citations=source_citations,
+            )
+            session.add(doc)
+        logger.info(
+            "[BOOTSTRAP] Upserted domain KnowledgeDocument for project %s (task %s)",
+            task.project_id,
+            task.id,
+        )
+    except Exception:
+        logger.exception(
+            "[BOOTSTRAP] Failed to upsert domain KnowledgeDocument for project %s "
+            "(task %s) — continuing without domain document",
+            task.project_id,
+            task.id,
+        )
+
+
 async def _handle_repo_bootstrap_completion(
     task: Task, logs: str, session: AsyncSession
 ) -> None:
@@ -4611,9 +4712,24 @@ async def _handle_repo_bootstrap_completion(
             project, build_config, task, session, now_iso
         )
 
+        # Mirror domain-knowledge capture timestamp into build_config so the
+        # admin UI can surface freshness independently of overview provenance.
+        if isinstance((task.context or {}).get("domain_overview"), dict):
+            build_config["bootstrap_domain_knowledge_refreshed_at"] = now_iso
+
         project.build_config = build_config
         flag_modified(project, "build_config")
         session.add(project)
+
+        # Upsert product-domain KnowledgeDocument (best-effort; never blocks bootstrap).
+        _bootstrap_payload = task.first_payload or {}
+        await _upsert_domain_knowledge_document(
+            session,
+            task,
+            github_owner=_bootstrap_payload.get("github_owner") or "",
+            github_repo=_bootstrap_payload.get("github_repo") or "",
+            now_iso=now_iso,
+        )
 
         # Stamp task.completed_at so the row is queryable by completion time.
         # repo_bootstrap tasks reach COMPLETED status via the normal agent status

@@ -210,6 +210,14 @@ describe('resetForNextRole', () => {
     expect(unlinkPaths).toContain('/tmp/self_audit_findings_X.json');
     expect(unlinkPaths).toContain('/tmp/self_review_X.json');
     expect(unlinkPaths).toContain('/tmp/symbols_X.json');
+    expect(unlinkPaths).toContain('/tmp/fix_responses_X.json');
+    expect(unlinkPaths).toContain('/tmp/fix_sr_context_X.json');
+    expect(unlinkPaths).toContain('/tmp/test_baseline_X.json');
+    expect(unlinkPaths).toContain('/tmp/fix_parallelized_X.json');
+    expect(unlinkPaths).toContain('/tmp/bootstrap_domain_X.json');
+    expect(unlinkPaths).toContain('/tmp/research_insights_X.json');
+    expect(unlinkPaths).toContain('/tmp/consumed_artifacts_X.json');
+    expect(unlinkPaths).toContain('/tmp/problem_model_X.json');
     // Stale basenames that were incorrectly in the old list must be absent.
     expect(unlinkPaths).not.toContain('/tmp/debug_output_X.json');
     expect(unlinkPaths).not.toContain('/tmp/perf_output_X.json');

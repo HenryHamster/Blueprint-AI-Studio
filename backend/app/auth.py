@@ -361,6 +361,24 @@ async def get_current_user(
     }
 
 
+async def get_current_user_optional(
+    credentials: HTTPAuthorizationCredentials | None = Security(
+        HTTPBearer(auto_error=False)
+    ),
+    session: AsyncSession = Depends(get_session),
+) -> dict | None:
+    """Like get_current_user but returns None instead of raising when no credentials.
+
+    Used by endpoints that accept EITHER admin Bearer auth OR an agent JWT via
+    a separate header (x-agent-token).  When credentials are absent the handler
+    checks the agent-token header; when credentials are present the normal
+    get_current_user path runs.
+    """
+    if credentials is None:
+        return None
+    return await get_current_user(credentials=credentials, session=session)
+
+
 def require_admin(current_user: dict = Depends(get_current_user)):
     """
     Dependency to ensure the current user has admin privileges.

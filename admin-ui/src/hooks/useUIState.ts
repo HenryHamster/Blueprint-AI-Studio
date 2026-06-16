@@ -36,7 +36,6 @@ export function useUIState() {
   const [showSettings, setShowSettings] = useState(false);
   const [showDirections, setShowDirections] = useState(false);
   const [showMetrics, setShowMetrics] = useState(false);
-  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
   const [showUserManagement, setShowUserManagement] = useState(false);
 
@@ -133,7 +132,6 @@ export function useUIState() {
     showSettings, setShowSettings,
     showDirections, setShowDirections,
     showMetrics, setShowMetrics,
-    showDiagnostics, setShowDiagnostics,
     showShortcutHelp, setShowShortcutHelp,
     showUserManagement, setShowUserManagement,
     settingsRef, shortcutHelpRef,

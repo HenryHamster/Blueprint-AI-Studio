@@ -31,6 +31,7 @@ from app.ci_completion import handle_ci_completion
 from app.ci_resolution import (
     build_no_ci_gate_ci_result,
     classify_merge_test_verdict,
+    resolve_no_checks_escalation,
     should_run_no_ci_test_gate,
 )
 from app.models import Alert, Artifact, ArtifactType, Project, Task, TaskStatus
@@ -213,8 +214,15 @@ async def test_setup_failed_verify_task_retries_then_merges_unverified_with_setu
 
     # ── First attempt: spawn, then FAIL with a setupFailed artifact. ──────────
     verify_task, was_created = await _spawn_pipeline_task(
-        parent, "verify_tests", db_session, PR_NUMBER, BRANCH, BASE,
-        original_task_id=str(parent.id), suppress_warm_handoff=True, attempt=0,
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+        attempt=0,
     )
     assert was_created is True and verify_task is not None
 
@@ -240,8 +248,15 @@ async def test_setup_failed_verify_task_retries_then_merges_unverified_with_setu
 
     retries += 1
     retry_task, retry_created = await _spawn_pipeline_task(
-        parent, "verify_tests", db_session, PR_NUMBER, BRANCH, BASE,
-        original_task_id=str(parent.id), suppress_warm_handoff=True, attempt=retries,
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+        attempt=retries,
     )
     assert retry_created is True and retry_task is not None
     assert retry_task.id != verify_task.id
@@ -302,7 +317,9 @@ async def test_genuine_detected_false_still_falls_open_without_setup_reason(
     # A COMPLETED detected=false verdict (suite ran, no runnable command) is a
     # dict — NOT a crash — so it must not be retried nor labeled setup-failed.
     fake_completed = Task(
-        project_id=project.id, title="verify", payloads=[{"type": "verify_tests"}],
+        project_id=project.id,
+        title="verify",
+        payloads=[{"type": "verify_tests"}],
         status=TaskStatus.COMPLETED,
     )
     artifact = {"detected": False}
@@ -312,3 +329,32 @@ async def test_genuine_detected_false_still_falls_open_without_setup_reason(
     outcome, _ = classify_merge_test_verdict(verdict)
     assert outcome == "undetected"
     assert _is_verify_crash(outcome, verdict) is False
+
+
+# ---------------------------------------------------------------------------
+# 3. The no-checks escalation backstop routes a DEFINITIVE no-CI repo (has_ci=
+#    False) with a detectable suite into the SAME verify_tests gate — so this
+#    file's setup-failure retry path applies whether the gate was reached via the
+#    definitive-no_checks branch OR via the escalation backstop.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_escalation_backstop_routes_definitive_no_ci_repo_into_verify_gate(
+    db_session,
+):
+    project = await _make_no_ci_project(db_session)
+    # Make the no-CI signal DEFINITIVE (detection found zero workflows).
+    project.build_config = {**project.build_config, "has_ci": False}
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The escalation backstop promotes this strand to the verify_tests gate —
+    # the same entry point this file's retry machinery guards. A setup failure
+    # then retries and (budget spent) falls open with verify_setup_failed,
+    # exactly as the definitive-no_checks branch does.
+    assert (
+        resolve_no_checks_escalation(project, BASE, gate_enabled=True) == "verify_tests"
+    )
+    assert should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is True

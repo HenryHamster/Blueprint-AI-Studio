@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Literal
+from typing import Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
@@ -733,7 +733,8 @@ async def _refresh_sr_catch_rate(
                         Task.project_id,
                         Task.strategic_cycle_id,
                         Task.payloads,
-                    raiseload=True,)
+                        raiseload=True,
+                    )
                 )
                 .where(*_where)
                 .order_by(Task.created_at.desc())
@@ -1055,7 +1056,8 @@ async def claim_task(
             Task.payloads,
             Task.context,
             Task.project_id,
-        raiseload=True,)
+            raiseload=True,
+        )
         _active_queued_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1071,7 +1073,12 @@ async def claim_task(
                 Task.project_id == task.project_id,
                 Task.id != task.id,
                 Task.status.in_(
-                    [TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING, TaskStatus.QUEUED]
+                    [
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                        TaskStatus.QUEUED,
+                        TaskStatus.BLOCKED,
+                    ]
                 ),
             )
             .cte("active_queued_ranked")
@@ -1125,7 +1132,8 @@ async def claim_task(
             Task.model,
             Task.strategic_cycle_id,
             Task.fix_loop_history,
-        raiseload=True,)
+            raiseload=True,
+        )
         _terminal_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1212,7 +1220,8 @@ async def claim_task(
             Task.model,
             Task.strategic_cycle_id,
             Task.fix_loop_history,
-        raiseload=True,)
+            raiseload=True,
+        )
         _history_ranked = (
             select(
                 Task.id.label("task_id"),
@@ -1292,6 +1301,7 @@ async def claim_task(
                     if hasattr(t.status, "value")
                     else str(t.status),
                     "pr_url": pr_url,
+                    "landed_on_head": is_merged_completion(t),
                     "research_findings_summary": research_findings_summary,
                     "failure_reason": (t.latest_status_message or "")[:500]
                     if is_failed and t.latest_status_message
@@ -1340,6 +1350,7 @@ async def claim_task(
                     if hasattr(t.status, "value")
                     else str(t.status),
                     "pr_url": pr_url,
+                    "landed_on_head": False,
                     "research_findings_summary": research_findings_summary,
                     "failure_reason": (t.latest_status_message or "")[:500]
                     if t.latest_status_message
@@ -1517,7 +1528,8 @@ async def claim_task(
                 Task.account_id,
                 Task.provider,
                 Task.model,
-            raiseload=True,)
+                raiseload=True,
+            )
             _sibling_ranked = (
                 select(
                     Task.id.label("task_id"),
@@ -2210,7 +2222,11 @@ async def claim_task(
                         await session.execute(
                             select(Task)
                             .where(Task.id.in_(_parsed_ids))
-                            .options(load_only(Task.id, Task.status, Task.context, raiseload=True))
+                            .options(
+                                load_only(
+                                    Task.id, Task.status, Task.context, raiseload=True
+                                )
+                            )
                         )
                     ).scalars()
                     for _src_task in _src_rows:
@@ -3424,7 +3440,13 @@ async def claim_task(
                     Task.created_at > _utcnow() - timedelta(days=14),
                 )
                 .options(
-                    load_only(Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True)
+                    load_only(
+                        Task.id,
+                        Task.context,
+                        Task.payloads,
+                        Task.created_at,
+                        raiseload=True,
+                    )
                 )
                 .order_by(Task.created_at.desc())
                 .limit(2000)
@@ -3996,7 +4018,8 @@ class ViewportScreenshotUploadUrlRequest(BaseModel):
     task_id: uuid.UUID
     name: str = Field(max_length=200)
     width: int = Field(ge=1, le=4096)
-    phase: Literal["before", "after"]
+    phase: Literal["before", "after", "diff"]
+    magnitude: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
 @router.post("/viewport/screenshot-upload-url")
@@ -4064,7 +4087,10 @@ async def get_viewport_screenshot_upload_url(
 
     ctx = dict(task.context or {})
     entry_name = f"{safe_name}-{req.width}-{req.phase}"
-    screenshots.append({"name": entry_name, "storage_uri": storage_uri})
+    entry: dict = {"name": entry_name, "storage_uri": storage_uri}
+    if req.magnitude is not None:
+        entry["magnitude"] = req.magnitude
+    screenshots.append(entry)
     ctx["viewport_screenshots"] = screenshots
     task.context = ctx
     flag_modified(task, "context")
@@ -4072,6 +4098,115 @@ async def get_viewport_screenshot_upload_url(
     await session.commit()
 
     return {"upload_url": upload_url, "storage_uri": storage_uri}
+
+
+@router.get("/viewport/failure-screenshot-download-url")
+@limiter.limit("120/minute")
+async def get_viewport_failure_screenshot_download_url_agent(
+    request: Request,
+    project_id: uuid.UUID,
+    component: str,
+    width: int,
+    token: dict = Depends(verify_agent_token),
+    session: AsyncSession = Depends(get_session),
+):
+    """Generate a signed download URL for a viewport failure screenshot (agent-token path).
+
+    Scoped to the agent's own task (sub claim) — cross-task reads are denied.
+    The calling task must have previously uploaded a screenshot at the requested
+    path (stamped in task.context['viewport_failure_screenshot_uri']).
+    """
+    if str(project_id) != token.get("project_id"):
+        raise HTTPException(status_code=403, detail="Project ID mismatch")
+
+    task_id = token.get("sub")
+    if not task_id:
+        raise HTTPException(status_code=403, detail="Agent token has no task scope")
+
+    result = await session.execute(select(Task).where(Task.id == uuid.UUID(task_id)))
+    task = result.scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=403, detail="Task not found")
+
+    from app.storage import (
+        ARTIFACT_BUCKET_NAME,
+        StorageUriError,
+        generate_download_signed_url,
+    )
+    from app.viewport_evidence import viewport_object_name
+
+    object_name = viewport_object_name(project_id, component, width)
+    stamped_uri = (task.context or {}).get("viewport_failure_screenshot_uri", "")
+    if not stamped_uri or not stamped_uri.endswith(object_name):
+        raise HTTPException(
+            status_code=403,
+            detail="Agent may only download its own uploaded screenshot",
+        )
+    storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+
+    try:
+        url = await generate_download_signed_url(storage_uri, expiration_minutes=60)
+    except StorageUriError as exc:
+        logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
+        raise HTTPException(
+            status_code=400, detail="Invalid screenshot reference"
+        ) from exc  # noqa: B904
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(
+            status_code=503, detail="Artifact storage unavailable"
+        ) from exc  # noqa: B904
+    return {"url": url}
+
+
+@router.get("/viewport/screenshot-download-url")
+@limiter.limit("120/minute")
+async def get_viewport_screenshot_download_url_agent(
+    request: Request,
+    task_id: uuid.UUID,
+    name: str,
+    token: dict = Depends(verify_agent_token),
+):
+    """Generate a signed download URL for a task-scoped viewport screenshot (agent-token path).
+
+    Scoped to the agent's own task (sub claim) — cross-task reads are denied.
+    The GCS path mirrors the upload endpoint exactly.
+    """
+    import re as _re
+
+    if str(task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    from app.storage import (
+        ARTIFACT_BUCKET_NAME,
+        StorageUriError,
+        generate_download_signed_url,
+    )
+
+    _SAFE_NAME_RE = _re.compile(r"[^A-Za-z0-9._-]")
+    safe_name = _SAFE_NAME_RE.sub("_", name)
+
+    project_id = token.get("project_id")
+    object_name = f"viewport-shots/{project_id}/{task_id}/{safe_name}.png"
+    storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+
+    try:
+        url = await generate_download_signed_url(storage_uri, expiration_minutes=60)
+    except StorageUriError as exc:
+        logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
+        raise HTTPException(
+            status_code=400, detail="Invalid screenshot reference"
+        ) from exc  # noqa: B904
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(
+            status_code=503, detail="Artifact storage unavailable"
+        ) from exc  # noqa: B904
+    return {"url": url}
 
 
 # Beacon prefix → _cold_start_stages key mapping for per-stage breakdown.
@@ -4805,10 +4940,17 @@ _VALID_REVIEWER_RECOVERY_ORIGINS = frozenset(
 )
 
 
+class _ReviewerFinding(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    category: str | None = Field(None, max_length=100)
+    severity: str | None = Field(None, max_length=20)
+    description: str | None = Field(None, max_length=2000)
+
+
 class ReviewerMergeRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
-    reviewer_findings: list[dict]
-    reviewer_edges_considered: list[dict] = []
+    reviewer_findings: list[_ReviewerFinding] = Field(default=[], max_length=100)
+    reviewer_edges_considered: list[dict] = Field(default=[], max_length=50)
     # Optional recovery-origin flavor the agent computed in-VM. Absent for the
     # legacy operator-requested request shape (defaults preserve that path).
     reviewer_recovery_origin: str | None = None
@@ -4866,12 +5008,13 @@ async def merge_operator_reviewer_findings(
 
     orig_ctx = dict(original_task.context or {})
     sr = dict(orig_ctx.get("_self_review_outcome") or {})
-    sr["reviewer_findings"] = req.reviewer_findings
+    findings_dicts = [f.model_dump() for f in req.reviewer_findings]
+    sr["reviewer_findings"] = findings_dicts
     if recovery_origin:
         sr["reviewer_recovery_origin"] = recovery_origin
 
     check_results = dict(sr.get("check_results") or {})
-    for finding in req.reviewer_findings:
+    for finding in findings_dicts:
         cat = finding.get("category")
         if cat:
             existing = check_results.get(cat)

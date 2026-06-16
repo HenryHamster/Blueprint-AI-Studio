@@ -76,6 +76,14 @@ export const TMP_OUTPUT_NAMES = [
   'self_audit_findings',
   'self_review',
   'symbols',
+  'fix_responses',
+  'fix_sr_context',
+  'test_baseline',
+  'fix_parallelized',
+  'bootstrap_domain',
+  'research_insights',
+  'consumed_artifacts',
+  'problem_model',
 ];
 
 export interface ResetOptions {

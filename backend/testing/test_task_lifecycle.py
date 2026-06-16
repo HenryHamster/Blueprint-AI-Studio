@@ -4349,6 +4349,61 @@ async def test_scan_transient_retry_exhausted(tl_db, mocker):
     assert "infrastructure error" in (task.latest_status_message or "")
 
 
+@pytest.mark.asyncio
+async def test_process_post_commit_stamps_first_pr_opened(tl_db, mocker):
+    """_process_post_commit stamps first_pr_opened_at in project.build_config when
+    a create task completes with a PULL_REQUEST artifact.
+
+    The stamp happens before the security scan; the scan is made to fail
+    transiently (requires_approval=True path) so the session commits quickly
+    while still including the project build_config update.
+    """
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        side_effect=TimeoutError("connection timed out"),
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/99",
+        branch="blueprint/task-abc123",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    async with factory() as verify_session:
+        fetched_project = (
+            (
+                await verify_session.execute(
+                    select(Project).where(Project.id == project.id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+    assert fetched_project is not None
+    assert (fetched_project.build_config or {}).get("first_pr_opened_at") is not None, (
+        "first_pr_opened_at must be stamped in build_config when a create task "
+        "completes with a PULL_REQUEST artifact"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Residual remediation MERGED transition on merge
 # ══════════════════════════════════════════════════════════════════════════════

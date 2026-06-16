@@ -386,6 +386,21 @@ def apply_merged_landed_signal(
                 getattr(task, "id", None),
                 exc_info=True,
             )
+        # Onboarding-proof: record the first PR that landed on the project's
+        # integration branch. This is the central merge-landed choke point that
+        # already records the capability proof, so it mirrors that pattern
+        # exactly — no session parameter, the caller's session already tracks
+        # ``project``. Best-effort and idempotent; never undoes a real merge.
+        try:
+            from app.onboarding_proof import stamp_first_pr_merged
+
+            stamp_first_pr_merged(project)
+        except Exception:  # noqa: BLE001 — observability stamp must never undo a real merge
+            logger.warning(
+                "[LANDED] onboarding first-pr-merged stamp failed for task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
     elif non_merge_reason:
         mark_unblocked_non_merge(task, reason=non_merge_reason)
     return landed_on_integration

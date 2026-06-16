@@ -3013,23 +3013,20 @@ async def test_research_history_records_finding_challenge_summary(db_session):
 
 
 @_pytest.mark.asyncio
-async def test_dedup_deadlock_holds_direction_out_of_rotation_and_auto_recovers(
-    db_session, mocker
-):
-    """Detecting a dedup deadlock auto-pauses the direction and auto-recovery restores it.
+async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
+    """Detecting a dedup deadlock retires a genuinely-exhausted direction terminally.
 
-    Three consecutive dedup-zero research cycles must:
-    - Set direction status to 'paused' with auto_paused=True and a 'dedup_deadlock:' reason
-    - Increment auto_pause_count
-    - Create a WARNING alert and a BUG_REPORT message
-    - Be reversible: _process_direction_lifecycle reactivates the direction once the
-      cooldown (direction_dedup_deadlock_recovery_hours, default 8h) elapses.
+    #10112 superseded: instead of the old auto-pause-and-recover loop, three
+    consecutive dedup-zero research cycles on a direction that is not externally
+    frozen and not code-failing now:
+    - Set direction status to terminal 'completed' with auto_completed=True and an
+      exhaustion auto_completed_reason
+    - Stamp completed_at
+    - Create an INFO 'Direction auto-completed' alert (not the WARNING deadlock alert)
+    - NOT auto-pause (no auto_paused / paused_reason) — the direction is terminal.
     """
     from datetime import datetime, timedelta
 
-    from sqlalchemy.orm.attributes import flag_modified
-
-    from app.direction_lifecycle import _process_direction_lifecycle
     from app.models import Alert
     from app.research_direction_state import apply_post_spawn_state
     from test_autonomous_research import _active_direction, _make_research_task
@@ -3113,61 +3110,236 @@ async def test_dedup_deadlock_holds_direction_out_of_rotation_and_auto_recovers(
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "paused", (
-        f"direction should be paused on dedup deadlock, got {d['status']!r}"
+    assert d["status"] == "completed", (
+        f"dedup-deadlocked exhausted direction should be terminally completed, "
+        f"got {d['status']!r}"
     )
-    assert d.get("auto_paused") is True, "auto_paused must be set"
-    assert (d.get("paused_reason") or "").startswith("dedup_deadlock:"), (
-        f"paused_reason must start with 'dedup_deadlock:', got {d.get('paused_reason')!r}"
+    assert d.get("auto_completed") is True, "auto_completed must be set"
+    assert d.get("completed_at") is not None, "completed_at must be stamped"
+    assert "exhausted" in (d.get("auto_completed_reason") or ""), (
+        f"auto_completed_reason must reflect exhaustion, got {d.get('auto_completed_reason')!r}"
     )
-    assert d.get("auto_pause_count") == 1, (
-        f"auto_pause_count should be 1, got {d.get('auto_pause_count')}"
-    )
-    assert d.get("paused_at") is not None, "paused_at must be stamped"
+    # The superseded auto-pause must NOT have fired.
+    assert not d.get("auto_paused"), "exhausted-completed direction must not be auto-paused"
+    assert not d.get("paused_reason"), "no paused_reason on a completed direction"
 
-    # Verify a WARNING alert was created for the deadlock
+    # An INFO 'Direction auto-completed' alert is created (not the WARNING deadlock alert).
     result = await db_session.execute(
         _select(Alert).where(
             Alert.project_id == project.id,
-            Alert.title == "Dedup deadlock detected",
+            Alert.title == "Direction auto-completed",
             Alert.dismissed_at.is_(None),
         )
     )
     assert result.scalars().first() is not None, (
-        "expected a 'Dedup deadlock detected' alert"
+        "expected a 'Direction auto-completed' alert"
     )
 
-    # Simulate 50h elapsed since the pause (past the 8h dedup_deadlock recovery window)
-    dirs = list(project.directions)
-    dirs[0]["paused_at"] = (datetime.utcnow() - timedelta(hours=50)).isoformat()
-    project.directions = dirs
-    flag_modified(project, "directions")
+
+@_pytest.mark.asyncio
+async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
+    """When a dedup deadlock fires but exhaustion-completion is DECLINED (the
+    direction is externally frozen), the existing auto-pause path still runs and
+    writes deadlock_filtered_titles.
+
+    The field collects titles from filtered_findings across the deadlocked history window
+    so the next research cycle's prompt can exclude them explicitly. Externally-frozen
+    directions are guarded out of terminal completion (#10112 supersession), so they
+    fall through to the legacy pause behavior — which this test pins.
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-dft-populate"
+    old_history = [
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "task_id": "t-dft-old1",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 2, "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
+                "type_filtered": 0, "empty_prompt": 0,
+            },
+            "filtered_findings": [
+                {"title": "Fix null pointer in auth handler", "reason": "hash match"},
+                {"title": "Add retry to payment service", "reason": "word overlap"},
+            ],
+            "summary": "no findings",
+        },
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "task_id": "t-dft-old2",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1, "word_overlap_dedup": 1,
+                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
+                "type_filtered": 0, "empty_prompt": 0,
+            },
+            "filtered_findings": [
+                {"title": "Fix null pointer in auth handler", "reason": "hash match"},
+                {"title": "Remove unused import in models", "reason": "word overlap"},
+            ],
+            "summary": "no findings",
+        },
+    ]
+    direction = {
+        **_active_direction(direction_id, "Deadlock filtered titles test"),
+        "research_history": old_history,
+        # Externally frozen → exhaustion-completion is declined, so the legacy
+        # auto-pause + deadlock_filtered_titles path still fires.
+        "needs_manual_intervention": True,
+    }
+    project = _Project(
+        name="DFT Populate Test",
+        user_id="test-user-dft1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Run direction lifecycle — should auto-recover the direction past the cooldown
-    mocker.patch(
-        "app.direction_lifecycle._compute_direction_error_fingerprint",
-        new_callable=AsyncMock,
-        return_value=None,
-    )
-    await _process_direction_lifecycle(
-        project,
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Third dedup-zero cycle with filtered findings — triggers deadlock
+    await apply_post_spawn_state(
         db_session,
-        cooldown_minutes=0.0,
-        busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        1,   # hash_dedup_count
+        0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+        filtered_findings=[
+            {"title": "Add config validation", "reason": "hash match",
+             "direction_id": direction_id},
+        ],
     )
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "active", (
-        f"direction should be active after cooldown, got {d['status']!r}"
+    assert d["status"] == "paused", "direction should be paused"
+    dft = d.get("deadlock_filtered_titles")
+    assert dft is not None, "deadlock_filtered_titles must be set on deadlock"
+    assert isinstance(dft, list), "deadlock_filtered_titles must be a list"
+    # Should include titles from the history window (deduplicated)
+    assert "Fix null pointer in auth handler" in dft
+    assert "Add retry to payment service" in dft
+    assert "Remove unused import in models" in dft
+    # No duplicates
+    assert len(dft) == len(set(dft)), "deadlock_filtered_titles must not have duplicates"
+
+
+@_pytest.mark.asyncio
+async def test_dedup_deadlock_filtered_titles_cleared_on_productive_cycle(db_session):
+    """deadlock_filtered_titles is cleared when the next cycle creates tasks.
+
+    After a direction recovers from dedup deadlock and its next research cycle
+    successfully creates child tasks, the deadlock_filtered_titles field is removed.
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+    from app.models import Task as _Task
+
+    direction_id = "d-dft-clear"
+    old_history = [
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "task_id": "t-dft-c1",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1, "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
+                "type_filtered": 0, "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "task_id": "t-dft-c2",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1, "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
+                "type_filtered": 0, "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+    ]
+    # Direction already has deadlock_filtered_titles from a prior deadlock
+    direction = {
+        **_active_direction(direction_id, "DFT clear test"),
+        "research_history": old_history,
+        "deadlock_filtered_titles": ["Old rejected title A", "Old rejected title B"],
+    }
+    project = _Project(
+        name="DFT Clear Test",
+        user_id="test-user-dft2",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
     )
-    assert d.get("auto_recovered_at") is not None, "auto_recovered_at must be stamped"
-    assert not d.get("auto_paused"), "auto_paused should be cleared on recovery"
-    assert not d.get("paused_reason"), "paused_reason should be cleared on recovery"
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Productive cycle: spawn a child task for this direction
+    child = _Task(
+        project_id=project.id,
+        task_type="create",
+        status=TaskStatus.QUEUED,
+        payloads=[{"prompt": "fix something", "base_branch": "main"}],
+        context={"direction_id": direction_id},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    from app.finding_deduplication import finding_hash, canonical_finding_body
+
+    finding = {"title": "New real fix", "description": "Actually new work",
+               "direction_id": direction_id, "type": "fix"}
+    fhash = finding_hash(finding["title"], canonical_finding_body(finding))
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [finding],     # findings
+        [child],       # child_tasks — productive cycle
+        [(0, finding, fhash)],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("deadlock_filtered_titles") is None, (
+        "deadlock_filtered_titles should be cleared when tasks are created"
+    )
 
 
 @_pytest.mark.asyncio
@@ -5160,6 +5332,108 @@ async def test_depends_on_indices_missing_sibling_wires_to_existing_inflight(
     )
     assert get_blocker_needs(dep) == [], (
         "no unresolved need must be persisted when the edge was wired"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_depends_on_indices_deduped_sibling_no_provider_spawns_standalone(
+    db_session, mocker
+):
+    """When a depends_on_indices sibling is dropped by deduplicate_findings as a
+    duplicate of EXISTING/COVERED work that is NOT identity-resolvable, the
+    dependent must spawn STANDALONE (orphaned edge dropped) — not be cancelled as
+    'no_live_or_deferred_provider', which would also fail the whole research task.
+
+    This is the real-world strand: two independent research runs surface the same
+    foundation finding. The foundation is word-overlap-deduped against an existing
+    in-flight task whose finding_hash differs (different body across runs), so
+    resolve_prerequisite_task cannot wire an edge — the hashes never line up. Before
+    the fix the dependent landed in dead_task_needs and was CANCELLED, escalating to
+    the parent which FAILED ('All N subtasks were cancelled'), discarding the whole
+    cycle. After the fix the dependent spawns standalone: the foundation is already
+    covered, so the declared edge is orphaned, not an unmet dependency."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-prq-dedup-standalone"
+    )
+
+    # Pre-existing in-flight task whose TITLE word-overlaps foundation finding A but
+    # whose finding_hash is DIFFERENT (a prior run's body) — so A is word-overlap
+    # deduped against it, yet A's recomputed hash resolves to no provider.
+    foundation_title = "reconcile chosen snecko act-2 move logic to canonical"
+    existing_inflight = _Task(
+        project_id=_project.id,
+        title=foundation_title,
+        payloads=[{"type": "create", "prompt": "earlier run of the same foundation"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        context={
+            "direction_id": direction["id"],
+            # Hash from a DIFFERENT body — deliberately not equal to finding A's hash.
+            "finding_hash": _finding_hash(foundation_title, "a different earlier body"),
+        },
+    )
+    db_session.add(existing_inflight)
+    await db_session.commit()
+    await db_session.refresh(existing_inflight)
+
+    # Foundation finding A (same title → word-overlap deduped; default body → its
+    # OWN hash, which differs from the existing task's stored hash).
+    finding_a = _make_finding(title=foundation_title, direction_id=direction["id"])
+    a_hash = _finding_hash(finding_a["title"], finding_a["description"])
+    assert a_hash != existing_inflight.context["finding_hash"], (
+        "test precondition: A's hash must differ from the existing task's so the "
+        "edge cannot be identity-resolved"
+    )
+
+    # Dependent finding B declares an edge to A (index 0).
+    finding_b = _make_finding(
+        title="dilute act-2 normal pool with canonical easy fights",
+        direction_id=direction["id"],
+    )
+    finding_b["depends_on_indices"] = [0]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_a, finding_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    dep_children = [c for c in children if "dilute act-2" in c.title.lower()]
+    assert len(dep_children) == 1, "dependent finding B must spawn as a child task"
+    dep = dep_children[0]
+    assert dep.status not in (TaskStatus.CANCELLED, TaskStatus.BLOCKED), (
+        "dependent whose deduped foundation is unresolvable must spawn standalone, "
+        "not be cancelled/blocked as a dead need"
+    )
+    assert (dep.context or {}).get("prerequisite_escalation_reason") != (
+        "no_live_or_deferred_provider"
+    )
+    assert get_blocker_needs(dep) == [], (
+        "no unresolved need may persist — the orphaned edge is dropped, not gated"
+    )
+    assert str(existing_inflight.id) not in (dep.depends_on or []), (
+        "no edge is wired to the fuzzy word-overlap match (identities diverge)"
+    )
+    dropped = (dep.context or {}).get("_spawn_prereq_dropped_duplicate") or []
+    assert any(d.get("finding_hash") == a_hash for d in dropped), (
+        "the dropped-duplicate prerequisite must be stamped for observability"
     )
 
 
@@ -13316,6 +13590,130 @@ class TestStampNoFindingsRefractory:
         direction2 = project2.directions[0]
         assert direction2.get("status") == "completed", (
             "Direction with 3 verified aggregate merges must be auto-completed"
+        )
+
+    # ── Additive exhaustion route (terminal COMPLETED regardless of merge count) ──
+
+    def _make_exhausted_project(
+        self,
+        direction_id="d-test",
+        research_history=None,
+        extra=None,
+        consecutive_unproductive=2,
+    ):
+        """Build an active, about-to-be-saturated direction with optional extra fields."""
+        direction = {
+            "id": direction_id,
+            "text": "Exhausted direction",
+            "status": "active",
+            "research_history": research_history if research_history is not None else [],
+            "history_aggregate": {},
+            "consecutive_unproductive_cycles": consecutive_unproductive,
+        }
+        if extra:
+            direction.update(extra)
+        project = MagicMock()
+        project.directions = [direction]
+        return project
+
+    def test_exhausted_unproductive_direction_auto_completes(self):
+        """A saturated, genuinely-exhausted (already-fixed-deadlock) UNPRODUCTIVE
+        direction with < 3 merges auto-completes to terminal status='completed'.
+
+        This is the #10113 root fix: an already-fixed-deadlocked direction (its
+        spawned tasks all terminate SCOPE_EMPTY because the work is already on HEAD)
+        is retired terminally rather than looping or emitting an advisory-only alert,
+        even though it has zero verified merges.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # Three consecutive cycles whose spawned tasks all resolved SCOPE_EMPTY
+        # (tasks_created >= 1 and scope_empty_noop_count >= tasks_created) → the
+        # already-fixed deadlock signal. Zero merges.
+        already_fixed_history = [
+            {"tasks_created": 2, "scope_empty_noop_count": 2, "prs_merged": 0}
+            for _ in range(3)
+        ]
+        task = self._make_task()
+        project = self._make_exhausted_project(research_history=already_fixed_history)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+
+        direction = project.directions[0]
+        assert direction.get("status") == "completed", (
+            "A genuinely-exhausted already-fixed-deadlocked direction with <3 merges "
+            "must auto-complete to terminal 'completed'"
+        )
+        assert direction.get("auto_completed") is True, "auto_completed must be stamped"
+        assert direction.get("completed_at"), "completed_at must be stamped"
+        reason = direction.get("auto_completed_reason", "")
+        assert "exhausted" in reason and "no new work remaining" in reason, (
+            f"exhaustion reason must distinguish it from the proven-merge route, got: {reason!r}"
+        )
+
+    def test_exhaustion_complete_blocked_for_code_failing_direction(self):
+        """GUARDRAIL 1: a code-failing direction is BROKEN, not exhausted, and must
+        NOT auto-complete — the existing pause/diagnosis path owns it."""
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # Saturated-shaped history, but every cycle has a CODE failure (not infra) →
+        # _check_direction_health returns a 'High code failure rate' pause reason.
+        code_failing_history = [
+            {
+                "tasks_created": 1,
+                "tasks_failed": 1,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            }
+            for _ in range(3)
+        ]
+        task = self._make_task()
+        project = self._make_exhausted_project(research_history=code_failing_history)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "A code-failing direction must NOT be auto-completed as exhausted"
+        )
+
+    def test_exhaustion_complete_blocked_for_externally_frozen_direction(self):
+        """GUARDRAIL 2: an externally-frozen direction (needs_manual_intervention /
+        budget pause) may still have work once the block clears, so it must NOT be
+        auto-completed as exhausted."""
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # Saturated, no merges, no code failures → genuinely exhausted on its own…
+        plain_history = [
+            {"tasks_created": 1, "tasks_failed": 0, "prs_merged": 0} for _ in range(3)
+        ]
+        # …but flagged for manual intervention (an external freeze).
+        task = self._make_task()
+        project = self._make_exhausted_project(
+            research_history=plain_history,
+            extra={"needs_manual_intervention": True},
+        )
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "An externally-frozen (needs_manual_intervention) direction must NOT be "
+            "auto-completed as exhausted"
+        )
+
+        # Same exhaustion shape, but frozen by a budget pause instead.
+        task2 = self._make_task()
+        project2 = self._make_exhausted_project(
+            research_history=plain_history,
+            extra={
+                "cost_pause_evidence": {
+                    "cumulative_estimated_cost_usd": 12.0,
+                    "cost_budget_usd": 10.0,
+                }
+            },
+        )
+        self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
+        direction2 = project2.directions[0]
+        assert direction2.get("status") != "completed", (
+            "A budget-paused (cost_pause_evidence) direction must NOT be auto-completed"
         )
 
 

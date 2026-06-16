@@ -251,7 +251,12 @@ def _filter_acknowledged_buckets(
 
 async def _load_acknowledgements(session: AsyncSession) -> Dict[str, datetime]:
     """Return all persisted error-bucket acknowledgements as a key→datetime map."""
-    result = await session.execute(select(OrchestratorErrorAck))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+    result = await session.execute(
+        select(OrchestratorErrorAck).where(
+            OrchestratorErrorAck.acknowledged_at >= cutoff
+        )
+    )
     return {row.key: row.acknowledged_at for row in result.scalars().all()}
 
 

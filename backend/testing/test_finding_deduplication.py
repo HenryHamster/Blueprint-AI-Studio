@@ -578,7 +578,7 @@ def test_deduplicate_findings_recent_terminal_evidence_overlap_rejects_reworded_
     assert outcome.deduplicated == []
     assert len(outcome.filtered) == 1
     rec = outcome.filtered[0]
-    assert rec["reason"].startswith("recent terminal evidence overlap with: ")
+    assert rec["reason"].startswith("evidence overlap with: ")
 
 
 def test_dedup_outcome_default_empty():
@@ -959,6 +959,77 @@ def test_normalize_source_ref_formats():
     assert _normalize_source_ref("backend/app/foo.py#L10-L20") == "backend/app/foo.py"
     assert _normalize_source_ref("backend/app/foo.py:42-50") == "backend/app/foo.py"
     assert _normalize_source_ref("") == ""
+
+
+def test_normalize_source_ref_preserves_typed_refs():
+    # Typed refs like pr:123 or message:abc must not be collapsed to their prefix.
+    assert _normalize_source_ref("pr:123") == "pr:123"
+    assert _normalize_source_ref("message:abc") == "message:abc"
+    assert _normalize_source_ref("pr:456") == "pr:456"
+
+
+def test_normalize_source_ref_preserves_url_scheme():
+    # URL schemes must not be stripped at the first colon.
+    assert _normalize_source_ref("https://github.com/foo") == "https://github.com/foo"
+    assert _normalize_source_ref("https://github.com/foo/bar") == "https://github.com/foo/bar"
+
+
+def test_evidence_dedup_preserves_typed_refs_and_recent_overlap():
+    """Typed source refs (pr:123) are not collapsed by normalization, and
+    recent_terminal_findings seeds the primary evidence-overlap check so
+    cross-cycle duplicates are caught without a separate secondary pass."""
+    # Typed ref normalization: pr:123 and pr:456 stay distinct (not both "pr").
+    assert _normalize_source_ref("pr:123") == "pr:123"
+    assert _normalize_source_ref("message:abc") == "message:abc"
+
+    # A terminal finding from a previous cycle.
+    terminal = {
+        "title": "measure retry inflation root cause",
+        "description": "desc",
+        "direction_id": "dir-1",
+        "sources": [{"type": "file", "ref": "backend/app/cache.py:42"}],
+        "claims": ["retry inflation from duplicate spawning"],
+    }
+    # A cross-cycle duplicate with the same evidence but a different title.
+    candidate = {
+        "title": "track retry inflation drivers",
+        "description": "reworded desc",
+        "priority": "high",
+        "direction_id": "dir-1",
+        "sources": [{"type": "file", "ref": "backend/app/cache.py"}],
+        "claims": ["retry inflation from duplicate spawning"],
+    }
+    # Two findings with DIFFERENT typed PR refs should NOT evidence-overlap.
+    pr_finding_a = {
+        "title": "investigate pr 123 regression",
+        "description": "desc a",
+        "priority": "medium",
+        "sources": [{"type": "pr", "ref": "pr:123"}],
+        "claims": ["pr caused regression"],
+    }
+    pr_finding_b = {
+        "title": "investigate pr 456 regression",
+        "description": "desc b",
+        "priority": "medium",
+        "sources": [{"type": "pr", "ref": "pr:456"}],
+        "claims": ["pr caused regression"],
+    }
+    outcome = deduplicate_findings(
+        [candidate, pr_finding_a, pr_finding_b],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+        recent_terminal_findings=[terminal],
+    )
+    # candidate is blocked by primary evidence check (seeded from terminal).
+    assert outcome.evidence_overlap_count == 1
+    # pr_finding_a and pr_finding_b have distinct typed refs → no evidence overlap.
+    assert len(outcome.deduplicated) == 2
+    rec = outcome.filtered[0]
+    # Primary evidence overlap reason, not the old "recent terminal evidence overlap" prefix.
+    assert rec["reason"].startswith("evidence overlap with: ")
 
 
 def test_extract_source_refs_normalizes_and_filters():

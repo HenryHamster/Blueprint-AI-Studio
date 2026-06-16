@@ -16,18 +16,33 @@ os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
 
 from fastapi.routing import APIRoute
 
-from app.auth import get_current_user, get_metrics_reader, require_admin
+from app.auth import (
+    get_current_user,
+    get_current_user_optional,
+    get_metrics_reader,
+    require_admin,
+)
 from app.main import app
 
 # Intentional exceptions — expected to be empty.
 # When a route genuinely should be unauthenticated (e.g. a public health check
 # under /api/admin for infra monitoring), add its path here with a comment
 # explaining why auth is intentionally absent.
-ALLOWLIST: set[str] = set()
+ALLOWLIST: set[str] = {
+    # Intentionally public: returns a 302 redirect to a time-limited GCS signed URL.
+    # Operators follow these links from GitHub PR bodies without a bearer token;
+    # the signed URL itself is the security boundary.
+    "/api/admin/viewport-shots/download-url",
+}
 
 # get_metrics_reader is a narrowly scoped read-only auth dep that accepts
 # agent JWTs; it is a valid auth callable for metrics-only endpoints.
-_AUTH_CALLABLES = frozenset({get_current_user, require_admin, get_metrics_reader})
+# get_current_user_optional is used on endpoints that accept EITHER an admin
+# bearer token OR an agent JWT via x-agent-token; the endpoint enforces
+# auth itself when the optional dep returns None.
+_AUTH_CALLABLES = frozenset(
+    {get_current_user, get_current_user_optional, require_admin, get_metrics_reader}
+)
 
 
 def _collect_dep_callables(dependant, visited: set) -> set:

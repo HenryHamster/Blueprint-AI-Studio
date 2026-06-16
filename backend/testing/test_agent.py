@@ -18935,6 +18935,94 @@ async def test_viewport_screenshot_upload_url(client: AsyncClient, db_session, m
     assert len(screenshots) == 1
     assert screenshots[0]["name"] == "TaskCard-long-title-375-before"
     assert screenshots[0]["storage_uri"] == body["storage_uri"]
+    # No magnitude in the request body -> the key is omitted entirely (not stored
+    # as None), so the badge consumers can rely on `"magnitude" in entry`.
+    assert "magnitude" not in screenshots[0]
+
+
+@pytest.mark.asyncio
+async def test_viewport_screenshot_upload_url_persists_magnitude(
+    client: AsyncClient, db_session, mocker
+):
+    """A magnitude in [0,1] is persisted into the task context entry verbatim."""
+    import asyncio
+
+    project = Project(name="VP Shot Magnitude Test", user_id="user-vpshot-mag")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add feature"}],
+        vm_instance_id="vm-vpshot-mag",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/signed?X-Goog-Signature=abc"
+    mocker.patch.object(asyncio, "to_thread", new=AsyncMock(return_value=fake_url))
+
+    token = create_agent_token(str(task.id), "vm-vpshot-mag")
+    resp = await client.post(
+        "/api/agent/viewport/screenshot-upload-url",
+        json={
+            "task_id": str(task.id),
+            "name": "TaskCard",
+            "width": 375,
+            "phase": "after",
+            "magnitude": 0.23,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    screenshots = task.context["viewport_screenshots"]
+    assert len(screenshots) == 1
+    # change_pct/100 (0-1 fraction) round-trips so the badge renders the real value.
+    assert screenshots[0]["magnitude"] == 0.23
+
+
+@pytest.mark.asyncio
+async def test_viewport_screenshot_upload_url_rejects_out_of_range_magnitude(
+    client: AsyncClient, db_session
+):
+    """magnitude > 1.0 (e.g. an unscaled 0-100 change_pct) is rejected with 422."""
+    project = Project(name="VP Shot Bad Magnitude Test", user_id="user-vpshot-badmag")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-vpshot-badmag",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-vpshot-badmag")
+    resp = await client.post(
+        "/api/agent/viewport/screenshot-upload-url",
+        json={
+            "task_id": str(task.id),
+            "name": "TaskCard",
+            "width": 375,
+            "phase": "after",
+            "magnitude": 23.0,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 422
+
+    # Nothing was persisted for the rejected request.
+    await db_session.refresh(task)
+    assert (task.context or {}).get("viewport_screenshots", []) == []
 
 
 @pytest.mark.asyncio
@@ -19041,16 +19129,11 @@ async def test_viewport_screenshot_upload_url_cap_enforced(
 
 @pytest.mark.asyncio
 async def test_viewport_shots_download_url(client: AsyncClient, db_session, mocker):
-    """Admin download endpoint reconstructs the correct GCS path and returns a signed URL."""
+    """Admin download endpoint redirects to a signed GCS URL (unauthenticated, 302)."""
     project = Project(name="VP Shot Download Test", user_id="user-vpshot-dl-001")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    member = ProjectMember(
-        project_id=project.id, user_id="test-user-123", role="member"
-    )
-    db_session.add(member)
-    await db_session.commit()
 
     import uuid as _uuid
 
@@ -19070,22 +19153,27 @@ async def test_viewport_shots_download_url(client: AsyncClient, db_session, mock
             "name": "TaskCard-375-before",
         },
     )
-    assert resp.status_code == 200
-    assert resp.json()["url"] == fake_url
+    assert resp.status_code == 302
+    assert resp.headers["location"] == fake_url
 
 
 @pytest.mark.asyncio
-async def test_viewport_shots_download_url_non_member_rejected(
+async def test_viewport_shots_download_url_unauthenticated_succeeds(
     client: AsyncClient, db_session, mocker
 ):
-    """Non-member cannot download viewport screenshots from a project they don't belong to."""
+    """Endpoint is public: no auth token required to follow a PR-body view link."""
     project = Project(name="VP Shot Download Auth Test", user_id="user-vpshot-dl-002")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    # Intentionally do NOT add test-user-123 as a project member
 
     import uuid as _uuid
+
+    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/public?X-Goog-Signature=pub"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
 
     resp = await client.get(
         "/api/admin/viewport-shots/download-url",
@@ -19095,7 +19183,259 @@ async def test_viewport_shots_download_url_non_member_rejected(
             "name": "TaskCard-375-before",
         },
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 302
+    assert resp.headers["location"] == fake_url
+
+
+# ---------------------------------------------------------------------------
+# Agent-token viewport download endpoints
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_viewport_failure_screenshot_download_url(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent can download its own failure screenshot when context URI matches."""
+    project = Project(name="Agent VP Fail DL Test", user_id="user-agent-vpdl-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp"}],
+        vm_instance_id="vm-agent-vpdl-001",
+        context={
+            "viewport_failure_screenshot_uri": f"gs://bucket/viewport-failures/{project.id}/ChatPanel-375.png"
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/vp-fail-dl?X-Goog-Signature=abc"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    token = create_agent_token(
+        str(task.id), "vm-agent-vpdl-001", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/agent/viewport/failure-screenshot-download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "ChatPanel",
+            "width": 375,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_agent_viewport_failure_screenshot_download_url_cross_task_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent cannot download a failure screenshot it did not upload (cross-task read denied)."""
+    project = Project(
+        name="Agent VP Fail DL Cross", user_id="user-agent-vpdl-cross-001"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # task_a uploaded a screenshot; task_b tries to download it
+    task_a = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix a"}],
+        vm_instance_id="vm-agent-vpdl-cross-001",
+        context={
+            "viewport_failure_screenshot_uri": f"gs://bucket/viewport-failures/{project.id}/ChatPanel-375.png"
+        },
+    )
+    task_b = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix b"}],
+        vm_instance_id="vm-agent-vpdl-cross-002",
+    )
+    db_session.add_all([task_a, task_b])
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # task_b's token — no matching context entry
+    token = create_agent_token(
+        str(task_b.id), "vm-agent-vpdl-cross-002", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/agent/viewport/failure-screenshot-download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "ChatPanel",
+            "width": 375,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_agent_viewport_failure_screenshot_download_url_cross_project_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT scoped to a different project is denied with 403."""
+    project_a = Project(name="Agent VP Fail DL Proj A", user_id="user-agent-vpdl-002")
+    project_b = Project(name="Agent VP Fail DL Proj B", user_id="user-agent-vpdl-003")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task = Task(
+        project_id=project_a.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp cross"}],
+        vm_instance_id="vm-agent-vpdl-002",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Token is for project_a's task but request asks for project_b
+    token = create_agent_token(str(task.id), "vm-agent-vpdl-002")
+    resp = await client.get(
+        "/api/agent/viewport/failure-screenshot-download-url",
+        params={
+            "project_id": str(project_b.id),
+            "component": "ChatPanel",
+            "width": 375,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_viewport_shots_download_url_agent_cross_task_denied(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT scoped to task_a cannot download screenshots for task_b."""
+    project = Project(name="Agent VP Shot DL Test", user_id="user-agent-vpshot-dl-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix a"}],
+        vm_instance_id="vm-agent-vpshot-dl-001",
+    )
+    task_b = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix b"}],
+        vm_instance_id="vm-agent-vpshot-dl-002",
+    )
+    db_session.add_all([task_a, task_b])
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # Token is for task_a; request asks for task_b's screenshots
+    token = create_agent_token(str(task_a.id), "vm-agent-vpshot-dl-001")
+    resp = await client.get(
+        "/api/agent/viewport/screenshot-download-url",
+        params={
+            "task_id": str(task_b.id),
+            "name": "TaskCard-375-before",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_agent_viewport_screenshot_download_url(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent with matching task_id gets a signed download URL for a task screenshot."""
+    project = Project(name="Agent VP Shot DL OK", user_id="user-agent-vpshot-dl-002")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp shot"}],
+        vm_instance_id="vm-agent-vpshot-dl-003",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/vp-shot-dl?X-Goog-Signature=xyz"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    token = create_agent_token(str(task.id), "vm-agent-vpshot-dl-003")
+    resp = await client.get(
+        "/api/agent/viewport/screenshot-download-url",
+        params={
+            "task_id": str(task.id),
+            "name": "TaskCard-375-before",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_agent_viewport_screenshot_download_url_storage_failure(
+    client: AsyncClient, db_session, mocker
+):
+    """GCS failure from the agent download path surfaces as 503."""
+    project = Project(name="Agent VP Shot DL Fail", user_id="user-agent-vpshot-dl-003")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp shot fail"}],
+        vm_instance_id="vm-agent-vpshot-dl-004",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(side_effect=RuntimeError("gcs unavailable")),
+    )
+
+    token = create_agent_token(str(task.id), "vm-agent-vpshot-dl-004")
+    resp = await client.get(
+        "/api/agent/viewport/screenshot-download-url",
+        params={
+            "task_id": str(task.id),
+            "name": "TaskCard-375-before",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 503
 
 
 # ---------------------------------------------------------------------------
@@ -21558,6 +21898,83 @@ async def test_reviewer_merge_unrelated_task_still_403(client, db_session):
     assert resp.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_reviewer_merge_findings_list_too_long(client, db_session):
+    """reviewer_findings with more than 100 items must return HTTP 422."""
+    project = await _make_reviewer_merge_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-bounds-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-bounds-1")
+    oversized = [
+        {"category": "correctness", "description": f"finding {i}"} for i in range(101)
+    ]
+    resp = await client.post(
+        f"/api/agent/tasks/{task.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={"reviewer_findings": oversized},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_edges_list_too_long(client, db_session):
+    """reviewer_edges_considered with more than 50 items must return HTTP 422."""
+    project = await _make_reviewer_merge_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-bounds-2",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-bounds-2")
+    oversized_edges = [{"case": f"edge {i}"} for i in range(51)]
+    resp = await client.post(
+        f"/api/agent/tasks/{task.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={"reviewer_findings": [], "reviewer_edges_considered": oversized_edges},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_reviewer_merge_finding_description_too_long(client, db_session):
+    """A single finding whose description exceeds 2000 characters must return HTTP 422."""
+    project = await _make_reviewer_merge_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"prompt": "do work"}],
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-bounds-3",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-bounds-3")
+    resp = await client.post(
+        f"/api/agent/tasks/{task.id}/reviewer-merge",
+        headers={"x-agent-token": token},
+        json={
+            "reviewer_findings": [
+                {"category": "correctness", "description": "x" * 2001}
+            ]
+        },
+    )
+    assert resp.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # POST /api/agent/build-config-discovery tests
 # ---------------------------------------------------------------------------
@@ -22615,3 +23032,372 @@ async def test_agent_claim_diagnostics_after_edit_reject_returns_holdback_one(
     assert resp.status_code == 200
     data = resp.json()
     assert data["project_metadata"]["diagnostics_after_edit_holdback_fraction"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_research_grounding_surfaces_landed_and_blocked(
+    client: AsyncClient, db_session
+):
+    """Research agent grounding surfaces landed_on_head and BLOCKED in-flight tasks.
+
+    Asserts:
+    - recently_completed_tasks carries landed_on_head=True for a task with the
+      integration-branch landing signal, and False for one without it.
+    - A BLOCKED task appears in active_tasks so research agents see it and don't
+      propose findings for work it already addresses.
+    """
+    from app.landed_signal import mark_landed_on_integration
+
+    project = Project(name="Research Grounding Test", user_id="test-user-grounding")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Completed task that truly landed on the integration branch
+    landed_task = Task(
+        project_id=project.id,
+        title="Landed completed task",
+        payloads=[{"type": "fix", "prompt": "Fix the bug"}],
+        vm_instance_id="agent-vm-grounding-landed",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(landed_task)
+    await db_session.commit()
+    await db_session.refresh(landed_task)
+    mark_landed_on_integration(landed_task)
+    await db_session.commit()
+
+    # Completed task that did NOT land on HEAD (no landing signal)
+    non_landed_task = Task(
+        project_id=project.id,
+        title="Non-landed completed task",
+        payloads=[{"type": "fix", "prompt": "Fix something else"}],
+        vm_instance_id="agent-vm-grounding-non-landed",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(non_landed_task)
+    await db_session.commit()
+
+    # BLOCKED in-flight task — must surface in active_tasks
+    blocked_task = Task(
+        project_id=project.id,
+        title="Blocked in-flight task",
+        payloads=[{"type": "create", "prompt": "Implement the feature"}],
+        vm_instance_id="agent-vm-grounding-blocked",
+        status=TaskStatus.BLOCKED,
+    )
+    db_session.add(blocked_task)
+    await db_session.commit()
+
+    # Research task to claim (research type triggers project_context assembly)
+    claim_task = Task(
+        project_id=project.id,
+        title="Research claim task",
+        payloads=[{"type": "research", "prompt": "Investigate the codebase"}],
+        vm_instance_id="agent-vm-grounding-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-grounding-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    project_context = data.get("project_context", {})
+
+    # Verify landed_on_head signal in recently_completed_tasks
+    recent_tasks = project_context.get("recently_completed_tasks", [])
+    by_title = {t["title"]: t for t in recent_tasks}
+
+    assert "Landed completed task" in by_title, (
+        "Landed completed task must appear in recently_completed_tasks"
+    )
+    assert by_title["Landed completed task"]["landed_on_head"] is True, (
+        "landed_on_head must be True for a task with the integration-branch landing signal"
+    )
+
+    assert "Non-landed completed task" in by_title, (
+        "Non-landed completed task must appear in recently_completed_tasks"
+    )
+    assert by_title["Non-landed completed task"]["landed_on_head"] is False, (
+        "landed_on_head must be False for a completed task without a landing signal"
+    )
+
+    # Verify BLOCKED task appears in active_tasks
+    active_tasks = project_context.get("active_tasks", [])
+    blocked_titles = [t["title"] for t in active_tasks if t.get("status") == "BLOCKED"]
+    assert "Blocked in-flight task" in blocked_titles, (
+        "BLOCKED tasks must appear in active_tasks so research agents don't regenerate their work"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Agent-token path through ADMIN viewport download endpoints
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_failure_download_url_agent_token(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT can download its own failure screenshot via the ADMIN endpoint.
+
+    The admin endpoint accepts x-agent-token and validates that the task's
+    context URI matches the reconstructed object path for (project_id, component, width).
+    """
+    project = Project(
+        name="Admin VP Fail DL Agent JWT", user_id="user-admin-vp-fail-jwt-001"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp"}],
+        vm_instance_id="vm-admin-vp-fail-jwt-001",
+        context={
+            "viewport_failure_screenshot_uri": f"gs://bucket/viewport-failures/{project.id}/NavBar-768.png"
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = (
+        "https://storage.googleapis.com/bucket/admin-vp-fail-dl?X-Goog-Signature=abc"
+    )
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    token = create_agent_token(
+        str(task.id), "vm-admin-vp-fail-jwt-001", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-failures/download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "NavBar",
+            "width": 768,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_failure_download_url_agent_token_cross_task_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT is denied when the task's context URI does not match the requested screenshot.
+
+    task_b has no viewport_failure_screenshot_uri for NavBar-768, so its token
+    must not be able to download that path even though the project_id matches.
+    """
+    project = Project(
+        name="Admin VP Fail DL Agent JWT Cross", user_id="user-admin-vp-fail-jwt-002"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # task_a uploaded; task_b has no matching context entry
+    task_a = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix a"}],
+        vm_instance_id="vm-admin-vp-fail-jwt-cross-001",
+        context={
+            "viewport_failure_screenshot_uri": f"gs://bucket/viewport-failures/{project.id}/NavBar-768.png"
+        },
+    )
+    task_b = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix b"}],
+        vm_instance_id="vm-admin-vp-fail-jwt-cross-002",
+    )
+    db_session.add_all([task_a, task_b])
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # task_b's token — no matching context URI
+    token = create_agent_token(
+        str(task_b.id), "vm-admin-vp-fail-jwt-cross-002", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-failures/download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "NavBar",
+            "width": 768,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_shots_download_url_agent_token(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT can download its own task-scoped screenshot via the ADMIN endpoint.
+
+    The admin endpoint validates that the token's sub (task_id) and project_id
+    claims match the query parameters before issuing a signed URL.
+    """
+    project = Project(
+        name="Admin VP Shot DL Agent JWT", user_id="user-admin-vp-shot-jwt-001"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp shot"}],
+        vm_instance_id="vm-admin-vp-shot-jwt-001",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = (
+        "https://storage.googleapis.com/bucket/admin-vp-shot-dl?X-Goog-Signature=xyz"
+    )
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    token = create_agent_token(
+        str(task.id), "vm-admin-vp-shot-jwt-001", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-shots/download-url",
+        params={
+            "project_id": str(project.id),
+            "task_id": str(task.id),
+            "name": "HeroSection-1280-after",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_shots_download_url_agent_token_cross_task_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT scoped to task_a cannot download screenshots for task_b via the ADMIN endpoint."""
+    project = Project(
+        name="Admin VP Shot DL Agent JWT Cross", user_id="user-admin-vp-shot-jwt-002"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix a"}],
+        vm_instance_id="vm-admin-vp-shot-jwt-cross-001",
+    )
+    task_b = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix b"}],
+        vm_instance_id="vm-admin-vp-shot-jwt-cross-002",
+    )
+    db_session.add_all([task_a, task_b])
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # Token is for task_a; request asks for task_b's screenshots
+    token = create_agent_token(
+        str(task_a.id), "vm-admin-vp-shot-jwt-cross-001", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-shots/download-url",
+        params={
+            "project_id": str(project.id),
+            "task_id": str(task_b.id),
+            "name": "HeroSection-1280-after",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_shots_download_url_no_auth_redirect(
+    client: AsyncClient, db_session, mocker
+):
+    """Admin viewport-shots endpoint has two intentionally different response shapes.
+
+    Without authentication (operator navigating via browser/PR body link):
+      - Returns 302 redirect to the signed GCS URL for the browser to fetch directly.
+
+    With agent JWT (agent reading screenshots programmatically):
+      - Returns JSON {"url": ...} with the signed URL so the agent can parse it.
+    """
+    project = Project(
+        name="Admin VP Shot No-Auth Test", user_id="user-admin-vp-shot-no-auth-001"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix"}],
+        vm_instance_id="vm-admin-vp-shot-no-auth-001",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/test?X-Goog-Signature=fake"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    # Test 1: No authentication => 302 redirect
+    resp = await client.get(
+        "/api/admin/viewport-shots/download-url",
+        params={
+            "project_id": str(project.id),
+            "task_id": str(task.id),
+            "name": "TestPanel-375-before",
+        },
+    )
+    assert resp.status_code == 302
+    assert resp.headers["location"] == fake_url
+
+    # Test 2: With JWT => JSON response
+    token = create_agent_token(
+        str(task.id), "vm-admin-vp-shot-no-auth-001", project_id=str(project.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-shots/download-url",
+        params={
+            "project_id": str(project.id),
+            "task_id": str(task.id),
+            "name": "TestPanel-375-before",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url

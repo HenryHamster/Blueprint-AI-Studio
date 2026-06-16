@@ -391,7 +391,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
     deps: [fetchEvents, refreshInterval],
   });
 
-  const filteredEvents = events.filter(e => {
+  const filteredEvents = useMemo(() => events.filter(e => {
     let statusMatches: boolean;
     if (activeFilter === 'ALL') {
       statusMatches = true;
@@ -408,7 +408,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
     const titleMatches = e.title.toLowerCase().includes(queryLower);
     const summaryMatches = e.error_summary?.toLowerCase().includes(queryLower) ?? false;
     return titleMatches || summaryMatches;
-  });
+  }), [events, activeFilter, searchQuery]);
 
   const handleRowClick = useCallback((event: ActivityEvent) => {
     if (!event.task_id) return;
