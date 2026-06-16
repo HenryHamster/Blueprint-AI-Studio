@@ -2858,6 +2858,70 @@ async def test_checkpoint_or_recover_phase_emits_pre_exhaustion_operator_message
     )
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_or_recover_phase_emits_pre_exhaustion_budget_alert(
+    db: AsyncSession,
+):
+    """At penultimate requeue slot, a lane_budget_near_exhausted message must be emitted.
+
+    Start a lane with phase_requeues = _LANE_MAX_PHASE_REQUEUES - 2 so that after one
+    checkpoint miss it reaches _LANE_MAX_PHASE_REQUEUES - 1 (the penultimate slot).
+    The function must emit both the regular lane_checkpoint_recover message AND a
+    distinct lane_budget_near_exhausted message.
+    """
+    from app.models import ProjectMessage, TaskStatus, _LANE_MAX_PHASE_REQUEUES
+    from app.review_fix_lane_pilot import (
+        CHECKPOINT_PHASE_RECOVER,
+        checkpoint_or_recover_phase,
+    )
+
+    project_id = await _make_project(db)
+    task = await _make_task(db, project_id, TaskStatus.EVALUATING)
+    lane = await _make_active_lane(
+        db,
+        project_id,
+        current_task_id=task.id,
+        phase_requeues=_LANE_MAX_PHASE_REQUEUES - 2,
+    )
+
+    result = await checkpoint_or_recover_phase(
+        db,
+        task,
+        lane,
+        sha=None,
+        summary="test summary",
+        reserve_workspace=False,
+        enable_recovery=True,
+    )
+    await db.flush()
+
+    assert result == CHECKPOINT_PHASE_RECOVER
+
+    msgs = (
+        (
+            await db.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    event_types = [(m.context or {}).get("event_type") for m in msgs]
+    assert "lane_checkpoint_recover" in event_types, (
+        f"expected lane_checkpoint_recover message, got event_types={event_types}"
+    )
+    assert "lane_budget_near_exhausted" in event_types, (
+        f"expected lane_budget_near_exhausted message at penultimate slot, got event_types={event_types}"
+    )
+    near_exhausted = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "lane_budget_near_exhausted"
+    ]
+    assert len(near_exhausted) == 1
+    assert "next checkpoint miss will kill" in near_exhausted[0].content
+
+
 # ---------------------------------------------------------------------------
 # sweep_stranded_lanes — operator board emit on recovery dispatch path
 # ---------------------------------------------------------------------------

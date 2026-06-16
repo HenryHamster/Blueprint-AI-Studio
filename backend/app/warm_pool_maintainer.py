@@ -1527,6 +1527,17 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                         f"lane '{lane_title}' stranded — checkpoint recovery task spawned "
                         f"(phase_requeues={lane_locked.phase_requeues}; pr=#{pr_number})",
                     )
+                    from app.models import _LANE_MAX_PHASE_REQUEUES
+
+                    if lane_locked.phase_requeues == _LANE_MAX_PHASE_REQUEUES - 1:
+                        await emit_lane_event_message(
+                            session,
+                            lane.project_id,
+                            lane.id,
+                            "lane_budget_near_exhausted",
+                            f"lane '{lane_title}' budget near exhausted — next checkpoint miss will kill this lane "
+                            f"(phase_requeues={lane_locked.phase_requeues}/{_LANE_MAX_PHASE_REQUEUES}; pr=#{pr_number})",
+                        )
                 else:
                     # No dispatch context (task vanished or payload has no
                     # pr_number) — kill deterministically so the lane does not

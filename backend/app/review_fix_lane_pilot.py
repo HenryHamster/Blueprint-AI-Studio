@@ -880,6 +880,15 @@ async def checkpoint_or_recover_phase(
         f"lane '{lane_title}' checkpoint miss — recovery queued "
         f"(phase_requeues={lane.phase_requeues or 0})",
     )
+    if (lane.phase_requeues or 0) == _LANE_MAX_PHASE_REQUEUES - 1:
+        await emit_lane_event_message(
+            session,
+            lane.project_id,
+            lane.id,
+            "lane_budget_near_exhausted",
+            f"lane '{lane_title}' budget near exhausted — next checkpoint miss will kill this lane "
+            f"(phase_requeues={lane.phase_requeues or 0}/{_LANE_MAX_PHASE_REQUEUES})",
+        )
     return CHECKPOINT_PHASE_RECOVER
 
 

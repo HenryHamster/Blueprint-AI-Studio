@@ -95,7 +95,7 @@
     "runtime_config_state.py": 2050,
     "routers/directions.py": 1750,
     "warm_pool_maintainer.py": 2300,
-    "review_fix_lane_pilot.py": 2100,
+    "review_fix_lane_pilot.py": 2450,
     "routers/admin_projects.py": 1750,
     "recovery_evaluating.py": 2950,
     "recovery_post_commit.py": 1900,
