@@ -996,7 +996,14 @@ def _read_promotion_policy_file() -> dict | None:
             raise ValueError(
                 f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
-        return {"weights": weights, "threshold": threshold}
+        result: dict = {"weights": weights, "threshold": threshold}
+        for _k in ("theme_warn_threshold", "theme_block_threshold"):
+            if _k in parsed:
+                try:
+                    result[_k] = float(parsed[_k])
+                except (TypeError, ValueError):
+                    pass
+        return result
     except Exception as exc:  # noqa: BLE001 — fall back on any failure, never raise
         logger.warning(
             "[CONFIG] failed to seed promotion policy from promotion_policy.yaml "
@@ -1028,6 +1035,9 @@ def _seed_promotion_policy() -> None:
         }
     runtime_config["promotion_threshold"] = float(policy["threshold"])
     runtime_config["promotion_weights"] = dict(policy["weights"])
+    for _k in ("theme_warn_threshold", "theme_block_threshold"):
+        if _k in policy:
+            runtime_config[_k] = policy[_k]
 
 
 _seed_promotion_policy()

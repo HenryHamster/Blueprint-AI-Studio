@@ -4058,6 +4058,14 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
 
+    # Theme-delivery certification: {state, theme_class, deterministic_grade,
+    # assessed_grade, directional_contradiction, criteria, shortfalls, ...}
+    # Nullable: existing verdict rows carry no theme_delivery data.
+    theme_delivery: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
     # Promotion-attempt context (only set on the promotion_failed / promoted
     # paths): the merge PR URL, whether the merge hit a conflict, and the
     # error/detail string describing why the merge failed.

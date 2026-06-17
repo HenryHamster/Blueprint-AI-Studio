@@ -20,3 +20,6 @@ weights:
 
 threshold: 0.90        # composite confidence required to promote.
 # Raised back to the conservative 0.90 calibration bar.
+
+theme_warn_threshold: 0.70   # assessed_grade below this -> advisory shortfall
+theme_block_threshold: 0.0   # raise (>0) to arm hard-blocking; ships dark
