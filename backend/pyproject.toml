@@ -210,6 +210,7 @@ timeout_method = "thread"  # works with asyncio
 # prior test's loop (see testing/conftest.py _dispose_production_engine_per_test,
 # which fixes the root cause; this is defense-in-depth).
 addopts = "-m 'not integration' --reruns 2 --only-rerun 'attached to a different loop' --only-rerun 'Event loop is closed'"
+python_classes = ["Test", "*Test"]
 markers = [
     "smoketest: Critical tests run by the smoketest agent after every merge to main",
     "slow: Tests that take >10s (excluded from fast test runs)",
