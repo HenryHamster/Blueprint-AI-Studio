@@ -16,7 +16,7 @@ from sqlmodel import select
 
 from app.depends_on_provenance import remember_structural_depends_on
 from app.models import Task, TaskStatus
-from app.time_utils import _utcnow
+from app.time_utils import _is_cadence_due, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -479,10 +479,8 @@ async def sweep_regression_scan(session) -> int:
     global _last_regression_scan
 
     now_scan = _utcnow()
-    if (
-        _last_regression_scan is not None
-        and (now_scan - _last_regression_scan).total_seconds()
-        < _REGRESSION_SCAN_INTERVAL_SECONDS
+    if not _is_cadence_due(
+        _last_regression_scan, _REGRESSION_SCAN_INTERVAL_SECONDS, now_scan
     ):
         return 0
 
@@ -1025,10 +1023,8 @@ async def sweep_converge_duplicate_foundations(session, now=None) -> int:
 
     global _last_converge_duplicate_scan
     _now = now or _utcnow()
-    if (
-        _last_converge_duplicate_scan is not None
-        and (_now - _last_converge_duplicate_scan).total_seconds()
-        < _FLEET_SCAN_INTERVAL_SECONDS
+    if not _is_cadence_due(
+        _last_converge_duplicate_scan, _FLEET_SCAN_INTERVAL_SECONDS, _now
     ):
         return 0
     _last_converge_duplicate_scan = _now
@@ -2366,10 +2362,8 @@ async def sweep_merge_gate_verification_degradation(session) -> int:
     """
     global _last_merge_gate_degradation_scan
     _now_scan = _utcnow()
-    if (
-        _last_merge_gate_degradation_scan is not None
-        and (_now_scan - _last_merge_gate_degradation_scan).total_seconds()
-        < _FLEET_SCAN_INTERVAL_SECONDS
+    if not _is_cadence_due(
+        _last_merge_gate_degradation_scan, _FLEET_SCAN_INTERVAL_SECONDS, _now_scan
     ):
         return 0
     _last_merge_gate_degradation_scan = _now_scan

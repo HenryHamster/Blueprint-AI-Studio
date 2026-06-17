@@ -145,6 +145,23 @@ def rate_limit_retry_minutes(
     return max(default_min, delta_min)
 
 
+def _is_cadence_due(
+    last_run: datetime | None,
+    interval_seconds: float,
+    now: datetime | None = None,
+) -> bool:
+    """Return True when at least interval_seconds have elapsed since last_run.
+
+    A None last_run is always considered due (first-run-immediate semantics).
+    Pass now to avoid a redundant _utcnow() call when the caller already has it.
+    """
+    if last_run is None:
+        return True
+    if now is None:
+        now = _utcnow()
+    return (now - last_run).total_seconds() >= interval_seconds
+
+
 def parse_retry_after(value) -> Optional[datetime]:
     """Parse a stored retry_after value. Returns a naive UTC datetime or None."""
     if not value or not isinstance(value, str):

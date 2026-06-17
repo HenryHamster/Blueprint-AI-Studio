@@ -244,6 +244,39 @@ warm_backlog_reuse_suppressed_until: datetime | None = None
 warm_pool_suppressed_until: datetime | None = None
 
 
+def _check_windowed_rate_breaker(
+    current_deadline: datetime | None,
+    threshold_config_key: str,
+    threshold_default: int,
+    cooldown_config_key: str,
+    cooldown_default: int,
+    event_count_fn,
+    log_prefix: str,
+    event_description: str,
+) -> tuple[bool, datetime | None]:
+    """Check and update a windowed-rate circuit breaker.
+
+    Returns (is_suppressed, new_deadline) so callers can update their global.
+    """
+    now = _utcnow()
+    if current_deadline is not None and now < current_deadline:
+        return True, current_deadline
+
+    threshold = runtime_config.get(threshold_config_key, threshold_default)
+    recent_count = event_count_fn()
+    if recent_count >= threshold:
+        cooldown = runtime_config.get(cooldown_config_key, cooldown_default)
+        new_deadline = now + timedelta(seconds=cooldown)
+        logger.warning(
+            f"{log_prefix} Circuit breaker tripped: {recent_count} {event_description} "
+            f"in last hour (threshold {threshold}). Suppressed until "
+            f"{new_deadline.isoformat()}."
+        )
+        return True, new_deadline
+
+    return False, None
+
+
 def is_warm_continuity_suppressed() -> bool:
     """True iff warm continuity is auto-suppressed by the pin-clear circuit breaker.
 
@@ -252,25 +285,17 @@ def is_warm_continuity_suppressed() -> bool:
     cold provisioning until the cooldown expires and the rate normalises.
     """
     global warm_continuity_suppressed_until
-    now = _utcnow()
-    if (
-        warm_continuity_suppressed_until is not None
-        and now < warm_continuity_suppressed_until
-    ):
-        return True
-    threshold = runtime_config.get("warm_pin_clear_rate_threshold", 10)
-    recent_clears = count_recent_warm_pin_clears(3600)
-    if recent_clears >= threshold:
-        cooldown = runtime_config.get("warm_continuity_cooldown_seconds", 1800)
-        warm_continuity_suppressed_until = now + timedelta(seconds=cooldown)
-        logger.warning(
-            f"[WARM_CONTINUITY] Circuit breaker tripped: {recent_clears} pin-clear events "
-            f"in last hour (threshold {threshold}). Suppressed until "
-            f"{warm_continuity_suppressed_until.isoformat()}."
-        )
-        return True
-    warm_continuity_suppressed_until = None
-    return False
+    is_suppressed, warm_continuity_suppressed_until = _check_windowed_rate_breaker(
+        current_deadline=warm_continuity_suppressed_until,
+        threshold_config_key="warm_pin_clear_rate_threshold",
+        threshold_default=10,
+        cooldown_config_key="warm_continuity_cooldown_seconds",
+        cooldown_default=1800,
+        event_count_fn=lambda: count_recent_warm_pin_clears(3600),
+        log_prefix="[WARM_CONTINUITY]",
+        event_description="pin-clear events",
+    )
+    return is_suppressed
 
 
 def is_warm_backlog_reuse_suppressed() -> bool:
@@ -281,25 +306,17 @@ def is_warm_backlog_reuse_suppressed() -> bool:
     to cold provisioning until the cooldown expires and the rate normalises.
     """
     global warm_backlog_reuse_suppressed_until
-    now = _utcnow()
-    if (
-        warm_backlog_reuse_suppressed_until is not None
-        and now < warm_backlog_reuse_suppressed_until
-    ):
-        return True
-    threshold = runtime_config.get("warm_backlog_reuse_failure_rate_threshold", 5)
-    recent_failures = count_recent_backlog_reuse_failures(3600)
-    if recent_failures >= threshold:
-        cooldown = runtime_config.get("warm_backlog_reuse_cooldown_seconds", 1800)
-        warm_backlog_reuse_suppressed_until = now + timedelta(seconds=cooldown)
-        logger.warning(
-            f"[BACKLOG_REUSE] Circuit breaker tripped: {recent_failures} failure events "
-            f"in last hour (threshold {threshold}). Suppressed until "
-            f"{warm_backlog_reuse_suppressed_until.isoformat()}."
-        )
-        return True
-    warm_backlog_reuse_suppressed_until = None
-    return False
+    is_suppressed, warm_backlog_reuse_suppressed_until = _check_windowed_rate_breaker(
+        current_deadline=warm_backlog_reuse_suppressed_until,
+        threshold_config_key="warm_backlog_reuse_failure_rate_threshold",
+        threshold_default=5,
+        cooldown_config_key="warm_backlog_reuse_cooldown_seconds",
+        cooldown_default=1800,
+        event_count_fn=lambda: count_recent_backlog_reuse_failures(3600),
+        log_prefix="[BACKLOG_REUSE]",
+        event_description="failure events",
+    )
+    return is_suppressed
 
 
 def is_warm_pool_suppressed() -> bool:
@@ -309,22 +326,17 @@ def is_warm_pool_suppressed() -> bool:
     When the rate exceeds the threshold, sets a suppression window so the
     maintainer stops replenishing and the orchestrator dispatch hook stops
     leasing (falling back to cold provisioning) until the cooldown expires and
-    the rate normalises. Mirrors is_warm_backlog_reuse_suppressed.
+    the rate normalises.
     """
     global warm_pool_suppressed_until
-    now = _utcnow()
-    if warm_pool_suppressed_until is not None and now < warm_pool_suppressed_until:
-        return True
-    threshold = runtime_config.get("warm_pool_failure_rate_threshold", 5)
-    recent_failures = count_recent_pool_claim_failures(3600)
-    if recent_failures >= threshold:
-        cooldown = runtime_config.get("warm_pool_cooldown_seconds", 1800)
-        warm_pool_suppressed_until = now + timedelta(seconds=cooldown)
-        logger.warning(
-            f"[WARM_POOL] Circuit breaker tripped: {recent_failures} pool-claim "
-            f"failure events in last hour (threshold {threshold}). Suppressed until "
-            f"{warm_pool_suppressed_until.isoformat()}."
-        )
-        return True
-    warm_pool_suppressed_until = None
-    return False
+    is_suppressed, warm_pool_suppressed_until = _check_windowed_rate_breaker(
+        current_deadline=warm_pool_suppressed_until,
+        threshold_config_key="warm_pool_failure_rate_threshold",
+        threshold_default=5,
+        cooldown_config_key="warm_pool_cooldown_seconds",
+        cooldown_default=1800,
+        event_count_fn=lambda: count_recent_pool_claim_failures(3600),
+        log_prefix="[WARM_POOL]",
+        event_description="pool-claim failure events",
+    )
+    return is_suppressed

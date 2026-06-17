@@ -110,6 +110,7 @@ from app.shared_state import (
 from app.task_locking import task_lock
 from app.task_blocked import strip_fresh_attempt_context
 from app.time_utils import (
+    _is_cadence_due,
     _utcnow,
     clear_retry_after,
     rate_limit_retry_minutes,
@@ -1788,13 +1789,13 @@ async def orchestrator_worker():
             tasks_recovered = 0
 
             # Periodic pool refresh — pick up admin changes without restart
-            if (_utcnow() - _last_pool_refresh).total_seconds() >= 300:
+            if _is_cadence_due(_last_pool_refresh, 300):
                 await load_max_plan_pool()
                 _last_pool_refresh = _utcnow()
 
             # Periodic zone health persist — prevents retry storms after restart
             global _last_zone_health_persist
-            if (_utcnow() - _last_zone_health_persist).total_seconds() >= 60:
+            if _is_cadence_due(_last_zone_health_persist, 60):
                 await _persist_zone_health()
                 _last_zone_health_persist = _utcnow()
 
@@ -1802,7 +1803,7 @@ async def orchestrator_worker():
             # All three live on the same DeploymentState row, so coalesce into a
             # single session/commit (M-P6) instead of three round-trips.
             global _last_anomaly_state_persist
-            if (_utcnow() - _last_anomaly_state_persist).total_seconds() >= 60:
+            if _is_cadence_due(_last_anomaly_state_persist, 60):
                 await _persist_self_healing_state_bundle()
                 _last_anomaly_state_persist = _utcnow()
 
@@ -1818,7 +1819,7 @@ async def orchestrator_worker():
             # Independent anomaly maintenance — expires stale entries and restores
             # pipeline adjustments without depending on autonomous research cycles.
             global _last_anomaly_sweep
-            if (_utcnow() - _last_anomaly_sweep).total_seconds() >= 600:
+            if _is_cadence_due(_last_anomaly_sweep, 600):
                 from app.anomaly_detection import anomaly_maintenance_sweep
 
                 try:
@@ -2619,7 +2620,9 @@ async def orchestrator_worker():
                             )
                             if locked_task is None:
                                 continue
-                            locked_task.context = strip_fresh_attempt_context(locked_task.context or {})
+                            locked_task.context = strip_fresh_attempt_context(
+                                locked_task.context or {}
+                            )
                             _clear_retry_after_state(locked_task)
                             session.add(locked_task)
                             await session.commit()
@@ -7248,7 +7251,7 @@ async def orchestrator_worker():
             # is now bounded (per-cycle row cap + per-GitHub-call asyncio.wait_for
             # + per-row heartbeat in services._recover_orphaned_tasks, C3) so it
             # can no longer saturate the cycle on a large orphan backlog.
-            if (_utcnow() - _last_orphan_check).total_seconds() >= 120:
+            if _is_cadence_due(_last_orphan_check, 120):
                 _last_orphan_check = _utcnow()
                 await _bounded_leader_step(
                     "recover_orphaned_tasks", _recover_orphaned_tasks(), budget=120
@@ -7263,7 +7266,7 @@ async def orchestrator_worker():
             # processing for terminal tasks whose prior attempt timed out
             # (GitHub quota exhaustion, transient failures, etc.) without
             # waiting for the agent to retry (the VM has usually terminated).
-            if (_utcnow() - _last_post_commit_sweep).total_seconds() >= 60:
+            if _is_cadence_due(_last_post_commit_sweep, 60):
                 _last_post_commit_sweep = _utcnow()
                 # Self-heartbeats per task internally; the 120s outer bound only
                 # trips if it stops making progress (e.g. a single relock-starved
@@ -7276,7 +7279,7 @@ async def orchestrator_worker():
             # tasks whose side-car challenger died without posting status (reaper
             # kill, VM death with retries exhausted, cancellation). Calls the
             # lane resolver with a synthetic FAILED payload for fail-closed semantics.
-            if (_utcnow() - _last_sidecar_sweep).total_seconds() >= 120:
+            if _is_cadence_due(_last_sidecar_sweep, 120):
                 _last_sidecar_sweep = _utcnow()
                 await _bounded_leader_step(
                     "stranded_sidecar_sweep",
@@ -7286,7 +7289,7 @@ async def orchestrator_worker():
             # Bootstrap-recovery sweep — every 300s. Finds external projects with
             # no active bootstrap task and no bootstrap_completed_at, and enqueues
             # one recovery repo_bootstrap each. Idempotent via the spawn helper.
-            if (_utcnow() - _last_bootstrap_recovery_sweep).total_seconds() >= 300:
+            if _is_cadence_due(_last_bootstrap_recovery_sweep, 300):
                 _last_bootstrap_recovery_sweep = _utcnow()
                 try:
                     await _bounded_leader_step(
@@ -7297,7 +7300,7 @@ async def orchestrator_worker():
             # Lane-baseline backfill sweep — every 600s. Finds closed versions
             # lacking a stored baseline and persists one retroactively.
             # First-write-wins idempotent; best-effort/non-fatal.
-            if (_utcnow() - _last_lane_baseline_backfill).total_seconds() >= 600:
+            if _is_cadence_due(_last_lane_baseline_backfill, 600):
                 _last_lane_baseline_backfill = _utcnow()
                 try:
                     await _bounded_leader_step(
