@@ -363,6 +363,7 @@ async def reaper_db(mocker):
     )
     mocker.patch("app.reaper.AsyncSessionLocal", Session)
     mocker.patch("app.reaper_halt.AsyncSessionLocal", Session)
+    mocker.patch("app.reaper_post_orphan_sweep.AsyncSessionLocal", Session)
 
     async with Session() as s:
         yield s
@@ -391,7 +392,7 @@ def reaper_side_effects(mocker):
     mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
-    mocker.patch("app.reaper._capture_serial_for_vm", return_value=None)
+    mocker.patch("app.reaper_orphan_io._capture_serial_for_vm", return_value=None)
     mocker.patch("app.reaper.record_zone_failure")
     # Disable infra-recovery resurrection so FAILED tasks stay FAILED where asserted.
     mocker.patch("app.reaper.any_zone_available", return_value=True)
@@ -3872,14 +3873,15 @@ async def test_step5_resurrection_clears_failure_class(
 
 
 def _install_dep_unblock_compat(mocker, blocked_id_str: str):
-    """Replace app.reaper.AsyncSessionLocal with a smart factory that routes
-    the dep-unblock session through a Python-level filter (SQLite lacks the
-    JSONB @> operator used by Task.depends_on.contains(...)). The first call
-    (main reaper session) returns the underlying session unchanged; every
-    subsequent call returns a proxy that rewrites the dep-unblock query."""
-    import app.reaper as _reaper_mod
+    """Replace app.reaper_post_orphan_sweep.AsyncSessionLocal with a proxy
+    factory that routes the dep-unblock session through a Python-level filter
+    (SQLite lacks the JSONB @> operator used by Task.depends_on.contains(...)).
+    The dep-unblocking logic was extracted to reaper_post_orphan_sweep.py and
+    opens its own session via AsyncSessionLocal() — every call through that
+    module returns a proxy that rewrites the dep-unblock query."""
+    import app.reaper_post_orphan_sweep as _post_sweep_mod
 
-    real_asl = _reaper_mod.AsyncSessionLocal
+    real_asl = _post_sweep_mod.AsyncSessionLocal
     call_count = {"n": 0}
 
     class _DepSessionProxy:
@@ -3921,11 +3923,11 @@ def _install_dep_unblock_compat(mocker, blocked_id_str: str):
         def __call__(self):
             call_count["n"] += 1
             inner = real_asl()
-            if call_count["n"] == 1:
-                return inner
+            # All calls in reaper_post_orphan_sweep are dep-unblock or
+            # safeguard sessions — always return the proxy.
             return _DepSessionProxy(inner)
 
-    mocker.patch("app.reaper.AsyncSessionLocal", _SmartASL())
+    mocker.patch("app.reaper_post_orphan_sweep.AsyncSessionLocal", _SmartASL())
     return call_count
 
 
@@ -4113,8 +4115,10 @@ async def test_dep_unblocking_skipped_when_task_is_retried_not_failed(
     assert retrying.status == TaskStatus.QUEUED
     assert retrying.attempt_count == 1
     assert waiting.depends_on == [str(retrying.id)]
-    # Only the main reaper session should have opened — never the dep-session.
-    assert call_tracker["n"] == 1
+    # No dep-unblock session should open — the tracker only counts
+    # reaper_post_orphan_sweep.AsyncSessionLocal calls (dep-unblock + safeguard),
+    # neither of which fires for a retried (non-terminal) task.
+    assert call_tracker["n"] == 0
 
 
 def test_resolve_retry_budget_external_api_scope_aware():
@@ -5096,8 +5100,9 @@ async def test_serial_log_survives_requeue_via_context_copy(
     """last_serial_log set from a previous cycle must survive the requeue
     context copy — clear_task_llm_runtime_context must not strip it."""
     # Serial capture returns None this cycle (VM is gone), but previous cycle
-    # wrote a log into task.context already.
-    mocker.patch("app.reaper._capture_serial_for_vm", return_value=None)
+    # wrote a log into task.context already. reaper_side_effects already patches
+    # app.reaper_orphan_io._capture_serial_for_vm to return None; we only need to
+    # suppress the zone lookup in reaper.py's provision-failure path.
     mocker.patch("app.reaper.get_vm_zone", return_value=None)
 
     project = await _make_project(reaper_db)
@@ -14607,3 +14612,88 @@ def test_snap_all_terminal_and_snap_any_completed():
     # one child still running
     assert _snap_all_terminal(snap_running) is False
     assert _snap_any_completed(snap_running) is False
+
+
+# ── _run_orphan_io / OrphanIoSnapshot ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_orphan_external_io_gather_result_bundle(mocker):
+    """_run_orphan_io() bundles all four external I/O calls into an
+    OrphanIoSnapshot with the correct field values.
+
+    Acceptance gate: exercises the extracted production function, not just
+    the dataclass — verifies PR-state lookup and spot-preemption outcomes
+    are wired into the returned snapshot.
+    """
+    from app.reaper_orphan_io import OrphanIoSnapshot, _run_orphan_io
+    from datetime import datetime, timezone
+
+    # ── task / fresh_task stubs ──────────────────────────────────────────
+    class _Task:
+        id = "task-abc"
+        project_id = "proj-1"
+        context = {}
+        first_payload = {"type": "create"}
+        vm_instance_id = None
+        vm_spot = False
+        last_heartbeat = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        started_at = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
+        status = "IN_PROGRESS"
+
+    task = _Task()
+    fresh_task = _Task()
+
+    # ── mock the DB-backed PR artifact check (no PR) ─────────────────────
+    mocker.patch(
+        "app.reaper_orphan_io._task_has_open_pr",
+        new=AsyncMock(return_value=(False, None)),
+    )
+
+    # ── mock the max_plan_pool deferred imports ───────────────────────────
+    mocker.patch(
+        "app.max_plan_pool.db_account_was_rate_limited",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.max_plan_pool.db_pool_wide_rate_limit_cooldown",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.max_plan_pool.get_task_llm_account_id",
+        return_value=None,
+    )
+    mocker.patch(
+        "app.max_plan_pool.get_task_rate_limit_scope",
+        return_value={},
+    )
+
+    session = object()  # not used for real DB calls in this path
+
+    snapshot = await _run_orphan_io(
+        task=task,
+        fresh_task=fresh_task,
+        reap_reason_code="heartbeat_timeout_post_claim",
+        is_provision_failure=False,
+        is_rate_limited=False,
+        is_dead_auth=False,
+        session=session,
+        runtime_config={},
+    )
+
+    assert isinstance(snapshot, OrphanIoSnapshot)
+    # Pre-IO status captured from fresh_task before any external call
+    assert snapshot.pre_io_status == "IN_PROGRESS"
+    assert snapshot.pre_io_last_hb == fresh_task.last_heartbeat
+    # No spot VM, no preemption
+    assert snapshot.is_spot_preemption is False
+    # No rate-limit signal — remains False
+    assert snapshot.is_rate_limited is False
+    # No PR artifact — GH lookup skipped
+    assert snapshot.has_pr_artifact is False
+    assert snapshot.pr_num is None
+    assert snapshot.gh_pr_state is None
+    assert snapshot.gh_pr_merged is False
+    # No provision failure — serial capture skipped
+    assert snapshot.io_serial_log is None
+    assert snapshot.io_prov_zone is None

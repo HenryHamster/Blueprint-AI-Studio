@@ -1694,6 +1694,9 @@ async def test_reaper_infra_provision_failure_no_retry_budget_burn(reaper_db, mo
     mocker.patch(
         "app.reaper.get_provision_error", return_value="quota exceeded for region"
     )
+    mocker.patch(
+        "app.reaper_orphan_io.get_provision_error", return_value="quota exceeded for region"
+    )
     mocker.patch("app.reaper.any_zone_available", return_value=True)
     mocker.patch("app.reaper.soonest_zone_recovery", return_value=None)
     mocker.patch("app.reaper.record_zone_failure")
@@ -2032,12 +2035,13 @@ async def test_reaper_rate_limit_disable_account_model_retry_succeeds(
 
 
 def _make_sqlite_compat_asl(real_asl, project_id, blocked_id_str):
-    """Return a replacement for AsyncSessionLocal that works around SQLite's lack
-    of JSONB @> operator.  The first call returns the real session (main reaper
-    session); subsequent calls return a proxy that executes a plain QUEUED-tasks
-    query and filters depends_on in Python instead of using @>."""
+    """Return (main_asl, dep_asl) to work around SQLite's lack of JSONB @>.
 
-    call_count = 0
+    main_asl: always returns a real unmodified session (for app.reaper).
+    dep_asl: wraps every session in a proxy that replaces the @> query with
+    Python-level filtering (for app.reaper_post_orphan_sweep, which owns
+    the dep-unblocking ASL call after the orphan-I/O extraction).
+    """
 
     class _DepSessionProxy:
         """Wraps a real session but replaces the @> query with Python filtering."""
@@ -2078,16 +2082,15 @@ def _make_sqlite_compat_asl(real_asl, project_id, blocked_id_str):
         async def __aexit__(self, *args):
             return await self._inner.__aexit__(*args)
 
-    class _SmartASL:
+    class _MainASL:
         def __call__(self):
-            nonlocal call_count
-            call_count += 1
-            real_cm = real_asl()
-            if call_count == 1:
-                return real_cm  # main session: use real session unchanged
-            return _DepSessionProxy(real_cm)  # dep session: Python-level filter
+            return real_asl()
 
-    return _SmartASL()
+    class _DepOnlyASL:
+        def __call__(self):
+            return _DepSessionProxy(real_asl())
+
+    return _MainASL(), _DepOnlyASL()
 
 
 @pytest.mark.asyncio
@@ -2129,15 +2132,18 @@ async def test_reaper_unblocks_dependent_tasks_on_terminal_failure(reaper_db, mo
     await reaper_db.refresh(waiting_task)
 
     # SQLite does not support the JSONB @> operator used in the dep-unblocking
-    # query.  Patch AsyncSessionLocal so the dep_session uses Python-level filtering.
+    # query.  Patch both ASLs: app.reaper uses the real session; the dep-session
+    # is now opened in app.reaper_post_orphan_sweep (after the orphan-I/O
+    # extraction) and needs the Python-level filter proxy.
     import app.reaper as _reaper_mod
 
-    compat_asl = _make_sqlite_compat_asl(
+    main_asl, dep_asl = _make_sqlite_compat_asl(
         _reaper_mod.AsyncSessionLocal,
         project.id,
         str(failed_task.id),
     )
-    mocker.patch("app.reaper.AsyncSessionLocal", compat_asl)
+    mocker.patch("app.reaper.AsyncSessionLocal", main_asl)
+    mocker.patch("app.reaper_post_orphan_sweep.AsyncSessionLocal", dep_asl)
 
     try:
         await reaper_service()

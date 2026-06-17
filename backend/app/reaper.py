@@ -49,9 +49,7 @@ from app.models import (
 from app.compute import (
     get_provision_error,
     record_zone_failure,
-    _capture_serial_for_vm,
     get_vm_zone,
-    get_vm_status,
     INFRA_PROVISION_PATTERNS,
     any_zone_available,
     soonest_zone_recovery,
@@ -83,6 +81,7 @@ from app.time_utils import (
     set_retry_after,
 )
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
+from app.reaper_post_orphan_sweep import run_post_orphan_sweep
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +137,7 @@ _reaper_last_progress: datetime | None = None
 REAPER_HANG_SECONDS = float(os.getenv("REAPER_HANG_SECONDS", "300"))
 
 
-from app.reaper_halt import (  # noqa: E402
+from app.reaper_halt import (
     _REAPER_CYCLE_HALT_THRESHOLD,
     _REAPER_HALF_OPEN_PROBE_LIMIT,
     _reaper_halt_state,
@@ -179,28 +178,29 @@ _REAPER_MAX_ORPHANS_PER_CYCLE_DEFAULT = 60
 _REAPER_ORPHAN_LOOP_TIME_BUDGET_DEFAULT = 180.0
 
 
-from app.reaper_orphan_classify import (  # noqa: E402
+from app.reaper_orphan_classify import (
     _ORPHAN_PRIORITY_RATE_LIMITED,  # noqa: F401
     _ORPHAN_PRIORITY_SPOT,  # noqa: F401
     _ORPHAN_PRIORITY_PROVISION,  # noqa: F401
     _ORPHAN_PRIORITY_DEFAULT,  # noqa: F401
     _orphan_priority_key,  # noqa: F401
-    _select_orphans_for_cycle,  # noqa: F401
+    _select_orphans_for_cycle,
     _vm_contact_within_cutoff,  # noqa: F401
     _vm_tool_use_within_cutoff,  # noqa: F401
-    _classify_orphan,  # noqa: F401
+    _classify_orphan,
     _HEARTBEAT_STALE_DEFAULTS,  # noqa: F401
     _HEARTBEAT_EFFORT_FLOORS,  # noqa: F401
     _PRECLAIM_STALE_DEFAULTS,  # noqa: F401
     _PROGRESS_STALE_DEFAULTS,  # noqa: F401
     _THINKING_HEAVY_TASK_TYPES,  # noqa: F401
     _THINKING_HEAVY_PROGRESS_STALE_SECONDS,  # noqa: F401
-    _progress_stale_cutoff,  # noqa: F401
+    _progress_stale_cutoff,
     _preclaim_stale_cutoff,  # noqa: F401
-    _heartbeat_stale_cutoff,  # noqa: F401
-    _extract_tool_trace_tail,  # noqa: F401
+    _heartbeat_stale_cutoff,
+    _extract_tool_trace_tail,
     _task_has_open_pr,  # noqa: F401
 )
+from app.reaper_orphan_io import _run_orphan_io
 
 
 _TRANSIENT_5XX_PATTERNS = frozenset(
@@ -226,8 +226,8 @@ _BATCH = 5000
 from app.retry_prompt import _copy_analysis_artifacts_to_previous  # noqa: E402, F401, RUF100
 
 
-from app.reaper_evaluating_sweeps import sweep_evaluating_parents  # noqa: E402
-from app.reaper_sweeps import (  # noqa: E402
+from app.reaper_evaluating_sweeps import sweep_evaluating_parents
+from app.reaper_sweeps import (
     sweep_queued_age_alerts,
     sweep_stalled_strategic_cycles,
     sweep_regression_scan,
@@ -298,21 +298,12 @@ async def reaper_service():
     # Deferred imports to avoid circular dependency with app.main
     from app.max_plan_pool import (
         clear_task_llm_runtime_context,
-        db_account_was_rate_limited,
-        db_pool_wide_rate_limit_cooldown,
-        disable_account_model,
-        disable_account_for_auth,
         get_task_llm_account_id,
-        get_task_rate_limit_scope,
-        _extract_task_model,
         release_max_plan_account,
     )
-    from app.vm_lifecycle import _ensure_vm_deleted
     from app.alert_dispatch import _maybe_create_failure_alert
     from app.routers.agent_status import record_task_result
     from app.broadcast import broadcast_to_project
-    from app.task_lifecycle import _requeue_parent_task
-    from app.rollup_management import _check_and_trigger_rollup
 
     consecutive_errors = 0
     while True:
@@ -1061,300 +1052,31 @@ async def reaper_service():
                         # unlocked. We re-acquire FOR UPDATE briefly after this block
                         # to apply the resulting mutations.
                         # ──────────────────────────────────────────────────────────
-
-                        # Capture pre-IO snapshot so the relock below can detect peer
-                        # mutation during the unlocked window. status + last_heartbeat
-                        # are the two fields the heartbeat path writes; an advance in
-                        # either signals the agent revived and the reap should be aborted.
-                        pre_io_status = fresh_task.status
-                        pre_io_last_hb = fresh_task.last_heartbeat
-
-                        # 1. Spot preemption check (GCP API)
-                        is_spot_preemption = False
-                        prov_zone_for_status: str | None = None
-                        io_vm_status: str | None = None
-                        io_orch_delete_info: tuple[bool, str] = (False, "")
-                        if (
-                            getattr(fresh_task, "vm_spot", False)
-                            and fresh_task.vm_instance_id
-                            and reap_reason_code
-                            in (
-                                "heartbeat_timeout_post_claim",
-                                "provision_timeout_pre_claim",
-                                # absolute_timeout: a PROVISIONING task that aged past
-                                # the 15-min absolute ceiling before earlier reaper
-                                # codes had a chance to classify it (typically because
-                                # the reaper itself was lagging — e.g., 2026-05-07
-                                # MissingGreenlet crash on last_tool_use_at). Without
-                                # this branch, the spot check is skipped and the
-                                # account gets blacklisted for what's actually a GCE
-                                # capacity issue.
-                                "absolute_timeout",
-                            )
-                        ):
-                            prov_zone_for_status = (task.context or {}).get(
-                                "provision_zone"
-                            ) or get_vm_zone(fresh_task.vm_instance_id)
-                            if prov_zone_for_status:
-                                try:
-                                    io_vm_status = await asyncio.to_thread(
-                                        get_vm_status,
-                                        fresh_task.vm_instance_id,
-                                        prov_zone_for_status,
-                                    )
-                                    # TERMINATED = preempted by GCP. DELETED = already gone.
-                                    # DELETED is ambiguous: GCP delete-on-preempt OR orchestrator-
-                                    # initiated cleanup (agent_completion, terminal_transition,
-                                    # admin_requeue, etc). Production 2026-05-04: reaper misclassified
-                                    # orchestrator-deleted VMs as preemptions, inflating
-                                    # spot_preemption_count for tasks that were really completed
-                                    # but whose status POST 500'd during a cutover.
-                                    # Fix: consult the orchestrator-initiated-delete tracker. If the
-                                    # VM was deleted by us within the last 30min, it's NOT a preemption.
-                                    from app.vm_lifecycle import (
-                                        is_orchestrator_initiated_delete,
-                                    )
-
-                                    io_orch_delete_info = (
-                                        is_orchestrator_initiated_delete(
-                                            fresh_task.vm_instance_id
-                                        )
-                                    )
-                                    if io_orch_delete_info[0]:
-                                        logger.info(
-                                            f"[REAPER] Task {task.id} on SPOT VM {fresh_task.vm_instance_id} "
-                                            f"vm_status={io_vm_status} but orchestrator-initiated delete "
-                                            f"(reason={io_orch_delete_info[1]}) — NOT classifying as preemption"
-                                        )
-                                    elif io_vm_status in ("TERMINATED", "DELETED"):
-                                        is_spot_preemption = True
-                                        logger.warning(
-                                            f"[REAPER] Task {task.id} on SPOT VM {fresh_task.vm_instance_id} "
-                                            f"in {prov_zone_for_status} — vm_status={io_vm_status}, treating "
-                                            f"as preemption (skipping attempt_count++)"
-                                        )
-                                except Exception as e:  # noqa: BLE001
-                                    logger.debug(
-                                        f"[REAPER] get_vm_status failed for {fresh_task.vm_instance_id}: {e}"
-                                    )
-
-                        # 1.5. Durable DB rate-limit check (cross-instance fallback).
-                        # The in-memory classify_failure above consults only
-                        # _account_was_rate_limited (same-process cache). When the
-                        # cooldown was recorded on a different Cloud Run instance or
-                        # before a restart, the cache is empty and the task would be
-                        # silently misclassified CODE_ERROR. Augment the flag with
-                        # durable DB state before the account-disable I/O step so all
-                        # reaper deaths get the same cross-instance treatment that
-                        # agent_status.py already applies on the agent-reported path.
-                        # Skip DB rate-limit fallback when dead-auth is already
-                        # confirmed — the account needs a hard-disable, not a cooldown.
-                        if (
-                            not is_rate_limited
-                            and not is_dead_auth
-                            and not is_spot_preemption
-                        ):
-                            _db_rl_acct = get_task_llm_account_id(fresh_task)
-                            _at_time_rl = (
-                                fresh_task.last_heartbeat or fresh_task.started_at
-                            )
-                            _db_rl_scope = get_task_rate_limit_scope(fresh_task)
-                            if _db_rl_acct:
-                                if await db_account_was_rate_limited(
-                                    _db_rl_acct, at_time=_at_time_rl
-                                ):
-                                    is_rate_limited = True
-                                    logger.info(
-                                        "[REAPER] Task %s reclassified RATE_LIMIT via "
-                                        "durable DB state (account=%s) — in-memory cache missed",
-                                        fresh_task.id,
-                                        _db_rl_acct,
-                                    )
-                            elif await db_pool_wide_rate_limit_cooldown(
-                                at_time=_at_time_rl,
-                                providers=_db_rl_scope.get("providers"),
-                                model=_db_rl_scope.get("model"),
-                                user_id=_db_rl_scope.get("user_id"),
-                            ):
-                                is_rate_limited = True
-                                logger.info(
-                                    "[REAPER] Task %s (no account) reclassified RATE_LIMIT "
-                                    "via pool-wide DB state — pool was fully blocked at failure time",
-                                    fresh_task.id,
-                                )
-
-                        # 2. Rate-limited account-disable I/O (called only when is_rate_limited
-                        #    AND not is_spot_preemption; mirrors the original elif chain where
-                        #    the rate-limited branch was skipped if spot preempt fired first).
-                        #    Side-effect-only — disables the account/model in the in-memory pool
-                        #    + persists to DB via its own internal session.
-                        rl_acct_id: str | None = None
-                        rl_model: str | None = None
-                        if is_rate_limited and not is_spot_preemption:
-                            rl_acct_id = get_task_llm_account_id(task)
-                            logger.info(
-                                f"[REAPER] Task {task.id} rate-limited (account={rl_acct_id}) — "
-                                f"requeuing immediately with account blacklisted"
-                            )
-                            # Disable the exhausted model on the account so the orchestrator's
-                            # blacklist pruning preserves this entry on the next dispatch cycle.
-                            rl_model = _extract_task_model(task)
-                            if not rl_model:
-                                _rl_task_type = (task.first_payload or {}).get(
-                                    "type", "create"
-                                )
-                                rl_model = _runtime_config.get(
-                                    "task_type_models", {}
-                                ).get(_rl_task_type)
-                            if rl_acct_id and rl_model:
-                                _reaper_ctx_io = task.context or {}
-                                _reaper_kwargs_io = {
-                                    "retry_after_seconds": _reaper_ctx_io.get(
-                                        "rate_limit_retry_after_seconds"
-                                    ),
-                                    "kind": _reaper_ctx_io.get("rate_limit_kind")
-                                    or "rate_limit",
-                                }
-                                try:
-                                    await disable_account_model(
-                                        rl_acct_id, rl_model, **_reaper_kwargs_io
-                                    )
-                                except Exception as _disable_err:  # noqa: BLE001
-                                    logger.warning(
-                                        f"[REAPER] disable_account_model failed for {rl_acct_id}/{rl_model}: "
-                                        f"{_disable_err}; retrying in 1s"
-                                    )
-                                    await asyncio.sleep(1)
-                                    try:
-                                        await disable_account_model(
-                                            rl_acct_id, rl_model, **_reaper_kwargs_io
-                                        )
-                                    except Exception as _disable_err2:  # noqa: BLE001
-                                        logger.error(  # noqa: TRY400
-                                            f"[REAPER] disable_account_model retry also failed for "
-                                            f"{rl_acct_id}/{rl_model}: {_disable_err2}. "
-                                            "Account remains active in pool — tight re-selection loop risk."
-                                        )
-
-                        # 2b. Dead-auth account hard-disable I/O.
-                        # Called only when is_dead_auth AND not is_spot_preemption.
-                        # Uses disable_account_for_auth (permanent hard-disable, no
-                        # auto-recover) rather than disable_account_model (cooldown).
-                        da_acct_id: str | None = None
-                        if is_dead_auth and not is_spot_preemption:
-                            da_acct_id = get_task_llm_account_id(task)
-                            if da_acct_id:
-                                _da_pattern = (task.context or {}).get(
-                                    "dead_auth_matched_pattern", "dead_oauth_session"
-                                )
-                                _da_reason = f"dead-auth: {_da_pattern}"
-                                logger.warning(
-                                    "[REAPER] Task %s dead-auth (account=%s pattern=%r) — "
-                                    "hard-disabling account fleet-wide; requeuing onto different account",
-                                    task.id,
-                                    da_acct_id,
-                                    _da_pattern,
-                                )
-                                try:
-                                    await disable_account_for_auth(
-                                        da_acct_id, _da_reason
-                                    )
-                                except Exception as _da_err:  # noqa: BLE001
-                                    logger.warning(
-                                        "[REAPER] disable_account_for_auth failed for %s: %s; retrying in 1s",
-                                        da_acct_id,
-                                        _da_err,
-                                    )
-                                    await asyncio.sleep(1)
-                                    try:
-                                        await disable_account_for_auth(
-                                            da_acct_id, _da_reason
-                                        )
-                                    except Exception as _da_err2:  # noqa: BLE001
-                                        logger.error(  # noqa: TRY400
-                                            "[REAPER] disable_account_for_auth retry also failed for %s: %s. "
-                                            "Account remains active — dead-auth re-selection risk.",
-                                            da_acct_id,
-                                            _da_err2,
-                                        )
-
-                        # 3. Provision-failure serial capture I/O (GCP serial console).
-                        # Run unconditionally on provision failures: the spot-preempt
-                        # branch falls through to the provision-failure mutation block
-                        # below (which uses io_serial_log), so we need the capture
-                        # whenever is_provision_failure regardless of spot/rate-limit
-                        # branch. Tiny perf cost when spot/rate fast-paths skip the
-                        # mutation block, but avoids re-introducing the held-lock-during-IO
-                        # bug as a fallback path.
-                        io_serial_log: str | None = None
-                        io_prov_zone: str | None = None
-                        io_provision_err: str | None = None
-                        if is_provision_failure:
-                            # Resolve zone (in-memory cache + persisted fallback). The two
-                            # values prov_zone and provision_err are stable post-fail; reading
-                            # them while unlocked is safe — no peer mutates them.
-                            if fresh_task.vm_instance_id:
-                                cached = get_vm_zone(fresh_task.vm_instance_id)
-                                if cached and cached != "unknown":
-                                    io_prov_zone = cached
-                            if not io_prov_zone:
-                                io_prov_zone = (task.context or {}).get(
-                                    "provision_zone"
-                                )
-                            io_provision_err = get_provision_error(
-                                fresh_task.vm_instance_id or ""
-                            )
-                            if io_prov_zone and fresh_task.vm_instance_id:
-                                try:
-                                    io_serial_log = await asyncio.to_thread(
-                                        _capture_serial_for_vm,
-                                        fresh_task.vm_instance_id,
-                                        io_prov_zone,
-                                    )
-                                    if io_serial_log:
-                                        logger.warning(
-                                            f"[REAPER] Serial log for dying agent {fresh_task.vm_instance_id} "
-                                            f"(task {task.id}):\n{io_serial_log}"
-                                        )
-                                except Exception:
-                                    logger.exception(
-                                        f"[REAPER] Failed to capture serial log for VM {fresh_task.vm_instance_id}"
-                                    )
-
-                        # 4. PR-state lookup I/O (GitHub API)
-                        _has_pr_artifact, _pr_num = await _task_has_open_pr(
-                            task, session
+                        _io = await _run_orphan_io(
+                            task=task,
+                            fresh_task=fresh_task,
+                            reap_reason_code=reap_reason_code,
+                            is_provision_failure=is_provision_failure,
+                            is_rate_limited=is_rate_limited,
+                            is_dead_auth=is_dead_auth,
+                            session=session,
+                            runtime_config=_runtime_config,
                         )
-                        io_gh_pr_state: str | None = None
-                        io_gh_pr_merged: bool = False
-                        io_gh_pr_base_branch: str | None = None
-                        if _has_pr_artifact and _pr_num:
-                            try:
-                                from app.routers.agent import get_github_token_for_task
-                                from app.github import get_pull_request
-
-                                (
-                                    _gh_token,
-                                    _gh_owner,
-                                    _gh_repo,
-                                ) = await get_github_token_for_task(task.id, session)
-                                _pr_data = await get_pull_request(
-                                    _gh_token, _gh_owner, _gh_repo, _pr_num
-                                )
-                                io_gh_pr_state = _pr_data.get("state")
-                                io_gh_pr_merged = bool(_pr_data.get("merged"))
-                                io_gh_pr_base_branch = (_pr_data.get("base") or {}).get(
-                                    "ref"
-                                )
-                            except Exception as _gh_exc:  # noqa: BLE001
-                                # GH API unreachable: fall back to "open" — handing off
-                                # to review pipeline is the safer default.
-                                logger.warning(
-                                    f"[REAPER] PR-state lookup failed for task {task.id} PR #{_pr_num}: "
-                                    f"{type(_gh_exc).__name__}: {_gh_exc} — assuming open",
-                                    exc_info=True,
-                                )
-                                io_gh_pr_state = "open"
+                        pre_io_status = _io.pre_io_status
+                        pre_io_last_hb = _io.pre_io_last_hb
+                        is_spot_preemption = _io.is_spot_preemption
+                        is_rate_limited = _io.is_rate_limited
+                        rl_acct_id = _io.rl_acct_id
+                        rl_model = _io.rl_model
+                        da_acct_id = _io.da_acct_id
+                        io_serial_log = _io.io_serial_log
+                        io_prov_zone = _io.io_prov_zone
+                        io_provision_err = _io.io_provision_err
+                        _has_pr_artifact = _io.has_pr_artifact
+                        _pr_num = _io.pr_num
+                        io_gh_pr_state = _io.gh_pr_state
+                        io_gh_pr_merged = _io.gh_pr_merged
+                        io_gh_pr_base_branch = _io.gh_pr_base_branch
 
                         # ── RE-ACQUIRE FOR UPDATE FOR MUTATIONS ──────────────────
                         # All external I/O above is done. Re-acquire the FOR UPDATE
@@ -1457,7 +1179,8 @@ async def reaper_service():
                                 "spot_preemption",
                                 task_id=str(task.id),
                                 vm_id=fresh_task.vm_instance_id,
-                                zone=prov_zone_for_status,
+                                zone=(task.context or {}).get("provision_zone")
+                                or get_vm_zone(fresh_task.vm_instance_id),
                             )
                         elif is_dead_auth:
                             # disable_account_for_auth (permanent hard-disable) was already
@@ -1779,7 +1502,7 @@ async def reaper_service():
                                 f"classifying landing"
                             )
                             _proj = await session.get(Project, task.project_id)
-                            from app.recovery_evaluating_helpers import (  # noqa: PLC0415
+                            from app.recovery_evaluating_helpers import (
                                 _apply_rollup_merge_classification,
                             )
 
@@ -1803,7 +1526,7 @@ async def reaper_service():
                                 non_merge_reason="merged_pr_non_integration_branch",
                             )
                             try:
-                                from app.task_completion import (  # noqa: PLC0415
+                                from app.task_completion import (
                                     _finalize_migration_reservation_after_merge,
                                 )
 
@@ -2587,270 +2310,16 @@ async def reaper_service():
                     await session.commit()
                     _orphan_commit_ok = True
 
-                if orphaned_tasks and _orphan_commit_ok:
-                    # Re-fetch fresh task state by id before the post-commit loops.
-                    # A per-task reap crash above triggers session.rollback() (2211),
-                    # which expires EVERY orphaned_tasks ORM object (rollback expires
-                    # regardless of expire_on_commit). Reading task.status/.context on
-                    # an expired object below drives a sync lazy-refresh on the
-                    # AsyncSession -> MissingGreenlet (see 1028-1036). Re-fetching by id
-                    # keeps every attribute access inside the async greenlet bridge and
-                    # reflects the committed (or rolled-back) state of each task.
-                    _post_reap_tasks: list[Task] = []
-                    for _post_id in _orphaned_task_ids:
-                        _refetched = await session.get(Task, _post_id)
-                        if _refetched is not None:
-                            _post_reap_tasks.append(_refetched)
-
-                    # Audit A8: now that the orphan-row lock is released, do the
-                    # slow parent-requeue work (child clone + dep remap). Heartbeats
-                    # on the parent task will go through fine since we only set
-                    # requeue_in_flight (a marker), not a row lock.
-                    for parent in _deferred_parent_requeues:
-                        # Heartbeat: parent requeue clones children + remaps deps
-                        # (multiple queries) per parent — keep the watchdog happy.
-                        _mark_reaper_progress()
-                        try:
-                            await _requeue_parent_task(parent, session)
-                        except (
-                            Exception
-                        ) as e:  # per-attempt try in deferred-requeue loop
-                            logger.error(
-                                f"[REAPER] Deferred parent requeue failed for {parent.id}: {e}",
-                                exc_info=True,
-                            )
-                            # C1: _requeue_parent_task commits internally; a
-                            # failure (IntegrityError on the cloned child) leaves
-                            # the shared session aborted, which would poison the
-                            # remaining requeues, the post-reap rollup loop, and
-                            # Steps 3-10. Roll back so each subsequent operation
-                            # starts on a clean session.
-                            with contextlib.suppress(Exception):
-                                await session.rollback()
-                        finally:
-                            # Always clear the in-flight marker so subsequent reaper
-                            # cycles can re-evaluate if requeue itself failed.
-                            parent.requeue_in_flight = False
-                            session.add(parent)
-                    if _deferred_parent_requeues:
-                        await session.commit()
-
-                    # Delete old VMs after commit (IDs captured before overwrite)
-                    for old_vm in _reaper_old_vms.values():
-                        # Heartbeat: each VM delete is a GCE API call.
-                        _mark_reaper_progress()
-                        await _ensure_vm_deleted(old_vm, reason="reaper")
-
-                    # Trigger rollup checks for failed tasks with parents (after commit)
-                    for task in _post_reap_tasks:
-                        # Heartbeat: _check_and_trigger_rollup hits GitHub per task.
-                        _mark_reaper_progress()
-                        if task.status == TaskStatus.FAILED and task.parent_task_id:
-                            try:
-                                # C3: pass the heartbeat so the per-child
-                                # _verify_pr_merged loop inside the rollup check
-                                # also heartbeats — a fan-heavy parent's PR-verify
-                                # round-trips cannot silently exhaust
-                                # REAPER_HANG_SECONDS on this loop either (mirrors
-                                # the stale-EVALUATING sweep at reaper.py:2789).
-                                await _check_and_trigger_rollup(
-                                    task, session, progress_cb=_mark_reaper_progress
-                                )
-                                # Completion-side warm-reuse: if that landing
-                                # completed the parent rollup, stamp the
-                                # _deps_satisfied marker on the dependents it just
-                                # unblocked so a polling warm VM can claim them
-                                # before tearing down cold (see helper docstring).
-                                await _mark_landed_parent_dependents(
-                                    task.parent_task_id, session
-                                )
-                            except Exception as e:
-                                logger.error(
-                                    f"[REAPER] Rollup check failed for task {task.id}: {e}",
-                                    exc_info=True,
-                                )
-                                # C1: _check_and_trigger_rollup runs FOR UPDATE
-                                # selects + commits that can raise on a DB error,
-                                # leaving the shared session aborted. Roll back so
-                                # the next task's rollup check (and Steps 3-10) do
-                                # not inherit a PendingRollback session.
-                                with contextlib.suppress(Exception):
-                                    await session.rollback()
-
-                    # Immediately unblock dependents of terminally failed tasks
-                    for task in _post_reap_tasks:
-                        # Heartbeat: per-task dependent-unblock opens its own session.
-                        _mark_reaper_progress()
-                        if task.status == TaskStatus.FAILED:
-                            try:
-                                async with AsyncSessionLocal() as dep_session:
-                                    dep_stmt = select(Task).where(
-                                        Task.project_id == task.project_id,
-                                        Task.status == TaskStatus.QUEUED,
-                                        Task.depends_on.contains([str(task.id)]),
-                                    )
-                                    dep_result = await dep_session.execute(dep_stmt)
-                                    waiting_tasks = dep_result.scalars().all()
-                                    count = 0
-                                    for wt in waiting_tasks:
-                                        wt.depends_on = [
-                                            d
-                                            for d in (wt.depends_on or [])
-                                            if d != str(task.id)
-                                        ]
-                                        dep_session.add(wt)
-                                        count += 1
-                                    if count:
-                                        await dep_session.commit()
-                                        logger.info(
-                                            f"[PIPELINE] Cleared terminal dependency {task.id} from {count} waiting tasks"
-                                        )
-                            except Exception as e:  # noqa: BLE001
-                                logger.warning(
-                                    f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}",
-                                    exc_info=True,
-                                )
-
-                    # C5: release the cross-cutting safeguard merge gate when a
-                    # reaper-terminated safeguard task FAILS. The gate is otherwise
-                    # released only on the security_audit COMPLETED branch, so a
-                    # reaped safeguard (orphan-timeout, retries exhausted) would
-                    # leave orig.requires_approval=True forever — a permanent
-                    # strand that services.py then 2h-timeout-FAILs into a healthy
-                    # parent. Each release runs in its OWN session (mirrors the
-                    # dependent-unblock loop above and reaper Step 9
-                    # sweep_stuck_qualifications) so a failure here cannot poison
-                    # the shared reaper session. _maybe_release_safeguard_gate
-                    # no-ops for non-safeguard tasks; findings=None → release
-                    # (a reaped safeguard produced no blocker).
-                    for task in _post_reap_tasks:
-                        _mark_reaper_progress()
-                        if task.status != TaskStatus.FAILED:
-                            continue
-                        _t_payload = task.first_payload if task.payloads else {}
-                        if _t_payload.get("type") != "security_audit":
-                            continue
-                        try:
-                            from app.task_completion import (
-                                _maybe_release_safeguard_gate,
-                            )
-
-                            async with AsyncSessionLocal() as _sg_session:
-                                _sg_task = await _sg_session.get(Task, task.id)
-                                if _sg_task is not None:
-                                    await _maybe_release_safeguard_gate(
-                                        _sg_task, None, _sg_session
-                                    )
-                        except Exception as _sg_exc:  # noqa: BLE001
-                            logger.warning(
-                                f"[SAFEGUARD] Failed to release gate on reaped "
-                                f"safeguard {task.id}: {_sg_exc}",
-                                exc_info=True,
-                            )
-
-                    # Close open PRs owned by terminally-failed fix tasks. When a
-                    # fix exhausts retries, its PR stays OPEN on GitHub, and
-                    # sibling tasks whose rollup waits on open PRs targeting the
-                    # same research branch block forever. Closing the dead PR
-                    # removes it from the sibling rollup-wait gate.
-                    for task in _post_reap_tasks:
-                        # Heartbeat: closing a dead PR is a GitHub API call per task.
-                        _mark_reaper_progress()
-                        if task.status != TaskStatus.FAILED:
-                            continue
-                        payload = task.first_payload if task.payloads else {}
-                        if payload.get("type") != "fix":
-                            continue
-                        pr_number = (task.context or {}).get("review_loop", {}).get(
-                            "pr_number"
-                        ) or payload.get("pr_number")
-                        if not pr_number:
-                            continue
-                        # Skip closing rollup PRs (branch=staging prefix). A
-                        # rollup PR represents many tasks' worth of merged work;
-                        # closing it discards the whole body. Better to leave the
-                        # rollup open for human follow-up than to throw away N
-                        # children's successfully-merged contributions for a
-                        # single fix task that exhausted retries. Match the FULL
-                        # set of per-project staging prefixes, not just research/.
-                        branch = payload.get("branch", "")
-                        _proj = await session.get(Project, task.project_id)
-                        if _proj is not None and _proj.is_staging_branch(branch):
-                            logger.warning(
-                                f"[REAPER] Skip closing rollup PR #{pr_number} "
-                                f"(branch={branch}, fix task {task.id}) — "
-                                f"closing would discard the rollup body"
-                            )
-                            continue
-                        # Infra-recovery guard: do NOT close PRs for fix tasks that
-                        # failed due to transient infrastructure (AGENT_TIMEOUT, VM
-                        # preemption, etc.) while the review-loop still has iteration
-                        # budget.  The code on the PR is valid — the agent may never
-                        # have run.  Leave the PR open so the eval-sweep reaped-owner
-                        # reconcile (recovery_evaluating.py) or the resurrection sweep
-                        # can re-drive the chain.  Only close for genuine merit/code
-                        # failures or when iteration budget is truly exhausted.
-                        # Sibling chokepoints that are failure-class-blind (rollup-wait
-                        # gate in rollup_management.py ~2031, _resolve_terminal_parent_
-                        # verdict in task_lifecycle_requeue.py, review cap handler) are
-                        # tracked as follow-up work — they require broader DB queries
-                        # and separate review to fix safely.
-                        from app.failure_classification import (
-                            is_recoverable_infra_terminal,
-                        )
-
-                        if is_recoverable_infra_terminal(task):
-                            logger.info(
-                                f"[PIPELINE] Preserving PR #{pr_number} for infra-reaped "
-                                f"fix task {task.id} — review-loop budget remains, "
-                                f"skipping close so eval-sweep can re-drive the chain"
-                            )
-                            continue
-                        try:
-                            from app.routers.agent import get_github_token_for_task
-                            from app.github import close_pull_request, create_pr_comment
-
-                            gh_token, owner, repo = await get_github_token_for_task(
-                                task.id, session
-                            )
-                            reason = (
-                                task.latest_status_message
-                                or "fix task reached terminal failure"
-                            )
-                            try:
-                                await create_pr_comment(
-                                    gh_token,
-                                    owner,
-                                    repo,
-                                    int(pr_number),
-                                    f":warning: Abandoning this PR — fix task `{str(task.id)[:8]}` reached terminal failure.\n\n"
-                                    f"{reason[:400]}\n\n"
-                                    f"Closing so sibling rollups aren't blocked waiting for this branch.",
-                                )
-                            except Exception as ce:  # noqa: BLE001
-                                logger.warning(
-                                    f"[PIPELINE] Failed to comment on dead PR #{pr_number}: {ce}"
-                                )
-                            closed = await close_pull_request(
-                                gh_token,
-                                owner,
-                                repo,
-                                int(pr_number),
-                                project_id=str(task.project_id),
-                            )
-                            if closed:
-                                logger.info(
-                                    f"[PIPELINE] Closed PR #{pr_number} after fix task {task.id} terminal-failed"
-                                )
-                            else:
-                                logger.warning(
-                                    f"[PIPELINE] close_pull_request returned False for PR #{pr_number}"
-                                )
-                        except Exception as e:  # noqa: BLE001
-                            logger.warning(
-                                f"[PIPELINE] Failed to close PR for failed fix task {task.id}: {e}",
-                                exc_info=True,
-                            )
+                await run_post_orphan_sweep(
+                    session,
+                    orphaned_tasks,
+                    orphan_commit_ok=_orphan_commit_ok,
+                    orphaned_task_ids=_orphaned_task_ids,
+                    deferred_parent_requeues=_deferred_parent_requeues,
+                    reaper_old_vms=_reaper_old_vms,
+                    progress_cb=_mark_reaper_progress,
+                    landed_cb=_mark_landed_parent_dependents,
+                )
 
                 # Steps 3+4: Sweep stale EVALUATING parents (rollup re-trigger)
                 # and rescue all-children-failed EVALUATING parents. Extracted to
