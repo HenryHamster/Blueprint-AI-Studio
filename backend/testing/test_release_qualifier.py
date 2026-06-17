@@ -21579,6 +21579,13 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     latest last_qualification overwrite."""
     import uuid
 
+    _theme_cert = {
+        "theme_class": "leanness",
+        "assessed_grade": 0.0,
+        "net_loc": 120,
+        "directional_contradiction": True,
+        "state": "blocked",
+    }
     verdict = QualificationVerdict(
         project_id=uuid.uuid4(),
         release_version_id=uuid.uuid4(),
@@ -21618,6 +21625,7 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         promotion_pr_url="https://example.com/pr/7",
         promotion_conflict=True,
         promotion_error_detail="merge conflict",
+        theme_delivery=_theme_cert,
     )
 
     out = rq.format_verdict_for_api(verdict)
@@ -21640,6 +21648,23 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     assert out["promotion_pr_url"] == "https://example.com/pr/7"
     assert out["promotion_conflict"] is True
     assert out["promotion_error_detail"] == "merge conflict"
+    # Theme-delivery cert surfaces from migration-0305 column.
+    assert out["theme_delivery"] == _theme_cert
+    # Legacy rows (no theme_delivery set) must return None, not raise.
+    verdict_legacy = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="legacy",
+        confidence=0.9,
+        blocker=None,
+        audit_missing_reason=None,
+        would_promote=True,
+        promotion_enabled=True,
+        terminal_status="promoted",
+        threshold=0.8,
+    )
+    out_legacy = rq.format_verdict_for_api(verdict_legacy)
+    assert out_legacy["theme_delivery"] is None
 
 
 def test_format_verdict_for_api_surfaces_acceptance_window_signal_without_changing_composite():

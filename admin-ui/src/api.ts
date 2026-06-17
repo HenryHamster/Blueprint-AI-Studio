@@ -1608,6 +1608,14 @@ export interface AuditReconciliation {
   excluded_findings_count: number;
 }
 
+export interface ThemeDeliveryCert {
+  theme_class?: string | null;
+  assessed_grade?: number | null;
+  net_loc?: number | null;
+  directional_contradiction?: boolean | null;
+  state?: string | null;
+}
+
 export interface AuditFinding {
   severity: string;
   summary: string;
@@ -1676,6 +1684,7 @@ export interface VersionQualification {
   promotion_pr_url?: string | null;
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
+  theme_delivery?: ThemeDeliveryCert | null;
 }
 
 /** Single resolved serving block — the canonical answer to "is this version live?"
@@ -2254,6 +2263,7 @@ export interface QualificationVerdictRecord {
   promotion_pr_url?: string | null;
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
+  theme_delivery?: ThemeDeliveryCert | null;
 }
 
 export interface QualificationVerdictsInfraContext {
