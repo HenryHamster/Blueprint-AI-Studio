@@ -4447,3 +4447,29 @@ async def test_invalidate_repo_installation_token_forces_remint(mocker):
     assert len(mint_calls) == 2, "invalidation must force a re-mint"
 
     gh_auth._repo_installation_token_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_get_open_pull_requests_paginates(mocker):
+    """get_open_pull_requests follows pagination and returns PRs beyond page 1."""
+    page1 = [{"number": i} for i in range(1, 101)]  # 100 PRs — full page
+    page2 = [{"number": i} for i in range(101, 111)]  # 10 PRs — short page (last)
+
+    call_pages = []
+
+    async def _fake_request(method, url, headers, params=None, **kwargs):
+        page = int((params or {}).get("page", 1))
+        call_pages.append(page)
+        batch = page1 if page == 1 else page2
+        return MockResponse(200, batch)
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+
+    from app.github_pulls import get_open_pull_requests
+
+    result = await get_open_pull_requests("token", "owner", "repo", base="main")
+
+    assert len(result) == 110, f"expected 110 PRs, got {len(result)}"
+    assert result[0]["number"] == 1
+    assert result[109]["number"] == 110
+    assert call_pages == [1, 2], f"expected exactly 2 page requests, got {call_pages}"
