@@ -6379,6 +6379,68 @@ class TestCrossBaseDependencyGate:
         assert eligible == "eligible"
 
     @pytest.mark.asyncio
+    async def test_compute_experiment_same_base_eligible_after_pr_merged(
+        self, db_session
+    ):
+        """A compute_experiment depending on a same-plan-branch create dep is
+        eligible once the create is COMPLETED with pr_merged — no
+        landed_on_integration required.
+
+        Regression guard: before the plan_completion fix, compute_experiment
+        payloads omitted base_branch, making them appear cross-base relative to
+        sibling create tasks. The dep resolver then required landed_on_integration
+        (a signal that never fires for plan-branch merges), permanently wedging
+        the compute subtask in QUEUED.
+        """
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = make_project(name="ComputeSameBase", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Both tasks share the same plan branch — same-base relationship.
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/xyz789"}],
+            context={"related_files": ["backend/app/search_agent.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        compute_task = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "base_branch": "plan/xyz789",
+                    "command": "python bench.py",
+                    "spend_cap_usd": 2.0,
+                    "deadline_seconds": 600,
+                }
+            ],
+            context={"related_files": ["backend/app/search_agent.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, compute_task])
+        await db_session.commit()
+
+        # Same-base create dep COMPLETED with PR merged → compute is eligible.
+        # _verify_true simulates pr_merged=True (a verifier that returns True).
+        result, _ = await _check_candidate_task_deps(
+            compute_task, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert result == "eligible", (
+            f"compute_experiment should be eligible after same-base dep PR merged, got {result!r}"
+        )
+
+        # Without PR merged (verifier returns False), same-base logic holds.
+        waiting, _ = await _check_candidate_task_deps(
+            compute_task, [dep], [dep.id], db_session, self._verify_false
+        )
+        assert waiting == "waiting", (
+            "compute_experiment must wait when same-base dep PR not yet merged"
+        )
+
+    @pytest.mark.asyncio
     async def test_terminally_failed_cross_base_code_dep_cascade_cancels(
         self, db_session
     ):

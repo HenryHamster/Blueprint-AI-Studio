@@ -1724,6 +1724,29 @@ async def _attach_repo_clone(
                     job.id,
                 )
                 return spec
+            # staging branches are deleted after the plan rolls up to integration.
+            # If the resolved ref is a staging branch that no longer exists, degrade
+            # to the project's integration/promotion branch where the code has landed.
+            if project.is_staging_branch(ref):
+                from app.github_refs import get_branch_sha
+
+                try:
+                    await get_branch_sha(
+                        token,
+                        str(project.github_owner),
+                        str(project.github_repo),
+                        ref,
+                    )
+                except Exception:
+                    fallback = getattr(project, "promotion_target", None) or "main"
+                    logger.info(
+                        "[COMPUTE_JOB] plan branch %r not found for job=%s; "
+                        "falling back to %r",
+                        ref,
+                        job.id,
+                        fallback,
+                    )
+                    ref = fallback
             spec.repo_clone = {
                 "owner": str(project.github_owner),
                 "repo": str(project.github_repo),

@@ -878,6 +878,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                     "command": compute_contract["command"],
                     "spend_cap_usd": float(compute_contract["spend_cap_usd"]),
                     "deadline_seconds": int(compute_contract["deadline_seconds"]),
+                    "base_branch": plan_branch,
                     **(
                         {"success_criterion": compute_contract["success_criterion"]}
                         if compute_contract.get("success_criterion") is not None

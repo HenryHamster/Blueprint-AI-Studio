@@ -9482,6 +9482,133 @@ async def test_attach_repo_clone_skips_when_project_has_no_repo(
     assert calls["n"] == 0
 
 
+@pytest.mark.asyncio
+async def test_attach_repo_clone_falls_back_on_deleted_plan_branch(
+    db_session, monkeypatch
+):
+    """When base_branch is a plan/* branch that no longer exists, _attach_repo_clone
+    degrades to the project's promotion_target instead of cloning a dead ref.
+
+    This covers compute_experiment tasks that were delayed past plan-branch cleanup:
+    the plan merged to integration, the plan/* branch was deleted, but the compute
+    job is only now launching.
+    """
+    project = Project(
+        name="plan-fallback",
+        user_id="u",
+        github_owner="octo",
+        github_repo="demo",
+        promotion_target="integration",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "plan/abc123"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    async def fake_token(_project, _session):
+        return "ghs_FAKE"
+
+    async def branch_not_found(_token, _owner, _repo, _branch):
+        raise Exception("404 branch not found")
+
+    monkeypatch.setattr("app.branch_cleanup._get_project_github_token", fake_token)
+    monkeypatch.setattr("app.github_refs.get_branch_sha", branch_not_found)
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    spec = await compute_jobs._attach_repo_clone(
+        session_factory, job, compute_jobs._build_launch_spec(job)
+    )
+    # Must degrade to promotion_target, not the deleted plan branch.
+    assert spec.repo_clone == {
+        "owner": "octo",
+        "repo": "demo",
+        "ref": "integration",
+    }
+    assert spec.repo_token == "ghs_FAKE"
+
+
+@pytest.mark.asyncio
+async def test_attach_repo_clone_uses_plan_branch_when_it_exists(
+    db_session, monkeypatch
+):
+    """When base_branch is a plan/* branch that still exists, use it directly."""
+    project = Project(
+        name="plan-exists",
+        user_id="u",
+        github_owner="octo",
+        github_repo="demo",
+        promotion_target="integration",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "plan/abc123"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    async def fake_token(_project, _session):
+        return "ghs_FAKE"
+
+    async def branch_exists(_token, _owner, _repo, _branch):
+        return "abc123sha"
+
+    monkeypatch.setattr("app.branch_cleanup._get_project_github_token", fake_token)
+    monkeypatch.setattr("app.github_refs.get_branch_sha", branch_exists)
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    spec = await compute_jobs._attach_repo_clone(
+        session_factory, job, compute_jobs._build_launch_spec(job)
+    )
+    # Branch exists — use it as-is.
+    assert spec.repo_clone == {
+        "owner": "octo",
+        "repo": "demo",
+        "ref": "plan/abc123",
+    }
+
+
 def test_parse_serial_status_extracts_release_echo():
     """_parse_serial_status decodes BLUEPRINT_COMPUTE_RELEASE_ECHO into echoed_release_sha."""
     sha = "abc123def456"

@@ -35,7 +35,9 @@ from testing.factories import make_project, make_task
 
 @pytest.fixture
 def _quiet_mocks(mocker):
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch("app.plan_completion.broadcast_to_project", new_callable=AsyncMock)
 
 
@@ -51,9 +53,7 @@ async def _setup_plan_task(db_session, mocker, subtasks_json, base_branch="main"
         project_id=project.id,
         title="Plan: test ordering",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[
-            {"type": "plan", "prompt": "do things", "base_branch": base_branch}
-        ],
+        payloads=[{"type": "plan", "prompt": "do things", "base_branch": base_branch}],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
     db_session.add(task)
@@ -104,11 +104,7 @@ async def test_depends_on_set_atomically_no_empty_window(
     await _handle_plan_completion(task, plan_logs, db_session)
 
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -162,11 +158,7 @@ async def test_three_step_chain_ordering_is_atomic(db_session, mocker, _quiet_mo
     await _handle_plan_completion(task, plan_logs, db_session)
 
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -215,11 +207,7 @@ async def test_history_records_created_in_same_transaction(
     await _handle_plan_completion(task, plan_logs, db_session)
 
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -264,11 +252,7 @@ async def test_no_dep_subtasks_all_have_empty_depends_on(
     await _handle_plan_completion(task, plan_logs, db_session)
 
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -313,11 +297,7 @@ async def test_file_overlap_deps_injected_atomically(db_session, mocker, _quiet_
     await _handle_plan_completion(task, plan_logs, db_session)
 
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -332,8 +312,7 @@ async def test_file_overlap_deps_injected_atomically(db_session, mocker, _quiet_
         f"First child should have no deps, got {first.depends_on!r}"
     )
     assert second.depends_on == [str(first.id)], (
-        f"Second child should depend on first (file overlap), "
-        f"got {second.depends_on!r}"
+        f"Second child should depend on first (file overlap), got {second.depends_on!r}"
     )
 
 
@@ -350,7 +329,15 @@ async def test_registry_eligible_subtype_is_honored_not_downgraded(
     PLAN_SUBTASK_TYPES, so each declared eligible type is spawned AS ITSELF.
     """
     plan_logs = json.dumps(
-        {"subtasks": [{"title": f"Step {eligible_type}", "prompt": "do it", "type": eligible_type}]}
+        {
+            "subtasks": [
+                {
+                    "title": f"Step {eligible_type}",
+                    "prompt": "do it",
+                    "type": eligible_type,
+                }
+            ]
+        }
     )
 
     task = await _setup_plan_task(db_session, mocker, plan_logs)
@@ -361,7 +348,9 @@ async def test_registry_eligible_subtype_is_honored_not_downgraded(
         .scalars()
         .all()
     )
-    assert len(children) == 1, f"Expected 1 child for {eligible_type}, got {len(children)}"
+    assert len(children) == 1, (
+        f"Expected 1 child for {eligible_type}, got {len(children)}"
+    )
     assert children[0].first_payload.get("type") == eligible_type, (
         f"Child should keep its declared eligible type {eligible_type!r}, "
         f"got {children[0].first_payload.get('type')!r}"
@@ -411,9 +400,7 @@ async def test_non_eligible_subtask_type_is_skipped_not_rewritten(
     assert coercion["original_type"] == "fix"
     assert coercion["coerced_type"] == "create"
     # No child is typed as research or fix.
-    assert not any(
-        c.first_payload.get("type") in {"research", "fix"} for c in children
-    )
+    assert not any(c.first_payload.get("type") in {"research", "fix"} for c in children)
 
 
 @pytest.mark.asyncio
@@ -462,11 +449,7 @@ async def test_dependent_on_skipped_producer_fails_plan(
 
     # No children should have been spawned.
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -546,7 +529,9 @@ async def test_knowledge_prereq_subtype_spawns_as_itself(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("knowledge_type", sorted(PLAN_KNOWLEDGE_SUBTASK_TYPES - {"compute_experiment"}))
+@pytest.mark.parametrize(
+    "knowledge_type", sorted(PLAN_KNOWLEDGE_SUBTASK_TYPES - {"compute_experiment"})
+)
 async def test_plan_knowledge_child_carries_finding_provenance(
     db_session, mocker, _quiet_mocks, knowledge_type
 ):
@@ -591,11 +576,7 @@ async def test_plan_knowledge_child_carries_finding_provenance(
     await _handle_plan_completion(task, plan_logs, db_session)
 
     child = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .one()
     )
@@ -753,7 +734,10 @@ async def test_compute_experiment_prereq_propagates_live_proof_contract(
                     "deadline_seconds": 600,
                     "live_proof": True,
                     "live_proof_marker": "plan-live-proof",
-                    "live_release_proof": {"enabled": True, "marker": "plan-live-proof"},
+                    "live_release_proof": {
+                        "enabled": True,
+                        "marker": "plan-live-proof",
+                    },
                     "live_release_proof_marker": "plan-live-proof",
                     "requires_live_release": True,
                 }
@@ -774,7 +758,10 @@ async def test_compute_experiment_prereq_propagates_live_proof_contract(
     assert payload["type"] == "compute_experiment"
     assert payload["live_proof"] is True
     assert payload["live_proof_marker"] == "plan-live-proof"
-    assert payload["live_release_proof"] == {"enabled": True, "marker": "plan-live-proof"}
+    assert payload["live_release_proof"] == {
+        "enabled": True,
+        "marker": "plan-live-proof",
+    }
     assert payload["live_release_proof_marker"] == "plan-live-proof"
     assert payload["requires_live_release"] is True
 
@@ -980,7 +967,9 @@ async def test_plan_exceeding_subtask_cap_fails_with_record(
 
     # Context must record dropped subtasks durably.
     cap_record = (task.context or {}).get("subtask_cap_exceeded")
-    assert cap_record, f"subtask_cap_exceeded must be recorded on task.context, got {cap_record!r}"
+    assert cap_record, (
+        f"subtask_cap_exceeded must be recorded on task.context, got {cap_record!r}"
+    )
     assert cap_record.get("total_subtasks") == 12, (
         f"Record must capture total subtask count, got {cap_record.get('total_subtasks')!r}"
     )
@@ -993,11 +982,7 @@ async def test_plan_exceeding_subtask_cap_fails_with_record(
 
     # No children should have been spawned.
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1085,11 +1070,7 @@ async def test_kept_subtask_depending_on_dropped_subtask_fails_plan(
 
     # No children should have been spawned.
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1215,11 +1196,7 @@ async def test_injection_cycle_drops_only_offending_edge_keeps_rest(
     await _handle_plan_completion(task, plan_logs, db_session)
 
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1236,9 +1213,7 @@ async def test_injection_cycle_drops_only_offending_edge_keeps_rest(
     )
 
     # Unrelated conflict-prevention edge D→C must be PRESERVED (not wholesale-dropped).
-    assert (c.depends_on or []) == [], (
-        f"C should have no deps, got {c.depends_on!r}"
-    )
+    assert (c.depends_on or []) == [], f"C should have no deps, got {c.depends_on!r}"
     assert d.depends_on == [str(c.id)], (
         f"Unrelated injected D→C must survive the cycle break, got {d.depends_on!r}"
     )
@@ -1247,9 +1222,9 @@ async def test_injection_cycle_drops_only_offending_edge_keeps_rest(
     await db_session.refresh(task)
     dropped = (task.context or {}).get("dropped_serialization_edges")
     assert dropped, f"Dropped edges must be recorded on task.context, got {dropped!r}"
-    assert any(
-        e["successor"] == "B" and e["predecessor"] == "A" for e in dropped
-    ), f"Dropped record must name the B→A edge, got {dropped!r}"
+    assert any(e["successor"] == "B" and e["predecessor"] == "A" for e in dropped), (
+        f"Dropped record must name the B→A edge, got {dropped!r}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1436,11 +1411,7 @@ async def test_plan_subtask_acceptance_evidence_propagates_to_child_context(
     await _handle_plan_completion(task, plan_logs, db_session)
 
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1465,11 +1436,7 @@ async def test_plan_subtask_absent_acceptance_evidence_is_noop(
     await _handle_plan_completion(task, plan_logs, db_session)
 
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1767,11 +1734,7 @@ async def test_plan_subtask_malformed_acceptance_evidence_is_dropped(
     await _handle_plan_completion(task, plan_logs, db_session)
 
     children = (
-        (
-            await db_session.execute(
-                select(Task).where(Task.parent_task_id == task.id)
-            )
-        )
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1823,7 +1786,9 @@ async def test_compute_experiment_subtask_carries_downstream_artifact_evidence(
     payload = child.first_payload or {}
     assert payload["type"] == "compute_experiment"
     child_evidence = payload.get("acceptance_evidence")
-    assert child_evidence is not None, "acceptance_evidence missing from compute_experiment payload"
+    assert child_evidence is not None, (
+        "acceptance_evidence missing from compute_experiment payload"
+    )
     assert child_evidence["kind"] == "downstream_artifact"
     assert child_evidence["artifact_id"] == "benchmark-result-bundle"
 
@@ -1885,11 +1850,7 @@ async def test_mislabeled_fresh_work_type_is_coerced_and_plan_spawns(
 async def test_fix_type_coerced_to_create(db_session, mocker, _quiet_mocks):
     """A subtask typed 'fix' is coerced to 'create' and spawns successfully."""
     plan_logs = json.dumps(
-        {
-            "subtasks": [
-                {"title": "Fix the bug", "prompt": "patch it", "type": "fix"}
-            ]
-        }
+        {"subtasks": [{"title": "Fix the bug", "prompt": "patch it", "type": "fix"}]}
     )
 
     task = await _setup_plan_task(db_session, mocker, plan_logs)
@@ -2098,3 +2059,73 @@ async def test_visual_evidence_propagates_through_decomposition(
     assert child_ev["kind"] == "visual"
     assert child_ev["component"] == "MetricsDashboard"
     assert child_ev["viewport_width"] == 1280
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression: compute_experiment subtasks must inherit plan_branch base_branch
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_subtask_inherits_plan_branch(
+    db_session, mocker, _quiet_mocks
+):
+    """A compute_experiment subtask spawned by plan completion must carry
+    base_branch == plan_branch in its payload.
+
+    Without this fix the field was absent, making the compute subtask appear
+    cross-base relative to sibling create tasks and permanently QUEUED waiting
+    on a landed_on_integration signal that never fires.
+    """
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Create the feature",
+                    "prompt": "implement the feature",
+                    "type": "create",
+                },
+                {
+                    "title": "Measure the result",
+                    "prompt": "benchmark the feature",
+                    "type": "compute_experiment",
+                    "command": "python bench.py",
+                    "spend_cap_usd": 2.0,
+                    "deadline_seconds": 600,
+                    "depends_on_indices": [0],
+                },
+            ]
+        }
+    )
+
+    task = await _setup_plan_task(
+        db_session, mocker, plan_logs, base_branch="plan/abc123"
+    )
+    await _handle_plan_completion(task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 2
+    by_title = {c.title: c for c in children}
+    create_child = by_title["Create the feature"]
+    compute_child = by_title["Measure the result"]
+
+    create_payload = create_child.first_payload or {}
+    compute_payload = compute_child.first_payload or {}
+
+    create_base = create_payload.get("base_branch")
+    assert create_base is not None, "create subtask must carry a base_branch"
+    assert create_base.startswith("plan/"), (
+        f"create subtask base_branch should be a plan/* branch, got {create_base!r}"
+    )
+    compute_base = compute_payload.get("base_branch")
+    assert compute_base is not None, (
+        "compute_experiment subtask must carry base_branch (was missing before the fix)"
+    )
+    assert compute_base == create_base, (
+        f"compute_experiment base_branch {compute_base!r} must match sibling create "
+        f"base_branch {create_base!r} so they are same-base in dep resolution"
+    )
