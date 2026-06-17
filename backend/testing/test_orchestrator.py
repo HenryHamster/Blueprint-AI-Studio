@@ -4027,7 +4027,7 @@ class TestWarmVMSkipProvision:
         )
         _orch_module._runtime_config["max_concurrent_vms"] = 0
         # Open the deadlock-scan throttle so the recovery runs this cycle.
-        _orch_module._last_deadlock_check = 0.0
+        _orch_module._last_deadlock_check = None
         prov_mock = mocker.patch(
             "app.orchestrator.provision_agent_vm",
             new_callable=AsyncMock,

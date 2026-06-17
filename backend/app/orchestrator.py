@@ -404,11 +404,11 @@ _last_post_commit_sweep: datetime = _utcnow()
 _last_sidecar_sweep: datetime = _utcnow()
 _last_bootstrap_recovery_sweep: datetime = _utcnow()
 _last_lane_baseline_backfill: datetime = _utcnow()
-_last_deadlock_check: float = 0.0
+_last_deadlock_check: datetime | None = None
 _last_zone_exhaustion_log: datetime | None = None
-_last_concurrency_broadcast: float = 0.0
-_last_type_throttle_broadcast: dict[str, float] = {}
-_last_type_unthrottle_broadcast: dict[str, float] = {}
+_last_concurrency_broadcast: datetime | None = None
+_last_type_throttle_broadcast: dict[str, datetime | None] = {}
+_last_type_unthrottle_broadcast: dict[str, datetime | None] = {}
 _previously_failing_types: set[str] = set()
 
 # No-CI merge gate: how many times a CRASHED verify_tests task (FAILED/CANCELLED,
@@ -2140,8 +2140,9 @@ async def orchestrator_worker():
                         )
                     ).scalar() or 0
                     global _last_concurrency_broadcast
-                    if (time.monotonic() - _last_concurrency_broadcast) > 60:
-                        _last_concurrency_broadcast = time.monotonic()
+                    now_broadcast = _utcnow()
+                    if _is_cadence_due(_last_concurrency_broadcast, 60, now_broadcast):
+                        _last_concurrency_broadcast = now_broadcast
                         try:
                             await ws_manager.broadcast_to_all(
                                 "pipeline_throttle",
@@ -2198,8 +2199,8 @@ async def orchestrator_worker():
                     # up until a slot frees, which under a long pause may be never.
                     # Honor the same 60s throttle as the in-dispatch deadlock scan.
                     global _last_deadlock_check
-                    _idle_now = time.time()
-                    if _idle_now - _last_deadlock_check > 60:
+                    _idle_now = _utcnow()
+                    if _is_cadence_due(_last_deadlock_check, 60, _idle_now):
                         _last_deadlock_check = _idle_now
                         try:
                             _idle_broken = await _recover_stale_dependency_deadlocks(
@@ -2298,13 +2299,10 @@ async def orchestrator_worker():
                     _last_type_throttle_broadcast, \
                     _last_type_unthrottle_broadcast, \
                     _previously_failing_types
-                _now_mono = time.monotonic()
                 if _failing_types:
                     for _ftype in _failing_types:
-                        if (
-                            _now_mono - _last_type_throttle_broadcast.get(_ftype, 0.0)
-                        ) > 60:
-                            _last_type_throttle_broadcast[_ftype] = _now_mono
+                        if _is_cadence_due(_last_type_throttle_broadcast.get(_ftype), 60):
+                            _last_type_throttle_broadcast[_ftype] = _utcnow()
                             _frate, _fsample = _shared_state.get_task_type_failure_rate(
                                 _ftype, window_minutes=15
                             )
@@ -2327,10 +2325,8 @@ async def orchestrator_worker():
                 # now recovered (aged out of _failing_types). Debounced 60s per type like throttle.
                 _recovered_types = _previously_failing_types - _failing_types
                 for _rtype in _recovered_types:
-                    if (
-                        _now_mono - _last_type_unthrottle_broadcast.get(_rtype, 0.0)
-                    ) > 60:
-                        _last_type_unthrottle_broadcast[_rtype] = _now_mono
+                    if _is_cadence_due(_last_type_unthrottle_broadcast.get(_rtype), 60):
+                        _last_type_unthrottle_broadcast[_rtype] = _utcnow()
                         _rrate, _rsample = _shared_state.get_task_type_failure_rate(
                             _rtype, window_minutes=15
                         )
@@ -2824,8 +2820,8 @@ async def orchestrator_worker():
 
                 # Step 2.4: Deadlock detection — break circular deps among stuck QUEUED tasks
                 # (_last_deadlock_check declared global in the idle-cycle branch above)
-                now = time.time()
-                if now - _last_deadlock_check > 60:
+                now = _utcnow()
+                if _is_cadence_due(_last_deadlock_check, 60, now):
                     _last_deadlock_check = now
                     stuck_tasks = [
                         t
@@ -3197,10 +3193,7 @@ async def orchestrator_worker():
                     # previously this subtracted a naive _utcnow() and raised
                     # TypeError, firing this 60s-gated error path repeatedly).
                     now_check = _utcnow()
-                    if (
-                        _last_zone_exhaustion_log is None
-                        or (now_check - _last_zone_exhaustion_log).total_seconds() >= 60
-                    ):
+                    if _is_cadence_due(_last_zone_exhaustion_log, 60, now_check):
                         _last_zone_exhaustion_log = now_check
                         wait_sec = zone_recovery_wait_seconds()
                         if wait_sec is not None:
