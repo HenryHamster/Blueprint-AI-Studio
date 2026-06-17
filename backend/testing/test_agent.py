@@ -19274,7 +19274,9 @@ async def test_viewport_screenshot_upload_url_cap_enforced(
 
 
 @pytest.mark.asyncio
-async def test_viewport_shots_download_url(client: AsyncClient, db_session, mocker):
+async def test_viewport_shots_download_url(
+    unauthenticated_client: AsyncClient, db_session, mocker
+):
     """Admin download endpoint redirects to a signed GCS URL (unauthenticated, 302)."""
     project = Project(name="VP Shot Download Test", user_id="user-vpshot-dl-001")
     db_session.add(project)
@@ -19291,7 +19293,7 @@ async def test_viewport_shots_download_url(client: AsyncClient, db_session, mock
         new=AsyncMock(return_value=fake_url),
     )
 
-    resp = await client.get(
+    resp = await unauthenticated_client.get(
         "/api/admin/viewport-shots/download-url",
         params={
             "project_id": str(project.id),
@@ -19305,7 +19307,7 @@ async def test_viewport_shots_download_url(client: AsyncClient, db_session, mock
 
 @pytest.mark.asyncio
 async def test_viewport_shots_download_url_unauthenticated_succeeds(
-    client: AsyncClient, db_session, mocker
+    unauthenticated_client: AsyncClient, db_session, mocker
 ):
     """Endpoint is public: no auth token required to follow a PR-body view link."""
     project = Project(name="VP Shot Download Auth Test", user_id="user-vpshot-dl-002")
@@ -19321,7 +19323,7 @@ async def test_viewport_shots_download_url_unauthenticated_succeeds(
         new=AsyncMock(return_value=fake_url),
     )
 
-    resp = await client.get(
+    resp = await unauthenticated_client.get(
         "/api/admin/viewport-shots/download-url",
         params={
             "project_id": str(project.id),
@@ -23487,15 +23489,13 @@ async def test_admin_viewport_shots_download_url_agent_token_cross_task_rejected
 
 @pytest.mark.asyncio
 async def test_admin_viewport_shots_download_url_no_auth_redirect(
-    client: AsyncClient, db_session, mocker
+    unauthenticated_client: AsyncClient, db_session, mocker
 ):
-    """Admin viewport-shots endpoint has two intentionally different response shapes.
+    """No-auth browser request gets a 302 redirect (operator clicking a PR-body link).
 
-    Without authentication (operator navigating via browser/PR body link):
-      - Returns 302 redirect to the signed GCS URL for the browser to fetch directly.
-
-    With agent JWT (agent reading screenshots programmatically):
-      - Returns JSON {"url": ...} with the signed URL so the agent can parse it.
+    The endpoint intentionally returns a redirect for unauthenticated requests so
+    operators can follow links from GitHub PR bodies directly in their browser.
+    The JWT path (agent → JSON) is covered by test_admin_viewport_shots_download_url_agent_token.
     """
     project = Project(
         name="Admin VP Shot No-Auth Test", user_id="user-admin-vp-shot-no-auth-001"
@@ -23520,8 +23520,9 @@ async def test_admin_viewport_shots_download_url_no_auth_redirect(
         new=AsyncMock(return_value=fake_url),
     )
 
-    # Test 1: No authentication => 302 redirect
-    resp = await client.get(
+    # No authentication => 302 redirect (unauthenticated_client has no get_current_user_optional
+    # override, so the dependency returns None and return_json stays False)
+    resp = await unauthenticated_client.get(
         "/api/admin/viewport-shots/download-url",
         params={
             "project_id": str(project.id),
@@ -23532,18 +23533,48 @@ async def test_admin_viewport_shots_download_url_no_auth_redirect(
     assert resp.status_code == 302
     assert resp.headers["location"] == fake_url
 
-    # Test 2: With JWT => JSON response
-    token = create_agent_token(
-        str(task.id), "vm-admin-vp-shot-no-auth-001", project_id=str(project.id)
+
+@pytest.mark.asyncio
+async def test_admin_viewport_shots_download_url_firebase_user_returns_json(
+    client: AsyncClient, db_session, mocker
+):
+    """Firebase-authenticated admin user gets JSON {url: ...}, not a 302 redirect."""
+    project = Project(
+        name="Admin VP Shot Firebase Test", user_id="user-admin-vp-shot-firebase-001"
     )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # conftest overrides get_current_user_optional to return {"user_id": "test-user-123"}
+    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    db_session.add(member)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp shot firebase"}],
+        vm_instance_id="vm-admin-vp-shot-firebase-001",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/firebase?X-Goog-Signature=fb"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    # Firebase user (no x-agent-token) — should return 200 JSON, not 302
     resp = await client.get(
         "/api/admin/viewport-shots/download-url",
         params={
             "project_id": str(project.id),
             "task_id": str(task.id),
-            "name": "TestPanel-375-before",
+            "name": "TaskCard-375-after",
         },
-        headers={"x-agent-token": token},
     )
     assert resp.status_code == 200
     assert resp.json()["url"] == fake_url

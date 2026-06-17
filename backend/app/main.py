@@ -1283,13 +1283,15 @@ async def get_viewport_screenshot_download_url(
     project_id: uuid.UUID,
     task_id: uuid.UUID,
     name: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict | None = Depends(get_current_user_optional),
     x_agent_token: str | None = Header(None),
 ):
     """Signed download URL for a task-scoped viewport screenshot.
 
-    Two access paths:
-    - Agent JWT (x-agent-token header): validates that the token's sub (task_id)
-      and project_id claims match the query parameters, then returns JSON {"url": ...}.
+    Three access paths:
+    - Agent JWT (x-agent-token header): validates token claims, returns JSON {"url": ...}.
+    - Firebase-authenticated admin user: validates project access, returns JSON {"url": ...}.
     - No token: returns a 302 redirect to the signed URL so operators can click
       links from GitHub PR bodies without a bearer token. The signed URL itself
       is the security boundary.
@@ -1316,6 +1318,12 @@ async def get_viewport_screenshot_download_url(
             raise HTTPException(status_code=403, detail="Task mismatch")
         if str(token_project_id) != str(project_id):
             raise HTTPException(status_code=403, detail="Project mismatch")
+        return_json = True
+    elif current_user is not None:
+        await _get_user_project(project_id, current_user["user_id"], session)
+        return_json = True
+    else:
+        return_json = False
 
     _SAFE_NAME_RE = _re.compile(r"[^A-Za-z0-9._-]")
     safe_name = _SAFE_NAME_RE.sub("_", name)
@@ -1334,7 +1342,7 @@ async def get_viewport_screenshot_download_url(
         )
         raise HTTPException(status_code=503, detail="Artifact storage unavailable")
 
-    if x_agent_token is not None:
+    if return_json:
         return {"url": url}
     return RedirectResponse(url=url, status_code=302)
 
