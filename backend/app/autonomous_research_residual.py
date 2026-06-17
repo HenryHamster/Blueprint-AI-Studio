@@ -173,39 +173,19 @@ async def _spawn_residual_fingerprint_remediation(
     if not fingerprints:
         return 0
 
-    # Guard: per-project spend ceiling via canonical resource_envelope resolver
-    from app.resource_envelope import (
-        get_project_recent_spend_usd,
-        resolve_project_spend_ceiling,
-        resolve_project_spend_window_days,
-    )
+    # Guard: per-project spend ceiling via canonical helper (also emits approaching-ceiling alert)
+    from app.autonomous_research import (
+        _project_spend_ceiling_spawn_defer_reason,
+    )  # deferred — avoids circular import
 
-    spend_ceiling = resolve_project_spend_ceiling(project)
-    if spend_ceiling is not None:
-        spend_window_days = resolve_project_spend_window_days(project)
-        spend_breakdown = await get_project_recent_spend_usd(
-            session,
-            project_id=project.id,
-            window_days=spend_window_days,
+    _spend_defer = await _project_spend_ceiling_spawn_defer_reason(project, session)
+    if _spend_defer:
+        logger.info(
+            "[AUTO REMEDIATION] Skipping residual spawn for project %s: %s",
+            project.id,
+            _spend_defer,
         )
-        window_spend = spend_breakdown["total"]
-        if window_spend >= spend_ceiling:
-            from app.alert_dispatch import _maybe_create_spend_ceiling_alert
-
-            logger.info(
-                "[AUTO REMEDIATION] Spend ceiling reached for project %s: "
-                "$%.4f >= $%.4f — skipping remediation spawn",
-                project.id,
-                window_spend,
-                spend_ceiling,
-            )
-            await _maybe_create_spend_ceiling_alert(
-                project.id,
-                session,
-                window_spend_usd=window_spend,
-                ceiling_usd=spend_ceiling,
-            )
-            return 0
+        return 0
 
     # Load case rows we need for spawn-side filters in one query:
     # IGNORED + SUSPENDED block re-spawn; REMEDIATING + last_spawned_at
@@ -513,39 +493,19 @@ async def _spawn_viewport_regression_remediation(
     if not fingerprints:
         return 0
 
-    # Guard: per-project spend ceiling via canonical resource_envelope resolver.
-    from app.resource_envelope import (
-        get_project_recent_spend_usd,
-        resolve_project_spend_ceiling,
-        resolve_project_spend_window_days,
-    )
+    # Guard: per-project spend ceiling via canonical helper (also emits approaching-ceiling alert)
+    from app.autonomous_research import (
+        _project_spend_ceiling_spawn_defer_reason,
+    )  # deferred — avoids circular import
 
-    spend_ceiling = resolve_project_spend_ceiling(project)
-    if spend_ceiling is not None:
-        spend_window_days = resolve_project_spend_window_days(project)
-        spend_breakdown = await get_project_recent_spend_usd(
-            session,
-            project_id=project.id,
-            window_days=spend_window_days,
+    _spend_defer = await _project_spend_ceiling_spawn_defer_reason(project, session)
+    if _spend_defer:
+        logger.info(
+            "[VIEWPORT REMEDIATION] Skipping viewport spawn for project %s: %s",
+            project.id,
+            _spend_defer,
         )
-        window_spend = spend_breakdown["total"]
-        if window_spend >= spend_ceiling:
-            from app.alert_dispatch import _maybe_create_spend_ceiling_alert
-
-            logger.info(
-                "[VIEWPORT REMEDIATION] Spend ceiling reached for project %s: "
-                "$%.4f >= $%.4f — skipping viewport remediation spawn",
-                project.id,
-                window_spend,
-                spend_ceiling,
-            )
-            await _maybe_create_spend_ceiling_alert(
-                project.id,
-                session,
-                window_spend_usd=window_spend,
-                ceiling_usd=spend_ceiling,
-            )
-            return 0
+        return 0
 
     # Load case rows for spawn-side filters in one query:
     # IGNORED + SUSPENDED block re-spawn; last_spawned_at drives per-fingerprint

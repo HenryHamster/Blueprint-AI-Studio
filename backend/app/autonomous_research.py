@@ -463,9 +463,68 @@ async def _fetch_direction_reasoning_memos(
     return result
 
 
+async def _check_half_open_test_task(
+    project_id: uuid.UUID,
+    session: AsyncSession,
+    breaker: dict,
+) -> bool:
+    """Check a HALF_OPEN circuit breaker's test task for failure conditions.
+
+    Handles two failure modes: stuck-for-30m+ and deleted/reaped.  In either
+    case the breaker is mutated back to OPEN (with doubled cooldown) and an
+    alert is created.
+
+    Returns True when the breaker was re-opened — the caller must return
+    immediately.  Returns False when the test task is still in-flight and the
+    caller may proceed normally.
+
+    Must only be called when breaker["state"] == "HALF_OPEN".
+    """
+    from app.alert_dispatch import _maybe_create_circuit_breaker_alert
+
+    test_id = breaker.get("half_open_task_id")
+    if not test_id:
+        return False
+
+    test_task = await session.get(Task, uuid.UUID(test_id))
+    if (
+        test_task
+        and test_task.started_at
+        and (_utcnow() - test_task.started_at).total_seconds() > 1800
+    ):
+        logger.warning(
+            f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN"
+        )
+        breaker["state"] = "OPEN"
+        breaker["opened_at"] = _utcnow()
+        breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
+        breaker["half_open_task_id"] = None
+        await _maybe_create_circuit_breaker_alert(
+            project_id,
+            session,
+            f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
+        )
+        return True
+    elif not test_task:
+        logger.warning(
+            f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} no longer exists (deleted/reaped) → OPEN"
+        )
+        breaker["state"] = "OPEN"
+        breaker["opened_at"] = _utcnow()
+        breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
+        breaker["half_open_task_id"] = None
+        await _maybe_create_circuit_breaker_alert(
+            project_id,
+            session,
+            f"HALF_OPEN test task deleted/reaped — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
+        )
+        return True
+
+    return False
+
+
 async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     """Inner implementation — always called under the per-project spawn lock."""
-    from app.alert_dispatch import _maybe_create_circuit_breaker_alert
     from app.research_completion import (
         _compute_momentum_factor,
         _compute_productivity_score,
@@ -552,60 +611,17 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             )
             return  # Still in cooldown
     elif breaker["state"] == "HALF_OPEN":
-        # Check if existing test task is stuck — treat as failure after 30 min
-        test_id = breaker.get("half_open_task_id")
-        if test_id:
-            test_task = await session.get(Task, uuid.UUID(test_id))
-            if (
-                test_task
-                and test_task.started_at
-                and (_utcnow() - test_task.started_at).total_seconds() > 1800
-            ):
-                logger.warning(
-                    f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN"
-                )
-                breaker["state"] = "OPEN"
-                breaker["opened_at"] = _utcnow()
-                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
-                breaker["half_open_task_id"] = None
-                await _maybe_create_circuit_breaker_alert(
-                    project.id,
-                    session,
-                    f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
-                )
-                # Re-opened breaker is still a circuit-breaker halt: surface the
-                # deferral to any pending operator steering (once). Marker is
-                # preserved. Placed after the breaker mutation/alert so the
-                # helper's commit also flushes the alert.
-                await _maybe_notify_operator_refresh_deferred(
-                    project,
-                    session,
-                    "paused while the research circuit breaker is open",
-                )
-                return  # Back to cooldown
-            elif not test_task:
-                logger.warning(
-                    f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} no longer exists (deleted/reaped) → OPEN"
-                )
-                breaker["state"] = "OPEN"
-                breaker["opened_at"] = _utcnow()
-                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
-                breaker["half_open_task_id"] = None
-                await _maybe_create_circuit_breaker_alert(
-                    project.id,
-                    session,
-                    f"HALF_OPEN test task deleted/reaped — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
-                )
-                # Re-opened breaker is still a circuit-breaker halt: surface the
-                # deferral to any pending operator steering (once). Marker is
-                # preserved. Placed after the breaker mutation/alert so the
-                # helper's commit also flushes the alert.
-                await _maybe_notify_operator_refresh_deferred(
-                    project,
-                    session,
-                    "paused while the research circuit breaker is open",
-                )
-                return  # Back to cooldown
+        if await _check_half_open_test_task(project.id, session, breaker):
+            # Re-opened breaker is still a circuit-breaker halt: surface the
+            # deferral to any pending operator steering (once). Marker is
+            # preserved. Placed after the breaker mutation/alert so the
+            # helper's commit also flushes the alert.
+            await _maybe_notify_operator_refresh_deferred(
+                project,
+                session,
+                "paused while the research circuit breaker is open",
+            )
+            return  # Back to cooldown
     # Guard: defer autonomous research until repo_bootstrap completes for external-repo
     # projects. Strategic cycles already defer this way; keeping research consistent
     # prevents ungrounded findings against a half-onboarded repo. Terminal bootstraps
@@ -2566,7 +2582,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
 async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncSession):
     """Spawn a periodic non-research task (qa, security_audit, deps) if its schedule is due."""
-    from app.alert_dispatch import _maybe_create_circuit_breaker_alert
     from sqlalchemy import func
 
     # Guard: task_type must be a known type
@@ -2606,27 +2621,8 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
             )
             return  # Still in cooldown
     elif breaker["state"] == "HALF_OPEN":
-        test_id = breaker.get("half_open_task_id")
-        if test_id:
-            test_task = await session.get(Task, uuid.UUID(test_id))
-            if (
-                test_task
-                and test_task.started_at
-                and (_utcnow() - test_task.started_at).total_seconds() > 1800
-            ):
-                logger.warning(
-                    f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN"
-                )
-                breaker["state"] = "OPEN"
-                breaker["opened_at"] = _utcnow()
-                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
-                breaker["half_open_task_id"] = None
-                await _maybe_create_circuit_breaker_alert(
-                    project.id,
-                    session,
-                    f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
-                )
-                return
+        if await _check_half_open_test_task(project.id, session, breaker):
+            return
 
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(
         task_type, {}
