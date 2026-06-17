@@ -7334,6 +7334,15 @@ async def test_relock_orphan_no_cutoff_does_not_consult_vm_contact(reaper_db):
     assert relocked.id == t.id
 
 
+def test_relock_orphan_task_re_export_identity():
+    """app.reaper._relock_orphan_task must be the same object as
+    app.reaper_relock._relock_orphan_task (re-export points at the moved definition)."""
+    import app.reaper as _reaper_mod
+    import app.reaper_relock as _reaper_relock_mod
+
+    assert _reaper_mod._relock_orphan_task is _reaper_relock_mod._relock_orphan_task
+
+
 # ── Per-cycle orphan-loop wall-time budget (FIX c) ──────────────────────────
 
 
@@ -12728,12 +12737,14 @@ async def test_event_driven_unblock_fail_open(reaper_db, mocker, monkeypatch):
     )
 
     # Inject a failure into _classify_blocker_needs to simulate an unexpected error.
-    import app.reaper_sweeps as _rs_mod
+    # Patch the module where the function is defined (blocked_task_unblock_sweeps)
+    # since _event_driven_unblock_project references it as a module-local there.
+    import app.blocked_task_unblock_sweeps as _btu_mod
 
     async def _raise(*args, **kwargs):
         raise RuntimeError("simulated classification error")
 
-    monkeypatch.setattr(_rs_mod, "_classify_blocker_needs", _raise)
+    monkeypatch.setattr(_btu_mod, "_classify_blocker_needs", _raise)
 
     # Must not raise; must return 0.
     result = await event_driven_unblock_dependents(foundation, reaper_db)
@@ -14261,6 +14272,47 @@ def test_extracted_sweeps_reexported_from_reaper_sweeps():
         )
 
 
+def test_blocked_unblock_helpers_reexport_identity():
+    """Helpers extracted to blocked_task_unblock_sweeps must remain importable from
+    app.reaper_sweeps and resolve to the SAME objects (identity check), so every
+    existing import site keeps working without change.
+    """
+    import app.blocked_task_unblock_sweeps as _sub
+    import app.reaper_sweeps as _rs
+
+    helper_names = [
+        "_apply_needs_disposition",
+        "_blocked_precondition_state",
+        "_cancel_blocker_as_dead",
+        "_classify_blocker_needs",
+        "_clear_blocked_fields",
+        "_fetch_active_candidates",
+        "_fetch_completed_candidates",
+        "_fetch_dead_candidates",
+        "_fetch_knowledge_substance_index",
+        "_fetch_working_capability_names",
+        "_next_recheck_delay",
+        "_partition_completed_needs_base_safe",
+        "_persist_residual_needs",
+        "_wire_edges",
+    ]
+    for name in helper_names:
+        assert hasattr(_rs, name), (
+            f"app.reaper_sweeps is missing re-export '{name}' — "
+            "callers that import it from reaper_sweeps will break"
+        )
+        assert hasattr(_sub, name), (
+            f"app.blocked_task_unblock_sweeps is missing '{name}'"
+        )
+        rs_obj = getattr(_rs, name)
+        sub_obj = getattr(_sub, name)
+        assert rs_obj is sub_obj, (
+            f"app.reaper_sweeps.{name} is NOT the same object as "
+            f"app.blocked_task_unblock_sweeps.{name} — the re-export is a "
+            "stale copy, not a live reference to the sub-module symbol"
+        )
+
+
 # ── _apply_rollup_merge_classification helper ────────────────────────────────
 
 
@@ -14506,6 +14558,18 @@ async def test_recover_orphaned_tasks_skips_non_write_type(reaper_db, mocker):
 
     # research type is not in WRITE_TASK_TYPES — no GitHub lookup should occur
     mock_get_token.assert_not_called()
+
+
+def test_unblock_sweep_entrypoints_reexport_identity():
+    """The four moved sweep entry points accessed via reaper_sweeps ARE the same
+    objects as in blocked_task_unblock_sweeps (not copies or re-definitions)."""
+    import app.reaper_sweeps as rs
+    import app.blocked_task_unblock_sweeps as btu
+
+    assert rs.sweep_unblock_blocked_tasks is btu.sweep_unblock_blocked_tasks
+    assert rs._event_driven_unblock_project is btu._event_driven_unblock_project
+    assert rs.event_driven_unblock_dependents is btu.event_driven_unblock_dependents
+    assert rs.event_driven_unblock_on_knowledge is btu.event_driven_unblock_on_knowledge
 
 
 def test_snap_all_terminal_and_snap_any_completed():
