@@ -7,11 +7,9 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 
 from app.compute_jobs import (
     ComputeLaunchPreconditionFailed,
-    build_compute_result_logs,
     create_compute_job,
     get_compute_job_for_task,
 )
@@ -25,11 +23,6 @@ from app.vm_cost_rates import resolve_compute_machine_type, supported_machine_ty
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent"])
-
-# Context key carrying the VM-substrate analysis request bundle stamped by
-# task_completion._route_compute_analysis_to_vm. Mirrored here (not imported) to
-# avoid a router → task_completion import cycle; the string is the contract.
-_COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY = "compute_vm_analysis_request"
 
 
 class LaunchComputeJobRequest(BaseModel):
@@ -124,7 +117,9 @@ async def launch_compute_job(
     except ComputeLaunchPreconditionFailed as exc:
         raise HTTPException(status_code=412, detail=exc.detail) from exc
     except ValueError as exc:
-        logger.warning("Validation error launching compute job: %s: %s", type(exc).__name__, exc)
+        logger.warning(
+            "Validation error launching compute job: %s: %s", type(exc).__name__, exc
+        )
         raise HTTPException(status_code=422, detail="Invalid request") from exc
 
     return {"status": "success", "data": serialize_compute_job_response(job)}
@@ -150,107 +145,3 @@ async def poll_compute_job(
     if job is None:
         raise HTTPException(status_code=404, detail="Compute job not found")
     return {"status": "success", "data": serialize_compute_job_response(job)}
-
-
-class ComputeAnalysisDocument(BaseModel):
-    """The cited analysis JSON the agent VM produced with the centralized CLI."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    title: str | None = Field(default=None, max_length=500)
-    summary: str = Field(..., min_length=1, max_length=20000)
-    body: str = Field(..., min_length=1, max_length=200000)
-    source_citations: list[str] = Field(default_factory=list, max_length=100)
-
-
-class SubmitComputeAnalysisRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    job_id: uuid.UUID
-    analysis: ComputeAnalysisDocument
-
-
-@router.post("/compute-analysis")
-@limiter.limit("30/minute")
-async def submit_compute_analysis(
-    request: Request,
-    req: SubmitComputeAnalysisRequest,
-    session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token),
-):
-    """Accept VM-produced compute analysis and upgrade the KnowledgeDocument.
-
-    The agent VM ran the model on the centralized-accounts substrate (operator
-    policy p-13f153e9 forbids a backend ANTHROPIC_API_KEY) and POSTs the produced
-    analysis JSON here. Citation grounding is re-enforced BACKEND-SIDE against the
-    real durable artifact — the VM's citations are never trusted — and a grounded
-    analysis upgrades the deterministic doc to ``analysis_mode='llm'`` through the
-    existing upgrade-only persistence machinery. Additive endpoint: it does not
-    change POST /api/agent/status or the admin analyze endpoint.
-    """
-    task_id_raw = token.get("sub")
-    if not task_id_raw:
-        raise HTTPException(status_code=403, detail="Invalid token: missing sub")
-    try:
-        task_id = uuid.UUID(task_id_raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail="Invalid token: bad sub") from exc
-
-    task = await session.get(Task, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # Resolve the terminal compute job for THIS task so the analysis inputs and
-    # citation-grounding evidence are derived authoritatively from the durable job
-    # row — never from anything the VM supplies beyond the produced prose.
-    job = await get_compute_job_for_task(
-        session, job_id=req.job_id, task_id=task_id
-    )
-    if job is None:
-        raise HTTPException(status_code=404, detail="Compute job not found")
-
-    compute_result = (task.plan_output or {}).get("compute_result") or {}
-    outcome = str(compute_result.get("outcome") or "")
-    if not outcome and job.outcome is not None:
-        outcome = getattr(job.outcome, "value", str(job.outcome))
-    if not outcome:
-        outcome = "unknown"
-    raw_cost = compute_result.get("final_cost_usd")
-    cost: float | None = float(raw_cost) if raw_cost is not None else None
-    criterion = compute_result.get("criterion")
-    if not isinstance(criterion, dict):
-        criterion = (task.context or {}).get("compute_success_criterion")
-        if not isinstance(criterion, dict):
-            criterion = None
-    logs = build_compute_result_logs(job)
-
-    from app.knowledge_completion import submit_compute_vm_analysis
-
-    envelope = await submit_compute_vm_analysis(
-        task,
-        vm_document=req.analysis.model_dump(),
-        outcome=outcome,
-        cost=cost,
-        criterion=criterion,
-        result_reference=job.result_reference,
-        session=session,
-        logs=logs,
-    )
-
-    # Clear the one-shot request bundle so a re-claim does not re-enter analysis
-    # mode. Best-effort and additive — never blocks the response.
-    try:
-        if (task.context or {}).get(_COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY) is not None:
-            ctx = dict(task.context or {})
-            ctx.pop(_COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY, None)
-            task.context = ctx
-            flag_modified(task, "context")
-            session.add(task)
-            await session.commit()
-    except Exception:  # noqa: BLE001 — bundle cleanup must never fail the submission
-        logger.warning(
-            "Failed to clear VM analysis request bundle for task %s", task_id,
-            exc_info=True,
-        )
-
-    return {"status": "success", "data": envelope}

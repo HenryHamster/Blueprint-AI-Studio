@@ -6414,6 +6414,83 @@ def test_build_compute_result_logs_omits_command_log_when_absent():
     assert "command_log_truncated" not in result
 
 
+def test_build_compute_result_logs_stdout_metrics_fallback():
+    """When NO result file metrics exist but the command printed a JSON object to
+    stdout, the builder recovers its numeric keys as top-level metrics so a metric
+    that only reached stdout is still measurable."""
+    job = _make_job_with_command_log(
+        'training run complete\n{"accuracy": 0.93, "loss": "0.12", "label": "run-a"}\n'
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    # Numeric keys recovered (numeric strings coerced); non-numeric dropped.
+    assert result["accuracy"] == pytest.approx(0.93)
+    assert result["loss"] == pytest.approx(0.12)
+    assert "label" not in result
+    # The bounded command-log text is still embedded alongside the metrics.
+    assert "training run complete" in result["command_log_text"]
+
+
+def test_build_compute_result_logs_result_file_wins_over_stdout():
+    """An explicit $BLUEPRINT_RESULT_FILE write (result_metrics) ALWAYS wins over a
+    conflicting value the command also printed to stdout."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="g2-standard-4",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+        polling_metadata={
+            "result_metrics": {"accuracy": 0.99},
+            "command_log": {"text": '{"accuracy": 0.10}\n', "truncated": False},
+        },
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert result["accuracy"] == pytest.approx(0.99)
+
+
+def test_build_compute_result_logs_stdout_fallback_last_object_wins():
+    """When the command prints several JSON objects, the LAST balanced object wins —
+    the final reported result, not an intermediate one."""
+    job = _make_job_with_command_log(
+        '{"accuracy": 0.50}\nepoch 1\n{"accuracy": 0.88}\nfinal\n'
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert result["accuracy"] == pytest.approx(0.88)
+
+
+def test_build_compute_result_logs_stdout_fallback_skips_reserved_keys():
+    """The stdout fallback can never overwrite a reserved job-level field or a
+    backend-derived durable key."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="g2-standard-4",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+        polling_metadata={
+            "durable_file_count": 3,
+            "command_log": {
+                "text": '{"final_cost_usd": 999, "durable_file_count": 0, "f1": 0.7}\n',
+                "truncated": False,
+            },
+        },
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    # Reserved/backend-derived keys untouched by the stdout fallback.
+    assert result["final_cost_usd"] == pytest.approx(0.5)
+    assert result["durable_file_count"] == pytest.approx(3)
+    # A genuine new metric from stdout is still surfaced.
+    assert result["f1"] == pytest.approx(0.7)
+
+
 def test_build_compute_result_logs_falls_back_to_accrued_cost():
     """When final_cost_usd is unset, the builder falls back to accrued cost."""
     job = ComputeJob(

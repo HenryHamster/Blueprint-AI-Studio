@@ -272,6 +272,18 @@ DEAD_AUTH = "DEAD_AUTH"
 # treated as CODE_ERROR, PR_REJECTED, or direction-health damage.
 APPROVED_CAP_PR_CLOSED = "APPROVED_CAP_PR_CLOSED"
 
+# A compute_experiment declared a kind=metric success_criterion but produced NO
+# numeric value for that metric (the experiment ran, yet the hypothesis was never
+# measured). Written by ``task_completion._handle_compute_experiment_completion``
+# as a DISTINCT, visible failure_category so 'the job ran' can never masquerade as
+# 'the hypothesis was measured' under a clean outcome=SUCCESS. This is a genuine
+# work/measurement defect — the command must be fixed to emit the declared metric
+# — so it routes to CODE_ERROR (burns the retry budget, drives the diagnosis
+# pipeline), NOT an infra class. Distinct from kind=artifact_produced criteria
+# (which gate on durable_file_count) and from intentional budget/deadline kills
+# (which stay clean terminal outcomes).
+COMPUTE_UNMEASURED_CRITERION = "compute_unmeasured_criterion"
+
 # Administrative cancellation — orchestrator or operator terminated the task before
 # it ran meaningful work: cascade cancels ("Cancelled: dependency task failed"),
 # parent-dependency cancels ("Cancelled: parent evaluation timeout"), or system
@@ -796,6 +808,13 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # classes (see INFRA_CLASSES) so neither burns the retry budget.
     "park_wake_timeout": PARK_WAKE_TIMEOUT,
     "park_wake_stranded": PARK_WAKE_STRANDED,
+    # ``compute_unmeasured_criterion`` — a compute_experiment declared a
+    # kind=metric success_criterion but produced no numeric value for it. A
+    # genuine measurement/work defect (the command must emit the declared
+    # metric), so it routes to CODE_ERROR for retry-budget + diagnosis while the
+    # distinct failure_category literal stays visible on task.context for the
+    # spawning agent and operator panels.
+    "compute_unmeasured_criterion": CODE_ERROR,
     # ``panel_review_lens_failed`` — the panel_review task posted a failure because
     # a lens subprocess exited non-zero. Normally an infra-level failure (→
     # PROVISION_FAILURE) but requires a dead-auth text check first: when a Codex

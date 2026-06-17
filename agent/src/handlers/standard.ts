@@ -35,6 +35,7 @@ import { resolveMigrationLayout } from './specialized.js';
 import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { runCodeChangeTask } from './code-change.js';
+import { consumeAndCommitArtifacts } from './artifact-consume.js';
 import { isBlueprintSelfRepo } from '../prompts/code-change-helpers.js';
 import { writeDiagnosticsAfterEditHook } from '../prompts/diagnostics-after-edit-hook.js';
 import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt, formatPrecisionRecallQuadrantHintForSrPrompt } from '../prompts/self-review.js';
@@ -724,14 +725,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         }))
         .filter((p) => p.artifact_id)
     : [];
+  const signedArtifactUrls = new Map<string, string>();
   if (artifactPointers.length > 0) {
-    const signedUrls = new Map<string, string>();
     for (const p of artifactPointers) {
       const url = await fetchArtifactDownloadUrl(p.artifact_id);
-      if (url) signedUrls.set(p.artifact_id, url);
+      if (url) signedArtifactUrls.set(p.artifact_id, url);
     }
-    prerequisiteArtifactSection = buildPrerequisiteArtifactSection(artifactPointers, signedUrls, taskId);
-    sendLog(ws, `[PrereqArtifacts] Injected ${artifactPointers.length} commissioned artifact pointer(s); resolved ${signedUrls.size} signed URL(s).\n`);
+    prerequisiteArtifactSection = buildPrerequisiteArtifactSection(artifactPointers, signedArtifactUrls, taskId);
+    sendLog(ws, `[PrereqArtifacts] Injected ${artifactPointers.length} commissioned artifact pointer(s); resolved ${signedArtifactUrls.size} signed URL(s).\n`);
   }
 
   const finalPromptWithTree = fileTree + repoMap + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection + finalPrompt;
@@ -766,6 +767,31 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   sendHeartbeatSync(taskId, statusRef.value, _heartbeatOpts);
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
   const baseCommit = git(['rev-parse', 'HEAD']);
+
+  // ── Consume-and-commit delivered artifacts (Pillar 5: SHIP THE ARTIFACT) ──
+  // When a direct dependency delivered a committable (GIT_COMMIT) artifact as a
+  // prerequisite, fetch its bundle, extract it (path-traversal-guarded), and
+  // commit the files into the repo clone so they ride the normal review gate.
+  // Runs AFTER baseCommit is captured so the artifact commit advances HEAD and
+  // is seen as part of the shipped diff. Fail-soft: any failure logs and
+  // proceeds — the prompt section + signed URL still let the agent consume
+  // manually.
+  if (artifactPointers.length > 0) {
+    try {
+      const consumed = await consumeAndCommitArtifacts({
+        taskId,
+        pointers: artifactPointers,
+        repoRoot: WORKSPACE,
+        ws,
+        signedUrls: signedArtifactUrls,
+      });
+      if (consumed.committedArtifactIds.length > 0) {
+        sendLog(ws, `[ArtifactConsume] Committed ${consumed.committedArtifactIds.length} delivered artifact(s) into the repo: ${consumed.committedArtifactIds.join(', ')}.\n`);
+      }
+    } catch (e) {
+      sendLog(ws, `[ArtifactConsume] consume-and-commit step failed (non-fatal): ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+  }
   // 2026-05-04: wrapper-driven lint/test/push/PR pipeline replaced with
   // runCodeChangeTask. Claude owns its own loop via ./check + ./pr +
   // ./done + ./fail helpers. Wrapper just runs Claude, watches markers,
