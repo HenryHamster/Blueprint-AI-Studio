@@ -16,6 +16,7 @@ Subcommand groups:
     diagnostics       stuck tasks, circuit breakers, grouped failure modes
     tasks list|show   list/filter tasks, or show one by id
     versions list|show  release versions with phase/status/sha and a summary
+    trials            capability-trial verdict, arm counts, days-to-decision projection
     promote-recover   promotion + recovery operator levers (confirm before mutate)
     logs tail|errors|search|task   Cloud Logging reads (via gcloud)
 
@@ -26,6 +27,7 @@ Examples:
     python scripts/blueprint.py tasks list --status IN_PROGRESS --type create
     python scripts/blueprint.py tasks show 7ab3f93a
     python scripts/blueprint.py versions show
+    python scripts/blueprint.py trials
     python scripts/blueprint.py promote-recover qualify --yes
     python scripts/blueprint.py logs errors --minutes 30
 """
@@ -1089,6 +1091,63 @@ def _directions_unhold(args: argparse.Namespace) -> None:
     ))
 
 
+# ── trials ───────────────────────────────────────────────────────────────────
+
+def cmd_trials(args: argparse.Namespace) -> None:
+    """List capability-trial verdicts with convergence projection and arm composition."""
+    pid = get_project_id(getattr(args, "project_id", None))
+    digest, err = _safe_read(f"/api/admin/digest?project_id={pid}")
+    digest = digest or {}
+
+    if err:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return
+
+    verdicts = digest.get("capability_adoption_verdicts") or {}
+    data = {
+        "trials": [
+            {
+                "cap_name": cap,
+                "verdict": v.get("verdict"),
+                "lift": v.get("lift"),
+                "arm_composition": v.get("arm_composition") or {},
+                "accrual_projection": v.get("accrual_projection") or {},
+                "containment_rate": v.get("containment_rate"),
+                "delivery_rate": v.get("delivery_rate"),
+            }
+            for cap, v in verdicts.items()
+        ],
+        "errors": {"digest": err} if err else {},
+    }
+    _emit(args, data, _render_trials)
+
+
+def _render_trials(data: dict) -> None:
+    trials = data.get("trials") or []
+    print("=== CAPABILITY TRIALS ===")
+    if not trials:
+        print("  (none)")
+        return
+    for trial in trials:
+        cap = trial.get("cap_name", "?")
+        verdict = trial.get("verdict", "?")
+        lift = trial.get("lift")
+        arm_comp = trial.get("arm_composition") or {}
+        with_n = arm_comp.get("with_assigned", 0)
+        without_n = arm_comp.get("without_assigned", 0)
+        accrual = trial.get("accrual_projection") or {}
+        days_to_decision = accrual.get("days_to_min_n")
+
+        print(f"\n  {cap}  verdict={verdict}  lift={lift}")
+        print(f"    with_assigned={with_n}  without_assigned={without_n}")
+        if days_to_decision is not None:
+            print(f"    days_to_decision={days_to_decision:.1f}")
+        alt_proj = accrual.get("alternative_projections") or {}
+        if alt_proj:
+            holdback = accrual.get("holdback_fraction", 0)
+            print(f"    holdback_fraction={holdback:.2f}  alternative_projections={alt_proj}")
+
+
 # ── settings ─────────────────────────────────────────────────────────────────
 
 def cmd_settings(args: argparse.Namespace) -> None:
@@ -1496,6 +1555,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("diagnostics", parents=[common],
                    help="Stuck tasks, circuit breakers, and grouped failure modes.")
 
+    # trials
+    sub.add_parser("trials", parents=[common],
+                   help="Capability-trial convergence status, arm counts, and days-to-decision.")
+
     # tasks
     p_tasks = sub.add_parser("tasks", parents=[common], help="List or show tasks.",
                              description="List, filter, show, cancel, or requeue tasks. "
@@ -1700,6 +1763,7 @@ _DISPATCH = {
     "tasks": cmd_tasks,
     "versions": cmd_versions,
     "directions": cmd_directions,
+    "trials": cmd_trials,
     "promote-recover": cmd_promote_recover,
     "logs": cmd_logs,
     "messages": cmd_messages,

@@ -33,6 +33,7 @@ HELP_INVOCATIONS = [
     ["versions", "list"],
     ["versions", "show"],
     ["versions", "export-changelog"],
+    ["trials"],
     ["promote-recover"],
     ["directions"],
     ["directions", "list"],
@@ -184,6 +185,34 @@ def mock_api(monkeypatch):
                 ],
                 "highlights": {"headline": "7 tasks merged; early version"},
                 "serving_status": "SERVING",
+            }
+        if "/admin/digest" in path:
+            return {
+                "capability_adoption_verdicts": {
+                    "repo_map": {
+                        "verdict": "adopt",
+                        "lift": 1.25,
+                        "arm_composition": {
+                            "with_assigned": 45,
+                            "without_assigned": 38,
+                        },
+                        "accrual_projection": {
+                            "with_7d": 7,
+                            "without_7d": 6,
+                            "window_days": 7,
+                            "holdback_fraction": 0.3,
+                            "days_to_min_n": 5.5,
+                            "alternative_projections": {
+                                "0.1": 2.1,
+                                "0.3": 5.5,
+                                "0.5": 8.3,
+                            },
+                        },
+                        "containment_rate": 0.95,
+                        "delivery_rate": 0.98,
+                    },
+                },
+                "window_hours": 24,
             }
         if "/admin/settings" in path:
             return {"max_concurrent_vms": 10, "promotion_enabled": True,
@@ -1205,6 +1234,66 @@ def test_directions_group(mock_api, monkeypatch, capsys):
         with pytest.raises(SystemExit) as exc:
             blueprint.main(argv)
         assert exc.value.code == 1
+
+
+def test_trials_json(mock_api, capsys):
+    """trials --json surfaces capability-trial verdict, arm counts, and days-to-decision."""
+    rc = blueprint.main(["--json", "trials"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert "trials" in parsed
+    assert len(parsed["trials"]) == 1
+
+    trial = parsed["trials"][0]
+    assert trial["cap_name"] == "repo_map"
+    assert trial["verdict"] == "adopt"
+    assert trial["lift"] == 1.25
+
+    # Verify arm composition is present
+    arm_comp = trial["arm_composition"]
+    assert arm_comp["with_assigned"] == 45
+    assert arm_comp["without_assigned"] == 38
+
+    # Verify accrual projection includes days-to-decision
+    accrual = trial["accrual_projection"]
+    assert accrual["days_to_min_n"] == 5.5
+    assert accrual["alternative_projections"]["0.3"] == 5.5
+
+    # Verify containment and delivery rates
+    assert trial["containment_rate"] == 0.95
+    assert trial["delivery_rate"] == 0.98
+
+    # Verify the API was called
+    assert any("/admin/digest" in path for _, path, _ in mock_api)
+
+
+def test_trials_human_render(mock_api, capsys):
+    """Human-readable trials output includes verdict, arm counts, and days-to-decision."""
+    rc = blueprint.main(["trials"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "CAPABILITY TRIALS" in out
+    assert "repo_map" in out
+    assert "verdict=adopt" in out
+    assert "with_assigned=45" in out
+    assert "without_assigned=38" in out
+    assert "days_to_decision=5.5" in out
+
+
+def test_trials_empty(monkeypatch, capsys):
+    """trials with no capability verdicts emits a graceful message."""
+    def fake_api(method, path, body=None, timeout=30):
+        if "/admin/digest" in path:
+            return {"capability_adoption_verdicts": {}}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["trials"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "(none)" in out
 
 
 def test_settings_group(monkeypatch, capsys):
