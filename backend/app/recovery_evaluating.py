@@ -32,10 +32,8 @@ from sqlmodel import select
 import app.shared_state as _shared_state
 from app import services
 from app.branch_resolution import classify_rollup_merge_outcome
-from app.spawn_calibration import SPEND_BUDGET_APPROVAL_HOLD_REASON
 from app.landed_signal import (
     apply_merged_landed_signal,
-    mark_landed_on_integration,
 )
 from app.models import (
     Task,
@@ -45,6 +43,11 @@ from app.models import (
     Artifact,
     ArtifactType,
 )
+from app.recovery_evaluating_strand import (
+    _handle_evaluating_strand_backstop,
+    _handle_rollup_lost_marker,
+)
+from app.recovery_evaluating_approval import _handle_approval_gate_timeout
 from app.recovery_evaluating_helpers import (  # noqa: F401
     _last_status_transition_at,
     _chain_has_active_pipeline_work,
@@ -129,20 +132,9 @@ async def _check_evaluating_timeouts(progress_cb=None):
     # (rollup PR CI + review iteration), and the optimistic-retry cap bounds how
     # long a recoverable child can keep re-arming anyway.
     CI_BACKSTOP_DEFER_WINDOW_HOURS = 6
-    # Approval-gate companion timeout: parents flagged requires_approval can
-    # otherwise stall indefinitely when _chain_has_active_pipeline_work defers
-    # the EVALUATING_FAIL backstop. 2h gives operators a reasonable window
-    # to approve/deny independent of the configured wall-clock.
-    APPROVAL_GATE_FAIL_SECONDS = 2 * 3600
-    # Bounded defer window for the approval-gate timeout while the chain is
-    # STILL actively working the PR (live review/fix children, or a fix parked
-    # in CI-wait). A stuck/standoff escalation flags the parent but does NOT
-    # stop the loop — FAILing the parent at the bare 2h mark while its own fix
-    # chain is mid-flight orphans that work and strands the rollup (research
-    # 6506582b / PR #9179, 2026-06-09). Mirrors CI_BACKSTOP_DEFER_WINDOW_HOURS;
-    # beyond 2h + this window the original unconditional timeout applies, so a
-    # genuinely wedged chain still terminates.
-    APPROVAL_GATE_DEFER_WINDOW_HOURS = 6
+    # Approval-gate companion timeout constants (APPROVAL_GATE_FAIL_SECONDS /
+    # APPROVAL_GATE_DEFER_WINDOW_HOURS) now live in
+    # ``app.recovery_evaluating_approval`` alongside the extracted handler.
     # Deliberate spend/budget approval holds (requires_approval=True AND
     # context.approval_hold_reason == "spend_budget") get their OWN longer,
     # operator-configurable window and resolve to a CLEAN NON-FAILURE CANCELLED
@@ -594,328 +586,21 @@ async def _check_evaluating_timeouts(progress_cb=None):
                         )
                         continue
 
-                # EVALUATING-STRAND BACKSTOP. A review/CI task that spawned a
-                # conflict-fix or ci-fix child (review_loop.conflict_fix_spawned /
-                # ci_fix_spawned set) parks here until the chain resolves. The
-                # historical strand: an APPROVED review hit a merge conflict,
-                # spawned a conflict-fix, the fix's PR later MERGED, but the
-                # original review was never terminalized — the conflict_fix_spawned
-                # latch was never cleared (orchestrator:3086 skips it, ci_completion
-                # only updates the chain root) so it sits in EVALUATING forever.
-                # The root cause (children inheriting _is_rollup_review and looking
-                # like rollup parents) is fixed in review_pipeline; this is a
-                # belt-and-suspenders recovery for already-stranded rows.
-                #
-                # GUARDRAIL: only acts on NON-rollup-parent tasks (real rollup
-                # parents are handled by their own merge gate), and NEVER completes
-                # a task whose PR is still OPEN — open PRs are left EVALUATING.
-                _strand_rl = ctx.get("review_loop") or {}
-                _strand_spawned = _strand_rl.get("conflict_fix_spawned") or (
-                    _strand_rl.get("ci_fix_spawned")
-                )
-                if _strand_spawned and not ctx.get("pr_merged"):
-                    from app.rollup_state import _is_rollup_parent_awaiting_merge
-
-                    if not _is_rollup_parent_awaiting_merge(ctx):
-                        _strand_pr = _strand_rl.get("pr_number") or ctx.get(
-                            "rollup_pr_number"
-                        )
-                        if _strand_pr:
-                            _s_state = "open"
-                            _s_merged = False
-                            _s_lookup_ok = False
-                            try:
-                                from app.routers.agent import (
-                                    get_github_token_for_task,
-                                )
-                                from app.github import get_pull_request
-
-                                _gh = await services._bounded(
-                                    get_github_token_for_task(task.id, session),
-                                    services._GH_CALL_TIMEOUT_S,
-                                    what=f"strand token {str(task.id)[:8]}",
-                                )
-                                _gh_token, _owner, _repo = _gh
-                                _pr = await services._bounded(
-                                    get_pull_request(
-                                        _gh_token, _owner, _repo, _strand_pr
-                                    ),
-                                    services._GH_CALL_TIMEOUT_S,
-                                    what=f"strand get_pull_request #{_strand_pr}",
-                                )
-                                _s_state = _pr.get("state") or "open"
-                                _s_merged = bool(_pr.get("merged"))
-                                _s_lookup_ok = True
-                            except Exception as _strand_exc:
-                                logger.warning(
-                                    f"[EVAL TIMEOUT strand] Task {str(task.id)[:8]} "
-                                    f"PR #{_strand_pr} lookup failed: "
-                                    f"{type(_strand_exc).__name__}: {_strand_exc} — "
-                                    f"leaving EVALUATING for next sweep"
-                                )
-                            if _s_lookup_ok and _s_state == "closed" and _s_merged:
-                                from sqlalchemy.orm.attributes import flag_modified
-
-                                task.status = TaskStatus.COMPLETED
-                                task.latest_status_message = (
-                                    f"Strand recovery: conflict/CI-fix PR "
-                                    f"#{_strand_pr} merged out-of-band"
-                                )
-                                # The APPROVED original's work landed on the
-                                # integration branch via its conflict/CI-fix
-                                # child's merged PR, so stamp the canonical
-                                # integration-landing signal (preserves the
-                                # prior bare ``pr_merged=True`` analytics
-                                # meaning while routing through the helper).
-                                task.context = dict(ctx)
-                                mark_landed_on_integration(task)
-                                flag_modified(task, "context")
-                                session.add(task)
-                                await session.commit()
-                                logger.info(
-                                    f"[EVAL TIMEOUT strand] Task {str(task.id)[:8]} "
-                                    f"terminalized COMPLETED — PR #{_strand_pr} merged"
-                                )
-                                await services.broadcast_to_project(
-                                    str(task.project_id),
-                                    "task_updated",
-                                    {
-                                        "task_id": str(task.id),
-                                        "status": TaskStatus.COMPLETED,
-                                    },
-                                )
-                                continue
-                            if _s_lookup_ok and _s_state == "closed" and not _s_merged:
-                                # PR closed without merging — terminal, but route
-                                # through FIX A's non-rejection classifier so a
-                                # cleanup/supersession close lands CANCELLED and a
-                                # genuine rejection lands FAILED.
-                                from app.rollup_management import (
-                                    _pr_closed_is_non_rejection,
-                                )
-                                from sqlalchemy.orm.attributes import flag_modified
-                                from app.failure_classification import (
-                                    SCOPE_EMPTY,
-                                    classify_failure,
-                                    persist_failure_category,
-                                )
-
-                                _non_rej = False
-                                with contextlib.suppress(Exception):
-                                    _non_rej = await _pr_closed_is_non_rejection(
-                                        task, _pr, _strand_pr, session
-                                    )
-                                if _non_rej:
-                                    task.status = TaskStatus.CANCELLED
-                                    task.latest_status_message = (
-                                        f"Strand recovery: PR #{_strand_pr} closed "
-                                        f"without merging (no rejection — cleanup)"
-                                    )
-                                    task.context = {
-                                        **ctx,
-                                        "pr_closed_unmerged": True,
-                                        "failure_detail": "pr_closed_non_rejection",
-                                        "failure_category": SCOPE_EMPTY,
-                                    }
-                                    flag_modified(task, "context")
-                                    session.add(task)
-                                    await session.commit()
-                                    await services.broadcast_to_project(
-                                        str(task.project_id),
-                                        "task_updated",
-                                        {
-                                            "task_id": str(task.id),
-                                            "status": TaskStatus.CANCELLED,
-                                        },
-                                    )
-                                    continue
-                                task.status = TaskStatus.FAILED
-                                task.latest_status_message = (
-                                    f"Strand recovery: PR #{_strand_pr} closed "
-                                    f"without merging"
-                                )
-                                task.context = {**ctx, "pr_closed_unmerged": True}
-                                _sfc = classify_failure(task)
-                                persist_failure_category(task, _sfc)
-                                flag_modified(task, "context")
-                                session.add(task)
-                                await _maybe_create_failure_alert(
-                                    task,
-                                    session,
-                                    f"Strand recovery: PR #{_strand_pr} closed "
-                                    f"without merging",
-                                )
-                                await session.commit()
-                                await services.broadcast_to_project(
-                                    str(task.project_id),
-                                    "task_updated",
-                                    {
-                                        "task_id": str(task.id),
-                                        "status": TaskStatus.FAILED,
-                                    },
-                                )
-                                continue
-                            # STILL OPEN (or lookup failed) → leave EVALUATING.
-                            # GUARDRAIL: never complete a task whose PR is open.
-
-                # ROLLUP-PARENT LOST-MARKER RECOVERY. When a rollup parent's
-                # rollup_pr_number marker was not persisted (crash/reap window
-                # between GitHub PR creation and the DB write), the parent stays
-                # EVALUATING forever — every convergence path is keyed on the
-                # marker.  Worse, the rollup machinery keeps re-commissioning
-                # child tasks against the now-deleted staging branch, burning VMs
-                # in a BRANCH_GONE loop.
-                #
-                # Detection: EVALUATING task has a staging branch in context
-                # (plan_branch / research_branch) but no rollup_pr_number and no
-                # pr_merged.  We query GitHub for closed PRs from that head
-                # branch; if one is merged we converge the parent.
-                #
-                # GUARDRAIL: only acts when GitHub confirms a merged PR.  If the
-                # lookup fails or the PR is still open (state=closed returns []),
-                # fall through unchanged and re-check after _LM_RECHECK_INTERVAL_S
-                # so the sweep catches the PR merging later.
-                _LM_RECHECK_INTERVAL_S = 1800  # 30 minutes between re-checks
-                _stg_branch = ctx.get("plan_branch") or ctx.get("research_branch")
-                _lm_last_checked_at = ctx.get("_lost_marker_checked_at")
-                _lm_recheck_due = not _lm_last_checked_at or (
-                    (
-                        datetime.utcnow() - datetime.fromisoformat(_lm_last_checked_at)
-                    ).total_seconds()
-                    > _LM_RECHECK_INTERVAL_S
-                )
-                if (
-                    _stg_branch
-                    and not ctx.get("rollup_pr_number")
-                    and not ctx.get("pr_merged")
-                    and _lm_recheck_due
+                if await _handle_evaluating_strand_backstop(
+                    task,
+                    ctx,
+                    session,
+                    maybe_create_failure_alert=_maybe_create_failure_alert,
                 ):
-                    _lm_merged = False
-                    _lm_pr_data: dict | None = None
-                    _lm_lookup_ok = False
-                    try:
-                        from app.routers.agent import get_github_token_for_task
-                        from app.github import get_pull_requests_for_head_branch
+                    continue
 
-                        _lm_token, _lm_owner, _lm_repo = await services._bounded(
-                            get_github_token_for_task(task.id, session),
-                            services._GH_CALL_TIMEOUT_S,
-                            what=f"lost-marker token {str(task.id)[:8]}",
-                        )
-                        _target_base = ctx.get("parent_base") or ctx.get(
-                            "original_base"
-                        )
-                        _lm_prs = await services._bounded(
-                            get_pull_requests_for_head_branch(
-                                _lm_token,
-                                _lm_owner,
-                                _lm_repo,
-                                _stg_branch,
-                                base=_target_base,
-                            ),
-                            services._GH_CALL_TIMEOUT_S,
-                            what=f"lost-marker list-prs {_stg_branch!r}",
-                        )
-                        # Fallback: if the base-filtered query returned nothing and
-                        # we had a base filter, retry without it — the actual base
-                        # ref may differ from what's in context.
-                        if not _lm_prs and _target_base:
-                            _lm_prs = await services._bounded(
-                                get_pull_requests_for_head_branch(
-                                    _lm_token,
-                                    _lm_owner,
-                                    _lm_repo,
-                                    _stg_branch,
-                                    base=None,
-                                ),
-                                services._GH_CALL_TIMEOUT_S,
-                                what=f"lost-marker list-prs unfiltered {_stg_branch!r}",
-                            )
-                        _lm_lookup_ok = True
-                        for _pr in _lm_prs or []:
-                            if _pr.get("merged_at") or bool(_pr.get("merged")):
-                                _lm_merged = True
-                                _lm_pr_data = _pr
-                                break
-                    except Exception as _lm_exc:
-                        logger.warning(
-                            f"[EVAL TIMEOUT lost-marker] Task {str(task.id)[:8]} "
-                            f"branch {_stg_branch!r} lookup failed: "
-                            f"{type(_lm_exc).__name__}: {_lm_exc} — leaving EVALUATING"
-                        )
-
-                    if _lm_lookup_ok and not _lm_merged:
-                        # No merged PR found (PR still open, not yet created, or
-                        # closed-unmerged).  Stamp a timestamp so we back off and
-                        # re-check after _LM_RECHECK_INTERVAL_S rather than
-                        # querying GitHub on every sweep cycle.
-                        from sqlalchemy.orm.attributes import flag_modified
-
-                        task.context = {
-                            **ctx,
-                            "_lost_marker_checked_at": datetime.utcnow().isoformat(),
-                        }
-                        flag_modified(task, "context")
-                        session.add(task)
-                        await session.commit()
-                        ctx = task.context
-                    elif _lm_lookup_ok and _lm_merged and _lm_pr_data is not None:
-                        # Confirmed: rollup PR was merged.  Converge the parent.
-                        from sqlalchemy.orm.attributes import flag_modified
-                        from app.rollup_state import _clear_rollup_transient_state
-                        from app.models import Project
-
-                        _lm_pr_num = int(_lm_pr_data.get("number") or 0) or None
-                        _lm_pr_url = _lm_pr_data.get("html_url") or None
-                        _lm_base_ref = (_lm_pr_data.get("base") or {}).get(
-                            "ref"
-                        ) or None
-
-                        _lm_proj = await session.get(Project, task.project_id)
-                        _lm_new_ctx = _clear_rollup_transient_state({**ctx})
-                        if _lm_pr_num:
-                            _lm_new_ctx["rollup_pr_number"] = _lm_pr_num
-                        if _lm_pr_url:
-                            _lm_new_ctx["rollup_pr_url"] = _lm_pr_url
-                        task.context = _lm_new_ctx
-                        (
-                            _lm_record_merged,
-                            _lm_terminal,
-                            _lm_landed,
-                        ) = await _apply_rollup_merge_classification(
-                            task,
-                            _lm_proj,
-                            session,
-                            pr_number=_lm_pr_num,
-                            merged_base_branch=_lm_base_ref,
-                            source="recovery_sweeps.lost_marker",
-                            msg_terminal=(
-                                f"✓ rollup PR #{_lm_pr_num} already merged to "
-                                f"{{landed}}; converged from stranded EVALUATING"
-                            ),
-                            msg_non_terminal=(
-                                f"Lost-marker recovery: rollup PR #{_lm_pr_num} "
-                                f"merged into {{landed}}; awaiting downstream landing"
-                            ),
-                            hotfix_lane=None,
-                        )
-                        flag_modified(task, "context")
-                        session.add(task)
-                        await session.commit()
-                        logger.info(
-                            f"[EVAL TIMEOUT lost-marker] Task {str(task.id)[:8]} "
-                            f"converged → {task.status} (rollup PR #{_lm_pr_num} "
-                            f"merged into {_lm_landed})"
-                        )
-                        await services.broadcast_to_project(
-                            str(task.project_id),
-                            "task_updated",
-                            {
-                                "task_id": str(task.id),
-                                "status": task.status,
-                            },
-                        )
-                        continue
+                if await _handle_rollup_lost_marker(task, ctx, session):
+                    continue
+                # The lost-marker no-merged path stamps _lost_marker_checked_at
+                # on task.context and commits without converging; re-sync the
+                # loop-local ctx so downstream context writes preserve that
+                # back-off timestamp (matches the original inline reassignment).
+                ctx = task.context or {}
 
                 # Approval-gate hard timeout. Parents with requires_approval=True
                 # remain in EVALUATING waiting for human approval; the
@@ -931,179 +616,16 @@ async def _check_evaluating_timeouts(progress_cb=None):
                 #    task result / failure category / failure alert.
                 #  - Everything else (no marker / review-escalation churn): the
                 #    EXACT current 2h → FAILED behavior, unchanged.
-                if task.requires_approval:
-                    from sqlalchemy.orm.attributes import flag_modified
-
-                    is_spend_hold = (
-                        ctx.get("approval_hold_reason")
-                        == SPEND_BUDGET_APPROVAL_HOLD_REASON
-                    )
-
-                    approval_set_at = ctx.get("_approval_set_at")
-                    if not approval_set_at:
-                        new_ctx = {**ctx, "_approval_set_at": now.isoformat()}
-                        # MAKE THE HOLD LOUD: when a spend/budget hold is first
-                        # seen, fire the created notification + a non-failure
-                        # WARNING alert, exactly once (guarded by the flag).
-                        if is_spend_hold and not ctx.get(
-                            "_spend_hold_created_notified"
-                        ):
-                            await _emit_spend_hold_created_signals(
-                                task, session, window_hours=_spend_hours
-                            )
-                            new_ctx["_spend_hold_created_notified"] = True
-                        task.context = new_ctx
-                        flag_modified(task, "context")
-                        session.add(task)
-                        await session.commit()
-                        continue
-                    try:
-                        approval_since = datetime.fromisoformat(approval_set_at)
-                        approval_elapsed = (now - approval_since).total_seconds()
-                    except (ValueError, TypeError):
-                        approval_elapsed = 0.0
-
-                    if is_spend_hold:
-                        # Fire the EXPIRING warning once, within the lead window
-                        # (last 20% of the configured window, min 1h) before the
-                        # hold expires — so the operator gets an active nudge.
-                        warn_lead = max(SPEND_APPROVAL_FAIL_SECONDS * 0.2, 3600.0)
-                        if (
-                            not ctx.get("_spend_hold_expiring_notified")
-                            and SPEND_APPROVAL_FAIL_SECONDS - warn_lead
-                            <= approval_elapsed
-                            < SPEND_APPROVAL_FAIL_SECONDS
-                        ):
-                            hours_remaining = round(
-                                (SPEND_APPROVAL_FAIL_SECONDS - approval_elapsed) / 3600,
-                                1,
-                            )
-                            _dispatch_spend_hold_notification(
-                                task,
-                                "SPEND_HOLD_EXPIRING",
-                                _spend_hours,
-                                hours_remaining=hours_remaining,
-                            )
-                            task.context = {
-                                **ctx,
-                                "_spend_hold_expiring_notified": True,
-                            }
-                            flag_modified(task, "context")
-                            session.add(task)
-                            await session.commit()
-                            continue
-                        if approval_elapsed > SPEND_APPROVAL_FAIL_SECONDS:
-                            hours = round(approval_elapsed / 3600, 1)
-                            logger.info(
-                                f"[EVAL TIMEOUT] Task {str(task.id)[:8]} "
-                                f"spend/budget approval not granted in {hours}h — "
-                                f"declining (CANCELLED, not a failure)"
-                            )
-                            task.status = TaskStatus.CANCELLED
-                            task.latest_status_message = (
-                                "Spend/budget approval not granted in time — "
-                                "declined (not a failure)"
-                            )
-                            # Clear the hold so it leaves the digest needs-
-                            # attention list; the task is terminal now. This path
-                            # deliberately does NOT call record_task_result /
-                            # classify_failure / _maybe_create_failure_alert — it
-                            # must not be counted as a task failure.
-                            task.requires_approval = False
-                            task.context = {**ctx, "spend_approval_declined": True}
-                            flag_modified(task, "context")
-                            session.add(task)
-                            await session.commit()
-                            await services.broadcast_to_project(
-                                str(task.project_id),
-                                "task_updated",
-                                {
-                                    "task_id": str(task.id),
-                                    "status": TaskStatus.CANCELLED,
-                                },
-                            )
-                            continue
-                        # Within window, not yet at the warning lead — leave
-                        # EVALUATING for a later sweep. A spend/budget hold never
-                        # falls through to the review-escalation FAILED path.
-                        continue
-
-                    if approval_elapsed > APPROVAL_GATE_FAIL_SECONDS:
-                        # Defer (bounded) while the chain is still actively
-                        # working the PR: live review/fix children, or a fix
-                        # parked in CI-wait. The two other backstops in this
-                        # sweep already consult the chain before terminalizing;
-                        # the approval gate was the one that did not.
-                        if (
-                            approval_elapsed
-                            <= APPROVAL_GATE_FAIL_SECONDS
-                            + APPROVAL_GATE_DEFER_WINDOW_HOURS * 3600
-                        ):
-                            _approval_chain_busy = False
-                            try:
-                                _approval_chain_busy = (
-                                    await services._chain_has_active_pipeline_work(
-                                        task, session
-                                    )
-                                    or await _approval_gate_chain_busy(task, session)
-                                )
-                            except Exception:
-                                logger.debug(
-                                    f"[EVAL TIMEOUT] Approval-gate chain check "
-                                    f"failed for {str(task.id)[:8]}",
-                                    exc_info=True,
-                                )
-                            if _approval_chain_busy:
-                                logger.info(
-                                    f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past "
-                                    f"the approval-gate window but its review/fix "
-                                    f"chain is still working the PR — deferring "
-                                    f"(hard ceiling "
-                                    f"{round(APPROVAL_GATE_FAIL_SECONDS / 3600 + APPROVAL_GATE_DEFER_WINDOW_HOURS, 1)}h)"
-                                )
-                                continue
-                        hours = round(approval_elapsed / 3600, 1)
-                        logger.error(
-                            f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has been "
-                            f"requires_approval for {hours}h without resolution — "
-                            f"approval-gate timeout, marking FAILED"
-                        )
-                        task.status = TaskStatus.FAILED
-                        task.latest_status_message = (
-                            f"Approval-gate timeout after {hours}h — no manual "
-                            f"approval received, escalating to FAILED"
-                        )
-                        from app.failure_classification import (
-                            classify_failure,
-                            persist_failure_category,
-                        )
-                        from app.routers.agent_status import record_task_result
-
-                        _fc = classify_failure(task)
-                        persist_failure_category(task, _fc)
-                        record_task_result(
-                            success=False,
-                            failure_class=_fc,
-                            task_id=str(task.id),
-                            task_type=task.first_payload.get("type", ""),
-                        )
-                        session.add(task)
-                        await _maybe_create_failure_alert(
-                            task,
-                            session,
-                            f"Approval-gate timeout after {hours}h — parent failed "
-                            f"without manual resolution",
-                        )
-                        await session.commit()
-                        # task.status was set to FAILED above; _maybe_create_failure_alert
-                        # can poison/roll back the session (expiring `task`), so use the
-                        # literal rather than a post-commit lazy-load (MissingGreenlet).
-                        await services.broadcast_to_project(
-                            str(task.project_id),
-                            "task_updated",
-                            {"task_id": str(task.id), "status": TaskStatus.FAILED},
-                        )
-                        continue
+                if await _handle_approval_gate_timeout(
+                    task,
+                    ctx,
+                    session,
+                    now,
+                    spend_approval_fail_seconds=SPEND_APPROVAL_FAIL_SECONDS,
+                    spend_hours=_spend_hours,
+                    maybe_create_failure_alert=_maybe_create_failure_alert,
+                ):
+                    continue
 
                 ci_waiting = (
                     ctx.get("ci_waiting") is True

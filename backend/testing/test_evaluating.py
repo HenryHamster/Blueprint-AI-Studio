@@ -3153,6 +3153,82 @@ async def test_strand_backstop_skips_rollup_parent(eval_db, mocker):
     assert not (task.context or {}).get("pr_merged")
 
 
+def _mock_lost_marker_github(mocker, *, prs):
+    """Mock the GitHub calls the lost-marker recovery makes (token +
+    list-PRs-for-head-branch). ``prs`` is the list returned for the staging
+    head branch."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The lost-marker recovery (now in app.recovery_evaluating_strand) broadcasts
+    # via ``services.broadcast_to_project`` (a binding separate from
+    # app.broadcast.broadcast_to_project), so patch it there too.
+    mocker.patch(
+        "app.services.broadcast_to_project", new_callable=AsyncMock, create=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_requests_for_head_branch",
+        new_callable=AsyncMock,
+        return_value=prs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_lost_marker_converges_on_merged_pr(eval_db, mocker):
+    """ROLLUP-PARENT LOST-MARKER RECOVERY: an EVALUATING parent that has a
+    staging branch in context but never persisted its rollup_pr_number (and no
+    pr_merged) converges when GitHub reports a merged PR from that head branch.
+    The parent must terminalize COMPLETED, recover the lost rollup_pr_number,
+    and carry the integration-landing signal."""
+    _mock_lost_marker_github(
+        mocker,
+        prs=[
+            {
+                "number": 9901,
+                "merged": True,
+                "merged_at": "2026-06-17T00:00:00Z",
+                "html_url": "https://github.com/owner/repo/pull/9901",
+                "base": {"ref": "main"},
+            }
+        ],
+    )
+
+    project = Project(name="Lost Marker Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "research parent"}],
+        status=TaskStatus.EVALUATING,
+        # Staging branch present, but NO rollup_pr_number and NO pr_merged —
+        # the lost-marker window. No children: the lost-marker handler runs
+        # before any children/rollup-trigger branch.
+        context={"plan_branch": "rollup/stranded-staging"},
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.COMPLETED, (
+        f"Lost-marker parent whose rollup PR merged must converge COMPLETED, "
+        f"got {task.status}"
+    )
+    ctx = task.context or {}
+    assert ctx.get("rollup_pr_number") == 9901, (
+        "Lost-marker recovery must recover the un-persisted rollup_pr_number"
+    )
+    assert ctx.get("pr_merged") is True
+    assert ctx.get("landed_on_integration") is True
+
+
 # ── Rollup all-cancelled finalizer routes through the shared verdict ───────────
 # These exercise the REAL production entry point (the EVALUATING-timeout sweep →
 # the un-mocked rollup finalizer) for a parent whose children are all CANCELLED,
@@ -4249,9 +4325,7 @@ async def test_reaped_owner_with_merged_pr_reconciled_on_all_children_terminal(
 
 
 @pytest.mark.asyncio
-async def test_reaped_owner_with_open_pr_rearms_pr_state_check_pending(
-    eval_db, mocker
-):
+async def test_reaped_owner_with_open_pr_rearms_pr_state_check_pending(eval_db, mocker):
     """Defect 1 (open-PR branch): when all Review/Fix children are terminal but
     the owner's PR is still OPEN, the sweep must re-arm ``_pr_state_check_pending``
     and leave the owner EVALUATING — NOT reconcile to COMPLETED and NOT fall
@@ -4455,3 +4529,117 @@ async def test_reaped_owner_markerless_merged_pr_fallback_reconciles(eval_db, mo
     assert (owner.context or {}).get("pr_merged") is True, (
         "Reconciled reaped owner must have pr_merged stamped in context"
     )
+
+
+# ── Extracted approval-gate handler: direct dispositions + return contract ────
+
+
+@pytest.mark.asyncio
+async def test_handle_approval_gate_timeout_dispositions_and_contract(eval_db, mocker):
+    """Directly exercise the extracted ``_handle_approval_gate_timeout`` handler.
+
+    Locks the structural-extraction contract: the handler returns ``True`` for
+    every row it terminalizes/parks (so the caller ``continue``s) and ``False``
+    only when it leaves the row for the remaining recovery branches — and both
+    dispositions land exactly as before:
+
+      * a deliberate spend/budget hold past its window → CLEAN non-failure
+        ``CANCELLED`` (requires_approval cleared, ``spend_approval_declined``
+        stamped, NO ``record_task_result`` / failure alert);
+      * a non-marker (review-escalation) hold past 2h → ``FAILED`` with a failed
+        task result recorded and a failure alert dispatched;
+      * a non-marker hold still within the 2h window → handler returns ``False``
+        and leaves the task EVALUATING (fall-through);
+      * a task without ``requires_approval`` → handler returns ``False`` immediately.
+    """
+    from app.recovery_evaluating_approval import (
+        _handle_approval_gate_timeout,
+        APPROVAL_GATE_FAIL_SECONDS,
+    )
+
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+    fail_alert = AsyncMock()
+
+    project = Project(name="Approval Handler Direct", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    spend_hours = 24
+    spend_fail_seconds = spend_hours * 3600
+
+    def _make(ctx, *, requires_approval=True, ttype="research"):
+        t = Task(
+            project_id=project.id,
+            payloads=[{"type": ttype, "prompt": "approval-gate parent"}],
+            status=TaskStatus.EVALUATING,
+            requires_approval=requires_approval,
+            context=dict(ctx),
+        )
+        eval_db.add(t)
+        return t
+
+    spend_declined = _make(
+        {
+            "approval_hold_reason": "spend_budget",
+            "_approval_set_at": _naive_utc_ago(hours=25).isoformat(),
+            "_spend_hold_created_notified": True,
+            "_spend_hold_expiring_notified": True,
+        }
+    )
+    review_failed = _make(
+        {"_approval_set_at": _naive_utc_ago(hours=3).isoformat()},
+        ttype="review",
+    )
+    within_window = _make({"_approval_set_at": _naive_utc_ago(minutes=30).isoformat()})
+    no_approval = _make({}, requires_approval=False)
+    await eval_db.commit()
+    for t in (spend_declined, review_failed, within_window, no_approval):
+        await eval_db.refresh(t)
+
+    async def _call(task):
+        return await _handle_approval_gate_timeout(
+            task,
+            task.context or {},
+            eval_db,
+            now,
+            spend_approval_fail_seconds=spend_fail_seconds,
+            spend_hours=spend_hours,
+            maybe_create_failure_alert=fail_alert,
+        )
+
+    # 1) Spend/budget hold past window → handled (True), CLEAN CANCELLED.
+    assert await _call(spend_declined) is True
+    await eval_db.refresh(spend_declined)
+    assert spend_declined.status == TaskStatus.CANCELLED
+    assert spend_declined.requires_approval is False
+    assert spend_declined.context.get("spend_approval_declined") is True
+    assert "declined" in (spend_declined.latest_status_message or "").lower()
+    # Clean decline is NOT a task failure.
+    rec.assert_not_called()
+    fail_alert.assert_not_called()
+
+    # 2) Non-marker hold past 2h → handled (True), FAILED + failed result recorded.
+    assert await _call(review_failed) is True
+    await eval_db.refresh(review_failed)
+    assert review_failed.status == TaskStatus.FAILED
+    assert "approval" in (review_failed.latest_status_message or "").lower()
+    rec.assert_called_once()
+    assert rec.call_args.kwargs.get("success") is False
+    fail_alert.assert_awaited_once()
+
+    # 3) Non-marker hold still within the 2h window → fall through (False), untouched.
+    assert _naive_utc_ago(minutes=30) > now - timedelta(
+        seconds=APPROVAL_GATE_FAIL_SECONDS
+    )
+    assert await _call(within_window) is False
+    await eval_db.refresh(within_window)
+    assert within_window.status == TaskStatus.EVALUATING
+
+    # 4) Not approval-gated → fall through (False) without side effects.
+    assert await _call(no_approval) is False
+    await eval_db.refresh(no_approval)
+    assert no_approval.status == TaskStatus.EVALUATING

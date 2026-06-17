@@ -690,7 +690,7 @@ async def test_phase1_routes_through_spawn_review_helper(svc_db, mocker):
     mocker.patch("app.github._github_request", AsyncMock(return_value=mock_gh_resp))
 
     mock_helper = mocker.patch(
-        "app.recovery_post_commit._spawn_review_for_recovered_task",
+        "app.recovery_post_commit_orphans._spawn_review_for_recovered_task",
         new_callable=AsyncMock,
     )
 
@@ -729,7 +729,7 @@ async def test_phase2_routes_through_spawn_review_helper(svc_db, mocker):
     await svc_db.commit()
 
     mock_helper = mocker.patch(
-        "app.recovery_post_commit._spawn_review_for_recovered_task",
+        "app.recovery_post_commit_orphans._spawn_review_for_recovered_task",
         new_callable=AsyncMock,
     )
 
@@ -3087,7 +3087,9 @@ async def test_post_commit_sweep_defers_cleanly_when_row_held(svc_db, mocker):
     )
 
     # Capture real function BEFORE patching to avoid recursive call via the mock.
-    from app.recovery_post_commit import _claim_and_bump_total_attempts as _real_claim
+    from app.recovery_post_commit_pending import (
+        _claim_and_bump_total_attempts as _real_claim,
+    )
 
     # Return None for stuck task (row held), let other task claim normally.
     async def fake_claim(task_id, pending_meta):
@@ -3096,7 +3098,7 @@ async def test_post_commit_sweep_defers_cleanly_when_row_held(svc_db, mocker):
         return await _real_claim(task_id, pending_meta)
 
     mocker.patch(
-        "app.recovery_post_commit._claim_and_bump_total_attempts",
+        "app.recovery_post_commit_pending._claim_and_bump_total_attempts",
         side_effect=fake_claim,
     )
 

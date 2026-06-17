@@ -14447,6 +14447,65 @@ def test_apply_rollup_merge_classification_reexported_from_recovery_evaluating()
     )
 
 
+def test_recover_orphaned_tasks_reexported_from_recovery_post_commit():
+    """_recover_orphaned_tasks must be importable from recovery_post_commit and
+    recovery_post_commit_orphans, and both must resolve to the same callable."""
+    import app.services  # noqa: F401 — prime circular-import chain
+    import app.recovery_post_commit as _rpc
+    import app.recovery_post_commit_orphans as _rpo
+
+    assert callable(_rpc._recover_orphaned_tasks), (
+        "app.recovery_post_commit must re-export _recover_orphaned_tasks"
+    )
+    assert _rpc._recover_orphaned_tasks is _rpo._recover_orphaned_tasks, (
+        "re-export must be the same object as the canonical definition"
+    )
+    assert callable(_rpc._spawn_review_for_recovered_task), (
+        "app.recovery_post_commit must re-export _spawn_review_for_recovered_task"
+    )
+    assert (
+        _rpc._spawn_review_for_recovered_task is _rpo._spawn_review_for_recovered_task
+    ), "re-export must be the same object as the canonical definition"
+
+
+@pytest.mark.asyncio
+async def test_recover_orphaned_tasks_skips_non_write_type(reaper_db, mocker):
+    """_recover_orphaned_tasks must skip candidates whose task type is not in
+    WRITE_TASK_TYPES — no GitHub token fetch should occur for research tasks."""
+    from app.models import Task, TaskStatus, Project
+    from app.recovery_post_commit_orphans import _recover_orphaned_tasks
+
+    project = Project(
+        name="orphan-test-proj",
+        user_id="user1",
+        github_repo="owner/repo",
+        github_installation_id="inst-1",
+    )
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    now = _utcnow()
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        description="research task",
+        payloads=[{"type": "research", "prompt": "investigate something"}],
+        created_at=now - timedelta(minutes=10),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+
+    mock_get_token = mocker.AsyncMock(return_value=("gh_token", "owner", "repo"))
+    mocker.patch("app.routers.agent.get_github_token_for_task", mock_get_token)
+
+    await _recover_orphaned_tasks()
+
+    # research type is not in WRITE_TASK_TYPES — no GitHub lookup should occur
+    mock_get_token.assert_not_called()
+
+
 def test_snap_all_terminal_and_snap_any_completed():
     """Unit test for _snap_all_terminal and _snap_any_completed helpers."""
     import uuid
