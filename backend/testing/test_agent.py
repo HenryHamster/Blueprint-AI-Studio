@@ -29,6 +29,7 @@ from app.models import (
     ProjectStatus,
     ReleaseDeployArtifact,
     ReleaseVersion,
+    SourceKind,
     Task,
     TaskStatus,
     TaskWakeRegistration,
@@ -2443,6 +2444,151 @@ async def test_agent_claim_omits_repo_overview_for_non_repo_context_tasks(
 
     assert resp.status_code == 200
     assert "repo_overview" not in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_includes_domain_overview_for_repo_reading_tasks(
+    client: AsyncClient, db_session
+):
+    """Claim response includes domain_overview when a REPO_DOMAIN KnowledgeDocument exists."""
+    project = Project(
+        name="Domain Overview Test",
+        user_id="test-user-domain-1",
+        github_owner="acme",
+        github_repo="myapp",
+        build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
+        design_doc=_valid_repo_overview_doc(),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "repo_bootstrap", "prompt": "bootstrap"}],
+        vm_instance_id="agent-vm-domain-source-1",
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    long_body = "A" * 2000
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task.id,
+        title="Domain Overview",
+        summary="This is the domain summary.",
+        body=long_body,
+        source_kind=SourceKind.REPO_DOMAIN.value,
+        topic="domain-knowledge",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add a feature"}],
+        vm_instance_id="agent-vm-domain-claim-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-domain-claim-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "domain_overview" in data
+    dov = data["domain_overview"]
+    assert dov["summary"] == "This is the domain summary."
+    assert dov["body"] == long_body
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_omits_domain_overview_when_absent(
+    client: AsyncClient, db_session
+):
+    """Claim response omits domain_overview when no REPO_DOMAIN KnowledgeDocument exists."""
+    project = Project(
+        name="No Domain Overview Test",
+        user_id="test-user-domain-2",
+        build_config={},
+        design_doc=_valid_repo_overview_doc(),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add a feature"}],
+        vm_instance_id="agent-vm-no-domain-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-domain-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "domain_overview" not in resp.json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", ["repo_bootstrap", "web_research"])
+async def test_agent_claim_omits_domain_overview_for_non_repo_context_tasks(
+    client: AsyncClient, db_session, task_type
+):
+    """Claim response omits domain_overview for task types outside _REPO_OVERVIEW_TASK_TYPES."""
+    project = Project(
+        name="Non-Repo Domain Overview Test",
+        user_id="test-user-domain-3",
+        github_owner="acme",
+        github_repo="myapp",
+        build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
+        design_doc=_valid_repo_overview_doc(),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "repo_bootstrap", "prompt": "bootstrap"}],
+        vm_instance_id=f"agent-vm-domain-source-excl-{task_type}",
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task.id,
+        title="Domain Overview",
+        summary="Domain summary.",
+        body="Domain body.",
+        source_kind=SourceKind.REPO_DOMAIN.value,
+        topic="domain-knowledge",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": task_type, "prompt": "some prompt"}],
+        vm_instance_id=f"agent-vm-domain-excl-{task_type}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), f"agent-vm-domain-excl-{task_type}")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "domain_overview" not in resp.json()
 
 
 @pytest.mark.asyncio
