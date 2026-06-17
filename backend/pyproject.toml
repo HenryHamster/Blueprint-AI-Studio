@@ -66,7 +66,9 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 "app/recovery_sweeps.py" = ["BLE001"]
 "app/recovery_evaluating.py" = ["BLE001"]
 "app/recovery_evaluating_helpers.py" = ["BLE001"]
-"app/recovery_post_commit.py" = ["BLE001"]
+"app/recovery_post_commit.py" = ["BLE001", "PERF203"]
+"app/recovery_infrastructure.py" = ["BLE001", "PERF203"]
+"app/recovery_sidecar.py" = ["BLE001"]
 # lifecycle.py is the FastAPI lifespan that hosts every background service plus the
 # crash-monitor and leader-election loops. BLE001 (broad except) and PERF203
 # (try/except inside a loop) are both the intentional resilient-loop pattern — a
