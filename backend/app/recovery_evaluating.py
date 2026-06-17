@@ -60,6 +60,7 @@ from app.recovery_evaluating_helpers import (  # noqa: F401
     _dispatch_spend_hold_notification,
     _emit_spend_hold_created_signals,
     _heal_direction_outcomes_best_effort,
+    _apply_rollup_merge_classification,
 )
 from app.time_utils import _utcnow
 
@@ -439,7 +440,7 @@ async def _check_evaluating_timeouts(progress_cb=None):
                                 record_pr_merged,
                                 terminal_rollup_merge,
                                 landed_branch,
-                            ) = await classify_rollup_merge_outcome(
+                            ) = await _apply_rollup_merge_classification(
                                 task,
                                 _proj,
                                 session,
@@ -448,43 +449,23 @@ async def _check_evaluating_timeouts(progress_cb=None):
                                     "ref"
                                 ),
                                 source="services._check_evaluating_timeouts",
-                            )
-                            task.status = (
-                                TaskStatus.COMPLETED
-                                if terminal_rollup_merge
-                                else TaskStatus.EVALUATING
-                            )
-                            task.vm_instance_id = None
-                            task.last_heartbeat = None
-                            if terminal_rollup_merge:
-                                task.latest_status_message = (
+                                msg_terminal=(
                                     f"Recovered _pr_state_check_pending: PR "
                                     f"#{pr_num} merged out-of-band"
-                                )
-                            else:
-                                task.latest_status_message = (
+                                ),
+                                msg_non_terminal=(
                                     f"Recovered _pr_state_check_pending: PR "
-                                    f"#{pr_num} merged into {landed_branch}; "
+                                    f"#{pr_num} merged into {{landed}}; "
                                     "awaiting downstream landing"
-                                )
+                                ),
+                                hotfix_lane=bool(
+                                    (task.first_payload or {}).get("hotfix")
+                                    or _ctx2.get("hotfix")
+                                ),
+                                ctx_override=_ctx2,
+                                non_merge_reason="merged_pr_non_integration_branch",
+                            )
                             if record_pr_merged:
-                                # Route through the guarded landed-signal writer
-                                # so analytics get the integration-vs-promotion
-                                # distinction (mirrors agent_status.py /
-                                # reaper.py). Stage _ctx2 onto the task first so
-                                # the helper layers on top, then read it back —
-                                # _ctx2 is committed unconditionally below.
-                                task.context = _ctx2
-                                apply_merged_landed_signal(
-                                    task,
-                                    _proj,
-                                    base_branch=landed_branch,
-                                    hotfix_lane=bool(
-                                        (task.first_payload or {}).get("hotfix")
-                                        or _ctx2.get("hotfix")
-                                    ),
-                                    non_merge_reason="merged_pr_non_integration_branch",
-                                )
                                 _ctx2 = dict(task.context or {})
                                 _recovery_merge_refresh_needed = True
                         elif gh_pr_state == "closed" and not gh_pr_merged:
@@ -891,44 +872,34 @@ async def _check_evaluating_timeouts(progress_cb=None):
                         ) or None
 
                         _lm_proj = await session.get(Project, task.project_id)
-                        (
-                            _lm_record_merged,
-                            _lm_terminal,
-                            _lm_landed,
-                        ) = await classify_rollup_merge_outcome(
-                            task,
-                            _lm_proj,
-                            session,
-                            pr_number=_lm_pr_num,
-                            merged_base_branch=_lm_base_ref,
-                            source="recovery_sweeps.lost_marker",
-                        )
                         _lm_new_ctx = _clear_rollup_transient_state({**ctx})
                         if _lm_pr_num:
                             _lm_new_ctx["rollup_pr_number"] = _lm_pr_num
                         if _lm_pr_url:
                             _lm_new_ctx["rollup_pr_url"] = _lm_pr_url
                         task.context = _lm_new_ctx
-                        if _lm_record_merged:
-                            mark_landed_on_integration(task)
-                        flag_modified(task, "context")
-                        task.status = (
-                            TaskStatus.COMPLETED
-                            if _lm_terminal
-                            else TaskStatus.EVALUATING
-                        )
-                        task.vm_instance_id = None
-                        task.last_heartbeat = None
-                        if _lm_terminal:
-                            task.latest_status_message = (
+                        (
+                            _lm_record_merged,
+                            _lm_terminal,
+                            _lm_landed,
+                        ) = await _apply_rollup_merge_classification(
+                            task,
+                            _lm_proj,
+                            session,
+                            pr_number=_lm_pr_num,
+                            merged_base_branch=_lm_base_ref,
+                            source="recovery_sweeps.lost_marker",
+                            msg_terminal=(
                                 f"✓ rollup PR #{_lm_pr_num} already merged to "
-                                f"{_lm_landed}; converged from stranded EVALUATING"
-                            )
-                        else:
-                            task.latest_status_message = (
+                                f"{{landed}}; converged from stranded EVALUATING"
+                            ),
+                            msg_non_terminal=(
                                 f"Lost-marker recovery: rollup PR #{_lm_pr_num} "
-                                f"merged into {_lm_landed}; awaiting downstream landing"
-                            )
+                                f"merged into {{landed}}; awaiting downstream landing"
+                            ),
+                            hotfix_lane=None,
+                        )
+                        flag_modified(task, "context")
                         session.add(task)
                         await session.commit()
                         logger.info(

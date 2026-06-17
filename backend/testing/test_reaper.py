@@ -39,6 +39,8 @@ from app.models import (
 from app.reaper import (
     reaper_service,
     _copy_analysis_artifacts_to_previous,
+    _snap_all_terminal,
+    _snap_any_completed,
     _reaper_skip_counts,
     _orphan_reap_crash_streaks,
     _ORPHAN_REAP_CRASH_STREAK_LIMIT,
@@ -14255,3 +14257,228 @@ def test_extracted_sweeps_reexported_from_reaper_sweeps():
             f"app.reaper_bug_message_sweeps.{name} — the re-export is a "
             "stale copy, not a live reference to the sub-module symbol"
         )
+
+
+# ── _apply_rollup_merge_classification helper ────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_rollup_merge",
+    [True, False],
+    ids=["terminal", "non-terminal"],
+)
+async def test_apply_rollup_merge_classification_hotfix_lane_bool(
+    terminal_rollup_merge, mocker
+):
+    """hotfix_lane=False → apply_merged_landed_signal called when record_merged;
+    task.status, vm_instance_id, last_heartbeat, and message set correctly."""
+    import app.services  # noqa: F401 — prime circular-import chain before importing helpers
+    from app.recovery_evaluating_helpers import _apply_rollup_merge_classification
+    from app.models import Task, TaskStatus
+
+    task = Task(
+        status=TaskStatus.EVALUATING,
+        context={"some_key": "value"},
+        vm_instance_id="vm-old",
+        last_heartbeat=datetime(2026, 1, 1),
+    )
+    task.payloads = [{"type": "create", "hotfix": False}]
+
+    mock_classify = mocker.patch(
+        "app.branch_resolution.classify_rollup_merge_outcome",
+        new_callable=AsyncMock,
+        return_value=(True, terminal_rollup_merge, "main"),
+    )
+    mock_apply = mocker.patch(
+        "app.landed_signal.apply_merged_landed_signal",
+        return_value=True,
+    )
+    mocker.patch(
+        "app.landed_signal.mark_landed_on_integration",
+    )
+
+    mock_proj = object()
+    mock_session = AsyncMock()
+    ctx_override = {"staged": True}
+
+    record_merged, terminal, landed = await _apply_rollup_merge_classification(
+        task,
+        mock_proj,
+        mock_session,
+        pr_number=42,
+        merged_base_branch="main",
+        source="test",
+        msg_terminal="PR merged out-of-band",
+        msg_non_terminal="PR merged into {landed}; awaiting downstream landing",
+        hotfix_lane=False,
+        ctx_override=ctx_override,
+        non_merge_reason="merged_pr_non_integration_branch",
+    )
+
+    assert record_merged is True
+    assert terminal is terminal_rollup_merge
+    assert landed == "main"
+
+    assert task.status == (
+        TaskStatus.COMPLETED if terminal_rollup_merge else TaskStatus.EVALUATING
+    )
+    assert task.vm_instance_id is None
+    assert task.last_heartbeat is None
+    if terminal_rollup_merge:
+        assert task.latest_status_message == "PR merged out-of-band"
+    else:
+        assert (
+            task.latest_status_message
+            == "PR merged into main; awaiting downstream landing"
+        )
+
+    mock_classify.assert_awaited_once_with(
+        task,
+        mock_proj,
+        mock_session,
+        pr_number=42,
+        merged_base_branch="main",
+        source="test",
+    )
+    mock_apply.assert_called_once_with(
+        task,
+        mock_proj,
+        base_branch="main",
+        hotfix_lane=False,
+        non_merge_reason="merged_pr_non_integration_branch",
+    )
+    assert task.context is ctx_override
+
+
+@pytest.mark.asyncio
+async def test_apply_rollup_merge_classification_no_signal_when_not_record_merged(
+    mocker,
+):
+    """When record_merged=False, neither apply_merged_landed_signal nor
+    mark_landed_on_integration is called."""
+    import app.services  # noqa: F401 — prime circular-import chain before importing helpers
+    from app.recovery_evaluating_helpers import _apply_rollup_merge_classification
+    from app.models import Task, TaskStatus
+
+    task = Task(status=TaskStatus.EVALUATING)
+    task.payloads = [{"type": "create"}]
+
+    mocker.patch(
+        "app.branch_resolution.classify_rollup_merge_outcome",
+        new_callable=AsyncMock,
+        return_value=(False, True, "main"),
+    )
+    mock_apply = mocker.patch("app.landed_signal.apply_merged_landed_signal")
+    mock_mark = mocker.patch("app.landed_signal.mark_landed_on_integration")
+
+    record_merged, terminal, landed = await _apply_rollup_merge_classification(
+        task,
+        object(),
+        AsyncMock(),
+        pr_number=7,
+        merged_base_branch="main",
+        source="test",
+        msg_terminal="done",
+        msg_non_terminal="pending {landed}",
+        hotfix_lane=False,
+    )
+
+    assert record_merged is False
+    assert terminal is True
+    mock_apply.assert_not_called()
+    mock_mark.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_rollup_merge_classification_hotfix_lane_none_routes_mark_landed(
+    mocker,
+):
+    """hotfix_lane=None → mark_landed_on_integration called; apply_merged_landed_signal skipped."""
+    import app.services  # noqa: F401 — prime circular-import chain before importing helpers
+    from app.recovery_evaluating_helpers import _apply_rollup_merge_classification
+    from app.models import Task, TaskStatus
+
+    task = Task(status=TaskStatus.EVALUATING, context={"rollup_pr_number": 5})
+    task.payloads = [{"type": "create"}]
+
+    mocker.patch(
+        "app.branch_resolution.classify_rollup_merge_outcome",
+        new_callable=AsyncMock,
+        return_value=(True, True, "automain"),
+    )
+    mock_apply = mocker.patch("app.landed_signal.apply_merged_landed_signal")
+    mock_mark = mocker.patch("app.landed_signal.mark_landed_on_integration")
+
+    record_merged, terminal, landed = await _apply_rollup_merge_classification(
+        task,
+        object(),
+        AsyncMock(),
+        pr_number=5,
+        merged_base_branch="automain",
+        source="recovery_sweeps.lost_marker",
+        msg_terminal="✓ rollup PR #5 already merged to {landed}; converged",
+        msg_non_terminal="Lost-marker: merged into {landed}; awaiting",
+        hotfix_lane=None,
+    )
+
+    assert record_merged is True
+    assert terminal is True
+    assert landed == "automain"
+    assert task.status == TaskStatus.COMPLETED
+    assert task.vm_instance_id is None
+    assert task.last_heartbeat is None
+    assert (
+        task.latest_status_message
+        == "✓ rollup PR #5 already merged to automain; converged"
+    )
+    mock_apply.assert_not_called()
+    mock_mark.assert_called_once_with(task)
+
+
+def test_apply_rollup_merge_classification_reexported_from_recovery_evaluating():
+    """_apply_rollup_merge_classification must be importable from recovery_evaluating
+    so existing patch targets continue to work."""
+    import app.services  # noqa: F401 — prime circular-import chain
+    import app.recovery_evaluating as _re
+
+    assert hasattr(_re, "_apply_rollup_merge_classification"), (
+        "app.recovery_evaluating must re-export _apply_rollup_merge_classification"
+    )
+
+
+def test_snap_all_terminal_and_snap_any_completed():
+    """Unit test for _snap_all_terminal and _snap_any_completed helpers."""
+    import uuid
+    from app.models import TaskStatus
+
+    tid = uuid.uuid4()
+    snap_empty = []
+    snap_all_done = [
+        (tid, TaskStatus.FAILED, {}),
+        (uuid.uuid4(), TaskStatus.CANCELLED, {}),
+    ]
+    snap_with_completed = [
+        (tid, TaskStatus.COMPLETED, {}),
+        (uuid.uuid4(), TaskStatus.FAILED, {}),
+    ]
+    snap_running = [
+        (tid, TaskStatus.IN_PROGRESS, {}),
+        (uuid.uuid4(), TaskStatus.FAILED, {}),
+    ]
+
+    # empty snapshot: vacuously all-terminal, none completed
+    assert _snap_all_terminal(snap_empty) is True
+    assert _snap_any_completed(snap_empty) is False
+
+    # all terminal, none completed
+    assert _snap_all_terminal(snap_all_done) is True
+    assert _snap_any_completed(snap_all_done) is False
+
+    # has a completed child
+    assert _snap_all_terminal(snap_with_completed) is True
+    assert _snap_any_completed(snap_with_completed) is True
+
+    # one child still running
+    assert _snap_all_terminal(snap_running) is False
+    assert _snap_any_completed(snap_running) is False

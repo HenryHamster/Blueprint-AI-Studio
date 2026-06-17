@@ -508,6 +508,19 @@ async def _mark_landed_parent_dependents(parent_id, session) -> None:
         )
 
 
+_SNAPSHOT_TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+
+
+def _snap_all_terminal(snap: list[tuple]) -> bool:
+    """Return True iff every child in the snapshot tuple list has a terminal status."""
+    return all(status in _SNAPSHOT_TERMINAL for _, status, _ in snap)
+
+
+def _snap_any_completed(snap: list[tuple]) -> bool:
+    """Return True iff at least one child in the snapshot tuple list is COMPLETED."""
+    return any(status == TaskStatus.COMPLETED for _, status, _ in snap)
+
+
 async def reaper_service():
     """
     Background worker that scans for orphaned VMs.
@@ -3297,11 +3310,6 @@ async def reaper_service():
                 # at ``_children_snapshot_by_parent`` for why we don't touch
                 # live ORM children here.
                 try:
-                    _terminal = {
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                        TaskStatus.CANCELLED,
-                    }
                     rescued = 0
                     for parent_id in _parent_ids:
                         # Heartbeat: this rescue loop calls _requeue_parent_task
@@ -3312,15 +3320,10 @@ async def reaper_service():
                         children_snap = _children_snapshot_by_parent.get(parent_id, [])
                         if not children_snap:
                             continue
-                        if any(
-                            status not in _terminal for _, status, _ in children_snap
-                        ):
+                        if not _snap_all_terminal(children_snap):
                             # At least one child still running — not safe to rescue yet.
                             continue
-                        if any(
-                            status == TaskStatus.COMPLETED
-                            for _, status, _ in children_snap
-                        ):
+                        if _snap_any_completed(children_snap):
                             # Step 3 handles this; skip.
                             continue
                         # All children are terminal and none completed — attempt re-evaluation

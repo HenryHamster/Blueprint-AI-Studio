@@ -156,6 +156,42 @@ def _post_commit_retry_is_transient(exc: BaseException) -> bool:
     return any(s in msg for s in _POST_COMMIT_TRANSIENT_SUBSTRINGS)
 
 
+def _build_post_commit_abandoned_context(
+    ctx: dict,
+    *,
+    after_attempts: int | None = None,
+    after_total_attempts: int | None = None,
+    after_pending_age_s: int | None = None,
+    reason: str | None = None,
+    last_reason: str | None = None,
+) -> dict:
+    """Build context dict with _post_commit_abandoned marker.
+
+    Returns a new context dict with:
+    - _post_commit_abandoned key set with provided fields (always includes "at")
+    - _post_commit_pending_meta key removed
+
+    Does not touch any session or database.
+    """
+    new_ctx = dict(ctx or {})
+    abandoned = {"at": _utcnow().isoformat()}
+
+    if after_attempts is not None:
+        abandoned["after_attempts"] = after_attempts
+    if after_total_attempts is not None:
+        abandoned["after_total_attempts"] = after_total_attempts
+    if after_pending_age_s is not None:
+        abandoned["after_pending_age_s"] = after_pending_age_s
+    if reason is not None:
+        abandoned["reason"] = reason
+    if last_reason is not None:
+        abandoned["last_reason"] = last_reason
+
+    new_ctx["_post_commit_abandoned"] = abandoned
+    new_ctx.pop("_post_commit_pending_meta", None)
+    return new_ctx
+
+
 async def _sweep_post_commit_pending():
     """Re-run _process_post_commit for terminal tasks whose prior attempt died.
 
@@ -438,17 +474,16 @@ async def _sweep_post_commit_pending():
                                 )
                             refreshed = await age_session.get(Task, task.id)
                             if refreshed and refreshed.post_commit_pending:
-                                _new_ctx = dict(refreshed.context or {})
-                                _new_ctx["_post_commit_abandoned"] = {
-                                    "at": _utcnow().isoformat(),
-                                    "after_attempts": attempts,
-                                    "after_total_attempts": total_attempts,
-                                    "after_pending_age_s": int(_pending_age_s),
-                                    "reason": "max_pending_age_exceeded",
-                                    "last_reason": pending_meta.get("reason"),
-                                }
-                                _new_ctx.pop("_post_commit_pending_meta", None)
-                                refreshed.context = _new_ctx
+                                refreshed.context = (
+                                    _build_post_commit_abandoned_context(
+                                        refreshed.context,
+                                        after_attempts=attempts,
+                                        after_total_attempts=total_attempts,
+                                        after_pending_age_s=int(_pending_age_s),
+                                        reason="max_pending_age_exceeded",
+                                        last_reason=pending_meta.get("reason"),
+                                    )
+                                )
                                 refreshed.post_commit_pending = False
                                 refreshed.post_commit_failed = True
                                 from sqlalchemy.orm.attributes import flag_modified
@@ -493,15 +528,12 @@ async def _sweep_post_commit_pending():
                         f"total_attempts={total_attempts}) — marking "
                         f"post_commit_abandoned"
                     )
-                    new_ctx = dict(ctx)
-                    new_ctx["_post_commit_abandoned"] = {
-                        "at": _utcnow().isoformat(),
-                        "after_attempts": attempts,
-                        "after_total_attempts": total_attempts,
-                        "last_reason": pending_meta.get("reason"),
-                    }
-                    new_ctx.pop("_post_commit_pending_meta", None)
-                    task.context = new_ctx
+                    task.context = _build_post_commit_abandoned_context(
+                        ctx,
+                        after_attempts=attempts,
+                        after_total_attempts=total_attempts,
+                        last_reason=pending_meta.get("reason"),
+                    )
                     task.post_commit_pending = False
                     task.post_commit_failed = True
                     from sqlalchemy.orm.attributes import flag_modified
@@ -517,13 +549,9 @@ async def _sweep_post_commit_pending():
                     logger.warning(
                         f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} has no saved payload — cannot retry"
                     )
-                    new_ctx = dict(ctx)
-                    new_ctx["_post_commit_abandoned"] = {
-                        "at": _utcnow().isoformat(),
-                        "reason": "no_saved_payload",
-                    }
-                    new_ctx.pop("_post_commit_pending_meta", None)
-                    task.context = new_ctx
+                    task.context = _build_post_commit_abandoned_context(
+                        ctx, reason="no_saved_payload"
+                    )
                     task.post_commit_pending = False
                     task.post_commit_failed = True
                     from sqlalchemy.orm.attributes import flag_modified
@@ -586,15 +614,12 @@ async def _sweep_post_commit_pending():
                     async with services.AsyncSessionLocal() as ceiling_session:
                         refreshed = await ceiling_session.get(Task, task.id)
                         if refreshed and refreshed.post_commit_pending:
-                            _new_ctx = dict(refreshed.context or {})
-                            _new_ctx["_post_commit_abandoned"] = {
-                                "at": _utcnow().isoformat(),
-                                "after_attempts": attempts,
-                                "after_total_attempts": total_attempts,
-                                "last_reason": pending_meta.get("reason"),
-                            }
-                            _new_ctx.pop("_post_commit_pending_meta", None)
-                            refreshed.context = _new_ctx
+                            refreshed.context = _build_post_commit_abandoned_context(
+                                refreshed.context,
+                                after_attempts=attempts,
+                                after_total_attempts=total_attempts,
+                                last_reason=pending_meta.get("reason"),
+                            )
                             refreshed.post_commit_pending = False
                             refreshed.post_commit_failed = True
                             from sqlalchemy.orm.attributes import flag_modified
@@ -1348,6 +1373,7 @@ _AWAITING_SIDECAR_KEYS = (
     "awaiting_review_second_opinion",
 )
 _SIDECAR_VERDICT_APPLICATION_PENDING_KEY = "sidecar_verdict_application_pending"
+_SIDECAR_SWEEP_MAX_PER_CYCLE = 50
 
 
 async def _sweep_stranded_sidecar_sources() -> None:
@@ -1376,7 +1402,9 @@ async def _sweep_stranded_sidecar_sources() -> None:
     try:
         async with services.AsyncSessionLocal() as session:
             result = await session.execute(
-                select(Task).where(Task.status == TaskStatus.EVALUATING)
+                select(Task)
+                .where(Task.status == TaskStatus.EVALUATING)
+                .limit(_SIDECAR_SWEEP_MAX_PER_CYCLE)
             )
             evaluating = result.scalars().all()
 
@@ -1415,6 +1443,12 @@ async def _sweep_stranded_sidecar_sources() -> None:
             if resolved:
                 logger.info(
                     "[SIDECAR-RECOVERY] Resolved %d stranded source task(s)", resolved
+                )
+            if len(evaluating) >= _SIDECAR_SWEEP_MAX_PER_CYCLE:
+                logger.warning(
+                    "[SIDECAR-RECOVERY] Hit per-cycle cap of %d stranded sources — "
+                    "remainder deferred to next sweep",
+                    _SIDECAR_SWEEP_MAX_PER_CYCLE,
                 )
 
             if resolve_dialect_name(session) == "postgresql":
