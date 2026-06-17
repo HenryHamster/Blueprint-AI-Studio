@@ -46,6 +46,7 @@
     "reaper.py": 4850,
     "reaper_sweeps.py": 2750,
     "reaper_bug_message_sweeps.py": 1400,
+    "blocked_task_unblock_sweeps.py": 1750,
     "reaper_infra_recovery.py": 850,
     "agent_status_spawn.py": 650,
     "admin_task_mutations.py": 1350,
