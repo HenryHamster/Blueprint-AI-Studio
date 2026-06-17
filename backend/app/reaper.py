@@ -79,7 +79,7 @@ from app.failure_classification import (
 )
 from app.retry_budget import append_failure_class_history
 from app.task_blocked import strip_fresh_attempt_context
-from app.time_utils import _utcnow, set_retry_after
+from app.time_utils import _utcnow, clear_retry_after, set_retry_after
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 from app.schemas import redact_command_log_text
 
@@ -2290,7 +2290,6 @@ async def reaper_service():
                             _copy_analysis_artifacts_to_previous(da_ctx)
                             da_ctx = clear_task_llm_runtime_context(da_ctx)
                             da_ctx.pop("_slot_released", None)
-                            task.retry_after_until = None
                             da_ctx.pop("provision_failures", None)
                             # Clear the stale DEAD_AUTH verdict and matched pattern so
                             # the next attempt is classified fresh for its own provider.
@@ -2303,6 +2302,7 @@ async def reaper_service():
                             da_ctx.pop("failure_class", None)
                             da_ctx.pop("dead_auth_matched_pattern", None)
                             task.context = da_ctx
+                            clear_retry_after(task)
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),
@@ -2342,12 +2342,11 @@ async def reaper_service():
                             _copy_analysis_artifacts_to_previous(rl_ctx)
                             rl_ctx = clear_task_llm_runtime_context(rl_ctx)
                             rl_ctx.pop("_slot_released", None)
-                            # Audit W1: retry_after_until is a column now.
-                            task.retry_after_until = None
                             # Rate-limit is an account-level issue, not a provision failure —
                             # don't carry provision budget into the next dispatch.
                             rl_ctx.pop("provision_failures", None)
                             task.context = rl_ctx
+                            clear_retry_after(task)
                             persist_authoritative_verdict(task, RATE_LIMIT)
                             session.add(task)
                             await broadcast_to_project(
