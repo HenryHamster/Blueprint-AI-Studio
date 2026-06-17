@@ -668,6 +668,80 @@ async def test_orphan_recovery_recovers_qa_task(svc_db, mocker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# _spawn_review_for_recovered_task helper routing
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_phase1_routes_through_spawn_review_helper(svc_db, mocker):
+    """Phase 1 (COMPLETED orphan with missing review) invokes _spawn_review_for_recovered_task."""
+    project = await _make_project(svc_db)
+    await _make_completed_task(svc_db, project.id, task_type="create")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh_token", "owner", "repo"),
+    )
+    pr_url = "https://github.com/owner/repo/pull/11"
+    mock_gh_resp = MagicMock()
+    mock_gh_resp.status_code = 200
+    mock_gh_resp.json.return_value = [{"html_url": pr_url, "number": 11}]
+    mocker.patch("app.github._github_request", AsyncMock(return_value=mock_gh_resp))
+
+    mock_helper = mocker.patch(
+        "app.recovery_post_commit._spawn_review_for_recovered_task",
+        new_callable=AsyncMock,
+    )
+
+    await _recover_orphaned_tasks()
+
+    mock_helper.assert_called_once()
+    call_kwargs = mock_helper.call_args.kwargs
+    assert call_kwargs["pr_number"] == 11
+    assert "Auto-recovered orphaned PR" in call_kwargs["alert_title"]
+
+
+@pytest.mark.asyncio
+async def test_phase2_routes_through_spawn_review_helper(svc_db, mocker):
+    """Phase 2 (reaped task with PR artifact) invokes _spawn_review_for_recovered_task."""
+    project = await _make_project(svc_db)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do create"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        attempt_count=1,
+        created_at=_naive_utc_ago(minutes=30),
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+    await svc_db.refresh(task)
+
+    pr_url = "https://github.com/owner/repo/pull/22"
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url=pr_url,
+    )
+    svc_db.add(artifact)
+    await svc_db.commit()
+
+    mock_helper = mocker.patch(
+        "app.recovery_post_commit._spawn_review_for_recovered_task",
+        new_callable=AsyncMock,
+    )
+
+    await _recover_orphaned_tasks()
+
+    mock_helper.assert_called_once()
+    call_kwargs = mock_helper.call_args.kwargs
+    assert call_kwargs["pr_number"] == 22
+    assert "reaped" in call_kwargs["alert_title"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # _persist_circuit_breakers
 # ══════════════════════════════════════════════════════════════════════════════
 

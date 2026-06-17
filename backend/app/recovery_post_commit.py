@@ -905,10 +905,67 @@ async def _recover_childless_evaluating_without_marker():
         )
 
 
+async def _spawn_review_for_recovered_task(
+    source_task,
+    session,
+    pr_number: int,
+    branch: str,
+    base_branch: str,
+    original_prompt: str,
+    original_task_id: str,
+    project_id,
+    short_id: str,
+    alert_title: str,
+    alert_message: str,
+    log_message: str,
+) -> None:
+    """Spawn review pipeline + alert + broadcast for a recovered task.
+
+    Shared by Phase 1 (COMPLETED orphan) and Phase 2 (reaped-with-artifact)
+    of _recover_orphaned_tasks; the caller commits before invoking this for
+    Phase 2 (task status transition), then this helper does the spawn-commit
+    and broadcast in one place.
+    """
+    from app.review_pipeline import _spawn_pipeline_task
+
+    review_task, _ = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        session,
+        pr_number,
+        branch,
+        base_branch,
+        original_prompt=original_prompt,
+        original_task_id=original_task_id,
+    )
+
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title=alert_title,
+        message=alert_message,
+        task_id=source_task.id,
+    )
+    session.add(alert)
+    await session.commit()
+
+    await services.broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": "WARNING",
+            "title": alert.title,
+        },
+    )
+    logger.warning(
+        log_message + f", review={str(review_task.id)[:8] if review_task else 'NONE'}"
+    )
+
+
 async def _recover_orphaned_tasks():
     """Detect COMPLETED tasks with no PR artifact and no review child. Look up PR on GitHub and spawn review."""
     from app.routers.agent import get_github_token_for_task
-    from app.review_pipeline import _spawn_pipeline_task
     from app.orchestrator import _mark_orchestrator_progress
     from app.models import Project
 
@@ -1133,43 +1190,22 @@ async def _recover_orphaned_tasks():
                 )
                 session.add(artifact)
 
-                # Spawn review
                 original_prompt = task.first_payload.get(
                     "prompt", task.description or ""
                 )
-                review_task, _ = await _spawn_pipeline_task(
-                    task,
-                    "review",
-                    session,
-                    pr_number,
-                    branch,
-                    base_branch,
+                await _spawn_review_for_recovered_task(
+                    source_task=task,
+                    session=session,
+                    pr_number=pr_number,
+                    branch=branch,
+                    base_branch=base_branch,
                     original_prompt=original_prompt,
                     original_task_id=str(task.id),
-                )
-
-                # Create alert
-                alert = Alert(
                     project_id=task.project_id,
-                    severity=AlertSeverity.WARNING,
-                    title=f"Auto-recovered orphaned PR #{pr_number}",
-                    message=f"Task {str(task.id)[:8]} completed with PR #{pr_number} but review was never spawned. Auto-recovered.",
-                    task_id=task.id,
-                )
-                session.add(alert)
-                await session.commit()
-
-                await services.broadcast_to_project(
-                    str(task.project_id),
-                    "alert_created",
-                    {
-                        "alert_id": str(alert.id),
-                        "severity": "WARNING",
-                        "title": alert.title,
-                    },
-                )
-                logger.warning(
-                    f"[RECOVERY] Auto-recovered orphaned task {str(task.id)[:8]} → PR #{pr_number}, review={str(review_task.id)[:8] if review_task else 'NONE'}"
+                    short_id=str(task.id)[:8],
+                    alert_title=f"Auto-recovered orphaned PR #{pr_number}",
+                    alert_message=f"Task {str(task.id)[:8]} completed with PR #{pr_number} but review was never spawned. Auto-recovered.",
+                    log_message=f"[RECOVERY] Auto-recovered orphaned task {str(task.id)[:8]} → PR #{pr_number}",
                 )
 
         # Phase 2: Reaped-with-artifact recovery.
@@ -1327,38 +1363,19 @@ async def _recover_orphaned_tasks():
                         f"[RECOVERY] Task {short_id} disappeared after release-commit — skipping spawn"
                     )
                     continue
-                review_task, _ = await _spawn_pipeline_task(
-                    refreshed,
-                    "review",
-                    session,
-                    pr_number,
-                    branch,
-                    base_branch,
+                await _spawn_review_for_recovered_task(
+                    source_task=refreshed,
+                    session=session,
+                    pr_number=pr_number,
+                    branch=branch,
+                    base_branch=base_branch,
                     original_prompt=original_prompt,
                     original_task_id=str(task_id_local),
-                )
-
-                alert = Alert(
                     project_id=project_id_local,
-                    severity=AlertSeverity.WARNING,
-                    title=f"Auto-recovered reaped task with PR #{pr_number}",
-                    message=f"Task {short_id} was reaped after creating PR #{pr_number}. Auto-completed and review spawned.",
-                    task_id=task_id_local,
-                )
-                session.add(alert)
-                await session.commit()
-
-                await services.broadcast_to_project(
-                    str(project_id_local),
-                    "alert_created",
-                    {
-                        "alert_id": str(alert.id),
-                        "severity": "WARNING",
-                        "title": alert.title,
-                    },
-                )
-                logger.warning(
-                    f"[RECOVERY] Auto-completed reaped task {short_id} → PR #{pr_number}, review={str(review_task.id)[:8] if review_task else 'NONE'}"
+                    short_id=short_id,
+                    alert_title=f"Auto-recovered reaped task with PR #{pr_number}",
+                    alert_message=f"Task {short_id} was reaped after creating PR #{pr_number}. Auto-completed and review spawned.",
+                    log_message=f"[RECOVERY] Auto-completed reaped task {short_id} → PR #{pr_number}",
                 )
     except Exception as e:
         logger.error(f"[RECOVERY] Orphaned task sweep failed: {e}", exc_info=True)
