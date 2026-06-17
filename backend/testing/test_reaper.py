@@ -2042,7 +2042,7 @@ async def test_general_exponential_backoff_capped_at_15_minutes(
             }
         },
     )
-    mocker.patch("app.reaper.random.uniform", return_value=1.0)
+    mocker.patch("app.time_utils.random.uniform", return_value=1.0)
 
     project = await _make_project(reaper_db)
     t = Task(

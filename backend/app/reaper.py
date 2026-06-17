@@ -78,7 +78,12 @@ from app.failure_classification import (
 )
 from app.retry_budget import append_failure_class_history
 from app.task_blocked import strip_fresh_attempt_context
-from app.time_utils import _utcnow, clear_retry_after, exponential_backoff, set_retry_after
+from app.time_utils import (
+    _utcnow,
+    clear_retry_after,
+    exponential_backoff,
+    set_retry_after,
+)
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 
 logger = logging.getLogger(__name__)
@@ -562,7 +567,9 @@ async def reaper_service():
                 _runtime_config.get("reaper_cycle_halt_cooldown_seconds", 300)
             )
             half_open_failures = _reaper_halt_state.get("half_open_failures", 0)
-            cooldown = exponential_backoff(half_open_failures + 1, base=float(cooldown_base), cap=3600.0)
+            cooldown = exponential_backoff(
+                half_open_failures + 1, base=float(cooldown_base), cap=3600.0
+            )
             elapsed = (
                 (_utcnow() - halt_ts).total_seconds() if halt_ts else (cooldown + 1)
             )
@@ -2515,9 +2522,15 @@ async def reaper_service():
                                         ] * random.uniform(0.75, 1.25)
                                 else:
                                     # Exponential backoff for agent failures: 1, 2, 4, 8 min capped at 15
-                                    delay_minutes = min(
-                                        2 ** (task.attempt_count - 1), 15
-                                    ) * random.uniform(0.75, 1.25)
+                                    delay_minutes = (
+                                        exponential_backoff(
+                                            task.attempt_count,
+                                            base=60,
+                                            cap=900,
+                                            jitter=0.25,
+                                        )
+                                        / 60
+                                    )
                                 if task_type == "research":
                                     try:
                                         from app.autonomous_research import (
@@ -3881,7 +3894,9 @@ async def reaper_service():
                     )
 
         # Sleep before next cycle; use exponential backoff on consecutive errors
-        sleep_seconds = exponential_backoff(consecutive_errors + 1, base=60.0, cap=300.0, jitter=0.0)
+        sleep_seconds = exponential_backoff(
+            consecutive_errors + 1, base=60.0, cap=300.0, jitter=0.0
+        )
         try:
             await asyncio.sleep(sleep_seconds)
         except asyncio.CancelledError:
