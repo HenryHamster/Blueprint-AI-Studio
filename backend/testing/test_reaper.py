@@ -358,6 +358,7 @@ async def reaper_db(mocker):
         expire_on_commit=False,
     )
     mocker.patch("app.reaper.AsyncSessionLocal", Session)
+    mocker.patch("app.reaper_halt.AsyncSessionLocal", Session)
 
     async with Session() as s:
         yield s
