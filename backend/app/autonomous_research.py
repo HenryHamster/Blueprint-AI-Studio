@@ -523,6 +523,47 @@ async def _check_half_open_test_task(
     return False
 
 
+async def _advance_circuit_breaker_and_check(
+    project: "Project",
+    session: AsyncSession,
+    breaker: dict,
+    spawn_label: str,
+) -> bool:
+    """Advance OPEN→HALF_OPEN if cooldown elapsed; re-check HALF_OPEN test task.
+
+    Returns True if the circuit breaker is blocking the spawn (caller should
+    return immediately), False if spawn is allowed to proceed.
+    """
+    if breaker["state"] == "OPEN":
+        if (
+            breaker["opened_at"]
+            and (_utcnow() - breaker["opened_at"]).total_seconds()
+            >= breaker["cooldown_seconds"]
+        ):
+            breaker["state"] = "HALF_OPEN"
+            logger.warning(
+                f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)"
+            )
+        else:
+            logger.warning(
+                f"[CIRCUIT BREAKER] Skipping {spawn_label} for project={project.id} "
+                f"— circuit breaker state=OPEN (still in cooldown)"
+            )
+            await _maybe_notify_operator_refresh_deferred(
+                project, session, "paused while the research circuit breaker is open"
+            )
+            return True
+    elif breaker["state"] == "HALF_OPEN":
+        if await _check_half_open_test_task(project.id, session, breaker):
+            await _maybe_notify_operator_refresh_deferred(
+                project,
+                session,
+                "paused while the research circuit breaker is open",
+            )
+            return True
+    return False
+
+
 async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     """Inner implementation — always called under the per-project spawn lock."""
     from app.research_completion import (
@@ -584,44 +625,16 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         )
         return
     # Guard: circuit breaker must allow spawning
+    # A struggling project (breaker OPEN) is exactly when an operator is
+    # most likely to steer; never swallow that silently. Notify (once)
+    # that steering is queued while the breaker cools down. The marker is
+    # preserved — only the spawn returns — so steering still lands once
+    # the breaker clears.
     breaker = _shared_state.get_circuit_breaker(str(project.id))
-    if breaker["state"] == "OPEN":
-        # Check if cooldown has elapsed → transition to HALF-OPEN
-        if (
-            breaker["opened_at"]
-            and (_utcnow() - breaker["opened_at"]).total_seconds()
-            >= breaker["cooldown_seconds"]
-        ):
-            breaker["state"] = "HALF_OPEN"
-            logger.warning(
-                f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)"
-            )
-        else:
-            logger.warning(
-                f"[CIRCUIT BREAKER] Skipping autonomous research spawn for project={project.id} "
-                f"— circuit breaker state=OPEN (still in cooldown)"
-            )
-            # A struggling project (breaker OPEN) is exactly when an operator is
-            # most likely to steer; never swallow that silently. Notify (once)
-            # that steering is queued while the breaker cools down. The marker is
-            # preserved — only the spawn returns — so steering still lands once
-            # the breaker clears.
-            await _maybe_notify_operator_refresh_deferred(
-                project, session, "paused while the research circuit breaker is open"
-            )
-            return  # Still in cooldown
-    elif breaker["state"] == "HALF_OPEN":
-        if await _check_half_open_test_task(project.id, session, breaker):
-            # Re-opened breaker is still a circuit-breaker halt: surface the
-            # deferral to any pending operator steering (once). Marker is
-            # preserved. Placed after the breaker mutation/alert so the
-            # helper's commit also flushes the alert.
-            await _maybe_notify_operator_refresh_deferred(
-                project,
-                session,
-                "paused while the research circuit breaker is open",
-            )
-            return  # Back to cooldown
+    if await _advance_circuit_breaker_and_check(
+        project, session, breaker, "autonomous research spawn"
+    ):
+        return
     # Guard: defer autonomous research until repo_bootstrap completes for external-repo
     # projects. Strategic cycles already defer this way; keeping research consistent
     # prevents ungrounded findings against a half-onboarded repo. Terminal bootstraps
@@ -1362,32 +1375,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         is_strategic = False
 
     if is_strategic:
-        from sqlalchemy import func as _strat_func
+        from app.task_lifecycle import _has_active_strategic_task
 
-        has_active_strategic = (
-            await session.execute(
-                select(_strat_func.count())
-                .select_from(Task)
-                .where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"]
-                    .as_string()
-                    .in_(sorted(STRATEGIC_TASK_TYPES)),
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                            TaskStatus.EVALUATING,
-                        ]
-                    ),
-                )
-            )
-        ).scalar() or 0
-        if has_active_strategic > 0:
+        has_active_strategic = await _has_active_strategic_task(project.id, session)
+        if has_active_strategic:
             logger.debug(
-                f"[STRATEGIC] Skipping strategic spawn — {has_active_strategic} active "
-                f"strategic task(s) exist for project {project.id}; falling through to tactical"
+                f"[STRATEGIC] Skipping strategic spawn — active strategic task exists for "
+                f"project {project.id}; falling through to tactical"
             )
             # An operator steering request is deferred behind the running cycle
             # (it will consume on the follow-up tick). Surface that once so the
@@ -1401,6 +1395,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 False  # skip the spawn block; tactical research below may still fire
             )
         else:
+            from sqlalchemy import func as _strat_func
+
             cooldown_minutes = _runtime_config.get(
                 "strategic_spawn_cooldown_minutes", 30
             )
@@ -2604,25 +2600,10 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
 
     # Guard: circuit breaker must allow spawning
     breaker = _shared_state.get_circuit_breaker(str(project.id))
-    if breaker["state"] == "OPEN":
-        if (
-            breaker["opened_at"]
-            and (_utcnow() - breaker["opened_at"]).total_seconds()
-            >= breaker["cooldown_seconds"]
-        ):
-            breaker["state"] = "HALF_OPEN"
-            logger.warning(
-                f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)"
-            )
-        else:
-            logger.warning(
-                f"[CIRCUIT BREAKER] Skipping periodic task spawn (type={task_type}) for project={project.id} "
-                f"— circuit breaker state=OPEN (still in cooldown)"
-            )
-            return  # Still in cooldown
-    elif breaker["state"] == "HALF_OPEN":
-        if await _check_half_open_test_task(project.id, session, breaker):
-            return
+    if await _advance_circuit_breaker_and_check(
+        project, session, breaker, f"periodic task spawn (type={task_type})"
+    ):
+        return
 
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(
         task_type, {}

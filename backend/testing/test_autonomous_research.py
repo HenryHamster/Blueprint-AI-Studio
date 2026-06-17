@@ -11422,7 +11422,10 @@ async def test_residual_resumes_spawn_when_system_exits_audit_mode(
 @pytest.fixture()
 def _clear_viewport_residual_state():
     """Clear the viewport residual fingerprint store between tests."""
-    from app.failure_residual import _viewport_residual_store, _viewport_residual_seen_task_ids
+    from app.failure_residual import (
+        _viewport_residual_store,
+        _viewport_residual_seen_task_ids,
+    )
 
     _viewport_residual_store.clear()
     _viewport_residual_seen_task_ids.clear()
@@ -16506,4 +16509,56 @@ async def test_first_task_spawned_stamped_on_research_spawn(db_session):
     assert (project.build_config or {}).get("first_task_spawned_at") is not None, (
         "first_task_spawned_at must be stamped in build_config after the first "
         "successful autonomous research spawn"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_spawn_deduplication_respects_EVALUATING_status(
+    db_session, mocker
+):
+    """Regression: when a strategic task is in EVALUATING status (results being
+    evaluated), the canonical _has_active_strategic_task() must still consider it
+    active and prevent duplicate spawn. The inline guard in autonomous_research
+    previously included EVALUATING, but the canonical function in task_lifecycle
+    did not, causing possible double-spawn of a strategic cycle while one was
+    still EVALUATING its results."""
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="EVALUATING Strategic Status Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            _active_direction("d-eval-test", "Evaluating Test Direction"),
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a strategic task in EVALUATING status — results are being evaluated,
+    # not complete yet. The spawn guard must still consider this "active" and skip
+    # spawning a duplicate strategic cycle.
+    evaluating_strategic = Task(
+        project_id=project.id,
+        title="Strategic Review (Results Evaluating)",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(evaluating_strategic)
+    await db_session.commit()
+
+    # Trigger research spawn with force_strategic (wall-clock backstop fires, or
+    # operator flag set), which should normally spawn a design_doc_update or another
+    # strategic cycle. But the EVALUATING strategic task must block it.
+    await _spawn_research_task(project, db_session)
+
+    # The spawn should be skipped because an active strategic task (in EVALUATING
+    # status) exists for the project.
+    assert not design_doc_mock.called, (
+        "strategic spawn must be skipped when an EVALUATING strategic task is active"
     )

@@ -279,7 +279,7 @@ from app.task_lifecycle_github_helpers import (  # noqa: E402, F401, RUF100
 
 
 async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
-    """Return True if any QUEUED/PROVISIONING/IN_PROGRESS task is a design_doc_update or strategic_review.
+    """Return True if any QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING task is a design_doc_update or strategic_review.
 
     Takes a FOR UPDATE lock on the project row so the check+spawn is transactionally
     atomic. Without it, two concurrent callers (e.g. design_doc completion chaining
@@ -338,6 +338,7 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
                             TaskStatus.QUEUED,
                             TaskStatus.PROVISIONING,
                             TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
                         ]
                     ),
                 )

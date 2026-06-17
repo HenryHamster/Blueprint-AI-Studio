@@ -78,7 +78,7 @@ from app.failure_classification import (
 )
 from app.retry_budget import append_failure_class_history
 from app.task_blocked import strip_fresh_attempt_context
-from app.time_utils import _utcnow, clear_retry_after, set_retry_after
+from app.time_utils import _utcnow, clear_retry_after, exponential_backoff, set_retry_after
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 
 logger = logging.getLogger(__name__)
@@ -562,7 +562,7 @@ async def reaper_service():
                 _runtime_config.get("reaper_cycle_halt_cooldown_seconds", 300)
             )
             half_open_failures = _reaper_halt_state.get("half_open_failures", 0)
-            cooldown = min(cooldown_base * (2**half_open_failures), 3600)
+            cooldown = exponential_backoff(half_open_failures + 1, base=float(cooldown_base), cap=3600.0)
             elapsed = (
                 (_utcnow() - halt_ts).total_seconds() if halt_ts else (cooldown + 1)
             )
@@ -582,6 +582,7 @@ async def reaper_service():
             )
             _reaper_halt_state["_in_probe"] = True
             # Fall through to run one probe cycle (no continue).
+        session = None
         try:
             async with AsyncSessionLocal() as session:
                 # Intra-cycle liveness heartbeat at the very start of the cycle
@@ -3803,10 +3804,11 @@ async def reaper_service():
         except Exception as e:
             consecutive_errors += 1
             logger.error(f"[REAPER] Error: {e}", exc_info=True)
-            try:
-                await session.rollback()
-            except Exception:
-                logger.exception("[REAPER] Rollback after reaper error failed")
+            if session is not None:
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception("[REAPER] Rollback after reaper error failed")
             _halt_threshold = _runtime_config.get(
                 "reaper_cycle_halt_threshold", _REAPER_CYCLE_HALT_THRESHOLD
             )
@@ -3879,7 +3881,7 @@ async def reaper_service():
                     )
 
         # Sleep before next cycle; use exponential backoff on consecutive errors
-        sleep_seconds = min(60 * (2**consecutive_errors), 300)
+        sleep_seconds = exponential_backoff(consecutive_errors + 1, base=60.0, cap=300.0, jitter=0.0)
         try:
             await asyncio.sleep(sleep_seconds)
         except asyncio.CancelledError:

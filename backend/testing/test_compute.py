@@ -4112,20 +4112,24 @@ class TestZoneHealthRestoreDeque:
 class TestZoneCooldownSeconds:
     """Cover _zone_cooldown_seconds exponential backoff with 1800s cap."""
 
-    def test_zero_failures_baseline(self):
+    def test_zero_failures_baseline(self, mocker):
+        mocker.patch("app.time_utils.random.uniform", return_value=1.0)
         assert compute._zone_cooldown_seconds(0) == compute.ZONE_COOLDOWN_SECONDS
 
-    def test_doubling_on_each_failure(self):
+    def test_doubling_on_each_failure(self, mocker):
+        mocker.patch("app.time_utils.random.uniform", return_value=1.0)
         base = compute.ZONE_COOLDOWN_SECONDS
         assert compute._zone_cooldown_seconds(1) == min(base * 2, 1800)
         assert compute._zone_cooldown_seconds(2) == min(base * 4, 1800)
         assert compute._zone_cooldown_seconds(3) == min(base * 8, 1800)
 
-    def test_cap_at_1800_seconds(self):
+    def test_cap_at_1800_seconds(self, mocker):
+        mocker.patch("app.time_utils.random.uniform", return_value=1.0)
         assert compute._zone_cooldown_seconds(10) == 1800
         assert compute._zone_cooldown_seconds(100) == 1800
 
-    def test_monotonically_non_decreasing(self):
+    def test_monotonically_non_decreasing(self, mocker):
+        mocker.patch("app.time_utils.random.uniform", return_value=1.0)
         prev = 0
         for n in range(0, 15):
             current = compute._zone_cooldown_seconds(n)

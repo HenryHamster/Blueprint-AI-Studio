@@ -1,5 +1,6 @@
 """Shared time utilities with no intra-app dependencies."""
 
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -160,6 +161,26 @@ def _is_cadence_due(
     if now is None:
         now = _utcnow()
     return (now - last_run).total_seconds() >= interval_seconds
+
+
+def exponential_backoff(
+    consecutive: int,
+    base: float = 0.5,
+    cap: float = 60.0,
+    jitter: float = 0.2,
+) -> float:
+    """Return a jittered exponential backoff delay in seconds.
+
+    delay = min(base * 2**(consecutive - 1), cap) * uniform(1-jitter, 1+jitter)
+
+    Args:
+        consecutive: Number of consecutive errors (1-indexed; must be >= 1).
+        base: Base delay in seconds for the first error.
+        cap: Maximum delay in seconds before jitter.
+        jitter: Fractional jitter applied symmetrically (default ±20%).
+    """
+    raw = min(base * (2 ** (consecutive - 1)), cap)
+    return raw * random.uniform(1 - jitter, 1 + jitter)
 
 
 def parse_retry_after(value) -> Optional[datetime]:

@@ -90,7 +90,7 @@ from app.artifact_prerequisites import (
 )
 from app.landed_signal import merge_verification_status as _merge_verification_status
 from app.acceptance_gate import record_artifact_consumptions_for_task
-from app.time_utils import _utcnow, set_retry_after
+from app.time_utils import _utcnow, exponential_backoff, set_retry_after
 from app.agent_status_spawn import (
     _recover_poisoned_session,
     maybe_spawn_smoketest_fix,
@@ -1821,7 +1821,7 @@ async def update_agent_status(
                                 )
                                 should_requeue = False
                             else:
-                                delay = min(2**api_retries * 120, 1800)
+                                delay = exponential_backoff(api_retries, base=240, cap=1800, jitter=0)
                                 set_retry_after(ctx, delay / 60)
                                 logger.info(
                                     f"[AGENT STATUS] Task {task.id} EXTERNAL_API retry {api_retries} — backoff {delay}s"
@@ -2765,9 +2765,8 @@ async def update_agent_status(
                 ctx["rate_limit_counts"] = rl_counts
 
                 rl_hit_count = rl_counts.get(str(acct_id), 1) if acct_id else 1
-                # Exponential backoff: 30min * 2^(n-1), capped at 4 hours, ±20% jitter
-                base_delay_minutes = min(30 * (2 ** (rl_hit_count - 1)), 240)
-                delay_minutes = base_delay_minutes * random.uniform(0.8, 1.2)
+                # Exponential backoff: 30min * 2^(n-1), ±20% jitter
+                delay_minutes = exponential_backoff(rl_hit_count, base=30 * 60, cap=240 * 60, jitter=0.2) / 60
                 # Audit W1: pass task — set_retry_after now writes the column
                 # in addition to the context counter.
                 task.context = ctx

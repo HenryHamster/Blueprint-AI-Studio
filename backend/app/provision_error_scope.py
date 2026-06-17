@@ -33,6 +33,8 @@ import logging
 import os
 from datetime import datetime, timezone, timedelta
 
+from app.time_utils import exponential_backoff
+
 logger = logging.getLogger(__name__)
 
 QUOTA_SCOPE_GLOBAL = "global"
@@ -107,13 +109,13 @@ def classify_provision_error_scope(err_str: str) -> str:
     return QUOTA_SCOPE_ZONAL
 
 
-def _quota_backoff_seconds(consecutive: int, base: int) -> int:
-    """Exponential backoff for quota cooldowns: base → 2x → 4x …, 30-min cap."""
-    return min(base * (2 ** max(consecutive - 1, 0)), _QUOTA_COOLDOWN_CAP_SECONDS)
+def _quota_backoff_seconds(consecutive: int, base: int) -> float:
+    """Exponential backoff for quota cooldowns: base → 2x → 4x …, 30-min cap, no jitter."""
+    return exponential_backoff(max(consecutive, 1), base=float(base), cap=float(_QUOTA_COOLDOWN_CAP_SECONDS), jitter=0.0)
 
 
 def _post_global_quota_alert(
-    err_str: str, cooldown_secs: int, consecutive: int
+    err_str: str, cooldown_secs: float, consecutive: int
 ) -> None:
     """Operator alert for project-global quota exhaustion.
 
@@ -159,7 +161,7 @@ def _post_global_quota_alert(
         logger.warning(f"[QUOTA] global-quota alert webhook skipped: {e}")
 
 
-def _record_global_quota_exhaustion(err_str: str) -> int:
+def _record_global_quota_exhaustion(err_str: str) -> float:
     """Arm/extend the PROJECT-level quota backoff. Returns the cooldown seconds.
 
     Deliberately marks NO zones: a global quota event says nothing about zone
@@ -199,7 +201,7 @@ def _record_global_quota_exhaustion(err_str: str) -> int:
     return cooldown_secs
 
 
-def _record_region_quota_exhaustion(region: str, err_str: str) -> int:
+def _record_region_quota_exhaustion(region: str, err_str: str) -> float:
     """Arm/extend a REGION-level quota backoff. Returns the cooldown seconds.
 
     Marks no individual zone — every zone in ``region`` is equally blocked by
@@ -235,7 +237,7 @@ def _clear_quota_cooldowns_after_success(zone: str) -> None:
     _region_quota_state.pop(_zone_region(zone), None)
 
 
-def _record_gpu_global_quota_exhaustion(err_str: str) -> int:
+def _record_gpu_global_quota_exhaustion(err_str: str) -> float:
     """Arm/extend the GPU project-level quota backoff. Same logic as
     ``_record_global_quota_exhaustion`` but isolated to the GPU lane so a
     GPUS_ALL_REGIONS event never arms the CPU fleet's global cooldown."""
@@ -258,7 +260,7 @@ def _record_gpu_global_quota_exhaustion(err_str: str) -> int:
     return cooldown_secs
 
 
-def _record_gpu_region_quota_exhaustion(region: str, err_str: str) -> int:
+def _record_gpu_region_quota_exhaustion(region: str, err_str: str) -> float:
     """Arm/extend a GPU REGION-level quota backoff. Isolated to the GPU lane."""
     with _zone_state_lock():
         now = datetime.now(timezone.utc)
