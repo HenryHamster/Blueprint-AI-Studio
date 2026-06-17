@@ -1939,6 +1939,24 @@ async def _spawn_pipeline_task(
                 orig_task.context = orig_ctx
                 flag_modified(orig_task, "context")
                 session.add(orig_task)
+            else:
+                # Fail-safe for unloadable original task: cannot track churn counter,
+                # so halt the spawn to prevent unbounded supersession. The counter is
+                # the only bound; we must stop when we can't record it.
+                logger.warning(
+                    f"[PIPELINE] Halting {task_type} spawn for PR #{pr_number} — "
+                    f"cannot track supersession churn (original task unloadable). "
+                    f"Superseding stale task {t.id} but cannot persist count."
+                )
+                await session.flush()
+                source_task.latest_status_message = (
+                    f"Review/fix spawn halted for PR #{pr_number}: original task "
+                    f"unloadable and supersession counter cannot be persisted. "
+                    f"Manual review required."
+                )
+                _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
+                session.add(source_task)
+                return (None, False)
             logger.warning(
                 f"[PIPELINE] Superseding stale {t_type} task {t.id} "
                 f"(last_heartbeat={t.last_heartbeat}, started_at={t.started_at}) "
@@ -1997,6 +2015,24 @@ async def _spawn_pipeline_task(
                 orig_task.context = orig_ctx
                 flag_modified(orig_task, "context")
                 session.add(orig_task)
+            else:
+                # Fail-safe for unloadable original task: cannot track churn counter,
+                # so halt the spawn to prevent unbounded supersession. The counter is
+                # the only bound; we must stop when we can't record it.
+                logger.warning(
+                    f"[PIPELINE] Halting {task_type} spawn for PR #{pr_number} — "
+                    f"cannot track supersession churn (original task unloadable). "
+                    f"Superseding review {t.id} but cannot persist count."
+                )
+                await session.flush()
+                source_task.latest_status_message = (
+                    f"Review/fix spawn halted for PR #{pr_number}: original task "
+                    f"unloadable and supersession counter cannot be persisted. "
+                    f"Manual review required."
+                )
+                _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
+                session.add(source_task)
+                return (None, False)
             logger.warning(
                 f"[PIPELINE] Cancelling in-flight review {t.id} on PR #{pr_number} "
                 f"so fix can proceed (review snapshot is stale)"

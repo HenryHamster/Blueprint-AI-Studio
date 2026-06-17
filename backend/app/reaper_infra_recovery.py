@@ -416,6 +416,7 @@ async def run_infra_recovery_and_hold_maintenance(
             _new_ctx = clear_task_llm_runtime_context(_new_ctx)
             _new_ctx.pop("_slot_released", None)
             _new_ctx.pop("failure_category", None)
+            _new_ctx.pop("failure_class", None)
             # Clear EXTERNAL_API retry counter: a resurrected task that hits another
             # API error would otherwise see stale _api_failure_retries > 5 and
             # bypass the EXTERNAL_API-specific backoff, falling through to the

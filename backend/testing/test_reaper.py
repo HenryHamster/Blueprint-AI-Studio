@@ -3812,6 +3812,57 @@ async def test_step5_idempotency_collision_with_parked_holder_skipped(
     assert parked_holder.status == TaskStatus.PARKED
 
 
+@pytest.mark.asyncio
+async def test_step5_resurrection_clears_failure_class(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Resurrection sweep clears stale failure_class so subsequent failures
+    are reclassified instead of short-circuited to the old verdict.
+
+    When a task is resurrected from an infra failure, both failure_category
+    AND failure_class must be cleared so the resurrected task's next failure
+    is properly classified via _classify_failure_class, not short-circuited
+    to the stale verdict. Without this fix, a CODE_ERROR on the resurrected
+    task would be misclassified as the old PROVISION_FAILURE."""
+    project = await _make_project(reaper_db)
+
+    # Create a FAILED task with a stale infra failure_class that will be
+    # short-circuited by _classify_failure_class if not cleared.
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        attempt_count=4,
+        context={
+            "failure_category": "PROVISION_FAILURE",
+            "failure_class": "PROVISION_FAILURE",
+            "provision_failures": 3,
+            "provision_failures_infra": 2,
+            "_infra_wait": True,
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    # Resurrect via the infra-recovery sweep.
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+
+    # Verify resurrection occurred.
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 0
+    assert ctx.get("_resurrection_count") == 1
+
+    # Verify BOTH failure_class AND failure_category are cleared
+    # so the next failure is properly reclassified.
+    assert "failure_class" not in ctx, "failure_class must be cleared on resurrection"
+    assert "failure_category" not in ctx, (
+        "failure_category must be cleared on resurrection"
+    )
+
+
 # ── Dependent-task unblocking on terminal failure ────────────────────────
 
 
