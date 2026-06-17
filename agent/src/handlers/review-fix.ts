@@ -29,6 +29,7 @@ import {
   formatRejectionPatternsSection,
   formatStrategicIntent,
   formatRepoOverview,
+  formatDomainOverview,
   type RejectionPatternsSource,
 } from '../prompts/context-prefix.js';
 import { resolveBuildConfig } from '../build-config.js';
@@ -692,7 +693,8 @@ export async function handleReview(
     task.strategic_intent as Record<string, unknown> | undefined,
   );
   const reviewRepoOverview = formatRepoOverview(task.repo_overview);
-  const reviewStrategicFraming = [reviewProjectVision, reviewStrategicIntent, reviewRepoOverview]
+  const reviewDomainOverview = formatDomainOverview(task.domain_overview);
+  const reviewStrategicFraming = [reviewProjectVision, reviewStrategicIntent, reviewRepoOverview, reviewDomainOverview]
     .filter(Boolean)
     .join('\n');
 
@@ -1305,6 +1307,13 @@ export async function handleFix(
   const fixRepoOverview = formatRepoOverview(task.repo_overview);
   if (fixRepoOverview) {
     enrichedPrompt = `${fixRepoOverview}\n${enrichedPrompt}`;
+  }
+
+  // Prepend domain overview (product/domain context from bootstrap). Mirrors
+  // the repo overview wiring above — fix path bypasses buildContextPrefix.
+  const fixDomainOverview = formatDomainOverview(task.domain_overview);
+  if (fixDomainOverview) {
+    enrichedPrompt = `${fixDomainOverview}\n${enrichedPrompt}`;
   }
 
   // Prepend CLAUDE.md instructions + playbook
