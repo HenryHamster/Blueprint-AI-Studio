@@ -86,6 +86,10 @@ export interface BuildConfig {
   /** ISO timestamp stamped when a refresh bootstrap completed and replaced the
    *  prior repo_overview. Absent/null means no refresh has run yet. */
   bootstrap_overview_refreshed_at?: string | null;
+  /** ISO timestamp stamped when domain knowledge was last captured/refreshed
+   *  during a bootstrap. Absent/null means domain knowledge extraction has not
+   *  yet run for this project. */
+  bootstrap_domain_knowledge_refreshed_at?: string | null;
   /** Branch the refreshed overview describes (set alongside bootstrap_overview_refreshed_at). */
   bootstrap_overview_source_branch?: string | null;
   /** Commit SHA the refreshed overview was captured at (optional; may be absent). */
