@@ -266,7 +266,8 @@ def _render_diagnostics(data: dict) -> None:
 # ── tasks ──────────────────────────────────────────────────────────────────--
 
 def cmd_tasks(args: argparse.Namespace) -> None:
-    """Dispatch task subcommands: list / show / cancel / requeue / scope / tree / failures."""
+    """Dispatch task subcommands: list / show / cancel / requeue / scope / tree / failures /
+    evaluating / cancel-all / set-status / autonomy-debug."""
     sub = getattr(args, "tasks_cmd", None) or "list"
     if sub == "show":
         _tasks_show(args)
@@ -280,6 +281,14 @@ def cmd_tasks(args: argparse.Namespace) -> None:
         _tasks_tree(args)
     elif sub == "failures":
         _tasks_failures(args)
+    elif sub == "evaluating":
+        _tasks_evaluating(args)
+    elif sub == "cancel-all":
+        _tasks_cancel_all(args)
+    elif sub == "set-status":
+        _tasks_set_status(args)
+    elif sub == "autonomy-debug":
+        _tasks_autonomy_debug(args)
     else:
         _tasks_list(args)
 
@@ -582,6 +591,130 @@ def _render_failures(data: dict) -> None:
         print(f"  {cause}: {len(group)} tasks{suffix}")
 
 
+def _tasks_evaluating(args: argparse.Namespace) -> None:
+    """List EVALUATING tasks with CI/PR status and latest message."""
+    pid = get_project_id(getattr(args, "project_id", None))
+    resp = api("GET", f"/api/admin/tasks?project_id={pid}&status=EVALUATING&limit=200")
+    tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+    _emit(args, {"tasks": tasks, "total": len(tasks)}, _render_evaluating_list)
+
+
+def _render_evaluating_list(data: dict) -> None:
+    tasks = data.get("tasks") or []
+    print(f"=== EVALUATING TASKS ({len(tasks)}) ===")
+    if not tasks:
+        print("  (none)")
+        return
+    for t in tasks:
+        tid = (t.get("id") or "?")[:8]
+        loop = (t.get("context") or {}).get("review_loop") or {}
+        ci = loop.get("ci_waiting", False)
+        pr = loop.get("pr_number", "-")
+        ttype = t.get("task_type", "?")
+        title = (t.get("title") or "")[:55]
+        msg = (t.get("latest_status_message") or "")[:70]
+        print(f"  {tid}  [{ttype:8}]  ci={str(ci):<5}  pr={pr:<4}  {title}")
+        if msg:
+            print(f"           {msg}")
+
+
+def _tasks_cancel_all(args: argparse.Namespace) -> None:
+    """Bulk-cancel tasks filtered by status (and optional category)."""
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print("ERROR: 'cancel-all' requires an admin API key.", file=sys.stderr)
+        sys.exit(1)
+    statuses = [args.status] if getattr(args, "status", None) else [
+        "QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"]
+    category = getattr(args, "category", None)
+    if not _confirm(
+        f"Cancel all tasks with status={statuses}"
+        + (f" category={category}" if category else "") + "?",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+    pid = get_project_id(getattr(args, "project_id", None))
+    cancelled = skipped = 0
+    for status in statuses:
+        offset = 0
+        while True:
+            resp = api("GET", f"/api/admin/tasks?project_id={pid}&status={status}"
+                              f"&limit=500&offset={offset}")
+            batch = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+            if not batch:
+                break
+            for t in batch:
+                if category and (t.get("context") or {}).get("failure_category") != category:
+                    skipped += 1
+                    continue
+                try:
+                    api("PATCH", f"/api/admin/tasks/{t['id']}", {"status": "CANCELLED"})
+                    cancelled += 1
+                except Exception:  # noqa: BLE001
+                    pass
+            offset += len(batch)
+            if len(batch) < 500:
+                break
+    suffix = f" ({skipped} skipped, category filter)" if skipped else ""
+    print(f"Cancelled {cancelled} tasks{suffix}.")
+
+
+def _tasks_set_status(args: argparse.Namespace) -> None:
+    """Force a task to an arbitrary status (power-user recovery lever)."""
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print("ERROR: 'set-status' requires an admin API key.", file=sys.stderr)
+        sys.exit(1)
+    if not _confirm(
+        f"Set task {args.task_id} to {args.new_status}?", getattr(args, "yes", False)
+    ):
+        print("Aborted.")
+        return
+    body: dict = {"status": args.new_status}
+    if getattr(args, "message", None):
+        body["latest_status_message"] = args.message
+    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", body)
+    _emit(args, result, lambda d: print(f"  {args.task_id[:8]}: {d.get('status', 'ok')}"))
+
+
+def _tasks_autonomy_debug(args: argparse.Namespace) -> None:
+    """Fetch autonomy-debug for a project: blocking guards, eligible directions."""
+    pid = get_project_id(getattr(args, "project_id", None))
+    data = api("GET", f"/api/admin/projects/{pid}/autonomy-debug")
+    _emit(args, data, _render_autonomy_debug)
+
+
+def _render_autonomy_debug(data: dict) -> None:
+    print("=== AUTONOMY DEBUG ===")
+    blocked = data.get("spawn_blocked")
+    if blocked is True:
+        print("  can_spawn: NO (blocked)")
+    elif blocked is False:
+        print("  can_spawn: YES — no guards; next tick will spawn")
+    else:
+        print("  can_spawn: ?")
+    guards = data.get("blocking_guards") or []
+    if guards:
+        print(f"\n--- Blocking Guards ({len(guards)}) ---")
+        for g in guards:
+            print(f"  {g.get('guard', '?')}: {g.get('reason', '?')}")
+    dirs = data.get("directions") or []
+    eligible = [d for d in dirs if d.get("is_eligible")]
+    if dirs:
+        print(f"\n--- Directions ({len(eligible)}/{len(dirs)} eligible) ---")
+        for d in dirs:
+            did = (d.get("id") or "?")[:10]
+            text = (d.get("text") or "?")[:70]
+            markers = []
+            if d.get("seconds_until_eligible"):
+                markers.append(f"cooldown {d['seconds_until_eligible'] // 60}m")
+            if d.get("is_eligible"):
+                markers.append("eligible")
+            tag = f" [{', '.join(markers)}]" if markers else ""
+            print(f"  {did}  {text}{tag}")
+
+
 def _render_task_detail(t: dict) -> None:
     print(f"=== TASK {t.get('id', '?')} ===")
     print(f"  Title:    {t.get('title', '?')}")
@@ -854,6 +987,203 @@ def _render_version_summary(s: dict) -> None:
                 title = (item.get("title") or "")[:70]
                 pr_str = f"  #{pr}" if pr else ""
                 print(f"      {title}{pr_str}")
+
+
+# ── system ────────────────────────────────────────────────────────────────────
+
+def cmd_system(args: argparse.Namespace) -> None:
+    """Break-glass system commands: repair, restart, zones, autonomy."""
+    sub = getattr(args, "system_cmd", None)
+    dispatch = {
+        "repair": _system_repair,
+        "restart": _system_restart,
+        "zones": _system_zones,
+        "autonomy": _system_autonomy,
+    }
+    if sub not in dispatch:
+        print("system: subcommand required. Run `blueprint system --help`.", file=sys.stderr)
+        sys.exit(1)
+    dispatch[sub](args)
+
+
+def _system_repair(args: argparse.Namespace) -> None:
+    if load_config().get("read_only"):
+        print("ERROR: 'repair' requires an admin API key.", file=sys.stderr)
+        sys.exit(1)
+    if not _confirm("Trigger repair-state (fix stuck/orphaned tasks)?",
+                    getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", "/api/admin/repair-state", {})
+    repairs = result.get("repairs", [])
+    def _render_repair(d: dict) -> None:
+        print(f"Repairs: {d.get('count', 0)}")
+        for r in d.get("repairs", []):
+            print(f"  - {r}")
+        if not d.get("repairs"):
+            print("  (no repairs needed)")
+    _emit(args, result, _render_repair)
+
+
+def _system_restart(args: argparse.Namespace) -> None:
+    if load_config().get("read_only"):
+        print("ERROR: 'restart' requires an admin API key.", file=sys.stderr)
+        sys.exit(1)
+    if not _confirm("Restart orchestrator background loops?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", "/api/admin/restart-orchestrator", {})
+    _emit(args, result, lambda d: print(f"Restart: {json.dumps(d, indent=2, default=str)}"))
+
+
+def _system_zones(args: argparse.Namespace) -> None:
+    zones, err = _safe_read("/api/admin/zone-health")
+    _emit(args, {"zones": zones or {}, "error": err}, _render_zones)
+
+
+def _render_zones(data: dict) -> None:
+    print("=== ZONE HEALTH ===")
+    if data.get("error"):
+        print(f"  error: {data['error']}")
+        return
+    zones = data.get("zones") or {}
+    if isinstance(zones, dict):
+        for zone, info in sorted(zones.items()):
+            i = info or {}
+            status = i.get("status", "?")
+            fails = i.get("consecutive_failures", 0)
+            last = i.get("last_success", "?")
+            print(f"  {zone:30}: {status:12} fails={fails} last_ok={last}")
+    else:
+        print(f"  {zones}")
+
+
+def _system_autonomy(args: argparse.Namespace) -> None:
+    data, err = _safe_read("/api/admin/autonomous-status")
+    result = {"projects": (data or {}).get("projects", []), "error": err}
+    _emit(args, result, _render_autonomy)
+
+
+def _render_autonomy(data: dict) -> None:
+    print("=== AUTONOMY ===")
+    if data.get("error"):
+        print(f"  error: {data['error']}")
+        return
+    projects = data.get("projects") or []
+    if not projects:
+        print("  (none)")
+        return
+    for p in projects:
+        print(f"  {p.get('project_name', '?')}: "
+              f"enabled={p.get('autonomous_enabled')}  "
+              f"failures={p.get('consecutive_failures', 0)}  "
+              f"last_research={p.get('last_research_at', 'never')}")
+
+
+# ── monitor ───────────────────────────────────────────────────────────────────
+
+def cmd_monitor(args: argparse.Namespace) -> None:
+    """Show system alerts, digest, and activity feed for situational awareness."""
+    sub = getattr(args, "monitor_cmd", None)
+    dispatch = {
+        "alerts": _monitor_alerts,
+        "digest": _monitor_digest,
+        "activity": _monitor_activity,
+    }
+    if sub not in dispatch:
+        print("monitor: subcommand required. Run `blueprint monitor --help`.", file=sys.stderr)
+        sys.exit(1)
+    dispatch[sub](args)
+
+
+def _monitor_alerts(args: argparse.Namespace) -> None:
+    alerts, err = _safe_read("/api/admin/alerts")
+    result = {"alerts": alerts or [], "error": err}
+    _emit(args, result, _render_alerts)
+
+
+def _render_alerts(data: dict) -> None:
+    print("=== ALERTS ===")
+    if data.get("error"):
+        print(f"  error: {data['error']}")
+        return
+    alerts = data.get("alerts") or []
+    if not alerts:
+        print("  (no active alerts)")
+        return
+    for a in alerts:
+        severity = a.get("severity", "?")
+        title = a.get("title", "?")
+        msg = (a.get("message") or "")[:120]
+        ts = (a.get("created_at") or "")[:19]
+        aid = a.get("id", "?")[:8]
+        tid = (a.get("task_id") or "")[:8]
+        task_ref = f"  task={tid}" if tid else ""
+        print(f"  [{severity:8}] {aid}  {ts}  {title}{task_ref}")
+        if msg:
+            print(f"             {msg}")
+
+
+def _monitor_digest(args: argparse.Namespace) -> None:
+    hours = getattr(args, "hours", 24)
+    data, err = _safe_read(f"/api/admin/digest?hours={hours}")
+    result = {"digest": data or {}, "hours": hours, "error": err}
+    _emit(args, result, _render_digest)
+
+
+def _render_digest(data: dict) -> None:
+    hours = data.get("hours", "?")
+    print(f"=== DIGEST (last {hours}h) ===")
+    if data.get("error"):
+        print(f"  error: {data['error']}")
+        return
+    d = data.get("digest") or {}
+    print(f"  Completed:        {d.get('completed_count', '?')}")
+    print(f"  Failed:           {d.get('failed_count', '?')}")
+    print(f"  PRs opened:       {d.get('prs_opened', '?')}")
+    print(f"  Research cycles:  {d.get('research_cycles', '?')}")
+    print(f"  Pending approval: {d.get('pending_approval_count', '?')}")
+    print(f"  Active now:       {d.get('active_count', '?')} ({d.get('running_count', '?')} running, {d.get('queued_count', '?')} queued)")
+
+
+def _monitor_activity(args: argparse.Namespace) -> None:
+    limit = getattr(args, "limit", 20)
+    resp, err = _safe_read(f"/api/admin/activity?limit={limit}")
+    # Handle both list and dict responses (endpoint may evolve)
+    events = (resp.get("events", []) if isinstance(resp, dict) else resp) if resp else []
+    result = {"events": events, "limit": limit, "error": err}
+    _emit(args, result, _render_activity)
+
+
+def _render_activity(data: dict) -> None:
+    print(f"=== ACTIVITY (last {len(data.get('events', []))} events) ===")
+    if data.get("error"):
+        print(f"  error: {data['error']}")
+        return
+    events = data.get("events") or []
+    if not events:
+        print("  (no recent activity)")
+        return
+    icons = {
+        "TASK_COMPLETED": "done",
+        "TASK_FAILED": "FAIL",
+        "RESEARCH_FINDINGS": "research",
+        "DEPLOY": "deploy",
+    }
+    for e in events:
+        etype = e.get("type", "?")
+        icon = icons.get(etype, etype)
+        ts = (e.get("timestamp") or "")[:16]
+        title = (e.get("title") or "?")[:55]
+        tid = (e.get("task_id") or "")[:8]
+        pr = e.get("pr_url") or ""
+        err = (e.get("error_summary") or "")[:80]
+        dur = e.get("duration_seconds")
+        dur_str = f"  {int(dur)}s" if dur else ""
+        pr_str = f"  {pr}" if pr else ""
+        print(f"  {ts}  [{icon:10}]  {tid}  {title}{dur_str}{pr_str}")
+        if err:
+            print(f"                              {err}")
 
 
 # ── directions ───────────────────────────────────────────────────────────────
@@ -1599,6 +1929,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show recent FAILED tasks grouped by root cause for incident triage.")
     p_tasks_failures.add_argument("--limit", type=int, default=50,
                                   help="Max failed tasks to fetch (default 50).")
+    tasks_sub.add_parser(
+        "evaluating", parents=[common],
+        help="List EVALUATING tasks with CI-waiting status and PR info.")
+    p_cancel_all = tasks_sub.add_parser(
+        "cancel-all", parents=[common],
+        help="Bulk-cancel tasks by status (default: all active statuses).")
+    p_cancel_all.add_argument("--status", default=None,
+                              help="Cancel only tasks with this status.")
+    p_cancel_all.add_argument("--category", default=None,
+                              help="Restrict to tasks whose context.failure_category matches.")
+    p_cancel_all.add_argument("--yes", action="store_true",
+                              help="Skip confirmation prompt.")
+    p_set_status = tasks_sub.add_parser(
+        "set-status", parents=[common],
+        help="Force a task to an arbitrary status (power-user recovery lever).")
+    p_set_status.add_argument("task_id", help="Task id (full uuid).")
+    p_set_status.add_argument("new_status",
+                              choices=["QUEUED", "PROVISIONING", "IN_PROGRESS",
+                                       "EVALUATING", "COMPLETED", "FAILED", "CANCELLED"],
+                              help="Target status.")
+    p_set_status.add_argument("--message", default=None,
+                              help="Optional status message to record.")
+    p_set_status.add_argument("--yes", action="store_true",
+                              help="Skip confirmation prompt.")
+    tasks_sub.add_parser(
+        "autonomy-debug", parents=[common],
+        help="Show why autonomy is or isn't spawning: blocking guards and eligible directions.")
 
     # versions
     p_versions = sub.add_parser("versions", parents=[common],
@@ -1618,6 +1975,39 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="Version number (defaults to the open version).")
     p_versions_export.add_argument("--out", metavar="FILE", default=None,
                                    help="Write output to FILE instead of stdout.")
+
+    # system
+    p_system = sub.add_parser(
+        "system", parents=[common],
+        help="Break-glass system ops: repair, restart, zones, autonomy.",
+        description="System-level operator commands. Repair stuck state, restart the "
+                    "orchestrator, inspect zone health, or view autonomy state.")
+    system_sub = p_system.add_subparsers(dest="system_cmd")
+    p_sys_repair = system_sub.add_parser("repair", parents=[common],
+                                         help="Repair stuck/orphaned state (confirms before mutating).")
+    p_sys_repair.add_argument("--yes", action="store_true", help="Skip confirmation.")
+    p_sys_restart = system_sub.add_parser("restart", parents=[common],
+                                          help="Restart orchestrator background loops (confirms).")
+    p_sys_restart.add_argument("--yes", action="store_true", help="Skip confirmation.")
+    system_sub.add_parser("zones", parents=[common], help="Show zone health.")
+    system_sub.add_parser("autonomy", parents=[common],
+                          help="Show autonomous research state per project.")
+
+    # monitor
+    p_monitor = sub.add_parser(
+        "monitor", parents=[common],
+        help="Situational awareness: alerts, digest, activity feed.",
+        description="Monitor system state: show active alerts, catch-up digest, or "
+                    "recent activity feed for operational awareness.")
+    monitor_sub = p_monitor.add_subparsers(dest="monitor_cmd")
+    monitor_sub.add_parser("alerts", parents=[common], help="Show active system alerts.")
+    p_mon_digest = monitor_sub.add_parser("digest", parents=[common],
+                                          help="Catch-up digest (last N hours, default 24).")
+    p_mon_digest.add_argument("--hours", type=int, default=24, help="Lookback window in hours.")
+    p_mon_activity = monitor_sub.add_parser("activity", parents=[common],
+                                            help="Recent activity feed (completions, failures, research).")
+    p_mon_activity.add_argument("--limit", type=int, default=20,
+                               help="Max activity events to show (default 20).")
 
     # directions
     p_dirs = sub.add_parser(
@@ -1762,6 +2152,8 @@ _DISPATCH = {
     "diagnostics": cmd_diagnostics,
     "tasks": cmd_tasks,
     "versions": cmd_versions,
+    "system": cmd_system,
+    "monitor": cmd_monitor,
     "directions": cmd_directions,
     "trials": cmd_trials,
     "promote-recover": cmd_promote_recover,
