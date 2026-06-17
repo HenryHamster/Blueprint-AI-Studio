@@ -12,10 +12,12 @@ from app.finding_deduplication import (
     _check_evidence_overlap,
     _extract_normalized_claims,
     _extract_source_refs,
-    _find_retired_approach_match,
+    _extract_technical_tokens,
     _find_archived_diagnosis_match,
+    _find_retired_approach_match,
     _jaccard_overlap,
     _normalize_source_ref,
+    _title_bigrams,
     build_dedup_state,
     deduplicate_findings,
     extract_archived_diagnoses,
@@ -514,7 +516,7 @@ def test_reworded_same_direction_duplicate_of_recent_terminal_task_suppressed():
             "direction_id": "dir-1",
         },
         {
-            "title": "duplicate recent terminal finding chain elsewhere",
+            "title": "duplicate terminal chain noticed elsewhere",
             "description": "different desc",
             "priority": "medium",
             "direction_id": "dir-2",
@@ -971,7 +973,10 @@ def test_normalize_source_ref_preserves_typed_refs():
 def test_normalize_source_ref_preserves_url_scheme():
     # URL schemes must not be stripped at the first colon.
     assert _normalize_source_ref("https://github.com/foo") == "https://github.com/foo"
-    assert _normalize_source_ref("https://github.com/foo/bar") == "https://github.com/foo/bar"
+    assert (
+        _normalize_source_ref("https://github.com/foo/bar")
+        == "https://github.com/foo/bar"
+    )
 
 
 def test_evidence_dedup_preserves_typed_refs_and_recent_overlap():
@@ -1414,7 +1419,10 @@ def test_normalize_prerequisite_rejects_title_like_task_ref():
     # A title-like task ref (free prose, or any non-UUID/non-hash token) is NOT a
     # machine-resolvable task and must be dropped at ingestion so it never becomes
     # durable stranded "missing task" demand — named foundations use capability.
-    assert normalize_prerequisite({"kind": "task", "ref": "Build the auth subsystem"}) is None
+    assert (
+        normalize_prerequisite({"kind": "task", "ref": "Build the auth subsystem"})
+        is None
+    )
     assert normalize_prerequisite({"kind": "task", "ref": "abc123"}) is None
     assert normalize_prerequisite({"kind": "task", "ref": "auth-subsystem"}) is None
 
@@ -1522,7 +1530,9 @@ def test_resolve_prerequisite_task_no_candidate_returns_none():
 def test_resolve_prerequisite_task_malformed_prereq_returns_none():
     foundation = _make_task(status=TaskStatus.IN_PROGRESS)
     assert resolve_prerequisite_task(None, [foundation]) is None
-    assert resolve_prerequisite_task({"kind": "bogus", "ref": "x"}, [foundation]) is None
+    assert (
+        resolve_prerequisite_task({"kind": "bogus", "ref": "x"}, [foundation]) is None
+    )
 
 
 def test_resolve_prerequisite_task_selects_canonical_earliest_created_at():
@@ -1634,12 +1644,17 @@ def test_select_canonical_provider_picks_earliest_then_id():
 
 def test_prerequisite_matches_task_matches_by_id():
     task = _make_task()
-    assert prerequisite_matches_task({"kind": "task", "ref": str(task.id)}, task) is True
+    assert (
+        prerequisite_matches_task({"kind": "task", "ref": str(task.id)}, task) is True
+    )
 
 
 def test_prerequisite_matches_task_matches_by_finding_hash():
     task = _make_task(context={"finding_hash": "abc123def4560000"})
-    assert prerequisite_matches_task({"kind": "task", "ref": "abc123def4560000"}, task) is True
+    assert (
+        prerequisite_matches_task({"kind": "task", "ref": "abc123def4560000"}, task)
+        is True
+    )
 
 
 def test_prerequisite_matches_task_matches_by_finding_lineage():
@@ -1649,26 +1664,211 @@ def test_prerequisite_matches_task_matches_by_finding_lineage():
             "finding_lineage": ["feedfacecafebeef"],
         }
     )
-    assert prerequisite_matches_task({"kind": "task", "ref": "feedfacecafebeef"}, task) is True
+    assert (
+        prerequisite_matches_task({"kind": "task", "ref": "feedfacecafebeef"}, task)
+        is True
+    )
 
 
 def test_prerequisite_matches_task_matches_capability_marker_case_insensitive():
     task = _make_task(context={"provides_capability": "Auth-Service"})
-    assert prerequisite_matches_task({"kind": "capability", "ref": "auth-service"}, task) is True
+    assert (
+        prerequisite_matches_task({"kind": "capability", "ref": "auth-service"}, task)
+        is True
+    )
 
 
 def test_prerequisite_matches_task_matches_capability_list_marker():
     task = _make_task(context={"capability": ["logging", "auth-service"]})
-    assert prerequisite_matches_task({"kind": "capability", "ref": "auth-service"}, task) is True
+    assert (
+        prerequisite_matches_task({"kind": "capability", "ref": "auth-service"}, task)
+        is True
+    )
 
 
 def test_prerequisite_matches_task_negatives():
     task = _make_task(context={"finding_hash": "1111222233334444"})
     # Wrong hash, missing marker, malformed need, None task, and the resume-only
     # 'pr' kind all return False (pr is intentionally not a predicate signal).
-    assert prerequisite_matches_task({"kind": "task", "ref": "ffffffffffffffff"}, task) is False
-    assert prerequisite_matches_task({"kind": "capability", "ref": "auth"}, task) is False
+    assert (
+        prerequisite_matches_task({"kind": "task", "ref": "ffffffffffffffff"}, task)
+        is False
+    )
+    assert (
+        prerequisite_matches_task({"kind": "capability", "ref": "auth"}, task) is False
+    )
     assert prerequisite_matches_task({"kind": "bogus", "ref": "x"}, task) is False
     assert prerequisite_matches_task(None, task) is False
     assert prerequisite_matches_task({"kind": "task", "ref": "x"}, None) is False
     assert prerequisite_matches_task({"kind": "pr", "ref": "42"}, task) is False
+
+
+# --- Technical token and bigram Jaccard secondary dedup gates ---
+
+
+def test_extract_technical_tokens_file_paths():
+    tokens = _extract_technical_tokens(
+        "fix performance issue in backend/app/reaper.py startup"
+    )
+    assert "backend/app/reaper.py" in tokens
+
+
+def test_extract_technical_tokens_underscored_identifiers():
+    tokens = _extract_technical_tokens(
+        "finding_deduplication helpers miss reworded titles"
+    )
+    assert "finding_deduplication" in tokens
+
+
+def test_extract_technical_tokens_mixed_case():
+    tokens = _extract_technical_tokens(
+        "TaskStatus enum causes TypeError in orchestrator"
+    )
+    assert "taskstatus" in tokens
+
+
+def test_extract_technical_tokens_excludes_plain_words():
+    tokens = _extract_technical_tokens("reduce spawn churn in research cycle")
+    assert tokens == set()
+
+
+def test_extract_technical_tokens_excludes_stopwords():
+    tokens = _extract_technical_tokens("fix finding_deduplication threshold")
+    # "fix" is a stopword; "finding_deduplication" is technical
+    assert "finding_deduplication" in tokens
+    assert "fix" not in tokens
+
+
+def test_title_bigrams_basic():
+    bgs = _title_bigrams("finding deduplication misses reworded titles")
+    assert ("finding", "deduplication") in bgs
+    assert ("deduplication", "misses") in bgs
+
+
+def test_title_bigrams_strips_stopwords():
+    # "the" is a stopword — bigrams bridge across it
+    bgs = _title_bigrams("the finding deduplication issue")
+    assert ("finding", "deduplication") in bgs
+    # "the" should not appear in any bigram token
+    for a, b in bgs:
+        assert a != "the" and b != "the"
+
+
+def test_title_bigrams_too_short():
+    assert _title_bigrams("one") == set()
+    assert _title_bigrams("") == set()
+
+
+def test_is_duplicate_technical_token_same_direction():
+    # Shared underscore identifier triggers duplicate even with < 4 word overlap
+    existing = [("dir-1", "finding_deduplication helpers miss paraphrased titles")]
+    title = "finding_deduplication skips reworded research findings"
+    # Word overlap: {finding_deduplication} = 1 word (below 4 threshold without gate)
+    assert is_duplicate(title, "dir-1", existing) is True
+
+
+def test_is_duplicate_technical_token_file_path():
+    existing = [("dir-1", "reaper.py startup latency exceeds threshold")]
+    title = "reaper.py initialization takes too long on leader"
+    assert is_duplicate(title, "dir-1", existing) is True
+
+
+def test_is_duplicate_technical_token_cross_direction_single_token_no_match():
+    # Cross-direction: 1 shared technical token is NOT enough (threshold is 2)
+    existing = [("dir-2", "finding_deduplication helpers miss paraphrased titles")]
+    title = "finding_deduplication skips reworded research findings"
+    assert is_duplicate(title, "dir-1", existing) is False
+
+
+def test_is_duplicate_technical_token_cross_direction_two_tokens_match():
+    # Cross-direction: 2 shared technical tokens → duplicate
+    existing = [
+        ("dir-2", "finding_deduplication.py and reaper.py have overlapping logic")
+    ]
+    title = "finding_deduplication.py duplicates reaper.py retry handling"
+    assert is_duplicate(title, "dir-1", existing) is True
+
+
+def test_is_duplicate_bigram_jaccard_same_direction():
+    # Titles with very similar structure (>0.65 bigram Jaccard) → duplicate
+    # A: [word, overlap, deduplication, misses, reworded, titles, same, direction, cycles]
+    # B: [word, overlap, deduplication, skips, reworded, titles, same, direction, cycles]
+    # Bigrams intersect heavily: (word,overlap),(overlap,deduplication),(reworded,titles),(titles,same),(same,direction),(direction,cycles)
+    title_a = (
+        "word overlap deduplication misses reworded titles in same direction cycles"
+    )
+    title_b = (
+        "word overlap deduplication skips reworded titles in same direction cycles"
+    )
+    existing = [("dir-1", title_b)]
+    assert is_duplicate(title_a, "dir-1", existing) is True
+
+
+def test_is_duplicate_bigram_jaccard_cross_direction_below_threshold():
+    # Titles share 5 non-stopword words (< 6 cross-direction threshold) and
+    # bigram Jaccard ~0.67 (above same-direction 0.65 but below cross-direction 0.80)
+    title_a = "classify cascade cancellation events detection failures"
+    title_b = "classify cascade cancellation events detection behavior"
+    existing = [("dir-2", title_b)]
+    # Cross-direction threshold is 0.80; this pair has Jaccard ~0.67 → no match
+    assert is_duplicate(title_a, "dir-1", existing) is False
+
+
+def test_is_duplicate_plain_words_no_false_positive():
+    # Generic plain-word titles without technical tokens should NOT trigger secondary gates
+    existing = [("dir-1", "alpha beta gamma delta work queue task")]
+    title = "alpha beta gamma delta research cycle run"
+    # Word overlap = 4 (alpha, beta, gamma, delta) → fires via word-overlap gate
+    assert is_duplicate(title, "dir-1", existing) is True
+    # Use truly different words to test no false positive
+    existing3 = [("dir-1", "alpha beta gamma unrelated words here")]
+    title3 = "delta epsilon zeta completely different context"
+    assert is_duplicate(title3, "dir-1", existing3) is False
+
+
+def test_deduplicate_findings_catches_technical_token_duplicate():
+    # A reworded finding sharing a technical identifier should be blocked
+    findings = [
+        {
+            "title": "finding_deduplication.py misses paraphrased cross-cycle titles",
+            "description": "The word-overlap gate does not catch reworded duplicates.",
+            "priority": "medium",
+        }
+    ]
+    existing = [
+        ("dir-1", "finding_deduplication.py skips reworded research findings", None)
+    ]
+    outcome = deduplicate_findings(
+        findings=findings,
+        task_context={"direction_id": "dir-1"},
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert len(outcome.deduplicated) == 0
+    assert outcome.word_overlap_count == 1
+
+
+def test_deduplicate_findings_passes_unrelated_technical_token_finding():
+    # Unrelated findings with different technical tokens should NOT be blocked
+    findings = [
+        {
+            "title": "orchestrator.py loses context on cold restart",
+            "description": "Context is dropped.",
+            "priority": "medium",
+        }
+    ]
+    existing = [
+        ("dir-1", "finding_deduplication.py skips reworded research findings", None)
+    ]
+    outcome = deduplicate_findings(
+        findings=findings,
+        task_context={"direction_id": "dir-1"},
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert len(outcome.deduplicated) == 1
+    assert outcome.word_overlap_count == 0

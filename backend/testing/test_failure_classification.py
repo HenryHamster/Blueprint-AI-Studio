@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.failure_classification import (
+    ADMIN_CANCEL,
     AGENT_ERROR_REPORT_CONTEXT_KEY,
     AGENT_TIMEOUT,
     ALL_FAILURE_CLASSES,
@@ -430,13 +431,13 @@ class TestStuckLlmCallReclassifiedToRateLimit:
 
     def test_cancellation_with_zero_output_not_reclassified(self):
         # A deliberate orchestration cancellation also has 0 output tokens but is
-        # NOT a provider hang — it lacks an execution-stall signature, so it must
-        # stay AGENT_TIMEOUT (proves the reclassification is narrowly scoped).
+        # NOT a provider hang — it lacks an execution-stall signature and routes to
+        # ADMIN_CANCEL, not RATE_LIMIT (proves the reclassification is narrowly scoped).
         t = self._stalled(
             "Cancelled: dependency task failed",
             {"llm_call_count": 1, "total_input_tokens": 0, "total_output_tokens": 0},
         )
-        assert classify_failure(t) == AGENT_TIMEOUT
+        assert classify_failure(t) == ADMIN_CANCEL
 
     def test_missing_summary_stays_agent_timeout(self):
         t = _task("Fatal error: Claude Code exceeded 45-minute time limit")
@@ -1225,9 +1226,6 @@ class TestClassifyFailureAgentTimeout:
             "backstop timeout fired",
             "waiting on dependency PR",
             "Waiting: serializing migration — task 7af4d393 is already producing a migration in this project",
-            "Cancelled: parent evaluation timeout",
-            "Cancelled: some new orchestrator reason",
-            "Superseded by fix on PR #1234",
         ],
     )
     def test_timeout_keywords(self, msg):
@@ -1262,9 +1260,39 @@ class TestClassifyFailureAgentTimeout:
         assert classify_failure(_task(msg)) == AGENT_TIMEOUT
 
     def test_cascade_beats_code_error_default(self):
-        """A 'Cancelled:' prefix routes to AGENT_TIMEOUT even if tail looks like code."""
+        """A 'Cancelled:' prefix routes to ADMIN_CANCEL even if tail looks like code."""
         msg = "Cancelled: AssertionError in downstream"
-        assert classify_failure(_task(msg)) == AGENT_TIMEOUT
+        assert classify_failure(_task(msg)) == ADMIN_CANCEL
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "Cancelled: dependency task failed",
+            "Cancelled: parent dependency failed",
+            "Cancelled: parent evaluation timeout",
+            "Cancelled: AssertionError in downstream",
+        ],
+    )
+    def test_cancelled_prefix_routes_to_admin_cancel(self, msg):
+        """Tasks cancelled by orchestrator route to ADMIN_CANCEL, not AGENT_TIMEOUT."""
+        assert classify_failure(_task(msg)) == ADMIN_CANCEL
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "Superseded by fix on PR #42",
+            "superseded by newer revision",
+        ],
+    )
+    def test_superseded_routes_to_admin_cancel(self, msg):
+        """System-initiated supersession routes to ADMIN_CANCEL, not AGENT_TIMEOUT."""
+        assert classify_failure(_task(msg)) == ADMIN_CANCEL
+
+    def test_admin_cancel_in_infra_classes(self):
+        """ADMIN_CANCEL must be budget-exempt (in INFRA_CLASSES)."""
+        from app.failure_classification import INFRA_CLASSES
+
+        assert ADMIN_CANCEL in INFRA_CLASSES
 
 
 class TestClassifyFailureExternalApi:

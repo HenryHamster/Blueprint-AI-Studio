@@ -272,6 +272,15 @@ DEAD_AUTH = "DEAD_AUTH"
 # treated as CODE_ERROR, PR_REJECTED, or direction-health damage.
 APPROVED_CAP_PR_CLOSED = "APPROVED_CAP_PR_CLOSED"
 
+# Administrative cancellation — orchestrator or operator terminated the task before
+# it ran meaningful work: cascade cancels ("Cancelled: dependency task failed"),
+# parent-dependency cancels ("Cancelled: parent evaluation timeout"), or system
+# supersession ("Superseded by fix on PR #N"). These are never-started
+# administrative operations, not genuine LLM hangs or code defects. Distinct from
+# AGENT_TIMEOUT so agent_timeout_rate stays a clean signal for real LLM/VM deaths.
+# Budget-exempt (INFRA_CLASSES) — no retry burn, no direction-health penalty.
+ADMIN_CANCEL = "ADMIN_CANCEL"
+
 # Context key stamped on a co-deferred dependent task's context. When a research
 # cycle decomposes findings, a dependent finding whose prerequisite was deferred
 # in the SAME cycle is "co-deferred": its spawned task is set to CANCELLED and the
@@ -468,6 +477,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         PARK_WAKE_STRANDED,
         DEAD_AUTH,
         APPROVED_CAP_PR_CLOSED,
+        ADMIN_CANCEL,
     }
 )
 
@@ -523,6 +533,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     PARK_WAKE_TIMEOUT,
     PARK_WAKE_STRANDED,
     APPROVED_CAP_PR_CLOSED,
+    ADMIN_CANCEL,
 )
 
 
@@ -2320,6 +2331,15 @@ def _classify_failure_class(
             return RATE_LIMIT
         return AGENT_TIMEOUT
 
+    # Cascade cancellations and supersessions — administrative orchestrator decisions
+    # that must be classified before ANY keyword-matching loop so that substrings
+    # in the tail (e.g. "evaluation timeout" inside "Cancelled: parent evaluation
+    # timeout") cannot override the administrative intent.
+    if status_msg.startswith("cancelled:"):
+        return ADMIN_CANCEL
+    if "superseded" in status_msg:
+        return ADMIN_CANCEL
+
     # Migration-specific failures — alembic chain/head errors, missing migration
     # column drift, schema-revision mismatches, downgrade failures. Checked before
     # the database-connection EXTERNAL_API bank because UndefinedColumn errors
@@ -2569,17 +2589,6 @@ def _classify_failure_class(
         for kw in ["waiting on", "dependencies cleared", "serializing migration"]
     ):
         return "AGENT_TIMEOUT"
-
-    # Cascade cancellations — any task cancelled by the orchestrator/services is an infrastructure
-    # decision, not a code defect. Matches: "Cancelled: dependency task failed",
-    # "Cancelled: parent dependency failed", "Cancelled: parent evaluation timeout", etc.
-    if combined.startswith("cancelled:"):
-        return "AGENT_TIMEOUT"
-
-    # System-initiated supersession — review pipeline cancels stale tasks with
-    # "Superseded by fix on PR #N: ...". Same family as "cancelled:" above.
-    if "superseded" in combined:
-        return AGENT_TIMEOUT
 
     # Viewport gate infra-unavailable sentinel — Chromium missing or Docker fallback absent.
     # Checked before VIEWPORT_REGRESSION so infra shortfalls don't land in CODE_ERROR residuals.

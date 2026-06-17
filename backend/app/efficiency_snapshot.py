@@ -2821,6 +2821,7 @@ async def read_baseline_with_drift(
     llm_cost_attribution_trend = [
         {
             "captured_at": snap.get("captured_at"),
+            "by_model": (snap.get("llm_cost_attribution") or {}).get("by_model"),
             "rework_share": (snap.get("llm_cost_attribution") or {}).get(
                 "rework_share"
             ),

@@ -4892,6 +4892,7 @@ class TestFailureClassificationInvariants:
 
     def test_infra_classes_membership_exact(self):
         from app.failure_classification import (
+            ADMIN_CANCEL,
             AGENT_STALLED,
             AGENT_TIMEOUT,
             APPROVED_CAP_PR_CLOSED,
@@ -4934,6 +4935,9 @@ class TestFailureClassificationInvariants:
                 # Approved PR closed by cap burn — not a code defect, so it
                 # must not penalize direction health or consume retry budget.
                 APPROVED_CAP_PR_CLOSED,
+                # Administrative cancellation (cascade cancel / supersession) —
+                # not a code defect or genuine LLM hang.
+                ADMIN_CANCEL,
             }
         ), (
             "INFRA_CLASSES membership changed — direction_outcomes and "

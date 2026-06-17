@@ -3011,15 +3011,11 @@ async def test_failure_group_agent_timeout_subtypes(client: AsyncClient, db_sess
     await db_session.refresh(project)
 
     curr = _curr_ts()
-    cases = [
+    # Cascade cancellations are ADMIN_CANCEL (not AGENT_TIMEOUT) since PR #10508.
+    timeout_cases = [
         ("Heartbeat Task", "No heartbeat received after 300s", "heartbeat_lost"),
         ("OOM Task", "exit code 137 out of memory", "oom"),
         ("Exec Task", "execution timed out after 1800s", "execution_timeout"),
-        (
-            "Cascade Task",
-            "Cancelled: parent evaluation timeout",
-            "cascade_cancellation",
-        ),
         (
             "Iter Task",
             "merge blocked, fix not spawned (iteration cap)",
@@ -3027,7 +3023,10 @@ async def test_failure_group_agent_timeout_subtypes(client: AsyncClient, db_sess
         ),
         ("Crash Task", "[FATAL:uncaughtException] boom", "process_crash"),
     ]
-    for title, msg, _ in cases:
+    cascade_title = "Cascade Task"
+    cascade_msg = "Cancelled: parent evaluation timeout"
+    all_tasks = timeout_cases + [(cascade_title, cascade_msg, None)]
+    for title, msg, _ in all_tasks:
         db_session.add(
             make_task(
                 project_id=project.id,
@@ -3050,15 +3049,17 @@ async def test_failure_group_agent_timeout_subtypes(client: AsyncClient, db_sess
     title_to_subtype = {
         t["title"]: t["timeout_subtype"] for t in timeout_group["tasks"]
     }
-    for title, _, expected_subtype in cases:
+    for title, _, expected_subtype in timeout_cases:
         assert title_to_subtype[title] == expected_subtype, (
             title,
             title_to_subtype[title],
         )
 
     rf_by_title = {f["title"]: f for f in data["recent_failures"]}
-    for title, _, expected_subtype in cases:
+    for title, _, expected_subtype in timeout_cases:
         assert rf_by_title[title]["timeout_subtype"] == expected_subtype
+    # Cascade cancellations are ADMIN_CANCEL — timeout_subtype is not populated.
+    assert rf_by_title[cascade_title]["timeout_subtype"] is None
 
 
 @pytest.mark.asyncio

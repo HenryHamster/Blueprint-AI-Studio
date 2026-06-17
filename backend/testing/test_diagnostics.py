@@ -250,16 +250,16 @@ class TestClassifyStuckFailure:
         )
 
     def test_cascade_cancellation_messages(self):
-        """Cascade-cancelled children should be AGENT_TIMEOUT, not CODE_ERROR."""
+        """Cascade-cancelled children should be ADMIN_CANCEL, not CODE_ERROR."""
         from app.failure_classification import classify_failure
 
         cases = [
-            ("Cancelled: parent evaluation timeout after 2.0h", "AGENT_TIMEOUT"),
+            ("Cancelled: parent evaluation timeout after 2.0h", "ADMIN_CANCEL"),
             (
                 "Cancelled: parent CI wait backstop timeout after 1.9h (reason)",
-                "AGENT_TIMEOUT",
+                "ADMIN_CANCEL",
             ),
-            ("Cancelled: parent dependency failed", "AGENT_TIMEOUT"),
+            ("Cancelled: parent dependency failed", "ADMIN_CANCEL"),
         ]
         for msg, expected in cases:
             t = self._task_with_message(msg)
