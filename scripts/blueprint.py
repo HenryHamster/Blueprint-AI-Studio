@@ -85,16 +85,19 @@ def first_payload(task: dict) -> dict:
 # ── status ───────────────────────────────────────────────────────────────────
 
 def cmd_status(args: argparse.Namespace) -> None:
-    """Fetch canonical system state from GET /api/admin/state."""
+    """Fetch canonical system state from GET /api/admin/state and version-lifecycle."""
     pid = get_project_id(getattr(args, "project_id", None))
     state, state_err = _safe_read(f"/api/admin/state?project_id={pid}")
     state = state or {}
+    lifecycle, lifecycle_err = _safe_read(f"/api/admin/projects/{pid}/version-lifecycle")
+    lifecycle = lifecycle or {}
     deploy = state.get("deploy") or {}
     version = state.get("version")
     fleet_raw = state.get("fleet") or {}
 
     serving = (version.get("serving") or {}) if version else {}
 
+    errors = {k: v for k, v in (("state", state_err), ("lifecycle", lifecycle_err)) if v}
     data = {
         "project_id": pid,
         "deploy_state": {
@@ -126,16 +129,12 @@ def cmd_status(args: argparse.Namespace) -> None:
             "stale_heartbeat_count": fleet_raw.get("stale_heartbeat_count"),
         },
         "promotion": {
-            "enabled_effective": None,
-            "enabled_source": None,
+            "enabled_effective": lifecycle.get("promotion_enabled_effective"),
+            "enabled_source": lifecycle.get("promotion_enabled_source"),
             "ready": None,
             "reason": None,
         },
-        "errors": {
-            k: v
-            for k, v in (("state", state_err),)
-            if v
-        },
+        "errors": errors,
     }
     _emit(args, data, _render_status)
 

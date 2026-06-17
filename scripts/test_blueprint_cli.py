@@ -223,10 +223,12 @@ def test_status_json_is_valid_json(mock_api, capsys):
     assert parsed["project_id"] == "proj-1"
     assert parsed["current_version"]["version_number"] == 12
     assert parsed["current_version"]["active_candidate_sha"] == "abc123"
-    # promotion fields have no equivalent in /api/admin/state — emitted as None
-    assert parsed["promotion"]["enabled_effective"] is None
-    # single /api/admin/state call — no deploy-state or settings calls
+    # promotion fields come from version-lifecycle when available
+    assert parsed["promotion"]["enabled_effective"] is not None
+    assert parsed["promotion"]["enabled_effective"] is True
+    # state and lifecycle calls are made; no deploy-state or settings calls
     assert any("/admin/state" in path for _, path, _ in mock_api)
+    assert any("version-lifecycle" in path for _, path, _ in mock_api)
     assert not any("deploy-state" in path for _, path, _ in mock_api)
     assert not any("settings" in path for _, path, _ in mock_api)
 
