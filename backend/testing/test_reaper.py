@@ -36,11 +36,13 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.reaper_evaluating_sweeps import (
+    _snap_all_terminal,
+    _snap_any_completed,
+)
 from app.reaper import (
     reaper_service,
     _copy_analysis_artifacts_to_previous,
-    _snap_all_terminal,
-    _snap_any_completed,
     _reaper_skip_counts,
     _orphan_reap_crash_streaks,
     _ORPHAN_REAP_CRASH_STREAK_LIMIT,

@@ -2478,6 +2478,120 @@ async def sweep_recover_stranded_transient_blockers(
     return recovered
 
 
+# ── Strategic cycle starvation sweep ─────────────────────────────────────────
+
+# Autonomous projects older than this window with no StrategicCycle row trigger
+# a strategic_cycle_stall WARNING Alert.
+_STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS = 24
+_STRATEGIC_CYCLE_STALL_ALERT_TITLE = "Strategic engine starved: no cycle in window"
+
+
+async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
+    """Emit a deduped strategic_cycle_stall Alert for autonomous projects with no
+    recent StrategicCycle row at all. Returns the number of alerts created."""
+    from app.models import Alert, AlertSeverity, Project, StrategicCycle
+    from app.shared_state import runtime_config as _runtime_config
+
+    starvation_hours = int(
+        _runtime_config.get(
+            "strategic_cycle_starvation_hours",
+            _STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS,
+        )
+        or _STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS
+    )
+    cutoff = now - timedelta(hours=starvation_hours)
+
+    project_rows = (
+        await session.execute(
+            select(Project.id, Project.created_at).where(
+                Project.autonomous_enabled.is_(True),
+                Project.not_archived(),
+            )
+        )
+    ).all()
+
+    # New projects have not had time to establish a cadence — skip until the
+    # project itself is older than the starvation window. Filter in Python so
+    # the two batched lookups below only run over genuine candidates.
+    candidate_ids: list = []
+    for project_id, project_created_at in project_rows:
+        if project_created_at is not None:
+            pc = project_created_at
+            if pc.tzinfo is not None:
+                pc = pc.replace(tzinfo=None)
+            if pc > cutoff:
+                continue
+        candidate_ids.append(project_id)
+
+    created = 0
+    if not candidate_ids:
+        return created
+
+    # Batched lookup 1: which candidate projects already have a recent cycle.
+    # Replaces a per-project existence SELECT (the old N+1). Equivalent to the
+    # prior ``phase1_started_at >= cutoff`` LIMIT 1 existence check, collapsed
+    # into one round-trip via DISTINCT.
+    projects_with_recent_cycle = set(
+        (
+            await session.execute(
+                select(StrategicCycle.project_id)
+                .where(
+                    StrategicCycle.project_id.in_(candidate_ids),
+                    StrategicCycle.phase1_started_at >= cutoff,
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Batched lookup 2: which candidate projects already have an open WARNING
+    # dedup alert. Replaces the per-project dedup SELECT (the second N+1).
+    projects_with_open_alert = set(
+        (
+            await session.execute(
+                select(Alert.project_id)
+                .where(
+                    Alert.project_id.in_(candidate_ids),
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for project_id in candidate_ids:
+        if project_id in projects_with_recent_cycle:
+            continue
+        # Dedup: one open WARNING alert per project for this title.
+        if project_id in projects_with_open_alert:
+            continue
+
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.WARNING,
+                title=_STRATEGIC_CYCLE_STALL_ALERT_TITLE,
+                message=(
+                    f"No strategic cycle has started in the last {starvation_hours}h "
+                    "for this autonomous project — the strategic engine appears "
+                    "starved (zero cycles, not merely stalled mid-cycle). Review the "
+                    "strategic loop scheduler and recent orchestrator logs."
+                )[:1000],
+            )
+        )
+        created += 1
+    if created:
+        await session.commit()
+    return created
+
+
 # ── Re-exports from extracted sub-module ─────────────────────────────────────
 #
 # These symbols were extracted to app.reaper_bug_message_sweeps. They are
