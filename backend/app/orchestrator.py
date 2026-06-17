@@ -108,6 +108,7 @@ from app.shared_state import (
     sync_runtime_config_from_state as _sync_runtime_config_from_state,
 )
 from app.task_locking import task_lock
+from app.task_blocked import strip_fresh_attempt_context
 from app.time_utils import (
     _utcnow,
     clear_retry_after,
@@ -813,7 +814,9 @@ def _hard_watchdog_step(is_guarded, should_abort, abort) -> bool:
     return False
 
 
-def _hard_watchdog_loop(*, is_guarded, should_abort, abort, stop_event, poll_interval) -> None:
+def _hard_watchdog_loop(
+    *, is_guarded, should_abort, abort, stop_event, poll_interval
+) -> None:
     # ``stop_event.wait`` returns True only when the event is set (clean
     # shutdown) → exit the loop; otherwise it returns False after ``poll_interval``
     # and we re-check. Using the event as the sleep makes shutdown immediate.
@@ -1084,13 +1087,22 @@ async def _filter_project_resource_dispatch_eligible(
         task = task_by_id.get(task_id)
         if task is None:
             continue
-        defer_msg = await _project_resource_dispatch_defer_message(
-            session,
-            task,
-            projected_counts,
-            project_cache=project_cache,
-            spend_cache=spend_cache,
-        )
+        try:
+            defer_msg = await _project_resource_dispatch_defer_message(
+                session,
+                task,
+                projected_counts,
+                project_cache=project_cache,
+                spend_cache=spend_cache,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[ORCHESTRATOR] Error checking resource eligibility for task %s (project %s): %s",
+                task.id,
+                task.project_id,
+                exc,
+            )
+            defer_msg = f"Deferred due to resource check error: {type(exc).__name__}"
         if defer_msg:
             logger.info(
                 "[ORCHESTRATOR] Deferring task %s for project %s before slot slice: %s",
@@ -2607,6 +2619,7 @@ async def orchestrator_worker():
                             )
                             if locked_task is None:
                                 continue
+                            locked_task.context = strip_fresh_attempt_context(locked_task.context or {})
                             _clear_retry_after_state(locked_task)
                             session.add(locked_task)
                             await session.commit()
@@ -2631,6 +2644,7 @@ async def orchestrator_worker():
                             continue
                         ctx = dict(locked_task.context or {})
                         ctx.pop("_infra_wait", None)
+                        ctx = strip_fresh_attempt_context(ctx)
                         locked_task.context = ctx
                         _clear_retry_after_state(locked_task)
                         session.add(locked_task)
