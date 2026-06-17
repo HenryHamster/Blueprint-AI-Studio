@@ -99,31 +99,14 @@ def cmd_rollback(_args):
     sys.exit(1)
 
 
-def cmd_settings(args):
-    """Show or update runtime settings."""
-    if args and args[0] == '--set':
-        updates = {}
-        for kv in args[1:]:
-            k, v = kv.split('=', 1)
-            # Auto-convert types
-            if v.lower() in ('true', 'false'):
-                v = v.lower() == 'true'
-            else:
-                try:
-                    v = int(v)
-                except ValueError:
-                    try:
-                        v = float(v)
-                    except ValueError:
-                        pass
-            updates[k] = v
-        result = api("PATCH", "/api/admin/settings", updates)
-        print(f"Updated: {json.dumps(result, indent=2)}")
-    else:
-        s = api("GET", "/api/admin/settings")
-        print("=== RUNTIME SETTINGS ===")
-        for k, v in sorted(s.items()):
-            print(f"  {k}: {v}")
+def cmd_settings(_args):
+    """DEPRECATED — use: python scripts/blueprint.py settings"""
+    print(
+        "DEPRECATED: use python scripts/blueprint.py settings\n"
+        "  show:          python scripts/blueprint.py settings show\n"
+        "  set KEY=VAL:   python scripts/blueprint.py settings set KEY=VAL --yes"
+    )
+    sys.exit(1)
 
 
 def cmd_pool(_args):
@@ -615,189 +598,22 @@ def cmd_restart_orchestrator(_args):
     print(f"Restart: {json.dumps(result, indent=2)}")
 
 
-def cmd_message(args):
-    """Send a message to the autonomous system.
-
-    Usage: ops.py message "your message here" [--type NOTE|FEEDBACK|BUG_REPORT|QUESTION|BLOCKER]
-    """
-    if not args:
-        print("Usage: ops.py message \"your message\" [--type NOTE]")
-        return
-    msg_type = "FEEDBACK"
-    content_parts = []
-    i = 0
-    while i < len(args):
-        if args[i] == '--type' and i + 1 < len(args):
-            msg_type = args[i + 1]
-            i += 2
-        else:
-            content_parts.append(args[i])
-            i += 1
-    content = ' '.join(content_parts)
-    if not content:
-        print("Error: message content required")
-        return
-    pid = get_project_id()
-    result = api("POST", f"/api/admin/projects/{pid}/messages", {
-        "content": content,
-        "message_type": msg_type,
-    })
-    print(f"Message sent: {result.get('id', '?')}")
+def cmd_message(_args):
+    """DEPRECATED — use: python scripts/blueprint.py messages send"""
+    print('DEPRECATED: use python scripts/blueprint.py messages send "your message" [--type TYPE]')
+    sys.exit(1)
 
 
-def cmd_messages(args):
-    """List open messages."""
-    pid = get_project_id()
-    status = "open"
-    if args and args[0] == '--all':
-        status = ""
-    url = f"/api/admin/projects/{pid}/messages"
-    if status:
-        url += f"?status={status}"
-    msgs = api("GET", url)
-    if not msgs:
-        print("No messages.")
-        return
-    for m in msgs:
-        icon = {"BUG_REPORT": "BUG", "FEEDBACK": "FB", "NOTE": "NOTE", "QUESTION": "Q", "BLOCKER": "BLOCK"}.get(m.get("type", ""), "?")
-        src = m.get("from", "?")
-        age = m.get("created_at", "?")[:16] if m.get("created_at") else "?"
-        print(f"  [{icon}] ({src}, {age}) {m['content'][:120]}")
+def cmd_messages(_args):
+    """DEPRECATED — use: python scripts/blueprint.py messages list"""
+    print("DEPRECATED: use python scripts/blueprint.py messages list [--status open]")
+    sys.exit(1)
 
 
 def cmd_directions(args):
-    """Show project directions with status, notes, and research history.
-
-    Usage:
-        ops.py directions                   — show all active/proposed directions
-        ops.py directions --all             — include paused/completed/expired
-        ops.py directions --id d-xxxx       — show single direction in detail
-    """
-    pid = get_project_id()
-    data = api("GET", f"/api/admin/projects/{pid}/directions")
-    directions = data.get('directions', [])
-
-    if not directions:
-        print("No directions configured.")
-        return
-
-    # Single direction detail view
-    if args and args[0] == '--id' and len(args) > 1:
-        target = args[1]
-        match = [d for d in directions if d.get('id', '').startswith(target)]
-        if not match:
-            print(f"Direction not found: {target}")
-            return
-        d = match[0]
-        print(f"=== DIRECTION: {d.get('id', '?')} ===")
-        print(f"  Text:       {d.get('text', '?')}")
-        print(f"  Status:     {d.get('status', '?')}")
-        print(f"  Priority:   {d.get('priority', '?')}")
-        print(f"  Category:   {d.get('category', '-')}")
-        print(f"  Merge rate: {d.get('merge_rate', 0):.2f}")
-        print(f"  Added:      {(d.get('added_at') or '?')[:19]}")
-        if d.get('status') == 'paused' or d.get('paused_reason'):
-            print(f"  Paused why: {d.get('paused_reason', '(none recorded)')}")
-            print(f"  Auto-paused:{d.get('auto_paused', False)} (count={d.get('auto_pause_count', 0)})")
-            print(f"  Paused at:  {(d.get('paused_at') or '?')[:19]}")
-        if d.get('needs_manual_intervention'):
-            print(f"  ** NEEDS MANUAL INTERVENTION (since {(d.get('needs_manual_intervention_at') or '?')[:19]})")
-        print(f"  Productive: last_cycle_productive={d.get('last_cycle_productive')}  consec_unproductive={d.get('consecutive_unproductive_cycles', 0)}")
-        if d.get('paths'):
-            print(f"  Paths:      {', '.join(d['paths'])}")
-        if d.get('completion_criteria'):
-            print(f"  Criteria:   {d['completion_criteria']}")
-        if d.get('possibly_complete'):
-            print(f"  ** Possibly complete: {d.get('completion_suggestion', '(no suggestion)')}")
-        if d.get('possibly_saturated'):
-            print(f"  ** Possibly saturated")
-        if d.get('conflicts_with'):
-            print(f"  Conflicts:  {', '.join(d['conflicts_with'])}")
-        if d.get('pending_update'):
-            pu = d['pending_update']
-            print(f"\n  --- Pending Update ---")
-            if pu.get('suggested_text'):
-                print(f"    Text:     {pu['suggested_text'][:150]}")
-            if pu.get('suggested_priority'):
-                print(f"    Priority: {pu['suggested_priority']}")
-            if pu.get('rationale'):
-                print(f"    Reason:   {pu['rationale'][:200]}")
-
-        notes = d.get('notes', [])
-        if notes:
-            print(f"\n  --- Notes ({len(notes)}) ---")
-            for n in notes:
-                ts = (n.get('added_at') or n.get('timestamp') or '?')[:16]
-                text = n.get('text', '?')
-                print(f"    [{ts}] {text[:200]}")
-
-        history = d.get('research_history', [])
-        agg = d.get('history_aggregate', {})
-        if history or agg:
-            total_cycles = len(history) + (agg.get('total_cycles') or 0)
-            total_merged = sum(e.get('prs_merged', 0) for e in history) + (agg.get('total_prs_merged') or 0)
-            total_tasks = sum(e.get('tasks_created', 0) for e in history) + (agg.get('total_tasks_created') or 0)
-            print(f"\n  --- Research History ({total_cycles} cycles, {total_tasks} tasks, {total_merged} merged) ---")
-            for i, h in enumerate(history[-5:]):  # last 5 cycles
-                ts = (h.get('researched_at') or '?')[:16]
-                tc = h.get('tasks_created', 0)
-                pm = h.get('prs_merged', 0)
-                print(f"    {ts}  tasks={tc}  merged={pm}")
-
-        ctx = d.get('research_context', '')
-        if ctx:
-            print(f"\n  --- Research Context ---")
-            for line in ctx.strip().split('\n')[:20]:
-                print(f"    {line}")
-            lines = ctx.strip().split('\n')
-            if len(lines) > 20:
-                print(f"    ... ({len(lines) - 20} more lines)")
-        return
-
-    # List view
-    show_all = args and args[0] == '--all'
-    visible_statuses = {'active', 'proposed'} if not show_all else None
-
-    # Group by status
-    grouped: dict[str, list] = {}
-    for d in directions:
-        status = d.get('status', 'active')
-        if visible_statuses and status not in visible_statuses:
-            continue
-        grouped.setdefault(status, []).append(d)
-
-    status_order = ['proposed', 'active', 'paused', 'completed', 'expired']
-    status_icons = {'proposed': '?', 'active': '*', 'paused': '|', 'completed': '+', 'expired': 'x'}
-
-    print(f"=== DIRECTIONS ({sum(len(v) for v in grouped.values())} shown) ===")
-    for status in status_order:
-        dirs_in_status = grouped.get(status, [])
-        if not dirs_in_status:
-            continue
-        print(f"\n  [{status.upper()}]")
-        for d in dirs_in_status:
-            did = d.get('id', '?')
-            pri = d.get('priority', 'med')[:3]
-            cat = (d.get('category') or '-')[:5]
-            text = d.get('text', '?')[:80]
-            mr = d.get('merge_rate', 0)
-            icon = status_icons.get(status, ' ')
-            notes_ct = len(d.get('notes', []))
-            notes_str = f"  [{notes_ct} notes]" if notes_ct else ""
-            flags = []
-            if d.get('possibly_complete'):
-                flags.append('COMPLETE?')
-            if d.get('possibly_saturated'):
-                flags.append('SATURATED?')
-            if d.get('pending_update'):
-                flags.append('UPDATE?')
-            flag_str = f"  !! {', '.join(flags)}" if flags else ""
-            print(f"    {icon} {did}  [{pri:3}] [{cat:5}]  mr={mr:.1f}  {text}{notes_str}{flag_str}")
-
-    if not show_all:
-        hidden = len(directions) - sum(len(v) for v in grouped.values())
-        if hidden > 0:
-            print(f"\n  ({hidden} paused/completed/expired hidden — use --all to show)")
+    """DEPRECATED — use: python scripts/blueprint.py directions"""
+    print("DEPRECATED: use python scripts/blueprint.py directions [list|show|add|update|unhold]")
+    import sys; sys.exit(1)
 
 
 def cmd_vision(args):

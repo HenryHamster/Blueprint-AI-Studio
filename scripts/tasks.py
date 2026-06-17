@@ -722,37 +722,12 @@ def cmd_health(args):
 
 
 def cmd_directions(args):
-    """Show research directions for a project. Use -v for full text."""
-    from blueprint_api import api, get_project_id
-    verbose = "-v" in args or "--verbose" in args
-    clean_args = [a for a in args if not a.startswith("-")]
-    pid = clean_args[0] if clean_args else get_project_id()
-    data = api("GET", f"/api/admin/projects/{pid}/directions")
-    dirs = data.get("directions", data) if isinstance(data, dict) else data
-    if not dirs:
-        print("No research directions configured.")
-        return
-    print(f"=== RESEARCH DIRECTIONS ({len(dirs)}) ===")
-    for d in dirs:
-        prio = d.get("priority", "?")
-        full_text = d.get("text") or d.get("summary") or "?"
-        did = d.get("id") or "?"
-        status = d.get("status", "active")
-        saturated = d.get("saturated", False)
-        sat_str = " [SATURATED]" if saturated else ""
-        status_str = f" [{status}]" if status != "active" else ""
-        history = d.get("research_history") or []
-        hist_str = f"  ({len(history)} cycles)" if history else ""
-        if verbose:
-            print(f"\n  [{prio:6}] {did}{sat_str}{status_str}{hist_str}")
-            print(f"  {full_text}")
-            notes = d.get("notes") or []
-            if notes:
-                print(f"  Notes ({len(notes)}):")
-                for n in notes[-3:]:
-                    print(f"    • {_safe(n.get('text', ''), 200)}")
-        else:
-            print(f"  [{prio:6}] {did[:8]}  {_safe(full_text, 120)}{sat_str}{hist_str}")
+    """DEPRECATED — use: python scripts/blueprint.py directions list"""
+    print(
+        "DEPRECATED: tasks.py directions is superseded.\n"
+        "  Use: python scripts/blueprint.py directions [list|show|add|update|unhold]"
+    )
+    import sys; sys.exit(1)
 
 
 def cmd_reset_iteration_cap(args):
@@ -776,140 +751,31 @@ def cmd_reset_iteration_cap(args):
 
 
 def cmd_unhold_direction(args):
-    """Clear a direction's consecutive-failure hold.
-
-    Usage: tasks.py unhold-direction <direction_id>
-    """
-    from blueprint_api import api, get_project_id
-    if not args:
-        print("Usage: tasks.py unhold-direction <direction_id>")
-        return
-    did = args[0]
-    pid = get_project_id()
-    result = api("POST", f"/api/admin/projects/{pid}/directions/{did}/unhold")
-    was_held = result.get("was_held", False)
-    if was_held:
-        print(f"Unheld direction {did}")
-    else:
-        print(f"Direction {did} was not held (idempotent)")
+    """DEPRECATED — use: python scripts/blueprint.py directions unhold <direction_id>"""
+    print(
+        "DEPRECATED: tasks.py unhold-direction is superseded.\n"
+        "  Use: python scripts/blueprint.py directions unhold <direction_id>"
+    )
+    import sys; sys.exit(1)
 
 
 def cmd_add_direction(args):
-    """Add a new research direction.
-
-    Usage: tasks.py add-direction "direction text" [--priority high|medium|low]
-           tasks.py add-direction --text "direction text" --priority high
-    """
-    from blueprint_api import api, get_project_id
-    if not args:
-        print("Usage: tasks.py add-direction 'direction text' [--priority high|medium|low]")
-        return
-    text = None
-    priority = "medium"
-    for i, a in enumerate(args):
-        if a == "--priority" and i + 1 < len(args):
-            priority = args[i + 1]
-        elif a == "--text" and i + 1 < len(args):
-            text = args[i + 1]
-    # If no --text flag, first non-flag arg is the text
-    if text is None:
-        positional = [a for a in args if not a.startswith("--") and a not in (priority,)]
-        text = positional[0] if positional else None
-    if not text:
-        print("Error: direction text required")
-        return
-    pid = get_project_id()
-    result = api("POST", f"/api/admin/projects/{pid}/directions", {"text": text, "priority": priority})
-    d = result.get("direction", {})
-    print(f"Added direction {d.get('id', '?')} [{priority}]: {text[:80]}")
+    """DEPRECATED — use: python scripts/blueprint.py directions add "text" [--priority ...]"""
+    print(
+        "DEPRECATED: tasks.py add-direction is superseded.\n"
+        "  Use: python scripts/blueprint.py directions add \"text\" [--priority high|medium|low]"
+    )
+    import sys; sys.exit(1)
 
 
 def cmd_update_direction(args):
-    """Update a direction's text, priority, or status.
-
-    Usage:
-        tasks.py update-direction <direction_id> [--text "new text"] [--priority high|medium|low] [--status active|paused|completed]
-        tasks.py update-direction <direction_id> --reset-context        — wipe research_context
-        tasks.py update-direction <direction_id> --reset-history        — wipe research_history
-        tasks.py update-direction <direction_id> --reset-agent-notes    — remove agent-added notes (keep user notes)
-        tasks.py update-direction all --reset-all                       — full blank slate (context + history + agent notes)
-    """
-    from blueprint_api import api, get_project_id
-    if not args:
-        print("Usage: tasks.py update-direction <direction_id> [--text '...'] [--priority ...] [--status ...] [--reset-context] [--reset-history] [--reset-agent-notes] [--reset-all]")
-        return
-    did = args[0]
-    reset_all = "--reset-all" in args
-
-    def _build_reset_patch(direction_data):
-        """Build patch dict for reset flags, optionally using direction data for note filtering."""
-        patch = {}
-        if "--reset-context" in args or reset_all:
-            patch["research_context"] = "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
-        if "--reset-history" in args or reset_all:
-            patch["research_history"] = []
-        if "--reset-agent-notes" in args or reset_all:
-            notes = direction_data.get("notes", []) if direction_data else []
-            # Keep only user-added notes (no added_by_task field)
-            user_notes = [n for n in notes if not n.get("added_by_task")]
-            patch["notes"] = user_notes
-        return patch
-
-    # Handle "all" target for bulk resets
-    if did.lower() == "all":
-        pid = get_project_id()
-        dirs_data = api("GET", f"/api/admin/projects/{pid}/directions")
-        all_dirs = dirs_data if isinstance(dirs_data, list) else dirs_data.get("directions", [])
-        for d in all_dirs:
-            d_id = d.get("id", "?")
-            d_name = (d.get("text") or "?")[:50]
-            patch = _build_reset_patch(d)
-            if patch:
-                api("PATCH", f"/api/admin/projects/{pid}/directions/{d_id}", patch)
-                actions = []
-                if "research_context" in patch:
-                    actions.append("context")
-                if "research_history" in patch:
-                    actions.append("history")
-                if "notes" in patch:
-                    kept = len(patch["notes"])
-                    removed = len(d.get("notes", [])) - kept
-                    actions.append(f"notes (-{removed}, kept {kept} user)")
-                print(f"  Reset {d_id[:12]} ({d_name}): {', '.join(actions)}")
-        return
-
-    patch = {}
-    for i, a in enumerate(args):
-        if a == "--text" and i + 1 < len(args):
-            patch["text"] = args[i + 1]
-        if a == "--priority" and i + 1 < len(args):
-            patch["priority"] = args[i + 1]
-        if a == "--status" and i + 1 < len(args):
-            patch["status"] = args[i + 1]
-        if a == "--reset-context" or reset_all:
-            patch["research_context"] = "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
-        if a == "--reset-history" or reset_all:
-            patch["research_history"] = []
-        if a == "--reset-agent-notes" or reset_all:
-            # Need direction data for filtering — fetch it
-            pid_tmp = get_project_id()
-            dirs_tmp = api("GET", f"/api/admin/projects/{pid_tmp}/directions")
-            all_tmp = dirs_tmp if isinstance(dirs_tmp, list) else dirs_tmp.get("directions", [])
-            for dt in all_tmp:
-                if dt.get("id") == did:
-                    user_notes = [n for n in dt.get("notes", []) if not n.get("added_by_task")]
-                    patch["notes"] = user_notes
-                    break
-    if not patch:
-        print("Nothing to update. Use --text, --priority, or --status.")
-        return
-    pid = get_project_id()
-    result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", patch)
-    print(f"Updated {did}: {json.dumps(patch)}")
-    # Show the updated direction
-    updated = result.get("direction", {})
-    if updated:
-        print(f"  New text: {updated.get('text', '?')}")
+    """DEPRECATED — use: python scripts/blueprint.py directions update <id> [--text ...] [--priority ...] [--status ...]"""
+    print(
+        "DEPRECATED: tasks.py update-direction is superseded.\n"
+        "  Use: python scripts/blueprint.py directions update <direction_id> "
+        "[--text ...] [--priority ...] [--status ...] [--reset-context] [--reset-history] [--reset-agent-notes] [--reset-all]"
+    )
+    import sys; sys.exit(1)
 
 
 def cmd_autonomy_debug(args):

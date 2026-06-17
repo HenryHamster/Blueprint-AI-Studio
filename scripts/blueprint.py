@@ -854,6 +854,361 @@ def _render_version_summary(s: dict) -> None:
                 print(f"      {title}{pr_str}")
 
 
+# ── directions ───────────────────────────────────────────────────────────────
+
+def cmd_directions(args: argparse.Namespace) -> None:
+    """Dispatch directions subcommands: list / show / add / update / unhold."""
+    sub = getattr(args, "directions_cmd", None) or "list"
+    if sub == "show":
+        _directions_show(args)
+    elif sub == "add":
+        _directions_add(args)
+    elif sub == "update":
+        _directions_update(args)
+    elif sub == "unhold":
+        _directions_unhold(args)
+    else:
+        _directions_list(args)
+
+
+def _directions_list(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    resp = api("GET", f"/api/admin/projects/{pid}/directions")
+    directions = resp.get("directions", []) if isinstance(resp, dict) else resp
+
+    show_all = getattr(args, "all", False)
+    if not show_all:
+        directions = [d for d in directions
+                      if d.get("status") in ("active", "proposed")]
+
+    _emit(args, {"directions": directions}, _render_directions_list)
+
+
+def _render_directions_list(data: dict) -> None:
+    directions = data.get("directions") or []
+    print(f"=== DIRECTIONS ({len(directions)}) ===")
+    if not directions:
+        print("  (none)")
+        return
+    for d in directions:
+        did = (d.get("id") or "?")
+        status = d.get("status", "active")
+        prio = d.get("priority", "?")
+        text = (d.get("text") or "")[:100]
+        history = d.get("research_history") or []
+        notes = d.get("notes") or []
+        held = d.get("held", False)
+        flags = []
+        if d.get("possibly_complete"):
+            flags.append("possibly_complete")
+        if d.get("possibly_saturated"):
+            flags.append("saturated")
+        if held:
+            flags.append("held")
+        if d.get("pending_update"):
+            flags.append("pending_update")
+        flag_str = f"  [{', '.join(flags)}]" if flags else ""
+        print(f"  {did[:12]}  [{prio:6}] {status:8}  {text}{flag_str}"
+              f"  ({len(history)} cycles, {len(notes)} notes)")
+
+
+def _directions_show(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    resp = api("GET", f"/api/admin/projects/{pid}/directions")
+    directions = resp.get("directions", []) if isinstance(resp, dict) else resp
+    id_arg = args.direction_id
+    matches = [d for d in directions if (d.get("id") or "").startswith(id_arg)]
+    if not matches:
+        print(f"Direction not found: {id_arg}", file=sys.stderr)
+        sys.exit(1)
+    d = matches[0]
+    _emit(args, d, _render_direction_detail)
+
+
+def _render_direction_detail(d: dict) -> None:
+    print(f"=== DIRECTION: {d.get('id', '?')} ===")
+    print(f"  Text:       {d.get('text', '?')}")
+    print(f"  Status:     {d.get('status', '?')}")
+    print(f"  Priority:   {d.get('priority', '?')}")
+    print(f"  Category:   {d.get('category', '-')}")
+    print(f"  Added:      {(d.get('added_at') or '?')[:19]}")
+    if d.get("held"):
+        print(f"  Held:       yes  reason={d.get('held_reason', '?')}")
+    if d.get("status") == "paused" or d.get("paused_reason"):
+        print(f"  Paused why: {d.get('paused_reason', '(none recorded)')}")
+        print(f"  Paused at:  {(d.get('paused_at') or '?')[:19]}")
+    if d.get("needs_manual_intervention"):
+        print(f"  ** NEEDS MANUAL INTERVENTION "
+              f"(since {(d.get('needs_manual_intervention_at') or '?')[:19]})")
+    if d.get("paths"):
+        print(f"  Paths:      {', '.join(d['paths'])}")
+    if d.get("completion_criteria"):
+        print(f"  Criteria:   {d['completion_criteria']}")
+    if d.get("possibly_complete"):
+        print(f"  ** Possibly complete: {d.get('completion_suggestion', '(no suggestion)')}")
+    if d.get("possibly_saturated"):
+        print(f"  ** Possibly saturated")
+
+    notes = d.get("notes") or []
+    if notes:
+        print(f"\n  --- Notes ({len(notes)}) ---")
+        for n in notes:
+            ts = (n.get("added_at") or n.get("timestamp") or "?")[:16]
+            text = (n.get("text") or "?")[:200]
+            print(f"    [{ts}] {text}")
+
+    history = d.get("research_history") or []
+    agg = d.get("history_aggregate") or {}
+    if history or agg:
+        total_cycles = len(history) + int(agg.get("total_cycles") or 0)
+        total_merged = (sum(e.get("prs_merged", 0) for e in history)
+                        + int(agg.get("total_prs_merged") or 0))
+        total_tasks = (sum(e.get("tasks_created", 0) for e in history)
+                       + int(agg.get("total_tasks_created") or 0))
+        print(f"\n  --- Research History ({total_cycles} cycles, "
+              f"{total_tasks} tasks, {total_merged} merged) ---")
+        for h in history[-5:]:
+            ts = (h.get("researched_at") or "?")[:16]
+            tc = h.get("tasks_created", 0)
+            pm = h.get("prs_merged", 0)
+            print(f"    {ts}  tasks={tc}  merged={pm}")
+
+    ctx = d.get("research_context", "")
+    if ctx:
+        print(f"\n  --- Research Context ---")
+        lines = ctx.strip().split("\n")
+        for line in lines[:20]:
+            print(f"    {line}")
+        if len(lines) > 20:
+            print(f"    ... ({len(lines) - 20} more lines)")
+
+
+def _directions_add(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'add' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    text = args.text
+    priority = getattr(args, "priority", "medium") or "medium"
+    paths = getattr(args, "paths", None) or []
+    completion_criteria = getattr(args, "completion_criteria", None)
+    body: dict = {"text": text, "priority": priority}
+    if paths:
+        body["paths"] = paths
+    if completion_criteria:
+        body["completion_criteria"] = completion_criteria
+    if not _confirm(f"Add direction: {text[:60]}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    pid = get_project_id(getattr(args, "project_id", None))
+    result = api("POST", f"/api/admin/projects/{pid}/directions", body)
+    d = result.get("direction", {})
+    _emit(args, result, lambda r: print(
+        f"Added {d.get('id', '?')} [{priority}]: {text[:80]}"
+    ))
+
+
+def _directions_update(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'update' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    pid = get_project_id(getattr(args, "project_id", None))
+    did = args.direction_id
+    reset_all = getattr(args, "reset_all", False)
+
+    patch: dict = {}
+    if getattr(args, "text", None):
+        patch["text"] = args.text
+    if getattr(args, "priority", None):
+        patch["priority"] = args.priority
+    if getattr(args, "status", None):
+        patch["status"] = args.status
+    if getattr(args, "reset_context", False) or reset_all:
+        patch["research_context"] = (
+            "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
+        )
+    if getattr(args, "reset_history", False) or reset_all:
+        patch["research_history"] = []
+    if getattr(args, "reset_agent_notes", False) or reset_all:
+        # Fetch current direction to filter out agent-added notes
+        resp = api("GET", f"/api/admin/projects/{pid}/directions")
+        directions = resp.get("directions", []) if isinstance(resp, dict) else resp
+        direction_data = next(
+            (d for d in directions if (d.get("id") or "").startswith(did)), None
+        )
+        notes = (direction_data.get("notes") or []) if direction_data else []
+        patch["notes"] = [n for n in notes if not n.get("added_by_task")]
+
+    if not patch:
+        print("Nothing to update. Use --text, --priority, --status, or a reset flag.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not _confirm(f"Update direction {did}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+
+    result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", patch)
+    _emit(args, result, lambda r: print(
+        f"Updated {did}: {', '.join(patch.keys())}"
+    ))
+
+
+def _directions_unhold(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'unhold' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    did = args.direction_id
+    if not _confirm(f"Clear hold on direction {did}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    pid = get_project_id(getattr(args, "project_id", None))
+    result = api("POST", f"/api/admin/projects/{pid}/directions/{did}/unhold")
+    was_held = result.get("was_held", False)
+    _emit(args, result, lambda r: print(
+        f"Unheld {did} (was_held={was_held})"
+        if was_held else f"Direction {did} was not held (idempotent)"
+    ))
+
+
+# ── settings ─────────────────────────────────────────────────────────────────
+
+def cmd_settings(args: argparse.Namespace) -> None:
+    """Dispatch settings subcommands: show (default) / set."""
+    sub = getattr(args, "settings_cmd", None) or "show"
+    if sub == "set":
+        _settings_set(args)
+    else:
+        _settings_show(args)
+
+
+def _settings_show(args: argparse.Namespace) -> None:
+    data, err = _safe_read("/api/admin/settings")
+    if err or data is None:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return
+    _emit(args, data, _render_settings)
+
+
+def _settings_set(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'settings set' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    updates: dict = {}
+    for kv in args.assignments:
+        if "=" not in kv:
+            print(f"ERROR: invalid KEY=VALUE format: {kv!r}", file=sys.stderr)
+            sys.exit(1)
+        k, v = kv.split("=", 1)
+        if v.lower() in ("true", "false"):
+            v = v.lower() == "true"
+        else:
+            try:
+                v = int(v)
+            except ValueError:
+                try:
+                    v = float(v)
+                except ValueError:
+                    pass
+        updates[k] = v
+
+    if not _confirm(
+        f"Update {len(updates)} setting(s): {', '.join(updates.keys())}?",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+
+    result = api("PATCH", "/api/admin/settings", updates)
+    _emit(args, result, _render_settings)
+
+
+def _render_settings(data: dict) -> None:
+    print("=== RUNTIME SETTINGS ===")
+    for k, v in sorted(data.items()):
+        print(f"  {k}: {v}")
+
+
+# ── messages ─────────────────────────────────────────────────────────────────
+
+def cmd_messages(args: argparse.Namespace) -> None:
+    """Dispatch messages subcommands: list / send."""
+    sub = getattr(args, "messages_cmd", None) or "list"
+    if sub == "send":
+        _messages_send(args)
+    else:
+        _messages_list(args)
+
+
+def _messages_list(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    status = getattr(args, "status", "open")
+    url = f"/api/admin/projects/{pid}/messages"
+    if status:
+        url += f"?status={status}"
+    msgs = api("GET", url)
+    _emit(args, {"messages": msgs}, _render_messages)
+
+
+_MSG_ICONS = {"BUG_REPORT": "BUG", "FEEDBACK": "FB", "NOTE": "NOTE",
+              "QUESTION": "Q", "BLOCKER": "BLOCK"}
+
+
+def _render_messages(data: dict) -> None:
+    msgs = data.get("messages") or []
+    if not msgs:
+        print("No messages.")
+        return
+    for m in msgs:
+        icon = _MSG_ICONS.get(m.get("type", ""), "?")
+        src = m.get("from", "?")
+        age = (m.get("created_at") or "?")[:16]
+        print(f"  [{icon}] ({src}, {age}) {(m.get('content') or '')[:120]}")
+
+
+def _messages_send(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'send' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    pid = get_project_id(getattr(args, "project_id", None))
+    result = api("POST", f"/api/admin/projects/{pid}/messages", {
+        "content": args.content,
+        "message_type": getattr(args, "type", "FEEDBACK"),
+    })
+    _emit(args, result, lambda d: print(f"  Message sent: {d.get('id', '?')}"))
+
+
 # ── promote-recover ──────────────────────────────────────────────────────────
 
 def _confirm(prompt: str, assume_yes: bool) -> bool:
@@ -1201,6 +1556,66 @@ def build_parser() -> argparse.ArgumentParser:
     p_versions_export.add_argument("--out", metavar="FILE", default=None,
                                    help="Write output to FILE instead of stdout.")
 
+    # directions
+    p_dirs = sub.add_parser(
+        "directions", parents=[common],
+        help="View and steer research directions.",
+        description="View and steer research directions. Defaults to `list` "
+                    "when no subcommand is given.")
+    dirs_sub = p_dirs.add_subparsers(dest="directions_cmd")
+
+    p_dirs_list = dirs_sub.add_parser("list", parents=[common],
+                                      help="List active/proposed directions.")
+    p_dirs_list.add_argument("--all", action="store_true",
+                             help="Include paused/completed/expired directions.")
+
+    p_dirs_show = dirs_sub.add_parser("show", parents=[common],
+                                      help="Show one direction in detail.")
+    p_dirs_show.add_argument("direction_id", help="Direction id or prefix.")
+
+    p_dirs_add = dirs_sub.add_parser("add", parents=[common],
+                                     help="Add a new direction (confirms before posting).")
+    p_dirs_add.add_argument("text", help="Direction text.")
+    p_dirs_add.add_argument("--priority", choices=["high", "medium", "low"],
+                            default="medium", help="Priority (default medium).")
+    p_dirs_add.add_argument("--paths", nargs="+", metavar="PATH",
+                            help="File paths associated with this direction.")
+    p_dirs_add.add_argument("--completion-criteria", dest="completion_criteria",
+                            metavar="TEXT", help="Completion criteria text.")
+    p_dirs_add.add_argument("--yes", action="store_true",
+                            help="Skip the confirmation prompt.")
+
+    p_dirs_update = dirs_sub.add_parser("update", parents=[common],
+                                        help="Update a direction (confirms before patching).")
+    p_dirs_update.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_update.add_argument("--text", help="New direction text.")
+    p_dirs_update.add_argument("--priority", choices=["high", "medium", "low"],
+                               help="New priority.")
+    p_dirs_update.add_argument("--status",
+                               choices=["active", "paused", "completed",
+                                        "staged", "proposed", "expired"],
+                               help="New status.")
+    p_dirs_update.add_argument("--reset-context", dest="reset_context",
+                               action="store_true",
+                               help="Wipe research_context back to blank template.")
+    p_dirs_update.add_argument("--reset-history", dest="reset_history",
+                               action="store_true",
+                               help="Wipe research_history (sets to []).")
+    p_dirs_update.add_argument("--reset-agent-notes", dest="reset_agent_notes",
+                               action="store_true",
+                               help="Remove agent-added notes; keep user notes.")
+    p_dirs_update.add_argument("--reset-all", dest="reset_all",
+                               action="store_true",
+                               help="Apply all reset flags at once.")
+    p_dirs_update.add_argument("--yes", action="store_true",
+                               help="Skip the confirmation prompt.")
+
+    p_dirs_unhold = dirs_sub.add_parser("unhold", parents=[common],
+                                        help="Clear a direction's hold (confirms before posting).")
+    p_dirs_unhold.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_unhold.add_argument("--yes", action="store_true",
+                               help="Skip the confirmation prompt.")
+
     # promote-recover
     p_pr = sub.add_parser("promote-recover", parents=[common],
                           help="Promotion + recovery levers (confirms before mutating).")
@@ -1212,6 +1627,27 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Reason recorded for cut / clear-deploy-failed.")
     p_pr.add_argument("--force", action="store_true",
                       help="Force clear-deploy-failed when serving SHA is unobservable.")
+
+    # messages
+    p_msgs = sub.add_parser(
+        "messages", parents=[common],
+        help="Read or send operator<->system messages.",
+        description="List open messages or send a new one to the autonomous system. "
+                    "Defaults to `list` when no subcommand is given.",
+    )
+    msgs_sub = p_msgs.add_subparsers(dest="messages_cmd")
+    p_msgs_list = msgs_sub.add_parser("list", parents=[common], help="List messages.")
+    p_msgs_list.add_argument(
+        "--status", default="open",
+        help="Filter by status (default: open; pass empty string for all).",
+    )
+    p_msgs_send = msgs_sub.add_parser("send", parents=[common],
+                                      help="Send a message to the autonomous system.")
+    p_msgs_send.add_argument("content", help="Message content.")
+    p_msgs_send.add_argument(
+        "--type", default="FEEDBACK",
+        help="Message type: FEEDBACK|NOTE|BUG_REPORT|QUESTION|BLOCKER (default FEEDBACK).",
+    )
 
     # logs
     p_logs = sub.add_parser("logs", parents=[common], help="Read Cloud Run logs via gcloud.",
@@ -1238,6 +1674,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_log_task.add_argument("task_id", help="Task id to grep for.")
     _add_log_common(p_log_task)
 
+    # settings
+    p_settings = sub.add_parser(
+        "settings", parents=[common],
+        help="Show or update runtime settings (autonomy flags, cost ceilings, pool sizing).",
+        description="Read or patch runtime configuration. Defaults to `show` when no "
+                    "subcommand is given.")
+    settings_sub = p_settings.add_subparsers(dest="settings_cmd")
+    settings_sub.add_parser("show", parents=[common], help="Show all runtime settings.")
+    p_settings_set = settings_sub.add_parser(
+        "set", parents=[common],
+        help="Update one or more settings (KEY=VALUE ...).")
+    p_settings_set.add_argument(
+        "assignments", nargs="+", metavar="KEY=VALUE",
+        help="Setting assignments (e.g. max_concurrent_vms=5 promotion_enabled=true).")
+    p_settings_set.add_argument("--yes", action="store_true",
+                                help="Skip the confirmation prompt (for scripting).")
+
     return parser
 
 
@@ -1246,8 +1699,11 @@ _DISPATCH = {
     "diagnostics": cmd_diagnostics,
     "tasks": cmd_tasks,
     "versions": cmd_versions,
+    "directions": cmd_directions,
     "promote-recover": cmd_promote_recover,
     "logs": cmd_logs,
+    "messages": cmd_messages,
+    "settings": cmd_settings,
 }
 
 

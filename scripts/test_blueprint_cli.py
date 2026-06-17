@@ -34,11 +34,20 @@ HELP_INVOCATIONS = [
     ["versions", "show"],
     ["versions", "export-changelog"],
     ["promote-recover"],
+    ["directions"],
+    ["directions", "list"],
+    ["directions", "show"],
+    ["directions", "add"],
+    ["directions", "update"],
+    ["directions", "unhold"],
     ["logs"],
     ["logs", "errors"],
     ["logs", "tail"],
     ["logs", "search"],
     ["logs", "task"],
+    ["messages"],
+    ["messages", "list"],
+    ["messages", "send"],
 ]
 
 
@@ -176,6 +185,20 @@ def mock_api(monkeypatch):
                 "highlights": {"headline": "7 tasks merged; early version"},
                 "serving_status": "SERVING",
             }
+        if "/admin/settings" in path:
+            return {"max_concurrent_vms": 10, "promotion_enabled": True,
+                    "daily_cost_ceiling_usd": 50.0}
+        if "/messages" in path and method == "POST":
+            return {"id": "msg-abc", "status": "created", "arming": "not_armed"}
+        if "/messages" in path:
+            return [
+                {"id": "msg-001", "type": "FEEDBACK", "content": "please fix the CI",
+                 "from": "operator", "status": "open",
+                 "created_at": "2026-06-15T10:00:00Z"},
+                {"id": "msg-002", "type": "QUESTION", "content": "what is blocked?",
+                 "from": "system", "status": "open",
+                 "created_at": "2026-06-15T09:00:00Z"},
+            ]
         if "/tasks/" in path:
             return {"id": "task-123", "title": "demo", "task_type": "create",
                     "status": "IN_PROGRESS", "created_at": "2026-06-15T00:00:00Z"}
@@ -207,6 +230,31 @@ def mock_api(monkeypatch):
             return {"tasks": [{"id": "task-123", "task_type": "create",
                                "status": "IN_PROGRESS", "title": "demo"}],
                     "total": 1}
+        if "/directions/" in path and "/unhold" in path:
+            return {"status": "unheld", "direction_id": "d-abc12345", "was_held": True}
+        if "/directions/" in path and method == "PATCH":
+            return {"direction": {"id": "d-abc12345", "text": "Updated text",
+                                  "priority": "high", "status": "active"}}
+        if "/directions/" in path and method == "POST":
+            return {"direction": {"id": "d-abc12345", "text": "New direction",
+                                  "priority": "medium", "status": "active"}}
+        if "/directions" in path and method == "POST":
+            return {"direction": {"id": "d-newdir01", "text": "New direction",
+                                  "priority": "medium", "status": "active"}}
+        if "/directions" in path:
+            return {
+                "directions": [
+                    {"id": "d-abc12345", "text": "Improve test coverage",
+                     "status": "active", "priority": "high",
+                     "research_history": [{"researched_at": "2026-06-01", "tasks_created": 2, "prs_merged": 1}],
+                     "notes": [{"text": "operator note", "added_at": "2026-06-01T00:00:00"}],
+                     "held": False, "possibly_complete": False, "possibly_saturated": False},
+                    {"id": "d-def67890", "text": "Refactor legacy modules",
+                     "status": "paused", "priority": "medium",
+                     "research_history": [], "notes": [], "held": True,
+                     "possibly_complete": False, "possibly_saturated": False},
+                ]
+            }
         return {}
 
     monkeypatch.setattr(blueprint_api, "api", fake_api)
@@ -1077,3 +1125,190 @@ def test_changelog_to_markdown_no_pr():
     md = blueprint._changelog_to_markdown(tasks)
     assert "- Internal cleanup" in md
     assert "#" not in md
+
+
+# ── directions command group ─────────────────────────────────────────────────
+
+def test_directions_group(mock_api, monkeypatch, capsys):
+    """End-to-end coverage for blueprint directions list/show/add/update/unhold."""
+
+    # 1. directions list (human) — shows active direction, hides paused by default
+    rc = blueprint.main(["directions", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "DIRECTIONS" in out
+    assert "Improve test coverage" in out
+    assert any("/directions" in path for _, path, _ in mock_api)
+
+    # 2. directions list --json — emits valid JSON with directions key
+    mock_api.clear()
+    rc = blueprint.main(["--json", "directions", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert "directions" in payload
+    assert len(payload["directions"]) >= 1
+    assert payload["directions"][0]["id"] == "d-abc12345"
+
+    # 3. directions list --all — passes through all directions
+    mock_api.clear()
+    rc = blueprint.main(["directions", "list", "--all"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # paused direction is now visible
+    assert "Refactor legacy modules" in out
+
+    # 4. directions show <id-prefix> — renders detail view
+    mock_api.clear()
+    rc = blueprint.main(["directions", "show", "d-abc"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "d-abc12345" in out
+    assert "Improve test coverage" in out
+    assert "DIRECTION:" in out
+
+    # 5. directions show --json
+    mock_api.clear()
+    rc = blueprint.main(["--json", "directions", "show", "d-abc"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    d = json.loads(out)
+    assert d["id"] == "d-abc12345"
+
+    # 6. directions unhold --yes issues POST /unhold and reports was_held
+    mock_api.clear()
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["directions", "unhold", "d-abc12345", "--yes"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Unheld" in out or "was_held" in out.lower() or "d-abc12345" in out
+    unhold_calls = [(m, p) for m, p, _ in mock_api if m == "POST" and "unhold" in p]
+    assert unhold_calls, "Expected a POST to /unhold endpoint"
+
+    # 7. directions update <id> --priority high --yes issues PATCH
+    mock_api.clear()
+    rc = blueprint.main(["directions", "update", "d-abc12345", "--priority", "high", "--yes"])
+    assert rc == 0
+    patch_calls = [(m, p, b) for m, p, b in mock_api if m == "PATCH" and "directions" in p]
+    assert patch_calls, "Expected a PATCH to directions endpoint"
+    assert patch_calls[0][2].get("priority") == "high"
+
+    # 8. read-only guard blocks mutating actions
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    for argv in [
+        ["directions", "add", "some text", "--yes"],
+        ["directions", "update", "d-abc", "--priority", "low", "--yes"],
+        ["directions", "unhold", "d-abc", "--yes"],
+    ]:
+        with pytest.raises(SystemExit) as exc:
+            blueprint.main(argv)
+        assert exc.value.code == 1
+
+
+def test_settings_group(monkeypatch, capsys):
+    """settings show (human + --json) and set (PATCH body, type coercion, read-only guard)."""
+    calls = []
+    sample = {"max_concurrent_vms": 10, "promotion_enabled": True, "daily_cost_ceiling_usd": 50.0}
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if "/admin/settings" in path:
+            return dict(sample) if method == "GET" else {**sample, **(body or {})}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+
+    # show --json emits valid JSON with settings fields
+    rc = blueprint.main(["--json", "settings", "show"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["max_concurrent_vms"] == 10
+    assert parsed["promotion_enabled"] is True
+
+    # show human renders RUNTIME SETTINGS section
+    calls.clear()
+    rc = blueprint.main(["settings"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "RUNTIME SETTINGS" in out
+    assert "max_concurrent_vms" in out
+    assert any("/admin/settings" in p for _, p, _ in calls)
+
+    # set with read-only config is refused
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["settings", "set", "max_concurrent_vms=5", "--yes"])
+    assert exc.value.code == 1
+
+    # set with admin key sends PATCH with type-coerced values
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    calls.clear()
+    rc = blueprint.main(["settings", "set", "max_concurrent_vms=5",
+                         "promotion_enabled=true", "daily_cost_ceiling_usd=99.5", "--yes"])
+    assert rc == 0
+    patch_calls = [(m, p, b) for m, p, b in calls if m == "PATCH"]
+    assert len(patch_calls) == 1
+    _, _, body = patch_calls[0]
+    assert body["max_concurrent_vms"] == 5          # int, not "5"
+    assert body["promotion_enabled"] is True         # bool, not "true"
+    assert body["daily_cost_ceiling_usd"] == 99.5   # float
+
+
+# ── messages group ────────────────────────────────────────────────────────────
+
+def test_messages_group(mock_api, monkeypatch, capsys):
+    """messages list (human + --json, status filter) and send (POST body, type
+    passthrough, read-only refused) via blueprint.main with mocked api."""
+
+    # --- list human render ---
+    rc = blueprint.main(["messages", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[FB]" in out           # FEEDBACK icon
+    assert "please fix the CI" in out
+    assert "[Q]" in out            # QUESTION icon
+    assert "operator" in out
+    # default status=open must be sent
+    assert any("/messages?status=open" in path for _, path, _ in mock_api)
+
+    # --- list --json output ---
+    mock_api.clear()
+    rc = blueprint.main(["--json", "messages", "list"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert isinstance(parsed["messages"], list)
+    assert len(parsed["messages"]) == 2
+    assert parsed["messages"][0]["type"] == "FEEDBACK"
+
+    # --- status filter is threaded into the URL ---
+    mock_api.clear()
+    rc = blueprint.main(["messages", "list", "--status", "all"])
+    assert rc == 0
+    assert any("/messages?status=all" in path for _, path, _ in mock_api)
+
+    # --- send posts correct body and type ---
+    mock_api.clear()
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["messages", "send", "hello world", "--type", "NOTE"])
+    assert rc == 0
+    post_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/messages" in p]
+    assert len(post_calls) == 1
+    _, _, body = post_calls[0]
+    assert body["content"] == "hello world"
+    assert body["message_type"] == "NOTE"
+    out = capsys.readouterr().out
+    assert "msg-abc" in out
+
+    # --- read-only config refuses send ---
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["messages", "send", "blocked send"])
+    assert exc.value.code == 1
