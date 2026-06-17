@@ -17,7 +17,9 @@ Subcommand groups:
     tasks list|show   list/filter tasks, or show one by id
     versions list|show  release versions with phase/status/sha and a summary
     trials            capability-trial verdict, arm counts, days-to-decision projection
+    fleet pool|warm|accounts|zones  VM account pool, warm pool, and zone health
     promote-recover   promotion + recovery operator levers (confirm before mutate)
+    ops               system intervention: repair state, health reset, requeue, restart
     logs tail|errors|search|task   Cloud Logging reads (via gcloud)
 
 Examples:
@@ -28,6 +30,8 @@ Examples:
     python scripts/blueprint.py tasks show 7ab3f93a
     python scripts/blueprint.py versions show
     python scripts/blueprint.py trials
+    python scripts/blueprint.py fleet pool
+    python scripts/blueprint.py fleet accounts --disable evan --yes
     python scripts/blueprint.py promote-recover qualify --yes
     python scripts/blueprint.py logs errors --minutes 30
 """
@@ -267,7 +271,8 @@ def _render_diagnostics(data: dict) -> None:
 
 def cmd_tasks(args: argparse.Namespace) -> None:
     """Dispatch task subcommands: list / show / cancel / requeue / scope / tree / failures /
-    evaluating / cancel-all / set-status / autonomy-debug."""
+    evaluating / cancel-all / requeue-ci / trigger-rollup / complete / set-status /
+    reset-iteration-cap / archive / research / autonomy-debug."""
     sub = getattr(args, "tasks_cmd", None) or "list"
     if sub == "show":
         _tasks_show(args)
@@ -285,8 +290,20 @@ def cmd_tasks(args: argparse.Namespace) -> None:
         _tasks_evaluating(args)
     elif sub == "cancel-all":
         _tasks_cancel_all(args)
+    elif sub == "requeue-ci":
+        _tasks_requeue_ci(args)
+    elif sub == "trigger-rollup":
+        _tasks_trigger_rollup(args)
+    elif sub == "complete":
+        _tasks_complete(args)
     elif sub == "set-status":
         _tasks_set_status(args)
+    elif sub == "reset-iteration-cap":
+        _tasks_reset_iteration_cap(args)
+    elif sub == "archive":
+        _tasks_archive(args)
+    elif sub == "research":
+        _tasks_research(args)
     elif sub == "autonomy-debug":
         _tasks_autonomy_debug(args)
     else:
@@ -733,6 +750,193 @@ def _render_task_detail(t: dict) -> None:
     desc = t.get("description")
     if desc:
         print(f"\n  Description:\n    {desc[:500]}")
+
+
+# ── tasks: bulk and manual-state extensions ──────────────────────────────────
+
+def _require_write_config(action: str) -> None:
+    """Exit 1 with a clear error when the resolved config is read-only."""
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            f"ERROR: '{action}' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _tasks_evaluating(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    resp = api("GET", f"/api/admin/tasks?project_id={pid}&status=EVALUATING&limit=100")
+    tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+    verbose = getattr(args, "verbose", False)
+    if not tasks:
+        print("No EVALUATING tasks.")
+        return
+    for t in tasks:
+        ctx = t.get("context") or {}
+        loop = ctx.get("review_loop") or {}
+        ci = loop.get("ci_waiting", False)
+        pr = loop.get("pr_number", "-")
+        print(f"  {(t.get('id') or '?')[:8]}  [{t.get('task_type', '?'):8}]  "
+              f"{(t.get('title') or '')[:50]:<50}  ci={ci}  pr={pr}")
+        msg = (t.get("latest_status_message") or "")[:80]
+        if msg:
+            print(f"           {msg}")
+        if verbose:
+            for key, label in [("research_question", "Q"), ("scope", "Scope")]:
+                val = ctx.get(key, "")
+                if val:
+                    print(f"           {label}: {val[:120]}")
+
+
+def _tasks_cancel_all(args: argparse.Namespace) -> None:
+    _require_write_config("cancel-all")
+    pid = get_project_id(getattr(args, "project_id", None))
+    status_filter = getattr(args, "status", None)
+    category_filter = getattr(args, "category", None)
+    statuses = ([status_filter] if status_filter
+                else ["QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"])
+    to_cancel = []
+    for status in statuses:
+        offset = 0
+        while True:
+            resp = api("GET",
+                       f"/api/admin/tasks?project_id={pid}&status={status}"
+                       f"&limit=500&offset={offset}")
+            batch = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+            if not batch:
+                break
+            for t in batch:
+                if (category_filter
+                        and (t.get("context") or {}).get("failure_category") != category_filter):
+                    continue
+                to_cancel.append(t)
+            offset += len(batch)
+            if len(batch) < 500:
+                break
+    if not to_cancel:
+        print("No matching tasks to cancel.")
+        return
+    if not _confirm(f"Cancel {len(to_cancel)} task(s)?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    cancelled = 0
+    for t in to_cancel:
+        try:
+            api("PATCH", f"/api/admin/tasks/{t['id']}", {"status": "CANCELLED"})
+            cancelled += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {t['id'][:8]}: FAILED — {exc}")
+    suffix = f" (category={category_filter})" if category_filter else ""
+    print(f"Cancelled {cancelled}/{len(to_cancel)} tasks{suffix}.")
+
+
+def _tasks_requeue_ci(args: argparse.Namespace) -> None:
+    _require_write_config("requeue-ci")
+    pid = get_project_id(getattr(args, "project_id", None))
+    resp = api("GET", f"/api/admin/tasks?project_id={pid}&status=EVALUATING&limit=100")
+    tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+    ci_tasks = [t for t in tasks
+                if (t.get("context") or {}).get("review_loop", {}).get("ci_waiting")]
+    if not ci_tasks:
+        print("No CI-waiting EVALUATING tasks.")
+        return
+    if not _confirm(f"Requeue {len(ci_tasks)} CI-waiting task(s)?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    for t in ci_tasks:
+        pr = (t.get("context") or {}).get("review_loop", {}).get("pr_number", "?")
+        try:
+            api("PATCH", f"/api/admin/tasks/{t['id']}", {"status": "QUEUED"})
+            print(f"  {t['id'][:8]}  (PR #{pr}): requeued")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {t['id'][:8]}: FAILED — {exc}")
+
+
+def _tasks_trigger_rollup(args: argparse.Namespace) -> None:
+    _require_write_config("trigger-rollup")
+    parent_id = args.parent_id
+    if not _confirm(f"Force rollup for task {parent_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", f"/api/admin/tasks/{parent_id}/rollup")
+    pr_num = result.get("rollup_pr_number") or result.get("pr_number")
+    pr_url = result.get("rollup_pr_url") or result.get("pr_url") or ""
+    _emit(args, result, lambda r: print(f"  Rollup PR created: #{pr_num} {pr_url}"))
+
+
+def _tasks_complete(args: argparse.Namespace) -> None:
+    _require_write_config("complete")
+    if not _confirm(f"Mark task {args.task_id} COMPLETED?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {"status": "COMPLETED"}
+    if getattr(args, "message", None):
+        body["latest_status_message"] = args.message
+    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", body)
+    _emit(args, result, lambda r: print(f"  {args.task_id}: marked COMPLETED"))
+
+
+def _tasks_set_status(args: argparse.Namespace) -> None:
+    _require_write_config("set-status")
+    if not _confirm(f"Set task {args.task_id} to {args.new_status}?",
+                    getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {"status": args.new_status}
+    if getattr(args, "message", None):
+        body["latest_status_message"] = args.message
+    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", body)
+    _emit(args, result, lambda r: print(f"  {args.task_id}: -> {args.new_status}"))
+
+
+def _tasks_reset_iteration_cap(args: argparse.Namespace) -> None:
+    _require_write_config("reset-iteration-cap")
+    if not _confirm(f"Reset iteration cap for task {args.task_id}?",
+                    getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", f"/api/admin/tasks/{args.task_id}/reset-iteration-cap")
+    _emit(args, result, lambda r: print(
+        f"  PR #{r.get('pr_number')}: archived {r.get('archived_count')} failed review/fix tasks, "
+        f"per-chain iteration {r.get('previous_per_chain_iteration')}->0"
+        + (" (cleared requires_approval)" if r.get("requires_approval_cleared") else "")
+    ))
+
+
+def _tasks_archive(args: argparse.Namespace) -> None:
+    _require_write_config("archive")
+    pipelines = getattr(args, "pipelines", False)
+    completed_only = getattr(args, "completed", False)
+    filter_type = "completed" if completed_only else "terminal"
+    label = "all fully-terminal pipelines" if pipelines else f"all {filter_type} tasks"
+    if not _confirm(f"Archive {label}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {"filter": "terminal"} if pipelines else {"filter": filter_type}
+    result = api("POST", "/api/admin/tasks/bulk-archive", body)
+    _emit(args, result, lambda r: print(f"Archived {r.get('archived_count', '?')} tasks."))
+
+
+def _tasks_research(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    task_id = getattr(args, "task_id", None)
+    limit = getattr(args, "limit", 5)
+    if task_id:
+        task = api("GET", f"/api/admin/tasks/{task_id}")
+        _emit(args, task, _render_task_detail)
+        return
+    resp = api("GET",
+               f"/api/admin/tasks?project_id={pid}&status=COMPLETED"
+               f"&task_type=research&limit={limit}")
+    tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+    if not tasks:
+        print("No recent research tasks found.")
+        return
+    _emit(args, {"tasks": tasks, "total": len(tasks)}, _render_task_list)
 
 
 # ── versions ──────────────────────────────────────────────────────────────--
@@ -1598,6 +1802,203 @@ def _messages_send(args: argparse.Namespace) -> None:
     _emit(args, result, lambda d: print(f"  Message sent: {d.get('id', '?')}"))
 
 
+# ── fleet (pool / warm / accounts / zones) ────────────────────────────────────
+
+def cmd_fleet(args: argparse.Namespace) -> None:
+    """Dispatch fleet subcommands: pool / warm / accounts / zones."""
+    sub = getattr(args, "fleet_cmd", None) or "pool"
+    if sub == "warm":
+        _fleet_warm(args)
+    elif sub == "accounts":
+        _fleet_accounts(args)
+    elif sub == "zones":
+        _fleet_zones(args)
+    else:
+        _fleet_pool(args)
+
+
+def _fleet_pool(args: argparse.Namespace) -> None:
+    data, err = _safe_read("/api/admin/settings")
+    if err:
+        print(f"Pool: error ({err})")
+        return
+    accounts = (data or {}).get("max_plan_accounts", [])
+    _emit(args, {"accounts": accounts}, _render_fleet_pool)
+
+
+def _render_fleet_pool(data: dict) -> None:
+    accounts = data.get("accounts") or []
+    print("=== MAX PLAN POOL ===")
+    print(f"  Total:     {len(accounts)}")
+    print(f"  Enabled:   {sum(1 for a in accounts if a.get('enabled', True))}")
+    for a in accounts:
+        name = a.get("name", a.get("id", "?")[:8])
+        status = "OK" if a.get("enabled", True) else "DISABLED"
+        rl = a.get("rl_hit_count", 0)
+        suffix = f" (rate-limited x{rl})" if rl else ""
+        print(f"  {name:20}: active={a.get('active_tasks', 0)} {status}{suffix}")
+        for model, info in (a.get("disabled_models") or {}).items():
+            at = (info.get("at") or "")[:19]
+            print(f"    {model}: BLOCKED (hit #{info.get('hits', 0)}, since {at})")
+
+
+def _fleet_warm(args: argparse.Namespace) -> None:
+    ov, err = _safe_read("/api/admin/warm-vm-state")
+    if err:
+        print(f"Warm pool: error ({err})")
+        return
+    _emit(args, ov or {}, _render_fleet_warm)
+
+
+def _render_fleet_warm(data: dict) -> None:
+    pm = data.get("pool_metrics") or {}
+    wpm = data.get("warm_pin_metrics") or {}
+    if not pm:
+        print("=== WARM VM POOL ===\n  (pool_metrics empty — pool disabled or backend error)")
+        return
+    print("=== WARM VM POOL ===")
+    print(f"  enabled:        {pm.get('enabled')}")
+    allow = pm.get("project_allowlist") or []
+    print(f"  scope:          {allow if allow else 'fleet-wide (no allowlist)'}")
+    print(f"  target_size:    {pm.get('target_size')}   idle_ttl_secs: {pm.get('idle_ttl_secs')}")
+    print(f"  current_size:   {pm.get('current_size')}   idle_now: {pm.get('idle_count')}")
+    print(f"  idle_cost_usd:  projected={pm.get('projected_idle_cost_usd')} "
+          f"settled={pm.get('settled_idle_cost_usd')} live={pm.get('live_idle_cost_usd')}")
+
+    print("\n=== CLAIM CIRCUIT BREAKER ===")
+    sup_until = wpm.get("pool_suppressed_until")
+    print(f"  suppressed:     {wpm.get('pool_circuit_breaker_suppressed')}"
+          + (f" until {sup_until}" if sup_until else ""))
+    print(f"  failures/1h:    {wpm.get('pool_claim_failures_last_hour')} "
+          f"(threshold {wpm.get('pool_failure_rate_threshold')})")
+    print(f"  active pool-origin claims: {wpm.get('active_pool_origin_claims')}  "
+          f"pool_origin_share: {wpm.get('pool_origin_share')}")
+
+    cg = pm.get("cost_guard")
+    if cg is not None:
+        print("\n=== COST GUARD ===")
+        print(f"  engaged:        {cg.get('engaged')}"
+              + (f"  reason={cg.get('reason')}" if cg.get("reason") else ""))
+        print(f"  eligible_rate:  {cg.get('hit_rate')}  (min {cg.get('min_hit_rate')})  "
+              f"[raw {cg.get('raw_hit_rate')}]")
+        print(f"  eligible_disp:  {cg.get('total_dispatches')}  "
+              f"[raw {cg.get('raw_total_dispatches')}]")
+        print(f"  idle_cost_usd:  {cg.get('idle_cost_usd')}  (min {cg.get('min_idle_cost_usd')})")
+
+    funnel = pm.get("funnel") or {}
+    print(f"\n=== DISPATCH FUNNEL (last {funnel.get('window_hours', '?')}h) ===")
+    er = funnel.get("eligible_hit_rate")
+    rr = funnel.get("pool_hit_rate")
+    print(f"  eligible_rate:  {er if er is not None else 'n/a (no eligible demand)'}"
+          f"  ({funnel.get('pool_lease_hits')} hits / {funnel.get('eligible_dispatches')} eligible)")
+    print(f"  raw_rate:       {rr if rr is not None else 'n/a (no dispatches)'}"
+          f"  ({funnel.get('pool_lease_hits')} hits / {funnel.get('total_dispatches')} total)")
+    print(f"  cold:           {funnel.get('cold_dispatches')}")
+    misses = funnel.get("lease_miss_by_reason") or {}
+    print(f"  lease misses:   {funnel.get('lease_miss_total')} "
+          f"(eligible {funnel.get('eligible_miss_total')})")
+    for reason, n in sorted(misses.items(), key=lambda kv: -kv[1]):
+        print(f"    - {reason:22}: {n}")
+    by_acct = funnel.get("by_account") or {}
+    if by_acct:
+        print("\n=== PER-ACCOUNT ===")
+        for acct, b in sorted(by_acct.items(), key=lambda kv: -(kv[1].get("total_dispatches") or 0)):
+            ehr = b.get("eligible_hit_rate")
+            print(f"  {acct:36} elig_rate={ehr if ehr is not None else 'n/a':<8} "
+                  f"raw={b.get('pool_hit_rate')} hits={b.get('pool_lease_hits')} "
+                  f"cold={b.get('cold_dispatches')} misses={b.get('lease_miss_total')}")
+            for reason, n in sorted((b.get("lease_miss_by_reason") or {}).items(), key=lambda kv: -kv[1]):
+                print(f"      - {reason}: {n}")
+
+
+def _fleet_resolve_account(query: str) -> dict | None:
+    """Resolve a Max Plan account by name (case-insensitive substring) or ID prefix."""
+    s = api("GET", "/api/admin/settings")
+    q = query.lower()
+    for a in s.get("max_plan_accounts", []):
+        if a["id"].lower().startswith(q) or q in a.get("name", "").lower():
+            return a
+    return None
+
+
+def _fleet_accounts(args: argparse.Namespace) -> None:
+    disable = getattr(args, "disable", None)
+    enable = getattr(args, "enable", None)
+    remove = getattr(args, "remove", None)
+
+    if disable or enable:
+        cfg = load_config()
+        if cfg.get("read_only"):
+            print("ERROR: mutating action requires an admin API key.", file=sys.stderr)
+            sys.exit(1)
+        target = disable or enable
+        is_enable = bool(enable)
+        verb = "Enable" if is_enable else "Disable"
+        if not _confirm(f"{verb} account {target}?", getattr(args, "yes", False)):
+            print("Aborted.")
+            return
+        if target.lower() == "all":
+            s = api("GET", "/api/admin/settings")
+            for a in s.get("max_plan_accounts", []):
+                if a.get("enabled", True) != is_enable:
+                    result = api("PATCH", f"/api/admin/max-plan-accounts/{a['id']}", {"enabled": is_enable})
+                    print(f"  {verb}d: {result.get('name', a['id'][:8])}")
+                else:
+                    state = "enabled" if is_enable else "disabled"
+                    print(f"  {a.get('name', a['id'][:8])}: already {state}")
+            return
+        acct = _fleet_resolve_account(target)
+        if not acct:
+            print(f"Account not found: {target}")
+            return
+        result = api("PATCH", f"/api/admin/max-plan-accounts/{acct['id']}", {"enabled": is_enable})
+        print(f"{verb}d: {result.get('name', acct['id'][:8])}")
+        return
+
+    if remove:
+        cfg = load_config()
+        if cfg.get("read_only"):
+            print("ERROR: mutating action requires an admin API key.", file=sys.stderr)
+            sys.exit(1)
+        if not _confirm(f"Remove account {remove}?", getattr(args, "yes", False)):
+            print("Aborted.")
+            return
+        acct = _fleet_resolve_account(remove)
+        if not acct:
+            print(f"Account not found: {remove}")
+            return
+        path = f"/api/admin/max-plan-accounts/{acct['id']}"
+        if getattr(args, "force", False):
+            path += "?force=true"
+        result = api("DELETE", path)
+        print(f"Removed: {result.get('message', 'done')}")
+        return
+
+    _fleet_pool(args)
+
+
+def _fleet_zones(args: argparse.Namespace) -> None:
+    zones, err = _safe_read("/api/admin/zone-health")
+    if err:
+        print(f"Zones: error ({err})")
+        return
+    _emit(args, {"zones": zones or {}}, _render_fleet_zones)
+
+
+def _render_fleet_zones(data: dict) -> None:
+    zones = data.get("zones") or {}
+    print("=== ZONE HEALTH ===")
+    if isinstance(zones, dict):
+        for zone, zdata in sorted(zones.items()):
+            zdata = zdata or {}
+            status = zdata.get("status", "?")
+            last = zdata.get("last_success", "?")
+            fails = zdata.get("consecutive_failures", 0)
+            print(f"  {zone:30}: {status:12} fails={fails} last_ok={last}")
+    else:
+        print(f"  {zones}")
+
+
 # ── promote-recover ──────────────────────────────────────────────────────────
 
 def _confirm(prompt: str, assume_yes: bool) -> bool:
@@ -1687,6 +2088,119 @@ def cmd_promote_recover(args: argparse.Namespace) -> None:
 def _render_promote_recover(data: dict) -> None:
     print(f"=== {data['action']} ===")
     print(json.dumps(data.get("result"), indent=2, default=str))
+
+
+# ── ops (system intervention) ────────────────────────────────────────────────
+
+def cmd_ops(args: argparse.Namespace) -> None:
+    """Dispatch ops subcommands: repair / reset-health / requeue-failed / restart-orchestrator / circuit-breaker."""
+    sub = getattr(args, "ops_cmd", None)
+    if sub == "repair":
+        _ops_repair(args)
+    elif sub == "reset-health":
+        _ops_reset_health(args)
+    elif sub == "requeue-failed":
+        _ops_requeue_failed(args)
+    elif sub == "restart-orchestrator":
+        _ops_restart_orchestrator(args)
+    elif sub == "circuit-breaker":
+        _ops_circuit_breaker(args)
+    else:
+        print("ERROR: ops requires a subcommand", file=sys.stderr)
+        sys.exit(1)
+
+
+def _ops_repair(args: argparse.Namespace) -> None:
+    """Repair stuck state."""
+    result = api("POST", "/api/admin/repair-state", {})
+    repairs = result.get('repairs', [])
+    data = {"action": "repair", "count": result.get('count', 0), "repairs": repairs}
+    def _render(d):
+        print(f"Repairs: {d.get('count')}")
+        if d.get('repairs'):
+            for r in d.get('repairs', []):
+                print(f"  - {r}")
+        else:
+            print("  (no repairs needed)")
+    _emit(args, data, _render)
+
+
+def _ops_reset_health(args: argparse.Namespace) -> None:
+    """Force-reset health checks."""
+    result = api("POST", "/api/admin/deploy-state/reset-health", {})
+    _emit(args, result, lambda d: print(json.dumps(d, indent=2, default=str)))
+
+
+def _ops_requeue_failed(args: argparse.Namespace) -> None:
+    """Requeue all FAILED tasks."""
+    from blueprint_api import list_tasks
+    failed = list_tasks(status="FAILED", limit=100)
+    if not failed:
+        _emit(args, {"count": 0}, lambda d: print("No failed tasks."))
+        return
+    requeued = []
+    failed_requeue = []
+    for t in failed:
+        tid = t['id']
+        try:
+            api("PATCH", f"/api/admin/tasks/{tid}", {"status": "QUEUED"})
+            requeued.append(tid)
+        except Exception as e:
+            failed_requeue.append((tid, str(e)))
+    data = {
+        "count": len(failed),
+        "requeued": len(requeued),
+        "failed": len(failed_requeue),
+        "requeued_ids": requeued,
+        "failed_requeue": failed_requeue,
+    }
+    def _render(d):
+        print(f"Requeued {d['requeued']}/{d['count']} failed tasks")
+        if d.get('failed_requeue'):
+            print("Failed to requeue:")
+            for tid, err in d['failed_requeue']:
+                print(f"  {tid[:8]} FAILED: {err}")
+    _emit(args, data, _render)
+
+
+def _ops_restart_orchestrator(args: argparse.Namespace) -> None:
+    """Restart background loops."""
+    result = api("POST", "/api/admin/restart-orchestrator", {})
+    _emit(args, result, lambda d: print(json.dumps(d, indent=2, default=str)))
+
+
+def _ops_circuit_breaker(args: argparse.Namespace) -> None:
+    """Show circuit breaker state, optionally reset for a project."""
+    if getattr(args, "reset", None):
+        pid = args.reset if args.reset else get_project_id()
+        result = api("POST", f"/api/admin/projects/{pid}/circuit-breaker/reset", {})
+        _emit(args, {"action": "reset", "project_id": pid, "result": result},
+              lambda d: print(json.dumps(d.get('result'), indent=2, default=str)))
+        return
+    data = api("GET", "/api/admin/diagnostics")
+    cbs = data.get('circuit_breakers', {})
+    cb_list = []
+    for pid, cb in cbs.items():
+        cb_list.append({
+            "project_id": pid,
+            "state": cb.get('state', '?'),
+            "failure_count": cb.get('failure_count', 0),
+            "success_count": cb.get('success_count', 0),
+            "opened_at": cb.get('opened_at', ''),
+            "cooldown_ends_at": cb.get('cooldown_ends_at', ''),
+        })
+    def _render(d):
+        if not d:
+            print("No circuit breakers registered.")
+            return
+        print("=== CIRCUIT BREAKERS ===")
+        for cb in d:
+            print(f"  {cb['project_id'][:8]}  state={cb['state']}  "
+                  f"failures={cb['failure_count']}  successes={cb['success_count']}")
+            if cb['opened_at']:
+                print(f"           opened_at={cb['opened_at']}  "
+                      f"cooldown_until={cb['cooldown_ends_at'] or '?'}")
+    _emit(args, cb_list, _render)
 
 
 # ── logs (ported from scripts/logs.py) ───────────────────────────────────────
@@ -1852,6 +2366,303 @@ def _render_logs(data: dict, full: bool) -> None:
             print(f"  {ts}  [{sev:5}] {text.splitlines()[0] if text else ''}")
 
 
+# ── health ───────────────────────────────────────────────────────────────────
+
+def cmd_health(args: argparse.Namespace) -> None:
+    """Dispatch health subcommands: deploy / autonomy / alerts / digest / activity."""
+    sub = getattr(args, "health_cmd", None) or "deploy"
+    dispatch = {
+        "deploy": _health_deploy,
+        "autonomy": _health_autonomy,
+        "alerts": _health_alerts,
+        "digest": _health_digest,
+        "activity": _health_activity,
+    }
+    dispatch[sub](args)
+
+
+def _age_str(iso_or_dt) -> str:
+    """Return human-readable age ('Ns ago' / 'Nm ago') from an ISO string or datetime."""
+    if not iso_or_dt:
+        return "never"
+    try:
+        if isinstance(iso_or_dt, str):
+            ts = datetime.fromisoformat(iso_or_dt.replace("Z", "+00:00"))
+        else:
+            ts = iso_or_dt
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        delta = (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:
+        return str(iso_or_dt)
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    if delta < 3600:
+        return f"{int(delta // 60)}m{int(delta % 60)}s ago"
+    return f"{int(delta // 3600)}h{int((delta % 3600) // 60)}m ago"
+
+
+def _health_deploy(args: argparse.Namespace) -> None:
+    """Deploy health deep-dive: probe ring buffer, external deps, orchestrator cycle."""
+    ds, ds_err = _safe_read("/api/admin/deploy-state")
+    ds = ds or {}
+    hd, hd_err = _safe_read("/api/health/detailed")
+    hd = hd or {}
+    orch = (hd.get("components") or {}).get("orchestrator") or {}
+    eh = ds.get("external_health") or {}
+    data = {
+        "status": ds.get("status"),
+        "pause_reason": ds.get("pause_reason"),
+        "paused_at": ds.get("paused_at"),
+        "health_check_interval_seconds": ds.get("health_check_interval_seconds"),
+        "health_recovery_streak": ds.get("health_recovery_streak"),
+        "health_recovery_streak_required": ds.get("health_recovery_streak_required"),
+        "health_recovery_history": ds.get("health_recovery_history") or [],
+        "health_recovery_history_size": ds.get("health_recovery_history_size"),
+        "health_failure_streak": ds.get("health_failure_streak"),
+        "health_failure_streak_threshold": ds.get("health_failure_streak_threshold"),
+        "external_health": eh,
+        "orchestrator": {
+            "status": orch.get("status"),
+            "cycle_age_seconds": orch.get("cycle_age_seconds"),
+            "queued_tasks": orch.get("queued_tasks"),
+            "active_tasks": orch.get("active_tasks"),
+        },
+        "errors": {k: v for k, v in (("deploy_state", ds_err), ("health_detailed", hd_err)) if v},
+    }
+    _emit(args, data, _render_health_deploy)
+
+
+def _render_health_deploy(data: dict) -> None:
+    print("=== DEPLOY HEALTH ===")
+    print(f"  Status:       {data.get('status', '?')}")
+    if data.get("pause_reason"):
+        print(f"  Pause reason: {data['pause_reason']}")
+    if data.get("paused_at"):
+        print(f"  Paused:       {_age_str(data['paused_at'])}")
+    eh = data.get("external_health") or {}
+    errs = eh.get("errors") or {}
+    print("\n=== EXTERNAL DEPS ===")
+    for dep in ("github_api", "db", "dispatch_api", "anthropic_api", "openai_api", "gemini_api", "gcp"):
+        val = eh.get(dep)
+        if val is None:
+            continue
+        status_str = "OK" if val else "DOWN"
+        err_str = errs.get(dep, "")
+        suffix = f" — {err_str}" if err_str else ""
+        print(f"  {dep:12}: {status_str}{suffix}")
+    hist = data.get("health_recovery_history") or []
+    size = data.get("health_recovery_history_size") or 5
+    streak = data.get("health_recovery_streak") or 0
+    required = data.get("health_recovery_streak_required") or 3
+    dots = ["OK " if hist[i] else "FAIL" for i in range(min(len(hist), size))]
+    dots += ["--  "] * (size - len(dots))
+    print(f"\n=== RING BUFFER (3-of-5 gate) ===")
+    print(f"  Recovery: [{' | '.join(dots)}]  {streak}/{required} healthy")
+    orch = data.get("orchestrator") or {}
+    print(f"\n=== ORCHESTRATOR CYCLE ===")
+    print(f"  Status:    {orch.get('status', '?')}")
+    cycle_age = orch.get("cycle_age_seconds")
+    if cycle_age is None:
+        print("  Last cycle: never (loop has not completed a cycle since process start)")
+    else:
+        print(f"  Last cycle: {int(cycle_age)}s ago"
+              + ("  WARNING: cycle >30s old — loop may be stuck" if cycle_age > 30 else ""))
+    errors = data.get("errors") or {}
+    if errors:
+        print("\n=== READ ERRORS ===")
+        for endpoint, e in errors.items():
+            print(f"  {endpoint}: {e}")
+
+
+def _health_autonomy(args: argparse.Namespace) -> None:
+    """Autonomous research state per project."""
+    data, err = _safe_read("/api/admin/autonomous-status")
+    data = data or {}
+    projects = data.get("projects") or []
+    out = {
+        "projects": [
+            {
+                "project_name": p.get("project_name"),
+                "autonomous_enabled": p.get("autonomous_enabled"),
+                "consecutive_failures": p.get("consecutive_failures", 0),
+                "tasks_spawned_last_hour": p.get("tasks_spawned_last_hour", 0),
+                "last_research_at": p.get("last_research_at"),
+                "current_direction": p.get("current_direction"),
+            }
+            for p in projects
+        ],
+        "errors": {"autonomy": err} if err else {},
+    }
+    _emit(args, out, _render_health_autonomy)
+
+
+def _render_health_autonomy(data: dict) -> None:
+    projects = data.get("projects") or []
+    print("=== AUTONOMY STATE ===")
+    if not projects:
+        print("  No projects configured.")
+        return
+    for p in projects:
+        print(f"  Project: {p.get('project_name', '?')}")
+        print(f"    enabled:              {p.get('autonomous_enabled')}")
+        print(f"    consecutive_failures: {p.get('consecutive_failures', 0)}")
+        print(f"    tasks_last_hour:      {p.get('tasks_spawned_last_hour', 0)}")
+        print(f"    last_research_at:     {p.get('last_research_at', 'never')}")
+        direction = p.get("current_direction") or {}
+        if direction:
+            print(f"    direction:            {(direction.get('summary') or '?')[:100]}")
+
+
+def _health_alerts(args: argparse.Namespace) -> None:
+    """Show system alerts; optionally dismiss one or all."""
+    dismiss = getattr(args, "dismiss", None)
+    dismiss_all = getattr(args, "dismiss_all", False)
+    if dismiss_all or dismiss:
+        cfg = load_config()
+        if cfg.get("read_only"):
+            print(
+                "ERROR: 'dismiss' is a mutating action but the resolved config is "
+                "read-only (agent-JWT fallback). Provide an admin API key "
+                "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if dismiss_all:
+            result = api("POST", "/api/admin/alerts/dismiss-all", {})
+            _emit(args, result, lambda d: print(f"Dismissed: {d.get('dismissed_count', '?')} alerts"))
+            return
+        result = api("POST", f"/api/admin/alerts/{dismiss}/dismiss", {})
+        _emit(args, result, lambda d: print(f"Dismissed: {d.get('status', 'ok')}"))
+        return
+    alerts, err = _safe_read("/api/admin/alerts")
+    alerts = alerts if isinstance(alerts, list) else []
+    out = {"alerts": alerts, "errors": {"alerts": err} if err else {}}
+    _emit(args, out, _render_health_alerts)
+
+
+def _render_health_alerts(data: dict) -> None:
+    alerts = data.get("alerts") or []
+    if not alerts:
+        print("No active alerts.")
+        return
+    print(f"=== ALERTS ({len(alerts)}) ===")
+    for a in alerts:
+        severity = a.get("severity", "?")
+        title = a.get("title", "?")
+        msg = (a.get("message") or "")[:120]
+        ts = (a.get("created_at") or "")[:19]
+        aid = (a.get("id") or "?")[:8]
+        tid = (a.get("task_id") or "")[:8]
+        task_ref = f"  task={tid}" if tid else ""
+        print(f"  [{severity:8}] {aid}  {ts}  {title}{task_ref}")
+        if msg:
+            print(f"             {msg}")
+
+
+def _health_digest(args: argparse.Namespace) -> None:
+    """Catch-up digest for the last N hours."""
+    hours = getattr(args, "hours", 24) or 24
+    pid = get_project_id(getattr(args, "project_id", None))
+    data, err = _safe_read(f"/api/admin/digest?project_id={pid}&hours={hours}")
+    data = data or {}
+    out = {
+        "hours": hours,
+        "completed_count": data.get("completed_count"),
+        "failed_count": data.get("failed_count"),
+        "prs_opened": data.get("prs_opened"),
+        "research_cycles": data.get("research_cycles"),
+        "pending_approval_count": data.get("pending_approval_count"),
+        "active_count": data.get("active_count"),
+        "running_count": data.get("running_count"),
+        "queued_count": data.get("queued_count"),
+        "needs_attention": data.get("needs_attention") or [],
+        "recent_completions": data.get("recent_completions") or [],
+        "recent_failures": data.get("recent_failures") or [],
+        "errors": {"digest": err} if err else {},
+    }
+    _emit(args, out, _render_health_digest)
+
+
+def _render_health_digest(data: dict) -> None:
+    hours = data.get("hours", 24)
+    print(f"=== DIGEST (last {hours}h) ===")
+    print(f"  Completed:        {data.get('completed_count', '?')}")
+    print(f"  Failed:           {data.get('failed_count', '?')}")
+    print(f"  PRs opened:       {data.get('prs_opened', '?')}")
+    print(f"  Research cycles:  {data.get('research_cycles', '?')}")
+    print(f"  Pending approval: {data.get('pending_approval_count', '?')}")
+    print(f"  Active now:       {data.get('active_count', '?')} "
+          f"({data.get('running_count', '?')} running, {data.get('queued_count', '?')} queued)")
+    for item in (data.get("needs_attention") or []):
+        reason = item.get("reason", "?")
+        title = (item.get("title") or "?")[:55]
+        wait_h = item.get("waiting_hours")
+        tid = (item.get("task_id") or "?")[:8]
+        wait_str = f"{wait_h}h ago" if wait_h is not None else "?"
+        print(f"\n--- Needs Attention ---") if item == (data.get("needs_attention") or [])[0] else None
+        print(f"  {tid}  [{reason:18}]  {title}  ({wait_str})")
+    for c in (data.get("recent_completions") or []):
+        print(f"\n--- Recent Completions ---") if c == (data.get("recent_completions") or [])[0] else None
+        tid = (c.get("task_id") or "?")[:8]
+        title = (c.get("title") or "?")[:50]
+        ttype = c.get("task_type", "?")
+        pr = c.get("pr_url", "")
+        ts = (c.get("completed_at") or "")[:16]
+        pr_str = f"  {pr}" if pr else ""
+        print(f"  {tid}  [{ttype:8}]  {ts}  {title}{pr_str}")
+    for f in (data.get("recent_failures") or []):
+        print(f"\n--- Recent Failures ---") if f == (data.get("recent_failures") or [])[0] else None
+        tid = (f.get("task_id") or "?")[:8]
+        title = (f.get("title") or "?")[:50]
+        ts = (f.get("failed_at") or "")[:16]
+        err = (f.get("error_snippet") or "")[:100]
+        print(f"  {tid}  {ts}  {title}")
+        if err:
+            print(f"           {err}")
+
+
+def _health_activity(args: argparse.Namespace) -> None:
+    """Recent activity feed: completions, failures, research events."""
+    limit = getattr(args, "limit", 20) or 20
+    data, err = _safe_read(f"/api/admin/activity?limit={limit}")
+    events = data.get("events", []) if isinstance(data, dict) else (data or [])
+    out = {
+        "events": events,
+        "total": data.get("total") if isinstance(data, dict) else None,
+        "errors": {"activity": err} if err else {},
+    }
+    _emit(args, out, _render_health_activity)
+
+
+_ACTIVITY_ICONS = {
+    "TASK_COMPLETED": "done", "TASK_FAILED": "FAIL",
+    "RESEARCH_FINDINGS": "research", "DEPLOY": "deploy",
+}
+
+
+def _render_health_activity(data: dict) -> None:
+    events = data.get("events") or []
+    if not events:
+        print("No recent activity.")
+        return
+    print(f"=== ACTIVITY (last {len(events)} events) ===")
+    for e in events:
+        etype = e.get("type", "?")
+        icon = _ACTIVITY_ICONS.get(etype, etype)
+        ts = (e.get("timestamp") or "")[:16]
+        title = (e.get("title") or "?")[:55]
+        tid = (e.get("task_id") or "")[:8]
+        pr = e.get("pr_url") or ""
+        err = (e.get("error_summary") or "")[:80]
+        dur = e.get("duration_seconds")
+        dur_str = f"  {int(dur)}s" if dur else ""
+        pr_str = f"  {pr}" if pr else ""
+        print(f"  {ts}  [{icon:10}]  {tid}  {title}{dur_str}{pr_str}")
+        if err:
+            print(f"                              {err}")
+
+
 # ── argument parser ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1884,6 +2695,25 @@ def build_parser() -> argparse.ArgumentParser:
     # diagnostics
     sub.add_parser("diagnostics", parents=[common],
                    help="Stuck tasks, circuit breakers, and grouped failure modes.")
+
+    # ops
+    p_ops = sub.add_parser("ops", parents=[common],
+                           help="System intervention: repair state, health reset, requeue, restart.",
+                           description="System intervention subcommands for stuck-state recovery, "
+                                       "health resets, task requeuing, and orchestrator restarts.")
+    ops_sub = p_ops.add_subparsers(dest="ops_cmd")
+    ops_sub.add_parser("repair", parents=[common],
+                       help="Repair stuck state (orphaned parents, stale locks).")
+    ops_sub.add_parser("reset-health", parents=[common],
+                       help="Force-reset health checks.")
+    ops_sub.add_parser("requeue-failed", parents=[common],
+                       help="Requeue all FAILED tasks.")
+    ops_sub.add_parser("restart-orchestrator", parents=[common],
+                       help="Restart background loops.")
+    p_ops_cb = ops_sub.add_parser("circuit-breaker", parents=[common],
+                                  help="Show circuit breaker state or reset for a project.")
+    p_ops_cb.add_argument("--reset", metavar="PROJECT_ID", default=None,
+                          help="Reset circuit breaker for a project (defaults to current project).")
 
     # trials
     sub.add_parser("trials", parents=[common],
@@ -1929,30 +2759,73 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show recent FAILED tasks grouped by root cause for incident triage.")
     p_tasks_failures.add_argument("--limit", type=int, default=50,
                                   help="Max failed tasks to fetch (default 50).")
-    tasks_sub.add_parser(
+    p_tasks_evaluating = tasks_sub.add_parser(
         "evaluating", parents=[common],
-        help="List EVALUATING tasks with CI-waiting status and PR info.")
-    p_cancel_all = tasks_sub.add_parser(
+        help="Show all EVALUATING tasks with CI/PR state.")
+    p_tasks_evaluating.add_argument("-v", "--verbose", action="store_true",
+                                    help="Show research question and scope.")
+    p_tasks_cancel_all = tasks_sub.add_parser(
         "cancel-all", parents=[common],
-        help="Bulk-cancel tasks by status (default: all active statuses).")
-    p_cancel_all.add_argument("--status", default=None,
-                              help="Cancel only tasks with this status.")
-    p_cancel_all.add_argument("--category", default=None,
-                              help="Restrict to tasks whose context.failure_category matches.")
-    p_cancel_all.add_argument("--yes", action="store_true",
-                              help="Skip confirmation prompt.")
-    p_set_status = tasks_sub.add_parser(
+        help="Cancel tasks in bulk (confirms before mutating).")
+    p_tasks_cancel_all.add_argument("--status", help="Filter by status (default: non-terminal).")
+    p_tasks_cancel_all.add_argument("--category",
+                                    help="Filter by context.failure_category.")
+    p_tasks_cancel_all.add_argument("--yes", action="store_true",
+                                    help="Skip the confirmation prompt.")
+    p_tasks_requeue_ci = tasks_sub.add_parser(
+        "requeue-ci", parents=[common],
+        help="Requeue all CI-waiting EVALUATING tasks (confirms before mutating).")
+    p_tasks_requeue_ci.add_argument("--yes", action="store_true",
+                                    help="Skip the confirmation prompt.")
+    p_tasks_trigger_rollup = tasks_sub.add_parser(
+        "trigger-rollup", parents=[common],
+        help="Force rollup PR creation for a stuck parent task (confirms before mutating).")
+    p_tasks_trigger_rollup.add_argument("parent_id", help="Parent task id (full uuid).")
+    p_tasks_trigger_rollup.add_argument("--yes", action="store_true",
+                                        help="Skip the confirmation prompt.")
+    p_tasks_complete = tasks_sub.add_parser(
+        "complete", parents=[common],
+        help="Mark a task COMPLETED (confirms before mutating).")
+    p_tasks_complete.add_argument("task_id", help="Task id.")
+    p_tasks_complete.add_argument("--message", "-m", help="Status message to record.")
+    p_tasks_complete.add_argument("--yes", action="store_true",
+                                  help="Skip the confirmation prompt.")
+    p_tasks_set_status = tasks_sub.add_parser(
         "set-status", parents=[common],
-        help="Force a task to an arbitrary status (power-user recovery lever).")
-    p_set_status.add_argument("task_id", help="Task id (full uuid).")
-    p_set_status.add_argument("new_status",
-                              choices=["QUEUED", "PROVISIONING", "IN_PROGRESS",
-                                       "EVALUATING", "COMPLETED", "FAILED", "CANCELLED"],
-                              help="Target status.")
-    p_set_status.add_argument("--message", default=None,
-                              help="Optional status message to record.")
-    p_set_status.add_argument("--yes", action="store_true",
-                              help="Skip confirmation prompt.")
+        help="Set a task to an arbitrary status (confirms before mutating).")
+    p_tasks_set_status.add_argument("task_id", help="Task id.")
+    p_tasks_set_status.add_argument(
+        "new_status",
+        choices=["QUEUED", "PROVISIONING", "IN_PROGRESS",
+                 "EVALUATING", "COMPLETED", "FAILED", "CANCELLED"],
+        help="Target status.")
+    p_tasks_set_status.add_argument("--message", "-m", help="Status message to record.")
+    p_tasks_set_status.add_argument("--yes", action="store_true",
+                                    help="Skip the confirmation prompt.")
+    p_tasks_reset_cap = tasks_sub.add_parser(
+        "reset-iteration-cap", parents=[common],
+        help="Reset the review-fix iteration cap for a stuck task (confirms before mutating).")
+    p_tasks_reset_cap.add_argument("task_id", help="Task id.")
+    p_tasks_reset_cap.add_argument("--yes", action="store_true",
+                                   help="Skip the confirmation prompt.")
+    p_tasks_archive = tasks_sub.add_parser(
+        "archive", parents=[common],
+        help="Archive old terminal tasks (confirms before mutating).")
+    p_tasks_archive.add_argument("--completed", action="store_true",
+                                 help="Archive only COMPLETED tasks (not FAILED/CANCELLED).")
+    p_tasks_archive.add_argument("--pipelines", action="store_true",
+                                 help="Archive fully-terminal pipelines (parent+all children).")
+    p_tasks_archive.add_argument("--yes", action="store_true",
+                                 help="Skip the confirmation prompt.")
+    p_tasks_research = tasks_sub.add_parser(
+        "research", parents=[common],
+        help="Show recent completed research tasks.")
+    p_tasks_research.add_argument("task_id", nargs="?", default=None,
+                                  help="Research task id (show detail; default lists recent).")
+    p_tasks_research.add_argument("--limit", type=int, default=5,
+                                  help="Max tasks to show (default 5).")
+    p_tasks_research.add_argument("-v", "--verbose", action="store_true",
+                                  help="Verbose output.")
     tasks_sub.add_parser(
         "autonomy-debug", parents=[common],
         help="Show why autonomy is or isn't spawning: blocking guards and eligible directions.")
@@ -2127,6 +3000,56 @@ def build_parser() -> argparse.ArgumentParser:
     p_log_task.add_argument("task_id", help="Task id to grep for.")
     _add_log_common(p_log_task)
 
+    # fleet
+    p_fleet = sub.add_parser(
+        "fleet", parents=[common],
+        help="VM account pool, warm pool, and zone health.",
+        description="Show Max Plan account pool, warm VM pool, and zone health. "
+                    "Defaults to `pool` when no subcommand is given.")
+    fleet_sub = p_fleet.add_subparsers(dest="fleet_cmd")
+    fleet_sub.add_parser("pool", parents=[common], help="Show Max Plan account pool.")
+    fleet_sub.add_parser("warm", parents=[common],
+                         help="Warm VM pool funnel: sizing, dispatch hit rate, and cost guard.")
+    p_fleet_accounts = fleet_sub.add_parser(
+        "accounts", parents=[common],
+        help="Show or manage Max Plan accounts (--disable/--enable/--remove).")
+    p_fleet_accounts.add_argument("--disable", metavar="NAME",
+                                  help="Disable account by name/prefix, or 'all'.")
+    p_fleet_accounts.add_argument("--enable", metavar="NAME",
+                                  help="Enable account by name/prefix, or 'all'.")
+    p_fleet_accounts.add_argument("--remove", metavar="NAME",
+                                  help="Remove account by name/prefix.")
+    p_fleet_accounts.add_argument("--force", action="store_true",
+                                  help="Force remove even with active tasks.")
+    p_fleet_accounts.add_argument("--yes", action="store_true",
+                                  help="Skip the confirmation prompt.")
+    fleet_sub.add_parser("zones", parents=[common], help="Show zone health.")
+
+    # health
+    p_health = sub.add_parser(
+        "health", parents=[common],
+        help="System health: deploy state, autonomy, alerts, digest, activity.",
+        description="System health subcommands. Defaults to `deploy` when no subcommand is given.")
+    health_sub = p_health.add_subparsers(dest="health_cmd")
+    health_sub.add_parser("deploy", parents=[common],
+                          help="Deploy health deep-dive: probe ring buffer, external deps, orchestrator.")
+    health_sub.add_parser("autonomy", parents=[common],
+                          help="Autonomous research state per project.")
+    p_health_alerts = health_sub.add_parser("alerts", parents=[common],
+                                            help="Show or dismiss system alerts.")
+    p_health_alerts.add_argument("--dismiss", metavar="ALERT_ID",
+                                 help="Dismiss a specific alert by id (confirms via read-only guard).")
+    p_health_alerts.add_argument("--dismiss-all", dest="dismiss_all", action="store_true",
+                                 help="Dismiss all active alerts.")
+    p_health_digest = health_sub.add_parser("digest", parents=[common],
+                                            help="Catch-up digest (default last 24h).")
+    p_health_digest.add_argument("--hours", type=int, default=24,
+                                 help="Lookback window in hours (default 24).")
+    p_health_activity = health_sub.add_parser("activity", parents=[common],
+                                              help="Recent activity feed.")
+    p_health_activity.add_argument("--limit", type=int, default=20,
+                                   help="Max activity events to show (default 20).")
+
     # settings
     p_settings = sub.add_parser(
         "settings", parents=[common],
@@ -2150,16 +3073,19 @@ def build_parser() -> argparse.ArgumentParser:
 _DISPATCH = {
     "status": cmd_status,
     "diagnostics": cmd_diagnostics,
+    "ops": cmd_ops,
     "tasks": cmd_tasks,
     "versions": cmd_versions,
     "system": cmd_system,
     "monitor": cmd_monitor,
     "directions": cmd_directions,
     "trials": cmd_trials,
+    "fleet": cmd_fleet,
     "promote-recover": cmd_promote_recover,
     "logs": cmd_logs,
     "messages": cmd_messages,
     "settings": cmd_settings,
+    "health": cmd_health,
 }
 
 

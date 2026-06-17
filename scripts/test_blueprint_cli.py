@@ -21,6 +21,12 @@ HELP_INVOCATIONS = [
     [],
     ["status"],
     ["diagnostics"],
+    ["ops"],
+    ["ops", "repair"],
+    ["ops", "reset-health"],
+    ["ops", "requeue-failed"],
+    ["ops", "restart-orchestrator"],
+    ["ops", "circuit-breaker"],
     ["tasks"],
     ["tasks", "list"],
     ["tasks", "show"],
@@ -31,7 +37,13 @@ HELP_INVOCATIONS = [
     ["tasks", "failures"],
     ["tasks", "evaluating"],
     ["tasks", "cancel-all"],
+    ["tasks", "requeue-ci"],
+    ["tasks", "trigger-rollup"],
+    ["tasks", "complete"],
     ["tasks", "set-status"],
+    ["tasks", "reset-iteration-cap"],
+    ["tasks", "archive"],
+    ["tasks", "research"],
     ["tasks", "autonomy-debug"],
     ["versions"],
     ["versions", "list"],
@@ -62,6 +74,11 @@ HELP_INVOCATIONS = [
     ["messages"],
     ["messages", "list"],
     ["messages", "send"],
+    ["fleet"],
+    ["fleet", "pool"],
+    ["fleet", "warm"],
+    ["fleet", "accounts"],
+    ["fleet", "zones"],
 ]
 
 
@@ -235,9 +252,67 @@ def mock_api(monkeypatch):
                 },
                 "window_hours": 24,
             }
+        if "/max-plan-accounts/" in path and method == "PATCH":
+            acct_id = path.split("/max-plan-accounts/")[1]
+            enabled = (body or {}).get("enabled", True)
+            return {"id": acct_id, "name": "evan", "enabled": enabled}
+        if "/max-plan-accounts/" in path and method == "DELETE":
+            return {"message": "removed"}
+        if "/warm-vm-state" in path:
+            return {
+                "pool_metrics": {
+                    "enabled": True,
+                    "target_size": 5,
+                    "current_size": 3,
+                    "idle_count": 2,
+                    "idle_ttl_secs": 300,
+                    "project_allowlist": [],
+                    "projected_idle_cost_usd": 0.5,
+                    "settled_idle_cost_usd": 0.4,
+                    "live_idle_cost_usd": 0.1,
+                    "cost_guard": {
+                        "engaged": False, "hit_rate": 0.8, "min_hit_rate": 0.5,
+                        "raw_hit_rate": 0.7, "total_dispatches": 10,
+                        "raw_total_dispatches": 15, "idle_cost_usd": 0.5,
+                        "min_idle_cost_usd": 0.1, "reason": None,
+                    },
+                    "funnel": {
+                        "window_hours": 24, "eligible_hit_rate": 0.8,
+                        "pool_hit_rate": 0.7, "pool_lease_hits": 8,
+                        "eligible_dispatches": 10, "total_dispatches": 15,
+                        "cold_dispatches": 5, "lease_miss_total": 2,
+                        "eligible_miss_total": 2,
+                        "lease_miss_by_reason": {"no_idle_vm": 2},
+                        "by_account": {},
+                    },
+                },
+                "warm_pin_metrics": {
+                    "pool_circuit_breaker_suppressed": False,
+                    "pool_suppressed_until": None,
+                    "pool_claim_failures_last_hour": 0,
+                    "pool_failure_rate_threshold": 5,
+                    "active_pool_origin_claims": 1,
+                    "pool_origin_share": 0.2,
+                },
+            }
+        if "/zone-health" in path:
+            return {
+                "us-central1-a": {"status": "OK", "last_success": "2026-06-17T00:00:00Z",
+                                   "consecutive_failures": 0},
+                "us-east1-b": {"status": "DEGRADED", "last_success": "2026-06-16T00:00:00Z",
+                                "consecutive_failures": 2},
+            }
         if "/admin/settings" in path:
-            return {"max_concurrent_vms": 10, "promotion_enabled": True,
-                    "daily_cost_ceiling_usd": 50.0}
+            return {
+                "max_concurrent_vms": 10, "promotion_enabled": True,
+                "daily_cost_ceiling_usd": 50.0,
+                "max_plan_accounts": [
+                    {"id": "acct-0001-abcd", "name": "henry", "enabled": True,
+                     "active_tasks": 2, "rl_hit_count": 0, "disabled_models": {}},
+                    {"id": "acct-0002-efgh", "name": "evan", "enabled": False,
+                     "active_tasks": 0, "rl_hit_count": 1, "disabled_models": {}},
+                ],
+            }
         if "/messages" in path and method == "POST":
             return {"id": "msg-abc", "status": "created", "arming": "not_armed"}
         if "/messages" in path:
@@ -1407,6 +1482,129 @@ def test_system_zones_human_render(monkeypatch, capsys):
     assert "OK" in out
 
 
+# ── fleet command group ───────────────────────────────────────────────────────
+
+def test_fleet_pool_human(mock_api, capsys):
+    """fleet pool shows MAX PLAN POOL section with account names."""
+    rc = blueprint.main(["fleet", "pool"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "MAX PLAN POOL" in out
+    assert "henry" in out
+    assert "evan" in out
+    assert any("/admin/settings" in path for _, path, _ in mock_api)
+
+
+def test_fleet_pool_json(mock_api, capsys):
+    """fleet pool --json emits a list of accounts under the 'accounts' key."""
+    rc = blueprint.main(["--json", "fleet", "pool"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert isinstance(parsed["accounts"], list)
+    assert len(parsed["accounts"]) == 2
+    assert parsed["accounts"][0]["name"] == "henry"
+
+
+def test_fleet_warm_human(mock_api, capsys):
+    """fleet warm shows WARM VM POOL and DISPATCH FUNNEL sections."""
+    rc = blueprint.main(["fleet", "warm"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "WARM VM POOL" in out
+    assert "DISPATCH FUNNEL" in out
+    assert "COST GUARD" in out
+    assert "CLAIM CIRCUIT BREAKER" in out
+    assert any("/warm-vm-state" in path for _, path, _ in mock_api)
+
+
+def test_fleet_warm_json(mock_api, capsys):
+    """fleet warm --json emits the raw warm-vm-state payload."""
+    rc = blueprint.main(["--json", "fleet", "warm"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert "pool_metrics" in parsed
+    assert parsed["pool_metrics"]["enabled"] is True
+    assert "warm_pin_metrics" in parsed
+
+
+def test_fleet_accounts_show(mock_api, capsys):
+    """fleet accounts (no flags) defaults to showing the pool."""
+    rc = blueprint.main(["fleet", "accounts"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "MAX PLAN POOL" in out
+    assert "henry" in out
+
+
+def test_fleet_accounts_disable_yes(mock_api, monkeypatch, capsys):
+    """fleet accounts --disable NAME --yes sends PATCH with enabled=False."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["fleet", "accounts", "--disable", "evan", "--yes"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Disabled" in out
+    patch_calls = [(m, p, b) for m, p, b in mock_api
+                   if m == "PATCH" and "max-plan-accounts" in p]
+    assert patch_calls, "Expected a PATCH to /max-plan-accounts endpoint"
+    assert patch_calls[0][2] == {"enabled": False}
+
+
+def test_fleet_accounts_enable_yes(mock_api, monkeypatch, capsys):
+    """fleet accounts --enable NAME --yes sends PATCH with enabled=True."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["fleet", "accounts", "--enable", "evan", "--yes"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Enabled" in out
+    patch_calls = [(m, p, b) for m, p, b in mock_api
+                   if m == "PATCH" and "max-plan-accounts" in p]
+    assert patch_calls
+    assert patch_calls[0][2] == {"enabled": True}
+
+
+def test_fleet_accounts_read_only_refused(mock_api, monkeypatch):
+    """fleet accounts --disable refuses under read-only config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["fleet", "accounts", "--disable", "evan", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_fleet_accounts_aborts_without_yes(mock_api, monkeypatch, capsys):
+    """fleet accounts --disable without --yes on non-interactive stdin aborts."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = blueprint.main(["fleet", "accounts", "--disable", "evan"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Aborted" in out
+    assert not any("max-plan-accounts" in p and m == "PATCH" for m, p, _ in mock_api)
+
+
+def test_fleet_zones_human(mock_api, capsys):
+    """fleet zones shows ZONE HEALTH section with per-zone status."""
+    rc = blueprint.main(["fleet", "zones"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ZONE HEALTH" in out
+    assert "us-central1-a" in out
+    assert "us-east1-b" in out
+    assert any("/zone-health" in path for _, path, _ in mock_api)
+
+
+def test_fleet_zones_json(mock_api, capsys):
+    """fleet zones --json emits the zones dict under the 'zones' key."""
+    rc = blueprint.main(["--json", "fleet", "zones"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert "zones" in parsed
+    assert "us-central1-a" in parsed["zones"]
+    assert parsed["zones"]["us-east1-b"]["consecutive_failures"] == 2
+
 def test_system_autonomy_json(monkeypatch, capsys):
     """system autonomy --json surfaces per-project autonomy state."""
     def fake_api(method, path, body=None, timeout=30):
@@ -1784,6 +1982,191 @@ def test_settings_group(monkeypatch, capsys):
 
 # ── messages group ────────────────────────────────────────────────────────────
 
+def test_health_group(monkeypatch, capsys):
+    """health deploy/autonomy/alerts/digest/activity all produce structured --json output."""
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if "/admin/deploy-state" in path:
+            return {
+                "status": "RUNNING", "pause_reason": None, "paused_at": None,
+                "health_check_interval_seconds": 30,
+                "health_recovery_streak": 3, "health_recovery_streak_required": 3,
+                "health_recovery_history": [True, True, True, False, True],
+                "health_recovery_history_size": 5,
+                "health_failure_streak": 0, "health_failure_streak_threshold": 3,
+                "external_health": {
+                    "github_api": True, "db": True, "anthropic_api": True,
+                    "errors": {},
+                },
+            }
+        if "/health/detailed" in path:
+            return {
+                "components": {
+                    "orchestrator": {"status": "ok", "cycle_age_seconds": 5,
+                                     "queued_tasks": 2, "active_tasks": 3}
+                }
+            }
+        if "/admin/autonomous-status" in path:
+            return {
+                "projects": [{
+                    "project_name": "blueprint", "autonomous_enabled": True,
+                    "consecutive_failures": 0, "tasks_spawned_last_hour": 2,
+                    "last_research_at": "2026-06-17T10:00:00Z",
+                    "current_direction": {"summary": "Improve test coverage"},
+                }]
+            }
+        if "/admin/alerts" in path and method == "GET":
+            return [
+                {"id": "alert-001", "severity": "WARNING", "title": "High error rate",
+                 "message": "error rate above threshold", "created_at": "2026-06-17T10:00:00Z",
+                 "task_id": None},
+            ]
+        if "/admin/digest" in path:
+            return {
+                "completed_count": 5, "failed_count": 1, "prs_opened": 3,
+                "research_cycles": 2, "pending_approval_count": 0,
+                "active_count": 4, "running_count": 3, "queued_count": 1,
+                "needs_attention": [], "recent_completions": [], "recent_failures": [],
+            }
+        if "/admin/activity" in path:
+            return {
+                "events": [
+                    {"type": "TASK_COMPLETED", "timestamp": "2026-06-17T10:00:00Z",
+                     "title": "Add widget feature", "task_id": "task-abc",
+                     "pr_url": "https://github.com/x/y/pull/42",
+                     "duration_seconds": 120, "error_summary": None},
+                ],
+                "total": 1,
+            }
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+
+    # health deploy --json
+    calls.clear()
+    rc = blueprint.main(["--json", "health", "deploy"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["status"] == "RUNNING"
+    assert parsed["orchestrator"]["status"] == "ok"
+    assert parsed["orchestrator"]["cycle_age_seconds"] == 5
+    assert any("/admin/deploy-state" in p for _, p, _ in calls)
+    assert any("/health/detailed" in p for _, p, _ in calls)
+
+    # health deploy human render
+    calls.clear()
+    rc = blueprint.main(["health", "deploy"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "DEPLOY HEALTH" in out
+    assert "RING BUFFER" in out
+    assert "ORCHESTRATOR" in out
+
+    # health autonomy --json
+    calls.clear()
+    rc = blueprint.main(["--json", "health", "autonomy"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert len(parsed["projects"]) == 1
+    assert parsed["projects"][0]["project_name"] == "blueprint"
+    assert parsed["projects"][0]["autonomous_enabled"] is True
+
+    # health alerts --json
+    calls.clear()
+    rc = blueprint.main(["--json", "health", "alerts"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert len(parsed["alerts"]) == 1
+    assert parsed["alerts"][0]["severity"] == "WARNING"
+
+    # health alerts human render
+    rc = blueprint.main(["health", "alerts"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ALERTS" in out
+    assert "High error rate" in out
+
+    # health digest --json
+    calls.clear()
+    rc = blueprint.main(["--json", "health", "digest", "--hours", "48"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["hours"] == 48
+    assert parsed["completed_count"] == 5
+    assert parsed["failed_count"] == 1
+    assert any("hours=48" in p for _, p, _ in calls)
+
+    # health activity --json
+    calls.clear()
+    rc = blueprint.main(["--json", "health", "activity", "--limit", "10"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert len(parsed["events"]) == 1
+    assert parsed["events"][0]["type"] == "TASK_COMPLETED"
+    assert any("limit=10" in p for _, p, _ in calls)
+
+    # health activity human render
+    rc = blueprint.main(["health", "activity"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ACTIVITY" in out
+    assert "Add widget feature" in out
+
+
+def test_health_alerts_dismiss_read_only_refused(monkeypatch, capsys):
+    """health alerts --dismiss refuses under read-only config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["health", "alerts", "--dismiss", "alert-001"])
+    assert exc.value.code == 1
+
+
+def test_health_deploy_defaults_no_subcommand(monkeypatch, capsys):
+    """health without a subcommand defaults to deploy."""
+    def fake_api(method, path, body=None, timeout=30):
+        if "/admin/deploy-state" in path:
+            return {"status": "RUNNING", "external_health": {}}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["health"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "DEPLOY HEALTH" in out
+
+
+def test_ops_health_deprecation(capsys):
+    """ops.py health/autonomy/alerts/digest/activity print DEPRECATED and exit 1."""
+    import ops
+    for cmd in ("cmd_health", "cmd_autonomy", "cmd_alerts", "cmd_digest", "cmd_activity"):
+        with pytest.raises(SystemExit) as exc:
+            getattr(ops, cmd)([])
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "DEPRECATED" in out
+
+
+def test_tasks_health_autonomy_debug_deprecation(capsys):
+    """tasks.py health and autonomy-debug print DEPRECATED and exit 1."""
+    import tasks
+    for cmd in ("cmd_health", "cmd_autonomy_debug"):
+        with pytest.raises(SystemExit) as exc:
+            getattr(tasks, cmd)([])
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "DEPRECATED" in out
+
+
 def test_messages_group(mock_api, monkeypatch, capsys):
     """messages list (human + --json, status filter) and send (POST body, type
     passthrough, read-only refused) via blueprint.main with mocked api."""
@@ -1833,4 +2216,108 @@ def test_messages_group(mock_api, monkeypatch, capsys):
     monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
     with pytest.raises(SystemExit) as exc:
         blueprint.main(["messages", "send", "blocked send"])
+    assert exc.value.code == 1
+
+
+# ── tasks bulk/manual-state extensions ───────────────────────────────────────
+
+def test_tasks_evaluating_human(mock_api, capsys):
+    """tasks evaluating lists EVALUATING tasks with ci/pr state."""
+    rc = blueprint.main(["tasks", "evaluating"])
+    assert rc == 0
+    # mock_api returns a generic task list for /tasks
+    assert any("status=EVALUATING" in path for _, path, _ in mock_api)
+
+
+def test_tasks_evaluating_verbose_flag(mock_api, capsys):
+    """-v flag is accepted without error."""
+    rc = blueprint.main(["tasks", "evaluating", "-v"])
+    assert rc == 0
+
+
+def test_tasks_cancel_all_read_only_refused(mock_api, monkeypatch):
+    """tasks cancel-all refuses under a read-only config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "cancel-all", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_tasks_requeue_ci_no_ci_tasks(monkeypatch, capsys):
+    """tasks requeue-ci with no CI-waiting tasks prints a graceful message."""
+    def fake_api(method, path, body=None, timeout=30):
+        if "/tasks" in path:
+            return {"tasks": [
+                {"id": "task-aaa", "task_type": "create", "status": "EVALUATING",
+                 "title": "no ci", "context": {"review_loop": {"ci_waiting": False}}}
+            ], "total": 1}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["tasks", "requeue-ci"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "No CI-waiting" in out
+
+
+def test_tasks_complete_read_only_refused(mock_api, monkeypatch):
+    """tasks complete refuses under a read-only config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "complete", "task-123", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_tasks_set_status_fires_patch(mock_api, monkeypatch, capsys):
+    """tasks set-status sends PATCH with correct status when --yes is passed."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["tasks", "set-status", "task-123", "FAILED", "--yes"])
+    assert rc == 0
+    assert any(
+        m == "PATCH" and "/tasks/task-123" in p and (b or {}).get("status") == "FAILED"
+        for m, p, b in mock_api
+    )
+
+
+def test_tasks_archive_read_only_refused(mock_api, monkeypatch):
+    """tasks archive refuses under a read-only config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "archive", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_tasks_archive_fires_bulk_archive(mock_api, monkeypatch, capsys):
+    """tasks archive --yes posts to bulk-archive with filter=terminal."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["tasks", "archive", "--yes"])
+    assert rc == 0
+    assert any(
+        m == "POST" and "bulk-archive" in p
+        for m, p, _ in mock_api
+    )
+
+
+def test_tasks_research_lists(mock_api, capsys):
+    """tasks research lists recent COMPLETED research tasks."""
+    rc = blueprint.main(["tasks", "research"])
+    assert rc == 0
+    assert any("task_type=research" in path for _, path, _ in mock_api)
+
+
+def test_tasks_reset_iteration_cap_read_only_refused(mock_api, monkeypatch):
+    """tasks reset-iteration-cap refuses under a read-only config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "reset-iteration-cap", "task-123", "--yes"])
     assert exc.value.code == 1
