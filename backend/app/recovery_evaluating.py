@@ -46,6 +46,7 @@ from app.recovery_evaluating_reaped_owner import (
     _handle_reaped_owner_fallback,
     _handle_reaped_owner_reconcile,
 )
+from app.recovery_evaluating_hard_timeout import _handle_evaluating_hard_timeout
 from app.recovery_evaluating_helpers import (  # noqa: F401
     _last_status_transition_at,
     _chain_has_active_pipeline_work,
@@ -506,207 +507,20 @@ async def _check_evaluating_timeouts(progress_cb=None):
                     await session.commit()
                     continue
 
-                # 6-hour hard timeout
-                if elapsed > EVALUATING_FAIL_SECONDS:
-                    # Same protection as the CI backstop: if the chain has an
-                    # actively heartbeating review/fix task, the pipeline is
-                    # still doing real work — defer to next sweep.
-                    if await services._chain_has_active_pipeline_work(task, session):
-                        logger.info(
-                            f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past "
-                            f"{EVALUATING_FAIL_SECONDS // 3600}h hard timeout but "
-                            f"chain has fresh review/fix heartbeat — skipping kill"
-                        )
-                        continue
-
-                    # Recoverable-FAILED defer: a child / chain pipeline task in
-                    # FAILED with infra-class failure_category may come back via
-                    # resurrection sweep or operator requeue. Cascade-killing
-                    # mid-recovery destroys salvageable work (incident
-                    # 2026-04-29: PRs #3450/#3408 + parents c30701d3/ddd987fc).
-                    # Defer for a bounded window so a truly stuck case still
-                    # terminates eventually.
-                    EVAL_DEFER_WINDOW_HOURS = 24
-                    first_defer_at = ctx.get("_eval_timeout_first_defer_at")
-                    # Treat a defer marker older than evaluating_since as stale
-                    # (left over from a previous EVALUATING transition).
-                    if first_defer_at:
-                        try:
-                            _fd = datetime.fromisoformat(first_defer_at)
-                            if _fd < evaluating_since:
-                                first_defer_at = None
-                        except (ValueError, TypeError):
-                            first_defer_at = None
-                    has_recoverable = await _chain_has_recoverable_failed_work(
-                        task, session
-                    )
-                    if has_recoverable:
-                        if first_defer_at:
-                            try:
-                                _fd = datetime.fromisoformat(first_defer_at)
-                                defer_elapsed = (now - _fd).total_seconds()
-                            except (ValueError, TypeError):
-                                defer_elapsed = 0.0
-                            if defer_elapsed <= EVAL_DEFER_WINDOW_HOURS * 3600:
-                                logger.info(
-                                    f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past "
-                                    f"{EVALUATING_FAIL_SECONDS // 3600}h but chain "
-                                    f"has recoverable FAILED children — deferring "
-                                    f"({round(defer_elapsed / 3600, 1)}h into "
-                                    f"{EVAL_DEFER_WINDOW_HOURS}h window)"
-                                )
-                                continue
-                            logger.warning(
-                                f"[EVAL TIMEOUT] Task {str(task.id)[:8]} exhausted "
-                                f"{EVAL_DEFER_WINDOW_HOURS}h defer window despite recoverable "
-                                f"FAILED children — proceeding to kill"
-                            )
-                            # fall through to existing kill
-                        else:
-                            from sqlalchemy.orm.attributes import flag_modified
-
-                            task.context = {
-                                **ctx,
-                                "_eval_timeout_first_defer_at": now.isoformat(),
-                            }
-                            flag_modified(task, "context")
-                            session.add(task)
-                            logger.warning(
-                                f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past "
-                                f"{EVALUATING_FAIL_SECONDS // 3600}h with "
-                                f"recoverable FAILED children — deferring cascade-cancel "
-                                f"for up to {EVAL_DEFER_WINDOW_HOURS}h"
-                            )
-                            await _maybe_create_failure_alert(
-                                task,
-                                session,
-                                f"Evaluation past {EVALUATING_FAIL_SECONDS // 3600}h with "
-                                f"recoverable infra failures in chain — deferring "
-                                f"cascade-cancel for up to {EVAL_DEFER_WINDOW_HOURS}h",
-                            )
-                            await session.commit()
-                            continue
-
-                    hours = round(elapsed / 3600, 1)
-                    logger.error(
-                        f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has been EVALUATING "
-                        f"for {hours}h — hard timeout, marking FAILED"
-                    )
-                    task.status = TaskStatus.FAILED
-                    task.latest_status_message = (
-                        f"Evaluation timeout — children did not complete "
-                        f"within {EVALUATING_FAIL_SECONDS // 3600} hours"
-                    )
-                    from app.failure_classification import (
-                        classify_failure,
-                        persist_failure_category,
-                    )
-                    from app.routers.agent_status import record_task_result
-
-                    _fc = classify_failure(task)
-                    persist_failure_category(task, _fc)
-                    record_task_result(
-                        success=False,
-                        failure_class=_fc,
-                        task_id=str(task.id),
-                        task_type=task.first_payload.get("type", ""),
-                    )
-                    session.add(task)
-
-                    # Re-fetch children fresh — the batch holds only a plain
-                    # status snapshot, and the cascade-cancel + PR-close below
-                    # read and mutate the live rows.
-                    children = (
-                        (
-                            await session.execute(
-                                select(Task).where(Task.parent_task_id == task.id)
-                            )
-                        )
-                        .scalars()
-                        .all()
-                    )
-
-                    # Cascade-cancel non-terminal children
-                    from app.vm_lifecycle import _ensure_vm_deleted
-                    from app.max_plan_pool import release_max_plan_account
-
-                    non_terminal_children = [
-                        c for c in children if c.status not in TERMINAL
-                    ]
-                    vms_to_delete = []
-                    hard_timeout_cancel_msg = (
-                        f"Cancelled: parent evaluation timeout after {hours}h"
-                    )
-                    for child in non_terminal_children:
-                        child.status = TaskStatus.CANCELLED
-                        child.latest_status_message = hard_timeout_cancel_msg
-                        if child.vm_instance_id:
-                            vms_to_delete.append(child)
-                        child_acct = (child.context or {}).get("max_plan_account_id")
-                        if child_acct:
-                            await release_max_plan_account(child_acct)
-                        session.add(child)
-                    if non_terminal_children:
-                        logger.info(
-                            f"[EVAL TIMEOUT] Cascade-cancelled {len(non_terminal_children)} "
-                            f"children of timed-out task {str(task.id)[:8]}"
-                        )
-
-                    # Close orphaned rollup PRs from CI-waiting children
-                    from app.github import close_pull_request
-
-                    for child in children:
-                        child_pr = (
-                            (child.context or {})
-                            .get("review_loop", {})
-                            .get("pr_number")
-                        )
-                        if child_pr and not (child.context or {}).get("pr_merged"):
-                            try:
-                                from app.routers.agent import get_github_token_for_task
-
-                                _gh, _owner, _repo = await services._bounded(
-                                    get_github_token_for_task(child.id, session),
-                                    services._GH_CALL_TIMEOUT_S,
-                                    what=f"eval-timeout token {str(child.id)[:8]}",
-                                )
-                                await services._bounded(
-                                    close_pull_request(_gh, _owner, _repo, child_pr),
-                                    services._GH_CALL_TIMEOUT_S,
-                                    what=f"eval-timeout close PR #{child_pr}",
-                                )
-                                logger.info(
-                                    f"[EVAL TIMEOUT] Closed orphaned PR #{child_pr} from child {str(child.id)[:8]}"
-                                )
-                            except Exception as pr_err:
-                                logger.warning(
-                                    f"[EVAL TIMEOUT] Failed to close PR #{child_pr}: {pr_err}"
-                                )
-
-                    # Create ERROR alert (deduplicated by _maybe_create_failure_alert)
-                    await _maybe_create_failure_alert(
-                        task,
-                        session,
-                        f"Evaluation timeout after {hours}h — children did not complete",
-                    )
-                    await session.commit()
-                    # task.status=FAILED / children=CANCELLED were set above; the
-                    # PR-close calls + alert + commit can poison/expire these
-                    # instances, so broadcast the known literals rather than
-                    # post-commit lazy-loads. child.id (PK) is always safe to read.
-                    await services.broadcast_to_project(
-                        str(task.project_id),
-                        "task_updated",
-                        {"task_id": str(task.id), "status": TaskStatus.FAILED},
-                    )
-                    for child in non_terminal_children:
-                        await services.broadcast_to_project(
-                            str(task.project_id),
-                            "task_updated",
-                            {"task_id": str(child.id), "status": TaskStatus.CANCELLED},
-                        )
-                    for child_vm in vms_to_delete:
-                        await _ensure_vm_deleted(child_vm, reason="parent_eval_timeout")
+                # 6-hour hard timeout — extracted to
+                # app.recovery_evaluating_hard_timeout._handle_evaluating_hard_timeout
+                if await _handle_evaluating_hard_timeout(
+                    task,
+                    ctx,
+                    session,
+                    now,
+                    evaluating_since,
+                    elapsed,
+                    EVALUATING_FAIL_SECONDS,
+                    TERMINAL,
+                    _chain_has_recoverable_failed_work,
+                    _maybe_create_failure_alert,
+                ):
                     continue
 
                 # 2-hour warning
