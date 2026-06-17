@@ -56,8 +56,6 @@ from app.compute import (
     any_zone_available,
     soonest_zone_recovery,
 )
-from app.branch_resolution import classify_rollup_merge_outcome
-from app.landed_signal import apply_merged_landed_signal
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import (
     record_pipeline_event,
@@ -2015,43 +2013,28 @@ async def reaper_service():
                                 f"classifying landing"
                             )
                             _proj = await session.get(Project, task.project_id)
+                            from app.recovery_evaluating_helpers import (  # noqa: PLC0415
+                                _apply_rollup_merge_classification,
+                            )
                             (
                                 _record_pr_merged,
                                 _terminal_rollup_merge,
                                 _landed_branch,
-                            ) = await classify_rollup_merge_outcome(
+                            ) = await _apply_rollup_merge_classification(
                                 task,
                                 _proj,
                                 session,
                                 pr_number=_pr_num,
                                 merged_base_branch=_gh_pr_base_branch,
                                 source="reaper.orphan_recovery",
+                                msg_terminal=f"Reaped mid-run; PR #{_pr_num} was merged out-of-band",
+                                msg_non_terminal=f"Reaped mid-run; PR #{_pr_num} merged into {{landed}}; awaiting downstream landing",
+                                hotfix_lane=bool(
+                                    (task.first_payload or {}).get("hotfix")
+                                    or (task.context or {}).get("hotfix")
+                                ),
+                                non_merge_reason="merged_pr_non_integration_branch",
                             )
-                            task.status = (
-                                TaskStatus.COMPLETED
-                                if _terminal_rollup_merge
-                                else TaskStatus.EVALUATING
-                            )
-                            task.vm_instance_id = None
-                            task.last_heartbeat = None
-                            if _terminal_rollup_merge:
-                                task.latest_status_message = f"Reaped mid-run; PR #{_pr_num} was merged out-of-band"
-                            else:
-                                task.latest_status_message = (
-                                    f"Reaped mid-run; PR #{_pr_num} merged into "
-                                    f"{_landed_branch}; awaiting downstream landing"
-                                )
-                            if _record_pr_merged:
-                                apply_merged_landed_signal(
-                                    task,
-                                    _proj,
-                                    base_branch=_landed_branch,
-                                    hotfix_lane=bool(
-                                        (task.first_payload or {}).get("hotfix")
-                                        or (task.context or {}).get("hotfix")
-                                    ),
-                                    non_merge_reason="merged_pr_non_integration_branch",
-                                )
                             try:
                                 from app.task_completion import (  # noqa: PLC0415
                                     _finalize_migration_reservation_after_merge,

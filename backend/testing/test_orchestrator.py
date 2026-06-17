@@ -2549,6 +2549,7 @@ class TestProjectConcurrencyCap:
             _orch_module._last_zone_health_persist = now
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
+            _orch_module._last_deadlock_check = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 
@@ -3914,6 +3915,7 @@ class TestWarmVMSkipProvision:
             _orch_module._last_zone_health_persist = now
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
+            _orch_module._last_deadlock_check = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 
@@ -7370,6 +7372,7 @@ class TestDispatchCrashContainment:
             _orch_module._last_zone_health_persist = now
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
+            _orch_module._last_deadlock_check = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 
