@@ -3120,7 +3120,9 @@ async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
         f"auto_completed_reason must reflect exhaustion, got {d.get('auto_completed_reason')!r}"
     )
     # The superseded auto-pause must NOT have fired.
-    assert not d.get("auto_paused"), "exhausted-completed direction must not be auto-paused"
+    assert not d.get("auto_paused"), (
+        "exhausted-completed direction must not be auto-paused"
+    )
     assert not d.get("paused_reason"), "no paused_reason on a completed direction"
 
     # An INFO 'Direction auto-completed' alert is created (not the WARNING deadlock alert).
@@ -3160,9 +3162,12 @@ async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
             "tasks_created": 0,
             "findings_produced": 0,
             "filter_breakdown": {
-                "hash_dedup": 2, "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
-                "type_filtered": 0, "empty_prompt": 0,
+                "hash_dedup": 2,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
             },
             "filtered_findings": [
                 {"title": "Fix null pointer in auth handler", "reason": "hash match"},
@@ -3176,9 +3181,12 @@ async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
             "tasks_created": 0,
             "findings_produced": 0,
             "filter_breakdown": {
-                "hash_dedup": 1, "word_overlap_dedup": 1,
-                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
-                "type_filtered": 0, "empty_prompt": 0,
+                "hash_dedup": 1,
+                "word_overlap_dedup": 1,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
             },
             "filtered_findings": [
                 {"title": "Fix null pointer in auth handler", "reason": "hash match"},
@@ -3220,12 +3228,22 @@ async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
         [],  # insights
         [],  # direction_notes
         [],  # direction_proposals
-        1,   # hash_dedup_count
-        0, 0, 0, 0, 0,
-        "research-branch", "main", 0, None,
+        1,  # hash_dedup_count
+        0,
+        0,
+        0,
+        0,
+        0,
+        "research-branch",
+        "main",
+        0,
+        None,
         filtered_findings=[
-            {"title": "Add config validation", "reason": "hash match",
-             "direction_id": direction_id},
+            {
+                "title": "Add config validation",
+                "reason": "hash match",
+                "direction_id": direction_id,
+            },
         ],
     )
     await db_session.refresh(project)
@@ -3240,7 +3258,9 @@ async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
     assert "Add retry to payment service" in dft
     assert "Remove unused import in models" in dft
     # No duplicates
-    assert len(dft) == len(set(dft)), "deadlock_filtered_titles must not have duplicates"
+    assert len(dft) == len(set(dft)), (
+        "deadlock_filtered_titles must not have duplicates"
+    )
 
 
 @_pytest.mark.asyncio
@@ -3264,9 +3284,12 @@ async def test_dedup_deadlock_filtered_titles_cleared_on_productive_cycle(db_ses
             "tasks_created": 0,
             "findings_produced": 0,
             "filter_breakdown": {
-                "hash_dedup": 1, "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
-                "type_filtered": 0, "empty_prompt": 0,
+                "hash_dedup": 1,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
             },
             "summary": "no findings",
         },
@@ -3276,9 +3299,12 @@ async def test_dedup_deadlock_filtered_titles_cleared_on_productive_cycle(db_ses
             "tasks_created": 0,
             "findings_produced": 0,
             "filter_breakdown": {
-                "hash_dedup": 1, "word_overlap_dedup": 0,
-                "file_overlap_dedup": 0, "evidence_overlap_dedup": 0,
-                "type_filtered": 0, "empty_prompt": 0,
+                "hash_dedup": 1,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
             },
             "summary": "no findings",
         },
@@ -3318,21 +3344,33 @@ async def test_dedup_deadlock_filtered_titles_cleared_on_productive_cycle(db_ses
 
     from app.finding_deduplication import finding_hash, canonical_finding_body
 
-    finding = {"title": "New real fix", "description": "Actually new work",
-               "direction_id": direction_id, "type": "fix"}
+    finding = {
+        "title": "New real fix",
+        "description": "Actually new work",
+        "direction_id": direction_id,
+        "type": "fix",
+    }
     fhash = finding_hash(finding["title"], canonical_finding_body(finding))
 
     await apply_post_spawn_state(
         db_session,
         task,
-        [finding],     # findings
-        [child],       # child_tasks — productive cycle
+        [finding],  # findings
+        [child],  # child_tasks — productive cycle
         [(0, finding, fhash)],  # deduplicated
         [],  # insights
         [],  # direction_notes
         [],  # direction_proposals
-        0, 0, 0, 0, 0, 0,
-        "research-branch", "main", 0, None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        "research-branch",
+        "main",
+        0,
+        None,
     )
     await db_session.refresh(project)
 
@@ -4635,6 +4673,18 @@ class TestParseGraderVerdict:
     def test_unparseable_fails_closed(self):
         assert parse_grader_verdict("no machine verdict in here").passed is False
         assert parse_grader_verdict("").passed is False
+
+    def test_alias_tokens_pass(self):
+        """Divergent accept/approve/approved/passed aliases all map to passed=True."""
+        for token in ("accept", "approve", "approved", "passed"):
+            v = parse_grader_verdict(f'{{"verdict": "{token}", "reasoning": "ok"}}')
+            assert v.passed is True, f"token {token!r} should map to passed=True"
+
+    def test_alias_tokens_fail(self):
+        """Divergent reject/rejected/request_changes aliases all map to passed=False."""
+        for token in ("reject", "rejected", "request_changes"):
+            v = parse_grader_verdict(f'{{"verdict": "{token}", "reasoning": "nope"}}')
+            assert v.passed is False, f"token {token!r} should map to passed=False"
 
 
 @_pytest.mark.asyncio
@@ -9327,6 +9377,33 @@ class TestParseAdversarialFindingVerdicts:
         assert result["abc999"]["passed"] is False
         assert result["abc999"]["explicit"] is True
 
+    def test_alias_tokens_approved_rejected(self):
+        """Divergent alias tokens: approved->pass, rejected->fail (present in this parser)."""
+        logs_approved = (
+            '[{"hash": "h1", "verdict": "approved", "reason": "looks good"}]'
+        )
+        result, outcome = parse_adversarial_finding_verdicts(logs_approved, ["h1"])
+        assert result["h1"]["passed"] is True
+        assert result["h1"]["explicit"] is True
+        assert outcome == "ok"
+
+        logs_rejected = '[{"hash": "h2", "verdict": "rejected", "reason": "stale"}]'
+        result, outcome = parse_adversarial_finding_verdicts(logs_rejected, ["h2"])
+        assert result["h2"]["passed"] is False
+        assert result["h2"]["explicit"] is True
+        assert outcome == "ok"
+
+    def test_absent_alias_tokens_accept_and_request_changes(self):
+        """Tokens absent from this parser: accept and request_changes -> unrecognized."""
+        for token in ("accept", "request_changes"):
+            logs = f'[{{"hash": "h3", "verdict": "{token}", "reason": "n/a"}}]'
+            result, outcome = parse_adversarial_finding_verdicts(logs, ["h3"])
+            assert result["h3"]["explicit"] is False, (
+                f"token {token!r} should not produce an explicit verdict in this parser"
+            )
+            assert result["h3"]["unresolved_reason"] == "verdict_unrecognized"
+            assert outcome == "ok"
+
 
 def test_adversarial_parser_uses_final_verdict_after_echoed_schema():
     """Standalone acceptance test for the last-array fix.
@@ -13606,7 +13683,9 @@ class TestStampNoFindingsRefractory:
             "id": direction_id,
             "text": "Exhausted direction",
             "status": "active",
-            "research_history": research_history if research_history is not None else [],
+            "research_history": research_history
+            if research_history is not None
+            else [],
             "history_aggregate": {},
             "consecutive_unproductive_cycles": consecutive_unproductive,
         }
