@@ -66,6 +66,10 @@ async def test_lock_project_then_task_canonical_order_no_deadlock(db_session):
         expire_on_commit=False,
     )
     first_holds_project = asyncio.Event()
+    # second_lock_attempted gates first_flow's commit so there's no timing
+    # race: first_flow holds both locks until second_flow has confirmed its
+    # SKIP LOCKED attempt completed, eliminating the need for a fixed sleep.
+    second_lock_attempted = asyncio.Event()
     outcomes: list[str] = []
 
     async def first_flow() -> None:
@@ -81,9 +85,10 @@ async def test_lock_project_then_task_canonical_order_no_deadlock(db_session):
         ):
             assert proj is not None and t is not None
             first_holds_project.set()
-            # Hold both locks briefly so the second flow's project-lock
-            # attempt sees contention.
-            await asyncio.sleep(0.2)
+            # Hold both locks until second_flow confirms its lock attempt
+            # completed. This replaces the fixed sleep(0.2) which could race
+            # with connection setup time under a loaded CI NullPool engine.
+            await asyncio.wait_for(second_lock_attempted.wait(), timeout=9.0)
             outcomes.append("first")
             await s.commit()
 
@@ -105,6 +110,8 @@ async def test_lock_project_then_task_canonical_order_no_deadlock(db_session):
             assert t is None, "task lock must not be attempted when project is held"
             outcomes.append("second-deferred")
             await s.commit()
+        # Signal after the lock attempt + commit so first_flow can release.
+        second_lock_attempted.set()
 
     # Bounded by asyncio.wait_for so a regression that deadlocks fails
     # the test loudly rather than hanging the suite.
