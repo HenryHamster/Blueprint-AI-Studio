@@ -47,7 +47,10 @@ export function CatchUpStatsRow({ digest }: CatchUpStatsRowProps) {
         >
           {Math.round(digest.success_rate * 100)}% success
           {digest.success_rate_delta != null && (
-            <span className={digest.success_rate_delta > 0 ? 'text-emerald-400' : digest.success_rate_delta < 0 ? 'text-red-400' : 'text-neutral-500'}>
+            <span
+              className={digest.success_rate_delta > 0 ? 'text-emerald-400' : digest.success_rate_delta < 0 ? 'text-red-400' : 'text-neutral-500'}
+              title={digest.prev_success_rate != null ? `was ${Math.round(digest.prev_success_rate * 100)}% last period` : undefined}
+            >
               {digest.success_rate_delta > 0 ? '+' : ''}{Math.round(digest.success_rate_delta * 100)}%
             </span>
           )}

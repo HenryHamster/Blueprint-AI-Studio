@@ -125,3 +125,48 @@ def test_manifest_values_are_well_formed():
             f"{field}: manifest entry must declare EXACTLY ONE of "
             f"'consumer' or 'status' (got consumer={has_consumer}, status={has_status})"
         )
+
+
+def test_active_consumer_claims_backed_by_frontend_read():
+    """Each active-consumer manifest entry must be referenced in admin-ui source.
+
+    Searches all non-test *.tsx files under admin-ui/src/components/ for the
+    key name. A consumer claim backed only by a TypeScript type declaration in
+    types/digest.ts does NOT satisfy this check — the key must appear as an
+    actual property reference in a component file.
+
+    This enforces the lesson from prev_success_rate drift: the manifest declared
+    CatchUpStatsRow as consumer, but the component never rendered the field.
+    """
+    import pathlib
+    import pytest
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent.parent
+    components_dir = repo_root / "admin-ui" / "src" / "components"
+    if not components_dir.is_dir():
+        pytest.skip(f"admin-ui/src/components not found at {components_dir} — skipping")
+
+    component_texts: list[str] = [
+        tsx.read_text(encoding="utf-8")
+        for tsx in components_dir.glob("*.tsx")
+        if ".test." not in tsx.name
+        and ".spec." not in tsx.name
+        and ".viewport." not in tsx.name
+    ]
+    assert component_texts, "No component .tsx files found — glob is broken"
+
+    failures: list[str] = []
+    for field, meta in DIGEST_PAYLOAD_METRIC_MANIFEST.items():
+        if "consumer" not in meta:
+            continue
+        if not any(field in text for text in component_texts):
+            failures.append(
+                f"  {field!r} (consumer: {meta['consumer']!r}) — "
+                "key not referenced in any admin-ui/src/components/*.tsx file"
+            )
+
+    assert not failures, (
+        "These manifest active-consumer entries are not backed by a real "
+        "frontend read. Add a reference in the named component, or mark "
+        "the entry 'pending':\n" + "\n".join(failures)
+    )

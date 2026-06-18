@@ -6,10 +6,12 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 import noFixedWidthOverflow from './eslint-rules/no-fixed-width-overflow.js'
 import minTouchTarget from './eslint-rules/min-touch-target.js'
+import noOversizedFile from './eslint-rules/no-oversized-file.js'
 
 const viewportPlugin = {
   rules: { 'no-fixed-width': noFixedWidthOverflow, 'min-touch-target': minTouchTarget },
 }
+const sizePlugin = { rules: { 'no-oversized-file': noOversizedFile } }
 
 export default defineConfig([
   globalIgnores(['dist']),
@@ -21,7 +23,7 @@ export default defineConfig([
       reactHooks.configs.flat.recommended,
       reactRefresh.configs.vite,
     ],
-    plugins: { viewport: viewportPlugin },
+    plugins: { viewport: viewportPlugin, size: sizePlugin },
     languageOptions: {
       ecmaVersion: 2020,
       globals: globals.browser,
@@ -31,6 +33,7 @@ export default defineConfig([
       'no-console': ['warn', { allow: ['warn', 'error'] }],
       'viewport/no-fixed-width': 'error',
       'viewport/min-touch-target': 'error',
+      'size/no-oversized-file': 'error',
     },
   },
 ])

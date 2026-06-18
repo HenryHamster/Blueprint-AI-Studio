@@ -1683,3 +1683,87 @@ describe('WarmVmPanel — backlog dropout row', () => {
     expect(screen.queryByTestId('backlog-dropout-row')).toBeNull();
   });
 });
+
+// ── Direct tests for components extracted to WarmVmRows.tsx ──────────────────
+// These verify the extracted pure components in isolation, exercising the
+// production code that moved out of WarmVmPanel.tsx.
+
+import { render as directRender, screen as directScreen } from '@testing-library/react';
+import { EffMetric, ChainFunnelRow, PoolMetricsRow } from './WarmVmRows';
+
+describe('EffMetric — extracted pure display component', () => {
+  test('renders label and value with emerald up-arrow when higher is better and delta > 0', () => {
+    directRender(<EffMetric label="reuse rate" value="82%" delta={0.15} lowerIsBetter={false} />);
+    expect(directScreen.getByText('reuse rate')).toBeTruthy();
+    expect(directScreen.getByText('82%')).toBeTruthy();
+    const arrow = directScreen.getByText('↑');
+    expect(arrow.className).toContain('text-emerald-400');
+  });
+
+  test('renders red up-arrow when lower is better and delta > 0 (regression)', () => {
+    directRender(<EffMetric label="cold-start p50" value="45s" delta={5} lowerIsBetter />);
+    const arrow = directScreen.getByText('↑');
+    expect(arrow.className).toContain('text-red-400');
+  });
+
+  test('renders no arrow when delta is zero', () => {
+    directRender(<EffMetric label="review cycles" value="1.2" delta={0} lowerIsBetter />);
+    expect(directScreen.queryByText('↑')).toBeNull();
+    expect(directScreen.queryByText('↓')).toBeNull();
+  });
+
+  test('renders no arrow when delta is null', () => {
+    directRender(<EffMetric label="review cycles" value="—" delta={null} lowerIsBetter />);
+    expect(directScreen.queryByText('↑')).toBeNull();
+    expect(directScreen.queryByText('↓')).toBeNull();
+  });
+});
+
+describe('ChainFunnelRow — extracted from WarmVmRows.tsx', () => {
+  test('renders all funnel fields and hides zero skip reasons', () => {
+    directRender(
+      <ChainFunnelRow funnel={{
+        window_hours: 24,
+        poll_arrivals: 100,
+        chain_claimed: 30,
+        no_pinned_task: 20,
+        another_vm_owns_pr: 5,
+        doomed_vm: 2,
+        skipped_by_reason: { disabled: 0, breaker_tripped: 8 },
+        skipped_total: 8,
+      }} />,
+    );
+    expect(directScreen.getByText('Chain Continuity Funnel (24h)')).toBeTruthy();
+    expect(directScreen.getByText('polls').parentElement?.textContent).toContain('100');
+    expect(directScreen.getByText('claimed').parentElement?.textContent).toContain('30');
+    expect(directScreen.getByText('skip breaker').parentElement?.textContent).toContain('8');
+    // Zero-count disabled reason must not render.
+    expect(directScreen.queryByText('skip disabled')).toBeNull();
+  });
+});
+
+describe('PoolMetricsRow — extracted from WarmVmRows.tsx', () => {
+  test('renders enabled pool with funnel hit rate and miss reasons', () => {
+    directRender(
+      <PoolMetricsRow pool={{
+        enabled: true,
+        target_size: 4,
+        current_size: 3,
+        idle_count: 2,
+        projected_idle_cost_usd: 0.05,
+        funnel: {
+          window_hours: 24,
+          pool_lease_hits: 8,
+          cold_dispatches: 4,
+          total_dispatches: 12,
+          pool_hit_rate: 0.667,
+          lease_miss_by_reason: { no_idle_member: 4 },
+          lease_miss_total: 4,
+        },
+      }} />,
+    );
+    expect(directScreen.getByTestId('pool-metrics-row').textContent).toContain('(enabled)');
+    expect(directScreen.getByTestId('pool-idle-cost').textContent).toBe('$0.05');
+    expect(directScreen.getByTestId('pool-lease-misses').textContent).toContain('no_idle_member');
+  });
+});

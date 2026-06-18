@@ -3042,4 +3042,61 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.queryByTestId('pinned-serving-version')).not.toBeInTheDocument();
     });
   });
+
+  describe('historical audit context (stale audit)', () => {
+    it('renders historical-audit-context with active vs audited SHA when audit_evidence_state is stale', () => {
+      const staleAudit: api.LatestAudit = {
+        audit_task_id: 'task-old',
+        task_status: 'COMPLETED',
+        candidate_sha: 'aabbcc1234567890',
+        created_at: '2026-01-01T00:00:00Z',
+        report: { findings: [] },
+      };
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'stale',
+              stale_audit: staleAudit,
+              active_candidate_sha: 'deadbeef12345678',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const ctx = screen.getByTestId('historical-audit-context');
+      expect(ctx).toBeInTheDocument();
+      expect(ctx).toHaveTextContent('no current audit for this candidate');
+      expect(ctx).toHaveTextContent('@deadbee');
+      expect(ctx).toHaveTextContent('@aabbcc1');
+    });
+
+    it('does not render historical-audit-context when audit_evidence_state is current', () => {
+      const currentAudit: api.LatestAudit = {
+        audit_task_id: 'task-current',
+        task_status: 'COMPLETED',
+        candidate_sha: 'deadbeef12345678',
+        created_at: '2026-01-01T00:00:00Z',
+        report: { findings: [] },
+      };
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              audit_evidence_state: 'current',
+              latest_audit: currentAudit,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.queryByTestId('historical-audit-context')).not.toBeInTheDocument();
+    });
+  });
 });

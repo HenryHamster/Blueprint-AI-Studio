@@ -200,6 +200,7 @@
     "components/TaskDetailDrawerMeta.tsx": 400,
     "api.ts": 3650,
     "components/WarmVmPanel.tsx": 1800,
-    "components/TaskDetailDrawerSections.tsx": 1950
+    "components/TaskDetailDrawerSections.tsx": 1950,
+    "components/VersionLifecyclePanelPrimitives.tsx": 1300
   }
 }
