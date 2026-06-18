@@ -374,6 +374,9 @@ async def get_open_pull_requests(
     Follows GitHub's Link pagination so repos with more than 100 open PRs
     are fully enumerated.  Bounded at 30 pages (3 000 PRs) to match the
     hard cap used by other list helpers in this module.
+
+    On a transient GitHub error mid-pagination, returns the already-fetched
+    pages instead of discarding them.
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -398,7 +401,7 @@ async def get_open_pull_requests(
             )
         if response.status_code != 200:
             logger.error(f"Failed to list PRs (base={base}): {response.text}")
-            return []
+            return result
         batch = response.json()
         result.extend(batch)
         if len(batch) < 100:

@@ -4473,3 +4473,38 @@ async def test_get_open_pull_requests_paginates(mocker):
     assert result[0]["number"] == 1
     assert result[109]["number"] == 110
     assert call_pages == [1, 2], f"expected exactly 2 page requests, got {call_pages}"
+
+
+@pytest.mark.asyncio
+async def test_get_open_pull_requests_mid_pagination_error_returns_partial(mocker):
+    """When a transient GitHub error occurs mid-pagination, return the already-fetched
+    pages instead of discarding them. A 503 on page 3 should return the 200 PRs from
+    pages 1–2, not an empty list."""
+    page1 = [{"number": i} for i in range(1, 101)]  # 100 PRs — full page
+    page2 = [{"number": i} for i in range(101, 201)]  # 100 PRs — full page
+    # page 3 will fail
+
+    call_pages = []
+
+    async def _fake_request(method, url, headers, params=None, **kwargs):
+        page = int((params or {}).get("page", 1))
+        call_pages.append(page)
+        if page == 1:
+            return MockResponse(200, page1)
+        elif page == 2:
+            return MockResponse(200, page2)
+        else:  # page 3: transient error
+            return MockResponse(503, {}, text="Service Unavailable")
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+
+    from app.github_pulls import get_open_pull_requests
+
+    result = await get_open_pull_requests("token", "owner", "repo", base="main")
+
+    assert len(result) == 200, f"expected 200 PRs from pages 1–2, got {len(result)}"
+    assert result[0]["number"] == 1
+    assert result[199]["number"] == 200
+    assert call_pages == [1, 2, 3], (
+        f"expected 3 page requests (last fails), got {call_pages}"
+    )

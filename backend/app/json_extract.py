@@ -146,8 +146,21 @@ def scan_balanced_json_objects(
     idx = text.find("{")
     while idx != -1:
         depth = 0
+        in_string = False
+        escape_next = False
         for j in range(idx, len(text)):
             c = text[j]
+            if escape_next:
+                escape_next = False
+                continue
+            if c == "\\" and in_string:
+                escape_next = True
+                continue
+            if c == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
             if c == "{":
                 depth += 1
             elif c == "}":
