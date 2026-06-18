@@ -3748,9 +3748,10 @@ def test_parse_panel_review_embedded_json_in_prose():
 
 
 @pytest.mark.asyncio
-async def test_spawn_review_second_opinion_sets_sonnet_quality_tier(db_session):
-    """spawn_review_second_opinion must set quality_tier='sonnet' in the spawned
-    challenger task's payload — regression guard against accidental tier removal."""
+async def test_spawn_review_second_opinion_uses_opus_quality_tier(db_session):
+    """spawn_review_second_opinion must NOT set quality_tier in the spawned
+    challenger task's payload, so it defaults to Opus via DEFAULT_QUALITY_TIER —
+    regression guard against re-introducing the Sonnet downgrade."""
     from app.task_evaluators import spawn_review_second_opinion
 
     project = make_project(name="ReviewSecondOpinionTierProj")
@@ -3788,8 +3789,9 @@ async def test_spawn_review_second_opinion_sets_sonnet_quality_tier(db_session):
         investigated_files=None,
     )
     assert challenger is not None
-    assert (challenger.first_payload or {}).get("quality_tier") == "sonnet", (
-        "Spawned review second-opinion challenger must carry quality_tier='sonnet'"
+    assert (challenger.first_payload or {}).get("quality_tier") is None, (
+        "Spawned panel_review challenger must NOT carry an explicit quality_tier "
+        "— it should fall back to DEFAULT_QUALITY_TIER (Opus)"
     )
 
 

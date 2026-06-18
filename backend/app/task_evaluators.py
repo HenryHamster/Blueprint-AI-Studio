@@ -292,7 +292,6 @@ async def spawn_review_second_opinion(
                 "is_challenge": True,
                 "primary_verdict": verdict,
                 "primary_issues": list(issues or []),
-                "quality_tier": "sonnet",
                 **(
                     {
                         "viewport_shot_entries": _viewport_shots,
