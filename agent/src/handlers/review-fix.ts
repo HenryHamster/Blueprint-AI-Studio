@@ -271,8 +271,12 @@ export function detectMediumScopeSubsystemHint(changedFiles: string, buildConfig
     return `This is a medium-scope change confined to ${dir.path}/. Apply full security scrutiny — review SQL injection, authorization checks, input validation, and server-side concerns thoroughly.\n\n`;
   }
 
-  // node or other types — deprioritize database/SQL checks
-  return `This is a medium-scope change confined to ${dir.path}/ (TypeScript/Node.js). This code does not directly access the database, so deprioritize SQL injection and database query checks. Focus on Correctness & Logic, Build & Type Safety, and TypeScript-specific concerns.\n\n`;
+  if (dir.type === 'node') {
+    return `This is a medium-scope change confined to ${dir.path}/ (TypeScript/Node.js). This code does not directly access the database, so deprioritize SQL injection and database query checks. Focus on Correctness & Logic, Build & Type Safety, and TypeScript-specific concerns.\n\n`;
+  }
+
+  // other types — external family repos (Ruby, Gradle, Maven, Elixir, .NET, PHP, Makefile, etc.)
+  return `This is a medium-scope change confined to ${dir.path}/ (external family: non-core language/toolchain). Review this code for correctness and the conventions appropriate to its ecosystem. Deprioritize SQL injection checks unless you know this code directly queries a database.\n\n`;
 }
 
 // Pre-install node_modules in every node-typed directory in the reviewer's

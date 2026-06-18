@@ -666,6 +666,30 @@ describe('detectMediumScopeSubsystemHint — medium-scope subsystem hint', () =>
     expect(hint).toContain('lib');
     expect(hint).toContain('interface consistency');
   });
+
+  it('handles other type directories with honest guidance (not mislabeled as Node)', () => {
+    const config = { directories: [{ path: 'ruby-svc', type: 'other' }] };
+    const hint = detectMediumScopeSubsystemHint('M\truby-svc/lib/handler.rb\nM\truby-svc/config.rb', config);
+    expect(hint).toContain('ruby-svc/');
+    expect(hint).not.toContain('TypeScript');
+    expect(hint).not.toContain('Node.js');
+    expect(hint).toContain('external family');
+    expect(hint).toContain('ecosystem');
+  });
+
+  it('includes other type in merge verdict when mixed with core families', () => {
+    const config = {
+      directories: [
+        { path: 'backend', type: 'python' },
+        { path: 'ruby-svc', type: 'other' },
+      ],
+    };
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/app/main.py\nM\truby-svc/lib/handler.rb', config);
+    expect(hint).toContain('cross-system');
+    expect(hint).toContain('backend');
+    expect(hint).toContain('ruby-svc');
+    expect(hint).toContain('interface consistency');
+  });
 });
 
 describe('handleReview — medium-scope subsystem hint integration', () => {

@@ -244,6 +244,7 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
     else if (dir.type === 'node') pkgManagers.push('npm/yarn');
     else if (dir.type === 'go') pkgManagers.push('go mod');
     else if (dir.type === 'rust') pkgManagers.push('cargo');
+    else if (dir.type === 'other') pkgManagers.push('language-specific package manager');
   }
   if (pkgManagers.length > 0) {
     hints['deps'] = `Check for breaking changes in major version bumps. This project uses ${pkgManagers.join(', ')}. Run the full test suite after updating to verify compatibility.`;

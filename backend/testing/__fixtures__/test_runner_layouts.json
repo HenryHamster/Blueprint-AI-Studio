@@ -138,7 +138,9 @@
       }
     ],
     "detectable": true,
-    "family": "cargo"
+    "family": "cargo",
+    "provision_cmd": "cargo fetch",
+    "probe_cmd": "cargo check --quiet"
   },
   {
     "name": "tox_ini_root",
@@ -168,7 +170,9 @@
       }
     ],
     "detectable": true,
-    "family": "go"
+    "family": "go",
+    "provision_cmd": "go mod download",
+    "probe_cmd": "go build ./..."
   },
   {
     "name": "libs_web_pyproject_nested",
@@ -234,7 +238,8 @@
       }
     ],
     "detectable": true,
-    "family": "ruby"
+    "family": "ruby",
+    "provision_cmd": "bundle install"
   },
   {
     "name": "build_gradle_root",
@@ -244,7 +249,9 @@
       }
     ],
     "detectable": true,
-    "family": "gradle"
+    "family": "gradle",
+    "provision_cmd": "./gradlew dependencies --no-daemon",
+    "probe_cmd": "./gradlew classes --no-daemon"
   },
   {
     "name": "pom_xml_root",
@@ -254,7 +261,9 @@
       }
     ],
     "detectable": true,
-    "family": "maven"
+    "family": "maven",
+    "provision_cmd": "mvn -B dependency:go-offline",
+    "probe_cmd": "mvn -o -B test-compile"
   },
   {
     "name": "mix_exs_root",
@@ -264,7 +273,9 @@
       }
     ],
     "detectable": true,
-    "family": "elixir"
+    "family": "elixir",
+    "provision_cmd": "mix deps.get",
+    "probe_cmd": "mix compile"
   },
   {
     "name": "csproj_root",
@@ -274,7 +285,9 @@
       }
     ],
     "detectable": true,
-    "family": "dotnet"
+    "family": "dotnet",
+    "provision_cmd": "dotnet restore",
+    "probe_cmd": "dotnet build --nologo"
   },
   {
     "name": "phpunit_xml_root",
@@ -572,6 +585,7 @@
       }
     ],
     "detectable": true,
-    "family": "flutter"
+    "family": "flutter",
+    "provision_cmd": "flutter pub get"
   }
 ]
