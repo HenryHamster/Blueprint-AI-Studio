@@ -3795,6 +3795,67 @@ async def test_spawn_review_second_opinion_uses_opus_quality_tier(db_session):
     )
 
 
+@pytest.mark.asyncio
+async def test_spawn_forward_quality_grader_sets_sonnet_quality_tier(db_session):
+    """spawn_forward_quality_grader must set quality_tier='sonnet' in the spawned
+    grader task's payload — regression guard against accidental tier promotion."""
+    from app.task_evaluators import spawn_forward_quality_grader
+
+    project = make_project(name="FwdGraderTierProj")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source = make_task(
+        project_id=project.id,
+        payloads=[{"type": "research", "base_branch": "main"}],
+    )
+    db_session.add(source)
+    await db_session.commit()
+    await db_session.refresh(source)
+
+    grader = await spawn_forward_quality_grader(
+        source, "some artifact text", db_session
+    )
+    assert grader is not None
+    assert (grader.first_payload or {}).get("quality_tier") == "sonnet", (
+        "Spawned forward-quality grader must carry quality_tier='sonnet'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_finding_challenge_sets_sonnet_quality_tier(db_session):
+    """spawn_finding_challenge must set quality_tier='sonnet' in the spawned
+    challenge task's payload — regression guard against accidental tier promotion."""
+    from app.task_evaluators import spawn_finding_challenge
+
+    project = make_project(name="FindingChallengeTierProj")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source = make_task(
+        project_id=project.id,
+        payloads=[{"type": "research", "base_branch": "main"}],
+    )
+    db_session.add(source)
+    await db_session.commit()
+    await db_session.refresh(source)
+
+    finding = {"description": "Some finding", "severity": "high"}
+    challenge = await spawn_finding_challenge(
+        source,
+        finding,
+        "reproduce_absent",
+        "KEEP",
+        db_session,
+    )
+    assert challenge is not None
+    assert (challenge.first_payload or {}).get("quality_tier") == "sonnet", (
+        "Spawned finding challenge must carry quality_tier='sonnet'"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Security audit completion handler — idempotency under replay
 # ══════════════════════════════════════════════════════════════════════════════

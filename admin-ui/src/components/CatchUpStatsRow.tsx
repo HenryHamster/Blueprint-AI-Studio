@@ -114,6 +114,14 @@ export function CatchUpStatsRow({ digest }: CatchUpStatsRowProps) {
                 Arch context: {fmt(fas.with_arch_context)} vs {fmt(fas.without_arch_context)} without
               </span>
             )}
+            {(fas.with_measurements != null || fas.without_measurements != null) && (
+              <span
+                className={compareTone(fas.with_measurements ?? null, fas.without_measurements ?? null)}
+                title="First-attempt success with vs without measurements"
+              >
+                Measurements: {fmt(fas.with_measurements ?? null)} vs {fmt(fas.without_measurements ?? null)} without
+              </span>
+            )}
             {fas.by_scope && Object.keys(fas.by_scope).length > 0 && (() => {
               const order = ['small', 'medium', 'large'];
               const byScope = fas.by_scope;
@@ -134,6 +142,27 @@ export function CatchUpStatsRow({ digest }: CatchUpStatsRowProps) {
                   {entries.map(([scope, rate], i) => (
                     <span key={scope} className={tone(rate)}>
                       {scope}: {Math.round(rate * 100)}%{i < entries.length - 1 ? ' |' : ''}
+                    </span>
+                  ))}
+                </span>
+              );
+            })()}
+            {fas.by_type && Object.keys(fas.by_type).length > 0 && (() => {
+              const byType = fas.by_type;
+              if (!byType) return null;
+              const entries = Object.entries(byType)
+                .filter(([, v]) => typeof v === 'number')
+                .sort((a, b) => a[0].localeCompare(b[0]));
+              if (entries.length === 0) return null;
+              return (
+                <span
+                  className="flex items-center gap-1 text-neutral-400"
+                  title="First-attempt success rate by task type"
+                >
+                  <span>By type:</span>
+                  {entries.map(([type, rate], i) => (
+                    <span key={type} className={tone(rate)}>
+                      {type}: {Math.round(rate * 100)}%{i < entries.length - 1 ? ' |' : ''}
                     </span>
                   ))}
                 </span>
