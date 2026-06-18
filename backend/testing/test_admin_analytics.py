@@ -2854,6 +2854,57 @@ class TestShadowLaneHealth:
 
 
 # ---------------------------------------------------------------------------
+# TestWorkspaceStateCounts
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceStateCounts:
+    """Tests for workspace_state_counts aggregate in GET /api/admin/improvement-lanes."""
+
+    @pytest.mark.asyncio
+    async def test_workspace_state_counts_returned(
+        self, client: AsyncClient, db_session
+    ):
+        """Three lanes with mixed workspace_state values → counts tally correctly."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        db_session.add(_make_lane(project.id, workspace_state="COLD"))
+        db_session.add(_make_lane(project.id, workspace_state="WARM_RESERVED"))
+        db_session.add(_make_lane(project.id, workspace_state="WARM_RESERVED"))
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        counts = resp.json()["workspace_state_counts"]
+        assert counts["COLD"] == 1
+        assert counts["WARM_RESERVED"] == 2
+
+    @pytest.mark.asyncio
+    async def test_workspace_state_counts_fleet_wide(
+        self, client: AsyncClient, db_session
+    ):
+        """workspace_state_counts covers all lanes, not just the paginated window."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # Add 3 lanes but request limit=1 (only 1 in paginated window).
+        for _ in range(3):
+            db_session.add(_make_lane(project.id, workspace_state="WARM_RESERVED"))
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/improvement-lanes?project_id={project.id}&limit=1&offset=0"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_returned"] == 1
+        assert body["workspace_state_counts"]["WARM_RESERVED"] == 3
+
+
+# ---------------------------------------------------------------------------
 # TestImprovementLanesTrialMetrics
 # ---------------------------------------------------------------------------
 
@@ -3287,8 +3338,7 @@ class TestKillImprovementLane:
         await db_session.commit()
 
         resp = await client.post(
-            f"/api/admin/improvement-lanes/{lane.id}/kill"
-            f"?project_id={project.id}"
+            f"/api/admin/improvement-lanes/{lane.id}/kill?project_id={project.id}"
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -3327,8 +3377,7 @@ class TestKillImprovementLane:
         await db_session.commit()
 
         resp = await client.post(
-            f"/api/admin/improvement-lanes/{lane.id}/kill"
-            f"?project_id={project.id}"
+            f"/api/admin/improvement-lanes/{lane.id}/kill?project_id={project.id}"
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -3365,8 +3414,7 @@ class TestKillImprovementLane:
 
         # ... but the request names other_project, so the guard must 404.
         resp = await client.post(
-            f"/api/admin/improvement-lanes/{lane.id}/kill"
-            f"?project_id={other_project.id}"
+            f"/api/admin/improvement-lanes/{lane.id}/kill?project_id={other_project.id}"
         )
         assert resp.status_code == 404
 
@@ -3394,8 +3442,7 @@ class TestKillImprovementLane:
         await db_session.commit()
 
         resp = await client.post(
-            f"/api/admin/improvement-lanes/{lane.id}/kill"
-            f"?project_id={project.id}"
+            f"/api/admin/improvement-lanes/{lane.id}/kill?project_id={project.id}"
         )
         assert resp.status_code == 403
 
@@ -3412,8 +3459,7 @@ class TestKillImprovementLane:
         await db_session.commit()
 
         resp = await client.post(
-            f"/api/admin/improvement-lanes/{uuid.uuid4()}/kill"
-            f"?project_id={project.id}"
+            f"/api/admin/improvement-lanes/{uuid.uuid4()}/kill?project_id={project.id}"
         )
         assert resp.status_code == 404
 

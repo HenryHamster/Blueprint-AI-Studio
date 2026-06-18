@@ -2809,6 +2809,15 @@ async def test_maintainer_skips_expired_reservation_for_other_vm_instance(
     mocker.patch("app.efficiency_snapshot.settle_pool_vm_idle_cost", return_value=0)
     try:
         project = await _make_project(db_session, name="Reserve Other Vm")
+        # "live-vm" is the pool VM that already holds the lane's workspace.
+        # It must exist in the DB so the periodic orphan-reclaim sweep does not
+        # incorrectly treat the lane as abandoned.
+        live_pool_vm = PoolVm(
+            vm_instance_id="live-vm",
+            state=PoolVmState.IDLE,
+            project_id=project.id,
+        )
+        db_session.add(live_pool_vm)
         lane = ImprovementLane(
             project_id=project.id,
             title="other vm lane",
@@ -2857,6 +2866,15 @@ async def test_maintainer_skips_live_lane_workspace_for_stale_expired_reservatio
     mocker.patch("app.efficiency_snapshot.settle_pool_vm_idle_cost", return_value=0)
     try:
         project = await _make_project(db_session, name="Reserve Live Lane Maint")
+        # "live-vm" represents the leased pool VM actually running the workspace.
+        # It must exist in the DB so the periodic orphan-reclaim sweep does not
+        # incorrectly treat the still-active lane as abandoned.
+        live_pool_vm = PoolVm(
+            vm_instance_id="live-vm",
+            state=PoolVmState.LEASED,
+            project_id=project.id,
+        )
+        db_session.add(live_pool_vm)
         lane = ImprovementLane(
             project_id=project.id,
             title="live lane",
@@ -4631,3 +4649,75 @@ async def test_leader_startup_reclaims_orphaned_lane_workspaces(db_session):
     assert live_lane.workspace_state == "WARM_RESERVED"
     assert live_lane.workspace_vm_instance_id == "vm-still-alive"
     assert cold_lane.workspace_state == "COLD"
+
+
+@pytest.mark.asyncio
+async def test_periodic_reclaim_clears_orphaned_workspace(
+    db_session, warm_pool_on, mocker
+):
+    """sweep_idle_pool_vms runs reclaim_orphaned_lane_workspace_states as a
+    periodic defense-in-depth pass.  A lane whose backing VM was removed
+    out-of-band (GCP console, crash during retire) should have its
+    workspace_state reset to COLD by the end of the sweep, without requiring
+    an orchestrator restart.
+    """
+    project = await _make_project(db_session, name="Periodic Reclaim Test")
+
+    # Lane whose VM exists in the DB — workspace_state should survive.
+    live_vm = PoolVm(
+        vm_instance_id="vm-periodic-alive",
+        state=PoolVmState.IDLE,
+        project_id=project.id,
+    )
+    db_session.add(live_vm)
+
+    live_lane = ImprovementLane(
+        project_id=project.id,
+        title="live lane",
+        goal="live goal",
+        branch_name="lane/periodic-live",
+        base_branch="automain",
+        status=ImprovementLaneStatus.ACTIVE.value,
+        workspace_state="WARM_RESERVED",
+        workspace_vm_instance_id="vm-periodic-alive",
+    )
+    db_session.add(live_lane)
+
+    # Lane whose VM is absent — should be cleared by the periodic sweep.
+    orphaned_lane = ImprovementLane(
+        project_id=project.id,
+        title="orphaned lane",
+        goal="orphaned goal",
+        branch_name="lane/periodic-orphan",
+        base_branch="automain",
+        status=ImprovementLaneStatus.ACTIVE.value,
+        workspace_state="LEASED",
+        workspace_vm_instance_id="vm-periodic-gone",
+    )
+    db_session.add(orphaned_lane)
+
+    await db_session.commit()
+    await db_session.refresh(live_lane)
+    await db_session.refresh(orphaned_lane)
+
+    now = _utcnow()
+    mocker.patch("app.warm_pool_maintainer._PROCESS_START_TS", now - timedelta(hours=1))
+    mocker.patch(
+        "app.warm_pool_maintainer._stale_pool_image_ids",
+        new=AsyncMock(return_value=set()),
+    )
+    mocker.patch("app.warm_vm_state.is_pool_vm_alive", return_value=True)
+
+    runtime_config = {}
+    await sweep_idle_pool_vms(db_session, now, runtime_config=runtime_config)
+
+    await db_session.refresh(live_lane)
+    await db_session.refresh(orphaned_lane)
+
+    assert orphaned_lane.workspace_state == "COLD", (
+        f"orphaned lane should be COLD after sweep, got {orphaned_lane.workspace_state}"
+    )
+    assert orphaned_lane.workspace_vm_instance_id is None
+    assert live_lane.workspace_state == "WARM_RESERVED", (
+        f"live lane should remain WARM_RESERVED, got {live_lane.workspace_state}"
+    )

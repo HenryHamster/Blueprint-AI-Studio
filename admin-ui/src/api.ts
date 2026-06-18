@@ -748,6 +748,7 @@ export interface ImprovementLanesResponse {
   project_id: string;
   shadow_health?: ShadowLaneHealth;
   trial_metrics?: LanePilotTrialMetrics | null;
+  workspace_state_counts?: Record<string, number>;
   [key: string]: unknown;
 }
 

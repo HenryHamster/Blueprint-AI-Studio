@@ -1569,6 +1569,22 @@ async def get_improvement_lanes(
         except Exception:
             logger.exception("Failed to fetch lane_relay_comparison for %s", project_id)
 
+    # workspace_state_counts: fleet-wide tally across ALL lanes for this project
+    # (not just the paginated window) so operators can spot orphan accumulation.
+    ws_count_rows = (
+        await session.execute(
+            select(
+                ImprovementLane.workspace_state,
+                func.count().label("cnt"),
+            )
+            .where(ImprovementLane.project_id == project_id)
+            .group_by(ImprovementLane.workspace_state)
+        )
+    ).all()
+    workspace_state_counts: Dict[str, int] = {
+        (row.workspace_state or "COLD"): row.cnt for row in ws_count_rows
+    }
+
     return {
         "lanes": rows,
         "total_returned": len(rows),
@@ -1577,6 +1593,7 @@ async def get_improvement_lanes(
         "project_id": str(project_id),
         "shadow_health": shadow_health,
         "trial_metrics": trial_metrics,
+        "workspace_state_counts": workspace_state_counts,
     }
 
 

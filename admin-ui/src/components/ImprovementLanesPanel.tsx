@@ -297,6 +297,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
   const [lanes, setLanes] = useState<ImprovementLaneRow[]>([]);
   const [shadowHealth, setShadowHealth] = useState<ShadowLaneHealth | null>(null);
   const [trialMetrics, setTrialMetrics] = useState<LanePilotTrialMetrics | null>(null);
+  const [workspaceStateCounts, setWorkspaceStateCounts] = useState<Record<string, number> | null>(null);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [collapsedPref, setCollapsedPref] = useState<boolean | null>(() => readCollapsedPreference());
@@ -327,6 +328,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
       setLanes(lanesData.lanes ?? []);
       setShadowHealth(lanesData.shadow_health ?? null);
       setTrialMetrics(lanesData.trial_metrics ?? null);
+      setWorkspaceStateCounts(lanesData.workspace_state_counts ?? null);
       setPreflight(preflightData);
     } catch (e) {
       if (e instanceof Error && e.name === 'AbortError') return;
@@ -596,6 +598,24 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                   </div>
                 );
               })()}
+            </div>
+          )}
+          {workspaceStateCounts && Object.keys(workspaceStateCounts).length > 0 && (
+            <div
+              data-testid="workspace-state-counts"
+              className="mb-3 rounded border border-neutral-700 bg-neutral-800/50 p-2 text-xs"
+            >
+              <div className="mb-1 font-semibold text-neutral-300">Workspace states (fleet)</div>
+              <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-neutral-400">
+                {Object.entries(workspaceStateCounts).sort(([a], [b]) => a.localeCompare(b)).map(([state, count]) => (
+                  <div key={state}>
+                    <span className="text-neutral-500">{state} </span>
+                    <span className={state === 'WARM_RESERVED' || state === 'LEASED' ? 'text-emerald-300' : count > 0 && state !== 'COLD' ? 'text-amber-300' : 'text-neutral-200'}>
+                      {count}
+                    </span>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
           {shadowHealth && shadowHealth.shadow_lane_count > 0 && (
