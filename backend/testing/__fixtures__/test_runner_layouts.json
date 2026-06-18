@@ -460,5 +460,68 @@
     ],
     "detectable": false,
     "family": null
+  },
+  {
+    "name": "services_api_pom_xml_nested",
+    "files": [
+      {
+        "path": "services/api/pom.xml"
+      }
+    ],
+    "detectable": true,
+    "family": "maven"
+  },
+  {
+    "name": "packages_web_gemfile_rakefile_nested",
+    "files": [
+      {
+        "path": "packages/web/Gemfile"
+      },
+      {
+        "path": "packages/web/Rakefile"
+      }
+    ],
+    "detectable": true,
+    "family": "ruby"
+  },
+  {
+    "name": "apps_backend_build_gradle_nested",
+    "files": [
+      {
+        "path": "apps/backend/build.gradle"
+      }
+    ],
+    "detectable": true,
+    "family": "gradle"
+  },
+  {
+    "name": "libs_core_mix_exs_nested",
+    "files": [
+      {
+        "path": "libs/core/mix.exs"
+      }
+    ],
+    "detectable": true,
+    "family": "elixir"
+  },
+  {
+    "name": "apps_svc_csproj_nested",
+    "files": [
+      {
+        "path": "apps/svc/Service.csproj"
+      }
+    ],
+    "detectable": true,
+    "family": "dotnet"
+  },
+  {
+    "name": "modules_api_phpunit_xml_nested",
+    "files": [
+      {
+        "path": "modules/api/phpunit.xml"
+      }
+    ],
+    "detectable": true,
+    "family": "php"
   }
 ]

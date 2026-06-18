@@ -109,7 +109,14 @@ describe('resolveBuildConfig', () => {
     }
   });
 
-  it('falls back to "python" for unknown type values', () => {
+  it('preserves type="other" for extra-family languages (Ruby, Gradle, Maven, etc.)', () => {
+    const task = {
+      build_config: { directories: [{ path: 'src', type: 'other' }] },
+    };
+    expect(resolveBuildConfig(task)?.directories?.[0].type).toBe('other');
+  });
+
+  it('falls back to "python" for truly unknown type values', () => {
     const task = {
       build_config: { directories: [{ path: 'src', type: 'cobol' }] },
     };

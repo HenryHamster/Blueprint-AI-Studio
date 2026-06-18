@@ -6,7 +6,7 @@
 import type { BuildConfig, DirectoryConfig, MigrationConfig } from './index.js';
 import { SHELL_CMD_RE } from './shell-safety.js';
 
-const VALID_TYPES = new Set(['python', 'node', 'go', 'rust']);
+const VALID_TYPES = new Set(['python', 'node', 'go', 'rust', 'other']);
 
 /**
  * Extract and type-narrow build_config from a task object.
