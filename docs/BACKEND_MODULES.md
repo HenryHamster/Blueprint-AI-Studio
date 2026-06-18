@@ -157,6 +157,45 @@ Background worker that kills VMs on heartbeat timeout.
 
 ---
 
+### `reaper_sweeps.py`
+
+Reaper sweep dispatcher: routes each named sweep to its implementation and
+re-exports public symbols from the extracted sub-modules so existing import
+sites require no changes.
+
+**Sub-modules extracted here:**
+- `reaper_fleet_health_sweeps.py` — fleet-level degradation alerts
+- `blocked_task_unblock_sweeps.py` — BLOCKED task auto-unblock / escalation
+
+---
+
+### `reaper_fleet_health_sweeps.py`
+
+Fleet-level health monitoring sweeps extracted from `reaper_sweeps.py`.
+Monitors degradation patterns across all projects and raises operator alerts
+when fleet-wide thresholds are breached.
+
+**Key sweeps:**
+- `sweep_merge_gate_verification_degradation()` — alerts when the no-CI
+  merge-gate verification success rate drops below threshold fleet-wide
+
+---
+
+### `blocked_task_unblock_sweeps.py`
+
+Auto-unblock and escalation sweep helpers extracted from `reaper_sweeps.py`.
+Implements the Step 12 BLOCKED-task lifecycle: clears blocking conditions
+when dependencies are resolved, escalates to operators when tasks remain
+blocked past the configured threshold.
+
+**Key functions:**
+- `_clear_blocked_fields(preserve_first_blocked)` — clears blocker metadata
+  with two modes: optimistic (preserve escalation stamp and defer counter on
+  conflict requeue) vs. genuine clear (wipe all defer state)
+- Re-exports all public sweep entry points to `app.reaper_sweeps`
+
+---
+
 ### `vm_lifecycle.py`
 
 Canonical home for orchestrator-side VM deletion tracking (extracted from `main.py`,
@@ -848,6 +887,31 @@ Computes readiness scores from test results, metrics, and heuristics.
 
 ---
 
+#### `release_readiness.py`
+
+Aggregates recent qualification history into an operator-facing readiness
+verdict, indicating whether promotion is ready and by how much.
+
+Tracks two complementary precision signals:
+- **Self-approval rate** (`would_promote_rate`) — how often the qualifier's
+  own confidence exceeded the promotion threshold (available immediately)
+- **Validated precision** — post-promotion `serving_confirmed` outcomes
+  recorded by `release_reconciliation`; only surfaced once the resolved
+  sample reaches the minimum threshold (`ground_truth_validated` flag)
+
+---
+
+#### `theme_delivery.py`
+
+Pure certification layer (no DB writes) that maps a version goal and a PR
+diffstat to a deterministic cert object. The release qualifier uses this to
+detect when a release candidate's diffstat directionally contradicts its
+stated theme (e.g., a "lean/shrink" goal with a net line-count increase).
+
+**Theme categories checked:** leanness, reliability, performance, feature.
+
+---
+
 ### Failure & Anomaly Detection
 
 #### `failure_classification.py`
@@ -914,6 +978,24 @@ Spawns research tasks from strategic directions without manual intervention.
   GitHub webhook handler
 - `_spawn_research_task()` / `_spawn_research_task_inner()` — Create a research task from a direction
 - `_spawn_periodic_task()` — Spawn periodic non-research strategic tasks
+
+---
+
+#### `autonomous_research_residual.py`
+
+Residual-fingerprint create-fix lane: the explicitly-preserved
+auto-remediation lane re-homed from the deleted `autonomous_research_investigations`
+module. Contains three functions:
+
+- `_infer_fingerprint_audit_system()` — maps a fingerprint's contributing
+  tasks back to a `SystemMaturity` row; used to defer remediation when a
+  system is being actively audited
+- `_record_residual_audit_deferral()` — stamps deferral on the
+  `ResidualRemediationCase` row and one-shot-escalates at the configured
+  threshold
+- `_spawn_residual_fingerprint_remediation()` — spawns at most one fix
+  task per call for the top uncooled residual CODE_ERROR fingerprint;
+  re-exported from `autonomous_research.py` for back-compat
 
 ---
 
@@ -1148,6 +1230,9 @@ Test files mirror source structure:
 | **Orchestration** | | |
 | orchestrator.py | Task queue polling | task_lifecycle, compute |
 | reaper.py | Heartbeat timeout handler | task_lifecycle, compute |
+| reaper_sweeps.py | Sweep dispatcher + re-exports | reaper_fleet_health_sweeps, blocked_task_unblock_sweeps |
+| reaper_fleet_health_sweeps.py | Fleet-level degradation alerts | reaper_sweeps |
+| blocked_task_unblock_sweeps.py | BLOCKED task auto-unblock/escalation | models, task_lifecycle |
 | compute.py | GCP VM lifecycle | google-cloud-compute |
 | compute_manifest.py | Agent secret manifest building | models |
 | **Task Management** | | |
@@ -1160,9 +1245,16 @@ Test files mirror source structure:
 | branch_resolution.py | Per-project branch/promotion resolution | models |
 | **Autonomous Research** | | |
 | autonomous_research.py | Research task spawning | task_lifecycle, strategic_spawning |
+| autonomous_research_residual.py | Residual fingerprint fix lane | models, task_lifecycle |
 | strategic_spawning.py | Context building for strategic agent | models |
 | strategic_completion.py | Post-research processing | models |
 | direction_lifecycle.py | Direction state management | models |
+| **Release Qualification** | | |
+| release_qualifier.py | Promotion gate scoring | release_scoring, release_promotion |
+| release_scoring.py | Readiness score computation | models |
+| release_readiness.py | Qualification history aggregation | models |
+| release_promotion.py | Promotion execution | github, models |
+| theme_delivery.py | PR diffstat vs. version-goal certification | — |
 | **Monitoring & Diagnostics** | | |
 | failure_classification.py | Error categorization | — |
 | ci_merge_helpers.py | Merge decision logic | github, task_lifecycle |
