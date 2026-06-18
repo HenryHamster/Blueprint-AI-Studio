@@ -520,7 +520,9 @@ export async function handleReleaseAudit(
   };
   let computedTestErosion: ComputedTestErosion | null = null;
   try {
-    const TEST_PATH_RE = /\/(testing|tests|__tests__)\/|\.test\.|\.spec\./;
+    // Matches test paths at any depth: root-level (testing/foo.py) or nested
+    // (src/testing/foo.py), plus .test. / .spec. file markers.
+    const TEST_PATH_RE = /(^|\/)(__tests__|tests|testing)\/|\.test\.|\.spec\./;
 
     const nameStatus = execFileSync('git', ['diff', '--name-status', diffRange], {
       cwd: WORKSPACE, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'],
@@ -536,12 +538,33 @@ export async function handleReleaseAudit(
       maxBuffer: 50 * 1024 * 1024,
     });
 
-    const ASSERTION_RE = /\b(assert[\s(]|expect\(|assertEqual|assertRaises|it\(|describe\()/;
+    // ASSERTION_RE must NOT include it(/describe( — those are test-function
+    // declarations counted by TEST_FN_RE. Overlapping both regexes would
+    // double-count every JS/TS test declaration.
+    const ASSERTION_RE = /\b(assert[\s(]|expect\(|assertEqual|assertRaises)/;
     const TEST_FN_RE = /\b(def test_|test\(|it\(|describe\()/;
 
+    // Build a set of deleted test file paths for O(1) lookup while iterating
+    // diff lines. Lines removed from a wholly-deleted test file are owned by
+    // the hard-blocker gate (deleted_test_files), not by the graded penalty,
+    // so exclude them from delta counting to avoid double-penalizing authorized
+    // dead-code deletions.
+    const deletedTestFileSet = new Set(deletedTestFiles);
+    let currentFile = '';
     let assertionDelta = 0;
     let testCountDelta = 0;
     for (const line of diffText.split('\n')) {
+      // Track which file the current hunk belongs to.
+      if (line.startsWith('diff --git ')) {
+        // Format: "diff --git a/<path> b/<path>" — extract the b-side path.
+        const m = line.match(/^diff --git a\/.+ b\/(.+)$/);
+        currentFile = m ? m[1] : '';
+        continue;
+      }
+      // Skip delta counting for lines in wholly-deleted test files — the
+      // hard-blocker gate already owns those files.
+      if (deletedTestFileSet.has(currentFile)) continue;
+
       if (line.startsWith('+') && !line.startsWith('+++')) {
         if (ASSERTION_RE.test(line)) assertionDelta++;
         if (TEST_FN_RE.test(line)) testCountDelta++;

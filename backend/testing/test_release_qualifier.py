@@ -1506,6 +1506,59 @@ class TestScoreAuditComputedErosion:
             rq._score_audit(report)
         assert any("test_erosion divergence" in r.message for r in caplog.records)
 
+    def test_authorized_deletion_with_zero_delta_does_not_penalize(self):
+        """An authorized deletion whose removed lines are excluded from the delta
+        (by the TS-side fix) yields a non-penalized test_erosion score.
+
+        When the agent correctly excludes deleted-file lines from
+        assertion_delta/test_count_delta, both deltas arrive at 0 even though
+        the file itself had test content — the hard-blocker gate owns the file
+        dimension, the graded penalty must see delta=0 and return 1.0.
+        """
+        report = {
+            "audit_score": 0.9,
+            "computed_test_erosion": {
+                "deleted_test_files": ["admin-ui/src/utils/viewportRegression.test.ts"],
+                # TS fix: lines from the deleted file are excluded, so deltas stay 0.
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        # Authorized deletion — hard-blocker must NOT fire.
+        assert erosion is not None, (
+            "Authorized deletion must not produce the None hard-blocker"
+        )
+        # Zero deltas — graded penalty must not fire.
+        assert erosion == pytest.approx(1.0), (
+            "Zero deltas after authorized deletion must yield an unpenalized score of 1.0"
+        )
+
+    def test_unauthorized_deleted_root_level_test_file_hard_blocks(self):
+        """A root-level test directory deletion detected by the TS path fix hard-blocks.
+
+        Regression pin: before the TEST_PATH_RE fix, 'testing/test_foo.py'
+        (no leading slash) was NOT matched as a test file and the hard-blocker
+        would silently miss the deletion.  After the fix it is detected, so
+        _score_audit must return erosion=None for an unauthorized deletion.
+        """
+        report = {
+            "audit_score": 0.9,
+            "computed_test_erosion": {
+                # Path with no leading slash — as emitted by 'git diff --name-status'
+                # for a root-level testing/ directory.
+                "deleted_test_files": ["testing/test_root_level.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion is None, (
+            "An unauthorized deleted test file must hard-block (erosion=None)"
+        )
+
 
 class TestAuditMissingReason:
     """_audit_missing_reason returns a structured sub-status string for parseable
