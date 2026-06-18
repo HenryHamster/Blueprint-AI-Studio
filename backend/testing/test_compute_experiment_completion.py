@@ -3333,6 +3333,87 @@ async def test_fallback_grounding_mismatched_result_reference_unresolved(
 
 
 @pytest.mark.asyncio
+async def test_grounding_stamp_error_fails_closed(
+    db_session, mocker, _quiet_compute_io
+):
+    """When citation-grounding probe hits an unexpected error, the document is
+    persisted with citations cleared (fail-closed), not with ungrounded citations."""
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    project = Project(name="GroundingErrorTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: grounding error",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "experiment": "error-test",
+                "base_branch": "main",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    gs_uri = "gs://bucket/jobs/result.json"
+
+    # Create an artifact to back the result_reference
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.COMPUTE_RESULT,
+        storage_uri=gs_uri,
+        logs=json.dumps({"artifact_uri": gs_uri, "file_count": 1}),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    # Create a job referencing the artifact
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=artifact.id,
+        result_reference=gs_uri,
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs_json = json.dumps({"job_id": str(job.id), "outcome": "SUCCESS"})
+
+    # Mock _compute_citation_grounding_stamp to raise an exception
+    mocker.patch(
+        "app.knowledge_completion._compute_citation_grounding_stamp",
+        side_effect=RuntimeError("database connection lost"),
+    )
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        doc = await persist_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.10,
+            criterion=None,
+            result_reference=gs_uri,
+            session=db_session,
+            logs=logs_json,
+        )
+
+    assert doc is not None
+    # Fail-closed: citations must be empty when grounding probe fails
+    assert doc.source_citations == [], (
+        "citations must be cleared when grounding stamp probe fails unexpectedly"
+    )
+
+
+@pytest.mark.asyncio
 async def test_real_evidence_rejects_http_artifact_location(
     db_session, _quiet_compute_io
 ):

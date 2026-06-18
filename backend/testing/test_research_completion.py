@@ -10136,6 +10136,123 @@ async def test_adversarial_gate_disabled_by_flag(db_session, mocker):
 
 
 @_pytest.mark.asyncio
+async def test_spawn_gate_fail_closed_when_grader_spawn_returns_none(
+    db_session, mocker
+):
+    """ACCEPTANCE TEST: adversarial spawn gate fails closed when grader spawn returns None.
+
+    When spawn_forward_quality_grader returns None (single-shot guard hit / grader already
+    in flight) during the first attempt to spawn an adversarial grader, the source task
+    must be marked as awaiting the verdict and return early WITHOUT spawning high-stakes
+    findings. On re-entry while still awaiting, the task must return as a no-op. Only
+    when the grader verdict actually arrives can findings be spawned (after passing the
+    adversarial gate).
+    """
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-spawn-none"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_high_stakes_finding(direction["id"])],
+    )
+
+    # Mock spawn_forward_quality_grader to return None, simulating single-shot guard hit.
+    spawn_grader_mock = mocker.patch(
+        "app.task_evaluators.spawn_forward_quality_grader",
+        return_value=None,
+    )
+
+    # First pass: attempt to spawn grader, but it returns None.
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # Verify grader spawn was attempted.
+    assert spawn_grader_mock.called, "spawn_forward_quality_grader should be called"
+
+    # Task must be marked as EVALUATING and awaiting adversarial grader.
+    assert task.status == TaskStatus.EVALUATING, (
+        "Task must be EVALUATING when grader spawn returns None"
+    )
+    assert task.context.get("awaiting_adversarial_grader") is True, (
+        "awaiting_adversarial_grader flag must be set when grader spawn returns None"
+    )
+    assert task.context.get("_adversarial_challenged_hashes"), (
+        "challenged hashes must be stored for fail-closed gating"
+    )
+
+    # No implementation children must have been spawned (high-stakes finding deferred).
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], (
+        "High-stakes findings must not spawn when grader spawn returns None"
+    )
+
+    # Re-entry while still awaiting (verdict still None): must return as no-op.
+    spawn_grader_mock.reset_mock()
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # Grader spawn should NOT be attempted again on re-entry while awaiting.
+    assert not spawn_grader_mock.called, (
+        "On re-entry with awaiting_adversarial_grader set, grader spawn should not be retried"
+    )
+    assert task.status == TaskStatus.EVALUATING, (
+        "Task must remain EVALUATING while awaiting verdict"
+    )
+    assert not children, "Still no children spawned on re-entry while awaiting"
+
+    # Now simulate the grader verdict arriving: update task context with a passing verdict.
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "parse_outcome": "ok",
+            "finding_verdicts": {
+                task.context.get("_adversarial_challenged_hashes", [])[0]: {
+                    "passed": True,
+                    "explicit": True,
+                    "reason": "premise holds",
+                }
+            },
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    # Re-entry with verdict: must proceed to spawn.
+    spawn_grader_mock.reset_mock()
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # Now the finding should have been spawned (grader approved it).
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) > 0, (
+        "When grader verdict approves finding, it must be spawned on re-entry"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
     db_session, mocker
 ):

@@ -2214,6 +2214,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     len(_manifest_items),
                 )
                 return
+            else:
+                # Grader spawn returned None (single-shot guard hit / grader already in flight).
+                # Mark as awaiting and return to prevent ungated spawn of high-stakes findings.
+                # On re-entry the guard will detect this marker and no-op until the verdict arrives.
+                task.status = TaskStatus.EVALUATING
+                task.latest_status_message = (
+                    "Awaiting adversarial challenge verdict before spawning "
+                    "high-stakes implementation tasks"
+                )
+                _ctx = dict(task.context or {})
+                _ctx["awaiting_adversarial_grader"] = True
+                _ctx["_adversarial_challenged_hashes"] = _challenged_hashes
+                task.context = _ctx
+                flag_modified(task, "context")
+                session.add(task)
+                await session.commit()
+                logger.info(
+                    "[RESEARCH] Task %s parked awaiting adversarial challenge "
+                    "(spawn returned None — grader in flight or single-shot guard hit, "
+                    "%d high-stakes finding(s))",
+                    task.id,
+                    len(_high_stakes),
+                )
+                return
 
     # Adversarial re-entry: stamp per-finding verdicts so the spawn loop can
     # skip challenged-and-failed findings. The gate is fail-closed: any finding

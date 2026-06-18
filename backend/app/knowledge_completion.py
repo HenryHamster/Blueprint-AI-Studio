@@ -2215,6 +2215,9 @@ async def _prepare_deterministic_compute_document(
             task.id,
             exc_info=True,
         )
+        # Fail-closed: treat unexpected error as ungrounded; strip citations
+        if document.get("citations"):
+            document["citations"] = []
     return document, job.id if job is not None else None
 
 
