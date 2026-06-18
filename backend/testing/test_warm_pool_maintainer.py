@@ -1360,7 +1360,8 @@ def test_all_warm_breakers_trip_and_reset_identically(warm_pool_on):
         _shared_state.warm_pool_suppressed_until,
     ]
     deadline_diffs = [
-        abs((deadlines[i] - deadlines[0]).total_seconds()) for i in range(1, len(deadlines))
+        abs((deadlines[i] - deadlines[0]).total_seconds())
+        for i in range(1, len(deadlines))
     ]
     assert all(diff < 1 for diff in deadline_diffs), (
         f"Deadline drift detected: {deadline_diffs}"
@@ -3968,6 +3969,55 @@ async def test_routine_over_target_drain_spares_leased_member(
     assert surviving is not None and surviving.state == PoolVmState.LEASED
 
 
+@pytest.mark.asyncio
+async def test_global_disable_drain_records_force_expired_cause(
+    db_session, warm_pool_on, mocker
+):
+    """drain_global_warm_pool must record force_expired reservation cause for any
+    lane whose warm workspace is backed by a drained VM.
+
+    Before this fix, retire_and_delete_pool_vm cleared the lane workspace via
+    clear_lanes_for_torn_down_vm but never called record_lane_reservation_cause,
+    so global-disable drain, cost-guard teardown, and stale-image recycle all
+    degraded lanes to COLD without incrementing reservation_force_expired_count.
+    """
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+
+    project = await _make_project(db_session, name="Force Expired Cause")
+    member = await _register(
+        db_session, project, "agent-vm-drain-cause", PoolVmState.IDLE
+    )
+
+    lane = ImprovementLane(
+        project_id=project.id,
+        title="drain cause lane",
+        goal="test",
+        branch_name="drain-cause-branch",
+        base_branch="main",
+        status=ImprovementLaneStatus.PARKED.value,
+        workspace_state="WARM_RESERVED",
+        workspace_vm_instance_id="agent-vm-drain-cause",
+    )
+    db_session.add(lane)
+    await db_session.commit()
+    await db_session.refresh(lane)
+
+    assert lane.reservation_force_expired_count == 0
+
+    retired = await _wpm.drain_global_warm_pool(
+        session_factory=_factory_for(db_session)
+    )
+    assert retired == 1, f"expected 1 retired, got {retired}"
+    assert await db_session.get(PoolVm, member.id) is None
+
+    await db_session.refresh(lane)
+    assert lane.workspace_state == "COLD", "lane must be degraded to COLD after drain"
+    assert lane.reservation_force_expired_count == 1, (
+        "global-disable drain must record force_expired cause on the cleared lane"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Per-project cost guard: lease-side honor
 # ---------------------------------------------------------------------------
@@ -4504,3 +4554,80 @@ async def test_sweep_lane_pilot_kill_verdict_applies_kill(db_session, pilot_on, 
     assert call_kwargs.kwargs["reason"] == "reaper_sweep"
     # Gate violations set immediate_alert=True → alert_detail must be non-None.
     assert call_kwargs.kwargs["alert_detail"] is not None
+
+
+@pytest.mark.asyncio
+async def test_leader_startup_reclaims_orphaned_lane_workspaces(db_session):
+    """reclaim_orphaned_lane_workspace_states resets workspace_state to COLD for lanes
+    whose backing pool VM no longer exists, and leaves intact lanes whose VM is present.
+
+    This test exercises the production sweep that lifecycle.py calls at leader startup
+    to recover workspace state orphaned by out-of-process pool VM deletions.
+    """
+    from app.improvement_lane_ops import reclaim_orphaned_lane_workspace_states
+
+    project = await _make_project(db_session, name="Reclaim Test")
+
+    # Lane whose backing VM is gone — should be reclaimed.
+    orphaned_lane = ImprovementLane(
+        project_id=project.id,
+        title="orphaned lane",
+        goal="orphaned goal",
+        branch_name="lane/orphaned",
+        base_branch="automain",
+        status=ImprovementLaneStatus.ACTIVE.value,
+        workspace_state="WARM_RESERVED",
+        workspace_vm_instance_id="vm-gone-from-db",
+    )
+    db_session.add(orphaned_lane)
+
+    # Create a real PoolVm so the second lane keeps its workspace_state.
+    live_vm = PoolVm(
+        vm_instance_id="vm-still-alive",
+        state=PoolVmState.IDLE,
+        project_id=project.id,
+    )
+    db_session.add(live_vm)
+
+    live_lane = ImprovementLane(
+        project_id=project.id,
+        title="live lane",
+        goal="live goal",
+        branch_name="lane/live",
+        base_branch="automain",
+        status=ImprovementLaneStatus.ACTIVE.value,
+        workspace_state="WARM_RESERVED",
+        workspace_vm_instance_id="vm-still-alive",
+    )
+    db_session.add(live_lane)
+
+    # Lane already COLD — should be untouched.
+    cold_lane = ImprovementLane(
+        project_id=project.id,
+        title="cold lane",
+        goal="cold goal",
+        branch_name="lane/cold",
+        base_branch="automain",
+        status=ImprovementLaneStatus.ACTIVE.value,
+        workspace_state="COLD",
+        workspace_vm_instance_id=None,
+    )
+    db_session.add(cold_lane)
+
+    await db_session.commit()
+    await db_session.refresh(orphaned_lane)
+    await db_session.refresh(live_lane)
+    await db_session.refresh(cold_lane)
+
+    reclaimed = await reclaim_orphaned_lane_workspace_states(db_session)
+    await db_session.commit()
+    await db_session.refresh(orphaned_lane)
+    await db_session.refresh(live_lane)
+    await db_session.refresh(cold_lane)
+
+    assert reclaimed == 1, f"expected 1 reclaimed lane, got {reclaimed}"
+    assert orphaned_lane.workspace_state == "COLD"
+    assert orphaned_lane.workspace_vm_instance_id is None
+    assert live_lane.workspace_state == "WARM_RESERVED"
+    assert live_lane.workspace_vm_instance_id == "vm-still-alive"
+    assert cold_lane.workspace_state == "COLD"

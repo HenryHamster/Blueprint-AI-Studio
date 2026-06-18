@@ -552,12 +552,19 @@ async def retire_and_delete_pool_vm(
     # Clear workspace state on any lane that was warm-reserved or leased to
     # this VM — covers ALL teardown paths (drain, cost-guard, stale-image,
     # idle-reaper) so no lane is left with a dangling workspace_vm_instance_id.
-    cleared = await clear_lanes_for_torn_down_vm(session, vm_id)
-    if cleared:
+    # Record force_expired cause for every cleared lane so reservation-cause
+    # telemetry captures forced expirations from all teardown paths, not only
+    # the idle-reaper's own call-site.
+    cleared_lane_ids = await clear_lanes_for_torn_down_vm(session, vm_id)
+    if cleared_lane_ids:
+        from app.warm_pool import record_lane_reservation_cause
+
+        for lane_id in cleared_lane_ids:
+            await record_lane_reservation_cause(session, lane_id, "force_expired")
         await session.commit()
         logger.info(
             "[WARM-POOL] cleared %d lane workspace(s) for torn-down VM %s",
-            cleared,
+            len(cleared_lane_ids),
             vm_id,
         )
     logger.info(
