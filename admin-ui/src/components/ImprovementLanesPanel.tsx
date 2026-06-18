@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, CircleDollarSign, GitBranch, RefreshCw, TimerReset, XCircle } from 'lucide-react';
-import { drainLanePilot, fetchImprovementLaneDetail, fetchImprovementLanes, fetchLanePilotPreflight, type ImprovementLaneCheckpoint, type ImprovementLaneCurrentTask, type ImprovementLaneDetail, type ImprovementLaneManifest, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse, type LanePilotTrialMetrics, type ShadowLaneHealth } from '../api';
+import { drainLanePilot, fetchImprovementLaneDetail, fetchImprovementLanes, fetchLanePilotPreflight, reclaimOrphanedLaneWorkspaces, type ImprovementLaneCheckpoint, type ImprovementLaneCurrentTask, type ImprovementLaneDetail, type ImprovementLaneManifest, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse, type LanePilotTrialMetrics, type ShadowLaneHealth } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { formatAbsolute, formatDurationSec, parseTimestamp, timeAgo } from '../utils/time';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -297,6 +297,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
   const [lanes, setLanes] = useState<ImprovementLaneRow[]>([]);
   const [shadowHealth, setShadowHealth] = useState<ShadowLaneHealth | null>(null);
   const [trialMetrics, setTrialMetrics] = useState<LanePilotTrialMetrics | null>(null);
+  const [workspaceStateCounts, setWorkspaceStateCounts] = useState<Record<string, number> | null>(null);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [collapsedPref, setCollapsedPref] = useState<boolean | null>(() => readCollapsedPreference());
@@ -307,6 +308,9 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
   const [drainError, setDrainError] = useState<string | null>(null);
   const [preflight, setPreflight] = useState<LanePilotPreflightResponse | null>(null);
   const [preflightError, setPreflightError] = useState<string | null>(null);
+  const [reclaiming, setReclaiming] = useState(false);
+  const [reclaimResult, setReclaimResult] = useState<number | null>(null);
+  const [reclaimError, setReclaimError] = useState<string | null>(null);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     if (!projectId) return;
@@ -327,6 +331,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
       setLanes(lanesData.lanes ?? []);
       setShadowHealth(lanesData.shadow_health ?? null);
       setTrialMetrics(lanesData.trial_metrics ?? null);
+      setWorkspaceStateCounts(lanesData.workspace_state_counts ?? null);
       setPreflight(preflightData);
     } catch (e) {
       if (e instanceof Error && e.name === 'AbortError') return;
@@ -336,6 +341,22 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
       if (!signal?.aborted) setLoading(false);
     }
   }, [projectId]);
+
+  const handleReclaimOrphaned = useCallback(async () => {
+    if (!projectId) return;
+    setReclaiming(true);
+    setReclaimError(null);
+    setReclaimResult(null);
+    try {
+      const result = await reclaimOrphanedLaneWorkspaces(projectId);
+      setReclaimResult(result.reclaimed);
+      await load();
+    } catch (e) {
+      setReclaimError(e instanceof Error ? e.message : 'Failed to reclaim orphaned workspaces');
+    } finally {
+      setReclaiming(false);
+    }
+  }, [projectId, load]);
 
   const handleDrainConfirm = useCallback(async () => {
     if (!projectId) return;
@@ -362,6 +383,10 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
     setPreflight(null);
     setPreflightError(null);
     setLoading(Boolean(projectId));
+    setDrainResult(null);
+    setDrainError(null);
+    setReclaimResult(null);
+    setReclaimError(null);
   }, [projectId]);
 
   usePoller((signal) => load(signal), {
@@ -598,6 +623,24 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
               })()}
             </div>
           )}
+          {workspaceStateCounts && Object.keys(workspaceStateCounts).length > 0 && (
+            <div
+              data-testid="workspace-state-counts"
+              className="mb-3 rounded border border-neutral-700 bg-neutral-800/50 p-2 text-xs"
+            >
+              <div className="mb-1 font-semibold text-neutral-300">Workspace states (fleet)</div>
+              <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-neutral-400">
+                {Object.entries(workspaceStateCounts).sort(([a], [b]) => a.localeCompare(b)).map(([state, count]) => (
+                  <div key={state}>
+                    <span className="text-neutral-500">{state} </span>
+                    <span className={state === 'WARM_RESERVED' || state === 'LEASED' ? 'text-emerald-300' : count > 0 && state !== 'COLD' ? 'text-amber-300' : 'text-neutral-200'}>
+                      {count}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           {shadowHealth && shadowHealth.shadow_lane_count > 0 && (
             <div
               data-testid="shadow-lane-health"
@@ -635,7 +678,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
             </div>
           )}
 
-          <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
             <button
               type="button"
               data-testid="drain-lane-pilot-button"
@@ -645,12 +688,33 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
             >
               {draining ? 'Draining…' : 'Drain / Kill Pilot'}
             </button>
+            <button
+              type="button"
+              data-testid="reclaim-orphaned-button"
+              disabled={reclaiming || !projectId}
+              onClick={handleReclaimOrphaned}
+              className="min-h-[44px] rounded border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-[11px] font-semibold text-amber-400 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {reclaiming ? 'Reclaiming…' : 'Reclaim Orphaned'}
+            </button>
             {drainResult && (
               <span className="text-[11px] text-emerald-400" data-testid="drain-result-summary">
                 Pilot drained: {drainResult.reservations_cleared} reservation{drainResult.reservations_cleared !== 1 ? 's' : ''} released, {drainResult.lanes_killed} lane{drainResult.lanes_killed !== 1 ? 's' : ''} killed
               </span>
             )}
+            {reclaimResult != null && (
+              <span className="text-[11px] text-emerald-400" data-testid="reclaim-result-summary">
+                Reclaimed {reclaimResult} orphaned lane{reclaimResult !== 1 ? 's' : ''}
+              </span>
+            )}
           </div>
+
+          {reclaimError && (
+            <div className="mb-2 flex items-start gap-2 rounded border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-amber-300">
+              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+              <span className="min-w-0 break-words" data-testid="reclaim-error">{reclaimError}</span>
+            </div>
+          )}
 
           {drainError && (
             <div className="mb-2 flex items-start gap-2 rounded border border-red-500/20 bg-red-500/10 px-3 py-2 text-red-300">
@@ -754,7 +818,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                         <div className="mt-0.5 break-words text-neutral-300">
                           {lane.workspace_state ?? '—'}
                         </div>
-                        <div className="mt-0.5 text-neutral-500">
+                        <div className="mt-0.5 break-words text-neutral-500">
                           {lane.workspace_vm_instance_id ?? '—'}
                         </div>
                       </div>

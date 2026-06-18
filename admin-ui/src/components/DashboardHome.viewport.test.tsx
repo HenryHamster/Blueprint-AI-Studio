@@ -378,6 +378,7 @@ vi.mock('../api', () => ({
   fetchImprovementLanes: vi.fn(async () => ({ total: 0, lanes: [] })),
   fetchImprovementLaneDetail: vi.fn(async () => null),
   fetchLanePilotPreflight: vi.fn(async () => null),
+  reclaimOrphanedLaneWorkspaces: vi.fn(async () => ({ reclaimed: 0 })),
   fetchVersionSummary: vi.fn(async () => ({})),
 }));
 

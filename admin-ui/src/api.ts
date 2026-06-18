@@ -252,6 +252,64 @@ export async function createComputeExperiment(
   return res.json();
 }
 
+export async function getBlockDegradedUnverifiedMerge(
+  projectId: string,
+): Promise<{ block_degraded_unverified_merge: boolean; is_default: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/block-degraded-unverified-merge`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch block-degraded-unverified-merge: ${res.status}`);
+  return res.json();
+}
+
+export async function setBlockDegradedUnverifiedMerge(
+  projectId: string,
+  enabled: boolean,
+): Promise<{ block_degraded_unverified_merge: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/block-degraded-unverified-merge`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ block_degraded_unverified_merge: enabled }),
+    },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update block-degraded-unverified-merge: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update block-degraded-unverified-merge: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getBlockNoTestUnverifiedMerge(
+  projectId: string,
+): Promise<{ block_no_test_unverified_merge: boolean; is_default: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/block-no-test-unverified-merge`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch block-no-test-unverified-merge: ${res.status}`);
+  return res.json();
+}
+
+export async function setBlockNoTestUnverifiedMerge(
+  projectId: string,
+  enabled: boolean,
+): Promise<{ block_no_test_unverified_merge: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/block-no-test-unverified-merge`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ block_no_test_unverified_merge: enabled }),
+    },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update block-no-test-unverified-merge: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update block-no-test-unverified-merge: ${res.status}`);
+  }
+  return res.json();
+}
+
 export type ResourceEnvelopePatch = Partial<ResourceEnvelopeConfig>;
 
 export async function fetchProjectResourceEnvelope(
@@ -748,6 +806,7 @@ export interface ImprovementLanesResponse {
   project_id: string;
   shadow_health?: ShadowLaneHealth;
   trial_metrics?: LanePilotTrialMetrics | null;
+  workspace_state_counts?: Record<string, number>;
   [key: string]: unknown;
 }
 
@@ -790,6 +849,19 @@ export async function drainLanePilot(projectId: string): Promise<LanePilotDrainR
     const data = await res.json().catch(() => ({}));
     const msg = data?.detail || data?.error?.message || `Failed to drain lane pilot: ${res.status}`;
     throw new Error(typeof msg === 'string' ? msg : `Failed to drain lane pilot: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function reclaimOrphanedLaneWorkspaces(projectId: string): Promise<{ reclaimed: number }> {
+  const res = await apiFetch(
+    `/api/admin/improvement-lanes/reclaim-orphaned?project_id=${encodeURIComponent(projectId)}`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || data?.error?.message || `Failed to reclaim orphaned workspaces: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to reclaim orphaned workspaces: ${res.status}`);
   }
   return res.json();
 }
@@ -1202,14 +1274,6 @@ export interface SrCategoryTrend {
   precision_recall_alert?: boolean | null;
 }
 
-export interface SrFixIterationBucket {
-  hit_rate?: number | null;
-  miss_rate?: number | null;
-  sample_count?: number | null;
-}
-
-export type SrFixIterationBreakdown = Record<string, SrFixIterationBucket>;
-
 export interface SrFalsePositiveCategoryStat {
   category: string;
   sample_size: number;
@@ -1403,6 +1467,16 @@ export interface FormatComplianceResponse {
   repair_successes: number | null;
 }
 
+export interface FormatComplianceByTypeEntry {
+  tasks_measured: number | null;
+  well_formed_tasks: number | null;
+  format_compliance_rate: number | null;
+  format_error_total: number | null;
+  repair_attempts: number | null;
+  repair_successes: number | null;
+  self_repair_success_rate: number | null;
+}
+
 export interface AgentTimeoutRateResponse {
   overall: EfficiencyDriftAxis;
   by_subtype: Record<string, { current: number | null; baseline: number | null; drift_pct: number | null }>;
@@ -1439,6 +1513,35 @@ export interface PoolPayoffVerdict {
   recommended_action: string;
 }
 
+export interface PanelReviewEffectiveness {
+  challenged_confirmed: number;
+  challenged_revised: number;
+  challenged_rejected: number;
+  total_challenged: number;
+  overturn_rate: number;
+  cost_per_challenge_usd?: number | null;
+}
+
+export interface VmCostAttributionEntry {
+  task_type: string;
+  task_count: number;
+  merged_count: number;
+  total_cost_usd: number;
+  share_of_total_cost: number | null;
+  cost_per_merge: number | null;
+}
+
+export interface VmCostAttribution {
+  by_task_type: VmCostAttributionEntry[];
+  total_vm_usd: number;
+}
+
+export interface VmCostAttributionTrendEntry {
+  captured_at: string | null;
+  by_task_type: VmCostAttributionEntry[] | null;
+  total_vm_usd: number | null;
+}
+
 export interface EfficiencyAxesResponse {
   axes: Record<string, EfficiencyAxis>;
   baseline_captured_at: string | null;
@@ -1461,6 +1564,21 @@ export interface EfficiencyAxesResponse {
   // Optional nested blocks surfaced by the backend for the operator dashboard.
   format_compliance?: FormatComplianceResponse;
   agent_timeout_rate?: AgentTimeoutRateResponse;
+  // Panel review effectiveness: overturn_rate, challenged outcome counts, and
+  // total gate invocations from the latest snapshot. Null when no gate
+  // invocations exist in the window. Optional for older backends.
+  panel_review_effectiveness?: PanelReviewEffectiveness | null;
+  // VM cost attribution: per-task-type breakdown of infrastructure spend from
+  // the latest snapshot, showing which task types (review, create, side-car, etc.)
+  // dominate VM spend. Optional for older backends.
+  vm_cost_attribution?: VmCostAttribution | null;
+  // Day-over-day VM cost trend (one entry per daily snapshot). Optional/null
+  // for older backends that omit it.
+  vm_cost_attribution_trend?: VmCostAttributionTrendEntry[] | null;
+  // Per-task-type format-compliance breakdown from the latest snapshot. Keyed
+  // by task type; each entry mirrors FormatComplianceByTypeEntry. Optional/null
+  // for older snapshots.
+  format_compliance_by_type?: Record<string, FormatComplianceByTypeEntry> | null;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {
@@ -2388,26 +2506,6 @@ export interface StagingBranchPrefixesResponse {
   is_default: boolean;
 }
 
-export async function fetchStagingBranchPrefixes(
-  projectId: string,
-): Promise<StagingBranchPrefixesResponse> {
-  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/staging-branch-prefixes`);
-  if (!res.ok) throw new Error(`Failed to fetch staging branch prefixes: ${res.status}`);
-  return res.json();
-}
-
-export async function updateStagingBranchPrefixes(
-  projectId: string,
-  prefixes: string[] | null,
-): Promise<StagingBranchPrefixesResponse> {
-  const res = await apiFetch(
-    `/api/admin/projects/${encodeURIComponent(projectId)}/staging-branch-prefixes`,
-    { method: 'PATCH', body: JSON.stringify({ staging_branch_prefixes: prefixes }) },
-  );
-  if (!res.ok) throw new Error(`Failed to update staging branch prefixes: ${res.status}`);
-  return res.json();
-}
-
 export interface ApprovalGateConfig {
   infra_files: string[];
   critical_files: string[];
@@ -2725,50 +2823,6 @@ export async function setWarmPoolTargetForProject(
     const msg = data?.detail || `Failed to set warm-pool target: ${res.status}`;
     throw new Error(typeof msg === 'string' ? msg : `Failed to set warm-pool target: ${res.status}`);
   }
-  return res.json();
-}
-
-export interface SrDisagreementTask {
-  task_id: string;
-  title: string;
-  task_type?: string | null;
-  scope?: string | null;
-  created_at?: string | null;
-  pr_url?: string | null;
-  sr_check_results?: Record<string, { passed: boolean; issue?: string | null; origin?: string | null }>;
-  reviewer_findings?: Array<{ category: string; severity?: string | null; description: string }>;
-}
-
-export interface SrReviewerDisagreementTasksResponse {
-  items: SrDisagreementTask[];
-  total: number;
-  page?: number;
-  page_size?: number;
-  category_counts?: Record<string, number>;
-}
-
-export async function fetchSrReviewerDisagreementTasks(
-  projectId: string,
-  params?: {
-    category?: string;
-    task_type?: string;
-    severity?: string;
-    days?: number;
-    page?: number;
-    page_size?: number;
-  },
-): Promise<SrReviewerDisagreementTasksResponse> {
-  const searchParams = new URLSearchParams();
-  if (params?.category) searchParams.set('category', params.category);
-  if (params?.task_type) searchParams.set('task_type', params.task_type);
-  if (params?.severity) searchParams.set('severity', params.severity);
-  if (params?.days !== undefined) searchParams.set('days', String(params.days));
-  if (params?.page !== undefined) searchParams.set('page', String(params.page));
-  if (params?.page_size !== undefined) searchParams.set('page_size', String(params.page_size));
-  const query = searchParams.toString();
-  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/sr-reviewer-disagreements/tasks${query ? `?${query}` : ''}`;
-  const res = await apiFetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch SR reviewer disagreement tasks: ${res.status}`);
   return res.json();
 }
 
@@ -3462,6 +3516,31 @@ export async function fetchEvergreenFillSettings(signal?: AbortSignal): Promise<
     evergreen_fill_daily_cap: data?.evergreen_fill_daily_cap ?? 3,
     evergreen_fill_deferred_memo_enrollment: data?.evergreen_fill_deferred_memo_enrollment ?? false,
   };
+}
+
+export interface StructuralHealthRowMeasurement {
+  task_id: string;
+  project_id: string;
+  bytes: number;
+}
+
+export interface StructuralHealthObservabilityResponse {
+  cycles: number;
+  enrolled_total: number;
+  last_decision: Record<string, unknown> | null;
+  largest_rows: StructuralHealthRowMeasurement[];
+  recent: Record<string, unknown>[];
+  last_jsonb_bloat_decision: Record<string, unknown> | null;
+  last_gin_overhead_decision: Record<string, unknown> | null;
+  last_pool_saturation_decision: Record<string, unknown> | null;
+}
+
+export async function fetchStructuralHealthObservability(
+  signal?: AbortSignal,
+): Promise<StructuralHealthObservabilityResponse> {
+  const res = await apiFetch('/api/admin/evergreen/structural-health-observability', undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch structural health observability: ${res.status}`);
+  return res.json();
 }
 
 export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSettings>): Promise<void> {

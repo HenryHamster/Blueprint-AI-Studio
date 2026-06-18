@@ -15,6 +15,7 @@ import {
   classifySetupFailure, classifyTestExecution, extractTestCoverage,
   matchesEnvironmentFailureSignature,
   detectAcceptanceProbes, classifyProbeOutcome, buildWroteNewOutput,
+  detectProvisioningSteps,
   isSafeDocumentedCommand, isAllowlistedRunnerShape, discoverDocumentedCommands,
   MAX_DOCUMENTED_COMMANDS,
   discoverNewlyDisabledTests, isTestFilePath, MAX_DISABLED_TEST_MARKERS,
@@ -64,6 +65,11 @@ type RunnerFamily =
   | 'dotnet'
   | 'php'
   | 'composer'
+  | 'swift'
+  | 'scala'
+  | 'bazel'
+  | 'haskell'
+  | 'flutter'
   | 'script'
   | null;
 
@@ -84,6 +90,15 @@ type LayoutFixture = {
   // Python parity test (test_onboard.py::test_shared_layout_parity); declared
   // here only to keep the shared TS fixture type total.
   onboard_families?: RunnerFamily[];
+  // Expected provisioning step command (cmd + args joined) from
+  // detectProvisioningSteps — present only for layouts where the manifest that
+  // triggers the suite detector also unconditionally triggers a provision step.
+  // Consumed by the provision/probe parity describe block below.
+  provision_cmd?: string;
+  // Expected acceptance probe command (cmd + args joined) from
+  // detectAcceptanceProbes — present only for compiled-language layouts that
+  // have a cheap compile check. Consumed by the provision/probe parity block.
+  probe_cmd?: string;
 };
 
 const sharedLayouts = JSON.parse(
@@ -164,6 +179,21 @@ function familyFromRunner(runner: TestRunner): LayoutFixture['family'] {
   }
   if (runner.cmd === 'composer' && runner.args[0] === 'test') {
     return 'composer';
+  }
+  if (runner.cmd === 'swift' && runner.args[0] === 'test') {
+    return 'swift';
+  }
+  if (runner.cmd === 'sbt' && runner.args[0] === 'test') {
+    return 'scala';
+  }
+  if (runner.cmd === 'bazel' && runner.args[0] === 'test') {
+    return 'bazel';
+  }
+  if (runner.cmd === 'cabal' && runner.args[0] === 'test') {
+    return 'haskell';
+  }
+  if (runner.cmd === 'flutter' && runner.args[0] === 'test') {
+    return 'flutter';
   }
   if (runner.cmd === 'bash') {
     return 'script';
@@ -984,6 +1014,62 @@ describe('detectTestRunners — shared layout parity fixtures', () => {
     );
     expect(missing).toEqual([]);
   });
+});
+
+// Parity: provision and probe detectors must cover the same language families
+// as the suite detector. These tests use the same shared layout fixture and the
+// same fs-mock setup so that a new family added to the suite detector without
+// corresponding provision/probe support becomes a test failure.
+describe('detectProvisioningSteps + detectAcceptanceProbes — shared layout parity', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.readFileSync.mockReturnValue('');
+    mockFs.readdirSync.mockReturnValue([]);
+  });
+  afterEach(() => { vi.clearAllMocks(); });
+
+  for (const layout of sharedLayouts) {
+    if (!layout.provision_cmd && !layout.probe_cmd) continue;
+    it(layout.name, () => {
+      // Synthesize the same fs mock used by the suite parity loop above.
+      const files = new Map(layout.files.map(f => [f.path, f.content ?? '']));
+      const dirs = new Set<string>();
+      for (const p of files.keys()) {
+        let d = p.split('/').slice(0, -1).join('/');
+        while (d) { dirs.add(d); d = d.split('/').slice(0, -1).join('/'); }
+      }
+      mockFs.existsSync.mockImplementation((p: string) => {
+        const r = toWorkspaceRelativePath(p);
+        return files.has(r) || dirs.has(r);
+      });
+      mockFs.readdirSync.mockImplementation((p: string) => {
+        const r = toWorkspaceRelativePath(p);
+        const isRoot = r === '' || r === WORKSPACE;
+        const pre = isRoot ? '' : `${r}/`;
+        return [...files.keys(), ...dirs].filter(k => k.startsWith(pre) && !k.slice(pre.length).includes('/'));
+      });
+      mockFs.readFileSync.mockImplementation((p: string) => {
+        const r = toWorkspaceRelativePath(p);
+        return files.get(r) ?? '';
+      });
+
+      if (layout.provision_cmd) {
+        const steps = detectProvisioningSteps(undefined);
+        expect(
+          steps.some(s => [s.cmd, ...s.args].join(' ') === layout.provision_cmd),
+          `${layout.name}: expected provision step '${layout.provision_cmd}'`,
+        ).toBe(true);
+      }
+      if (layout.probe_cmd) {
+        const probes = detectAcceptanceProbes(undefined);
+        expect(
+          probes.some(p => [p.cmd, ...p.args].join(' ') === layout.probe_cmd),
+          `${layout.name}: expected probe '${layout.probe_cmd}'`,
+        ).toBe(true);
+      }
+    });
+  }
 });
 
 describe('detectTestRunners — nested monorepo / external layouts', () => {

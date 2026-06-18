@@ -420,6 +420,13 @@ _previously_failing_types: set[str] = set()
 # never retries — it falls open immediately, as before.
 _VERIFY_TESTS_MAX_RETRIES = 1
 
+# No-CI merge gate: how many consecutive cycles the verify_tests spawn may be
+# deferred (i.e. _spawn_pipeline_task returns None due to resource pressure)
+# before the parent task is escalated to FAILED + operator review.  A single
+# transient deferral is expected during resource pressure, but a persistent
+# deferral across 5 cycles means the PR is stranded with no self-recovery path.
+_VERIFY_TESTS_SPAWN_DEFERRAL_CAP = 5
+
 # Debounce: fire the all-accounts-blocked alert once per stall episode.
 # Reset when any task dispatches successfully (stall resolved), then re-arm
 # if every eligible task is again blocked by account rate limits.
@@ -1242,6 +1249,7 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
     from app.alert_dispatch import _maybe_create_failure_alert
 
     vm_id = None
+    child_vm_ids = []
     cancelled_count = 0
     async with AsyncSessionLocal() as cancel_session:
         cancel_task = await cancel_session.get(Task, task_id)
@@ -1290,6 +1298,9 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
                 await release_max_plan_account(child_acct)
                 child.context = {**(child.context or {}), "_slot_released": True}
             cancel_session.add(child)
+            # Track child VM IDs for post-commit deletion
+            if child.vm_instance_id:
+                child_vm_ids.append(child.vm_instance_id)
         await _maybe_create_failure_alert(
             cancel_task,
             cancel_session,
@@ -1303,6 +1314,9 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
         {"task_id": str(task_id), "status": TaskStatus.CANCELLED},
     )
     await _ensure_vm_deleted(vm_id, reason="dependency_cancelled")
+    # Tear down provisioned VMs for any children that have them
+    for child_vm_id in child_vm_ids:
+        await _ensure_vm_deleted(child_vm_id, reason="dependency_cancelled")
     logger.error(f"[ORCHESTRATOR] Cancelled task {task_id} — dependency failed")
     return cancelled_count
 
@@ -2301,7 +2315,9 @@ async def orchestrator_worker():
                     _previously_failing_types
                 if _failing_types:
                     for _ftype in _failing_types:
-                        if _is_cadence_due(_last_type_throttle_broadcast.get(_ftype), 60):
+                        if _is_cadence_due(
+                            _last_type_throttle_broadcast.get(_ftype), 60
+                        ):
                             _last_type_throttle_broadcast[_ftype] = _utcnow()
                             _frate, _fsample = _shared_state.get_task_type_failure_rate(
                                 _ftype, window_minutes=15
@@ -6404,15 +6420,57 @@ async def orchestrator_worker():
                                         f"spawned verify_tests → {_verify_task.id}"
                                     )
                                 else:
-                                    ci_task.latest_status_message = (
-                                        f"No CI on PR #{ci_pr_number} — verify_tests "
-                                        f"spawn deferred, will retry"
-                                    )
-                                    logger.info(
-                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
-                                        f"verify_tests spawn suppressed/deferred — "
-                                        f"retrying"
-                                    )
+                                    _spawn_deferrals = (
+                                        ci_loop.get(
+                                            "verify_tests_spawn_deferrals", 0
+                                        )
+                                        or 0
+                                    ) + 1
+                                    ci_loop[
+                                        "verify_tests_spawn_deferrals"
+                                    ] = _spawn_deferrals
+                                    if (
+                                        _spawn_deferrals
+                                        >= _VERIFY_TESTS_SPAWN_DEFERRAL_CAP
+                                        and not ci_task.requires_approval
+                                    ):
+                                        ci_task.status = TaskStatus.FAILED
+                                        if ci_task.vm_provisioned_at:
+                                            ci_task.vm_stopped_at = _utcnow()
+                                        if _runtime_config.get(
+                                            "require_approval_gates", True
+                                        ):
+                                            ci_task.requires_approval = True
+                                        ci_task.latest_status_message = (
+                                            f"No CI on PR #{ci_pr_number} — verify_tests "
+                                            f"spawn deferred {_spawn_deferrals} consecutive "
+                                            f"times — escalating for operator review"
+                                        )
+                                        await _maybe_create_failure_alert(
+                                            ci_task,
+                                            session,
+                                            f"PR #{ci_pr_number} no-CI verify_tests spawn "
+                                            f"deferred {_spawn_deferrals} consecutive cycles "
+                                            f"— escalating for operator review",
+                                        )
+                                        logger.warning(
+                                            f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                            f"verify_tests spawn deferred "
+                                            f"{_spawn_deferrals} times — task "
+                                            f"{ci_task.id} FAILED (requires_approval)"
+                                        )
+                                    else:
+                                        ci_task.latest_status_message = (
+                                            f"No CI on PR #{ci_pr_number} — verify_tests "
+                                            f"spawn deferred ({_spawn_deferrals}/"
+                                            f"{_VERIFY_TESTS_SPAWN_DEFERRAL_CAP}), will retry"
+                                        )
+                                        logger.info(
+                                            f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                            f"verify_tests spawn suppressed/deferred "
+                                            f"({_spawn_deferrals}/"
+                                            f"{_VERIFY_TESTS_SPAWN_DEFERRAL_CAP}) — retrying"
+                                        )
                                 ci_loop["ci_poll_interval"] = _v_poll_interval
                                 ci_loop["ci_last_polled"] = _utcnow().isoformat()
                                 ci_loop["head_sha"] = ci_head_sha
@@ -7013,6 +7071,83 @@ async def orchestrator_worker():
                                         f"the project's opt-in honest-block "
                                         f"policy — the suite could not run, so "
                                         f"the PR is held open for operator "
+                                        f"attention",
+                                    )
+                                await session.commit()
+                                await broadcast_to_project(
+                                    str(ci_task.project_id),
+                                    "task_updated",
+                                    {
+                                        "task_id": str(ci_task.id),
+                                        "status": ci_task.status,
+                                    },
+                                )
+                                continue
+
+                        # ── Opt-in honest-block for no-detectable-test merges ──
+                        # Default-OFF per-project policy
+                        # (build_config.block_no_test_unverified_merge). When ON
+                        # and the no-CI gate fell open with
+                        # ``no_detectable_test_command`` (a BENIGN reason — the
+                        # repo has no detectable suite), HOLD the PR open instead
+                        # of merging it UNVERIFIED. DEGRADED reasons and
+                        # policy-OFF projects take no branch here, so default
+                        # behavior is byte-for-byte unchanged. Sticky
+                        # ci_loop marker prevents re-alerting across polls.
+                        if _unverified_merge_reason:
+                            if _block_proj is None and ci_task.project_id:
+                                from app.models import Project as _NTProject
+
+                                _block_proj = await session.get(
+                                    _NTProject, ci_task.project_id
+                                )
+                            from app import ci_resolution as _nt_ci_res
+
+                            if _nt_ci_res.should_block_no_test_unverified_merge(
+                                _block_proj, _unverified_merge_reason
+                            ):
+                                from sqlalchemy.orm.attributes import (
+                                    flag_modified as _nt_flag_modified,
+                                )
+
+                                _already_nt_blocked = bool(
+                                    ci_loop.get("no_ci_no_test_blocked")
+                                )
+                                if not _already_nt_blocked:
+                                    _nt_ci_res.record_no_ci_gate_no_test_block(
+                                        session,
+                                        _block_proj,
+                                        unverified_reason=_unverified_merge_reason,
+                                        when=_utcnow(),
+                                    )
+                                ci_loop["no_ci_no_test_blocked"] = True
+                                ci_loop["no_ci_no_test_block_reason"] = (
+                                    _unverified_merge_reason
+                                )
+                                ci_task.latest_status_message = (
+                                    f"PR #{ci_pr_number}: no-CI merge gate found "
+                                    f"no detectable test command "
+                                    f"({_unverified_merge_reason}); the project's "
+                                    f"block-no-test-unverified-merge policy is ON "
+                                    f"— holding the PR open instead of merging "
+                                    f"UNVERIFIED"
+                                )
+                                ci_task.context = {
+                                    **(ci_task.context or {}),
+                                    "review_loop": ci_loop,
+                                }
+                                _nt_flag_modified(ci_task, "context")
+                                session.add(ci_task)
+                                if not _already_nt_blocked:
+                                    await _maybe_create_failure_alert(
+                                        ci_task,
+                                        session,
+                                        f"PR #{ci_pr_number}: no-CI merge gate "
+                                        f"BLOCKED an unverified merge (no-test "
+                                        f"reason: {_unverified_merge_reason}) per "
+                                        f"the project's opt-in no-test-block "
+                                        f"policy — no test command was detectable, "
+                                        f"so the PR is held open for operator "
                                         f"attention",
                                     )
                                 await session.commit()

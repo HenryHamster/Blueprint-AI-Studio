@@ -325,3 +325,45 @@ async def mark_checkpoint_missing(
             reason,
         )
     return lane, should_requeue
+
+
+async def reclaim_orphaned_lane_workspace_states(
+    session: AsyncSession,
+) -> int:
+    """Reset workspace_state to COLD on lanes whose backing pool VM no longer exists.
+
+    Complements the live-path ``clear_lanes_for_torn_down_vm`` call in
+    ``retire_and_delete_pool_vm`` — handles pool VMs that were deleted while the
+    orchestrator process was stopped (crash, deploy, manual removal).  Intended to
+    be called once at orchestrator startup as a recovery sweep.
+
+    Returns the count of lanes reclaimed.
+    """
+    from app.models import PoolVm
+
+    result = await session.execute(
+        select(ImprovementLane).where(
+            ImprovementLane.workspace_state != "COLD",
+            ImprovementLane.workspace_vm_instance_id.isnot(None),
+        )
+    )
+    lanes = result.scalars().all()
+
+    reclaimed = 0
+    for lane in lanes:
+        vm_result = await session.execute(
+            select(PoolVm).where(PoolVm.vm_instance_id == lane.workspace_vm_instance_id)
+        )
+        if vm_result.scalar_one_or_none() is None:
+            vm_id = lane.workspace_vm_instance_id
+            lane.workspace_state = "COLD"
+            lane.workspace_vm_instance_id = None
+            reclaimed += 1
+            logger.info(
+                "[WARM-POOL] reclaimed orphaned workspace state on lane %s "
+                "(vm %s no longer exists)",
+                lane.id,
+                vm_id,
+            )
+
+    return reclaimed

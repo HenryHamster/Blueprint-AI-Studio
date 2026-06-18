@@ -24,6 +24,7 @@ export function ConfirmDialog({ title, message, confirmLabel = 'Confirm', onConf
           </button>
           <button
             onClick={onConfirm}
+            data-testid="confirm-dialog-confirm"
             className="px-4 py-2 rounded-lg text-xs font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 border border-amber-500/40 transition-colors"
           >
             {confirmLabel}

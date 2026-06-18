@@ -136,10 +136,3 @@ export function formatTimeToDetect(firstSeenAt: string | null, signalFirstCrosse
   const seconds = (parseTimestamp(firstSeenAt).getTime() - parseTimestamp(signalFirstCrossedAt).getTime()) / 1000;
   return formatDurationSec(Math.max(0, seconds));
 }
-
-/** "10m 30s" from case opening to first investigation task spawn. */
-export function formatTimeToInvestigate(firstSeenAt: string | null, investigateSpawnedAt?: string | null): string {
-  if (!firstSeenAt || !investigateSpawnedAt) return 'unknown';
-  const seconds = (parseTimestamp(investigateSpawnedAt).getTime() - parseTimestamp(firstSeenAt).getTime()) / 1000;
-  return formatDurationSec(Math.max(0, seconds));
-}

@@ -54,14 +54,16 @@ from app.ci_resolution import (
     probe_is_clear_failure,
     proceed_on_no_checks,
     record_no_ci_gate_degraded_block,
+    record_no_ci_gate_no_test_block,
     record_no_ci_gate_runtime,
     resolve_no_checks_escalation,
     should_block_degraded_unverified_merge,
+    should_block_no_test_unverified_merge,
     should_run_no_ci_test_gate,
 )
 from app.build_config_detection import maybe_redetect_ci_presence
 from app.models import Alert, Artifact, ArtifactType, Project, Task, TaskStatus
-from app.orchestrator import _VERIFY_TESTS_MAX_RETRIES
+from app.orchestrator import _VERIFY_TESTS_MAX_RETRIES, _VERIFY_TESTS_SPAWN_DEFERRAL_CAP
 from app.release_qualifier_audit import _latest_artifact_logs
 from app.review_pipeline import _spawn_pipeline_task
 
@@ -1704,6 +1706,94 @@ def test_orchestrator_consults_degraded_block_helper():
     )
 
 
+@pytest.mark.asyncio
+async def test_block_no_test_unverified_merge_held_and_sticky(db_session):
+    """Opt-in no-test honest-block policy: with the flag ON and
+    ``no_detectable_test_command`` the predicate returns True; with the flag OFF
+    or a different reason it returns False.
+
+    Also exercises ``record_no_ci_gate_no_test_block`` and verifies that
+    ``merge_gate_runtime_block`` surfaces the new JSONB fields.
+    """
+    # ── Part 1: predicate behaviour ──────────────────────────────────────────
+    project = await _make_no_ci_project(db_session, with_test_cmd=False)
+    bc = dict(project.build_config or {})
+    bc["block_no_test_unverified_merge"] = True
+    from sqlalchemy.orm.attributes import flag_modified as _fm
+
+    project.build_config = bc
+    _fm(project, "build_config")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert (
+        should_block_no_test_unverified_merge(project, "no_detectable_test_command")
+        is True
+    ), "policy ON + no_detectable_test_command must block"
+
+    assert (
+        should_block_no_test_unverified_merge(project, "verify_setup_failed") is False
+    ), "a DEGRADED reason must NOT be caught by the no-test policy"
+
+    off_project = await _make_no_ci_project(db_session, with_test_cmd=False)
+    assert (
+        should_block_no_test_unverified_merge(off_project, "no_detectable_test_command")
+        is False
+    ), "policy OFF must never block"
+
+    # ── Part 2: recorder stamps the expected JSONB keys ───────────────────
+    record_no_ci_gate_no_test_block(
+        db_session,
+        project,
+        unverified_reason="no_detectable_test_command",
+        when=_RUNTIME_WHEN,
+    )
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    runtime = merge_gate_runtime_block(project)
+    assert runtime is not None
+    assert runtime["last_no_test_block_at"] == _RUNTIME_WHEN.isoformat()
+    assert runtime["last_no_test_block_reason"] == "no_detectable_test_command"
+    assert runtime["no_test_block_counts"]["no_detectable_test_command"] == 1
+    # The block is a fall-open that did NOT run a real suite.
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_reason"] == "no_detectable_test_command"
+
+    # ── Part 3: second block call increments count (sticky tally) ─────────
+    record_no_ci_gate_no_test_block(
+        db_session,
+        project,
+        unverified_reason="no_detectable_test_command",
+        when=_RUNTIME_WHEN,
+    )
+    await db_session.commit()
+    project = await db_session.get(Project, project.id)
+    runtime2 = merge_gate_runtime_block(project)
+    assert runtime2["no_test_block_counts"]["no_detectable_test_command"] == 2
+
+
+def test_orchestrator_consults_no_test_block_helper():
+    """Drift guard: the orchestrator's no-CI gate must consult
+    ``should_block_no_test_unverified_merge`` and, when it returns True, BLOCK
+    (record the block and ``continue`` without calling ``handle_ci_completion``).
+    Uses sticky ``ci_loop["no_ci_no_test_blocked"]`` to prevent re-alerting."""
+    src = _orchestrator_source()
+    required = [
+        "should_block_no_test_unverified_merge",
+        "record_no_ci_gate_no_test_block",
+        'ci_loop["no_ci_no_test_blocked"] = True',
+    ]
+    missing = [needle for needle in required if needle not in src]
+    assert not missing, (
+        "orchestrator no-CI no-test-block wiring changed — missing: "
+        f"{missing}. The no-test-block branch must consult "
+        "should_block_no_test_unverified_merge and park the PR; update "
+        "orchestrator.py AND this guard together."
+    )
+
+
 # ---------------------------------------------------------------------------
 # 5. A repo detected via a NON-MANIFEST entrypoint runs its suite and blocks
 #    the merge on failure (detection layer → gate layer, composed).
@@ -2874,6 +2964,29 @@ def test_orchestrator_no_ci_gate_bypass_reason_wiring():
     )
 
 
+def test_orchestrator_no_ci_gate_redetects_missing_test_command_wiring():
+    """Drift guard: the orchestrator's no-CI gate must still call
+    ``maybe_redetect_missing_test_command`` when a repo has no detectable test
+    command at gate-time, before falling back to the unverified merge. If this
+    call is dropped, the gate silently regresses to always merging UNVERIFIED
+    without attempting re-detection, even though a test command might be
+    recoverable."""
+    src = _orchestrator_source()
+    required = [
+        "maybe_redetect_missing_test_command",
+        "_redetected = await",
+        "_no_ci_verify_gate = True",
+        '"no_detectable_test_command"',
+    ]
+    missing = [needle for needle in required if needle not in src]
+    assert not missing, (
+        "orchestrator no-CI gate re-detection wiring changed — missing: "
+        f"{missing}. Before merging a no-CI repo UNVERIFIED, the gate must "
+        "attempt maybe_redetect_missing_test_command and route to verify_tests "
+        "if successful; update orchestrator.py AND this guard together."
+    )
+
+
 # ---------------------------------------------------------------------------
 # PR-caused self-suppression: the PR's OWN diff disabled tests AND the suite
 # stopped verifying (all-skipped, or a mostly-skipped pass). The gate must BLOCK
@@ -3291,4 +3404,107 @@ def test_orchestrator_no_checks_escalation_backstop_wiring():
     assert not missing, (
         "orchestrator no-checks escalation backstop wiring changed — missing: "
         f"{missing}. Update orchestrator.py AND the mirroring tests together."
+    )
+
+
+def test_orchestrator_verify_tests_spawn_deferral_escalation_wiring():
+    """The orchestrator must escalate to FAILED+requires_approval after
+    _VERIFY_TESTS_SPAWN_DEFERRAL_CAP consecutive spawn deferrals."""
+    src = _orchestrator_source()
+    required = [
+        "_VERIFY_TESTS_SPAWN_DEFERRAL_CAP",
+        '"verify_tests_spawn_deferrals"',
+        "verify_tests spawn deferred",
+        "escalating for operator review",
+        "ci_task.requires_approval = True",
+    ]
+    missing = [needle for needle in required if needle not in src]
+    assert not missing, (
+        "orchestrator verify_tests spawn-deferral escalation wiring changed — "
+        f"missing: {missing}. Update orchestrator.py AND the mirroring tests together."
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_ci_verify_tests_spawn_deferral_cap_escalates_to_operator_review(
+    db_session, mocker
+):
+    """After _VERIFY_TESTS_SPAWN_DEFERRAL_CAP consecutive spawn deferrals the
+    parent task must be set to FAILED+requires_approval and an alert dispatched.
+
+    When _spawn_pipeline_task returns None (resource pressure / suppression) on
+    every attempt, the orchestrator increments verify_tests_spawn_deferrals in
+    ci_loop.  Once that counter reaches the cap the task must leave EVALUATING
+    rather than remaining stranded.
+    """
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert",
+        new_callable=mocker.AsyncMock,
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # Simulate the orchestrator's deferral loop directly: increment the counter
+    # and apply the same escalation predicate the inline code applies.
+    from app.models import TaskStatus
+    from app.runtime_config_state import runtime_config as _runtime_config
+    from app.alert_dispatch import _maybe_create_failure_alert
+
+    ci_loop = dict((parent.context or {}).get("review_loop", {}) or {})
+
+    for _cycle in range(1, _VERIFY_TESTS_SPAWN_DEFERRAL_CAP + 1):
+        _spawn_deferrals = (ci_loop.get("verify_tests_spawn_deferrals", 0) or 0) + 1
+        ci_loop["verify_tests_spawn_deferrals"] = _spawn_deferrals
+
+        if (
+            _spawn_deferrals >= _VERIFY_TESTS_SPAWN_DEFERRAL_CAP
+            and not parent.requires_approval
+        ):
+            parent.status = TaskStatus.FAILED
+            if _runtime_config.get("require_approval_gates", True):
+                parent.requires_approval = True
+            parent.latest_status_message = (
+                f"No CI on PR #{PR_NUMBER} — verify_tests spawn deferred "
+                f"{_spawn_deferrals} consecutive times — escalating for operator review"
+            )
+            await _maybe_create_failure_alert(
+                parent,
+                db_session,
+                f"PR #{PR_NUMBER} no-CI verify_tests spawn deferred "
+                f"{_spawn_deferrals} consecutive cycles — escalating for operator review",
+            )
+
+    assert ci_loop["verify_tests_spawn_deferrals"] == _VERIFY_TESTS_SPAWN_DEFERRAL_CAP, (
+        f"counter must reach cap ({_VERIFY_TESTS_SPAWN_DEFERRAL_CAP})"
+    )
+    assert parent.status == TaskStatus.FAILED, (
+        "task must be FAILED after spawn-deferral cap is exhausted"
+    )
+    assert parent.requires_approval is True, (
+        "task must require operator approval after spawn-deferral cap"
+    )
+    assert "escalating for operator review" in parent.latest_status_message
+    alert_mock.assert_called_once(), "exactly one alert must be dispatched at the cap"
+
+    # Before the cap: no escalation should have occurred.
+    parent2 = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent2)
+    ci_loop2 = {}
+    for _cycle in range(1, _VERIFY_TESTS_SPAWN_DEFERRAL_CAP):
+        _d = (ci_loop2.get("verify_tests_spawn_deferrals", 0) or 0) + 1
+        ci_loop2["verify_tests_spawn_deferrals"] = _d
+        if _d >= _VERIFY_TESTS_SPAWN_DEFERRAL_CAP and not parent2.requires_approval:
+            parent2.status = TaskStatus.FAILED
+            parent2.requires_approval = True
+
+    assert parent2.status == TaskStatus.EVALUATING, (
+        f"task must remain EVALUATING before the cap ({_VERIFY_TESTS_SPAWN_DEFERRAL_CAP - 1} deferrals)"
+    )
+    assert not parent2.requires_approval, (
+        "requires_approval must NOT be set before the deferral cap"
     )

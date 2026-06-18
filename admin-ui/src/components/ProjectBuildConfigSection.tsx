@@ -7,7 +7,7 @@ function isRecognizedLintCmd(cmd: string): boolean {
   return /^(ruff|eslint|mypy|flake8|pyright)\b/.test(base);
 }
 import type { BuildConfig, BuildConfigDirectory, MergeGateRuntime, MergeVerificationVerdict } from '../types/project';
-import { apiFetch } from '../api';
+import { apiFetch, getBlockDegradedUnverifiedMerge, setBlockDegradedUnverifiedMerge, getBlockNoTestUnverifiedMerge, setBlockNoTestUnverifiedMerge } from '../api';
 import { SR_CANONICAL_CATEGORIES } from './SrRetrospectiveShared';
 import { MergeVerificationBanner } from './MergeVerificationBanner';
 
@@ -94,6 +94,10 @@ export function ProjectBuildConfigSection({
   const [stagingPrefixes, setStagingPrefixes] = useState<string[]>([]);
   const [stagingPrefixesIsDefault, setStagingPrefixesIsDefault] = useState(true);
   const [stagingPrefixesSaving, setStagingPrefixesSaving] = useState(false);
+  const [blockDegradedEnabled, setBlockDegradedEnabled] = useState(false);
+  const [blockDegradedSaving, setBlockDegradedSaving] = useState(false);
+  const [blockNoTestEnabled, setBlockNoTestEnabled] = useState(false);
+  const [blockNoTestSaving, setBlockNoTestSaving] = useState(false);
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [srTargets, setSrTargets] = useState<Record<string, number>>({});
@@ -120,6 +124,22 @@ export function ProjectBuildConfigSection({
     setPrTitlePrefix(buildConfig?.pr_title_prefix ?? preserved?.prTitlePrefix ?? '');
     preservedBranchOnDetect.current = null;
   }, [buildConfig]);
+
+  // Load honest-block policy flag — only relevant when CI checks are off
+  useEffect(() => {
+    if (!projectId || requiresCiChecks) { setBlockDegradedEnabled(false); return; }
+    getBlockDegradedUnverifiedMerge(projectId)
+      .then(resp => setBlockDegradedEnabled(resp.block_degraded_unverified_merge))
+      .catch(() => {});
+  }, [projectId, requiresCiChecks]);
+
+  // Load no-test-command hold policy flag — only relevant when CI checks are off
+  useEffect(() => {
+    if (!projectId || requiresCiChecks) { setBlockNoTestEnabled(false); return; }
+    getBlockNoTestUnverifiedMerge(projectId)
+      .then(resp => setBlockNoTestEnabled(resp.block_no_test_unverified_merge))
+      .catch(() => {});
+  }, [projectId, requiresCiChecks]);
 
   // Load staging-branch-prefixes from the dedicated endpoint
   useEffect(() => {
@@ -549,8 +569,84 @@ export function ProjectBuildConfigSection({
               </p>
             </div>
           </label>
+          {!requiresCiChecks && projectId && (
+            <label className="flex items-start gap-3 cursor-pointer group">
+              <div className="mt-0.5 shrink-0">
+                <input
+                  type="checkbox"
+                  checked={blockDegradedEnabled}
+                  onChange={() => {}}
+                  className="sr-only peer"
+                  id="block-degraded-toggle"
+                />
+                <div
+                  onClick={() => {
+                    if (blockDegradedSaving) return;
+                    const next = !blockDegradedEnabled;
+                    setBlockDegradedEnabled(next);
+                    setBlockDegradedSaving(true);
+                    setBlockDegradedUnverifiedMerge(projectId, next)
+                      .then(resp => setBlockDegradedEnabled(resp.block_degraded_unverified_merge))
+                      .catch(err => { console.error('Failed to update block-degraded-unverified-merge:', err); setBlockDegradedEnabled(!next); })
+                      .finally(() => setBlockDegradedSaving(false));
+                  }}
+                  className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${blockDegradedEnabled ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+                >
+                  <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${blockDegradedEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
+                </div>
+              </div>
+              <div>
+                <span className="text-xs text-neutral-200 font-medium">
+                  Block degraded unverified merges
+                  {blockDegradedSaving && <RefreshCw className="inline ml-1.5 w-3 h-3 animate-spin text-neutral-400" />}
+                </span>
+                <p className="text-[11px] text-neutral-500 mt-0.5">
+                  When the test suite can't run (setup failure, suite skipped, probe error), Blueprint normally falls open and merges anyway.
+                  With this enabled, Blueprint holds the PR instead — requiring operator action to unblock.
+                </p>
+              </div>
+            </label>
+          )}
+          {!requiresCiChecks && projectId && (
+            <label className="flex items-start gap-3 cursor-pointer group">
+              <div className="mt-0.5 shrink-0">
+                <input
+                  type="checkbox"
+                  checked={blockNoTestEnabled}
+                  onChange={() => {}}
+                  className="sr-only peer"
+                  id="block-no-test-toggle"
+                />
+                <div
+                  onClick={() => {
+                    if (blockNoTestSaving) return;
+                    const next = !blockNoTestEnabled;
+                    setBlockNoTestEnabled(next);
+                    setBlockNoTestSaving(true);
+                    setBlockNoTestUnverifiedMerge(projectId, next)
+                      .then(resp => setBlockNoTestEnabled(resp.block_no_test_unverified_merge))
+                      .catch(err => { console.error('Failed to update block-no-test-unverified-merge:', err); setBlockNoTestEnabled(!next); })
+                      .finally(() => setBlockNoTestSaving(false));
+                  }}
+                  className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${blockNoTestEnabled ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+                >
+                  <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${blockNoTestEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
+                </div>
+              </div>
+              <div>
+                <span className="text-xs text-neutral-200 font-medium">
+                  Hold no-test-command merges for review
+                  {blockNoTestSaving && <RefreshCw className="inline ml-1.5 w-3 h-3 animate-spin text-neutral-400" />}
+                </span>
+                <p className="text-[11px] text-neutral-500 mt-0.5">
+                  When no test command is detected, Blueprint normally merges PRs UNVERIFIED.
+                  With this enabled, Blueprint holds these PRs for operator action instead.
+                </p>
+              </div>
+            </label>
+          )}
           {/* Backend-computed verdict for what the merge gate will actually do. */}
-          <MergeVerificationBanner verdict={effectiveVerdict} runtime={effectiveRuntime} />
+          <MergeVerificationBanner verdict={effectiveVerdict} runtime={effectiveRuntime} blockDegradedEnabled={!requiresCiChecks && blockDegradedEnabled} blockNoTestEnabled={!requiresCiChecks && blockNoTestEnabled} />
 
           {/* CI-presence pre-flight: detection + guidance only (never auto-flips the toggle). */}
           {buildConfig?.has_ci === true && (

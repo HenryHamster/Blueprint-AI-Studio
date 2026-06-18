@@ -267,6 +267,10 @@ async def spawn_review_second_opinion(
         # Challenge already in flight or already reconciled — never double-spawn.
         return None
 
+    _review_payload = review_task.first_payload
+    _viewport_shots = _review_payload.get("viewport_shot_entries")
+    _viewport_source = _review_payload.get("viewport_source_task_id")
+
     challenger = Task(
         project_id=review_task.project_id,
         title=f"[CHALLENGE] second-opinion panel review for PR #{pr_number}",
@@ -288,6 +292,14 @@ async def spawn_review_second_opinion(
                 "is_challenge": True,
                 "primary_verdict": verdict,
                 "primary_issues": list(issues or []),
+                **(
+                    {
+                        "viewport_shot_entries": _viewport_shots,
+                        "viewport_source_task_id": _viewport_source,
+                    }
+                    if _viewport_shots
+                    else {}
+                ),
             }
         ],
         context={
@@ -1372,6 +1384,10 @@ async def spawn_forward_quality_grader(
                 "prompt": prompt,
                 "base_branch": base_branch,
                 "scope": "small",
+                # Deliberate cost-efficiency tier: mid-pipeline second opinion,
+                # not the final merge gate (spawn_review_second_opinion = Opus).
+                # Accepted finding; pinned by test_spawn_forward_quality_grader_sets_sonnet_quality_tier.
+                "quality_tier": "sonnet",
             }
         ],
         context={
@@ -1477,6 +1493,10 @@ async def spawn_safeguard_challenge(
                 "prompt": prompt,
                 "base_branch": base_branch,
                 "scope": "small",
+                # Deliberate cost-efficiency tier: mid-pipeline second opinion,
+                # not the final merge gate. Accepted finding; pinned by
+                # test_spawn_safeguard_challenge_sets_sonnet_quality_tier.
+                "quality_tier": "sonnet",
             }
         ],
         context={
@@ -1815,6 +1835,10 @@ async def spawn_finding_challenge(
                 "prompt": prompt,
                 "base_branch": base_branch,
                 "scope": "small",
+                # Deliberate cost-efficiency tier: mid-pipeline second opinion,
+                # not the final merge gate. Accepted finding; pinned by
+                # test_spawn_finding_challenge_sets_sonnet_quality_tier.
+                "quality_tier": "sonnet",
             }
         ],
         context={

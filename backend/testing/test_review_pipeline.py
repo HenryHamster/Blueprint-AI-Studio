@@ -2687,7 +2687,9 @@ async def test_review_history_feedback_is_bounded(db_session, mocker):
     # legitimate freeform feedback, but within the 2 MB DB CHECK constraint so the
     # source_task INSERT succeeds while still exercising the bounding logic.
     fat_log = "AGENT-RUN-LOG " * 50_000  # 14 chars × 50_000 = 700_000 chars
-    assert len(fat_log) > 500_000  # >> REVIEW_FEEDBACK_MAX_CHARS; below 2 MB DB constraint
+    assert (
+        len(fat_log) > 500_000
+    )  # >> REVIEW_FEEDBACK_MAX_CHARS; below 2 MB DB constraint
 
     # The carried-forward history already holds a fat entry (models a pre-fix
     # in-flight row): the bound must self-heal it, not just the new entry.
@@ -6601,6 +6603,94 @@ async def test_fix_prompt_does_not_duplicate_prior_review_feedback(db_session, m
 
 
 @pytest.mark.asyncio
+async def test_fix_task_carries_viewport_shot_entries(db_session, mocker):
+    """Fix tasks must forward viewport_shot_entries from the original create task
+    so the fix agent can visually inspect and reason about the visual changes."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    # Create an original task with viewport_screenshots in its context
+    viewport_shots = [
+        {"name": "mobile_before.png", "storage_uri": "gs://bucket/mobile_before.png"},
+        {"name": "desktop_after.png", "storage_uri": "gs://bucket/desktop_after.png"},
+    ]
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={
+            "scope": "small",
+            "viewport_screenshots": viewport_shots,
+        },
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Spawn a review task and verify it carries viewport_shot_entries
+    review_task, review_created = await _spawn_pipeline_task(
+        original_task,
+        "review",
+        db_session,
+        pr_number=999,
+        branch="feat/b",
+        base_branch="main",
+    )
+
+    assert review_created is True and review_task is not None
+    review_shots = review_task.first_payload.get("viewport_shot_entries", [])
+    assert review_shots == viewport_shots, (
+        f"Review task should carry viewport_shot_entries from original task; got: {review_shots!r}"
+    )
+
+    # Now spawn a fix task from the review task
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 999,
+                "branch": "feat/b",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Spawn a fix task and verify it carries viewport_shot_entries
+    fix_prompt = "Address the visual alignment issue."
+    fix_task, fix_created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=999,
+        branch="feat/b",
+        base_branch="main",
+        fix_prompt=fix_prompt,
+    )
+
+    assert fix_created is True and fix_task is not None
+    fix_shots = fix_task.first_payload.get("viewport_shot_entries", [])
+    assert fix_shots == viewport_shots, (
+        f"Fix task should carry viewport_shot_entries from original task; got: {fix_shots!r}"
+    )
+    assert "viewport_source_task_id" in fix_task.first_payload, (
+        "Fix task should carry viewport_source_task_id to identify the source of screenshots"
+    )
+    assert fix_task.first_payload.get("viewport_source_task_id") == str(
+        original_task.id
+    ), (
+        f"Fix task viewport_source_task_id should reference original task; got: {fix_task.first_payload.get('viewport_source_task_id')!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_supersede_churn_halts_after_limit(db_session, mocker):
     """Two consecutive supersessions with no counted run in between must stop
     respawning and escalate the chain original."""
@@ -6915,7 +7005,9 @@ async def test_supersede_churn_bounded_when_orig_task_unloadable(db_session, moc
     # (CANCELLED), but the new task is not spawned because orig_task is unloadable.
     assert result is None, "Spawn must be halted when orig_task is unloadable"
     assert created is False
-    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_SUPERSEDE_CHURN
+    assert (source_task.context or {}).get(
+        SPAWN_REASON_KEY
+    ) == SPAWN_REASON_SUPERSEDE_CHURN
 
     # Verify the stale task was actually superseded (cancelled).
     await db_session.refresh(stale_review)
@@ -17234,4 +17326,65 @@ async def test_stuck_cycle_still_detected_after_feedback_cap(db_session, mocker)
     )
     await db_session.refresh(original_task)
     assert original_task.requires_approval is True
-    assert "stuck" in (original_task.latest_status_message or "").lower()
+    assert "stuck" in (original_task.latest_status_message or "").lower(), (
+        f"Status message should mention stuck cycle: {original_task.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_second_opinion_forwards_viewport_shots(db_session):
+    """panel_review challenger payload carries viewport_shot_entries forwarded
+    from the review task when the review payload contains them."""
+    from app.task_evaluators import spawn_review_second_opinion
+
+    project = Project(name="vp-test", user_id="user-1", github_repo="o/r")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    shot_entries = [
+        {"name": "before/comp/renders-375px"},
+        {"name": "after/comp/renders-375px"},
+    ]
+    review_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9001,
+                "branch": "feat/vp",
+                "base_branch": "main",
+                "original_task_id": str(uuid.uuid4()),
+                "viewport_shot_entries": shot_entries,
+                "viewport_source_task_id": "src-task-abc",
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    challenger = await spawn_review_second_opinion(
+        review_task,
+        db_session,
+        verdict="APPROVE",
+        issues=[],
+        feedback="lgtm",
+        pr_number=9001,
+        branch="feat/vp",
+        base_branch="main",
+        original_task_id=str(uuid.uuid4()),
+        original_prompt="do the thing",
+        investigated_files=["app/x.py"],
+    )
+
+    assert challenger is not None
+    cp = challenger.first_payload
+    assert cp.get("type") == "panel_review"
+    assert cp.get("viewport_shot_entries") == shot_entries, (
+        "challenger payload must carry viewport_shot_entries forwarded from the review task"
+    )
+    assert cp.get("viewport_source_task_id") == "src-task-abc"

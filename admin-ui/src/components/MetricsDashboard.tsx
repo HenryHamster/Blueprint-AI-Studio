@@ -2,7 +2,7 @@ import { useMemo, useState, useEffect, useCallback, useRef } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
-import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint } from '../api';
+import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry } from '../api';
 import { LaneDiagPanel } from './LaneDiagPanel';
 import { WarmStartOriginRow } from './WarmStartOriginRow';
 import { usePoller } from '../hooks/usePoller';
@@ -586,6 +586,76 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           </div>
         );
       })}
+      {data.panel_review_effectiveness && (
+        <div data-testid="panel-review-effectiveness-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+          <div className="flex justify-between items-center gap-4">
+            <span className="text-neutral-400">Panel review effectiveness</span>
+            <div className="space-y-1 min-w-0">
+              <NestedAxisLine
+                label="overturn_rate"
+                axis={{
+                  current: data.panel_review_effectiveness.overturn_rate,
+                  baseline: null,
+                  drift_pct: null,
+                }}
+                unit="%"
+                favorableDirection="higher"
+                percent
+              />
+            </div>
+          </div>
+          <div className="mt-1 text-[10px] text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
+            <span>challenged confirmed: {data.panel_review_effectiveness.challenged_confirmed ?? '—'}</span>
+            <span>revised: {data.panel_review_effectiveness.challenged_revised ?? '—'}</span>
+            <span>rejected: {data.panel_review_effectiveness.challenged_rejected ?? '—'}</span>
+            <span>total: {data.panel_review_effectiveness.total_challenged ?? '—'}</span>
+            {data.panel_review_effectiveness.cost_per_challenge_usd != null && (
+              <span>cost/challenge: ${data.panel_review_effectiveness.cost_per_challenge_usd.toFixed(4)}</span>
+            )}
+          </div>
+        </div>
+      )}
+      {data.vm_cost_attribution && data.vm_cost_attribution.by_task_type.length > 0 && (
+        <div data-testid="vm-cost-attribution-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+          <div className="flex justify-between items-center gap-4 mb-2">
+            <span className="text-neutral-400">VM cost by task type</span>
+            <span className="text-neutral-500 font-mono">${data.vm_cost_attribution.total_vm_usd.toFixed(2)} total</span>
+          </div>
+          {data.vm_cost_attribution_trend && data.vm_cost_attribution_trend.length >= 2 && (() => {
+            const trendPoints = data.vm_cost_attribution_trend!
+              .filter((e): e is typeof e & { total_vm_usd: number } => e.total_vm_usd != null)
+              .map(e => ({ v: e.total_vm_usd }));
+            if (trendPoints.length < 2) return null;
+            const first = trendPoints[0].v;
+            const last = trendPoints[trendPoints.length - 1].v;
+            const color = last <= first ? '#10b981' : '#ef4444';
+            return (
+              <div style={{ height: 24 }} className="mb-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={trendPoints} margin={{ top: 2, right: 0, left: 0, bottom: 2 }}>
+                    <Area dataKey="v" stroke={color} fill={color} fillOpacity={0.15} dot={false} strokeWidth={1.5} isAnimationActive={false} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            );
+          })()}
+          <div className="space-y-1">
+            {data.vm_cost_attribution.by_task_type.map((row) => (
+              <div key={row.task_type} className="flex items-center justify-between gap-3 text-[10px]">
+                <span className="text-neutral-500">{row.task_type}</span>
+                <div className="flex items-center gap-2 text-neutral-400 font-mono">
+                  <span>${row.total_cost_usd.toFixed(2)}</span>
+                  <span className="text-neutral-600">· {row.task_count}</span>
+                  <span className="text-neutral-600">· {row.merged_count}↓</span>
+                  {row.cost_per_merge != null && (
+                    <span className="text-neutral-600">· ${row.cost_per_merge.toFixed(4)}/merge</span>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {data.format_compliance && (
         <div data-testid="format-compliance-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
           <div className="flex justify-between items-center gap-4">
@@ -614,6 +684,25 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             <span>repairs: {data.format_compliance.repair_attempts ?? '—'}</span>
             <span>successes: {data.format_compliance.repair_successes ?? '—'}</span>
           </div>
+          {data.format_compliance_by_type && Object.keys(data.format_compliance_by_type).length > 0 && (
+            <div data-testid="format-compliance-by-type-block" className="mt-2 pt-2 border-t border-neutral-700/50">
+              <div className="text-[10px] text-neutral-500 mb-1 uppercase tracking-wide">By task type</div>
+              <div className="space-y-0.5">
+                {Object.entries(data.format_compliance_by_type).sort(([a], [b]) => a.localeCompare(b)).map(([taskType, entry]: [string, FormatComplianceByTypeEntry]) => (
+                  <div key={taskType} className="flex items-center justify-between gap-3 text-[10px]">
+                    <span className="text-neutral-500">{taskType}</span>
+                    <div className="flex items-center gap-2 text-neutral-400 font-mono">
+                      <span>{entry.format_compliance_rate != null ? `${(entry.format_compliance_rate * 100).toFixed(0)}%` : '—'}</span>
+                      <span className="text-neutral-600">· {entry.tasks_measured ?? '—'} tasks</span>
+                      {(entry.format_error_total ?? 0) > 0 && (
+                        <span className="text-red-400/70">· {entry.format_error_total} err</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
       {data.agent_timeout_rate && (

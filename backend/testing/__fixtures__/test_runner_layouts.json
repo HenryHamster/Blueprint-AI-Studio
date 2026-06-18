@@ -138,7 +138,9 @@
       }
     ],
     "detectable": true,
-    "family": "cargo"
+    "family": "cargo",
+    "provision_cmd": "cargo fetch",
+    "probe_cmd": "cargo check --quiet"
   },
   {
     "name": "tox_ini_root",
@@ -168,7 +170,9 @@
       }
     ],
     "detectable": true,
-    "family": "go"
+    "family": "go",
+    "provision_cmd": "go mod download",
+    "probe_cmd": "go build ./..."
   },
   {
     "name": "libs_web_pyproject_nested",
@@ -234,7 +238,8 @@
       }
     ],
     "detectable": true,
-    "family": "ruby"
+    "family": "ruby",
+    "provision_cmd": "bundle install"
   },
   {
     "name": "build_gradle_root",
@@ -244,7 +249,9 @@
       }
     ],
     "detectable": true,
-    "family": "gradle"
+    "family": "gradle",
+    "provision_cmd": "./gradlew dependencies --no-daemon",
+    "probe_cmd": "./gradlew classes --no-daemon"
   },
   {
     "name": "pom_xml_root",
@@ -254,7 +261,9 @@
       }
     ],
     "detectable": true,
-    "family": "maven"
+    "family": "maven",
+    "provision_cmd": "mvn -B dependency:go-offline",
+    "probe_cmd": "mvn -o -B test-compile"
   },
   {
     "name": "mix_exs_root",
@@ -264,7 +273,9 @@
       }
     ],
     "detectable": true,
-    "family": "elixir"
+    "family": "elixir",
+    "provision_cmd": "mix deps.get",
+    "probe_cmd": "mix compile"
   },
   {
     "name": "csproj_root",
@@ -274,7 +285,9 @@
       }
     ],
     "detectable": true,
-    "family": "dotnet"
+    "family": "dotnet",
+    "provision_cmd": "dotnet restore",
+    "probe_cmd": "dotnet build --nologo"
   },
   {
     "name": "phpunit_xml_root",
@@ -460,5 +473,119 @@
     ],
     "detectable": false,
     "family": null
+  },
+  {
+    "name": "services_api_pom_xml_nested",
+    "files": [
+      {
+        "path": "services/api/pom.xml"
+      }
+    ],
+    "detectable": true,
+    "family": "maven"
+  },
+  {
+    "name": "packages_web_gemfile_rakefile_nested",
+    "files": [
+      {
+        "path": "packages/web/Gemfile"
+      },
+      {
+        "path": "packages/web/Rakefile"
+      }
+    ],
+    "detectable": true,
+    "family": "ruby"
+  },
+  {
+    "name": "apps_backend_build_gradle_nested",
+    "files": [
+      {
+        "path": "apps/backend/build.gradle"
+      }
+    ],
+    "detectable": true,
+    "family": "gradle"
+  },
+  {
+    "name": "libs_core_mix_exs_nested",
+    "files": [
+      {
+        "path": "libs/core/mix.exs"
+      }
+    ],
+    "detectable": true,
+    "family": "elixir"
+  },
+  {
+    "name": "apps_svc_csproj_nested",
+    "files": [
+      {
+        "path": "apps/svc/Service.csproj"
+      }
+    ],
+    "detectable": true,
+    "family": "dotnet"
+  },
+  {
+    "name": "modules_api_phpunit_xml_nested",
+    "files": [
+      {
+        "path": "modules/api/phpunit.xml"
+      }
+    ],
+    "detectable": true,
+    "family": "php"
+  },
+  {
+    "name": "package_swift_root",
+    "files": [
+      {
+        "path": "Package.swift"
+      }
+    ],
+    "detectable": true,
+    "family": "swift"
+  },
+  {
+    "name": "build_sbt_root",
+    "files": [
+      {
+        "path": "build.sbt"
+      }
+    ],
+    "detectable": true,
+    "family": "scala"
+  },
+  {
+    "name": "bazel_workspace_root",
+    "files": [
+      {
+        "path": "WORKSPACE"
+      }
+    ],
+    "detectable": true,
+    "family": "bazel"
+  },
+  {
+    "name": "cabal_file_root",
+    "files": [
+      {
+        "path": "app.cabal"
+      }
+    ],
+    "detectable": true,
+    "family": "haskell"
+  },
+  {
+    "name": "pubspec_yaml_root",
+    "files": [
+      {
+        "path": "pubspec.yaml"
+      }
+    ],
+    "detectable": true,
+    "family": "flutter",
+    "provision_cmd": "flutter pub get"
   }
 ]

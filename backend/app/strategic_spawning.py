@@ -8,6 +8,7 @@ function slots in that module.
 import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -1351,6 +1352,7 @@ def _build_cycle_start_reconciliation(
     active_by_direction: dict[str, int] | None,
     held_by_direction: dict[str, int] | None = None,
     per_direction_delta: list[dict] | None = None,
+    running_update: str | None = None,
 ) -> dict | None:
     """Compute one authoritative cycle-start reconciliation of the strategic surfaces.
 
@@ -1397,6 +1399,12 @@ def _build_cycle_start_reconciliation(
         contradiction). Only directions with at least one ``verified_not_landed``
         title are surfaced as conflicts; the landed/unverifiable tallies ride in
         ``counts`` so nothing is silently truncated.
+      * ``phantom_direction_refs`` — direction IDs cited in
+        ``intent.current_focus`` or ``running_update`` prose (matching
+        ``d-[0-9a-f]{8}``) that do not resolve to any known direction in
+        ``direction_stats``. A phantom ref means the prose narrates a direction
+        that no longer exists (or was never created), silently persisting stale
+        framing across cycles.
 
     Returns ``None`` when there is nothing to reconcile (no active directions and
     no conflicts), so the caller omits the field for cold-start projects. Pure
@@ -1422,6 +1430,7 @@ def _build_cycle_start_reconciliation(
         for d in direction_stats
         if isinstance(d, dict) and d.get("status") == "active"
     ]
+    active_dir_ids: set[str] = {str(d["id"]) for d in active_dirs if d.get("id")}
     referenced_gap_ids: set[str] = {
         str(d["gap_id"]) for d in active_dirs if d.get("gap_id")
     }
@@ -1502,6 +1511,27 @@ def _build_cycle_start_reconciliation(
                 "direction_id": d.get("id"),
                 "text": _label(d.get("text")),
                 "reason": reason,
+            }
+        )
+
+    # 3b. Stale active_moves: gap.active_moves references a direction that is no
+    # longer active (retired, completed, deleted, or simply absent from the known
+    # direction set). The forward-linkage check (ungrounded_directions) catches
+    # directions whose gap_id is stale; this is the reverse: gap entries whose
+    # active_moves list is stale.
+    stale_active_moves: list[dict] = []
+    for g in gaps:
+        if not isinstance(g, dict) or g.get("status") not in ("active", "blocked"):
+            continue
+        moves = [str(m) for m in (g.get("active_moves") or []) if m]
+        stale = [m for m in moves if m not in active_dir_ids]
+        if not stale:
+            continue
+        stale_active_moves.append(
+            {
+                "gap_id": str(g.get("id") or ""),
+                "gap_name": _label(g.get("name")),
+                "stale_direction_ids": stale,
             }
         )
 
@@ -1655,13 +1685,39 @@ def _build_cycle_start_reconciliation(
         )
     )
 
+    # 6. Phantom direction-refs: prose cites a d-XXXXXXXX that resolves to nothing.
+    _DIR_REF_PAT = re.compile(r"\bd-([0-9a-f]{8})\b")
+    all_direction_ids: set[str] = {
+        str(d["id"]) for d in direction_stats if isinstance(d, dict) and d.get("id")
+    }
+    _prose_to_check: list[tuple[str, str]] = []
+    intent = pm.get("intent")
+    if isinstance(intent, dict):
+        cf = intent.get("current_focus")
+        if isinstance(cf, str) and cf:
+            _prose_to_check.append(("intent.current_focus", cf))
+    if isinstance(running_update, str) and running_update:
+        _prose_to_check.append(("running_update", running_update))
+    phantom_direction_refs: list[dict] = []
+    _seen_phantom: set[str] = set()
+    for field_name, prose in _prose_to_check:
+        for m in _DIR_REF_PAT.finditer(prose):
+            ref_id = f"d-{m.group(1)}"
+            if ref_id not in all_direction_ids and ref_id not in _seen_phantom:
+                _seen_phantom.add(ref_id)
+                phantom_direction_refs.append(
+                    {"direction_id": ref_id, "cited_in": field_name}
+                )
+
     # Nothing to reconcile (e.g. a cold-start project): let the caller omit it.
     if (
         not active_dirs
         and not capability_contradictions
         and not orphaned_gaps
         and not deferred_gap_count
+        and not stale_active_moves
         and not merge_accounting
+        and not phantom_direction_refs
     ):
         return None
 
@@ -1673,8 +1729,10 @@ def _build_cycle_start_reconciliation(
     capped_caps, caps_total = _cap(capability_contradictions)
     capped_orphans, orphans_total = _cap(orphaned_gaps)
     capped_ungrounded, ungrounded_total = _cap(ungrounded_directions)
+    capped_stale, stale_total = _cap(stale_active_moves)
     capped_pipeline, pipeline_dropped = _cap(direction_pipeline)
     capped_merge, merge_dropped = _cap(merge_accounting)
+    capped_phantoms, phantoms_total = _cap(phantom_direction_refs)
     # Cap each surfaced direction's not-landed title list too, preserving the
     # true count (``not_landed``) so the renderer can show "+N more".
     for m in capped_merge:
@@ -1690,13 +1748,16 @@ def _build_cycle_start_reconciliation(
         "capability_contradictions": capped_caps,
         "orphaned_gaps": capped_orphans,
         "ungrounded_directions": capped_ungrounded,
+        "stale_active_moves": capped_stale,
         "direction_pipeline": capped_pipeline,
         "merge_accounting": capped_merge,
+        "phantom_direction_refs": capped_phantoms,
         "counts": {
             # True totals (shown + overflow) so the renderer can say "+N more".
             "capability_contradictions": len(capped_caps) + caps_total,
             "orphaned_gaps": len(capped_orphans) + orphans_total,
             "ungrounded_directions": len(capped_ungrounded) + ungrounded_total,
+            "stale_active_moves": len(capped_stale) + stale_total,
             "deferred_gaps": deferred_gap_count,
             "active_directions": len(active_dirs),
             "direction_pipeline": len(direction_pipeline),
@@ -1712,6 +1773,7 @@ def _build_cycle_start_reconciliation(
             "merge_landed": merge_landed_total,
             "merge_not_landed": merge_not_landed_total,
             "merge_unverifiable": merge_unverifiable_total,
+            "phantom_direction_refs": len(capped_phantoms) + phantoms_total,
         },
     }
 
@@ -2646,7 +2708,6 @@ def _rollup_body_is_trivial(body: str | None) -> bool:
     can substitute per-subtask detail instead."""
     if not body:
         return True
-    import re
 
     return bool(re.match(r"^\s*Rollup of \d+ subtasks?\b", body))
 
@@ -2658,7 +2719,6 @@ def _recent_commit_messages_match_task(
     pr_numbers: set[int],
 ) -> bool:
     """Return True when a bounded commit-message sample names this task."""
-    import re
 
     normalized_messages = [" ".join(m.casefold().split()) for m in messages]
     normalized_title = " ".join((title or "").casefold().split())
@@ -5501,7 +5561,7 @@ async def _spawn_strategic_review(
             _requal_ready = True
             if _candidate_behind:
                 try:
-                    from app.release_readiness import (  # noqa: PLC0415
+                    from app.release_readiness import (
                         compute_requalification_readiness,
                     )
 
@@ -5874,6 +5934,7 @@ async def _spawn_strategic_review(
         (recent_interventions or {}).get("active_by_direction"),
         (recent_interventions or {}).get("held_by_direction"),
         (recent_interventions or {}).get("per_direction_delta"),
+        running_update=project.running_update or "",
     )
     # Soft size/health signal from the DURABLE pre-trim model so counts are honest
     # (the agent view above is trimmed). Fail-open: None when the durable model

@@ -45,6 +45,7 @@ from app.models import (
 from app.time_utils import _utcnow
 from app.warm_pool import (
     clear_lane_warm_workspace_if_matching_member,
+    clear_lanes_for_torn_down_vm,
     IDLE_POOL_STATES,
     LIVE_POOL_STATES,
     WARM_POOL_PIN_KEY,
@@ -548,6 +549,24 @@ async def retire_and_delete_pool_vm(
             )
         await session.delete(fresh)
         await session.commit()
+    # Clear workspace state on any lane that was warm-reserved or leased to
+    # this VM — covers ALL teardown paths (drain, cost-guard, stale-image,
+    # idle-reaper) so no lane is left with a dangling workspace_vm_instance_id.
+    # Record force_expired cause for every cleared lane so reservation-cause
+    # telemetry captures forced expirations from all teardown paths, not only
+    # the idle-reaper's own call-site.
+    cleared_lane_ids = await clear_lanes_for_torn_down_vm(session, vm_id)
+    if cleared_lane_ids:
+        from app.warm_pool import record_lane_reservation_cause
+
+        for lane_id in cleared_lane_ids:
+            await record_lane_reservation_cause(session, lane_id, "force_expired")
+        await session.commit()
+        logger.info(
+            "[WARM-POOL] cleared %d lane workspace(s) for torn-down VM %s",
+            len(cleared_lane_ids),
+            vm_id,
+        )
     logger.info(
         "[WARM-POOL] retired pool VM vm_instance_id=%s reason=%s", vm_id, reason
     )
@@ -2202,4 +2221,24 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                 vm_id,
                 exc_info=True,
             )
+
+    # Periodic defense-in-depth: reclaim lanes whose backing VM was removed
+    # outside retire_and_delete_pool_vm (e.g. GCP console, API, or a crash
+    # between VM deletion and the lane-state clear).
+    try:
+        from app.improvement_lane_ops import reclaim_orphaned_lane_workspace_states
+
+        reclaimed = await reclaim_orphaned_lane_workspace_states(session)
+        if reclaimed:
+            await session.commit()
+            logger.info(
+                "[WARM-POOL] periodic orphan reclaim cleared %d lane workspace state(s)",
+                reclaimed,
+            )
+    except Exception:
+        logger.warning(
+            "[WARM-POOL] periodic orphan reclaim failed",
+            exc_info=True,
+        )
+
     return retired

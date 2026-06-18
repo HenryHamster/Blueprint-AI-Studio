@@ -11000,6 +11000,136 @@ async def test_unblock_sweep_conflict_blocker_with_stale_dep_preserves_first_blo
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_conflict_requeue_preserves_defer_counter(
+    reaper_db, mocker
+):
+    """Optimistic conflict requeue must NOT wipe _precondition_defer.
+
+    A task that has been deferred N times on the same file-conflict blocker
+    must keep its counter across BLOCKED→QUEUED episodes so dispatch can
+    accumulate toward the escalation threshold instead of cycling forever.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    blocker_key = "file conflict on src/foo.py"
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        depends_on=[],
+        context={
+            "_precondition_defer": {"key": blocker_key, "count": 3},
+            "_precondition_escalated_key": blocker_key,
+            "_blocked_first_at": {"key": blocker_key, "at": "2026-01-01T00:00:00"},
+        },
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    ctx = t.context or {}
+    # Defer counter and escalation stamp must survive the optimistic requeue.
+    defer = ctx.get("_precondition_defer")
+    assert defer is not None, (
+        "_precondition_defer must not be wiped on optimistic requeue"
+    )
+    assert defer.get("key") == blocker_key
+    assert defer.get("count") == 3
+    assert ctx.get("_precondition_escalated_key") == blocker_key
+
+
+@pytest.mark.asyncio
+async def test_genuine_dep_clear_wipes_defer_counter(reaper_db, mocker):
+    """A genuine dependency clear must wipe _precondition_defer and _precondition_escalated_key.
+
+    When a real blocking dependency completes and _clear_blocked_fields is called
+    with preserve_first_blocked=False, the defer counter must be erased so a fresh
+    block starts counting from zero.
+    """
+    from app.blocked_task_unblock_sweeps import _clear_blocked_fields
+
+    project = await _make_project(reaper_db)
+    blocker_key = "file conflict on src/foo.py"
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        depends_on=[],
+        context={
+            "_precondition_defer": {"key": blocker_key, "count": 3},
+            "_precondition_escalated_key": blocker_key,
+            "_blocked_first_at": {"key": blocker_key, "at": "2026-01-01T00:00:00"},
+        },
+    )
+
+    _clear_blocked_fields(t, preserve_first_blocked=False)
+
+    ctx = t.context or {}
+    assert "_precondition_defer" not in ctx, (
+        "_precondition_defer must be wiped on genuine clear"
+    )
+    assert "_precondition_escalated_key" not in ctx, (
+        "_precondition_escalated_key must be wiped on genuine clear"
+    )
+    assert "_blocked_first_at" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_clear_blocked_fields_resets_optimistic_budget_on_genuine_clear(
+    reaper_db,
+):
+    """_clear_blocked_fields wipes _blocked_optimistic_retries on genuine clear and
+    preserves it on optimistic requeue.
+
+    A genuine dependency clear (preserve_first_blocked=False) must reset the counter
+    so a later, unrelated block starts with a fresh budget.  An optimistic requeue
+    (preserve_first_blocked=True) must keep the counter so the cap is correctly
+    enforced across requeue episodes.
+    """
+    from app.blocked_task_unblock_sweeps import _clear_blocked_fields
+
+    project = await _make_project(reaper_db)
+
+    # --- genuine clear path ---
+    t_genuine = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        depends_on=[],
+        context={
+            "_blocked_optimistic_retries": 2,
+            "_blocked_first_at": {"key": "k", "at": "2026-01-01T00:00:00"},
+        },
+    )
+    _clear_blocked_fields(t_genuine, preserve_first_blocked=False)
+    ctx_genuine = t_genuine.context or {}
+    assert "_blocked_optimistic_retries" not in ctx_genuine, (
+        "_blocked_optimistic_retries must be wiped on genuine clear so a fresh block"
+        " starts with a full budget"
+    )
+
+    # --- optimistic requeue path ---
+    t_optimistic = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="file_conflict",
+        depends_on=[],
+        context={
+            "_blocked_optimistic_retries": 1,
+            "_blocked_first_at": {"key": "k", "at": "2026-01-01T00:00:00"},
+        },
+    )
+    _clear_blocked_fields(t_optimistic, preserve_first_blocked=True)
+    ctx_optimistic = t_optimistic.context or {}
+    assert ctx_optimistic.get("_blocked_optimistic_retries") == 1, (
+        "_blocked_optimistic_retries must be preserved on optimistic requeue so the"
+        " cap accumulates across episodes"
+    )
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_clears_failure_class_so_later_genuine_failure_reclassifies(
     reaper_db, mocker
 ):

@@ -701,6 +701,169 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
       expect(prompt).toContain('check for existing mitigations');
     });
   });
+
+  // ── TEST_PATH_RE gap-1: root-level test directories ────────────────────────
+  describe('computed_test_erosion — TEST_PATH_RE root-level path detection', () => {
+    beforeEach(() => vi.clearAllMocks());
+
+    it('detects a deleted file under a root-level testing/ directory (no leading slash)', async () => {
+      // "testing/test_foo.py" has no leading slash — the old regex required one.
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') {
+          return 'D\ttesting/test_foo.py\n';
+        }
+        if (Array.isArray(a) && a[0] === 'diff') return '';
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as { computed_test_erosion?: { deleted_test_files: string[] } };
+      expect(stored.computed_test_erosion?.deleted_test_files).toContain('testing/test_foo.py');
+    });
+
+    it('detects a deleted file under a root-level __tests__/ directory (no leading slash)', async () => {
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') {
+          return 'D\t__tests__/foo.test.ts\n';
+        }
+        if (Array.isArray(a) && a[0] === 'diff') return '';
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as { computed_test_erosion?: { deleted_test_files: string[] } };
+      expect(stored.computed_test_erosion?.deleted_test_files).toContain('__tests__/foo.test.ts');
+    });
+  });
+
+  // ── Gap-2: it(/describe( double-counting ──────────────────────────────────
+  describe('computed_test_erosion — no double-counting of it(/describe( lines', () => {
+    beforeEach(() => vi.clearAllMocks());
+
+    it('an added it( line increments test_count_delta but not assertion_delta', async () => {
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') return '';
+        if (Array.isArray(a) && a[0] === 'diff') {
+          // A single added it( line — should only count toward testCountDelta.
+          return "+  it('does something', () => {\n";
+        }
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: { assertion_delta: number; test_count_delta: number };
+      };
+      // it( is a test-function declaration, not an assertion.
+      expect(stored.computed_test_erosion?.test_count_delta).toBe(1);
+      expect(stored.computed_test_erosion?.assertion_delta).toBe(0);
+    });
+  });
+
+  // ── Gap-3: authorized deletion lines excluded from graded penalty ──────────
+  describe('computed_test_erosion — deleted-file lines excluded from delta', () => {
+    beforeEach(() => vi.clearAllMocks());
+
+    it('lines removed from a deleted test file do not penalize assertion_delta or test_count_delta', async () => {
+      // The deleted file contains assertion/test lines that would make delta negative
+      // if counted — but those lines belong to the hard-blocker dimension, not the
+      // graded-penalty dimension.
+      const deletedFileDiff = [
+        'diff --git a/testing/test_gone.py b/testing/test_gone.py',
+        '--- a/testing/test_gone.py',
+        '+++ /dev/null',
+        '-def test_something():',
+        '-    assert result == 42',
+        '-    assert other == True',
+      ].join('\n') + '\n';
+
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') {
+          return 'D\ttesting/test_gone.py\n';
+        }
+        if (Array.isArray(a) && a[0] === 'diff') return deletedFileDiff;
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: {
+          deleted_test_files: string[];
+          assertion_delta: number;
+          test_count_delta: number;
+        };
+      };
+      // The file must be detected as deleted.
+      expect(stored.computed_test_erosion?.deleted_test_files).toContain('testing/test_gone.py');
+      // But its removed lines must NOT feed the graded penalty.
+      expect(stored.computed_test_erosion?.assertion_delta).toBe(0);
+      expect(stored.computed_test_erosion?.test_count_delta).toBe(0);
+    });
+
+    it('within-file test removals (not wholly-deleted file) still penalize delta', async () => {
+      // A live file that had some tests removed — these should still count.
+      const partialDiff = [
+        'diff --git a/testing/test_live.py b/testing/test_live.py',
+        '--- a/testing/test_live.py',
+        '+++ b/testing/test_live.py',
+        '-def test_old():',
+        '-    assert value == 1',
+      ].join('\n') + '\n';
+
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') return '';
+        if (Array.isArray(a) && a[0] === 'diff') return partialDiff;
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: { assertion_delta: number; test_count_delta: number };
+      };
+      expect(stored.computed_test_erosion?.test_count_delta).toBe(-1);
+      expect(stored.computed_test_erosion?.assertion_delta).toBe(-1);
+    });
+  });
 });
 
 // ── resolveCandidateSha — payload/context SHA resolution + validation ─────────

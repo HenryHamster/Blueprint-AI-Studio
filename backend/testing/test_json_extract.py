@@ -105,6 +105,15 @@ def test_scan_balanced_json_objects_empty_text_returns_none():
     assert scan_balanced_json_objects("", required_key="verdict") is None
 
 
+def test_scan_balanced_json_objects_string_with_braces():
+    # Braces inside string values must not confuse the depth counter.
+    text = '{"code": "if (x) { return; }", "verdict": "APPROVE"}'
+    result = scan_balanced_json_objects(text, required_key="verdict")
+    assert result is not None
+    assert result["verdict"] == "APPROVE"
+    assert result["code"] == "if (x) { return; }"
+
+
 # ---------------------------------------------------------------------------
 # _extract_json_array
 # ---------------------------------------------------------------------------

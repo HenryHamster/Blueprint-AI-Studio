@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from app.ci_resolution import (
@@ -25,22 +26,38 @@ from app.migration_reconciliation import AUTHORIZED_DIVERGENCES
 
 logger = logging.getLogger(__name__)
 
-# Authorized dead-code test deletions — file basenames (or path suffixes) that
-# the qualifier treats as non-erosion.  Mirrors the AUTHORIZED_DIVERGENCES
+
+@dataclass(frozen=True)
+class AuthorizedTestDeletion:
+    """A test-file deletion that the qualifier treats as non-erosion.
+
+    Each entry requires three documentation fields so the allowlist cannot be
+    widened silently — ``test_invariants.py::test_authorized_test_deletions_require_documentation``
+    enforces their presence in CI.
+    """
+
+    path_suffix: str  # file basename or path suffix matched against deleted test paths
+    co_deleted_subject: str  # the module/file/function co-deleted with this test
+    commit_ref: str  # commit SHA or ref where the deletion was made
+    rationale: str  # why this deletion is safe (non-erosion)
+
+
+# Authorized dead-code test deletions.  Mirrors the AUTHORIZED_DIVERGENCES
 # pattern in migration_reconciliation.py.  A deleted test file whose path ends
-# with any entry here is excluded from the hard-blocker gate so a clean
-# dead-code removal does not veto a promotion.
+# with any entry's path_suffix is excluded from the hard-blocker gate so a
+# clean dead-code removal does not veto a promotion.
 #
 # Entry criteria: the test file must have zero live callers / test subjects
 # remaining in the candidate (the code it exercised was also co-deleted), AND
 # the deletion must be explicitly authorized here so it cannot silently suppress
 # a genuine test-erosion signal.
-AUTHORIZED_TEST_DELETIONS: frozenset[str] = frozenset(
-    {
-        # viewportRegression.test.ts: co-deleted with viewportRegression.ts
-        # (commit 3085d8d8); parseViewportSubkey had zero production callers.
-        "viewportRegression.test.ts",
-    }
+AUTHORIZED_TEST_DELETIONS: tuple[AuthorizedTestDeletion, ...] = (
+    AuthorizedTestDeletion(
+        path_suffix="viewportRegression.test.ts",
+        co_deleted_subject="viewportRegression.ts (parseViewportSubkey)",
+        commit_ref="3085d8d8",
+        rationale="parseViewportSubkey had zero production callers; test and subject co-deleted together.",
+    ),
 )
 
 # Hardcoded fallback used when promotion_policy.yaml is missing, unreadable, or
@@ -450,11 +467,16 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
 
     deleted = erosion.get("deleted_test_files")
     if isinstance(deleted, list) and len(deleted) > 0:
-        # Exclude authorized dead-code deletions (matching by path suffix).
+        # Exclude authorized dead-code deletions (anchored path-suffix match:
+        # requires a '/' before the suffix so that e.g. "evilFoo.test.ts"
+        # does not accidentally authorize "Foo.test.ts").
         unauthorized = [
             f
             for f in deleted
-            if not any(str(f).endswith(auth) for auth in AUTHORIZED_TEST_DELETIONS)
+            if not any(
+                str(f) == entry.path_suffix or str(f).endswith("/" + entry.path_suffix)
+                for entry in AUTHORIZED_TEST_DELETIONS
+            )
         ]
         if unauthorized:
             # Hard blocker — any non-authorized deleted test file forces a non-promote.
@@ -688,14 +710,17 @@ def _compact_challenge_finding(finding: Any) -> dict[str, str] | None:
     return compact
 
 
-def _compact_challenge_findings(findings: list[Any]) -> list[dict[str, str]]:
+def _compact_challenge_findings(
+    findings: list[Any],
+) -> tuple[list[dict[str, str]], bool]:
     compacted = [
         compact
         for finding in findings
         if (compact := _compact_challenge_finding(finding)) is not None
     ]
     compacted.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 3))
-    return compacted[:_CHALLENGE_FINDING_MAX]
+    truncated = len(compacted) > _CHALLENGE_FINDING_MAX
+    return compacted[:_CHALLENGE_FINDING_MAX], truncated
 
 
 def _finding_match_key(finding: dict[str, str]) -> tuple[str, str]:
@@ -744,24 +769,27 @@ def _compute_audit_challenge_synthesis(
             },
             "counts": {
                 "primary_findings": len(
-                    _compact_challenge_findings(_raw_audit_findings(primary_report))
+                    _compact_challenge_findings(_raw_audit_findings(primary_report))[0]
                 ),
                 "challenger_missing": 0,
                 "challenger_overstated": 0,
             },
+            "challenge_findings_truncated": False,
         }
     if not isinstance(challenge_report, dict):
         return _compute_audit_challenge_synthesis(
             primary_report, None, challenge_reason="challenge_absent"
         )
 
-    primary_findings = _compact_challenge_findings(_raw_audit_findings(primary_report))
+    primary_findings, primary_truncated = _compact_challenge_findings(
+        _raw_audit_findings(primary_report)
+    )
     missing_raw = challenge_report.get("missing_findings")
     overstated_raw = challenge_report.get("overstated_findings")
-    missing_findings = _compact_challenge_findings(
+    missing_findings, missing_truncated = _compact_challenge_findings(
         missing_raw if isinstance(missing_raw, list) else []
     )
-    overstated_findings = _compact_challenge_findings(
+    overstated_findings, overstated_truncated = _compact_challenge_findings(
         overstated_raw if isinstance(overstated_raw, list) else []
     )
 
@@ -831,6 +859,9 @@ def _compute_audit_challenge_synthesis(
             "challenger_missing": len(missing_findings),
             "challenger_overstated": len(overstated_findings),
         },
+        "challenge_findings_truncated": primary_truncated
+        or missing_truncated
+        or overstated_truncated,
     }
 
 

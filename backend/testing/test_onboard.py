@@ -21,6 +21,15 @@ TEST_USER_ID = "test-user-123"
 TEST_RUNNER_FIXTURE_PATH = (
     Path(__file__).resolve().parent / "__fixtures__" / "test_runner_layouts.json"
 )
+TEST_RUNNER_COMMANDS_FIXTURE_PATH = (
+    Path(__file__).resolve().parent / "__fixtures__" / "test_runner_commands.json"
+)
+
+# Families where the backend's stored command intentionally differs from the
+# agent's auto-detect command in test_runner_commands.json:
+#   pytest — backend stores "python3 -m pytest"; agent adds "-x -q" flags
+#   script — dynamic args (bash <script>), varies per repo
+_BACKEND_COMMAND_SKIP_FAMILIES: frozenset[str] = frozenset({"pytest", "script"})
 
 
 def _load_test_runner_layouts():
@@ -28,7 +37,13 @@ def _load_test_runner_layouts():
         return json.load(fh)
 
 
+def _load_test_runner_commands():
+    with TEST_RUNNER_COMMANDS_FIXTURE_PATH.open("r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
 TEST_RUNNER_LAYOUTS = _load_test_runner_layouts()
+TEST_RUNNER_COMMANDS = _load_test_runner_commands()
 
 
 def _listing_resp(items, status_code=200):
@@ -101,7 +116,7 @@ def _make_layout_github_side_effect(layout):
     prefix = "https://api.github.com/repos/owner/repo/contents/"
 
     def _route(method, url, headers, *args, **kwargs):
-        path = url[len(prefix):] if url.startswith(prefix) else url
+        path = url[len(prefix) :] if url.startswith(prefix) else url
         if path in file_contents:
             return _file_content_resp(file_contents[path])
         if path in dir_listings:
@@ -149,6 +164,16 @@ def _backend_family_for_directory(directory):
         return "php"
     if test_cmd == "composer test":
         return "composer"
+    if test_cmd == "swift test":
+        return "swift"
+    if test_cmd == "sbt test":
+        return "scala"
+    if test_cmd == "bazel test //...":
+        return "bazel"
+    if test_cmd == "cabal test all":
+        return "haskell"
+    if test_cmd == "flutter test":
+        return "flutter"
     if test_cmd.startswith("bash "):
         return "script"
     return None
@@ -682,7 +707,6 @@ class TestOnboardBranchConfig:
         # Empty list is a meaningful "disable" signal — must be preserved, not dropped.
         assert "stale_branch_prefixes" in bc
         assert bc["stale_branch_prefixes"] == []
-
 
     @pytest.mark.asyncio
     async def test_onboard_build_config_override_migration_survives_validation(
@@ -1363,14 +1387,18 @@ class TestOnboardStrategicIntentSeed:
         await db_session.commit()
 
         rows = (
-            await db_session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.from_type == "user",
-                    ProjectMessage.status == "open",
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.from_type == "user",
+                        ProjectMessage.status == "open",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(rows) == 1
         assert rows[0].content == "Reach product-market fit"
 
@@ -1387,7 +1415,9 @@ class TestBuildConfigDetection:
         root_resp.json.return_value = root_files
         # A pyproject-only dir's test command is gated on the body configuring
         # pytest (matching the runtime), so the detector fetches its content.
-        pyproject_resp = _file_content_resp("[tool.pytest.ini_options]\nminversion = '7'\n")
+        pyproject_resp = _file_content_resp(
+            "[tool.pytest.ini_options]\nminversion = '7'\n"
+        )
 
         with patch(
             "app.github._github_request",
@@ -1525,7 +1555,9 @@ class TestBuildConfigDetection:
     async def test_detect_build_config_bare_pyproject_keeps_lint_only(self):
         """A pyproject.toml without a pytest signal is Python-for-lint, not pytest-gated."""
         root = _listing_resp([{"name": "pyproject.toml", "type": "file"}])
-        pyproject = _file_content_resp("[build-system]\nrequires = [\"setuptools>=68\"]\n")
+        pyproject = _file_content_resp(
+            '[build-system]\nrequires = ["setuptools>=68"]\n'
+        )
 
         with patch(
             "app.github._github_request",
@@ -1596,9 +1628,7 @@ class TestBuildConfigDetection:
             config = await _detect_build_config("fake-token", "owner", "repo")
 
         assert config["language"] == "python"
-        python_dirs = [
-            d for d in config["directories"] if d.get("type") == "python"
-        ]
+        python_dirs = [d for d in config["directories"] if d.get("type") == "python"]
         assert len(python_dirs) == 1
         assert python_dirs[0]["test_cmd"] == "python3 -m pytest"
 
@@ -1634,9 +1664,7 @@ class TestBuildConfigDetection:
         )
 
         assert has_detectable_tests(project) is True
-        assert (
-            should_run_no_ci_test_gate(project, "main", gate_enabled=True) is True
-        )
+        assert should_run_no_ci_test_gate(project, "main", gate_enabled=True) is True
 
     @pytest.mark.asyncio
     async def test_detect_build_config_forwards_ref_to_every_request(self):
@@ -1672,9 +1700,7 @@ class TestBuildConfigDetection:
                 return_value=None,
             ),
         ):
-            await _detect_build_config(
-                "fake-token", "owner", "repo", ref="feature-x"
-            )
+            await _detect_build_config("fake-token", "owner", "repo", ref="feature-x")
 
         assert mock_req.call_count == 3
         for call in mock_req.call_args_list:
@@ -1790,9 +1816,7 @@ class TestBuildConfigDetection:
             config = await _detect_build_config("fake-token", "owner", "repo")
 
         assert config["language"] == "mixed"
-        directories = [
-            item for item in config["directories"] if item["path"] == "./"
-        ]
+        directories = [item for item in config["directories"] if item["path"] == "./"]
         assert len(directories) == 2
         directories_by_type = {item["type"]: item for item in directories}
         assert directories_by_type["python"]["lint_cmd"] == "ruff check"
@@ -2271,9 +2295,7 @@ class TestDetectorRuntimeParity:
             integration_branch="main",
             build_config={"requires_ci_checks": False, **config},
         )
-        assert (
-            should_run_no_ci_test_gate(project, "main", gate_enabled=True) is False
-        )
+        assert should_run_no_ci_test_gate(project, "main", gate_enabled=True) is False
 
 
 class TestFallbackTestEntrypointDetection:
@@ -2315,7 +2337,9 @@ class TestFallbackTestEntrypointDetection:
     async def test_makefile_without_test_target_emits_no_test_cmd(self):
         """A Makefile with NO ``test:`` target must not emit ``make test``."""
         root = _listing_resp([{"name": "Makefile", "type": "file"}])
-        makefile = _file_content_resp("build:\n\tgo build ./...\n\nlint:\n\truff check\n")
+        makefile = _file_content_resp(
+            "build:\n\tgo build ./...\n\nlint:\n\truff check\n"
+        )
 
         with patch(
             "app.github._github_request",
@@ -2351,7 +2375,7 @@ class TestFallbackTestEntrypointDetection:
     async def test_justfile_with_test_target_emits_just_test(self):
         root = _listing_resp([{"name": "Justfile", "type": "file"}])
         justfile = _file_content_resp(
-            "set shell := [\"bash\", \"-eu\", \"-o\", \"pipefail\", \"-c\"]\n\ntest:\n\tcargo test\n"
+            'set shell := ["bash", "-eu", "-o", "pipefail", "-c"]\n\ntest:\n\tcargo test\n'
         )
 
         with patch(
@@ -2776,9 +2800,7 @@ class TestFallbackTestEntrypointDetection:
             integration_branch="main",
             build_config={"requires_ci_checks": False, **config},
         )
-        assert (
-            should_run_no_ci_test_gate(project, "main", gate_enabled=True) is True
-        )
+        assert should_run_no_ci_test_gate(project, "main", gate_enabled=True) is True
 
 
 class TestSharedTestRunnerLayouts:
@@ -2807,7 +2829,10 @@ class TestSharedTestRunnerLayouts:
             config = await _detect_build_config("fake-token", "owner", "repo")
 
         directories = config.get("directories") or []
-        assert any(str(item.get("test_cmd") or "").strip() for item in directories) is layout["detectable"]
+        assert (
+            any(str(item.get("test_cmd") or "").strip() for item in directories)
+            is layout["detectable"]
+        )
 
         project = Project(
             name=f"shared-layout-{layout['name']}",
@@ -2849,6 +2874,85 @@ class TestSharedTestRunnerLayouts:
         )
         assert actual_families == expected_families
 
+        # Strengthened parity: for each non-skip family, assert the backend's
+        # detected test_cmd matches the shared commands fixture — so trailing-
+        # argument drift (e.g. a flag added only on the agent side) is caught here.
+        actual_cmd_by_family: dict[str, str] = {}
+        for d in directories:
+            cmd = str(d.get("test_cmd") or "").strip()
+            if cmd:
+                fam = _backend_family_for_directory(d)
+                if fam:
+                    actual_cmd_by_family[fam] = cmd
+
+        for family in expected_families:
+            if family in _BACKEND_COMMAND_SKIP_FAMILIES:
+                continue
+            assert family in TEST_RUNNER_COMMANDS, (
+                f"commands fixture has no entry for detectable family '{family}'"
+            )
+            assert family in actual_cmd_by_family, (
+                f"no directory detected for expected family '{family}'"
+            )
+            assert actual_cmd_by_family[family] == TEST_RUNNER_COMMANDS[family], (
+                f"backend emits '{actual_cmd_by_family[family]}' for family '{family}', "
+                f"but commands fixture says '{TEST_RUNNER_COMMANDS[family]}'"
+            )
+
+    def test_detector_parity_extra_family_table(self):
+        """Every detectable non-skip onboard family has a non-empty entry in the
+        shared commands fixture — backend analog to the agent's coverage guard.
+
+        Fails if a new ecosystem lands in the shared layouts but its command is
+        missing from test_runner_commands.json, which would silently degrade the
+        per-layout full-command assertion in test_shared_layout_parity above.
+        """
+        detectable_families: set[str] = set()
+        for layout in TEST_RUNNER_LAYOUTS:
+            if not layout.get("detectable"):
+                continue
+            for family in layout.get("onboard_families") or [layout.get("family")]:
+                if family and family not in _BACKEND_COMMAND_SKIP_FAMILIES:
+                    detectable_families.add(family)
+
+        missing = [
+            f
+            for f in sorted(detectable_families)
+            if not TEST_RUNNER_COMMANDS.get(f) or not TEST_RUNNER_COMMANDS[f].strip()
+        ]
+        assert missing == [], (
+            f"onboard families missing from commands fixture: {missing}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_onboard_detects_swiftpm_test_command(self):
+        """Onboarding detector emits 'swift test' for a Package.swift layout."""
+        from app.ci_resolution import has_detectable_tests
+
+        layout = {
+            "files": [{"path": "Package.swift"}],
+        }
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=_make_layout_github_side_effect(layout),
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        directories = config.get("directories") or []
+        assert any(d.get("test_cmd") == "swift test" for d in directories), (
+            f"expected 'swift test' in directories, got: {directories}"
+        )
+        project = Project(
+            name="swift-pm-test",
+            user_id=TEST_USER_ID,
+            github_owner="owner",
+            github_repo="repo",
+            integration_branch="main",
+            build_config=config,
+        )
+        assert has_detectable_tests(project) is True
+
 
 class TestMaybeRefreshEmptyBuildConfig:
     """Auto-refresh of an empty stored build_config once a repo gains structure."""
@@ -2877,7 +2981,11 @@ class TestMaybeRefreshEmptyBuildConfig:
             github_owner="acme",
             github_repo="bootstrap-repo",
             integration_branch="develop",
-            build_config={"language": "python", "directories": [], "repo_is_empty": True},
+            build_config={
+                "language": "python",
+                "directories": [],
+                "repo_is_empty": True,
+            },
         )
         db_session.add(project)
         await db_session.commit()
@@ -3031,7 +3139,11 @@ class TestMaybeRefreshEmptyBuildConfig:
             github_owner="acme",
             github_repo="boom-repo",
             integration_branch="develop",
-            build_config={"language": "python", "directories": [], "repo_is_empty": True},
+            build_config={
+                "language": "python",
+                "directories": [],
+                "repo_is_empty": True,
+            },
         )
         db_session.add(project)
         await db_session.commit()
@@ -3233,7 +3345,11 @@ class TestMaybeRefreshEmptyBuildConfig:
             github_owner="acme",
             github_repo="cooldown-repo",
             integration_branch="main",
-            build_config={"language": "python", "directories": [], "repo_is_empty": True},
+            build_config={
+                "language": "python",
+                "directories": [],
+                "repo_is_empty": True,
+            },
         )
         db_session.add(project)
         await db_session.commit()
@@ -3325,9 +3441,7 @@ class TestOnboardDetectionIncompleteMarker:
         self, client: AsyncClient, db_session
     ):
         """A non-200 listing (detector returns {}) => marker True."""
-        project_id = await self._onboard(
-            client, "empty-onboard", detect_return={}
-        )
+        project_id = await self._onboard(client, "empty-onboard", detect_return={})
         project = await db_session.get(Project, project_id)
         assert (project.build_config or {}).get("detection_incomplete") is True
 
@@ -3467,15 +3581,18 @@ class TestOnboardRepoBootstrapSpawn:
         assert project is not None
 
         tasks = (
-            await db_session.execute(
-                _select(Task).where(
-                    Task.project_id == project.id,
+            (
+                await db_session.execute(
+                    _select(Task).where(
+                        Task.project_id == project.id,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         bootstrap_tasks = [
-            t for t in tasks
-            if (t.first_payload or {}).get("type") == "repo_bootstrap"
+            t for t in tasks if (t.first_payload or {}).get("type") == "repo_bootstrap"
         ]
         assert len(bootstrap_tasks) == 1, (
             f"Expected 1 repo_bootstrap task, got {len(bootstrap_tasks)}"
@@ -3487,9 +3604,7 @@ class TestOnboardRepoBootstrapSpawn:
         assert bt.first_payload["integration_branch"] == "main"
 
     @pytest.mark.asyncio
-    async def test_empty_repo_skips_bootstrap(
-        self, client: AsyncClient, db_session
-    ):
+    async def test_empty_repo_skips_bootstrap(self, client: AsyncClient, db_session):
         """A repo_is_empty=True project onboard does NOT spawn a repo_bootstrap task."""
         from sqlalchemy import select as _select
         from app.models import Task
@@ -3520,13 +3635,16 @@ class TestOnboardRepoBootstrapSpawn:
         project_id = resp.json()["project_id"]
         project = await db_session.get(Project, project_id)
         tasks = (
-            await db_session.execute(
-                _select(Task).where(Task.project_id == project.id)
+            (
+                await db_session.execute(
+                    _select(Task).where(Task.project_id == project.id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         bootstrap_tasks = [
-            t for t in tasks
-            if (t.first_payload or {}).get("type") == "repo_bootstrap"
+            t for t in tasks if (t.first_payload or {}).get("type") == "repo_bootstrap"
         ]
         assert len(bootstrap_tasks) == 0, (
             "repo_is_empty project must not spawn a repo_bootstrap task"

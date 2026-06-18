@@ -308,6 +308,27 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
         }
       } catch { /* unreadable — skip */ }
     }
+    // Swift Package Manager: Package.swift → `swift test`.
+    if (has('Package.swift')) {
+      return { cmd: 'swift', args: ['test'], cwd: absDir, label: `swift test (${label})` };
+    }
+    // Scala/sbt: build.sbt → `sbt test`.
+    if (has('build.sbt')) {
+      return { cmd: 'sbt', args: ['test'], cwd: absDir, label: `sbt test (${label})` };
+    }
+    // Bazel: WORKSPACE or WORKSPACE.bazel → `bazel test //...`.
+    if (has('WORKSPACE') || has('WORKSPACE.bazel')) {
+      return { cmd: 'bazel', args: ['test', '//...'], cwd: absDir, label: `bazel test //... (${label})` };
+    }
+    // Haskell/Cabal: any *.cabal file → `cabal test all`. Reuses dotnetEntries
+    // (already-read directory listing) to glob by extension, like the .NET check above.
+    if (dotnetEntries.some(n => typeof n === 'string' && n.endsWith('.cabal'))) {
+      return { cmd: 'cabal', args: ['test', 'all'], cwd: absDir, label: `cabal test all (${label})` };
+    }
+    // Dart/Flutter: pubspec.yaml → `flutter test`.
+    if (has('pubspec.yaml')) {
+      return { cmd: 'flutter', args: ['test'], cwd: absDir, label: `flutter test (${label})` };
+    }
     return null;
   };
 
@@ -889,6 +910,12 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
     // could_not_run.
     if (exists(`${absDir}/Cargo.toml`)) {
       add({ cmd: 'cargo', args: ['fetch'], cwd: absDir, label: `cargo fetch (${label})` });
+      return;
+    }
+    // Dart/Flutter: pubspec.yaml → `flutter pub get`. Swift/sbt/Bazel/Cabal
+    // self-fetch on first run so they need no explicit pre-install step.
+    if (exists(`${absDir}/pubspec.yaml`)) {
+      add({ cmd: 'flutter', args: ['pub', 'get'], cwd: absDir, label: `flutter pub get (${label})` });
       return;
     }
   };

@@ -159,6 +159,7 @@ from app.release_scoring import (
     # as "unused" and silently break downstream importers / patch points.
     _AUDIT_DEDUCTION_UNKNOWN,  # noqa: F401
     _AUDIT_DEDUCTIONS,  # noqa: F401
+    _CHALLENGE_FINDING_MAX,  # noqa: F401 — re-exported for callers/tests
     _DEFAULT_POLICY,
     _FINDING_SUMMARY_MAX,
     _MAX_CARRIED_FINDINGS,  # noqa: F401
@@ -217,6 +218,7 @@ from app.release_qualifier_sweep import (
     _force_finalize_timed_out_qualification,
     _parse_started_at,
     _redrive_deferred_unsynced_qualification,  # noqa: F401 — re-exported for tests
+    _redrive_not_promoted_qualification,  # noqa: F401 — re-exported for tests
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
 from app.migration_apply_gate import run_migration_apply_gate
@@ -711,6 +713,22 @@ async def _resolve_candidate_ci(
         head_sha = head.get("sha") if isinstance(head, dict) else None
         if head_sha and head_sha != candidate_sha and head_sha not in head_shas:
             head_shas.append(head_sha)
+            # Cap the sweep to avoid exhausting API quota on repos with many PRs.
+            if len(head_shas) >= _PR_HEAD_SWEEP_MAX:
+                break
+
+    # Log a warning if we had to truncate the PR head sweep.
+    if len(use_prs) > len(head_shas):
+        total_prs = len(use_prs)
+        logger.warning(
+            "[RELEASE_QUALIFIER] CI resolution: commit %s@%s/%s is associated with "
+            "%d PRs; checking at most %d PR heads (truncated)",
+            candidate_sha[:8],
+            owner,
+            repo,
+            total_prs,
+            _PR_HEAD_SWEEP_MAX,
+        )
 
     if not head_shas:
         return {
@@ -1323,19 +1341,23 @@ async def run_qualification(
     # detect a persistently broken qualifier pipeline.  The streak is the count
     # of consecutive infrastructure failures (FAILED/CANCELLED required child
     # tasks) before the current pending run — it resets to 0 whenever a prior
-    # finalization wrote a non-infra_failure status.
+    # finalization wrote a non-infra_failure status OR when the candidate SHA
+    # changes (a new commit should not inherit infra failures from prior SHAs).
+    prior_infra_failure_candidate_sha = (
+        prior_qual.get("candidate_sha")
+        if prior_qual.get("status") == "infra_failure"
+        else None
+    )
     prior_infra_streak: int = (
         int(prior_qual.get("consecutive_infra_errors") or 0)
-        if prior_qual.get("status") == "infra_failure"
+        if (
+            prior_qual.get("status") == "infra_failure"
+            and prior_infra_failure_candidate_sha == candidate_sha
+        )
         else 0
     )
     prior_infra_failure_signature = (
         prior_qual.get("infra_failure_signature")
-        if prior_qual.get("status") == "infra_failure"
-        else None
-    )
-    prior_infra_failure_candidate_sha = (
-        prior_qual.get("candidate_sha")
         if prior_qual.get("status") == "infra_failure"
         else None
     )
@@ -1477,6 +1499,11 @@ async def run_qualification(
 # The child-task spawn / artifact-read / infra-failure seam lives in
 # app.release_qualifier_audit and is re-exported above for back-compat.
 # ---------------------------------------------------------------------------
+
+# Maximum number of PR heads to check in the CI resolution fallback path.
+# When a commit is associated with more than this many PRs, we cap the sweep
+# to avoid exhausting API quota and slowing the CI polling cycle.
+_PR_HEAD_SWEEP_MAX = 8
 
 # Maximum number of times a RATE_LIMIT-classified release_audit task will be
 # re-spawned per qualification run before falling through to _handle_infra_failure.
@@ -3139,7 +3166,9 @@ async def _finalize_qualification(
                 "assessed_grade": _theme_cert.get("assessed_grade"),
                 "threshold_warn": _theme_cert.get("threshold_warn"),
                 "net_loc": _theme_cert.get("net_loc"),
-                "directional_contradiction": _theme_cert.get("directional_contradiction"),
+                "directional_contradiction": _theme_cert.get(
+                    "directional_contradiction"
+                ),
             },
         )
 

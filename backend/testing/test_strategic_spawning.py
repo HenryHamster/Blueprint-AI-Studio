@@ -311,8 +311,10 @@ async def test_strategy_only_cycle_records_strategic_cycle_row(db_session):
         _shared_state.runtime_config["architecture_review_frequency"] = old
 
     tasks = (
-        await db_session.execute(select(Task).where(Task.project_id == project.id))
-    ).scalars().all()
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
     assert len(tasks) == 1, f"Expected one task, got {len(tasks)}"
     review_task = tasks[0]
     assert review_task.payloads[0]["type"] == "strategic_review"
@@ -9971,6 +9973,94 @@ class TestBuildCycleStartReconciliation:
         assert entry["not_landed_titles_overflow"] == 0
         assert out["counts"]["merge_landed"] == _RECENT_MERGED_TITLES_CAP
         assert out["counts"]["merge_not_landed"] == 3
+
+    def test_phantom_direction_refs_flagged_in_current_focus(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "intent": {
+                "current_focus": "Advance d-4890df9e which is in flight and d-aaaabbbb also.",
+            }
+        }
+        # Only d-deadbeef exists in direction_stats; the two cited refs are phantoms.
+        direction_stats = [{"id": "d-deadbeef", "status": "active", "gap_id": None}]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, pm, {}, running_update=""
+        )
+        assert out is not None
+        phantoms = out["phantom_direction_refs"]
+        phantom_ids = {p["direction_id"] for p in phantoms}
+        assert "d-4890df9e" in phantom_ids
+        assert "d-aaaabbbb" in phantom_ids
+        assert "d-deadbeef" not in phantom_ids
+        for p in phantoms:
+            assert p["cited_in"] == "intent.current_focus"
+        assert out["counts"]["phantom_direction_refs"] == 2
+
+    def test_real_direction_ref_not_falsely_flagged(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "intent": {
+                "current_focus": "Working on d-12345678 and d-abcdef01.",
+            }
+        }
+        direction_stats = [
+            {"id": "d-12345678", "status": "active", "gap_id": None},
+            {"id": "d-abcdef01", "status": "retired", "gap_id": None},
+        ]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, pm, {}, running_update=""
+        )
+        # Both cited IDs exist — phantom_direction_refs must be empty.
+        if out is not None:
+            assert out["phantom_direction_refs"] == []
+            assert out["counts"]["phantom_direction_refs"] == 0
+
+    def test_stale_active_moves_conflict(self):
+        # gap.active_moves references a direction that is no longer active → surfaced
+        # as stale_active_moves. An active direction in active_moves is NOT stale.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "gaps": [
+                # Stale: active_moves points at a retired direction not in active_dirs.
+                {
+                    "id": "g-stale",
+                    "name": "stale gap",
+                    "status": "active",
+                    "active_moves": ["d-retired"],
+                },
+                # Clean: active_moves points at a live active direction.
+                {
+                    "id": "g-clean",
+                    "name": "clean gap",
+                    "status": "active",
+                    "active_moves": ["d-live"],
+                },
+                # Closed gaps are never checked.
+                {
+                    "id": "g-closed",
+                    "name": "closed gap",
+                    "status": "closed",
+                    "active_moves": ["d-retired"],
+                },
+            ]
+        }
+        direction_stats = [
+            {"id": "d-live", "status": "active", "gap_id": "g-clean"},
+            # d-retired is NOT in direction_stats at all (deleted/missing).
+        ]
+        out = _build_cycle_start_reconciliation(direction_stats, pm, {})
+        assert out is not None
+        stale = out["stale_active_moves"]
+        assert len(stale) == 1
+        assert stale[0]["gap_id"] == "g-stale"
+        assert stale[0]["gap_name"] == "stale gap"
+        assert stale[0]["stale_direction_ids"] == ["d-retired"]
+        assert out["counts"]["stale_active_moves"] == 1
+        # Clean gap is not surfaced.
+        assert not any(s["gap_id"] == "g-clean" for s in stale)
 
 
 # ── _build_prune_candidates: concrete cleanup list when the model is heavy ─────

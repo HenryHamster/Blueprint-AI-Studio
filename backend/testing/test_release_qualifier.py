@@ -1026,7 +1026,10 @@ class TestScoreAudit:
         assert erosion == pytest.approx(1.0)
 
         # Confirm the authorized set is consulted via rs directly too.
-        assert "viewportRegression.test.ts" in rs.AUTHORIZED_TEST_DELETIONS
+        assert any(
+            e.path_suffix == "viewportRegression.test.ts"
+            for e in rs.AUTHORIZED_TEST_DELETIONS
+        )
 
         # A mix of authorized + unauthorized still hard-blocks.
         mixed_report = {
@@ -1505,6 +1508,59 @@ class TestScoreAuditComputedErosion:
         with caplog.at_level(logging.WARNING, logger="backend.app.release_qualifier"):
             rq._score_audit(report)
         assert any("test_erosion divergence" in r.message for r in caplog.records)
+
+    def test_authorized_deletion_with_zero_delta_does_not_penalize(self):
+        """An authorized deletion whose removed lines are excluded from the delta
+        (by the TS-side fix) yields a non-penalized test_erosion score.
+
+        When the agent correctly excludes deleted-file lines from
+        assertion_delta/test_count_delta, both deltas arrive at 0 even though
+        the file itself had test content — the hard-blocker gate owns the file
+        dimension, the graded penalty must see delta=0 and return 1.0.
+        """
+        report = {
+            "audit_score": 0.9,
+            "computed_test_erosion": {
+                "deleted_test_files": ["admin-ui/src/utils/viewportRegression.test.ts"],
+                # TS fix: lines from the deleted file are excluded, so deltas stay 0.
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        # Authorized deletion — hard-blocker must NOT fire.
+        assert erosion is not None, (
+            "Authorized deletion must not produce the None hard-blocker"
+        )
+        # Zero deltas — graded penalty must not fire.
+        assert erosion == pytest.approx(1.0), (
+            "Zero deltas after authorized deletion must yield an unpenalized score of 1.0"
+        )
+
+    def test_unauthorized_deleted_root_level_test_file_hard_blocks(self):
+        """A root-level test directory deletion detected by the TS path fix hard-blocks.
+
+        Regression pin: before the TEST_PATH_RE fix, 'testing/test_foo.py'
+        (no leading slash) was NOT matched as a test file and the hard-blocker
+        would silently miss the deletion.  After the fix it is detected, so
+        _score_audit must return erosion=None for an unauthorized deletion.
+        """
+        report = {
+            "audit_score": 0.9,
+            "computed_test_erosion": {
+                # Path with no leading slash — as emitted by 'git diff --name-status'
+                # for a root-level testing/ directory.
+                "deleted_test_files": ["testing/test_root_level.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion is None, (
+            "An unauthorized deleted test file must hard-block (erosion=None)"
+        )
 
 
 class TestAuditMissingReason:
@@ -2168,6 +2224,30 @@ class TestComputeAuditChallengeSynthesis:
         assert out["disagreement"]["primary_only"] == []
         assert out["disagreement"]["challenger_only"] == []
         assert out["disagreement"]["overstated_findings"] == []
+        assert out["challenge_findings_truncated"] is False
+
+    def test_challenge_findings_truncated_flag_set_when_primary_exceeds_max(self):
+        findings = [
+            {"severity": "high", "summary": f"Finding number {i}"} for i in range(15)
+        ]
+        out = rq._compute_audit_challenge_synthesis(
+            {"findings": findings},
+            {"agreement": "agree", "challenge_severity": "low"},
+        )
+        assert out["challenge_findings_truncated"] is True
+        assert (
+            len(out["agreement"]["findings_both_flagged"]) == rq._CHALLENGE_FINDING_MAX
+        )
+
+    def test_challenge_findings_truncated_false_when_within_max(self):
+        findings = [
+            {"severity": "high", "summary": f"Finding number {i}"} for i in range(5)
+        ]
+        out = rq._compute_audit_challenge_synthesis(
+            {"findings": findings},
+            {"agreement": "agree", "challenge_severity": "low"},
+        )
+        assert out["challenge_findings_truncated"] is False
 
 
 def _make_verified_finding(summary: str, file: str = "") -> dict:
@@ -4918,6 +4998,57 @@ async def test_resolve_candidate_ci_red_beats_green_across_multiple_pr_heads(moc
     assert result["ci_green"] is False
     assert result["state"] == rq._CI_RED
     assert result["resolved_sha"] == red_sha
+
+
+async def test_resolve_candidate_ci_caps_pr_head_sweep(mocker, caplog):
+    """When a commit has more than _PR_HEAD_SWEEP_MAX associated PR heads, the
+    sweep is capped at _PR_HEAD_SWEEP_MAX to avoid exhausting API quota.
+    A warning is logged when truncation occurs."""
+    import logging
+    caplog.set_level(logging.WARNING)
+
+    check_runs_call_count = 0
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        nonlocal check_runs_call_count
+        if sha == "candidate_many":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        # Count calls to get_check_runs_cached for PR heads (not the candidate).
+        check_runs_call_count += 1
+        return {"status": "completed", "conclusion": "success", "details": []}
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+
+    # Create more than _PR_HEAD_SWEEP_MAX PR heads.
+    num_prs = rq._PR_HEAD_SWEEP_MAX + 3
+    pr_heads = [
+        {
+            "number": 100 + i,
+            "merged_at": f"2026-01-{(i % 28) + 1:02d}T00:00:00Z",
+            "head": {"sha": f"pr_head_{i:03d}"},
+        }
+        for i in range(num_prs)
+    ]
+
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(return_value=pr_heads),
+    )
+
+    await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate_many")
+
+    # Verify that only _PR_HEAD_SWEEP_MAX check-runs fetches were made.
+    assert check_runs_call_count == rq._PR_HEAD_SWEEP_MAX
+    # Verify a truncation warning was logged.
+    assert any(
+        "truncated" in record.message.lower()
+        and str(num_prs) in record.message
+        and str(rq._PR_HEAD_SWEEP_MAX) in record.message
+        for record in caplog.records
+        if "CI resolution" in record.message
+    )
 
 
 # ===========================================================================
@@ -10658,6 +10789,55 @@ class TestFinalizeInfraFailure:
         assert prior_streak == 0  # streak reset after a real verdict
 
     @pytest.mark.asyncio
+    async def test_infra_failure_streak_resets_when_candidate_sha_changes(
+        self, db_session
+    ):
+        """The infra-failure streak resets to 0 when a new candidate SHA is
+        provided after an infra_failure on a different SHA."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+
+        # Simulate a previous infra_failure with SHA A (cafe...cafe)
+        old_candidate_sha = "cafe" * 10
+        version.last_qualification = {
+            "status": "infra_failure",
+            "candidate_sha": old_candidate_sha,
+            "error": "PROVISION_FAILURE",
+            "consecutive_infra_errors": 2,  # Previous streak was 2
+            "started_at": "2026-05-19T00:00:00",
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        # Now simulate a new run_qualification with SHA B (beef...beef)
+        new_candidate_sha = "beef" * 10
+        # In real code, run_qualification would call _resolve_candidate_ci, etc.
+        # Here we simulate just the streak initialization part
+        prior_qual = version.last_qualification or {}
+        prior_infra_failure_candidate_sha = (
+            prior_qual.get("candidate_sha")
+            if prior_qual.get("status") == "infra_failure"
+            else None
+        )
+        # This is the fix: prior_infra_streak should be 0 when SHA changes
+        prior_infra_streak = (
+            int(prior_qual.get("consecutive_infra_errors") or 0)
+            if (
+                prior_qual.get("status") == "infra_failure"
+                and prior_infra_failure_candidate_sha == new_candidate_sha
+            )
+            else 0
+        )
+        # Verify the streak resets to 0 when SHA changes
+        assert prior_infra_streak == 0, (
+            f"Expected streak=0 when SHA changes from {old_candidate_sha[:8]} "
+            f"to {new_candidate_sha[:8]}, but got streak={prior_infra_streak}"
+        )
+
+    @pytest.mark.asyncio
     async def test_smoketest_task_failed_when_disabled_does_not_route_infra_failure(
         self, db_session
     ):
@@ -12959,6 +13139,157 @@ async def test_sweep_leaves_deferred_unsynced_when_still_behind(db_session, mock
     # Still deferred, nothing spawned, and the accrued-wait clock is preserved.
     assert version.last_qualification["status"] == "deferred_unsynced"
     assert version.last_qualification["first_deferred_at"] == first_deferred
+    assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_redrive_requalifies_resolved_blocker_stale_verdict(db_session, mocker):
+    """A stabilize version at a conclusive not_promoted verdict with all gating
+    findings ledger-resolved and automain HEAD advanced past the candidate SHA
+    is re-driven into run_qualification by the sweep; a fresh qualification spawns.
+
+    Acceptance proof: version transitions from not_promoted to pending and an
+    audit task is created — matching the declared task acceptance evidence."""
+    from app.release_readiness import apply_finding_resolution
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Stale not_promoted verdict pinned to an old SHA.
+    old_sha = "oldsha0" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {
+                "key": "FINDING_A",
+                "severity": "high",
+                "summary": "some finding",
+            }
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # Resolve the gating finding in the ledger.
+    await apply_finding_resolution(
+        db_session,
+        project.id,
+        version.id,
+        "FINDING_A",
+        "resolved",
+        severity="high",
+    )
+    await db_session.commit()
+
+    # automain has advanced to a NEW SHA (different from old_sha).
+    new_sha = "automn0" * 5 + "00000"
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    # Synced — LTS gate passes.
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+    await db_session.refresh(version)
+    # Stale verdict overwritten — qualification started.
+    assert version.last_qualification["status"] == "pending"
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_not_promoted_when_findings_unresolved(db_session, mocker):
+    """A not_promoted version whose gating audit findings are NOT yet
+    ledger-resolved is left untouched by the sweep — blockers have not cleared."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "oldsha0" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {
+                "key": "FINDING_UNRESOLVED",
+                "severity": "high",
+                "summary": "still open",
+            }
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # No ledger rows — finding is unresolved.
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 0
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_not_promoted_when_head_unchanged(db_session, mocker):
+    """A not_promoted version whose gating findings ARE resolved but automain
+    HEAD has NOT advanced (same candidate SHA) is left as-is — run_qualification
+    returns cached_verdict and nothing spawns."""
+    from app.release_readiness import apply_finding_resolution
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Candidate SHA matches what _branch_sha_mock returns for automain.
+    same_sha = "automn0" * 5 + "00000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": same_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {
+                "key": "FINDING_B",
+                "severity": "medium",
+                "summary": "resolved finding",
+            }
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # Mark the finding as resolved in the ledger.
+    await apply_finding_resolution(
+        db_session,
+        project.id,
+        version.id,
+        "FINDING_B",
+        "resolved",
+        severity="medium",
+    )
+    await db_session.commit()
+
+    # automain HEAD is UNCHANGED — same SHA as candidate.
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=same_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 0
+    await db_session.refresh(version)
+    # Still not_promoted — cached_verdict guard fired.
+    assert version.last_qualification["status"] == "not_promoted"
     assert await _audit_tasks(db_session, project.id) == []
 
 

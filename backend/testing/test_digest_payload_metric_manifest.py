@@ -125,3 +125,132 @@ def test_manifest_values_are_well_formed():
             f"{field}: manifest entry must declare EXACTLY ONE of "
             f"'consumer' or 'status' (got consumer={has_consumer}, status={has_status})"
         )
+
+
+def test_active_consumer_claims_backed_by_frontend_read():
+    """Each active-consumer manifest entry must be referenced in admin-ui source.
+
+    Searches all non-test *.tsx files under admin-ui/src/components/ for the
+    key name. A consumer claim backed only by a TypeScript type declaration in
+    types/digest.ts does NOT satisfy this check — the key must appear as an
+    actual property reference in a component file.
+
+    This enforces the lesson from prev_success_rate drift: the manifest declared
+    CatchUpStatsRow as consumer, but the component never rendered the field.
+    """
+    import pathlib
+    import pytest
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent.parent
+    components_dir = repo_root / "admin-ui" / "src" / "components"
+    if not components_dir.is_dir():
+        pytest.skip(f"admin-ui/src/components not found at {components_dir} — skipping")
+
+    component_texts: list[str] = [
+        tsx.read_text(encoding="utf-8")
+        for tsx in components_dir.glob("*.tsx")
+        if ".test." not in tsx.name
+        and ".spec." not in tsx.name
+        and ".viewport." not in tsx.name
+    ]
+    assert component_texts, "No component .tsx files found — glob is broken"
+
+    failures: list[str] = []
+    for field, meta in DIGEST_PAYLOAD_METRIC_MANIFEST.items():
+        if "consumer" not in meta:
+            continue
+        if not any(field in text for text in component_texts):
+            failures.append(
+                f"  {field!r} (consumer: {meta['consumer']!r}) — "
+                "key not referenced in any admin-ui/src/components/*.tsx file"
+            )
+
+    assert not failures, (
+        "These manifest active-consumer entries are not backed by a real "
+        "frontend read. Add a reference in the named component, or mark "
+        "the entry 'pending':\n" + "\n".join(failures)
+    )
+
+
+def _camel_case(field: str) -> str:
+    """Convert a snake_case digest key to the camelCase prop form admin-ui uses."""
+    head, *rest = field.split("_")
+    return head + "".join(part[:1].upper() + part[1:] for part in rest)
+
+
+def test_consumer_names_reference_field_in_named_component():
+    """Each manifest entry must name a consumer that actually touches the field.
+
+    Where ``test_active_consumer_claims_backed_by_frontend_read`` only proves a
+    key is read *somewhere* in admin-ui, this test proves the *named* consumer
+    is honest: at least one component in the entry's ``consumer`` list must
+    reference the field. This is the enforcement layer that prevents a future
+    agent from attributing a key to a component that never touches it (the exact
+    class of drift this manifest fix corrected, e.g. sr_* trends attributed to
+    CatchUpReviewQualitySection when they render in ReviewQualitySection).
+
+    A consumer ``C`` is considered to reference field ``F`` when EITHER:
+      * ``F`` (snake_case) or its camelCase prop form appears in ``C.tsx``, OR
+      * a container component that renders ``<C`` reads ``F`` and passes it down
+        — admin-ui destructures ``digest.<snake_key>`` in container components
+        (CatchUpPanel, DashboardHome) and forwards camelCase props to the leaf
+        section that renders them, so the snake_case key legitimately lives one
+        hop up from the display component.
+
+    The check is satisfied when AT LEAST ONE named consumer references the
+    field, so a co-consumer list (e.g. "DashboardHome, OrchestratorHealthBar")
+    passes as long as one member genuinely reads it.
+    """
+    import pathlib
+    import pytest
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent.parent
+    components_dir = repo_root / "admin-ui" / "src" / "components"
+    if not components_dir.is_dir():
+        pytest.skip(f"admin-ui/src/components not found at {components_dir} — skipping")
+
+    sources: dict[str, str] = {
+        tsx.stem: tsx.read_text(encoding="utf-8")
+        for tsx in components_dir.glob("*.tsx")
+        if ".test." not in tsx.name
+        and ".spec." not in tsx.name
+        and ".viewport." not in tsx.name
+    }
+    assert sources, "No component .tsx files found — glob is broken"
+
+    def references(field: str, component: str) -> bool:
+        text = sources.get(component)
+        if text is None:
+            return False
+        return field in text or _camel_case(field) in text
+
+    def is_backed(field: str, component: str) -> bool:
+        if component not in sources:
+            return False
+        if references(field, component):
+            return True
+        # Container indirection: a parent that renders <component reads the key.
+        render_tag = "<" + component
+        return any(
+            name != component and render_tag in text and references(field, name)
+            for name, text in sources.items()
+        )
+
+    failures: list[str] = []
+    for field, meta in DIGEST_PAYLOAD_METRIC_MANIFEST.items():
+        consumer = meta.get("consumer")
+        if not consumer:
+            continue
+        named = [name.strip() for name in consumer.split(",") if name.strip()]
+        if not any(is_backed(field, name) for name in named):
+            failures.append(
+                f"  {field!r} (consumer: {consumer!r}) — none of the named "
+                "components reference the field (directly or via a container "
+                "that renders them and reads digest.<key>)"
+            )
+
+    assert not failures, (
+        "These manifest entries name a consumer that does not reference the "
+        "field. Point the consumer at the component that actually reads "
+        "digest.<key>:\n" + "\n".join(failures)
+    )

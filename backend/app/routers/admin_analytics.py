@@ -1569,6 +1569,22 @@ async def get_improvement_lanes(
         except Exception:
             logger.exception("Failed to fetch lane_relay_comparison for %s", project_id)
 
+    # workspace_state_counts: fleet-wide tally across ALL lanes for this project
+    # (not just the paginated window) so operators can spot orphan accumulation.
+    ws_count_rows = (
+        await session.execute(
+            select(
+                ImprovementLane.workspace_state,
+                func.count().label("cnt"),
+            )
+            .where(ImprovementLane.project_id == project_id)
+            .group_by(ImprovementLane.workspace_state)
+        )
+    ).all()
+    workspace_state_counts: Dict[str, int] = {
+        (row.workspace_state or "COLD"): row.cnt for row in ws_count_rows
+    }
+
     return {
         "lanes": rows,
         "total_returned": len(rows),
@@ -1577,6 +1593,7 @@ async def get_improvement_lanes(
         "project_id": str(project_id),
         "shadow_health": shadow_health,
         "trial_metrics": trial_metrics,
+        "workspace_state_counts": workspace_state_counts,
     }
 
 
@@ -2120,3 +2137,36 @@ async def get_lane_pilot_preflight(
         "durable_verdict": durable_verdict,
         "pilot_mode": get_lane_pilot_mode(),
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/improvement-lanes/reclaim-orphaned
+# ---------------------------------------------------------------------------
+
+
+@router.post("/improvement-lanes/reclaim-orphaned")
+async def reclaim_orphaned_lane_workspaces(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Reset workspace_state to COLD on lanes whose backing pool VM no longer exists.
+
+    On-demand trigger for the startup recovery sweep
+    (``reclaim_orphaned_lane_workspace_states``).  Useful when an operator
+    observes an improvement lane stuck in workspace_state=WARM_RESERVED or
+    LEASED with a missing VM — running this endpoint remediates the orphan
+    immediately without requiring an orchestrator restart.
+
+    Returns ``reclaimed``: the count of lanes whose workspace state was reset.
+    """
+    from app.improvement_lane_ops import reclaim_orphaned_lane_workspace_states  # noqa: PLC0415
+
+    reclaimed = await reclaim_orphaned_lane_workspace_states(session)
+    await session.commit()
+
+    logger.info(
+        "[LANE-PILOT] operator reclaim-orphaned: reclaimed=%s",
+        reclaimed,
+    )
+
+    return {"reclaimed": reclaimed}

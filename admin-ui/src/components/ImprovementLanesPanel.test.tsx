@@ -8,12 +8,14 @@ const fetchImprovementLanes = vi.fn();
 const drainLanePilot = vi.fn();
 const fetchLanePilotPreflight = vi.fn().mockResolvedValue(null);
 const fetchImprovementLaneDetail = vi.fn();
+const reclaimOrphanedLaneWorkspaces = vi.fn();
 
 vi.mock('../api', () => ({
   fetchImprovementLanes: (...args: unknown[]) => fetchImprovementLanes(...args),
   drainLanePilot: (...args: unknown[]) => drainLanePilot(...args),
   fetchLanePilotPreflight: (...args: unknown[]) => fetchLanePilotPreflight(...args),
   fetchImprovementLaneDetail: (...args: unknown[]) => fetchImprovementLaneDetail(...args),
+  reclaimOrphanedLaneWorkspaces: (...args: unknown[]) => reclaimOrphanedLaneWorkspaces(...args),
 }));
 
 const LANE_RESPONSE = {
@@ -91,6 +93,7 @@ describe('ImprovementLanesPanel', () => {
     fetchLanePilotPreflight.mockReset();
     fetchLanePilotPreflight.mockResolvedValue(null);
     fetchImprovementLaneDetail.mockReset();
+    reclaimOrphanedLaneWorkspaces.mockReset();
     localStorage.clear();
   });
 
@@ -676,5 +679,63 @@ describe('ImprovementLanesPanel', () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(screen.queryByText('No task currently running')).toBeNull());
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  test('Reclaim Orphaned button calls correct endpoint and shows reclaim count', async () => {
+    fetchImprovementLanes.mockResolvedValue(LANE_RESPONSE);
+    reclaimOrphanedLaneWorkspaces.mockResolvedValueOnce({ reclaimed: 3 });
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    await screen.findAllByTestId('improvement-lane-row');
+    const reclaimBtn = screen.getByTestId('reclaim-orphaned-button');
+    expect(reclaimBtn.textContent).toBe('Reclaim Orphaned');
+
+    fireEvent.click(reclaimBtn);
+
+    expect(await screen.findByTestId('reclaim-result-summary')).toBeTruthy();
+    expect(screen.getByTestId('reclaim-result-summary').textContent).toBe('Reclaimed 3 orphaned lanes');
+    expect(reclaimOrphanedLaneWorkspaces).toHaveBeenCalledWith('proj-1');
+  });
+
+  test('Reclaim Orphaned button shows error banner on failure', async () => {
+    fetchImprovementLanes.mockResolvedValueOnce(LANE_RESPONSE);
+    reclaimOrphanedLaneWorkspaces.mockRejectedValueOnce(new Error('reclaim failed'));
+
+    render(<ImprovementLanesPanel projectId="proj-1" />);
+
+    await screen.findAllByTestId('improvement-lane-row');
+    fireEvent.click(screen.getByTestId('reclaim-orphaned-button'));
+
+    expect(await screen.findByTestId('reclaim-error')).toBeTruthy();
+    expect(screen.getByTestId('reclaim-error').textContent).toBe('reclaim failed');
+  });
+
+  test('clears drain and reclaim result/error banners when projectId changes', async () => {
+    fetchImprovementLanes.mockResolvedValue(LANE_RESPONSE);
+    drainLanePilot.mockResolvedValueOnce({ reservations_cleared: 1, lanes_killed: 0, reason: 'operator_drain' });
+    reclaimOrphanedLaneWorkspaces.mockResolvedValueOnce({ reclaimed: 2 });
+
+    const { rerender } = render(<ImprovementLanesPanel projectId="proj-1" />);
+    await screen.findAllByTestId('improvement-lane-row');
+
+    // trigger drain result banner
+    fireEvent.click(screen.getByTestId('drain-lane-pilot-button'));
+    fireEvent.click(await screen.findByTestId('confirm-dialog-confirm'));
+    expect(await screen.findByTestId('drain-result-summary')).toBeTruthy();
+
+    // trigger reclaim result banner
+    reclaimOrphanedLaneWorkspaces.mockResolvedValueOnce({ reclaimed: 2 });
+    fireEvent.click(screen.getByTestId('reclaim-orphaned-button'));
+    expect(await screen.findByTestId('reclaim-result-summary')).toBeTruthy();
+
+    // switch project — both banners should disappear
+    fetchImprovementLanes.mockResolvedValue({ lanes: [], shadow_health: null, trial_metrics: null });
+    rerender(<ImprovementLanesPanel projectId="proj-2" />);
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('drain-result-summary')).toBeNull();
+      expect(screen.queryByTestId('reclaim-result-summary')).toBeNull();
+    });
   });
 });

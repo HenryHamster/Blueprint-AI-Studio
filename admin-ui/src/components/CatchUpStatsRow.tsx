@@ -47,7 +47,10 @@ export function CatchUpStatsRow({ digest }: CatchUpStatsRowProps) {
         >
           {Math.round(digest.success_rate * 100)}% success
           {digest.success_rate_delta != null && (
-            <span className={digest.success_rate_delta > 0 ? 'text-emerald-400' : digest.success_rate_delta < 0 ? 'text-red-400' : 'text-neutral-500'}>
+            <span
+              className={digest.success_rate_delta > 0 ? 'text-emerald-400' : digest.success_rate_delta < 0 ? 'text-red-400' : 'text-neutral-500'}
+              title={digest.prev_success_rate != null ? `was ${Math.round(digest.prev_success_rate * 100)}% last period` : undefined}
+            >
               {digest.success_rate_delta > 0 ? '+' : ''}{Math.round(digest.success_rate_delta * 100)}%
             </span>
           )}
@@ -111,6 +114,14 @@ export function CatchUpStatsRow({ digest }: CatchUpStatsRowProps) {
                 Arch context: {fmt(fas.with_arch_context)} vs {fmt(fas.without_arch_context)} without
               </span>
             )}
+            {(fas.with_measurements != null || fas.without_measurements != null) && (
+              <span
+                className={compareTone(fas.with_measurements ?? null, fas.without_measurements ?? null)}
+                title="First-attempt success with vs without measurements"
+              >
+                Measurements: {fmt(fas.with_measurements ?? null)} vs {fmt(fas.without_measurements ?? null)} without
+              </span>
+            )}
             {fas.by_scope && Object.keys(fas.by_scope).length > 0 && (() => {
               const order = ['small', 'medium', 'large'];
               const byScope = fas.by_scope;
@@ -133,6 +144,34 @@ export function CatchUpStatsRow({ digest }: CatchUpStatsRowProps) {
                       {scope}: {Math.round(rate * 100)}%{i < entries.length - 1 ? ' |' : ''}
                     </span>
                   ))}
+                </span>
+              );
+            })()}
+            {fas.by_type && Object.keys(fas.by_type).length > 0 && (() => {
+              const byType = fas.by_type;
+              if (!byType) return null;
+              const entries = Object.entries(byType)
+                .filter(([, v]) => typeof v === 'number')
+                .sort((a, b) => b[1] - a[1]);
+              if (entries.length === 0) return null;
+              return (
+                <span
+                  className="flex items-center gap-1 text-neutral-400"
+                  title="First-attempt success rate by task type"
+                >
+                  <span>Type:</span>
+                  {entries.map(([type, rate]) => {
+                    const style = TASK_TYPE_STYLES[type];
+                    return (
+                      <span
+                        key={type}
+                        className={`${style?.bg ?? 'bg-neutral-500/10 border-neutral-500/20'} ${style?.text ?? 'text-neutral-400'} border px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider`}
+                        title={`${type}: ${Math.round(rate * 100)}% first-attempt success`}
+                      >
+                        {style?.label ?? type} {Math.round(rate * 100)}%
+                      </span>
+                    );
+                  })}
                 </span>
               );
             })()}

@@ -86,9 +86,7 @@ async def _emit_crash_episode_alert(
     episode_title = f"Background service crash episode: {name}"
     created = 0
     async with session_factory() as ep_session:
-        ep_project_ids = (
-            (await ep_session.execute(select(Project.id))).scalars().all()
-        )
+        ep_project_ids = (await ep_session.execute(select(Project.id))).scalars().all()
         for project_id in ep_project_ids:
             existing_ep = (
                 (
@@ -152,6 +150,7 @@ def _evaluate_reaper_stall(
     if age > stall_threshold:
         return True, f"no progress heartbeat in {int(age)}s"
     return False, None
+
 
 async def _seed_initial_admin():
     """Seed the AllowedUser table with an initial admin if empty."""
@@ -608,6 +607,27 @@ async def lifespan(app):
             "[STARTUP] Branch backfill failed (non-fatal): %s", _bf_exc, exc_info=True
         )
 
+    # Reclaim lane warm-workspace states whose backing pool VM was deleted while
+    # the orchestrator was stopped (crash / deploy / manual removal).  The live
+    # path (clear_lanes_for_torn_down_vm) handles in-process teardowns; this
+    # sweep closes the gap for out-of-process deletions.
+    try:
+        from app.improvement_lane_ops import reclaim_orphaned_lane_workspace_states
+
+        async with AsyncSessionLocal() as _reclaim_session:
+            _reclaimed = await reclaim_orphaned_lane_workspace_states(_reclaim_session)
+            await _reclaim_session.commit()
+            logger.info(
+                "[STARTUP] Orphaned lane workspace reclaim complete: %d lanes reclaimed",
+                _reclaimed,
+            )
+    except Exception as _reclaim_exc:
+        logger.error(
+            "[STARTUP] Orphaned lane workspace reclaim failed (non-fatal): %s",
+            _reclaim_exc,
+            exc_info=True,
+        )
+
     # Start the Reaper Service background task
     reaper_task = asyncio.create_task(reaper_service())
 
@@ -727,10 +747,8 @@ async def lifespan(app):
                         # model) combos pages the operator instead of silently
                         # zero-costing. Best-effort — isolated try/except + commit.
                         try:
-                            unpriced_fired = (
-                                await maybe_alert_unpriced_models_coverage(
-                                    scan_session, project_id
-                                )
+                            unpriced_fired = await maybe_alert_unpriced_models_coverage(
+                                scan_session, project_id
                             )
                             await scan_session.commit()
                             if unpriced_fired:
