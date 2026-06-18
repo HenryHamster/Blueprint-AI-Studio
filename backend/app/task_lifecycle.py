@@ -48,10 +48,11 @@ from app.task_capabilities import (
     get_task_capability,
     strategic_phase_for,
 )
+from app.json_extract import scan_balanced_json_objects
 from app.task_blocked import strip_fresh_attempt_context
 from app.time_utils import clear_retry_after
 import app.shared_state as _shared_state
-from app.broadcast import broadcast_to_project
+from app.broadcast import broadcast_to_project, _sanitize_log
 from app.payload_schemas import validate_internal_payload
 from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
@@ -94,6 +95,10 @@ logger = logging.getLogger(__name__)
 #     branch (they iterate an EXISTING PR, not open a new one).
 #   • "" is included — a legacy/untyped task defaults to create-like routing.
 _PR_OPENING_COMPLETION_TYPES: frozenset[str] = (WRITE_TASK_TYPES - {"fix"}) | {""}
+
+
+def _safe_exception_message(e: Exception, context: str) -> str:
+    return _sanitize_log(f"{context}: {type(e).__name__}")[:500]
 
 
 def _sidecar_application_marker(
@@ -274,7 +279,7 @@ from app.task_lifecycle_github_helpers import (  # noqa: E402, F401, RUF100
 
 
 async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
-    """Return True if any QUEUED/PROVISIONING/IN_PROGRESS task is a design_doc_update or strategic_review.
+    """Return True if any QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING task is a design_doc_update or strategic_review.
 
     Takes a FOR UPDATE lock on the project row so the check+spawn is transactionally
     atomic. Without it, two concurrent callers (e.g. design_doc completion chaining
@@ -333,6 +338,7 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
                             TaskStatus.QUEUED,
                             TaskStatus.PROVISIONING,
                             TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
                         ]
                     ),
                 )
@@ -2103,9 +2109,10 @@ async def _process_post_commit(
                                         **(task.context or {}),
                                         "scan_transient_failure": True,
                                     }
-                                    task.latest_status_message = f"Security scan unavailable (infrastructure error) — requires manual approval: {type(retry_exc).__name__}: {retry_exc!r}"[
-                                        :500
-                                    ]
+                                    task.latest_status_message = _safe_exception_message(
+                                        retry_exc,
+                                        "Security scan unavailable (infrastructure error) — requires manual approval",
+                                    )
                                     session.add(task)
                                     if task.auto_remediation:
                                         try:
@@ -2128,9 +2135,9 @@ async def _process_post_commit(
                                     exc_info=True,
                                 )
                                 task.requires_approval = True
-                                task.latest_status_message = f"Security scan failed — requires manual approval: {type(e).__name__}: {e!r}"[
-                                    :500
-                                ]
+                                task.latest_status_message = _safe_exception_message(
+                                    e, "Security scan failed — requires manual approval"
+                                )
                                 session.add(task)
                                 if task.auto_remediation:
                                     try:
@@ -2656,9 +2663,10 @@ async def _process_post_commit(
                                     **(task.context or {}),
                                     "scan_transient_failure": True,
                                 }
-                                task.latest_status_message = f"Security scan unavailable (infrastructure error) — review will proceed but merge requires manual approval: {type(retry_exc).__name__}: {retry_exc!r}"[
-                                    :500
-                                ]
+                                task.latest_status_message = _safe_exception_message(
+                                    retry_exc,
+                                    "Security scan unavailable (infrastructure error) — review will proceed but merge requires manual approval",
+                                )
                                 session.add(task)
                                 await session.commit()
                         else:
@@ -2667,9 +2675,10 @@ async def _process_post_commit(
                                 exc_info=True,
                             )
                             task.requires_approval = True
-                            task.latest_status_message = f"Security scan failed — review will proceed but merge requires manual approval: {type(e).__name__}: {e!r}"[
-                                :500
-                            ]
+                            task.latest_status_message = _safe_exception_message(
+                                e,
+                                "Security scan failed — review will proceed but merge requires manual approval",
+                            )
                             session.add(task)
                             await session.commit()
 
@@ -2827,8 +2836,6 @@ async def _process_post_commit(
                 investigated_files: list[str] = []
 
                 # Parse verdict: prefer structured verdict_json field, fall back to log parsing
-                import re
-
                 verdict_parsed = False
                 verdict_unparseable = False
                 review_was_parallelized = False
@@ -2866,52 +2873,21 @@ async def _process_post_commit(
                             f"[REVIEW PIPELINE] verdict_json field present but invalid for task {task.id}"
                         )
 
-                # Method 2: Parse JSON from log output (string-aware bracket counting)
+                # Method 2: Parse JSON from log output
                 if not verdict_parsed:
                     try:
-                        for m in re.finditer(r'\{[^{}]*"verdict"', verdict_text):
-                            start = m.start()
-                            depth = 0
-                            in_string = False
-                            escape_next = False
-                            for i in range(start, len(verdict_text)):
-                                c = verdict_text[i]
-                                if escape_next:
-                                    escape_next = False
-                                    continue
-                                if c == "\\" and in_string:
-                                    escape_next = True
-                                    continue
-                                if c == '"' and not escape_next:
-                                    in_string = not in_string
-                                    continue
-                                if in_string:
-                                    continue
-                                if c == "{":
-                                    depth += 1
-                                elif c == "}":
-                                    depth -= 1
-                                    if depth == 0:
-                                        try:
-                                            candidate = json.loads(
-                                                verdict_text[start : i + 1]
-                                            )
-                                            if "verdict" in candidate:
-                                                verdict = candidate["verdict"]
-                                                feedback = candidate.get(
-                                                    "feedback", verdict_text
-                                                )
-                                                issues = (
-                                                    candidate.get("issues", [])
-                                                    if isinstance(
-                                                        candidate.get("issues"), list
-                                                    )
-                                                    else []
-                                                )
-                                                verdict_parsed = True
-                                        except json.JSONDecodeError:
-                                            pass
-                                        break
+                        candidate = scan_balanced_json_objects(
+                            verdict_text, required_key="verdict", last=True
+                        )
+                        if candidate is not None:
+                            verdict = candidate["verdict"]
+                            feedback = candidate.get("feedback", verdict_text)
+                            issues = (
+                                candidate.get("issues", [])
+                                if isinstance(candidate.get("issues"), list)
+                                else []
+                            )
+                            verdict_parsed = True
                     except Exception as e:
                         logger.error(
                             f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}",
@@ -3324,7 +3300,7 @@ async def _process_post_commit(
                         )
 
                         await _retire_lane_approve(session, task.context or {})
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.debug(
                             "[PIPELINE] retire_chain_lane (APPROVE) failed (non-critical)",
                             exc_info=True,
@@ -5439,9 +5415,10 @@ async def _process_post_commit(
                         exc_info=True,
                     )
                     task.requires_approval = True
-                    task.latest_status_message = f"Security scan failed — review will proceed but merge requires manual approval: {type(e).__name__}: {e!r}"[
-                        :500
-                    ]
+                    task.latest_status_message = _safe_exception_message(
+                        e,
+                        "Security scan failed — review will proceed but merge requires manual approval",
+                    )
                     session.add(task)
                     await session.commit()
 
@@ -5704,13 +5681,17 @@ async def _process_post_commit(
                     handler_ctx = dict(task.context or {})
                     handler_ctx.pop("provision_failures", None)
                     task.context = handler_ctx
-                    task.latest_status_message = f"Handler hit transient error, requeuing (attempt {task.attempt_count}): {type(handler_exc).__name__}"
+                    task.latest_status_message = _sanitize_log(
+                        f"Handler hit transient error, requeuing (attempt {task.attempt_count}): {type(handler_exc).__name__}: {handler_exc!s}"
+                    )[:500]
                     logger.warning(
                         f"[HANDLER] Transient error for {task.id}, requeuing: {handler_exc}"
                     )
                 else:
                     task.status = TaskStatus.FAILED
-                    task.latest_status_message = f"Completed but handler failed: {type(handler_exc).__name__}: {str(handler_exc)[:200]}"
+                    task.latest_status_message = _safe_exception_message(
+                        handler_exc, "Completed but handler failed"
+                    )
                     from app.failure_classification import persist_failure_category
                     from app.routers.agent_status import record_task_result
 
@@ -6486,8 +6467,8 @@ async def park_task(
     _park_pool_vm_id = task.vm_instance_id
     if _park_pool_vm_id:
         try:
-            from app.models import PoolVmState  # noqa: PLC0415
-            from app.warm_pool import (  # noqa: PLC0415
+            from app.models import PoolVmState
+            from app.warm_pool import (
                 is_warm_pool_enabled,
                 mark_pool_vm_retiring,
             )

@@ -2635,6 +2635,65 @@ class TestImprovementLanes:
             _app.dependency_overrides.pop(get_current_user, None)
             _app.dependency_overrides.pop(require_admin, None)
 
+    @pytest.mark.asyncio
+    async def test_at_risk_false_when_phase_requeues_below_threshold(
+        self, client: AsyncClient, db_session
+    ):
+        """at_risk=False when phase_requeues < _LANE_MAX_PHASE_REQUEUES - 1."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        lane = _make_lane(project.id, phase_requeues=1)
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        row = resp.json()["lanes"][0]
+        assert row["phase_requeues"] == 1
+        assert row["at_risk"] is False
+
+    @pytest.mark.asyncio
+    async def test_at_risk_true_when_phase_requeues_at_threshold(
+        self, client: AsyncClient, db_session
+    ):
+        """at_risk=True when phase_requeues >= _LANE_MAX_PHASE_REQUEUES - 1 (i.e., >= 2)."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # Test at threshold (phase_requeues = 2, which is _LANE_MAX_PHASE_REQUEUES - 1)
+        lane = _make_lane(project.id, phase_requeues=2)
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        row = resp.json()["lanes"][0]
+        assert row["phase_requeues"] == 2
+        assert row["at_risk"] is True
+
+    @pytest.mark.asyncio
+    async def test_at_risk_true_when_phase_requeues_above_threshold(
+        self, client: AsyncClient, db_session
+    ):
+        """at_risk=True when phase_requeues > _LANE_MAX_PHASE_REQUEUES - 1."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # Test above threshold (phase_requeues = 3, which is _LANE_MAX_PHASE_REQUEUES)
+        lane = _make_lane(project.id, phase_requeues=3)
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        row = resp.json()["lanes"][0]
+        assert row["phase_requeues"] == 3
+        assert row["at_risk"] is True
+
 
 class TestShadowLaneHealth:
     """Tests for shadow_health rollup in GET /api/admin/improvement-lanes."""
@@ -2872,6 +2931,85 @@ class TestImprovementLanesTrialMetrics:
         # trial_metrics is null when aggregation fails.
         assert body.get("trial_metrics") is None
 
+    @pytest.mark.asyncio
+    async def test_trial_metrics_includes_relay_comparison_when_stored(
+        self, client: AsyncClient, db_session
+    ):
+        """When capability_adoption_verdicts stores a lane_relay_comparison blob for
+        the lane-pilot capability, it is surfaced under trial_metrics."""
+        from app.capability_trial_verdict import LANE_PILOT_CAP_NAME
+
+        relay_cmp = {
+            "source_version": {
+                "version_number": 7,
+                "captured_at": "2026-01-01T00:00:00",
+                "terminal_status": "promoted",
+            },
+            "relay": {
+                "wall_clock_seconds": 3600.0,
+                "active_seconds": 1800.0,
+                "gap_seconds": 1800.0,
+            },
+            "lane": {
+                "wall_clock_seconds": 2800.0,
+                "active_seconds": 1600.0,
+                "gap_seconds": 1200.0,
+            },
+            "deltas": {
+                "wall_clock_seconds": -800.0,
+                "active_seconds": -200.0,
+                "gap_seconds": -600.0,
+            },
+        }
+        project = make_project(
+            capability_adoption_verdicts={
+                LANE_PILOT_CAP_NAME: {
+                    "verdict": "CONTINUE",
+                    "verdict_reason": "insufficient_data",
+                    "lane_relay_comparison": relay_cmp,
+                }
+            }
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        tm = body.get("trial_metrics")
+        assert tm is not None
+        assert "lane_relay_comparison" in tm
+        cmp_out = tm["lane_relay_comparison"]
+        assert cmp_out["source_version"]["version_number"] == 7
+        assert cmp_out["relay"]["wall_clock_seconds"] == 3600.0
+        assert cmp_out["deltas"]["wall_clock_seconds"] == -800.0
+
+    @pytest.mark.asyncio
+    async def test_trial_metrics_omits_relay_comparison_when_absent(
+        self, client: AsyncClient, db_session
+    ):
+        """When capability_adoption_verdicts has no lane_relay_comparison, the key
+        is absent from trial_metrics (not set to null)."""
+        from app.capability_trial_verdict import LANE_PILOT_CAP_NAME
+
+        project = make_project(
+            capability_adoption_verdicts={
+                LANE_PILOT_CAP_NAME: {
+                    "verdict": "CONTINUE",
+                    "verdict_reason": "insufficient_data",
+                }
+            }
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/improvement-lanes?project_id={project.id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        tm = body.get("trial_metrics")
+        assert tm is not None
+        assert "lane_relay_comparison" not in tm
+
 
 class TestLaneBaselines:
     """Tests for GET /api/admin/lane-baselines."""
@@ -3108,6 +3246,174 @@ class TestImprovementLanesDrain:
         """A project_id that does not exist returns HTTP 404."""
         resp = await client.post(
             f"/api/admin/improvement-lanes/drain?project_id={uuid.uuid4()}"
+        )
+        assert resp.status_code == 404
+
+
+class TestKillImprovementLane:
+    """Tests for POST /api/admin/improvement-lanes/{lane_id}/kill."""
+
+    @pytest.mark.asyncio
+    async def test_kill_lane_transitions_to_killed_and_releases_reservation(
+        self, client: AsyncClient, db_session
+    ):
+        """Happy path: owner kills a single ACTIVE lane via HTTP. The lane
+        transitions to KILLED, its warm-pool reservation is released, and the
+        response carries project_id, lane_id, and the kill report counts."""
+        project = make_project()
+        db_session.add(project)
+        db_session.add(
+            make_membership(project.id, user_id="test-user-123", role="owner")
+        )
+        await db_session.commit()
+
+        lane = _make_lane(
+            project.id,
+            status=ImprovementLaneStatus.ACTIVE.value,
+            pilot_arm="lane",
+        )
+        db_session.add(lane)
+        await db_session.flush()
+
+        pool_vm = PoolVm(
+            vm_instance_id="kill-lane-test-vm-1",
+            project_id=project.id,
+            state=PoolVmState.IDLE,
+            reserved_lane_id=lane.id,
+            reservation_expires_at=_utcnow(),
+            reservation_hard_expires_at=_utcnow(),
+        )
+        db_session.add(pool_vm)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/improvement-lanes/{lane.id}/kill"
+            f"?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["project_id"] == str(project.id)
+        assert body["lane_id"] == str(lane.id)
+        assert body["lanes_killed"] == 1
+        assert body["reservations_cleared"] == 1
+
+        # Lane row must be KILLED.
+        await db_session.refresh(lane)
+        assert lane.status == ImprovementLaneStatus.KILLED.value
+
+        # Reservation must be released so the member rejoins the general pool.
+        await db_session.refresh(pool_vm)
+        assert pool_vm.reserved_lane_id is None
+        assert pool_vm.reservation_expires_at is None
+        assert pool_vm.reservation_hard_expires_at is None
+
+    @pytest.mark.asyncio
+    async def test_kill_lane_idempotent_on_terminal_lane(
+        self, client: AsyncClient, db_session
+    ):
+        """Killing an already-KILLED lane succeeds with zero counts."""
+        project = make_project()
+        db_session.add(project)
+        db_session.add(
+            make_membership(project.id, user_id="test-user-123", role="owner")
+        )
+        await db_session.commit()
+
+        lane = _make_lane(
+            project.id,
+            status=ImprovementLaneStatus.KILLED.value,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/improvement-lanes/{lane.id}/kill"
+            f"?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["lanes_killed"] == 0
+        assert body["reservations_cleared"] == 0
+        assert body["lane_id"] == str(lane.id)
+
+    @pytest.mark.asyncio
+    async def test_kill_lane_cross_project_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """The lane belongs to project A, but the request scopes to project B
+        (also owned by the caller). The cross-project guard returns 404 rather
+        than killing a lane outside the named project."""
+        owner_project = make_project(name="Owner project")
+        other_project = make_project(name="Other project")
+        db_session.add(owner_project)
+        db_session.add(other_project)
+        db_session.add(
+            make_membership(owner_project.id, user_id="test-user-123", role="owner")
+        )
+        db_session.add(
+            make_membership(other_project.id, user_id="test-user-123", role="owner")
+        )
+        await db_session.commit()
+
+        # Lane lives in owner_project ...
+        lane = _make_lane(
+            owner_project.id,
+            status=ImprovementLaneStatus.ACTIVE.value,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        # ... but the request names other_project, so the guard must 404.
+        resp = await client.post(
+            f"/api/admin/improvement-lanes/{lane.id}/kill"
+            f"?project_id={other_project.id}"
+        )
+        assert resp.status_code == 404
+
+        # The lane must be untouched (still ACTIVE) since the kill was rejected.
+        await db_session.refresh(lane)
+        assert lane.status == ImprovementLaneStatus.ACTIVE.value
+
+    @pytest.mark.asyncio
+    async def test_kill_lane_non_owner_member_returns_403(
+        self, client: AsyncClient, db_session
+    ):
+        """A project member without owner role receives 403."""
+        project = make_project()
+        db_session.add(project)
+        db_session.add(
+            make_membership(project.id, user_id="test-user-123", role="member")
+        )
+        await db_session.commit()
+
+        lane = _make_lane(
+            project.id,
+            status=ImprovementLaneStatus.ACTIVE.value,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/improvement-lanes/{lane.id}/kill"
+            f"?project_id={project.id}"
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_kill_lane_unknown_lane_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """An unknown lane_id under an owned project returns HTTP 404."""
+        project = make_project()
+        db_session.add(project)
+        db_session.add(
+            make_membership(project.id, user_id="test-user-123", role="owner")
+        )
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/improvement-lanes/{uuid.uuid4()}/kill"
+            f"?project_id={project.id}"
         )
         assert resp.status_code == 404
 

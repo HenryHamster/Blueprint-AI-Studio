@@ -523,12 +523,6 @@ class Project(SQLModel, table=True):
     merge_gate_runtime: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
-    # Regression-class trip markers used to persist first-tripped timestamps
-    # across dispatcher ticks when a signal has no durable historical record.
-    regression_signal_state: Dict[str, Any] = Field(
-        default_factory=dict,
-        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
-    )
     # Per-category self-review catch-rate targets set by the operator.
     # Shape: {category_id: float} e.g. {'security': 0.80, 'regression_risk': 0.75}.
     # Absent key = no target configured for that category (default: no alerting).
@@ -1128,10 +1122,6 @@ class Task(SQLModel, table=True):
         default=False,
         sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
-    infra_wait_until: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
     retry_after_until: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
@@ -1186,14 +1176,6 @@ class Task(SQLModel, table=True):
         sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
     strategic_cycle_id: str | None = Field(default=None, max_length=36)
-    spawn_failed: bool = Field(
-        default=False,
-        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
-    )
-    last_remediation_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
     last_token_refresh_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
@@ -2785,10 +2767,6 @@ class DeploymentState(SQLModel, table=True):
     # current one. Lets RecentChangesContext builders compute the commit range
     # (prior_deploy_sha..current_sha) without a live git checkout.
     prior_deploy_sha: str | None = Field(default=None)
-    prior_deployed_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
 
     # Timestamp when HALTED state was entered — used for auto-recovery timer
     halted_at: datetime | None = Field(
@@ -4076,6 +4054,14 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
     audit_reconciliation: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Theme-delivery certification: {state, theme_class, deterministic_grade,
+    # assessed_grade, directional_contradiction, criteria, shortfalls, ...}
+    # Nullable: existing verdict rows carry no theme_delivery data.
+    theme_delivery: Any | None = Field(
         default=None,
         sa_column=Column(JSONB, nullable=True),
     )

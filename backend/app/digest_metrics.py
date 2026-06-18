@@ -113,6 +113,7 @@ from app.digest_lane_waste import (  # noqa: F401
     compute_lane_baseline_trend,
 )
 from app.failure_classification import (
+    ADMIN_CANCEL,
     AGENT_STALLED,
     AGENT_TIMEOUT,
     APPROVED_CAP_PR_CLOSED,
@@ -163,6 +164,7 @@ _FAILURE_CLASS_LABELS = {
     PARK_WAKE_TIMEOUT: "Park/Wake — source never fired (timed out)",
     PARK_WAKE_STRANDED: "Park/Wake — stranded (no live wake registration)",
     APPROVED_CAP_PR_CLOSED: "Approved Cap PR Closed — fix-loop cap hit post-approval",
+    ADMIN_CANCEL: "Admin Cancel",
 }
 
 _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5
@@ -3749,13 +3751,16 @@ def compute_retry_analytics(
 
     Returns a dict with keys:
       retry_overhead_cost_usd, retry_recovery_cost_usd,
+      llm_retry_overhead_cost_usd, llm_retry_recovery_cost_usd,
       retry_waste_by_direction (top-5), retry_task_count,
       retry_success_count, avg_retries_before_failure,
       retry_success_rate_by_class, retry_wasted_rate.
     """
     from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+    from app.efficiency_snapshot import _task_llm_cost
 
     _retry_overhead_cost = 0.0
+    _retry_overhead_llm_cost = 0.0
     _retry_task_count = 0
     _retry_attempt_sum = 0
     _retry_waste_by_dir: Dict[str, Dict[str, Any]] = {}
@@ -3775,6 +3780,11 @@ def compute_retry_analytics(
                     _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
                 )
                 _retry_overhead_cost += _task_retry_cost
+            try:
+                _task_llm_cost_val, _ = _task_llm_cost(t)
+                _retry_overhead_llm_cost += _task_llm_cost_val
+            except Exception:
+                pass
             _rw_did = (t.context or {}).get("direction_id")
             if _rw_did:
                 _key = str(_rw_did)
@@ -3791,6 +3801,7 @@ def compute_retry_analytics(
                 _entry["retry_task_count"] += 1
 
     retry_overhead_cost_usd = round(_retry_overhead_cost, 4)
+    llm_retry_overhead_cost_usd = round(_retry_overhead_llm_cost, 4)
     retry_waste_by_direction = sorted(
         [
             {**e, "retry_cost_usd": round(e["retry_cost_usd"], 4)}
@@ -3808,6 +3819,7 @@ def compute_retry_analytics(
     _retry_failure_by_class: Dict[str, int] = {}
     _retry_success_count = 0
     _retry_recovery_cost = 0.0
+    _retry_recovery_llm_cost = 0.0
     for t in completed_tasks:
         _ctx = t.context or {}
         if (_ctx.get("_attempt_number") or 0) > 1:
@@ -3818,7 +3830,12 @@ def compute_retry_analytics(
                 _retry_recovery_cost += float(_ctx.get("_prior_attempts_cost") or 0.0)
             except (TypeError, ValueError):
                 pass
+            try:
+                _retry_recovery_llm_cost += float(_ctx.get("_prior_attempts_llm_cost") or 0.0)
+            except (TypeError, ValueError):
+                pass
     retry_recovery_cost_usd = round(_retry_recovery_cost, 4)
+    llm_retry_recovery_cost_usd = round(_retry_recovery_llm_cost, 4)
     for t in failed_tasks:
         _ctx = t.context or {}
         if (_ctx.get("_attempt_number") or 0) > 1:
@@ -3849,6 +3866,8 @@ def compute_retry_analytics(
     return {
         "retry_overhead_cost_usd": retry_overhead_cost_usd,
         "retry_recovery_cost_usd": retry_recovery_cost_usd,
+        "llm_retry_overhead_cost_usd": llm_retry_overhead_cost_usd,
+        "llm_retry_recovery_cost_usd": llm_retry_recovery_cost_usd,
         "retry_waste_by_direction": retry_waste_by_direction,
         "retry_task_count": retry_task_count,
         "retry_success_count": retry_success_count,

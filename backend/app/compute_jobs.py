@@ -46,6 +46,7 @@ from app.artifact_prerequisites import (
     stamp_artifact_logical_key,
 )
 from app.database import AsyncSessionLocal
+from app.json_extract import scan_balanced_json_objects
 from app.models import (
     Artifact,
     ArtifactType,
@@ -1724,6 +1725,29 @@ async def _attach_repo_clone(
                     job.id,
                 )
                 return spec
+            # staging branches are deleted after the plan rolls up to integration.
+            # If the resolved ref is a staging branch that no longer exists, degrade
+            # to the project's integration/promotion branch where the code has landed.
+            if project.is_staging_branch(ref):
+                from app.github_refs import get_branch_sha
+
+                try:
+                    await get_branch_sha(
+                        token,
+                        str(project.github_owner),
+                        str(project.github_repo),
+                        ref,
+                    )
+                except Exception:
+                    fallback = getattr(project, "promotion_target", None) or "main"
+                    logger.info(
+                        "[COMPUTE_JOB] plan branch %r not found for job=%s; "
+                        "falling back to %r",
+                        ref,
+                        job.id,
+                        fallback,
+                    )
+                    ref = fallback
             spec.repo_clone = {
                 "owner": str(project.github_owner),
                 "repo": str(project.github_repo),
@@ -1945,6 +1969,45 @@ def _coerce_metric_number(value: Any) -> float | int | None:
     return None
 
 
+# Upper bound on how much captured command-log text the stdout->metrics fallback
+# scans for a trailing JSON object. The balanced-JSON scan is super-linear in the
+# number of "{" candidates, so a noisy multi-megabyte log can never make the
+# fallback expensive: only the trailing window is scanned (the experiment prints
+# its result object last, so last-object-wins lives in the tail).
+_STDOUT_METRICS_SCAN_MAX_CHARS = 100_000
+
+
+def _stdout_metrics_fallback(meta: dict) -> dict | None:
+    """Recover experiment metrics from captured stdout when no result file exists.
+
+    A command that writes ``{metric: value}`` JSON to ``$BLUEPRINT_RESULT_FILE``
+    populates ``result_metrics`` directly; that path always wins. This fallback
+    only fires when ``result_metrics`` is absent/empty: it scans the captured
+    command log for the LAST balanced JSON object the command printed to
+    stdout/stderr (last-object-wins) and returns its numeric keys so a metric
+    that only reached stdout is still measurable.
+
+    Bounded and defensive: scans at most the trailing
+    ``_STDOUT_METRICS_SCAN_MAX_CHARS`` of the log, keeps only numeric keys, and
+    returns ``None`` when there is no command log or no balanced JSON object. The
+    caller filters reserved/backend-derived keys, so this never overwrites
+    ``durable_file_count`` or a job-level field.
+    """
+    command_log = meta.get("command_log")
+    if not isinstance(command_log, dict):
+        return None
+    text = command_log.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if len(text) > _STDOUT_METRICS_SCAN_MAX_CHARS:
+        text = text[-_STDOUT_METRICS_SCAN_MAX_CHARS:]
+    obj = scan_balanced_json_objects(text, last=True)
+    if not isinstance(obj, dict):
+        return None
+    numeric = {k: v for k, v in obj.items() if _coerce_metric_number(v) is not None}
+    return numeric or None
+
+
 def build_compute_result_logs(job: ComputeJob) -> str:
     """Serialize a terminal :class:`ComputeJob` into the COMPUTE_RESULT artifact.
 
@@ -2011,6 +2074,12 @@ def build_compute_result_logs(job: ComputeJob) -> str:
     # reported metric whose name collides with a job-level key is skipped so it
     # can never overwrite the reserved field.
     reported = meta.get("result_metrics")
+    if not (isinstance(reported, dict) and reported):
+        # No explicit result-file metrics: fall back to the LAST balanced JSON
+        # object the command printed to stdout/stderr. An explicit
+        # $BLUEPRINT_RESULT_FILE write (above) always wins; this only fills the
+        # gap so a metric that only reached stdout is still measurable.
+        reported = _stdout_metrics_fallback(meta)
     if isinstance(reported, dict):
         for name, value in reported.items():
             if name in result or name in _BACKEND_DERIVED_KEYS:

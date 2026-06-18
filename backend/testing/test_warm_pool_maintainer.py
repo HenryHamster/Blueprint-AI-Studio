@@ -1312,6 +1312,99 @@ def test_pool_circuit_breaker_trips_after_threshold(warm_pool_on):
     assert _shared_state.warm_pool_suppressed_until is not None
 
 
+def test_all_warm_breakers_trip_and_reset_identically(warm_pool_on):
+    """Verify all three warm-* suppression breakers trip and reset identically
+    through the shared canonical helper given equal event rates and thresholds."""
+    from app.shared_state import (
+        is_warm_continuity_suppressed,
+        is_warm_backlog_reuse_suppressed,
+        is_warm_pool_suppressed,
+        record_warm_pin_clear,
+        record_backlog_reuse_failure,
+        record_pool_claim_failure,
+    )
+
+    threshold = 3
+    _runtime_config["warm_pin_clear_rate_threshold"] = threshold
+    _runtime_config["warm_backlog_reuse_failure_rate_threshold"] = threshold
+    _runtime_config["warm_pool_failure_rate_threshold"] = threshold
+    _runtime_config["warm_continuity_cooldown_seconds"] = 1800
+    _runtime_config["warm_backlog_reuse_cooldown_seconds"] = 1800
+    _runtime_config["warm_pool_cooldown_seconds"] = 1800
+
+    # All three breakers start unsuppressed
+    assert is_warm_continuity_suppressed() is False
+    assert is_warm_backlog_reuse_suppressed() is False
+    assert is_warm_pool_suppressed() is False
+
+    # Trip all three breakers with identical event counts
+    for i in range(threshold):
+        record_warm_pin_clear(f"vm-{i}", "test_reason")
+        record_backlog_reuse_failure("test_reason")
+        record_pool_claim_failure("test_reason")
+
+    # All three trip simultaneously
+    assert is_warm_continuity_suppressed() is True
+    assert is_warm_backlog_reuse_suppressed() is True
+    assert is_warm_pool_suppressed() is True
+
+    # All three have deadlines set
+    assert _shared_state.warm_continuity_suppressed_until is not None
+    assert _shared_state.warm_backlog_reuse_suppressed_until is not None
+    assert _shared_state.warm_pool_suppressed_until is not None
+
+    # Deadlines are approximately equal (within a second)
+    deadlines = [
+        _shared_state.warm_continuity_suppressed_until,
+        _shared_state.warm_backlog_reuse_suppressed_until,
+        _shared_state.warm_pool_suppressed_until,
+    ]
+    deadline_diffs = [
+        abs((deadlines[i] - deadlines[0]).total_seconds()) for i in range(1, len(deadlines))
+    ]
+    assert all(diff < 1 for diff in deadline_diffs), (
+        f"Deadline drift detected: {deadline_diffs}"
+    )
+
+    # Subsequent checks return suppressed (deadline not yet expired)
+    assert is_warm_continuity_suppressed() is True
+    assert is_warm_backlog_reuse_suppressed() is True
+    assert is_warm_pool_suppressed() is True
+
+    # Manually advance time past deadlines to test reset
+    now = _utcnow()
+    future = now + timedelta(seconds=2000)
+    _shared_state.warm_continuity_suppressed_until = future
+    _shared_state.warm_backlog_reuse_suppressed_until = future
+    _shared_state.warm_pool_suppressed_until = future
+
+    # All still suppressed while deadline not reached
+    assert is_warm_continuity_suppressed() is True
+    assert is_warm_backlog_reuse_suppressed() is True
+    assert is_warm_pool_suppressed() is True
+
+    # Clear event history so they don't trip again when we check
+    _shared_state.warm_pin_clear_events.clear()
+    _shared_state.warm_backlog_reuse_failure_events.clear()
+    _shared_state.warm_pool_claim_failure_events.clear()
+
+    # Manually set deadlines to past to simulate expiry
+    past = _utcnow() - timedelta(seconds=1)
+    _shared_state.warm_continuity_suppressed_until = past
+    _shared_state.warm_backlog_reuse_suppressed_until = past
+    _shared_state.warm_pool_suppressed_until = past
+
+    # All reset to unsuppressed after deadline passes
+    assert is_warm_continuity_suppressed() is False
+    assert is_warm_backlog_reuse_suppressed() is False
+    assert is_warm_pool_suppressed() is False
+
+    # Deadlines are cleared
+    assert _shared_state.warm_continuity_suppressed_until is None
+    assert _shared_state.warm_backlog_reuse_suppressed_until is None
+    assert _shared_state.warm_pool_suppressed_until is None
+
+
 def test_is_pool_vm_image_stale_helper():
     member = PoolVm(vm_instance_id="agent-vm-x", project_id=uuid.uuid4())
     assert is_pool_vm_image_stale(member, {"agent-vm-x"}) is True

@@ -2981,4 +2981,65 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.queryByTestId('out-of-band-promotion-badge')).not.toBeInTheDocument();
     });
   });
+
+  describe('pinned serving version callout', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('renders pinned callout for the serving_confirmed version in recent_versions', () => {
+      const servingVersion: api.RecentVersion = {
+        version_number: 3,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+        serving: { status: 'serving_confirmed', sha: 'abc1234', confirmed_at: '2026-06-01T13:00:00Z', failure_reason: null, artifacts: null },
+        merged_count: 5,
+        highlights: { headline: 'shipped 5 improvements', merged_count: 5, proven: 4, total_merged_for_acceptance: 5, qualification_confidence: 0.92, qualification_threshold: 0.9 },
+      };
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 4 }),
+            recent_versions: [servingVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const callout = screen.getByTestId('pinned-serving-version');
+      expect(callout).toBeInTheDocument();
+      expect(callout).toHaveTextContent('currently serving');
+      expect(callout).toHaveTextContent('v3');
+      expect(callout).toHaveTextContent('5 merged');
+      expect(callout).toHaveTextContent('shipped 5 improvements');
+    });
+
+    it('does not render pinned callout when no version is serving_confirmed', () => {
+      const nonServingVersion: api.RecentVersion = {
+        version_number: 2,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+        serving_status: 'unconfirmed',
+      };
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 3 }),
+            recent_versions: [nonServingVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('pinned-serving-version')).not.toBeInTheDocument();
+    });
+  });
 });

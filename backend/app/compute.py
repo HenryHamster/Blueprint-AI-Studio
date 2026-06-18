@@ -39,6 +39,7 @@ from app.database import AsyncSessionLocal
 # the names also stay reachable as `app.compute.*` (the quota state dicts are
 # only ever mutated in place, so these aliases remain live). No load-time
 # cycle: provision_error_scope imports compute._zone_lock at call time only.
+from app.time_utils import exponential_backoff
 from app.provision_error_scope import (
     QUOTA_SCOPE_GLOBAL,
     QUOTA_SCOPE_REGIONAL,
@@ -193,9 +194,9 @@ ZONE_HISTORY_WINDOW = int(
 _ZONE_NEUTRAL_RATE = 0.5  # Default success rate for zones with no history
 
 
-def _zone_cooldown_seconds(consecutive_failures: int) -> int:
-    """Exponential backoff: 3min → 6min → 12min → 24min → 30min cap."""
-    return min(ZONE_COOLDOWN_SECONDS * (2**consecutive_failures), 1800)
+def _zone_cooldown_seconds(consecutive_failures: int) -> float:
+    """Exponential backoff: 3min → 6min → 12min → 24min → 30min cap, with jitter."""
+    return exponential_backoff(consecutive_failures + 1, base=ZONE_COOLDOWN_SECONDS, cap=1800.0)
 
 
 # Zone health tracking: populated by provisioning attempts
@@ -1725,7 +1726,7 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
                     max_retries,
                 )
                 raise
-            backoff_seconds = min(0.1 * (2**attempt), 2.0)
+            backoff_seconds = exponential_backoff(attempt + 1, base=0.1, cap=2.0)
             logger.warning(
                 "[COMPUTE] IAM policy ETag conflict on %s (attempt %d/%d), retrying in %.2fs",
                 secret.name,

@@ -722,7 +722,9 @@ async def test_acceptance_aggregate_respects_since_window(db_session):
     await db_session.commit()
     with patch("app.models._utcnow", return_value=old_completed_at):
         before_window.status = TaskStatus.COMPLETED
-        before_window.context = _landed_ctx({"code_acceptance_verdict": {"satisfied": False}})
+        before_window.context = _landed_ctx(
+            {"code_acceptance_verdict": {"satisfied": False}}
+        )
         await db_session.commit()
 
     inside_window = Task(
@@ -824,9 +826,7 @@ async def test_count_in_flight_counts_all_non_terminal_statuses(db_session):
         TaskStatus.EVALUATING,
         TaskStatus.BLOCKED,
     ):
-        await _make_task(
-            db_session, project, status=status, context={}, updated_at=now
-        )
+        await _make_task(db_session, project, status=status, context={}, updated_at=now)
 
     count = await rv.count_in_flight_tasks(db_session, project.id)
     assert count == 5
@@ -842,9 +842,7 @@ async def test_count_in_flight_excludes_terminal_statuses(db_session):
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
     ):
-        await _make_task(
-            db_session, project, status=status, context={}, updated_at=now
-        )
+        await _make_task(db_session, project, status=status, context={}, updated_at=now)
     # One live task to prove the query selects the right rows.
     await _make_task(
         db_session, project, status=TaskStatus.IN_PROGRESS, context={}, updated_at=now
@@ -1253,9 +1251,7 @@ def test_to_phase_block_carries_audit_crashed_state():
     # No audit-child signal: unchanged behavior.
     assert rv.to_phase_block(version)["qualification_state"]["state"] == "qualifying"
     # Crashed audit child: reconciled to audit_crashed.
-    block = rv.to_phase_block(
-        version, {"task_status": "FAILED", "report": None}
-    )
+    block = rv.to_phase_block(version, {"task_status": "FAILED", "report": None})
     assert block["qualification_state"]["state"] == "audit_crashed"
     assert "wait for the verdict" not in block["qualification_state"]["summary"].lower()
 
@@ -1464,6 +1460,128 @@ def test_build_version_highlights_legacy_none_acceptance_defaults_zero():
     assert h["total_merged_for_acceptance"] == 0
     assert h["qualification_confidence"] is None
     assert h["qualification_threshold"] is None
+
+
+# ===========================================================================
+# build_version_highlights — narrative field
+# ===========================================================================
+
+
+def test_build_version_highlights_open_with_merged_has_narrative():
+    """An open version with merged work has a non-empty narrative that mentions
+    the merged count and phase, and reflects acceptance + qualification state."""
+    version = ReleaseVersion(
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"confidence": 0.82, "threshold": 0.9},
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=3,
+        aggregate_serving_status=None,
+        acceptance_aggregate={"proven": 2, "total": 3},
+    )
+    narrative = h["narrative"]
+    assert isinstance(narrative, str) and narrative, (
+        "narrative must be a non-empty string"
+    )
+    assert "3" in narrative, "narrative should mention merged count"
+    assert "stabilize" in narrative, "narrative should mention phase"
+    assert "2" in narrative and "3" in narrative, (
+        "narrative should reflect proven/total"
+    )
+    assert "82%" in narrative or "below" in narrative, (
+        "narrative should reflect qualification state"
+    )
+
+
+def test_build_version_highlights_promoted_and_serving_narrative():
+    """A promoted-and-serving version has a narrative that mentions promotion and serving."""
+    version = ReleaseVersion(
+        version_number=4,
+        phase="stabilize",
+        status="promoted",
+        opened_at=_utcnow(),
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=12,
+        aggregate_serving_status="serving_confirmed",
+        acceptance_aggregate={"proven": 10, "total": 12},
+    )
+    narrative = h["narrative"]
+    assert isinstance(narrative, str) and narrative
+    assert "serving" in narrative.lower(), "narrative must mention serving"
+    assert "12" in narrative, "narrative should mention merged count"
+    assert "10" in narrative, "narrative should mention proven count"
+
+
+def test_build_version_highlights_abandoned_narrative():
+    """An abandoned version has a narrative that mentions abandonment and merged count."""
+    version = ReleaseVersion(
+        version_number=7,
+        phase="build",
+        status="abandoned",
+        opened_at=_utcnow(),
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=5,
+        aggregate_serving_status="serving_confirmed",
+        acceptance_aggregate={"proven": 1, "total": 5},
+    )
+    narrative = h["narrative"]
+    assert isinstance(narrative, str) and narrative
+    assert "abandon" in narrative.lower(), "narrative must mention abandonment"
+    assert "5" in narrative, "narrative should mention merged count"
+
+
+def test_build_version_highlights_legacy_none_acceptance_narrative():
+    """A legacy version with no acceptance aggregate yields a non-empty narrative."""
+    version = ReleaseVersion(
+        version_number=8,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification=None,
+    )
+    h = rv.build_version_highlights(
+        version,
+        merged_count=2,
+        aggregate_serving_status=None,
+        acceptance_aggregate=None,
+    )
+    narrative = h["narrative"]
+    assert isinstance(narrative, str) and narrative
+    assert "build" in narrative.lower() or "2" in narrative
+
+
+def test_build_version_highlights_narrative_always_present():
+    """narrative key is always in the returned dict regardless of version state."""
+    for status, merged, agg in [
+        ("open", 0, None),
+        ("open", 5, {"proven": 3, "total": 5}),
+        ("promoted", 10, {"proven": 8, "total": 10}),
+        ("abandoned", 3, None),
+    ]:
+        version = ReleaseVersion(
+            version_number=1,
+            phase="build",
+            status=status,
+            opened_at=_utcnow(),
+        )
+        h = rv.build_version_highlights(
+            version,
+            merged_count=merged,
+            aggregate_serving_status=None,
+            acceptance_aggregate=agg,
+        )
+        assert "narrative" in h, f"narrative key missing for status={status}"
+        assert isinstance(h["narrative"], str) and h["narrative"], (
+            f"narrative must be non-empty string for status={status}"
+        )
 
 
 # ===========================================================================
@@ -2263,7 +2381,9 @@ async def test_abandon_stamps_reason_and_operator(db_session):
     await db_session.commit()
     await db_session.refresh(abandoned)
 
-    assert abandoned.phase_reasoning.startswith("[operator:alice@example.com] abandoned")
+    assert abandoned.phase_reasoning.startswith(
+        "[operator:alice@example.com] abandoned"
+    )
     # Truncated to the phase-reasoning cap.
     assert len(abandoned.phase_reasoning) <= rv._PHASE_REASONING_MAX
     assert len(abandoned.last_qualification["reason"]) <= rv._PHASE_REASONING_MAX
@@ -2732,3 +2852,145 @@ async def test_refresh_savepoint_keeps_outer_transaction_usable(db_session):
     await db_session.commit()
     await db_session.refresh(project)
     assert project.name == "still-usable"
+
+
+# ===========================================================================
+# list_release_versions endpoint — paginated full-history browse
+# ===========================================================================
+
+
+async def _make_member(db_session, project, *, user_id="rv-user", role="viewer"):
+    """Create a ProjectMember so the access check on the endpoint passes."""
+    from app.models import ProjectMember
+
+    member = ProjectMember(project_id=project.id, user_id=user_id, role=role)
+    db_session.add(member)
+    await db_session.commit()
+    return member
+
+
+async def _make_version(
+    db_session, project, *, version_number, status, opened_at, phase="build"
+):
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=version_number,
+        status=status,
+        phase=phase,
+        opened_at=opened_at,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return version
+
+
+async def _seed_history(db_session, project):
+    """Seed 3 closed versions + 1 open, opened_at increasing with the number."""
+    base = _utcnow()
+    await _make_version(
+        db_session, project, version_number=1, status="promoted",
+        opened_at=base - timedelta(days=4),
+    )
+    await _make_version(
+        db_session, project, version_number=2, status="abandoned",
+        opened_at=base - timedelta(days=3),
+    )
+    await _make_version(
+        db_session, project, version_number=3, status="promoted",
+        opened_at=base - timedelta(days=2),
+    )
+    await _make_version(
+        db_session, project, version_number=4, status="open",
+        opened_at=base - timedelta(days=1),
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_release_versions_pagination(db_session):
+    """The endpoint returns the full history newest-first, with limit/offset/status
+    honoured and a pre-pagination ``total``."""
+    from app.routers.admin_release_version import list_release_versions
+
+    project = await _make_project(db_session, name="RV-List")
+    await _make_member(db_session, project, user_id="rv-user", role="viewer")
+    current_user = {"user_id": "rv-user"}
+
+    await _seed_history(db_session, project)
+
+    # All versions, newest-first; envelope shape is exactly the four keys.
+    resp = await list_release_versions(
+        project_id=project.id, limit=20, offset=0, status=None,
+        session=db_session, current_user=current_user,
+    )
+    assert set(resp.keys()) == {"versions", "total", "limit", "offset"}
+    assert resp["total"] == 4
+    assert resp["limit"] == 20
+    assert resp["offset"] == 0
+    assert [v["version_number"] for v in resp["versions"]] == [4, 3, 2, 1]
+    # Each entry carries the rich serialization fields.
+    assert "highlights" in resp["versions"][0]
+    assert "merged_count" in resp["versions"][0]
+    assert "serving" in resp["versions"][0]
+
+    # limit is respected (only the 2 newest returned, total unchanged).
+    resp_limit = await list_release_versions(
+        project_id=project.id, limit=2, offset=0, status=None,
+        session=db_session, current_user=current_user,
+    )
+    assert resp_limit["total"] == 4
+    assert [v["version_number"] for v in resp_limit["versions"]] == [4, 3]
+
+    # offset skips the first rows.
+    resp_offset = await list_release_versions(
+        project_id=project.id, limit=2, offset=2, status=None,
+        session=db_session, current_user=current_user,
+    )
+    assert resp_offset["total"] == 4
+    assert [v["version_number"] for v in resp_offset["versions"]] == [2, 1]
+
+    # status filter returns only the matching rows, and total reflects the filter.
+    resp_promoted = await list_release_versions(
+        project_id=project.id, limit=20, offset=0, status="promoted",
+        session=db_session, current_user=current_user,
+    )
+    assert resp_promoted["total"] == 2
+    assert {v["version_number"] for v in resp_promoted["versions"]} == {1, 3}
+    assert all(v["status"] == "promoted" for v in resp_promoted["versions"])
+
+
+@pytest.mark.asyncio
+async def test_list_release_versions_rejects_invalid_status(db_session):
+    """An unknown ``status`` value is rejected with a 400 rather than silently
+    returning everything."""
+    from fastapi import HTTPException
+
+    from app.routers.admin_release_version import list_release_versions
+
+    project = await _make_project(db_session, name="RV-BadStatus")
+    await _make_member(db_session, project, user_id="rv-user", role="viewer")
+
+    with pytest.raises(HTTPException) as exc:
+        await list_release_versions(
+            project_id=project.id, limit=20, offset=0, status="bogus",
+            session=db_session, current_user={"user_id": "rv-user"},
+        )
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_list_release_versions_requires_membership(db_session):
+    """A non-member is denied (404) — the access check runs before any query."""
+    from fastapi import HTTPException
+
+    from app.routers.admin_release_version import list_release_versions
+
+    project = await _make_project(db_session, name="RV-NoMember")
+    await _seed_history(db_session, project)
+
+    with pytest.raises(HTTPException) as exc:
+        await list_release_versions(
+            project_id=project.id, limit=20, offset=0, status=None,
+            session=db_session, current_user={"user_id": "stranger"},
+        )
+    assert exc.value.status_code == 404

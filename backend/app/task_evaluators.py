@@ -40,6 +40,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.acceptance_gate import CRITERION_OPS, coerce_number, criterion_met
+from app.json_extract import (
+    _extract_json_array,
+    _extract_last_json_array,
+    scan_balanced_json_objects,
+)
 from app.models import Task, TaskStatus
 from app.task_capabilities import get_task_capability
 
@@ -735,8 +740,6 @@ def _extract_measurement(artifact_text: str | None) -> list | None:
     text = (artifact_text or "").strip()
     if not text:
         return None
-    from app.task_completion import _extract_json_array
-
     json_str = _extract_json_array(text, "severity")
     if not json_str:
         return None
@@ -766,7 +769,7 @@ def _extract_compute_measurement(
     unparseable, outcome-less, or cost-less artifact. ``final_cost_usd`` is
     preferred; ``accrued_cost_usd`` is the fallback the agent itself uses.
     """
-    obj = _extract_json_object(artifact_text)
+    obj = _parse_artifact_json(artifact_text)
     if obj is None:
         return None
     outcome = obj.get("outcome")
@@ -912,7 +915,7 @@ def evaluate_compute_success_criterion(
         value: float | None = _release_echo_numeric(binding_status, metric)
         raw_value: object = value
     else:
-        obj = _extract_json_object(artifact_text) or {}
+        obj = _parse_artifact_json(artifact_text) or {}
         raw_value = obj.get(metric)
         value = _coerce_number(raw_value)
     # Shared fail-closed core: a metric absent/non-numeric in the result is never
@@ -956,7 +959,7 @@ def _format_unmet_criterion(criterion: dict) -> str:
 _PERF_SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
-def _extract_json_object(artifact_text: str | None) -> dict | None:
+def _parse_artifact_json(artifact_text: str | None) -> dict | None:
     """Parse the first balanced JSON object from ``artifact_text``, or ``None``.
 
     Tries a direct parse first (the agent emits a bare ``JSON.stringify``
@@ -972,32 +975,7 @@ def _extract_json_object(artifact_text: str | None) -> dict | None:
             return parsed
     except (json.JSONDecodeError, ValueError):
         pass
-    obj = _extract_verdict_object_any(text)
-    return obj
-
-
-def _extract_verdict_object_any(text: str) -> dict | None:
-    """Find the first balanced JSON object in ``text`` that parses to a dict."""
-    idx = text.find("{")
-    while idx != -1:
-        depth = 0
-        for j in range(idx, len(text)):
-            c = text[j]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[idx : j + 1]
-                    try:
-                        obj = json.loads(candidate)
-                        if isinstance(obj, dict):
-                            return obj
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                    break
-        idx = text.find("{", idx + 1)
-    return None
+    return scan_balanced_json_objects(text)
 
 
 # ---------------------------------------------------------------------------
@@ -1149,8 +1127,6 @@ def parse_adversarial_finding_verdicts(
         return {
             h: _default_entry(ADVERSARIAL_PARSE_EMPTY_LOGS) for h in finding_hashes
         }, ADVERSARIAL_PARSE_EMPTY_LOGS
-
-    from app.task_completion import _extract_last_json_array
 
     text = logs.strip()
     # Try extraction with different required-key combinations to support:
@@ -1541,60 +1517,6 @@ async def spawn_safeguard_challenge(
     return challenge
 
 
-def _extract_verdict_object(text: str) -> dict | None:
-    """Find the first balanced JSON object containing a ``verdict`` key."""
-    idx = text.find("{")
-    while idx != -1:
-        depth = 0
-        for j in range(idx, len(text)):
-            c = text[j]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[idx : j + 1]
-                    try:
-                        obj = json.loads(candidate)
-                        if isinstance(obj, dict) and "verdict" in obj:
-                            return obj
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                    break
-        idx = text.find("{", idx + 1)
-    return None
-
-
-def _extract_last_verdict_object(text: str) -> dict | None:
-    """Find the LAST balanced JSON object containing a ``verdict`` key.
-
-    Challenge sidecar output often begins with an echoed schema example before
-    the agent's real answer. Scanning to the last verdict object ensures the
-    actual final verdict is used rather than an early schema fragment.
-    """
-    last: dict | None = None
-    idx = text.find("{")
-    while idx != -1:
-        depth = 0
-        for j in range(idx, len(text)):
-            c = text[j]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[idx : j + 1]
-                    try:
-                        obj = json.loads(candidate)
-                        if isinstance(obj, dict) and "verdict" in obj:
-                            last = obj
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                    break
-        idx = text.find("{", idx + 1)
-    return last
-
-
 def parse_grader_verdict(logs: str | None, completed: bool = True) -> EvaluationVerdict:
     """Parse an independent grader's pass/fail verdict from its output.
 
@@ -1610,7 +1532,7 @@ def parse_grader_verdict(logs: str | None, completed: bool = True) -> Evaluation
     if not text:
         return EvaluationVerdict(False, "grader produced no output", "forward-quality")
 
-    obj = _extract_verdict_object(text)
+    obj = scan_balanced_json_objects(text, required_key="verdict")
     if obj is not None:
         v = str(obj.get("verdict", "")).strip().lower()
         reason = str(obj.get("reasoning") or obj.get("reason") or "")[:480]
@@ -1668,27 +1590,12 @@ def parse_safeguard_challenge_outcome(logs: str | None, completed: bool = True) 
     if not text:
         return _fail_closed
 
-    # Try to extract a JSON object with an "outcome" key.
-    idx = text.find("{")
-    while idx != -1:
-        depth = 0
-        for j in range(idx, len(text)):
-            if text[j] == "{":
-                depth += 1
-            elif text[j] == "}":
-                depth -= 1
-            if depth == 0:
-                try:
-                    obj = json.loads(text[idx : j + 1])
-                    if "outcome" in obj:
-                        outcome = str(obj.get("outcome", "")).strip().lower()
-                        reasoning = str(obj.get("reasoning") or "")[:480]
-                        if outcome in ("confirmed", "rejected", "downgraded"):
-                            return {"outcome": outcome, "reasoning": reasoning}
-                except (json.JSONDecodeError, ValueError):
-                    pass
-                break
-        idx = text.find("{", idx + 1)
+    obj = scan_balanced_json_objects(text, required_key="outcome")
+    if obj is not None:
+        outcome = str(obj.get("outcome", "")).strip().lower()
+        reasoning = str(obj.get("reasoning") or "")[:480]
+        if outcome in ("confirmed", "rejected", "downgraded"):
+            return {"outcome": outcome, "reasoning": reasoning}
 
     # Fallback: anchored keyword scan.
     low = text.lower()
@@ -2002,7 +1909,7 @@ def parse_finding_challenge_verdict(
             finding_hash=finding_hash,
         )
 
-    obj = _extract_last_verdict_object(text)
+    obj = scan_balanced_json_objects(text, required_key="verdict", last=True)
     if obj is None:
         return FindingChallengeRecord(
             challenged_boundary=boundary,

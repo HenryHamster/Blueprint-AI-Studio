@@ -141,6 +141,7 @@ async def orch_db(mocker):
     _orch_module._last_zone_health_persist = now
     _orch_module._last_orphan_check = now
     _orch_module._last_evaluating_timeout_check = now
+    _orch_module._last_deadlock_check = now
 
     # Clear task_results so failure-rate gate doesn't trigger
     _shared_state.deploy_monitoring["task_results"].clear()
@@ -2261,7 +2262,7 @@ async def test_deadlock_detection_cascade_cancels_failed_deps(orch_db, mocker):
     task_b_id = task_b.id
 
     # Force the deadlock check to run this cycle (reset throttle timestamp)
-    _orch_module._last_deadlock_check = 0.0
+    _orch_module._last_deadlock_check = None
 
     await _run_one_cycle(mocker)
 
@@ -2352,7 +2353,7 @@ async def test_deadlock_no_false_positive_when_dep_has_active_parent(orch_db, mo
     original_a_deps = list(task_a.depends_on or [])
     original_b_deps = list(task_b.depends_on or [])
 
-    _orch_module._last_deadlock_check = 0.0
+    _orch_module._last_deadlock_check = None
 
     await _run_one_cycle(mocker)
 
@@ -2431,7 +2432,7 @@ async def test_deadlock_true_cycle_cleared(orch_db, mocker):
     task_a_id = task_a.id
     task_b_id = task_b.id
 
-    _orch_module._last_deadlock_check = 0.0
+    _orch_module._last_deadlock_check = None
 
     await _run_one_cycle(mocker)
 

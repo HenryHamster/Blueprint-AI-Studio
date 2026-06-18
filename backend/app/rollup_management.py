@@ -938,7 +938,7 @@ async def _check_and_trigger_rollup(
     """
     from app.alert_dispatch import _maybe_create_failure_alert
     from app.time_utils import _utcnow
-    from app.broadcast import broadcast_to_project
+    from app.broadcast import broadcast_to_project, _sanitize_log
     from app.routers.agent import get_github_token_for_task
     from app.security import scan_pr_for_injection
     from app.github import (
@@ -2737,9 +2737,7 @@ async def _check_and_trigger_rollup(
                     if rollup_scan_err is not None:
                         if _gates_on:
                             parent.requires_approval = True
-                            parent.latest_status_message = f"Rollup security scan failed — requires manual approval: {type(rollup_scan_err).__name__}: {rollup_scan_err!r}"[
-                                :500
-                            ]
+                            parent.latest_status_message = _sanitize_log(f"Rollup security scan failed — requires manual approval: {type(rollup_scan_err).__name__}")[:500]
                             parent.context = {
                                 **parent_ctx,
                                 "rollup_pr_url": rollup_pr_url,
@@ -4168,9 +4166,7 @@ async def _check_and_trigger_rollup(
                     )
                     parent.status = TaskStatus.FAILED
                     parent.context = _clear_rollup_transient_state(parent.context)
-                    parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {type(e).__name__}: {e!r}"[
-                        :500
-                    ]
+                    parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {type(e).__name__}"[:500]
                     from app.failure_classification import (
                         classify_failure,
                         persist_failure_category,

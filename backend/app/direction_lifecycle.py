@@ -18,7 +18,7 @@ from app.payload_schemas import validate_internal_payload
 from app.shared_state import (
     runtime_config as _runtime_config,
 )
-from app.direction_refractory import get_direction_refractory_info
+from app.direction_refractory import get_direction_refractory_info, resolve_direction_refractory_minutes
 from app.strategic_completion import _is_code_failure_pause_reason
 from app.time_utils import _utcnow
 
@@ -255,10 +255,59 @@ def _synthesize_outcome_scaffolding_memo(
     }
 
 
+async def _directed_research_recently_completed(
+    project_id, direction_id: str, session, direction: dict | None = None
+) -> bool:
+    """True when a directed research task for this direction COMPLETED within the
+    cooldown window.
+
+    Crash guard: protects against re-commissioning when ``_handle_research_completion``
+    dies before it can update ``refractory_until`` on the direction — the refractory
+    gate then sees no hold and allows a re-spawn (incident 2026-06-10).
+
+    Mirrors ``_undirected_research_recently_active`` for the directed case; the
+    undirected guard already covers all statuses, so this companion only checks
+    COMPLETED. Set ``completed_research_cooldown_minutes`` <= 0 to disable.
+
+    Absent an explicit ``completed_research_cooldown_minutes`` value the window
+    derives from the direction's effective refractory window (via
+    ``resolve_direction_refractory_minutes``) when a direction dict is supplied,
+    or falls back to ``autonomous_direction_cooldown_minutes`` (default 240) —
+    matching the refractory gate's fallback so both gates agree on the cooldown window.
+    """
+    from app.routers.admin_analytics import _derive_completed_at
+
+    explicit = _runtime_config.get("completed_research_cooldown_minutes")
+    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+        cooldown_minutes = float(explicit)
+    elif direction is not None:
+        cooldown_minutes = resolve_direction_refractory_minutes(direction)
+    else:
+        base = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
+        if isinstance(base, (int, float)) and not isinstance(base, bool):
+            cooldown_minutes = float(base)
+        else:
+            cooldown_minutes = 240.0
+    if cooldown_minutes <= 0:
+        return False
+    cutoff = _utcnow() - timedelta(minutes=cooldown_minutes)
+    completed = (
+        await session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.status == TaskStatus.COMPLETED,
+                Task.payloads[0]["type"].as_string() == "research",
+                Task.payloads[0]["current_direction_id"].as_string()
+                == str(direction_id),
+            )
+        )
+    ).scalars()
+    return any(_derive_completed_at(task) >= cutoff for task in completed)
+
+
 async def _process_direction_lifecycle(
     project: Project,
     session: AsyncSession,
-    cooldown_minutes: float,
     busy_direction_ids: set,
     now: datetime,
 ) -> list:
@@ -282,14 +331,13 @@ async def _process_direction_lifecycle(
         # the caller's outer project load and this lock acquisition.
         await session.refresh(project, attribute_names=["directions"])
         return await _process_direction_lifecycle_locked(
-            project, session, cooldown_minutes, busy_direction_ids, now
+            project, session, busy_direction_ids, now
         )
 
 
 async def _process_direction_lifecycle_locked(
     project: Project,
     session: AsyncSession,
-    cooldown_minutes: float,
     busy_direction_ids: set,
     now: datetime,
 ) -> list:
@@ -1203,6 +1251,18 @@ async def _process_direction_lifecycle_locked(
                 f"[AUTONOMOUS] Cleared outcome-scaffolding flag on {did}: "
                 f"condition no longer holds"
             )
+        # Crash guard: skip if a research task for this direction completed within the
+        # cooldown window — covers the gap when _handle_research_completion dies before
+        # stamping refractory_until (incident 2026-06-10).
+        if did and await _directed_research_recently_completed(
+            project.id, did, session, direction=d
+        ):
+            logger.info(
+                "[RESEARCH] Skipping direction %s: a research task completed within the "
+                "cooldown window (crash guard)",
+                did,
+            )
+            continue
         active_directions.append(d)
     if auto_paused_any or directions_modified:
         flag_modified(project, "directions")

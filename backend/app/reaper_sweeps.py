@@ -14,9 +14,48 @@ from datetime import datetime, timedelta
 
 from sqlmodel import select
 
-from app.depends_on_provenance import remember_structural_depends_on
+from app.blocked_task_unblock_sweeps import (
+    _BLOCKED_ESCALATE_AFTER,
+    _BLOCKED_ESCALATED_PARK,
+    _BLOCKED_OPTIMISTIC_RETRY_CAP,
+    _BLOCKED_PARKED_REEVAL_CAP,
+    _BLOCKED_PARKED_REEVAL_INTERVAL,
+    _TRANSIENT_BLOCKER_PARK_SENTINEL,
+    GIVE_UP_FOUNDATION_DIED,
+    GIVE_UP_NEVER_SATISFIABLE,
+    MISSING_FOUNDATION_MARKER_KEY,
+    RESUME_MARKER_CONTEXT_KEY,
+    UNRESUMABLE_CANCEL_CONTEXT_KEY,
+    _apply_needs_disposition,
+    _blocked_precondition_state,
+    _cancel_blocker_as_dead,
+    _classify_blocker_needs,
+    _clear_blocked_fields,
+    _fetch_active_candidates,
+    _fetch_completed_candidates,
+    _fetch_dead_candidates,
+    _fetch_knowledge_substance_index,
+    _fetch_working_capability_names,
+    _next_recheck_delay,
+    _partition_completed_needs_base_safe,
+    _persist_residual_needs,
+    _wire_edges,
+    sweep_unblock_blocked_tasks,
+    _event_driven_unblock_project,
+    event_driven_unblock_dependents,
+    event_driven_unblock_on_knowledge,
+)
 from app.models import Task, TaskStatus
-from app.time_utils import _utcnow
+from app.time_utils import _is_cadence_due, _utcnow
+from app.reaper_fleet_health_sweeps import (
+    sweep_merge_gate_verification_degradation,
+    sweep_migration_slot_contention,
+)
+
+__all__ = [
+    "sweep_merge_gate_verification_degradation",
+    "sweep_migration_slot_contention",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +156,7 @@ async def _run_regression_scan_and_notify(session) -> int:
                 logger.exception(
                     f"[REAPER] post_account_model_regression_message failed for project {pid}"
                 )
-            asyncio.ensure_future(  # noqa: RUF006
+            asyncio.ensure_future(
                 dispatch_external_notification(
                     pid,
                     "account_model_regression_quarantined",
@@ -343,7 +382,7 @@ async def sweep_queued_age_alerts(
         for project_id, payload in pending_broadcasts:
             try:
                 await _bcast(project_id, "alert_created", payload)
-            except Exception as _bcast_err:  # noqa: BLE001
+            except Exception as _bcast_err:
                 logger.warning(
                     f"[REAPER] Queued age alert broadcast failed for "
                     f"{payload.get('alert_id')}: {_bcast_err}"
@@ -458,7 +497,7 @@ async def sweep_stalled_strategic_cycles(
         for project_id, payload in pending_broadcasts:
             try:
                 await _bcast(project_id, "alert_created", payload)
-            except Exception as _bcast_err:  # noqa: BLE001
+            except Exception as _bcast_err:
                 logger.warning(
                     f"[REAPER] Stalled-cycle alert broadcast failed for "
                     f"{payload.get('alert_id')}: {_bcast_err}"
@@ -479,10 +518,8 @@ async def sweep_regression_scan(session) -> int:
     global _last_regression_scan
 
     now_scan = _utcnow()
-    if (
-        _last_regression_scan is not None
-        and (now_scan - _last_regression_scan).total_seconds()
-        < _REGRESSION_SCAN_INTERVAL_SECONDS
+    if not _is_cadence_due(
+        _last_regression_scan, _REGRESSION_SCAN_INTERVAL_SECONDS, now_scan
     ):
         return 0
 
@@ -518,482 +555,7 @@ async def sweep_routine_message_retention(session, *, retention_days: int = 7) -
 
 
 # ── Step 12: BLOCKED-task auto-unblock / escalation sweep ──────────────────
-#
-# A task enters the first-class BLOCKED state when a durable precondition is
-# missing — an orchestrator-discovered conflict that persisted past the defer
-# threshold (orchestrator_filters._record_defer_and_maybe_escalate) or an
-# agent/lifecycle "BLOCKER:" with an upstream dependency. BLOCKED tasks are
-# undispatchable on the normal queue path (the candidate query is QUEUED-only)
-# and are excluded from stale-task reaping. This sweep is the recovery path:
-# it cheaply rechecks each BLOCKED task at/after its recheck_after and either
-# moves it back to QUEUED (precondition cleared) or re-arms a later recheck.
-# A blocker that is permanently unsatisfiable (its dependency cascade-cancelled)
-# or that outlives the escalation deadline gets ONE deduplicated operator alert
-# and stops being rechecked.
-
-# Base recheck interval, doubled per consecutive still-blocked recheck up to the
-# cap. Keeps the sweep cheap (no per-cycle re-judging) while staying responsive.
-_BLOCKED_RECHECK_BASE = timedelta(minutes=5)
-_BLOCKED_RECHECK_MAX = timedelta(hours=1)
-# A blocker that never clears within this window is escalated to the operator
-# as permanently blocked (one ERROR alert) and parked.
-_BLOCKED_ESCALATE_AFTER = timedelta(hours=6)
-# Parking horizon for terminally-escalated blockers. On escalation we push
-# ``recheck_after`` far into the future (rather than leaving it NULL) so the row
-# drops out of the due query (``recheck_after IS NULL OR <= now``) and is never
-# re-SELECTed / FOR UPDATE-locked on the reaper hot path again. Leaving it NULL
-# kept escalated rows permanently "due" (sorted first by nullsfirst), where they
-# were re-locked every cycle and could crowd genuinely-due rechecks out of the
-# batch-size window. Recovery has given up on these; an operator re-queues them.
-_BLOCKED_ESCALATED_PARK = timedelta(days=3650)
-# A parked (escalated) blocker that STILL carries a machine-resolvable need is
-# re-examined at this LOW, bounded cadence instead of the multi-year park
-# horizon, so that when the foundation it waited on finally lands — a sibling
-# task, a merged PR, or shipped code now reachable on integration — the task
-# resumes automatically rather than waiting for a manual operator requeue. The
-# re-evaluation is cheap (one conservative exact-match pass) and never
-# re-escalates or re-alerts, so it does not reintroduce per-cycle churn. Parked
-# blockers with NO need keep the multi-year horizon and stay for the operator.
-_BLOCKED_PARKED_REEVAL_INTERVAL = timedelta(hours=6)
-# Bounded number of parked re-evaluations a still-unsatisfiable need is given
-# before the dependent is terminated. A need that never becomes satisfiable —
-# e.g. a capability no task ever advertises — would otherwise re-arm the parked
-# re-evaluation at the low cadence forever. After this many parked re-evals with
-# no resolution and no provably-dead foundation, the dependent reaches a bounded
-# TERMINAL (CANCELLED) outcome instead of parking forever. The legitimate
-# "foundation might still appear" case keeps its resume behavior within the
-# bound — only an exhausted, never-satisfiable need terminates.
-_BLOCKED_PARKED_REEVAL_CAP = 4
-# A no-dependency agent/lifecycle blocker is often a TRANSIENT infra failure
-# (orchestrator ./pr open 5xx, git push stale-lease) that clears on its own, but
-# can also be a durable precondition (missing base branch/file). We can't tell
-# them apart, so we optimistically requeue such a blocker up to this many times —
-# a transient blip recovers on retry; a durable blocker re-blocks and, once the
-# budget is spent, parks for the normal backoff + 6h operator escalation. The cap
-# is deliberately small: re-dispatch costs a full agent VM run, so this trades a
-# few wasted runs for auto-recovery instead of a multi-hour operator wedge.
-_BLOCKED_OPTIMISTIC_RETRY_CAP = 3
-
-# Durable context marker stamped on a blocked dependent that the resume system
-# terminally CANCELS because it can provably never resume. The terminal
-# transition clears all structured blocker metadata, so without this marker the
-# give-up is invisible in aggregate (only a free-text status message + one
-# deduplicated alert survive). The marker is queryable JSONB — no migration — and
-# feeds the fleet-wide unresumable-cancellation health signal
-# (``digest_metrics.compute_unresumable_cancellation_summary``). Observability
-# only: stamping it changes nothing about WHEN or WHETHER a dependent is
-# cancelled.
-UNRESUMABLE_CANCEL_CONTEXT_KEY = "_unresumable_cancellation"
-# Durable marker for the GOOD outcome, symmetric to the give-up marker above: a
-# blocked dependent that successfully RESUMED (status → QUEUED) when its foundation
-# landed. The transient latest_status_message and the in-memory ``requeued`` counter
-# do not survive, so a regression where resumes stall looks identical to 'all
-# healthy'. This queryable JSONB marker (no migration) feeds the dependency-health
-# digest's positive resume signal (``digest_metrics.compute_blocked_resume_summary``).
-# Observability only: stamping it changes nothing about WHEN or WHETHER a dependent
-# resumes.
-RESUME_MARKER_CONTEXT_KEY = "_blocked_resume"
-# Give-up classes — the two reasons a blocked dependent can provably never resume.
-GIVE_UP_FOUNDATION_DIED = (
-    "foundation_died"  # needed foundation reached terminal FAILED/CANCELLED
-)
-GIVE_UP_NEVER_SATISFIABLE = (
-    "never_satisfiable"  # need outlived its bounded parked re-evals
-)
-
-# Need kinds that name a FOUNDATION (a sibling task / finding-hash, or an explicit
-# capability) rather than an external ref like a PR number. When one of these is
-# cancelled as never_satisfiable, no task ever provided it — the dependent was
-# stranded because the foundation was never created, which is first-class
-# missing-foundation demand (see
-# ``capability_demand.collect_missing_capability_demand``).
-_FOUNDATION_NEED_KINDS = ("capability", "task")
-# Additive sub-key stamped onto the UNRESUMABLE_CANCEL_CONTEXT_KEY marker when a
-# never-satisfiable give-up cancelled a foundation-kind need: it flags an EXPLICIT
-# missing-foundation retirement (stranded because nothing was ever built to satisfy
-# the prerequisite), distinct from a give-up whose foundation existed and died.
-# Purely additive — it never removes or renames an existing marker key, and the
-# demand collector reads it to fold post-cancel demand back into the aggregate.
-MISSING_FOUNDATION_MARKER_KEY = "missing_foundation"
-
-
-def _next_recheck_delay(attempts: int) -> timedelta:
-    """Exponential backoff for the next recheck, capped at ``_BLOCKED_RECHECK_MAX``."""
-    secs = _BLOCKED_RECHECK_BASE.total_seconds() * (2 ** max(0, attempts))
-    return timedelta(seconds=min(secs, _BLOCKED_RECHECK_MAX.total_seconds()))
-
-
-async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
-    """Classify whether a BLOCKED task's recorded precondition is now satisfied.
-
-    Returns one of:
-      - ``"clear"``   — the precondition is satisfied (or is a transient conflict
-                        with no dependency edge); requeue and let dispatch run/
-                        re-judge it.
-      - ``"retry"``   — a no-dependency agent/lifecycle blocker that may be a
-                        transient infra failure; the driver optimistically
-                        requeues it a bounded number of times before parking.
-      - ``"waiting"`` — an upstream dependency is still in flight; stay BLOCKED.
-      - ``"dead"``    — an upstream dependency genuinely failed / was cancelled,
-                        so this work is impossible; escalate terminally.
-
-    Reuses the single source of truth for dependency resolution
-    (``orchestrator_health._check_candidate_task_deps``) rather than
-    reimplementing merge/cancel/scope-empty semantics here.
-    """
-    deps = task.depends_on or []
-    blocker_meta = (task.context or {}).get("blocker") or {}
-    blocker_source = (
-        blocker_meta.get("source") if isinstance(blocker_meta, dict) else None
-    )
-    if not deps:
-        if task.blocker_kind in {"file_conflict", "pending_rollup"}:
-            # Orchestrator-owned blockers with no dependency edges are still
-            # safe to requeue optimistically: dispatch re-judges and re-blocks
-            # them immediately if the conflict is still live.
-            return "clear"
-        if blocker_source == "parent":
-            children = (
-                (
-                    await session.execute(
-                        select(Task).where(Task.parent_task_id == task.id)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            for child in children:
-                child_ctx = child.context or {}
-                if child.status == TaskStatus.BLOCKED:
-                    return "waiting"
-                if child.status == TaskStatus.FAILED and (
-                    child_ctx.get("failure_category") == "BLOCKED_PRECONDITION"
-                    or child_ctx.get("failure_class") == "BLOCKED_PRECONDITION"
-                    or (child.latest_status_message or "")
-                    .lstrip()
-                    .lower()
-                    .startswith("blocker:")
-                ):
-                    return "waiting"
-            # Child blockers have cleared; move the parent back into the
-            # rollup/re-evaluation path instead of normal dispatch.
-            return "re_evaluate"
-        if verify_pr_merged is None:
-            return "waiting"
-        # AGENT-surfaced "BLOCKER:" with no explicit dependency edge (source set
-        # by agent_status.py): these are often TRANSIENT infra failures
-        # (orchestrator ./pr open 5xx, git push stale-lease) that clear on their
-        # own, but can also be durable preconditions (missing base branch/file).
-        # We can't reliably tell them apart from here, so signal a BOUNDED
-        # optimistic requeue: the driver retries up to
-        # _BLOCKED_OPTIMISTIC_RETRY_CAP times before parking + escalating. A
-        # transient blip recovers on retry; a durable blocker re-blocks and is
-        # parked once the retry budget is spent. (Previously this returned
-        # "waiting" unconditionally, which left a transient infra blip wedging
-        # its EVALUATING rollup parent for hours until an operator manually
-        # requeued — incident 2026-06-04, tasks 87ddb2a4/18c8c195.) Scoped to
-        # source=="agent" so parent-source blockers and metadata-less blocked
-        # subtasks keep their existing "wait for explicit recovery" semantics.
-        if blocker_source == "agent":
-            return "retry"
-        return "waiting"
-    if verify_pr_merged is None:
-        return "waiting"
-
-    from app.orchestrator_health import _check_candidate_task_deps
-
-    dep_uuids = []
-    for d in deps:
-        try:
-            dep_uuids.append(uuid.UUID(str(d)))
-        except (ValueError, AttributeError, TypeError):
-            continue
-    if not dep_uuids:
-        return "clear"
-    dep_tasks = (
-        (await session.execute(select(Task).where(Task.id.in_(dep_uuids))))
-        .scalars()
-        .all()
-    )
-    result, _ = await _check_candidate_task_deps(
-        task, dep_tasks, dep_uuids, session, verify_pr_merged
-    )
-    if result == "eligible":
-        return "clear"
-    if result == "cascade_cancel":
-        return "dead"
-    return "waiting"
-
-
-def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None:
-    """Reset a task's durable blocker metadata and defer bookkeeping on unblock.
-
-    Delegates the structured ``blocker`` record and the BLOCKED_PRECONDITION
-    compat-tag clearing to ``task_blocked.clear_blocker_metadata`` — the single
-    source of truth for "what a clean out-transition drops" — so the reaper's
-    recovery path and the canonical out-transition cannot drift. This sweep
-    then clears its own recheck/escalation bookkeeping keys on top.
-
-    ``preserve_first_blocked`` keeps the ``_blocked_first_at`` onset stamp so a
-    blocker that is only *optimistically* requeued — a conflict/rollup blocker
-    with no dependency edge, which dispatch may immediately re-block — still
-    measures its escalation deadline from the true onset rather than restarting
-    each requeue episode. A genuine dependency clear wipes everything.
-    """
-    from app.task_blocked import clear_blocker_metadata
-
-    # Drops blocker columns, the structured blocker record, and the stale
-    # BLOCKED_PRECONDITION failure_class/failure_category tags.
-    clear_blocker_metadata(task)
-    ctx = task.context or {}
-    keys = [
-        "_precondition_defer",
-        "_precondition_escalated_key",
-        "_blocked_escalated",
-        "_blocked_recheck_attempts",
-    ]
-    if not preserve_first_blocked:
-        keys.append("_blocked_first_at")
-        # The optimistic-retry budget is preserved across an onset-preserving
-        # requeue (so a transient agent/lifecycle blocker keeps counting toward
-        # its cap), but wiped on a genuine dependency clear so a later, unrelated
-        # block starts with a fresh budget.
-        keys.append("_blocked_optimistic_retries")
-    for k in keys:
-        ctx.pop(k, None)
-    task.context = ctx
-
-
-async def _fetch_active_candidates(session, project_id) -> list:
-    """Active/in-flight tasks in a project — the foundations a need can resolve to.
-
-    Statuses mirror ``blocked_need_resolution.ACTIVE_CANDIDATE_STATUSES``: a need
-    can only resolve onto work that is still going to land (QUEUED/PROVISIONING/
-    IN_PROGRESS/EVALUATING), never onto already-terminal rows.
-    """
-    from app.blocked_need_resolution import ACTIVE_CANDIDATE_STATUSES
-
-    active = [TaskStatus(s) for s in ACTIVE_CANDIDATE_STATUSES]
-    return (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project_id,
-                    Task.status.in_(active),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-
-async def _fetch_knowledge_substance_index(session, project_id) -> list:
-    """Substance index for durable KnowledgeDocuments in a project.
-
-    Delegates to :func:`knowledge_query.fetch_knowledge_substance_index` so the
-    SQL join lives in one place and the result is cached per project across the
-    sweep batch (exactly as the active/completed/dead candidate caches are).
-    """
-    from app.knowledge_query import fetch_knowledge_substance_index
-
-    return await fetch_knowledge_substance_index(session, project_id)
-
-
-async def _fetch_working_capability_names(session, project_id) -> set:
-    """Canonical names of registry capabilities the project declares ``working``.
-
-    Drawn from the strategist-curated ``project.problem_model.capabilities``
-    registry — the same vocabulary agents declare prerequisite refs from. A
-    ``working`` capability already exists in the codebase, so a capability need
-    naming one is satisfied by the repo itself (no provider task required).
-    Cached per project across the sweep batch like the candidate sets.
-    """
-    from app.capability_registry import working_capability_names
-    from app.models import Project
-
-    project = await session.get(Project, project_id)
-    return working_capability_names(getattr(project, "problem_model", None))
-
-
-async def _classify_blocker_needs(
-    task,
-    session,
-    *,
-    candidate_cache: dict,
-    completed_cache: dict,
-    dead_cache: dict,
-    knowledge_cache: dict,
-    registry_cache: dict,
-) -> dict:
-    """Classify EVERY recorded need of a blocked task against the live foundations.
-
-    A blocked dependent can wait on MORE THAN ONE unresolved prerequisite (see
-    :func:`task_blocked.get_blocker_needs`). This evaluates each one against the
-    active / completed / dead candidate sets and returns a disposition dict:
-
-      ``had_needs``       — the task carried ≥1 machine-resolvable need
-      ``edges``           — foundation ids to wire (need → active in-flight task)
-      ``completed_needs`` — needs satisfied by already-completed/merged work
-                            (includes knowledge-document-satisfied needs)
-      ``residual``        — needs not yet accounted for (no foundation matches)
-      ``dead``            — ≥1 need names a terminally FAILED/CANCELLED foundation
-
-    Resolution per need is active → completed → knowledge → registry → dead →
-    residual. Knowledge-satisfied needs (a dangling kind='task' ref whose
-    substance persists as a durable KnowledgeDocument) are routed into
-    ``completed_needs`` so the existing resume path handles them without wiring
-    a depends_on edge. The registry step does the same for a capability need the
-    project's problem_model already declares ``working`` — the capability exists
-    in the codebase itself, so no provider task will ever advertise it; without
-    this step such a need sits residual to the escalation deadline (or worse, a
-    long-dead historical provider routes it to the dead-foundation cancel). It
-    deliberately runs BEFORE the dead check for exactly that reason. This
-    prevents the dead-foundation path from cancelling a dependent whose need IS
-    durably satisfied. Reuses the shared conservative predicates in
-    :mod:`app.blocked_need_resolution` (no parallel matcher); candidate sets are
-    fetched lazily and cached per project across the sweep batch. A foundation
-    already present in ``task.depends_on`` is treated as already-wired (it is not
-    re-added to ``edges``), so a partially-resolved blocker keeps converging.
-    """
-    from app.task_blocked import get_blocker_needs
-    from app.blocked_need_resolution import (
-        resolve_blocked_need,
-        completed_foundation_for_need,
-        need_matched_dead_foundation,
-        knowledge_substance_satisfies_need,
-    )
-    from app.capability_registry import registry_satisfies_capability_need
-
-    needs = get_blocker_needs(task)
-    disp = {
-        "had_needs": bool(needs),
-        "edges": [],
-        "completed_needs": [],
-        "residual": [],
-        "dead": False,
-        # The first need that matched a terminally-dead foundation, recorded so the
-        # foundation-died cancel can stamp it into the unresumable marker.
-        "dead_need": None,
-    }
-    if not needs:
-        return disp
-
-    active = candidate_cache.get(task.project_id)
-    if active is None:
-        active = await _fetch_active_candidates(session, task.project_id)
-        candidate_cache[task.project_id] = active
-    completed = completed_cache.get(task.project_id)
-    if completed is None:
-        completed = await _fetch_completed_candidates(session, task.project_id)
-        completed_cache[task.project_id] = completed
-    dead = dead_cache.get(task.project_id)
-    if dead is None:
-        dead = await _fetch_dead_candidates(session, task.project_id)
-        dead_cache[task.project_id] = dead
-    knowledge = knowledge_cache.get(task.project_id)
-    if knowledge is None:
-        knowledge = await _fetch_knowledge_substance_index(session, task.project_id)
-        knowledge_cache[task.project_id] = knowledge
-    # Registry working-capability set, fetched only when a capability need is
-    # actually present (the common task-kind path pays no extra query).
-    working_caps = registry_cache.get(task.project_id)
-    if working_caps is None and any(n.get("kind") == "capability" for n in needs):
-        working_caps = await _fetch_working_capability_names(session, task.project_id)
-        registry_cache[task.project_id] = working_caps
-    if working_caps is None:
-        working_caps = set()
-
-    # Stranded-parent set so a GENUINE ghost merge does NOT satisfy a completed
-    # need. LANDED-IN-BASE-LINEAGE semantics: the ghost-merge exclusion fires ONLY
-    # for a rollup parent that has terminally FAILED/CANCELLED — its staging branch
-    # is abandoned, so a child PR that merged into it never reached the dependent's
-    # base lineage. A parent that has merely NOT-YET-ROLLED-UP — still in flight,
-    # or COMPLETED while its rollup PR to integration is pending — is NOT stranded:
-    # the child's PR has already merged into the plan/staging branch that IS in the
-    # dependent's base lineage, so the dependent cuts from it and sees the code
-    # regardless of when the parent rollup integrates (audit case 3: a completed,
-    # exact-title provider whose PR merged into the plan branch must resume its
-    # dependent even before the rollup lands). Keying the strand on definitively
-    # FAILED/CANCELLED parents only preserves the genuine ghost-merge exclusion
-    # while no longer parking a dependent on a provider that genuinely landed in
-    # its base lineage.
-    failed_parents = {c.id for c in dead}
-
-    existing_edges = {str(d) for d in (task.depends_on or [])}
-    for need in needs:
-        match = resolve_blocked_need(task, need, active)
-        if match is not None:
-            match_id = str(match.id)
-            if match_id not in existing_edges and match_id not in disp["edges"]:
-                disp["edges"].append(match_id)
-            continue
-        if (
-            completed_foundation_for_need(task, need, completed, failed_parents)
-            is not None
-        ):
-            disp["completed_needs"].append(need)
-            continue
-        # Durable-knowledge fallback: a dangling kind='task' need whose originating
-        # task is CANCELLED but whose substance persists as a KnowledgeDocument is
-        # satisfied — do NOT route it to the dead-foundation path.
-        if knowledge_substance_satisfies_need(need, knowledge):
-            disp["completed_needs"].append(need)
-            continue
-        # Registry-satisfied capability: the problem_model already declares this
-        # capability ``working``, so the codebase itself is the foundation —
-        # resume with no edge. Checked BEFORE the dead-foundation path so a
-        # stale terminal provider of a still-working capability can never
-        # cancel the dependent.
-        if registry_satisfies_capability_need(need, working_caps):
-            disp["completed_needs"].append(need)
-            continue
-        if need_matched_dead_foundation(task, need, dead):
-            disp["dead"] = True
-            if disp["dead_need"] is None:
-                disp["dead_need"] = need
-            continue
-        disp["residual"].append(need)
-    return disp
-
-
-def _wire_edges(task, edge_ids: list) -> bool:
-    """Idempotently append ``edge_ids`` to ``task.depends_on``. Returns True if any
-    edge was newly added. Full-list reassignment so SQLAlchemy observes the JSONB
-    change (``flag_modified`` is applied by callers)."""
-    existing = [str(d) for d in (task.depends_on or [])]
-    added = False
-    for match_id in edge_ids:
-        if match_id not in existing:
-            existing.append(match_id)
-            remember_structural_depends_on(task, match_id)
-            added = True
-    if added:
-        task.depends_on = existing
-    return added
-
-
-def _persist_residual_needs(task, residual: list) -> None:
-    """Re-persist only the still-unsatisfied needs back into the blocker metadata.
-
-    Drops needs resolved this round (wired into an edge or satisfied by completed
-    work) and keeps only ``residual``, recomputing the legacy single ``need``
-    mirror = ``residual[0]``. The blocker record is NOT cleared — the task stays
-    BLOCKED on the remaining needs so the next tick re-evaluates only those.
-    ``residual`` MUST be non-empty (the all-accounted path clears the blocker
-    instead).
-    """
-    from app.task_blocked import BLOCKER_CONTEXT_KEY
-
-    ctx = dict(task.context or {})
-    meta = ctx.get(BLOCKER_CONTEXT_KEY)
-    if not isinstance(meta, dict):
-        return
-    meta = dict(meta)
-    meta["needs"] = list(residual)
-    meta["need"] = residual[0]
-    ctx[BLOCKER_CONTEXT_KEY] = meta
-    task.context = ctx
+# (constants and sweep helpers live in app.blocked_task_unblock_sweeps)
 
 
 async def sweep_converge_duplicate_foundations(session, now=None) -> int:
@@ -1025,10 +587,8 @@ async def sweep_converge_duplicate_foundations(session, now=None) -> int:
 
     global _last_converge_duplicate_scan
     _now = now or _utcnow()
-    if (
-        _last_converge_duplicate_scan is not None
-        and (_now - _last_converge_duplicate_scan).total_seconds()
-        < _FLEET_SCAN_INTERVAL_SECONDS
+    if not _is_cadence_due(
+        _last_converge_duplicate_scan, _FLEET_SCAN_INTERVAL_SECONDS, _now
     ):
         return 0
     _last_converge_duplicate_scan = _now
@@ -1080,1069 +640,6 @@ async def sweep_converge_duplicate_foundations(session, now=None) -> int:
                 await _bcast(project_id, "task_updated", payload)
         logger.info(f"[REAPER] Step 15: converged {wired} duplicate foundation(s)")
     return wired
-
-
-async def _fetch_completed_candidates(session, project_id) -> list:
-    """Completed/merged tasks in a project — foundations that have already LANDED.
-
-    Statuses mirror ``blocked_need_resolution.COMPLETED_CANDIDATE_STATUSES``: a
-    parked blocker's need may now be satisfied by work that has since completed
-    (a sibling task done, the PR it named merged), which the active-candidate
-    matcher never sees.
-    """
-    from app.blocked_need_resolution import COMPLETED_CANDIDATE_STATUSES
-
-    completed = [TaskStatus(s) for s in COMPLETED_CANDIDATE_STATUSES]
-    return (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project_id,
-                    Task.status.in_(completed),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-
-async def _partition_completed_needs_base_safe(
-    task, completed_needs, completed, session
-) -> tuple[list, list]:
-    """Re-cut a resuming dependent's base over ALL its completed needs at ONCE.
-
-    A blocked dependent that resumes because its needs are satisfied by ALREADY-
-    completed work carries NO ``depends_on`` edge, so the dispatch-time re-cut
-    (which only inspects edged candidates) can never fire for it. If a completed
-    foundation that satisfied a need is a GENUINE cross-base code dependency that
-    has landed on integration, the dependent would otherwise dispatch against a
-    staging base forked before the foundation landed — exactly the failure the
-    re-cut machinery exists to prevent.
-
-    The re-cut MUST run as a SINGLE call over every completed foundation, exactly
-    as the dispatch path does with the full ``dep_tasks`` set. Re-cutting one
-    foundation at a time is unsafe when a dependent has MULTIPLE completed needs in
-    the same tick: the ``_recut_*`` accounting (conflict counter, recheck timer,
-    escalated flag) lives in a SINGLE per-dependent namespace, so a base-safe /
-    successful re-cut for one foundation calls ``_clear_recut_accounting`` and
-    WIPES a conflicting sibling foundation's accumulating conflict counter —
-    defeating the consecutive-conflict escalation bound and parking the dependent
-    invisibly forever. One shared re-cut keeps the accounting coherent:
-    ``_has_landed_cross_base_code_dep`` is ``any(...)`` over the whole set, so a
-    single conflicting foundation holds the dependent and accumulates the conflict
-    counter, and the no-op clear only fires when NO foundation needs a re-cut.
-
-    Returns ``(base_safe, recut_pending)``:
-
-      * ``base_safe``     — needs whose foundation needs no re-cut (same-base /
-        ordering-only / unresolved) or whose shared re-cut succeeded; safe to drop.
-      * ``recut_pending`` — needs whose landed cross-base foundation still requires
-        a (not-yet-clean) re-cut; retained so the dependent stays BLOCKED.
-    """
-    from app.blocked_need_resolution import completed_foundation_for_need
-    from app.orchestrator_health import (
-        _has_landed_cross_base_code_dep,
-        ensure_dependent_base_recut,
-    )
-
-    resolved = [
-        (need, completed_foundation_for_need(task, need, completed))
-        for need in completed_needs
-    ]
-    foundations = [f for _, f in resolved if f is not None]
-    # No foundation resolved (defensive) or a single shared re-cut succeeded / was
-    # a no-op → every completed need is base-safe.
-    if not foundations or await ensure_dependent_base_recut(task, foundations, session):
-        return list(completed_needs), []
-    # Re-cut required but not yet clean (conflict / transient error): hold back
-    # ONLY the needs whose foundation is the unsafe landed cross-base code dep; the
-    # rest (same-base / ordering-only / unresolved) need no re-cut, stay base-safe.
-    base_safe: list = []
-    recut_pending: list = []
-    for need, foundation in resolved:
-        if foundation is not None and _has_landed_cross_base_code_dep(
-            task, [foundation]
-        ):
-            recut_pending.append(need)
-        else:
-            base_safe.append(need)
-    return base_safe, recut_pending
-
-
-async def _fetch_dead_candidates(session, project_id) -> list:
-    """Terminally failed/cancelled tasks — foundations that have definitively DIED.
-
-    Statuses mirror ``blocked_need_resolution.TERMINAL_CANDIDATE_STATUSES``: a
-    blocked dependent whose named foundation reached one of these states will
-    never be satisfied by it, so the dependent is terminated (CANCELLED) rather
-    than parked to re-arm forever.
-    """
-    from app.blocked_need_resolution import TERMINAL_CANDIDATE_STATUSES
-
-    dead = [TaskStatus(s) for s in TERMINAL_CANDIDATE_STATUSES]
-    return (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project_id,
-                    Task.status.in_(dead),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-
-async def _cancel_blocker_as_dead(
-    task,
-    session,
-    *,
-    detail: str,
-    message: str,
-    pending_broadcasts: list,
-    give_up_class: str,
-    need=None,
-) -> None:
-    """Terminally CANCEL a blocked dependent that can provably never resume.
-
-    Mirrors the dispatch-time cascade-cancel of an edged dead dependency
-    (``orchestrator._cascade_cancel_dependent`` sets CANCELLED): a needed-but-
-    never-edged foundation that has definitively FAILED/CANCELLED — or a need that
-    has outlived its bounded parked re-evaluations without ever becoming
-    satisfiable — makes this work impossible. Raises ONE deduplicated operator
-    alert (so the auto-cancel is visible) and clears the blocker metadata.
-
-    Stamps a durable ``UNRESUMABLE_CANCEL_CONTEXT_KEY`` marker recording the
-    ``give_up_class`` (foundation-died vs never-satisfiable), the unresolved
-    ``need``, and the originating direction, so this terminal give-up is queryable
-    and countable fleet-wide (the structured blocker metadata is otherwise cleared
-    by ``_clear_blocked_fields`` on the same transition). Observability only.
-    """
-    from sqlalchemy.orm.attributes import flag_modified
-    from app.alert_dispatch import _maybe_create_blocked_escalation_alert
-
-    await _maybe_create_blocked_escalation_alert(
-        task,
-        session,
-        blocker_kind=task.blocker_kind or "upstream dependency",
-        detail=detail,
-    )
-    # Capture the originating direction before _clear_blocked_fields runs (it
-    # preserves direction_id, but read defensively in case that changes).
-    direction_id = (task.context or {}).get("direction_id")
-    _clear_blocked_fields(task, preserve_first_blocked=False)
-    ctx = task.context or {}
-    marker = {
-        "give_up_class": give_up_class,
-        "need": need if isinstance(need, dict) else None,
-        "direction_id": direction_id,
-        "at": _utcnow().isoformat(),
-    }
-    # Additively flag a never-satisfiable give-up of a FOUNDATION-kind need
-    # (capability / sibling-task / finding-hash) as an explicit missing-foundation
-    # retirement: nothing was ever built to satisfy the prerequisite, so the
-    # stranded dependent is first-class demand to COMMISSION that foundation. A PR
-    # need, a foundation-died give-up, or a malformed title-like ``task`` ref (not
-    # a real task id / finding hash, per the shared exact-task-ref policy) does NOT
-    # get the flag — a title-like ref names no commissionable foundation. Purely
-    # additive.
-    from app.task_blocked import is_foundation_demand_need
-
-    if give_up_class == GIVE_UP_NEVER_SATISFIABLE and is_foundation_demand_need(need):
-        marker[MISSING_FOUNDATION_MARKER_KEY] = True
-    ctx[UNRESUMABLE_CANCEL_CONTEXT_KEY] = marker
-    task.context = ctx
-    task.status = TaskStatus.CANCELLED
-    task.latest_status_message = message
-    flag_modified(task, "context")
-    session.add(task)
-    pending_broadcasts.append(
-        (
-            str(task.project_id),
-            {"task_id": str(task.id), "status": "CANCELLED", "message": message},
-        )
-    )
-
-
-async def _apply_needs_disposition(
-    task,
-    ctx,
-    session,
-    now,
-    disp,
-    *,
-    completed_cache: dict,
-    pending_broadcasts: list,
-    parked: bool,
-) -> str:
-    """Apply a multi-need classification (:func:`_classify_blocker_needs`).
-
-    A dependent is resumable to QUEUED ONLY when EVERY recorded need is accounted
-    for: an edge for each in-flight foundation, and no edge for a need already
-    satisfied by completed/merged work (verified base-safe). When only some needs
-    resolve, the resolvable edges are wired, the residual still-unsatisfied needs
-    are re-persisted, and the task stays BLOCKED so the next tick re-evaluates only
-    the remainder. If ANY need names a terminally dead foundation the dependent is
-    cancelled; the parked re-evaluation cap applies per the parked path.
-
-    Returns one of:
-      ``"resumed"``   — every need accounted for; task → QUEUED (caller counts it)
-      ``"cancelled"`` — a dead foundation, or the parked re-eval cap was exceeded
-      ``"held"``      — needs remain (partial / unsatisfiable / re-cut conflict);
-                        task stays BLOCKED, residual re-persisted, recheck re-armed
-      ``"escalate"``  — non-parked, residual needs remain, an edge is already wired
-                        and the escalation deadline has passed; caller escalates
-      ``"none"``      — non-parked, residual remains, no edge yet: caller falls
-                        through to the legacy precondition state machine
-    """
-    from sqlalchemy.orm.attributes import flag_modified
-    from app.alert_dispatch import _resolve_blocked_escalation_alert
-    from app.blocked_need_resolution import need_is_structurally_unobservable
-
-    # 1) ANY need names a terminally-dead foundation → cancel (both paths). A
-    #    single provably-dead foundation makes the dependent impossible regardless
-    #    of how the other needs resolve, mirroring the dispatch-time cascade.
-    if disp["dead"]:
-        await _cancel_blocker_as_dead(
-            task,
-            session,
-            detail=(
-                "A needed foundation has terminally failed or was cancelled — this "
-                "task can never run as-is. Auto-cancelled (re-scope, re-point the "
-                "need, or recreate the foundation to retry)."
-            ),
-            message="Cancelled — needed foundation terminally failed/cancelled",
-            pending_broadcasts=pending_broadcasts,
-            give_up_class=GIVE_UP_FOUNDATION_DIED,
-            need=disp.get("dead_need"),
-        )
-        return "cancelled"
-
-    # 1b) BOUNDED-OUTCOME LIVENESS INVARIANT. A residual need the sweep can prove
-    #     is STRUCTURALLY UNOBSERVABLE — an observation-class ("obs:") ref/label,
-    #     an explicit ``structurally_dead`` flag, or a malformed (non-dict) need —
-    #     matched NOTHING live/completed/lineage/knowledge/registry (it is in
-    #     ``residual``) and can never be matched by any future foundation. Re-arming
-    #     the recheck on it
-    #     would loop forever, so the dependent must reach a terminal disposition
-    #     NOW. Mirroring the dead-foundation cascade above, a SINGLE such residual
-    #     makes the task impossible (every recorded need must resolve to resume),
-    #     so escalate-and-cancel immediately regardless of how the other needs
-    #     resolved. This makes an indefinite recheck loop on an unobservable need
-    #     impossible by construction (the parked re-eval cap is the bound for
-    #     observable-but-unprovided needs; this is the bound for unobservable ones).
-    unobservable = [n for n in disp["residual"] if need_is_structurally_unobservable(n)]
-    if unobservable:
-        await _cancel_blocker_as_dead(
-            task,
-            session,
-            detail=(
-                "A recorded prerequisite can never be satisfied by any foundation "
-                "— it names an observation-class or structurally-dead reference no "
-                "task will ever provide. Auto-cancelled (re-scope or re-point the "
-                "need to retry)."
-            ),
-            message="Cancelled — prerequisite is structurally unobservable",
-            pending_broadcasts=pending_broadcasts,
-            give_up_class=GIVE_UP_NEVER_SATISFIABLE,
-            need=unobservable[0],
-        )
-        return "cancelled"
-
-    residual = list(disp["residual"])
-    edges = disp["edges"]
-    completed_needs = disp["completed_needs"]
-
-    # 2) Verify the completed foundations are base-safe BEFORE treating them as
-    #    accounted-for — on BOTH the partial- and full-resolution paths. A need
-    #    satisfied by ALREADY-completed work carries no edge, so the dispatch-time
-    #    re-cut (which only inspects edged candidates) can never fire for it; a
-    #    cross-base GENUINE code foundation must have the dependent's base re-cut
-    #    from integration first. _partition_completed_needs_base_safe runs ALL the
-    #    completed foundations through ONE shared re-cut this tick (per-foundation
-    #    re-cut would let a base-safe sibling's _clear_recut_accounting wipe a
-    #    conflicting sibling's accumulating conflict counter — parking the dependent
-    #    invisibly forever). A need whose re-cut is not yet safe is held back in
-    #    ``recut_pending`` so it is re-checked next tick rather than dropped
-    #    unverified — closing the partial-resolution gap where a cross-base
-    #    completed need silently vanished and the dependent later resumed against a
-    #    stale base. Such a need DID match a foundation (it is mid-recut, not
-    #    genuinely unprovided), so it must always HOLD and must NOT fall through to
-    #    the legacy precondition machine.
-    recut_pending: list = []
-    if completed_needs:
-        completed = completed_cache.get(task.project_id)
-        if completed is None:
-            completed = await _fetch_completed_candidates(session, task.project_id)
-            completed_cache[task.project_id] = completed
-        completed_needs, recut_pending = await _partition_completed_needs_base_safe(
-            task, completed_needs, completed, session
-        )
-        # The shared re-cut REPLACES and COMMITS task.context with a fresh dict
-        # carrying the _recut_* escalation accounting on its failure path; re-read
-        # the local ctx so the disposition branches below don't clobber it.
-        ctx = task.context or {}
-
-    progressed = bool(edges) or bool(completed_needs)
-    # A still-unsatisfied need is either genuinely unprovided (``residual``) or a
-    # completed foundation mid-recut (``recut_pending``). Both are re-persisted as
-    # needs so the next tick re-evaluates them; only the all-accounted-for path
-    # (both empty) leaves BLOCKED.
-    unresolved = residual + recut_pending
-
-    # 3) Unresolved needs remain → cannot fully resume this tick.
-    if unresolved:
-        if progressed or recut_pending:
-            # Partial resolution (or a need mid-recut): wire the resolvable edges,
-            # drop the resolved (and base-safe-verified completed) needs, keep ONLY
-            # the unresolved set, and stay BLOCKED so the next tick re-evaluates the
-            # remainder. A recut_pending need ALWAYS holds here — it matched a
-            # foundation, so it must never fall through to the precondition machine.
-            # Progress resets the parked re-eval cap — but ONLY when no sibling need
-            # is still stuck mid-recut. A base-safe need's progress must not erase
-            # the give-up accounting while a conflicting sibling remains unresolved.
-            edged = _wire_edges(task, edges)
-            _persist_residual_needs(task, unresolved)
-            ctx = task.context or {}
-            if progressed and not recut_pending:
-                ctx.pop("_blocked_parked_reevals", None)
-            attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
-            ctx["_blocked_recheck_attempts"] = attempts
-            task.context = ctx
-            flag_modified(task, "context")
-            if edged:
-                flag_modified(task, "depends_on")
-            task.recheck_after = now + (
-                _BLOCKED_PARKED_REEVAL_INTERVAL
-                if parked
-                else _next_recheck_delay(attempts)
-            )
-            session.add(task)
-            return "held"
-
-        # No need resolved this round (and none mid-recut).
-        if parked:
-            # Apply the per-need parked re-evaluation cap: cancel rather than
-            # re-arm a never-satisfiable parked blocker forever.
-            reevals = int(ctx.get("_blocked_parked_reevals", 0)) + 1
-            if reevals >= _BLOCKED_PARKED_REEVAL_CAP:
-                await _cancel_blocker_as_dead(
-                    task,
-                    session,
-                    detail=(
-                        f"Blocked need was never satisfiable after {reevals} parked "
-                        "re-evaluations — no task ever provided it. Auto-cancelled "
-                        "(re-scope or re-point the need to retry)."
-                    ),
-                    message="Cancelled — blocked need never became satisfiable",
-                    pending_broadcasts=pending_broadcasts,
-                    give_up_class=GIVE_UP_NEVER_SATISFIABLE,
-                    need=residual[0] if residual else None,
-                )
-                return "cancelled"
-            ctx["_blocked_parked_reevals"] = reevals
-            task.context = ctx
-            flag_modified(task, "context")
-            task.recheck_after = now + _BLOCKED_PARKED_REEVAL_INTERVAL
-            session.add(task)
-            return "held"
-
-        # Non-parked, no progress. With NO edge wired the task can safely fall
-        # through to the legacy precondition machine (optimistic retry / waiting /
-        # deadline escalation) exactly as a single unresolved need did before. But
-        # if an edge is ALREADY wired (a prerequisite resolved on an earlier tick)
-        # the task must NOT be resumed by that edge clearing while other needs are
-        # still missing — keep it BLOCKED, escalating only at the deadline.
-        if not (task.depends_on or []):
-            return "none"
-        if (
-            task.blocked_at is not None
-            and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER
-        ):
-            return "escalate"
-        attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
-        ctx["_blocked_recheck_attempts"] = attempts
-        task.context = ctx
-        flag_modified(task, "context")
-        task.recheck_after = now + _next_recheck_delay(attempts)
-        session.add(task)
-        return "held"
-
-    # 4) Nothing unresolved → every need is accounted for AND every completed
-    #    foundation was already verified base-safe in step 2 (a base-unsafe
-    #    completed need would have been captured in recut_pending above and held).
-    #    Wire any in-flight edges and resume.
-    # Capture the originating direction before _clear_blocked_fields runs (it
-    # preserves direction_id, but read defensively in case that changes), mirroring
-    # _cancel_blocker_as_dead.
-    direction_id = (task.context or {}).get("direction_id")
-    edged = _wire_edges(task, edges)
-    _clear_blocked_fields(task, preserve_first_blocked=False)
-    task.status = TaskStatus.QUEUED
-    if edged:
-        message = "Unblocked — all needs resolved into dependency edges, requeued"
-        resolved_by = "edge"
-        foundation = list(edges)
-    elif completed_needs:
-        message = "Unblocked — all needs satisfied by completed work, requeued"
-        resolved_by = "completed"
-        foundation = list(completed_needs)
-    else:
-        message = "Unblocked — all needs resolved, requeued"
-        resolved_by = "completed"
-        foundation = list(completed_needs)
-    task.latest_status_message = message
-    # Stamp the durable resume marker (symmetric to UNRESUMABLE_CANCEL_CONTEXT_KEY).
-    # Re-read ctx after _clear_blocked_fields cleared the structured blocker metadata.
-    ctx = task.context or {}
-    ctx[RESUME_MARKER_CONTEXT_KEY] = {
-        "resolved_by": resolved_by,
-        "foundation": foundation,
-        "direction_id": direction_id,
-        "at": _utcnow().isoformat(),
-    }
-    task.context = ctx
-    flag_modified(task, "context")
-    if edged:
-        flag_modified(task, "depends_on")
-    session.add(task)
-    pending_broadcasts.append(
-        (
-            str(task.project_id),
-            {"task_id": str(task.id), "status": "QUEUED", "message": message},
-        )
-    )
-    # Reconcile the now-stale 'permanently blocked' operator alert when resuming a
-    # parked blocker. Best-effort: a reconcile failure must never abort the resume.
-    if parked:
-        with contextlib.suppress(Exception):
-            await _resolve_blocked_escalation_alert(task, session)
-    return "resumed"
-
-
-async def sweep_unblock_blocked_tasks(
-    session,
-    now: datetime,
-    *,
-    verify_pr_merged=None,
-    batch_size: int = 200,
-) -> int:
-    """Step 12: re-evaluate due BLOCKED tasks; requeue or escalate them.
-
-    Idempotent and concurrency-safe alongside the orchestrator/reaper: due rows
-    are claimed with ``FOR UPDATE SKIP LOCKED`` so two sweeps (or a sweep racing
-    the orchestrator) never double-process the same task.
-
-    Returns the number of tasks moved back to QUEUED.
-    """
-    from sqlalchemy.orm.attributes import flag_modified
-    from app.alert_dispatch import _maybe_create_blocked_escalation_alert
-    from app.broadcast import broadcast_to_project as _bcast
-
-    if verify_pr_merged is None:
-        from app.rollup_pr_verification import _verify_pr_merged
-
-        verify_pr_merged = _verify_pr_merged
-
-    # Lock-free pre-scan: collect IDs without holding a batch of row locks across
-    # the per-task GitHub calls (_blocked_precondition_state → verify_pr_merged,
-    # up to 120s each). A batch FOR UPDATE on 200 rows held that entire window —
-    # a lock-across-network anti-pattern that starved agent heartbeats and drove
-    # idle_in_transaction_session_timeout kills. Instead: scan IDs advisory-only,
-    # re-acquire a single-row FOR UPDATE SKIP LOCKED at the top of each iteration,
-    # and commit (releasing that lock) before moving to the next task's I/O.
-    due_id_stmt = (
-        select(Task.id)
-        .where(
-            Task.status == TaskStatus.BLOCKED,
-            (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
-        )
-        .order_by(Task.recheck_after.asc().nullsfirst())
-        .limit(batch_size)
-    )
-    due_ids = (await session.execute(due_id_stmt)).scalars().all()
-    if not due_ids:
-        return 0
-
-    requeued = 0
-    # task_updated broadcasts are deferred until after the per-row commit so the
-    # admin UI (which refetches task/digest data on these events) never observes
-    # a stale BLOCKED row — or, on rollback, a transition that never persisted.
-    pending_broadcasts: list[tuple[str, dict]] = []
-    # Active-candidate lists are fetched at most once per project across the batch
-    # (only when a task actually has a resolvable need with no edge). The
-    # completed-candidate cache is the parked-resume counterpart: a parked
-    # blocker's need may now be satisfied by already-merged/shipped work.
-    candidate_cache: dict = {}
-    completed_cache: dict = {}
-    # Terminally-dead foundations (FAILED/CANCELLED): a needed-but-never-edged
-    # foundation that has definitively died makes its dependent impossible — it is
-    # cancelled rather than parked to re-arm forever.
-    dead_cache: dict = {}
-    # Durable knowledge-document substance index: a dangling kind='task' need whose
-    # originating task is CANCELLED but whose substance persists as a durable
-    # KnowledgeDocument is satisfied rather than routed to the dead-foundation path.
-    knowledge_cache: dict = {}
-    # Per-project registry working-capability sets (problem_model.capabilities):
-    # a capability need the registry already declares ``working`` is satisfied by
-    # the codebase itself and resumes with no edge.
-    registry_cache: dict = {}
-
-    async def _escalate_blocked_task(
-        task,
-        ctx,
-        *,
-        blocker_kind: str,
-        detail: str,
-    ) -> None:
-        from app.task_blocked import get_blocker_metadata, mark_blocker_escalated
-
-        await _maybe_create_blocked_escalation_alert(
-            task,
-            session,
-            blocker_kind=blocker_kind,
-            detail=detail,
-        )
-        ctx["_blocked_escalated"] = True
-        task.context = ctx
-        # Terminal escalation keeps the task parked in BLOCKED for the operator,
-        # so reflect that in the structured record (escalated -> True) rather
-        # than leaving the in-transition's escalated=False stale.
-        mark_blocker_escalated(task, detail=detail, now=now)
-        flag_modified(task, "context")
-        # A parked blocker that still carries a machine-resolvable need is parked
-        # at the LOW re-evaluation cadence (so it comes back due and resumes when
-        # its foundation lands), not the multi-year horizon.  Transient blockers
-        # (file_conflict, pending_rollup) are also parked at the LOW cadence so
-        # they self-heal when the overlapping in-flight task merges — hard-parking
-        # them at +10y caused operator-requeue whack-a-mole (incident 2026-06-07).
-        # A need-less non-transient blocker keeps the far-future park.
-        has_need = isinstance(get_blocker_metadata(task).get("need"), dict)
-        is_transient = task.blocker_kind in {"file_conflict", "pending_rollup"}
-        task.recheck_after = now + (
-            _BLOCKED_PARKED_REEVAL_INTERVAL
-            if (has_need or is_transient)
-            else _BLOCKED_ESCALATED_PARK
-        )
-        session.add(task)
-
-    async def _commit_task_row(bc_start: int) -> None:
-        """Commit this task's mutations and emit its deferred broadcasts.
-
-        Called at every loop-exit point (explicit ``continue`` or fall-through)
-        so the per-row FOR UPDATE lock is released before the NEXT task's
-        GitHub call starts.  Broadcast emission is deferred until after commit
-        so the UI never refetches a stale row.
-        """
-        task_bc = pending_broadcasts[bc_start:]
-        del pending_broadcasts[bc_start:]
-        await session.commit()
-        for _pid, _payload in task_bc:
-            try:
-                await _bcast(_pid, "task_updated", _payload)
-            except Exception:
-                logger.debug(
-                    "[REAPER] Failed to broadcast %s for %s",
-                    _payload.get("status"),
-                    _payload.get("task_id"),
-                    exc_info=True,
-                )
-
-    for task_id in due_ids:
-        # Per-row FOR UPDATE SKIP LOCKED: held for exactly this one task's
-        # processing window, then released by _commit_task_row before the
-        # next iteration's GitHub call begins.  populate_existing=True forces
-        # a fresh DB read even if this id is already in the session identity map
-        # (stale after a prior iteration's commit with expire_on_commit=False).
-        task = await session.scalar(
-            select(Task)
-            .where(
-                Task.id == task_id,
-                Task.status == TaskStatus.BLOCKED,
-                (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
-            )
-            .with_for_update(skip_locked=True)
-            .execution_options(populate_existing=True)
-        )
-        if task is None:
-            continue  # peer holds the lock, or task is no longer due/BLOCKED
-
-        _bc_start = len(pending_broadcasts)
-        ctx = task.context or {}
-        # Multi-need classification (shared by the parked and live paths): a
-        # blocked dependent can wait on MORE THAN ONE prerequisite. Classify EVERY
-        # recorded need once against the live active / completed / dead foundation
-        # sets, then apply the disposition — resume only when ALL needs resolve.
-        disp = await _classify_blocker_needs(
-            task,
-            session,
-            candidate_cache=candidate_cache,
-            completed_cache=completed_cache,
-            dead_cache=dead_cache,
-            knowledge_cache=knowledge_cache,
-            registry_cache=registry_cache,
-        )
-
-        # Already escalated terminally — leave parked for the operator. On
-        # escalation we push recheck_after to a far-future sentinel so these rows
-        # drop out of the due set entirely. Backstop: if a legacy/None
-        # recheck_after let one resurface here, evict it the same way so it stops
-        # being re-SELECTed and FOR UPDATE-locked every reaper cycle.
-        if ctx.get("_blocked_escalated"):
-            # Parked-blocker auto-resume / cancel / hold: a parked blocker that
-            # carries still-satisfiable needs is resumed (edges wired + requeue, or
-            # proceed when satisfied by completed work) and its stale alert is
-            # reconciled; one whose needs are partially resolved keeps converging;
-            # one whose needs are provably dead or have outlived the bounded parked
-            # re-evaluations is terminated. Runs at the low parked cadence — never
-            # re-escalates.
-            if disp["had_needs"]:
-                outcome = await _apply_needs_disposition(
-                    task,
-                    ctx,
-                    session,
-                    now,
-                    disp,
-                    completed_cache=completed_cache,
-                    pending_broadcasts=pending_broadcasts,
-                    parked=True,
-                )
-                if outcome == "resumed":
-                    requeued += 1
-                    await _commit_task_row(_bc_start)
-                    continue
-                if outcome in ("cancelled", "held"):
-                    await _commit_task_row(_bc_start)
-                    continue
-            # Need-less parked blocker — handle transient vs durable separately.
-            # Transient blockers (file_conflict, pending_rollup) clear when the
-            # overlapping in-flight task merges; re-evaluate their precondition
-            # state so they requeue automatically when the conflict lifts, or
-            # re-arm with bounded backoff while it persists.  A need-less
-            # NON-transient blocker keeps the far-future park and stays for
-            # the operator.
-            is_transient = task.blocker_kind in {"file_conflict", "pending_rollup"}
-            if is_transient:
-                state = await _blocked_precondition_state(
-                    task, session, verify_pr_merged
-                )
-                if state == "clear":
-                    _clear_blocked_fields(task, preserve_first_blocked=False)
-                    task.status = TaskStatus.QUEUED
-                    task.latest_status_message = (
-                        "Unblocked — transient conflict cleared, requeued"
-                    )
-                    flag_modified(task, "context")
-                    session.add(task)
-                    requeued += 1
-                    pending_broadcasts.append(
-                        (
-                            str(task.project_id),
-                            {
-                                "task_id": str(task.id),
-                                "status": "QUEUED",
-                                "message": task.latest_status_message,
-                            },
-                        )
-                    )
-                else:
-                    task.recheck_after = now + _BLOCKED_PARKED_REEVAL_INTERVAL
-                    session.add(task)
-                await _commit_task_row(_bc_start)
-                continue
-            if task.recheck_after is None or task.recheck_after <= now:
-                task.recheck_after = now + _BLOCKED_ESCALATED_PARK
-                session.add(task)
-            await _commit_task_row(_bc_start)
-            continue
-
-        # Cross-task RESOLUTION (runs BEFORE the optimistic-retry / escalate path):
-        # wire a real depends_on edge for each need that names an in-flight
-        # foundation, resume with no edge for any need already satisfied by
-        # completed/merged work, and stay BLOCKED on the residual until EVERY need
-        # is accounted for. A dead foundation cancels; a fully-resolved set
-        # SHORT-CIRCUITS the bounded optimistic retry below. A task that still has
-        # an unresolved need with no edge falls through ("none") to the legacy
-        # precondition machine unchanged.
-        if disp["had_needs"]:
-            outcome = await _apply_needs_disposition(
-                task,
-                ctx,
-                session,
-                now,
-                disp,
-                completed_cache=completed_cache,
-                pending_broadcasts=pending_broadcasts,
-                parked=False,
-            )
-            if outcome == "resumed":
-                requeued += 1
-                await _commit_task_row(_bc_start)
-                continue
-            if outcome in ("cancelled", "held"):
-                await _commit_task_row(_bc_start)
-                continue
-            if outcome == "escalate":
-                await _escalate_blocked_task(
-                    task,
-                    ctx,
-                    blocker_kind=task.blocker_kind or "upstream dependency",
-                    detail=(
-                        "Task has unresolved prerequisites that never appeared "
-                        "within the deadline — needs operator intervention "
-                        "(re-scope, re-point the need, or recreate the foundation)."
-                    ),
-                )
-                await _commit_task_row(_bc_start)
-                continue
-            # outcome == "none": fall through to the precondition state machine.
-
-        state = await _blocked_precondition_state(task, session, verify_pr_merged)
-        if state == "clear":
-            blocker_meta = (task.context or {}).get("blocker") or {}
-            blocker_source = (
-                blocker_meta.get("source") if isinstance(blocker_meta, dict) else None
-            )
-            # Conflict/rollup blockers are transient-but-self-re-blocking:
-            # dispatch requeues them every recheck interval and re-blocks if
-            # the precondition still holds. Their deadline must measure from
-            # the TRUE first-blocked onset, so they are escalation-eligible and
-            # onset-preserving even when they carry stale, already-satisfied
-            # dependency edges (a successfully-completed dep id is never
-            # stripped from depends_on). Key the discriminator off the actual
-            # blocker identity, NOT the mere presence of dependency edges —
-            # otherwise a conflict-blocked task with a satisfied dep would skip
-            # escalation and reset its onset every cycle, looping forever.
-            is_optimistic_conflict = task.blocker_kind in {
-                "file_conflict",
-                "pending_rollup",
-            }
-            is_genuine_clear = (not is_optimistic_conflict) and (
-                bool(task.depends_on) or blocker_source == "parent"
-            )
-            if (
-                not is_genuine_clear
-                and task.blocked_at is not None
-                and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER
-            ):
-                await _escalate_blocked_task(
-                    task,
-                    ctx,
-                    blocker_kind=task.blocker_kind or "unknown",
-                    detail=(
-                        f"Task has been blocked since {task.blocked_at:%Y-%m-%d %H:%M} "
-                        f"without clearing: {task.blocked_reason or task.latest_status_message or ''}"
-                    ),
-                )
-                await _commit_task_row(_bc_start)
-                continue
-            # A conflict/rollup blocker is requeued optimistically and must
-            # preserve its first-blocked onset across the requeue (so the next
-            # block episode keeps counting toward the deadline) — unless it has
-            # already crossed the deadline and was escalated above. A genuine
-            # dependency/parent clear resets all, including the onset.
-            _clear_blocked_fields(task, preserve_first_blocked=is_optimistic_conflict)
-            task.status = TaskStatus.QUEUED
-            task.latest_status_message = "Unblocked — requeued for dispatch"
-            flag_modified(task, "context")
-            session.add(task)
-            requeued += 1
-            pending_broadcasts.append(
-                (
-                    str(task.project_id),
-                    {
-                        "task_id": str(task.id),
-                        "status": "QUEUED",
-                        "message": task.latest_status_message,
-                    },
-                )
-            )
-        elif state == "re_evaluate":
-            _clear_blocked_fields(task, preserve_first_blocked=False)
-            task.status = TaskStatus.EVALUATING
-            task.latest_status_message = "Unblocked — awaiting rollup re-evaluation"
-            flag_modified(task, "context")
-            session.add(task)
-            pending_broadcasts.append(
-                (
-                    str(task.project_id),
-                    {
-                        "task_id": str(task.id),
-                        "status": "EVALUATING",
-                        "message": task.latest_status_message,
-                    },
-                )
-            )
-        elif state == "dead":
-            await _escalate_blocked_task(
-                task,
-                ctx,
-                blocker_kind=task.blocker_kind or "upstream dependency",
-                detail=(
-                    "Upstream dependency failed or was cancelled — this task can "
-                    "never run as-is and needs operator intervention "
-                    "(re-scope, re-point dependency, or cancel)."
-                ),
-            )
-        else:  # "retry" or "waiting"
-            past_deadline = (
-                task.blocked_at is not None
-                and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER
-            )
-            optimistic_used = int(ctx.get("_blocked_optimistic_retries", 0))
-            # "retry": a no-dep agent/lifecycle blocker that may be a transient
-            # infra failure — optimistically requeue (bounded) so a passing blip
-            # auto-recovers instead of wedging its rollup parent until an operator
-            # intervenes. Preserve the first-blocked onset so the 6h deadline
-            # still measures from true onset across the requeue episodes.
-            if (
-                state == "retry"
-                and not past_deadline
-                and optimistic_used < _BLOCKED_OPTIMISTIC_RETRY_CAP
-            ):
-                ctx["_blocked_optimistic_retries"] = optimistic_used + 1
-                task.context = ctx
-                # _clear_blocked_fields preserves _blocked_optimistic_retries on
-                # an onset-preserving requeue (it is only wiped on a genuine
-                # dependency clear), so the budget keeps counting across re-blocks.
-                _clear_blocked_fields(task, preserve_first_blocked=True)
-                task.status = TaskStatus.QUEUED
-                task.latest_status_message = (
-                    f"Unblocked — optimistic infra-precondition retry "
-                    f"{optimistic_used + 1}/{_BLOCKED_OPTIMISTIC_RETRY_CAP}"
-                )
-                flag_modified(task, "context")
-                session.add(task)
-                requeued += 1
-                pending_broadcasts.append(
-                    (
-                        str(task.project_id),
-                        {
-                            "task_id": str(task.id),
-                            "status": "QUEUED",
-                            "message": task.latest_status_message,
-                        },
-                    )
-                )
-                await _commit_task_row(_bc_start)
-                continue
-            # "waiting" (or a retry that exhausted its budget): re-arm a later
-            # recheck with backoff. Deadline escalation stays active for blockers
-            # still genuinely unresolved at the 6h mark.
-            if past_deadline:
-                await _escalate_blocked_task(
-                    task,
-                    ctx,
-                    blocker_kind=task.blocker_kind or "unknown",
-                    detail=(
-                        f"Task has been blocked since {task.blocked_at:%Y-%m-%d %H:%M} "
-                        f"without clearing: {task.blocked_reason or task.latest_status_message or ''}"
-                    ),
-                )
-                await _commit_task_row(_bc_start)
-                continue
-            attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
-            ctx["_blocked_recheck_attempts"] = attempts
-            task.context = ctx
-            flag_modified(task, "context")
-            task.recheck_after = now + _next_recheck_delay(attempts)
-            session.add(task)
-
-        # Per-row commit for paths that fall through (re_evaluate, dead,
-        # state==clear-requeue, waiting→recheck-armed).
-        await _commit_task_row(_bc_start)
-
-    if requeued:
-        logger.info(f"[REAPER] Step 12: unblocked {requeued} task(s) → QUEUED")
-    return requeued
-
-
-async def _event_driven_unblock_project(
-    project_id,
-    session,
-    *,
-    batch_size: int,
-) -> int:
-    """Shared engine for the event-driven BLOCKED re-resolution fast paths.
-
-    Scans same-project BLOCKED tasks that carry a machine-resolvable need and runs
-    the SAME classification (:func:`_classify_blocker_needs`, which consults the
-    active / completed / dead candidate sets AND the durable knowledge substance
-    index) + disposition (:func:`_apply_needs_disposition`) the periodic Step-12
-    sweep uses. A task is resumed to QUEUED only when EVERY recorded need is
-    accounted for — the disposition's all-needs-resolved gate is preserved, so a
-    task with a still-unsatisfied sibling need stays BLOCKED.
-
-    Fail-open: any per-task error is swallowed and logged; never propagated.
-    Bounded: scans at most ``batch_size`` BLOCKED rows per call. Idempotent
-    alongside the periodic sweep and the sibling fast paths — ``FOR UPDATE SKIP
-    LOCKED`` means a row being evaluated elsewhere is skipped here, and vice versa,
-    so a task can never be double-resumed.
-
-    Returns the number of tasks resumed (0 on error or no match). Callers own the
-    contextual log line; this helper only mutates + commits the resolved rows.
-    """
-    from app.broadcast import broadcast_to_project as _bcast
-    from app.task_blocked import get_blocker_needs
-
-    now = _utcnow()
-
-    # Fetch BLOCKED dependents in the same project; skip-lock for sweep parity.
-    due_stmt = (
-        select(Task)
-        .where(
-            Task.status == TaskStatus.BLOCKED,
-            Task.project_id == project_id,
-        )
-        .limit(batch_size)
-        .with_for_update(skip_locked=True)
-    )
-    candidates = (await session.execute(due_stmt)).scalars().all()
-    if not candidates:
-        return 0
-
-    requeued = 0
-    changed = False
-    pending_broadcasts: list[tuple[str, dict]] = []
-    candidate_cache: dict = {}
-    completed_cache: dict = {}
-    dead_cache: dict = {}
-    knowledge_cache: dict = {}
-    registry_cache: dict = {}
-
-    for task in candidates:
-        # Skip tasks with no machine-resolvable needs; the sweep handles those.
-        if not get_blocker_needs(task):
-            continue
-        ctx = task.context or {}
-        parked = bool(ctx.get("_blocked_escalated"))
-        try:
-            disp = await _classify_blocker_needs(
-                task,
-                session,
-                candidate_cache=candidate_cache,
-                completed_cache=completed_cache,
-                dead_cache=dead_cache,
-                knowledge_cache=knowledge_cache,
-                registry_cache=registry_cache,
-            )
-            if not disp["had_needs"]:
-                continue
-            outcome = await _apply_needs_disposition(
-                task,
-                ctx,
-                session,
-                now,
-                disp,
-                completed_cache=completed_cache,
-                pending_broadcasts=pending_broadcasts,
-                parked=parked,
-            )
-            if outcome == "resumed":
-                requeued += 1
-                changed = True
-            elif outcome in ("cancelled", "held"):
-                changed = True
-        except Exception:
-            logger.exception(
-                "[REAPER] event-driven unblock failed for task %s — skipping",
-                task.id,
-            )
-
-    if changed:
-        await session.commit()
-    # Loop var renamed off ``project_id`` so it can't shadow the engine's
-    # ``project_id`` parameter (the broadcast tuple already carries its own).
-    for bcast_pid, payload in pending_broadcasts:
-        try:
-            await _bcast(bcast_pid, "task_updated", payload)
-        except Exception:
-            logger.debug(
-                "[REAPER] event-driven unblock broadcast failed for %s",
-                payload.get("task_id"),
-                exc_info=True,
-            )
-    return requeued
-
-
-async def event_driven_unblock_dependents(
-    landed_task: "Task",
-    session,
-    *,
-    batch_size: int = 50,
-) -> int:
-    """Fast-path event-driven re-resolution of BLOCKED dependents when a foundation lands.
-
-    Called immediately after a task commits to COMPLETED + merge-unblock signal.
-    Scans same-project BLOCKED dependents with machine-resolvable needs and
-    resumes any whose needs are now satisfied by the just-landed foundation.
-
-    Fail-open: any per-task error is swallowed and logged; the function never
-    propagates an exception to its caller. Bounded: scans at most ``batch_size``
-    BLOCKED rows per call. Idempotent alongside the periodic sweep: uses
-    ``FOR UPDATE SKIP LOCKED`` so a row being evaluated by the sweep is skipped
-    here, and vice versa.
-
-    Returns the number of tasks resumed (0 on error or no-match).
-    """
-    from app.landed_signal import has_merge_unblock_signal
-
-    if not has_merge_unblock_signal(landed_task):
-        return 0
-
-    requeued = await _event_driven_unblock_project(
-        landed_task.project_id, session, batch_size=batch_size
-    )
-    if requeued:
-        logger.info(
-            "[REAPER] event_driven_unblock: landing of %s unblocked %d dependent(s) → QUEUED",
-            landed_task.id,
-            requeued,
-        )
-    return requeued
-
-
-async def event_driven_unblock_on_knowledge(
-    project_id,
-    session,
-    *,
-    batch_size: int = 50,
-) -> int:
-    """Fast-path event-driven re-resolution of BLOCKED tasks when a KnowledgeDocument lands.
-
-    A knowledge document making a BLOCKED task's ``kind='task'`` / finding-hash
-    prerequisite durably satisfiable (matching ``finding_hash`` or exact ``topic``)
-    used to leave waiters BLOCKED until the slow periodic sweep re-checked them at
-    ``recheck_after`` (or, once escalated, only every 6h). This fires immediately
-    after the producing task commits the document, so waiters resume at once.
-
-    Unlike :func:`event_driven_unblock_dependents` there is no single landed task —
-    a knowledge doc satisfies a need by substance, not by a depends_on edge — so it
-    is keyed on ``project_id`` and re-evaluates the whole project's BLOCKED set
-    through the SAME shared engine (:func:`_event_driven_unblock_project`), which in
-    turn consults the durable knowledge substance index via
-    :func:`_classify_blocker_needs`. The conservative finding-hash/exact-topic
-    matching and the all-needs-resolved resume gate are preserved unchanged.
-
-    Fail-open + bounded + idempotent (``FOR UPDATE SKIP LOCKED``) alongside the
-    periodic sweep and the landed-task path; must be called best-effort by the
-    knowledge-completion chokepoint so it can never break document persistence.
-
-    Returns the number of tasks resumed (0 on error or no match).
-    """
-    requeued = await _event_driven_unblock_project(
-        project_id, session, batch_size=batch_size
-    )
-    if requeued:
-        logger.info(
-            "[REAPER] event_driven_unblock_on_knowledge: new knowledge in project %s "
-            "unblocked %d task(s) → QUEUED",
-            project_id,
-            requeued,
-        )
-    return requeued
 
 
 # ── Step 13: staged-direction auto-activation backstop ─────────────────────
@@ -2345,151 +842,6 @@ async def sweep_stale_staged_directions(session) -> int:
     return total_alerts
 
 
-async def sweep_merge_gate_verification_degradation(session) -> int:
-    """Alert fleet-wide when the no-CI merge-gate verification rate degrades.
-
-    Computes the fleet's recent-window merge-gate health
-    (:func:`digest_metrics.compute_merge_gate_fleet_health`) and, when the
-    verification rate has collapsed and/or too many projects are degraded over a
-    meaningful sample, broadcasts a deduplicated operator alert. A systemically
-    broken gate merges 'done' PRs UNVERIFIED at scale while each project looks
-    individually unremarkable; today an operator only catches that by chance on
-    the dashboard. This raises the proactive alert every other fleet-level signal
-    already has. Alerting only — it never influences a merge decision.
-
-    Trigger (over the recent window, gated on a minimum sample so a single
-    fall-open never fires): verification rate below ``merge_gate_degradation_min_rate``
-    OR at least ``merge_gate_degradation_min_degraded_projects`` projects degraded.
-    Severity escalates to ERROR when the dominant fall-open reason is a degraded
-    environment/setup failure (reusing ``_severity_for_unverified_reason``), else
-    WARNING. Returns the number of NEW alerts created across the fleet.
-    """
-    global _last_merge_gate_degradation_scan
-    _now_scan = _utcnow()
-    if (
-        _last_merge_gate_degradation_scan is not None
-        and (_now_scan - _last_merge_gate_degradation_scan).total_seconds()
-        < _FLEET_SCAN_INTERVAL_SECONDS
-    ):
-        return 0
-    _last_merge_gate_degradation_scan = _now_scan
-
-    from app.alert_dispatch import (
-        _maybe_create_merge_gate_degradation_alerts,
-        _severity_for_unverified_reason,
-    )
-    from app.digest_metrics import compute_merge_gate_fleet_health
-    from app.models import AlertSeverity
-    from app.shared_state import runtime_config
-
-    window_days = int(runtime_config.get("merge_gate_degradation_window_days", 7))
-    min_samples = int(runtime_config.get("merge_gate_degradation_min_samples", 10))
-    min_rate = float(runtime_config.get("merge_gate_degradation_min_rate", 0.5))
-    min_degraded = int(
-        runtime_config.get("merge_gate_degradation_min_degraded_projects", 3)
-    )
-
-    window_start = _utcnow() - timedelta(days=window_days)
-    health = await compute_merge_gate_fleet_health(session, window_start=window_start)
-
-    total = health["verified_count"] + health["fell_open_count"]
-    if total < min_samples:
-        return 0
-    rate = health["verification_rate"]
-    degraded = health["degraded_project_count"]
-    rate_is_low = rate is not None and rate < min_rate
-    too_many_degraded = degraded >= min_degraded
-    if not (rate_is_low or too_many_degraded):
-        return 0
-
-    reason = health["most_common_reason"]
-    severity = (
-        _severity_for_unverified_reason(reason) if reason else AlertSeverity.WARNING
-    )
-    created = await _maybe_create_merge_gate_degradation_alerts(
-        session,
-        verification_rate=rate,
-        verified_count=health["verified_count"],
-        fell_open_count=health["fell_open_count"],
-        degraded_project_count=degraded,
-        project_count=health["project_count"],
-        most_common_reason=reason,
-        severity=severity,
-    )
-    if created:
-        await session.commit()
-        logger.info(
-            "[REAPER] raised fleet merge-gate degradation alert on %d project(s) "
-            "(rate=%s, degraded=%d/%d, reason=%s)",
-            created,
-            rate,
-            degraded,
-            health["project_count"],
-            reason,
-        )
-    return created
-
-
-async def sweep_migration_slot_contention(session) -> int:
-    """Alert per-project when a migration task has held the serialization slot too
-    long while schema-touching tasks are parked waiting on it.
-
-    Computes fleet-wide migration-slot contention
-    (:func:`digest_metrics.compute_migration_slot_contention`) and, for each
-    project whose holder has held the slot beyond
-    ``migration_slot_hold_alert_seconds`` while at least
-    ``migration_slot_min_waiters`` tasks are deferred, raises a deduplicated
-    operator alert. A multi-hour hold parking the schema queue (the recent
-    incident: ~2h holding, 5+ tasks parked) is invisible to the throughput-only
-    migration-health summary and to the escalated-only parked-blocker signal —
-    the deferred siblings are QUEUED, not BLOCKED. This raises the proactive
-    signal every other contention/degradation surface already has. Alerting only —
-    it never influences serialization. Returns the number of NEW alerts created.
-    """
-    import uuid as _uuid
-
-    from app.alert_dispatch import _maybe_create_migration_slot_contention_alert
-    from app.digest_metrics import compute_migration_slot_contention
-    from app.shared_state import runtime_config
-
-    hold_alert_seconds = float(
-        runtime_config.get("migration_slot_hold_alert_seconds", 3600)
-    )
-    min_waiters = int(runtime_config.get("migration_slot_min_waiters", 1))
-
-    contention = await compute_migration_slot_contention(session)
-    created = 0
-    for proj in contention.get("projects", []):
-        if not proj.get("slot_held"):
-            continue
-        held = proj.get("holder_held_seconds")
-        waiting = proj.get("waiting_count", 0)
-        if held is None or held < hold_alert_seconds or waiting < min_waiters:
-            continue
-        pid_raw = proj.get("project_id")
-        if not pid_raw:
-            continue
-        try:
-            pid = _uuid.UUID(str(pid_raw))
-        except (ValueError, TypeError):
-            continue
-        created += await _maybe_create_migration_slot_contention_alert(
-            session,
-            pid,
-            holder_task_id=proj.get("holder_task_id"),
-            held_seconds=held,
-            waiting_count=waiting,
-            longest_wait_seconds=proj.get("longest_wait_seconds"),
-        )
-    if created:
-        await session.commit()
-        logger.info(
-            "[REAPER] raised migration-slot-contention alert on %d project(s)",
-            created,
-        )
-    return created
-
-
 # ── Recovery: stranded transient-blocker self-heal sweep ─────────────────────
 #
 # A file_conflict or pending_rollup blocker that was escalated before Fix 2
@@ -2503,10 +855,6 @@ async def sweep_migration_slot_contention(session) -> int:
 # (so the alert is not re-fired) and just gives the row a near-future due date
 # so Step 12 picks it up.  Step 12's updated "need-less parked transient" path
 # (Fix 2) then actually decides whether to requeue or re-arm.
-
-# A recheck_after more than this far in the future is considered "hard-parked"
-# by the old +10y sentinel path; any legitimate bounded recheck will be shorter.
-_TRANSIENT_BLOCKER_PARK_SENTINEL = timedelta(days=365)
 
 
 async def sweep_recover_stranded_transient_blockers(
@@ -2569,6 +917,120 @@ async def sweep_recover_stranded_transient_blockers(
     return recovered
 
 
+# ── Strategic cycle starvation sweep ─────────────────────────────────────────
+
+# Autonomous projects older than this window with no StrategicCycle row trigger
+# a strategic_cycle_stall WARNING Alert.
+_STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS = 24
+_STRATEGIC_CYCLE_STALL_ALERT_TITLE = "Strategic engine starved: no cycle in window"
+
+
+async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
+    """Emit a deduped strategic_cycle_stall Alert for autonomous projects with no
+    recent StrategicCycle row at all. Returns the number of alerts created."""
+    from app.models import Alert, AlertSeverity, Project, StrategicCycle
+    from app.shared_state import runtime_config as _runtime_config
+
+    starvation_hours = int(
+        _runtime_config.get(
+            "strategic_cycle_starvation_hours",
+            _STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS,
+        )
+        or _STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS
+    )
+    cutoff = now - timedelta(hours=starvation_hours)
+
+    project_rows = (
+        await session.execute(
+            select(Project.id, Project.created_at).where(
+                Project.autonomous_enabled.is_(True),
+                Project.not_archived(),
+            )
+        )
+    ).all()
+
+    # New projects have not had time to establish a cadence — skip until the
+    # project itself is older than the starvation window. Filter in Python so
+    # the two batched lookups below only run over genuine candidates.
+    candidate_ids: list = []
+    for project_id, project_created_at in project_rows:
+        if project_created_at is not None:
+            pc = project_created_at
+            if pc.tzinfo is not None:
+                pc = pc.replace(tzinfo=None)
+            if pc > cutoff:
+                continue
+        candidate_ids.append(project_id)
+
+    created = 0
+    if not candidate_ids:
+        return created
+
+    # Batched lookup 1: which candidate projects already have a recent cycle.
+    # Replaces a per-project existence SELECT (the old N+1). Equivalent to the
+    # prior ``phase1_started_at >= cutoff`` LIMIT 1 existence check, collapsed
+    # into one round-trip via DISTINCT.
+    projects_with_recent_cycle = set(
+        (
+            await session.execute(
+                select(StrategicCycle.project_id)
+                .where(
+                    StrategicCycle.project_id.in_(candidate_ids),
+                    StrategicCycle.phase1_started_at >= cutoff,
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Batched lookup 2: which candidate projects already have an open WARNING
+    # dedup alert. Replaces the per-project dedup SELECT (the second N+1).
+    projects_with_open_alert = set(
+        (
+            await session.execute(
+                select(Alert.project_id)
+                .where(
+                    Alert.project_id.in_(candidate_ids),
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for project_id in candidate_ids:
+        if project_id in projects_with_recent_cycle:
+            continue
+        # Dedup: one open WARNING alert per project for this title.
+        if project_id in projects_with_open_alert:
+            continue
+
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.WARNING,
+                title=_STRATEGIC_CYCLE_STALL_ALERT_TITLE,
+                message=(
+                    f"No strategic cycle has started in the last {starvation_hours}h "
+                    "for this autonomous project — the strategic engine appears "
+                    "starved (zero cycles, not merely stalled mid-cycle). Review the "
+                    "strategic loop scheduler and recent orchestrator logs."
+                )[:1000],
+            )
+        )
+        created += 1
+    if created:
+        await session.commit()
+    return created
+
+
 # ── Re-exports from extracted sub-module ─────────────────────────────────────
 #
 # These symbols were extracted to app.reaper_bug_message_sweeps. They are
@@ -2587,8 +1049,38 @@ from app.reaper_bug_message_sweeps import (  # noqa: E402
 )
 
 __all__ = [
-    "WakeSweepResult",
+    # Re-exported from app.blocked_task_unblock_sweeps (constants)
+    "_BLOCKED_ESCALATE_AFTER",
+    "_BLOCKED_ESCALATED_PARK",
+    "_BLOCKED_OPTIMISTIC_RETRY_CAP",
+    "_BLOCKED_PARKED_REEVAL_CAP",
+    "GIVE_UP_FOUNDATION_DIED",
+    "GIVE_UP_NEVER_SATISFIABLE",
+    "MISSING_FOUNDATION_MARKER_KEY",
+    "RESUME_MARKER_CONTEXT_KEY",
+    "UNRESUMABLE_CANCEL_CONTEXT_KEY",
     "_WAKE_DELIVERY_STALL_CYCLE_THRESHOLD",
+    "WakeSweepResult",
+    # Re-exported from app.blocked_task_unblock_sweeps (sweep entry points)
+    "sweep_unblock_blocked_tasks",
+    "_event_driven_unblock_project",
+    "event_driven_unblock_dependents",
+    "event_driven_unblock_on_knowledge",
+    # Re-exported from app.blocked_task_unblock_sweeps (helpers)
+    "_apply_needs_disposition",
+    "_blocked_precondition_state",
+    "_cancel_blocker_as_dead",
+    "_classify_blocker_needs",
+    "_clear_blocked_fields",
+    "_fetch_active_candidates",
+    "_fetch_completed_candidates",
+    "_fetch_dead_candidates",
+    "_fetch_knowledge_substance_index",
+    "_fetch_working_capability_names",
+    "_next_recheck_delay",
+    "_partition_completed_needs_base_safe",
+    "_persist_residual_needs",
+    "_wire_edges",
     "get_wake_delivery_stall_cycles",
     "reset_wake_delivery_stall_state",
     "sweep_converge_linked_bug_messages",

@@ -31,8 +31,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
-from sqlalchemy import insert
-from sqlalchemy.exc import IntegrityError, InvalidRequestError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -50,15 +49,11 @@ from app.models import (
 from app.compute import (
     get_provision_error,
     record_zone_failure,
-    _capture_serial_for_vm,
     get_vm_zone,
-    get_vm_status,
     INFRA_PROVISION_PATTERNS,
     any_zone_available,
     soonest_zone_recovery,
 )
-from app.branch_resolution import classify_rollup_merge_outcome
-from app.landed_signal import apply_merged_landed_signal
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import (
     record_pipeline_event,
@@ -79,9 +74,14 @@ from app.failure_classification import (
 )
 from app.retry_budget import append_failure_class_history
 from app.task_blocked import strip_fresh_attempt_context
-from app.time_utils import _utcnow, set_retry_after
+from app.time_utils import (
+    _utcnow,
+    clear_retry_after,
+    exponential_backoff,
+    set_retry_after,
+)
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
-from app.schemas import redact_command_log_text
+from app.reaper_post_orphan_sweep import run_post_orphan_sweep
 
 logger = logging.getLogger(__name__)
 
@@ -95,106 +95,7 @@ def _normalize_reaper_retry_failure_class(failure_class: str, context: object) -
     return failure_class
 
 
-async def _relock_orphan_task(
-    session,
-    task_id,
-    cached_task: Task | None,
-    expected_status,
-    expected_last_heartbeat,
-    *,
-    vm_liveness_cutoff: datetime | None = None,
-) -> Task | None:
-    """Re-acquire FOR UPDATE on an orphan task and validate the pre-IO snapshot.
-
-    Mirrors ``rollup_management._relock_parent`` (canonical reference) and
-    ``ci_completion._relock_merge_task``: expire-then-populate_existing-SELECT
-    handles the cached-identity-map staleness under async + skip_locked.
-
-    Returns the freshly-loaded Task if:
-      - the row is still ours (not held by another writer), AND
-      - status is unchanged (still PROVISIONING or IN_PROGRESS, not COMPLETED/FAILED), AND
-      - last_heartbeat hasn't advanced (agent didn't revive during the unlocked window), AND
-      - no fresh ``vmcontact`` landed during the unlocked window (heartbeat
-        false-reap fix: the agent's last_heartbeat write may be lock-starved, so
-        a contact within ``vm_liveness_cutoff`` proves the VM is alive even
-        though ``last_heartbeat`` is unchanged).
-
-    Returns None on any of those conditions failing — caller should ``continue``
-    to the next orphan task.
-    """
-    if cached_task is not None:
-        try:
-            session.expire(cached_task)
-        except InvalidRequestError:
-            session.expire_all()
-    relock_stmt = (
-        select(Task)
-        .where(Task.id == task_id)
-        .with_for_update(skip_locked=True)
-        .execution_options(populate_existing=True)
-    )
-    fresh = (await session.execute(relock_stmt)).scalars().first()
-    if fresh is None:
-        logger.info(
-            f"[REAPER] Orphan re-lock skipped for task {task_id} — held by peer "
-            f"(deferring to next reaper cycle)"
-        )
-        return None
-    if fresh.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
-        logger.info(
-            f"[REAPER] Orphan re-lock found task {task_id} status transitioned "
-            f"to {fresh.status} during external I/O — skipping reap"
-        )
-        return None
-    if fresh.last_heartbeat != expected_last_heartbeat:
-        logger.info(
-            f"[REAPER] Orphan re-lock found task {task_id} heartbeat advanced "
-            f"({expected_last_heartbeat} → {fresh.last_heartbeat}) during external I/O "
-            f"— agent revived, skipping reap"
-        )
-        return None
-    # Heartbeat false-reap fix (option B): a contact that landed during the
-    # unlocked I/O window aborts the reap even when last_heartbeat is unchanged
-    # (the agent's contended last_heartbeat write was skipped by the rollup
-    # lock). Gated on the same cutoff: a genuinely dead VM has no fresh contact
-    # and is still reaped. Best-effort — never let a lookup error block the reap.
-    if vm_liveness_cutoff is not None and fresh.vm_instance_id:
-        try:
-            _contact_at = (
-                await session.execute(
-                    select(VmContact.last_contact_at).where(
-                        VmContact.vm_instance_id == fresh.vm_instance_id
-                    )
-                )
-            ).scalar_one_or_none()
-        except Exception as _vc_exc:  # noqa: BLE001
-            logger.warning(
-                "[REAPER] vm_contact re-lock lookup failed for task %s vm=%s "
-                "(non-fatal, proceeding with reap): %s",
-                task_id,
-                fresh.vm_instance_id,
-                _vc_exc,
-            )
-            _contact_at = None
-        if _contact_at is not None and _contact_at >= vm_liveness_cutoff:
-            logger.info(
-                f"[REAPER] Orphan re-lock found task {task_id} vm "
-                f"{fresh.vm_instance_id} contacted the orchestrator at "
-                f"{_contact_at} (>= cutoff {vm_liveness_cutoff}) during external "
-                f"I/O — agent alive (lock-starved heartbeat), skipping reap"
-            )
-            return None
-    if fresh.status != expected_status:
-        # Defensive: status changed within the (PROVISIONING, IN_PROGRESS) set
-        # — e.g. claim_task flipped PROVISIONING → IN_PROGRESS. Not the same as
-        # a terminal transition, but the reap reason classification was based on
-        # the original status, so safer to defer.
-        logger.info(
-            f"[REAPER] Orphan re-lock found task {task_id} status changed "
-            f"({expected_status} → {fresh.status}) during external I/O — skipping reap"
-        )
-        return None
-    return fresh
+from app.reaper_relock import _relock_orphan_task
 
 
 # Reaper: track tasks skipped by skip_locked to force-reap after repeated skips
@@ -236,146 +137,15 @@ _reaper_last_progress: datetime | None = None
 REAPER_HANG_SECONDS = float(os.getenv("REAPER_HANG_SECONDS", "300"))
 
 
-def _mark_reaper_progress() -> None:
-    """Heartbeat that the reaper worker is actively progressing within a cycle.
-
-    Liveness (the lifecycle watchdog) is gated on the freshness of this
-    timestamp, not on full-cycle completion, so a legitimately long cycle (large
-    orphan backlog → many sequential GitHub/VM calls) is not mistaken for a hung
-    process and killed. Kept cheap: a single timestamp write, no I/O. Mirrors
-    orchestrator._mark_orchestrator_progress (PR #6678)."""
-    global _reaper_last_progress
-    _reaper_last_progress = _utcnow()
-
-
-# Cycle-level circuit breaker. After N consecutive whole-cycle exceptions the
-# reaper enters HALTED state, stops cycling, and posts an ERROR alert. Resets
-# automatically on process restart (in-memory); tunable via runtime_config key
-# "reaper_cycle_halt_threshold".
-_REAPER_CYCLE_HALT_THRESHOLD: int = 5
-# Half-open probe limit: after this many consecutive failed probes the reaper
-# escalates to a hard halt that requires operator reset (like the original behavior).
-# Tunable via runtime_config key "reaper_half_open_probe_limit".
-_REAPER_HALF_OPEN_PROBE_LIMIT: int = 3
-_reaper_halt_state: dict = {
-    "halted": False,
-    "halt_timestamp": None,
-    "last_error": None,
-    "crash_count": 0,
-    # hard_halted=True → terminal; requires operator reset (not auto-recovered).
-    # hard_halted=False + halted=True → soft halt; auto-recovers after cooldown.
-    "hard_halted": False,
-    "half_open_failures": 0,  # consecutive failed half-open probes
-}
-
-
-def get_reaper_stats() -> dict:
-    """Snapshot of reaper liveness for /metrics and admin observability.
-
-    ``last_cycle_age_seconds`` is the wall-clock seconds since the last
-    fully-successful cycle. -1 means the reaper has never completed a cycle
-    (process just started, or every cycle has crashed). Alerts should fire
-    if this exceeds the reaper sleep interval by a meaningful margin
-    (e.g. >300s — five expected cycles missed).
-    """
-    age_seconds: float | int = -1
-    if _reaper_last_cycle_completed_at is not None:
-        age_seconds = max(
-            0, (_utcnow() - _reaper_last_cycle_completed_at).total_seconds()
-        )
-    # In-cycle progress age: seconds since the last _mark_reaper_progress()
-    # heartbeat, -1 if never marked. This is the freshest liveness signal under
-    # a long cycle (the watchdog judges on it before falling back to cycle age).
-    progress_age_seconds: float | int = -1
-    if _reaper_last_progress is not None:
-        progress_age_seconds = max(
-            0, (_utcnow() - _reaper_last_progress).total_seconds()
-        )
-    return {
-        "cycles_completed_total": _reaper_cycles_completed_count,
-        "last_cycle_age_seconds": age_seconds,
-        "last_progress_age_seconds": progress_age_seconds,
-        "halted": _reaper_halt_state["halted"],
-        "halt_timestamp": _reaper_halt_state["halt_timestamp"].isoformat()
-        if _reaper_halt_state["halt_timestamp"]
-        else None,
-        "halt_crash_count": _reaper_halt_state["crash_count"],
-        "hard_halted": _reaper_halt_state.get("hard_halted", False),
-        "half_open_failures": _reaper_halt_state.get("half_open_failures", 0),
-    }
-
-
-def is_reaper_halted() -> bool:
-    """Liveness probe: True iff the reaper has self-halted after a crash-loop."""
-    return _reaper_halt_state["halted"]
-
-
-async def _post_reaper_halt_alert(crash_count: int, last_error: str) -> None:
-    """Post an ERROR-severity alert to every project when the reaper self-halts."""
-    try:
-        from app.models import Alert, AlertSeverity
-
-        async with AsyncSessionLocal() as s:
-            # Bound the fan-out scan and fan-out insert: a single capped SELECT
-            # plus one bulk INSERT instead of an unbounded full-table scan and
-            # one ORM add() per project in the error-recovery hot path.
-            proj_ids = (await s.execute(select(Project.id).limit(1000))).scalars().all()
-            if not proj_ids:
-                return
-            message = (
-                f"Reaper crash-looped {crash_count}x and self-halted. "
-                f"Last error: {last_error[:300]}. "
-                "No new reap cycles until process restart or operator reset."
-            )
-            await s.execute(
-                insert(Alert),
-                [
-                    {
-                        "id": uuid.uuid4(),
-                        "project_id": pid,
-                        "severity": AlertSeverity.ERROR,
-                        "title": "Reaper service HALTED after crash-loop",
-                        "message": message,
-                    }
-                    for pid in proj_ids
-                ],
-            )
-            await s.commit()
-    except Exception:
-        logger.exception("[REAPER] Failed to post halt alert")
-
-
-async def _post_reaper_recovery_alert(probe_failures: int) -> None:
-    """Post an INFO alert to every project when the reaper autonomously recovers."""
-    try:
-        from app.models import Alert, AlertSeverity
-
-        async with AsyncSessionLocal() as s:
-            # Bound the fan-out scan and fan-out insert (see _post_reaper_halt_alert).
-            proj_ids = (await s.execute(select(Project.id).limit(1000))).scalars().all()
-            if not proj_ids:
-                return
-            message = (
-                f"Reaper self-recovered after {probe_failures} failed "
-                "probe(s). Normal reap cycles have resumed."
-            )
-            await s.execute(
-                insert(Alert),
-                [
-                    {
-                        "id": uuid.uuid4(),
-                        "project_id": pid,
-                        "severity": AlertSeverity.INFO,
-                        "title": "Reaper service recovered autonomously",
-                        "message": message,
-                    }
-                    for pid in proj_ids
-                ],
-            )
-            await s.commit()
-    except Exception:
-        logger.exception("[REAPER] Failed to post recovery alert")
-
+from app.reaper_halt import (
+    _REAPER_CYCLE_HALT_THRESHOLD,
+    _REAPER_HALF_OPEN_PROBE_LIMIT,
+    _reaper_halt_state,
+    _mark_reaper_progress,
+    _post_reaper_halt_alert,
+    _post_reaper_recovery_alert,
+)
+from app.reaper_halt import get_reaper_stats, is_reaper_halted  # noqa: F401
 
 # Per-(provider, model) regression scan cadence state is now managed in
 # reaper_sweeps.py (sweep_regression_scan).  The constants are kept there.
@@ -407,296 +177,30 @@ _REAPER_MAX_ORPHANS_PER_CYCLE_DEFAULT = 60
 # time budget, i.e. process every selected orphan — fail-safe if misconfigured).
 _REAPER_ORPHAN_LOOP_TIME_BUDGET_DEFAULT = 180.0
 
-# C3: per-cycle cap on the Step 3/4 stale-EVALUATING sweep. Each parent costs
-# either serial GitHub I/O (_check_and_trigger_rollup, Step 3) or a DB-heavy
-# requeue (_requeue_parent_task, Step 4). The previous unbounded SELECT could
-# pull every stale EVALUATING parent at once, growing the reaper cycle past
-# REAPER_HANG_SECONDS under a backlog (the 2026-05-30 watchdog-kill mechanism).
-# Generous default; deferred parents re-qualify next cycle (the sweep runs
-# every reaper cycle and selects oldest-stale first).
-_REAPER_MAX_EVALUATING_PER_CYCLE = int(
-    os.getenv("REAPER_MAX_EVALUATING_PER_CYCLE", "100")
+
+from app.reaper_orphan_classify import (
+    _ORPHAN_PRIORITY_RATE_LIMITED,  # noqa: F401
+    _ORPHAN_PRIORITY_SPOT,  # noqa: F401
+    _ORPHAN_PRIORITY_PROVISION,  # noqa: F401
+    _ORPHAN_PRIORITY_DEFAULT,  # noqa: F401
+    _orphan_priority_key,  # noqa: F401
+    _select_orphans_for_cycle,
+    _vm_contact_within_cutoff,  # noqa: F401
+    _vm_tool_use_within_cutoff,  # noqa: F401
+    _classify_orphan,
+    _HEARTBEAT_STALE_DEFAULTS,  # noqa: F401
+    _HEARTBEAT_EFFORT_FLOORS,  # noqa: F401
+    _PRECLAIM_STALE_DEFAULTS,  # noqa: F401
+    _PROGRESS_STALE_DEFAULTS,  # noqa: F401
+    _THINKING_HEAVY_TASK_TYPES,  # noqa: F401
+    _THINKING_HEAVY_PROGRESS_STALE_SECONDS,  # noqa: F401
+    _progress_stale_cutoff,
+    _preclaim_stale_cutoff,  # noqa: F401
+    _heartbeat_stale_cutoff,
+    _extract_tool_trace_tail,
+    _task_has_open_pr,  # noqa: F401
 )
-
-# Orphan-priority buckets (lower = processed first). Time-sensitive orphans are
-# reaped before the cap can truncate the tail.
-_ORPHAN_PRIORITY_RATE_LIMITED = 0  # rate-limited / quota — reroute ASAP
-_ORPHAN_PRIORITY_SPOT = 1  # spot VM — likelier to be preempted again
-_ORPHAN_PRIORITY_PROVISION = 2  # stuck PROVISIONING — never got a heartbeat
-_ORPHAN_PRIORITY_DEFAULT = 3  # everything else
-
-
-def _orphan_priority_key(task) -> int:
-    """Cheap priority bucket for one orphan, computed ONLY from already-loaded
-    columns (status, latest_status_message, context, vm_spot) — NO extra
-    queries. Lower number = processed first so time-sensitive orphans survive a
-    truncating cap. Pure + side-effect-free for unit testing.
-
-    Order: rate-limited (0) < spot (1) < provision-failure (2) < other (3).
-    """
-    # 0: rate-limited / quota — reroute to a fresh pool account ASAP.
-    msg = (getattr(task, "latest_status_message", None) or "").lower()
-    ctx = getattr(task, "context", None) or {}
-    failure_category = ctx.get("failure_category")
-    if (
-        "rate" in msg
-        or "429" in msg
-        or "quota" in msg
-        or failure_category == RATE_LIMIT
-    ):
-        return _ORPHAN_PRIORITY_RATE_LIMITED
-    # 1: spot VMs — cheaper but preemptible; recover before they churn again.
-    if getattr(task, "vm_spot", None) is True:
-        return _ORPHAN_PRIORITY_SPOT
-    # 2: provision-failures — VM died before first heartbeat; no agent state lost.
-    if getattr(task, "status", None) == TaskStatus.PROVISIONING:
-        return _ORPHAN_PRIORITY_PROVISION
-    # 3: everything else.
-    return _ORPHAN_PRIORITY_DEFAULT
-
-
-def _select_orphans_for_cycle(tasks: list, cap: int) -> tuple[list, int]:
-    """Sort ``tasks`` by ascending priority bucket and return the top ``cap``
-    plus the number deferred. Sort is stable (Python's sort), so within a bucket
-    the original orphan-detection order is preserved. Pure helper so the
-    cap+priority logic is unit-testable without the full reaper loop.
-
-    Returns ``(selected, deferred_count)``. A non-positive cap is treated as
-    "no cap" (process everything) to fail safe if misconfigured.
-    """
-    ordered = sorted(tasks, key=_orphan_priority_key)
-    if cap is None or cap <= 0 or len(ordered) <= cap:
-        return ordered, 0
-    return ordered[:cap], len(ordered) - cap
-
-
-def _vm_contact_within_cutoff(
-    task, hb_cutoff: datetime, vm_contact_lookup: dict | None
-) -> bool:
-    """True iff the orchestrator heard from this task's VM within ``hb_cutoff``.
-
-    Heartbeat false-reap fix (option B): the heartbeat handler upserts an
-    uncontended ``vmcontact`` row keyed on ``vm_instance_id`` BEFORE it touches
-    the contended Task row, so a VM that is alive-but-lock-starved (its
-    ``Task.last_heartbeat`` write was skipped while the rollup held the task row
-    FOR UPDATE) still leaves a fresh ``last_contact_at``. This override is gated
-    on the SAME heartbeat-stale cutoff used for ``last_heartbeat``: a genuinely
-    dead agent (crashed / preempted / OOM — sends no requests) has a stale or
-    absent contact row and is reaped exactly as before. Old / absent rows fall
-    back to the existing ``last_heartbeat`` behaviour (no regression).
-    """
-    if not vm_contact_lookup:
-        return False
-    vm_id = getattr(task, "vm_instance_id", None)
-    if not vm_id:
-        return False
-    last_contact = vm_contact_lookup.get(vm_id)
-    return last_contact is not None and last_contact >= hb_cutoff
-
-
-def _vm_tool_use_within_cutoff(
-    task, progress_cutoff: datetime, vm_tool_use_lookup: dict | None
-) -> bool:
-    """True iff the orchestrator heard a tool-use from this VM after ``progress_cutoff``.
-
-    Fix 3b: the PROGRESS-stall branch reaps a fresh-heartbeating agent whose
-    on-row ``Task.last_tool_use_at`` is stale. But that on-row write shares the
-    contended task row with ``last_heartbeat`` — a lock-starved heartbeat (the
-    rollup holding the task row FOR UPDATE) drops BOTH, so an agent that IS
-    making tool calls can read as stalled. The heartbeat handler upserts the
-    most-recent tool-use OFF the task row onto ``vmcontact.last_tool_use_at``
-    (keyed on ``vm_instance_id``), so a tool-use within the SAME progress-stale
-    cutoff proves the agent is progressing (its on-row stamp was merely
-    lock-dropped) and the stall reap is suppressed. A genuinely stalled agent
-    (no tool calls anywhere) leaves this stale/absent and is still reaped.
-    Unlike the heartbeat-stale ``_vm_contact_within_cutoff`` override, this does
-    NOT key on the mere fact of contact (a hung agent still heartbeats) — it
-    keys on actual TOOL-USE recency, so genuine stall detection is preserved.
-    """
-    if not vm_tool_use_lookup:
-        return False
-    vm_id = getattr(task, "vm_instance_id", None)
-    if not vm_id:
-        return False
-    last_tool_use = vm_tool_use_lookup.get(vm_id)
-    return last_tool_use is not None and last_tool_use >= progress_cutoff
-
-
-def _classify_orphan(
-    task,
-    now: datetime,
-    has_open_pr: bool,
-    vm_contact_lookup: dict | None = None,
-    vm_tool_use_lookup: dict | None = None,
-) -> bool:
-    """Single source of truth for the orphan-detection state machine.
-
-    Returns ``True`` iff ``task`` (a PROVISIONING / IN_PROGRESS row that already
-    owns a vm_instance_id, or a degenerate other-status catch-all) is an orphan
-    that should be reaped, given the current clock and whether it has an open PR.
-
-    Previously this predicate was DUPLICATED verbatim between the Step-1 lock-free
-    scan (which collected ``task.id``) and the Step-2 post-lock re-verification
-    (which collected the locked ORM object). Two copies drifting out of sync would
-    silently change recovery outcomes, so both call sites now route through here.
-    Pure + side-effect-free (no logging, no queries) so it is unit-testable and so
-    the caller owns any per-site logging.
-
-    ``vm_contact_lookup`` is an optional ``{vm_instance_id: last_contact_at}`` map
-    (batch-fetched ONCE per cycle by the caller, never one query per task). On any
-    heartbeat-stale branch that would reap, a contact within the SAME
-    ``hb_cutoff`` overrides the reap (the agent is alive; its ``last_heartbeat``
-    write was lock-starved). Absent / stale contact → existing behaviour.
-
-    ``vm_tool_use_lookup`` is an optional ``{vm_instance_id: last_tool_use_at}``
-    map (batch-fetched from the SAME query, Fix 3b). On the PROGRESS-stall
-    branches that would reap (``agent_stalled``), a tool-use within the
-    ``_progress_stale_cutoff`` overrides the reap — the agent IS making tool
-    calls; its on-row ``last_tool_use_at`` write was lock-starved together with
-    the heartbeat. Unlike ``vm_contact_lookup`` it keys on tool-use recency, NOT
-    mere contact (a hung agent still heartbeats), so genuine stall detection is
-    preserved. Absent / stale tool-use → existing behaviour (reap).
-
-    State machine (unchanged):
-      PROVISIONING:
-        - started_at > 15min ago                        → absolute provision ceiling
-        - last_heartbeat older than hb_cutoff            → claimed-then-silent (rare)
-        - vm_provisioned_at past preclaim cutoff + no hb → silent pre-claim death
-      IN_PROGRESS:
-        - last_heartbeat older than hb_cutoff            → agent crashed mid-run
-        - no hb, started_at older than hb_cutoff         → post-claim crash (defensive)
-        - no hb, no started_at, created >10min ago       → degenerate catch-all
-        - fresh hb but last_tool_use_at stale (+started)  → agent stalled (tool clock)
-        - fresh hb, no tool use ever, started stale, anthropic → agent stalled (Codex gate)
-      any other status: created >10min ago               → catch-all
-    """
-    ten_minutes_ago = now - timedelta(minutes=10)
-    fifteen_minutes_ago = now - timedelta(minutes=15)
-    hb_cutoff = _heartbeat_stale_cutoff(task, now, has_open_pr=has_open_pr)
-
-    if task.status == TaskStatus.PROVISIONING:
-        if task.started_at and task.started_at < fifteen_minutes_ago:
-            return True  # absolute provisioning ceiling
-        if task.last_heartbeat and task.last_heartbeat < hb_cutoff:
-            # Rare: agent claimed during PROVISIONING (shouldn't happen since
-            # claim_task also flips status to IN_PROGRESS), then went silent.
-            # vm_contact override: a fresh contact within hb_cutoff means the VM
-            # is alive (lock-starved last_heartbeat write) — don't reap.
-            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
-        if (
-            task.vm_provisioned_at
-            and task.vm_provisioned_at < _preclaim_stale_cutoff(task, now)
-            and task.last_heartbeat is None
-        ):
-            # Silent pre-claim death: VM was dispatched long enough ago
-            # (scope-aware: small 6min, medium 8min, large 10min) and the
-            # agent never claimed. Charge provision budget. vm_contact override:
-            # if the agent has actually been calling in within hb_cutoff it is
-            # NOT a silent death — suppress the reap.
-            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
-        return False
-
-    if task.status == TaskStatus.IN_PROGRESS:
-        if task.last_heartbeat and task.last_heartbeat < hb_cutoff:
-            # Agent crashed mid-run — UNLESS we heard from the VM within the
-            # same cutoff (lock-starved last_heartbeat write); then it's alive.
-            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
-        if (
-            task.last_heartbeat is None
-            and task.started_at
-            and task.started_at < hb_cutoff
-        ):
-            # Defensive: IN_PROGRESS without any heartbeat shouldn't happen
-            # (claim_task sets last_heartbeat at agent.py:312) but if we hit
-            # it, treat as a post-claim crash. Use scope-aware cutoff so
-            # large/high-effort tasks aren't reaped prematurely. vm_contact
-            # override: a fresh contact within hb_cutoff proves the VM is alive
-            # (its last_heartbeat write was lock-starved), so don't reap.
-            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
-        if (
-            task.last_heartbeat is None
-            and task.started_at is None
-            and task.created_at < ten_minutes_ago
-        ):
-            # Fully-degenerate IN_PROGRESS row (no heartbeat, no started_at)
-            # that's been alive for >10 min — data corruption or a path that
-            # forgot to set started_at. Reap as a catch-all. vm_contact override:
-            # if the VM is demonstrably alive (fresh contact within hb_cutoff)
-            # this is not a dead-VM orphan — suppress the reap.
-            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
-        if (
-            task.last_heartbeat
-            and task.last_heartbeat >= hb_cutoff
-            and task.last_tool_use_at is not None
-            and task.last_tool_use_at < _progress_stale_cutoff(task, now)
-            and (
-                task.started_at is None
-                or task.started_at < _progress_stale_cutoff(task, now)
-            )
-        ):
-            # Stalled-but-heartbeating: agent process is alive (fresh
-            # heartbeat) but has made no tool/LLM calls for longer than
-            # the scope-aware progress threshold. Indicates a hung LLM
-            # call, a spinning retry loop, or a wedged tool invocation.
-            #
-            # NO vm_contact (last_contact_at) override here: this is a
-            # PROGRESS-stale reap, not a heartbeat-stale one — the heartbeat IS
-            # fresh (last_heartbeat >= hb_cutoff), so a mere contact would
-            # likewise be fresh and suppressing on it would defeat genuine stall
-            # detection. The contact override only covers the last_heartbeat
-            # false-reap (lock-starved write).
-            #
-            # Fix 3b: a TOOL-USE override IS valid here. The on-row
-            # ``last_tool_use_at`` write shares the contended task row with
-            # ``last_heartbeat``, so a lock-starved heartbeat drops it too — an
-            # agent that IS calling tools can read as stalled. The off-row
-            # ``vmcontact.last_tool_use_at`` carries the real progress signal:
-            # if it's within the progress-stale cutoff the agent is progressing,
-            # so don't reap. Keyed on tool-use recency (not mere contact), so a
-            # genuinely stalled-but-heartbeating agent (no recent tool use
-            # anywhere) is still reaped.
-            #
-            # Cross-attempt stale-tool guard (8c8cf973 incident):
-            # last_tool_use_at carries forward across retries — if
-            # only this field is checked, every retry is born stale
-            # and reaped within seconds (8c8cf973 attempt 3 reaped
-            # 22s after starting because tool_use_at was 11min old
-            # from attempt 1). The started_at check ensures the
-            # current attempt has actually had time to call tools.
-            return not _vm_tool_use_within_cutoff(
-                task, _progress_stale_cutoff(task, now), vm_tool_use_lookup
-            )
-        if (
-            task.last_heartbeat
-            and task.last_heartbeat >= hb_cutoff
-            and task.last_tool_use_at is None
-            and task.started_at
-            and task.started_at < _progress_stale_cutoff(task, now)
-            and (task.context or {}).get("llm_provider") == "anthropic"
-        ):
-            # Stalled-but-heartbeating with zero tool calls ever.
-            # Provider-gated to anthropic only because the agent
-            # wrapper's outputMode='text' path (Codex/Gemini at
-            # agent/src/index.ts:3061,3119) never calls
-            # recordToolUse — only the claude-stream-json parser
-            # does. So last_tool_use_at IS NULL for every
-            # Codex/Gemini task by design, regardless of whether
-            # tools were called. Without this gate the watchdog
-            # reaps healthy non-anthropic work after 8 min.
-            # TODO: parse Codex --json events / Gemini events
-            # to populate tool_trace, then drop the gate.
-            #
-            # Fix 3b: even with on-row last_tool_use_at NULL, an off-row
-            # ``vmcontact.last_tool_use_at`` within the progress cutoff means
-            # the agent DID record a tool use that the lock-starved heartbeat
-            # failed to land on the task row — it is progressing, don't reap.
-            return not _vm_tool_use_within_cutoff(
-                task, _progress_stale_cutoff(task, now), vm_tool_use_lookup
-            )
-        return False
-
-    # Any other status (degenerate row left in an active-scan status): catch-all.
-    return task.created_at < ten_minutes_ago
+from app.reaper_orphan_io import _run_orphan_io
 
 
 _TRANSIENT_5XX_PATTERNS = frozenset(
@@ -721,202 +225,9 @@ _BATCH = 5000
 
 from app.retry_prompt import _copy_analysis_artifacts_to_previous  # noqa: E402, F401, RUF100
 
-_HEARTBEAT_STALE_DEFAULTS = {
-    "small": 300,
-    "medium": 420,
-    "large": 900,
-}
 
-
-_HEARTBEAT_EFFORT_FLOORS = {
-    "low": 300,
-    "medium": 300,
-    "high": 420,
-    "max": 720,
-}
-
-
-_PRECLAIM_STALE_DEFAULTS = {
-    "small": 360,
-    "medium": 480,
-    "large": 600,
-}
-
-# Progress-staleness thresholds: how long a fresh-heartbeating task may go
-# without any tool/LLM event before being classified as agent_stalled.
-# Longer than heartbeat-stale to avoid false positives on normal LLM think time.
-_PROGRESS_STALE_DEFAULTS = {
-    "small": 480,  # 8 min
-    "medium": 720,  # 12 min
-    "large": 1080,  # 18 min
-}
-
-# Task types where the agent legitimately spends 5-20 min reasoning before
-# emitting a tool call (b2410541 incident: Claude Opus on strategic_review
-# was reaped after 484s while in the middle of pass-1 thinking — actual
-# attempt completed cleanly in 19 min once given a budget). These types
-# get a flat longer cutoff regardless of nominal scope.
-# Memo (pure-reasoning documentation tasks with no repo) may run 5-10+ min
-# producing a reasoning artifact without any tool calls — not a sign of staleness.
-_THINKING_HEAVY_TASK_TYPES = frozenset(
-    {
-        "strategic_review",
-        "design_doc_update",
-        "research",
-        "investigate",
-        "plan",
-        "memo",
-    }
-)
-_THINKING_HEAVY_PROGRESS_STALE_SECONDS = 1500  # 25 min
-
-
-def _progress_stale_cutoff(task, now: datetime) -> datetime:
-    """Return cutoff time for meaningful-progress (last_tool_use_at) staleness.
-
-    Only fires when last_heartbeat IS fresh (agent alive but wedged). Uses
-    longer thresholds than heartbeat-stale to tolerate normal LLM latency.
-    Thinking-heavy task types override scope-based defaults — reasoning
-    models on strategic/research work spend long stretches between tool
-    calls (8-min cutoff misclassifies normal Opus reasoning as stalled).
-    """
-    ctx = task.context or {}
-    payload = task.first_payload or {}
-    task_type = payload.get("type") or ""
-    if task_type in _THINKING_HEAVY_TASK_TYPES:
-        thinking_override = _runtime_config.get(
-            "progress_stale_seconds_thinking_heavy",
-            _THINKING_HEAVY_PROGRESS_STALE_SECONDS,
-        )
-        return now - timedelta(seconds=thinking_override)
-    scope = ctx.get("scope") or payload.get("scope")
-    thresholds = _runtime_config.get(
-        "progress_stale_seconds_by_scope", _PROGRESS_STALE_DEFAULTS
-    )
-    seconds = thresholds.get(scope, thresholds.get("small", 480))
-    return now - timedelta(seconds=seconds)
-
-
-def _extract_tool_trace_tail(task) -> str:
-    """Extract and format the tail of _tool_trace from task.context.
-
-    Returns a compact formatted string of recent tool calls (timestamp + tool name
-    + first ~80 chars of input preview), limited to ~400 chars total. If _tool_trace
-    is missing or empty, returns empty string.
-    """
-    ctx = task.context or {}
-    tool_trace = ctx.get("_tool_trace") or []
-    if not tool_trace:
-        return ""
-
-    # Take the last 5 entries to stay within 400-char budget
-    entries = tool_trace[-5:] if len(tool_trace) > 5 else tool_trace
-    parts = []
-    total_len = 0
-    max_total = 400
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        t_str = entry.get("t", "").split("T")[-1][:8]  # HH:MM:SS from ISO-8601
-        tool_name = entry.get("tool", "?")[:20]
-        input_preview = redact_command_log_text(entry.get("input_preview", ""))[:80]
-        # Compact format: timestamp + tool + input
-        part = f"{t_str} {tool_name}: {input_preview}"
-        if total_len + len(part) + 3 > max_total:  # +3 for " | "
-            break
-        parts.append(part)
-        total_len += len(part) + 3
-
-    if not parts:
-        return ""
-    return " | ".join(parts)
-
-
-def _preclaim_stale_cutoff(task, now: datetime) -> datetime:
-    ctx = task.context or {}
-    payload = task.first_payload or {}
-    scope = ctx.get("scope") or payload.get("scope")
-    thresholds = _runtime_config.get(
-        "preclaim_stale_seconds_by_scope", _PRECLAIM_STALE_DEFAULTS
-    )
-    seconds = thresholds.get(scope, thresholds.get("small", 360))
-    return now - timedelta(seconds=seconds)
-
-
-def _heartbeat_stale_cutoff(task, now: datetime, has_open_pr: bool = False) -> datetime:
-    # When a task has an open PR, reduce the heartbeat-stale cutoff to 90s
-    # to detect post-PR silent deaths faster and hand off to the review
-    # pipeline sooner (normally 5-15 min delay; with PR cutoff ~90-150s).
-    # The 90s gives one missed heartbeat (60s) plus one reaper cycle (~30s).
-    if has_open_pr:
-        return now - timedelta(seconds=90)
-
-    ctx = task.context or {}
-    payload = task.first_payload or {}
-    scope = ctx.get("scope") or payload.get("scope")
-    thresholds = _runtime_config.get(
-        "heartbeat_stale_seconds_by_scope", _HEARTBEAT_STALE_DEFAULTS
-    )
-    seconds = thresholds.get(scope, thresholds.get("small", 300))
-
-    effort = ctx.get("effort") or payload.get("effort")
-    if not effort:
-        task_type = ctx.get("type") or payload.get("type")
-        if task_type:
-            # Resolve effort from the provider settings bag: merge Anthropic
-            # defaults with any per-task-type override. Reaper needs a scalar
-            # effort to size the heartbeat-stale floor; other providers'
-            # effort-like knobs (reasoning_effort, thinking_budget) aren't
-            # normalized so we look at Anthropic only, which is the dispatch
-            # default.
-            defaults = _runtime_config.get("provider_settings_defaults", {}).get(
-                "anthropic", {}
-            )
-            overrides = (
-                _runtime_config.get("task_type_provider_overrides", {})
-                .get(task_type, {})
-                .get("anthropic", {})
-            )
-            effort = overrides.get("effort") or defaults.get("effort")
-    floor = _HEARTBEAT_EFFORT_FLOORS.get(effort, 0)
-    seconds = max(seconds, floor)
-    return now - timedelta(seconds=seconds)
-
-
-async def _task_has_open_pr(task, session) -> tuple[bool, int | None]:
-    """Check whether a task has a PULL_REQUEST artifact (PR was published).
-
-    NOTE: Despite the name, this only checks the Artifact table — it does
-    NOT verify the PR is still open on GitHub. The PR may have been closed
-    or merged out-of-band. Callers that act on "open" must re-confirm via
-    get_pull_request before parking the task in EVALUATING.
-
-    Used by the reaper: a task that pushed a branch and opened a PR before
-    being reaped should hand off to the review pipeline (EVALUATING) rather
-    than retry from scratch (QUEUED) — the retry path would collide with the
-    existing branch and be refused by the agent's stale-branch guard
-    (agent/src/index.ts:706), orphaning the PR.
-
-    The Artifact table is written atomically with PR creation (see
-    routers/agent.py:2035). Returns (True, pr_number) on match.
-    """
-    stmt = select(Artifact).where(
-        Artifact.task_id == task.id,
-        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-    )
-    artifact = (await session.execute(stmt)).scalars().first()
-    if artifact is None or not artifact.pr_url:
-        return False, None
-    # Parse PR number from the URL (e.g. https://github.com/owner/repo/pull/2903)
-    try:
-        pr_num = int(artifact.pr_url.rstrip("/").rsplit("/", 1)[-1])
-    except (ValueError, IndexError):
-        return False, None
-    return True, pr_num
-
-
-from app.reaper_sweeps import (  # noqa: E402
+from app.reaper_evaluating_sweeps import sweep_evaluating_parents
+from app.reaper_sweeps import (
     sweep_queued_age_alerts,
     sweep_stalled_strategic_cycles,
     sweep_regression_scan,
@@ -935,121 +246,8 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_resolve_stale_open_bug_messages,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
+    _sweep_strategic_cycle_starvation,
 )
-
-# Zero-cycle starvation: a project that should be running the strategic loop but
-# has produced NO StrategicCycle row in this window emits a deduped
-# ``strategic_cycle_stall`` WARNING Alert. Distinct from the in-progress-but-stuck
-# detection handled by ``sweep_stalled_strategic_cycles`` — this catches the
-# strategic engine never spawning a cycle at all (the deleted regression-dispatcher
-# ``strategic_cycle_stall`` signal used to surface this; it is now a plain Alert).
-_STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS = 24
-_STRATEGIC_CYCLE_STALL_ALERT_TITLE = "Strategic engine starved: no cycle in window"
-
-
-async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
-    """Emit a deduped strategic_cycle_stall Alert for autonomous projects with no
-    recent StrategicCycle row at all. Returns the number of alerts created."""
-    from app.models import Alert, AlertSeverity, Project, StrategicCycle
-
-    starvation_hours = int(
-        _runtime_config.get(
-            "strategic_cycle_starvation_hours",
-            _STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS,
-        )
-        or _STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS
-    )
-    cutoff = now - timedelta(hours=starvation_hours)
-
-    project_rows = (
-        await session.execute(
-            select(Project.id, Project.created_at).where(
-                Project.autonomous_enabled.is_(True),
-                Project.not_archived(),
-            )
-        )
-    ).all()
-
-    # New projects have not had time to establish a cadence — skip until the
-    # project itself is older than the starvation window. Filter in Python so
-    # the two batched lookups below only run over genuine candidates.
-    candidate_ids: list = []
-    for project_id, project_created_at in project_rows:
-        if project_created_at is not None:
-            pc = project_created_at
-            if pc.tzinfo is not None:
-                pc = pc.replace(tzinfo=None)
-            if pc > cutoff:
-                continue
-        candidate_ids.append(project_id)
-
-    created = 0
-    if not candidate_ids:
-        return created
-
-    # Batched lookup 1: which candidate projects already have a recent cycle.
-    # Replaces a per-project existence SELECT (the old N+1). Equivalent to the
-    # prior ``phase1_started_at >= cutoff`` LIMIT 1 existence check, collapsed
-    # into one round-trip via DISTINCT.
-    projects_with_recent_cycle = set(
-        (
-            await session.execute(
-                select(StrategicCycle.project_id)
-                .where(
-                    StrategicCycle.project_id.in_(candidate_ids),
-                    StrategicCycle.phase1_started_at >= cutoff,
-                )
-                .distinct()
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    # Batched lookup 2: which candidate projects already have an open WARNING
-    # dedup alert. Replaces the per-project dedup SELECT (the second N+1).
-    projects_with_open_alert = set(
-        (
-            await session.execute(
-                select(Alert.project_id)
-                .where(
-                    Alert.project_id.in_(candidate_ids),
-                    Alert.task_id.is_(None),
-                    Alert.severity == AlertSeverity.WARNING,
-                    Alert.dismissed_at.is_(None),
-                    Alert.title == _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
-                )
-                .distinct()
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    for project_id in candidate_ids:
-        if project_id in projects_with_recent_cycle:
-            continue
-        # Dedup: one open WARNING alert per project for this title.
-        if project_id in projects_with_open_alert:
-            continue
-
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=AlertSeverity.WARNING,
-                title=_STRATEGIC_CYCLE_STALL_ALERT_TITLE,
-                message=(
-                    f"No strategic cycle has started in the last {starvation_hours}h "
-                    "for this autonomous project — the strategic engine appears "
-                    "starved (zero cycles, not merely stalled mid-cycle). Review the "
-                    "strategic loop scheduler and recent orchestrator logs."
-                )[:1000],
-            )
-        )
-        created += 1
-    if created:
-        await session.commit()
-    return created
 
 
 async def _mark_landed_parent_dependents(parent_id, session) -> None:
@@ -1100,21 +298,12 @@ async def reaper_service():
     # Deferred imports to avoid circular dependency with app.main
     from app.max_plan_pool import (
         clear_task_llm_runtime_context,
-        db_account_was_rate_limited,
-        db_pool_wide_rate_limit_cooldown,
-        disable_account_model,
-        disable_account_for_auth,
         get_task_llm_account_id,
-        get_task_rate_limit_scope,
-        _extract_task_model,
         release_max_plan_account,
     )
-    from app.vm_lifecycle import _ensure_vm_deleted
     from app.alert_dispatch import _maybe_create_failure_alert
     from app.routers.agent_status import record_task_result
     from app.broadcast import broadcast_to_project
-    from app.task_lifecycle import _requeue_parent_task
-    from app.rollup_management import _check_and_trigger_rollup
 
     consecutive_errors = 0
     while True:
@@ -1133,7 +322,9 @@ async def reaper_service():
                 _runtime_config.get("reaper_cycle_halt_cooldown_seconds", 300)
             )
             half_open_failures = _reaper_halt_state.get("half_open_failures", 0)
-            cooldown = min(cooldown_base * (2**half_open_failures), 3600)
+            cooldown = exponential_backoff(
+                half_open_failures + 1, base=float(cooldown_base), cap=3600.0
+            )
             elapsed = (
                 (_utcnow() - halt_ts).total_seconds() if halt_ts else (cooldown + 1)
             )
@@ -1153,6 +344,7 @@ async def reaper_service():
             )
             _reaper_halt_state["_in_probe"] = True
             # Fall through to run one probe cycle (no continue).
+        session = None
         try:
             async with AsyncSessionLocal() as session:
                 # Intra-cycle liveness heartbeat at the very start of the cycle
@@ -1860,300 +1052,31 @@ async def reaper_service():
                         # unlocked. We re-acquire FOR UPDATE briefly after this block
                         # to apply the resulting mutations.
                         # ──────────────────────────────────────────────────────────
-
-                        # Capture pre-IO snapshot so the relock below can detect peer
-                        # mutation during the unlocked window. status + last_heartbeat
-                        # are the two fields the heartbeat path writes; an advance in
-                        # either signals the agent revived and the reap should be aborted.
-                        pre_io_status = fresh_task.status
-                        pre_io_last_hb = fresh_task.last_heartbeat
-
-                        # 1. Spot preemption check (GCP API)
-                        is_spot_preemption = False
-                        prov_zone_for_status: str | None = None
-                        io_vm_status: str | None = None
-                        io_orch_delete_info: tuple[bool, str] = (False, "")
-                        if (
-                            getattr(fresh_task, "vm_spot", False)
-                            and fresh_task.vm_instance_id
-                            and reap_reason_code
-                            in (
-                                "heartbeat_timeout_post_claim",
-                                "provision_timeout_pre_claim",
-                                # absolute_timeout: a PROVISIONING task that aged past
-                                # the 15-min absolute ceiling before earlier reaper
-                                # codes had a chance to classify it (typically because
-                                # the reaper itself was lagging — e.g., 2026-05-07
-                                # MissingGreenlet crash on last_tool_use_at). Without
-                                # this branch, the spot check is skipped and the
-                                # account gets blacklisted for what's actually a GCE
-                                # capacity issue.
-                                "absolute_timeout",
-                            )
-                        ):
-                            prov_zone_for_status = (task.context or {}).get(
-                                "provision_zone"
-                            ) or get_vm_zone(fresh_task.vm_instance_id)
-                            if prov_zone_for_status:
-                                try:
-                                    io_vm_status = await asyncio.to_thread(
-                                        get_vm_status,
-                                        fresh_task.vm_instance_id,
-                                        prov_zone_for_status,
-                                    )
-                                    # TERMINATED = preempted by GCP. DELETED = already gone.
-                                    # DELETED is ambiguous: GCP delete-on-preempt OR orchestrator-
-                                    # initiated cleanup (agent_completion, terminal_transition,
-                                    # admin_requeue, etc). Production 2026-05-04: reaper misclassified
-                                    # orchestrator-deleted VMs as preemptions, inflating
-                                    # spot_preemption_count for tasks that were really completed
-                                    # but whose status POST 500'd during a cutover.
-                                    # Fix: consult the orchestrator-initiated-delete tracker. If the
-                                    # VM was deleted by us within the last 30min, it's NOT a preemption.
-                                    from app.vm_lifecycle import (
-                                        is_orchestrator_initiated_delete,
-                                    )
-
-                                    io_orch_delete_info = (
-                                        is_orchestrator_initiated_delete(
-                                            fresh_task.vm_instance_id
-                                        )
-                                    )
-                                    if io_orch_delete_info[0]:
-                                        logger.info(
-                                            f"[REAPER] Task {task.id} on SPOT VM {fresh_task.vm_instance_id} "
-                                            f"vm_status={io_vm_status} but orchestrator-initiated delete "
-                                            f"(reason={io_orch_delete_info[1]}) — NOT classifying as preemption"
-                                        )
-                                    elif io_vm_status in ("TERMINATED", "DELETED"):
-                                        is_spot_preemption = True
-                                        logger.warning(
-                                            f"[REAPER] Task {task.id} on SPOT VM {fresh_task.vm_instance_id} "
-                                            f"in {prov_zone_for_status} — vm_status={io_vm_status}, treating "
-                                            f"as preemption (skipping attempt_count++)"
-                                        )
-                                except Exception as e:  # noqa: BLE001
-                                    logger.debug(
-                                        f"[REAPER] get_vm_status failed for {fresh_task.vm_instance_id}: {e}"
-                                    )
-
-                        # 1.5. Durable DB rate-limit check (cross-instance fallback).
-                        # The in-memory classify_failure above consults only
-                        # _account_was_rate_limited (same-process cache). When the
-                        # cooldown was recorded on a different Cloud Run instance or
-                        # before a restart, the cache is empty and the task would be
-                        # silently misclassified CODE_ERROR. Augment the flag with
-                        # durable DB state before the account-disable I/O step so all
-                        # reaper deaths get the same cross-instance treatment that
-                        # agent_status.py already applies on the agent-reported path.
-                        # Skip DB rate-limit fallback when dead-auth is already
-                        # confirmed — the account needs a hard-disable, not a cooldown.
-                        if (
-                            not is_rate_limited
-                            and not is_dead_auth
-                            and not is_spot_preemption
-                        ):
-                            _db_rl_acct = get_task_llm_account_id(fresh_task)
-                            _at_time_rl = (
-                                fresh_task.last_heartbeat or fresh_task.started_at
-                            )
-                            _db_rl_scope = get_task_rate_limit_scope(fresh_task)
-                            if _db_rl_acct:
-                                if await db_account_was_rate_limited(
-                                    _db_rl_acct, at_time=_at_time_rl
-                                ):
-                                    is_rate_limited = True
-                                    logger.info(
-                                        "[REAPER] Task %s reclassified RATE_LIMIT via "
-                                        "durable DB state (account=%s) — in-memory cache missed",
-                                        fresh_task.id,
-                                        _db_rl_acct,
-                                    )
-                            elif await db_pool_wide_rate_limit_cooldown(
-                                at_time=_at_time_rl,
-                                providers=_db_rl_scope.get("providers"),
-                                model=_db_rl_scope.get("model"),
-                                user_id=_db_rl_scope.get("user_id"),
-                            ):
-                                is_rate_limited = True
-                                logger.info(
-                                    "[REAPER] Task %s (no account) reclassified RATE_LIMIT "
-                                    "via pool-wide DB state — pool was fully blocked at failure time",
-                                    fresh_task.id,
-                                )
-
-                        # 2. Rate-limited account-disable I/O (called only when is_rate_limited
-                        #    AND not is_spot_preemption; mirrors the original elif chain where
-                        #    the rate-limited branch was skipped if spot preempt fired first).
-                        #    Side-effect-only — disables the account/model in the in-memory pool
-                        #    + persists to DB via its own internal session.
-                        rl_acct_id: str | None = None
-                        rl_model: str | None = None
-                        if is_rate_limited and not is_spot_preemption:
-                            rl_acct_id = get_task_llm_account_id(task)
-                            logger.info(
-                                f"[REAPER] Task {task.id} rate-limited (account={rl_acct_id}) — "
-                                f"requeuing immediately with account blacklisted"
-                            )
-                            # Disable the exhausted model on the account so the orchestrator's
-                            # blacklist pruning preserves this entry on the next dispatch cycle.
-                            rl_model = _extract_task_model(task)
-                            if not rl_model:
-                                _rl_task_type = (task.first_payload or {}).get(
-                                    "type", "create"
-                                )
-                                rl_model = _runtime_config.get(
-                                    "task_type_models", {}
-                                ).get(_rl_task_type)
-                            if rl_acct_id and rl_model:
-                                _reaper_ctx_io = task.context or {}
-                                _reaper_kwargs_io = {
-                                    "retry_after_seconds": _reaper_ctx_io.get(
-                                        "rate_limit_retry_after_seconds"
-                                    ),
-                                    "kind": _reaper_ctx_io.get("rate_limit_kind")
-                                    or "rate_limit",
-                                }
-                                try:
-                                    await disable_account_model(
-                                        rl_acct_id, rl_model, **_reaper_kwargs_io
-                                    )
-                                except Exception as _disable_err:  # noqa: BLE001
-                                    logger.warning(
-                                        f"[REAPER] disable_account_model failed for {rl_acct_id}/{rl_model}: "
-                                        f"{_disable_err}; retrying in 1s"
-                                    )
-                                    await asyncio.sleep(1)
-                                    try:
-                                        await disable_account_model(
-                                            rl_acct_id, rl_model, **_reaper_kwargs_io
-                                        )
-                                    except Exception as _disable_err2:  # noqa: BLE001
-                                        logger.error(  # noqa: TRY400
-                                            f"[REAPER] disable_account_model retry also failed for "
-                                            f"{rl_acct_id}/{rl_model}: {_disable_err2}. "
-                                            "Account remains active in pool — tight re-selection loop risk."
-                                        )
-
-                        # 2b. Dead-auth account hard-disable I/O.
-                        # Called only when is_dead_auth AND not is_spot_preemption.
-                        # Uses disable_account_for_auth (permanent hard-disable, no
-                        # auto-recover) rather than disable_account_model (cooldown).
-                        da_acct_id: str | None = None
-                        if is_dead_auth and not is_spot_preemption:
-                            da_acct_id = get_task_llm_account_id(task)
-                            if da_acct_id:
-                                _da_pattern = (task.context or {}).get(
-                                    "dead_auth_matched_pattern", "dead_oauth_session"
-                                )
-                                _da_reason = f"dead-auth: {_da_pattern}"
-                                logger.warning(
-                                    "[REAPER] Task %s dead-auth (account=%s pattern=%r) — "
-                                    "hard-disabling account fleet-wide; requeuing onto different account",
-                                    task.id,
-                                    da_acct_id,
-                                    _da_pattern,
-                                )
-                                try:
-                                    await disable_account_for_auth(
-                                        da_acct_id, _da_reason
-                                    )
-                                except Exception as _da_err:  # noqa: BLE001
-                                    logger.warning(
-                                        "[REAPER] disable_account_for_auth failed for %s: %s; retrying in 1s",
-                                        da_acct_id,
-                                        _da_err,
-                                    )
-                                    await asyncio.sleep(1)
-                                    try:
-                                        await disable_account_for_auth(
-                                            da_acct_id, _da_reason
-                                        )
-                                    except Exception as _da_err2:  # noqa: BLE001
-                                        logger.error(  # noqa: TRY400
-                                            "[REAPER] disable_account_for_auth retry also failed for %s: %s. "
-                                            "Account remains active — dead-auth re-selection risk.",
-                                            da_acct_id,
-                                            _da_err2,
-                                        )
-
-                        # 3. Provision-failure serial capture I/O (GCP serial console).
-                        # Run unconditionally on provision failures: the spot-preempt
-                        # branch falls through to the provision-failure mutation block
-                        # below (which uses io_serial_log), so we need the capture
-                        # whenever is_provision_failure regardless of spot/rate-limit
-                        # branch. Tiny perf cost when spot/rate fast-paths skip the
-                        # mutation block, but avoids re-introducing the held-lock-during-IO
-                        # bug as a fallback path.
-                        io_serial_log: str | None = None
-                        io_prov_zone: str | None = None
-                        io_provision_err: str | None = None
-                        if is_provision_failure:
-                            # Resolve zone (in-memory cache + persisted fallback). The two
-                            # values prov_zone and provision_err are stable post-fail; reading
-                            # them while unlocked is safe — no peer mutates them.
-                            if fresh_task.vm_instance_id:
-                                cached = get_vm_zone(fresh_task.vm_instance_id)
-                                if cached and cached != "unknown":
-                                    io_prov_zone = cached
-                            if not io_prov_zone:
-                                io_prov_zone = (task.context or {}).get(
-                                    "provision_zone"
-                                )
-                            io_provision_err = get_provision_error(
-                                fresh_task.vm_instance_id or ""
-                            )
-                            if io_prov_zone and fresh_task.vm_instance_id:
-                                try:
-                                    io_serial_log = await asyncio.to_thread(
-                                        _capture_serial_for_vm,
-                                        fresh_task.vm_instance_id,
-                                        io_prov_zone,
-                                    )
-                                    if io_serial_log:
-                                        logger.warning(
-                                            f"[REAPER] Serial log for dying agent {fresh_task.vm_instance_id} "
-                                            f"(task {task.id}):\n{io_serial_log}"
-                                        )
-                                except Exception:
-                                    logger.exception(
-                                        f"[REAPER] Failed to capture serial log for VM {fresh_task.vm_instance_id}"
-                                    )
-
-                        # 4. PR-state lookup I/O (GitHub API)
-                        _has_pr_artifact, _pr_num = await _task_has_open_pr(
-                            task, session
+                        _io = await _run_orphan_io(
+                            task=task,
+                            fresh_task=fresh_task,
+                            reap_reason_code=reap_reason_code,
+                            is_provision_failure=is_provision_failure,
+                            is_rate_limited=is_rate_limited,
+                            is_dead_auth=is_dead_auth,
+                            session=session,
+                            runtime_config=_runtime_config,
                         )
-                        io_gh_pr_state: str | None = None
-                        io_gh_pr_merged: bool = False
-                        io_gh_pr_base_branch: str | None = None
-                        if _has_pr_artifact and _pr_num:
-                            try:
-                                from app.routers.agent import get_github_token_for_task
-                                from app.github import get_pull_request
-
-                                (
-                                    _gh_token,
-                                    _gh_owner,
-                                    _gh_repo,
-                                ) = await get_github_token_for_task(task.id, session)
-                                _pr_data = await get_pull_request(
-                                    _gh_token, _gh_owner, _gh_repo, _pr_num
-                                )
-                                io_gh_pr_state = _pr_data.get("state")
-                                io_gh_pr_merged = bool(_pr_data.get("merged"))
-                                io_gh_pr_base_branch = (_pr_data.get("base") or {}).get(
-                                    "ref"
-                                )
-                            except Exception as _gh_exc:  # noqa: BLE001
-                                # GH API unreachable: fall back to "open" — handing off
-                                # to review pipeline is the safer default.
-                                logger.warning(
-                                    f"[REAPER] PR-state lookup failed for task {task.id} PR #{_pr_num}: "
-                                    f"{type(_gh_exc).__name__}: {_gh_exc} — assuming open",
-                                    exc_info=True,
-                                )
-                                io_gh_pr_state = "open"
+                        pre_io_status = _io.pre_io_status
+                        pre_io_last_hb = _io.pre_io_last_hb
+                        is_spot_preemption = _io.is_spot_preemption
+                        is_rate_limited = _io.is_rate_limited
+                        rl_acct_id = _io.rl_acct_id
+                        rl_model = _io.rl_model
+                        da_acct_id = _io.da_acct_id
+                        io_serial_log = _io.io_serial_log
+                        io_prov_zone = _io.io_prov_zone
+                        io_provision_err = _io.io_provision_err
+                        _has_pr_artifact = _io.has_pr_artifact
+                        _pr_num = _io.pr_num
+                        io_gh_pr_state = _io.gh_pr_state
+                        io_gh_pr_merged = _io.gh_pr_merged
+                        io_gh_pr_base_branch = _io.gh_pr_base_branch
 
                         # ── RE-ACQUIRE FOR UPDATE FOR MUTATIONS ──────────────────
                         # All external I/O above is done. Re-acquire the FOR UPDATE
@@ -2256,7 +1179,8 @@ async def reaper_service():
                                 "spot_preemption",
                                 task_id=str(task.id),
                                 vm_id=fresh_task.vm_instance_id,
-                                zone=prov_zone_for_status,
+                                zone=(task.context or {}).get("provision_zone")
+                                or get_vm_zone(fresh_task.vm_instance_id),
                             )
                         elif is_dead_auth:
                             # disable_account_for_auth (permanent hard-disable) was already
@@ -2290,7 +1214,6 @@ async def reaper_service():
                             _copy_analysis_artifacts_to_previous(da_ctx)
                             da_ctx = clear_task_llm_runtime_context(da_ctx)
                             da_ctx.pop("_slot_released", None)
-                            task.retry_after_until = None
                             da_ctx.pop("provision_failures", None)
                             # Clear the stale DEAD_AUTH verdict and matched pattern so
                             # the next attempt is classified fresh for its own provider.
@@ -2303,6 +1226,7 @@ async def reaper_service():
                             da_ctx.pop("failure_class", None)
                             da_ctx.pop("dead_auth_matched_pattern", None)
                             task.context = da_ctx
+                            clear_retry_after(task)
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),
@@ -2342,12 +1266,11 @@ async def reaper_service():
                             _copy_analysis_artifacts_to_previous(rl_ctx)
                             rl_ctx = clear_task_llm_runtime_context(rl_ctx)
                             rl_ctx.pop("_slot_released", None)
-                            # Audit W1: retry_after_until is a column now.
-                            task.retry_after_until = None
                             # Rate-limit is an account-level issue, not a provision failure —
                             # don't carry provision budget into the next dispatch.
                             rl_ctx.pop("provision_failures", None)
                             task.context = rl_ctx
+                            clear_retry_after(task)
                             persist_authoritative_verdict(task, RATE_LIMIT)
                             session.add(task)
                             await broadcast_to_project(
@@ -2579,45 +1502,31 @@ async def reaper_service():
                                 f"classifying landing"
                             )
                             _proj = await session.get(Project, task.project_id)
+                            from app.recovery_evaluating_helpers import (
+                                _apply_rollup_merge_classification,
+                            )
+
                             (
                                 _record_pr_merged,
                                 _terminal_rollup_merge,
                                 _landed_branch,
-                            ) = await classify_rollup_merge_outcome(
+                            ) = await _apply_rollup_merge_classification(
                                 task,
                                 _proj,
                                 session,
                                 pr_number=_pr_num,
                                 merged_base_branch=_gh_pr_base_branch,
                                 source="reaper.orphan_recovery",
+                                msg_terminal=f"Reaped mid-run; PR #{_pr_num} was merged out-of-band",
+                                msg_non_terminal=f"Reaped mid-run; PR #{_pr_num} merged into {{landed}}; awaiting downstream landing",
+                                hotfix_lane=bool(
+                                    (task.first_payload or {}).get("hotfix")
+                                    or (task.context or {}).get("hotfix")
+                                ),
+                                non_merge_reason="merged_pr_non_integration_branch",
                             )
-                            task.status = (
-                                TaskStatus.COMPLETED
-                                if _terminal_rollup_merge
-                                else TaskStatus.EVALUATING
-                            )
-                            task.vm_instance_id = None
-                            task.last_heartbeat = None
-                            if _terminal_rollup_merge:
-                                task.latest_status_message = f"Reaped mid-run; PR #{_pr_num} was merged out-of-band"
-                            else:
-                                task.latest_status_message = (
-                                    f"Reaped mid-run; PR #{_pr_num} merged into "
-                                    f"{_landed_branch}; awaiting downstream landing"
-                                )
-                            if _record_pr_merged:
-                                apply_merged_landed_signal(
-                                    task,
-                                    _proj,
-                                    base_branch=_landed_branch,
-                                    hotfix_lane=bool(
-                                        (task.first_payload or {}).get("hotfix")
-                                        or (task.context or {}).get("hotfix")
-                                    ),
-                                    non_merge_reason="merged_pr_non_integration_branch",
-                                )
                             try:
-                                from app.task_completion import (  # noqa: PLC0415
+                                from app.task_completion import (
                                     _finalize_migration_reservation_after_merge,
                                 )
 
@@ -3086,9 +1995,15 @@ async def reaper_service():
                                         ] * random.uniform(0.75, 1.25)
                                 else:
                                     # Exponential backoff for agent failures: 1, 2, 4, 8 min capped at 15
-                                    delay_minutes = min(
-                                        2 ** (task.attempt_count - 1), 15
-                                    ) * random.uniform(0.75, 1.25)
+                                    delay_minutes = (
+                                        exponential_backoff(
+                                            task.attempt_count,
+                                            base=60,
+                                            cap=900,
+                                            jitter=0.25,
+                                        )
+                                        / 60
+                                    )
                                 if task_type == "research":
                                     try:
                                         from app.autonomous_research import (
@@ -3395,581 +2310,26 @@ async def reaper_service():
                     await session.commit()
                     _orphan_commit_ok = True
 
-                if orphaned_tasks and _orphan_commit_ok:
-                    # Re-fetch fresh task state by id before the post-commit loops.
-                    # A per-task reap crash above triggers session.rollback() (2211),
-                    # which expires EVERY orphaned_tasks ORM object (rollback expires
-                    # regardless of expire_on_commit). Reading task.status/.context on
-                    # an expired object below drives a sync lazy-refresh on the
-                    # AsyncSession -> MissingGreenlet (see 1028-1036). Re-fetching by id
-                    # keeps every attribute access inside the async greenlet bridge and
-                    # reflects the committed (or rolled-back) state of each task.
-                    _post_reap_tasks: list[Task] = []
-                    for _post_id in _orphaned_task_ids:
-                        _refetched = await session.get(Task, _post_id)
-                        if _refetched is not None:
-                            _post_reap_tasks.append(_refetched)
+                await run_post_orphan_sweep(
+                    session,
+                    orphaned_tasks,
+                    orphan_commit_ok=_orphan_commit_ok,
+                    orphaned_task_ids=_orphaned_task_ids,
+                    deferred_parent_requeues=_deferred_parent_requeues,
+                    reaper_old_vms=_reaper_old_vms,
+                    progress_cb=_mark_reaper_progress,
+                    landed_cb=_mark_landed_parent_dependents,
+                )
 
-                    # Audit A8: now that the orphan-row lock is released, do the
-                    # slow parent-requeue work (child clone + dep remap). Heartbeats
-                    # on the parent task will go through fine since we only set
-                    # requeue_in_flight (a marker), not a row lock.
-                    for parent in _deferred_parent_requeues:
-                        # Heartbeat: parent requeue clones children + remaps deps
-                        # (multiple queries) per parent — keep the watchdog happy.
-                        _mark_reaper_progress()
-                        try:
-                            await _requeue_parent_task(parent, session)
-                        except (
-                            Exception
-                        ) as e:  # per-attempt try in deferred-requeue loop
-                            logger.error(
-                                f"[REAPER] Deferred parent requeue failed for {parent.id}: {e}",
-                                exc_info=True,
-                            )
-                            # C1: _requeue_parent_task commits internally; a
-                            # failure (IntegrityError on the cloned child) leaves
-                            # the shared session aborted, which would poison the
-                            # remaining requeues, the post-reap rollup loop, and
-                            # Steps 3-10. Roll back so each subsequent operation
-                            # starts on a clean session.
-                            with contextlib.suppress(Exception):
-                                await session.rollback()
-                        finally:
-                            # Always clear the in-flight marker so subsequent reaper
-                            # cycles can re-evaluate if requeue itself failed.
-                            parent.requeue_in_flight = False
-                            session.add(parent)
-                    if _deferred_parent_requeues:
-                        await session.commit()
-
-                    # Delete old VMs after commit (IDs captured before overwrite)
-                    for old_vm in _reaper_old_vms.values():
-                        # Heartbeat: each VM delete is a GCE API call.
-                        _mark_reaper_progress()
-                        await _ensure_vm_deleted(old_vm, reason="reaper")
-
-                    # Trigger rollup checks for failed tasks with parents (after commit)
-                    for task in _post_reap_tasks:
-                        # Heartbeat: _check_and_trigger_rollup hits GitHub per task.
-                        _mark_reaper_progress()
-                        if task.status == TaskStatus.FAILED and task.parent_task_id:
-                            try:
-                                # C3: pass the heartbeat so the per-child
-                                # _verify_pr_merged loop inside the rollup check
-                                # also heartbeats — a fan-heavy parent's PR-verify
-                                # round-trips cannot silently exhaust
-                                # REAPER_HANG_SECONDS on this loop either (mirrors
-                                # the stale-EVALUATING sweep at reaper.py:2789).
-                                await _check_and_trigger_rollup(
-                                    task, session, progress_cb=_mark_reaper_progress
-                                )
-                                # Completion-side warm-reuse: if that landing
-                                # completed the parent rollup, stamp the
-                                # _deps_satisfied marker on the dependents it just
-                                # unblocked so a polling warm VM can claim them
-                                # before tearing down cold (see helper docstring).
-                                await _mark_landed_parent_dependents(
-                                    task.parent_task_id, session
-                                )
-                            except Exception as e:
-                                logger.error(
-                                    f"[REAPER] Rollup check failed for task {task.id}: {e}",
-                                    exc_info=True,
-                                )
-                                # C1: _check_and_trigger_rollup runs FOR UPDATE
-                                # selects + commits that can raise on a DB error,
-                                # leaving the shared session aborted. Roll back so
-                                # the next task's rollup check (and Steps 3-10) do
-                                # not inherit a PendingRollback session.
-                                with contextlib.suppress(Exception):
-                                    await session.rollback()
-
-                    # Immediately unblock dependents of terminally failed tasks
-                    for task in _post_reap_tasks:
-                        # Heartbeat: per-task dependent-unblock opens its own session.
-                        _mark_reaper_progress()
-                        if task.status == TaskStatus.FAILED:
-                            try:
-                                async with AsyncSessionLocal() as dep_session:
-                                    dep_stmt = select(Task).where(
-                                        Task.project_id == task.project_id,
-                                        Task.status == TaskStatus.QUEUED,
-                                        Task.depends_on.contains([str(task.id)]),
-                                    )
-                                    dep_result = await dep_session.execute(dep_stmt)
-                                    waiting_tasks = dep_result.scalars().all()
-                                    count = 0
-                                    for wt in waiting_tasks:
-                                        wt.depends_on = [
-                                            d
-                                            for d in (wt.depends_on or [])
-                                            if d != str(task.id)
-                                        ]
-                                        dep_session.add(wt)
-                                        count += 1
-                                    if count:
-                                        await dep_session.commit()
-                                        logger.info(
-                                            f"[PIPELINE] Cleared terminal dependency {task.id} from {count} waiting tasks"
-                                        )
-                            except Exception as e:  # noqa: BLE001
-                                logger.warning(
-                                    f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}",
-                                    exc_info=True,
-                                )
-
-                    # C5: release the cross-cutting safeguard merge gate when a
-                    # reaper-terminated safeguard task FAILS. The gate is otherwise
-                    # released only on the security_audit COMPLETED branch, so a
-                    # reaped safeguard (orphan-timeout, retries exhausted) would
-                    # leave orig.requires_approval=True forever — a permanent
-                    # strand that services.py then 2h-timeout-FAILs into a healthy
-                    # parent. Each release runs in its OWN session (mirrors the
-                    # dependent-unblock loop above and reaper Step 9
-                    # sweep_stuck_qualifications) so a failure here cannot poison
-                    # the shared reaper session. _maybe_release_safeguard_gate
-                    # no-ops for non-safeguard tasks; findings=None → release
-                    # (a reaped safeguard produced no blocker).
-                    for task in _post_reap_tasks:
-                        _mark_reaper_progress()
-                        if task.status != TaskStatus.FAILED:
-                            continue
-                        _t_payload = task.first_payload if task.payloads else {}
-                        if _t_payload.get("type") != "security_audit":
-                            continue
-                        try:
-                            from app.task_completion import (
-                                _maybe_release_safeguard_gate,
-                            )
-
-                            async with AsyncSessionLocal() as _sg_session:
-                                _sg_task = await _sg_session.get(Task, task.id)
-                                if _sg_task is not None:
-                                    await _maybe_release_safeguard_gate(
-                                        _sg_task, None, _sg_session
-                                    )
-                        except Exception as _sg_exc:  # noqa: BLE001
-                            logger.warning(
-                                f"[SAFEGUARD] Failed to release gate on reaped "
-                                f"safeguard {task.id}: {_sg_exc}",
-                                exc_info=True,
-                            )
-
-                    # Close open PRs owned by terminally-failed fix tasks. When a
-                    # fix exhausts retries, its PR stays OPEN on GitHub, and
-                    # sibling tasks whose rollup waits on open PRs targeting the
-                    # same research branch block forever. Closing the dead PR
-                    # removes it from the sibling rollup-wait gate.
-                    for task in _post_reap_tasks:
-                        # Heartbeat: closing a dead PR is a GitHub API call per task.
-                        _mark_reaper_progress()
-                        if task.status != TaskStatus.FAILED:
-                            continue
-                        payload = task.first_payload if task.payloads else {}
-                        if payload.get("type") != "fix":
-                            continue
-                        pr_number = (task.context or {}).get("review_loop", {}).get(
-                            "pr_number"
-                        ) or payload.get("pr_number")
-                        if not pr_number:
-                            continue
-                        # Skip closing rollup PRs (branch=staging prefix). A
-                        # rollup PR represents many tasks' worth of merged work;
-                        # closing it discards the whole body. Better to leave the
-                        # rollup open for human follow-up than to throw away N
-                        # children's successfully-merged contributions for a
-                        # single fix task that exhausted retries. Match the FULL
-                        # set of per-project staging prefixes, not just research/.
-                        branch = payload.get("branch", "")
-                        _proj = await session.get(Project, task.project_id)
-                        if _proj is not None and _proj.is_staging_branch(branch):
-                            logger.warning(
-                                f"[REAPER] Skip closing rollup PR #{pr_number} "
-                                f"(branch={branch}, fix task {task.id}) — "
-                                f"closing would discard the rollup body"
-                            )
-                            continue
-                        # Infra-recovery guard: do NOT close PRs for fix tasks that
-                        # failed due to transient infrastructure (AGENT_TIMEOUT, VM
-                        # preemption, etc.) while the review-loop still has iteration
-                        # budget.  The code on the PR is valid — the agent may never
-                        # have run.  Leave the PR open so the eval-sweep reaped-owner
-                        # reconcile (recovery_evaluating.py) or the resurrection sweep
-                        # can re-drive the chain.  Only close for genuine merit/code
-                        # failures or when iteration budget is truly exhausted.
-                        # Sibling chokepoints that are failure-class-blind (rollup-wait
-                        # gate in rollup_management.py ~2031, _resolve_terminal_parent_
-                        # verdict in task_lifecycle_requeue.py, review cap handler) are
-                        # tracked as follow-up work — they require broader DB queries
-                        # and separate review to fix safely.
-                        from app.failure_classification import (
-                            is_recoverable_infra_terminal,
-                        )
-
-                        if is_recoverable_infra_terminal(task):
-                            logger.info(
-                                f"[PIPELINE] Preserving PR #{pr_number} for infra-reaped "
-                                f"fix task {task.id} — review-loop budget remains, "
-                                f"skipping close so eval-sweep can re-drive the chain"
-                            )
-                            continue
-                        try:
-                            from app.routers.agent import get_github_token_for_task
-                            from app.github import close_pull_request, create_pr_comment
-
-                            gh_token, owner, repo = await get_github_token_for_task(
-                                task.id, session
-                            )
-                            reason = (
-                                task.latest_status_message
-                                or "fix task reached terminal failure"
-                            )
-                            try:
-                                await create_pr_comment(
-                                    gh_token,
-                                    owner,
-                                    repo,
-                                    int(pr_number),
-                                    f":warning: Abandoning this PR — fix task `{str(task.id)[:8]}` reached terminal failure.\n\n"
-                                    f"{reason[:400]}\n\n"
-                                    f"Closing so sibling rollups aren't blocked waiting for this branch.",
-                                )
-                            except Exception as ce:  # noqa: BLE001
-                                logger.warning(
-                                    f"[PIPELINE] Failed to comment on dead PR #{pr_number}: {ce}"
-                                )
-                            closed = await close_pull_request(
-                                gh_token,
-                                owner,
-                                repo,
-                                int(pr_number),
-                                project_id=str(task.project_id),
-                            )
-                            if closed:
-                                logger.info(
-                                    f"[PIPELINE] Closed PR #{pr_number} after fix task {task.id} terminal-failed"
-                                )
-                            else:
-                                logger.warning(
-                                    f"[PIPELINE] close_pull_request returned False for PR #{pr_number}"
-                                )
-                        except Exception as e:  # noqa: BLE001
-                            logger.warning(
-                                f"[PIPELINE] Failed to close PR for failed fix task {task.id}: {e}",
-                                exc_info=True,
-                            )
-
-                # Step 3: Sweep EVALUATING parents with stale unmerged children.
-                # When the initial review spawn after a child completes fails silently,
-                # no event re-triggers _check_and_trigger_rollup.  This sweep catches
-                # those stuck parents and lets the stale-PR recovery path respawn reviews.
-                #
-                # Phase B4 (H-P1): batch-fetch all children for ALL evaluating parents
-                # in a single ``IN (...)`` query (mirrors the Step 4 pattern at the
-                # batched fetch below). The previous code fired N queries — one per
-                # parent — to find a single COMPLETED child for the rollup trigger.
-                # ``load_only`` keeps each row narrow but MUST include ``status_log``
-                # because the ``Task.latest_status_message``/``Task.status`` event
-                # listeners (models.py ~360) read status_log on every set; under
-                # async sessions a deferred-column fetch raises MissingGreenlet.
-                # Plain-tuple snapshot of (id, status, context) per child, captured
-                # at SELECT time. Steps 3 AND 4 iterate this rather than touching
-                # live ORM rows: ``_check_and_trigger_rollup`` in Step 3 may commit
-                # or trigger a session rollback (via inner DB error), which under
-                # SQLAlchemy expires every loaded instance — a subsequent
-                # ``parent.id`` / ``child.status`` read fires a sync lazy-load that
-                # can't acquire a connection if the underlying asyncpg socket is
-                # dead, crashing the entire reaper cycle. Snapshotting + re-fetching
-                # via ``session.get`` decouples both steps from session state.
-                # (Production 2026-05-08: 26x crashes at reaper.py:2407; recurred
-                # 2026-05-21 at reaper.py:2385/2420 — Step 3/4 still read parent.id
-                # and child.status off the now-stale batch.)
-                _children_snapshot_by_parent: Dict[uuid.UUID, list[tuple]] = {}
-                evaluating_parents = []
-                # Plain UUID list — Steps 3 & 4 iterate this, never the live
-                # ``evaluating_parents`` ORM objects (see snapshot note above).
-                _parent_ids: list = []
-                try:
-                    stale_cutoff = now - timedelta(minutes=15)
-                    evaluating_parents = (
-                        (
-                            await session.execute(
-                                select(Task)
-                                .options(
-                                    load_only(
-                                        Task.id,
-                                        Task.status,
-                                        Task.updated_at,
-                                        Task.context,
-                                        Task.payloads,
-                                        Task.project_id,
-                                        Task.parent_task_id,
-                                        Task.latest_status_message,
-                                        Task.status_log,
-                                        Task.attempt_count,
-                                        Task.created_at,
-                                        raiseload=True,
-                                    )
-                                )
-                                .where(
-                                    Task.status == TaskStatus.EVALUATING,
-                                    Task.updated_at < stale_cutoff,
-                                )
-                                # C3: per-cycle row cap. Step 3 calls
-                                # _check_and_trigger_rollup (serial GitHub I/O)
-                                # per parent and Step 4 calls _requeue_parent_task
-                                # (DB-heavy) per parent. Without a cap a large
-                                # stale-EVALUATING backlog grows the reaper cycle
-                                # past REAPER_HANG_SECONDS mid-I/O — the same O(N)
-                                # saturation the orphan cap bounds. Oldest-stale
-                                # first (most-stuck parents); deferred parents
-                                # re-qualify next cycle (status+age scan, no
-                                # deferral queue needed).
-                                .order_by(Task.updated_at.asc())
-                                .limit(_REAPER_MAX_EVALUATING_PER_CYCLE)
-                            )
-                        )
-                        .scalars()
-                        .all()
-                    )
-                    if len(evaluating_parents) >= _REAPER_MAX_EVALUATING_PER_CYCLE:
-                        logger.warning(
-                            "[REAPER] Hit per-cycle cap of %d stale EVALUATING "
-                            "parents — remainder deferred to next cycle",
-                            _REAPER_MAX_EVALUATING_PER_CYCLE,
-                        )
-                    if evaluating_parents:
-                        _parent_ids = [p.id for p in evaluating_parents]
-                        _all_children = (
-                            (
-                                await session.execute(
-                                    select(Task)
-                                    .options(
-                                        load_only(
-                                            Task.id,
-                                            Task.status,
-                                            Task.parent_task_id,
-                                            Task.context,
-                                            Task.status_log,
-                                            Task.latest_status_message,
-                                            Task.payloads,
-                                            raiseload=True,
-                                        )
-                                    )
-                                    .where(Task.parent_task_id.in_(_parent_ids))
-                                )
-                            )
-                            .scalars()
-                            .all()
-                        )
-                        for _c in _all_children:
-                            _children_snapshot_by_parent.setdefault(
-                                _c.parent_task_id, []
-                            ).append((_c.id, _c.status, _c.context or {}))
-                    for parent_id in _parent_ids:
-                        # Heartbeat: Step 3 calls _check_and_trigger_rollup per
-                        # parent (serial GitHub I/O) — the other dominant per-cycle
-                        # cost besides the orphan loop. Mark progress every parent.
-                        _mark_reaper_progress()
-                        # Find a triggering child id from the plain-tuple
-                        # snapshot, then re-fetch it fresh. An earlier iteration's
-                        # _check_and_trigger_rollup may have committed or rolled
-                        # back — reading parent.id / child.status off the now-stale
-                        # ORM batch fires a sync lazy-load that crashes the cycle
-                        # on an unhealthy connection.
-                        #
-                        # Prefer a COMPLETED child (the normal stale-spawn case).
-                        # C6 rework (B): ALSO accept any child carrying the
-                        # ``_rollup_nudge_pending`` write-ahead marker, regardless
-                        # of status. ``_propagate_pipeline_failure_to_original``
-                        # sets that marker on a child it is CANCELLING just before
-                        # nudging the rollup; a death between its terminal commit
-                        # and the nudge drops the trigger, and a parent whose only
-                        # un-rolled child is that CANCELLED one has NO COMPLETED
-                        # child for the path above to find — it would sit
-                        # EVALUATING until the backstop. ``_check_and_trigger_rollup``
-                        # is keyed only on ``child.parent_task_id`` and re-evaluates
-                        # ALL siblings, so re-running it for the marker-carrying
-                        # child is correct and idempotent.
-                        _nudge_child_id = next(
-                            (
-                                cid
-                                for cid, _c_status, c_ctx in _children_snapshot_by_parent.get(
-                                    parent_id, []
-                                )
-                                if (c_ctx or {}).get("_rollup_nudge_pending")
-                            ),
-                            None,
-                        )
-                        completed_child_id = next(
-                            (
-                                cid
-                                for cid, c_status, _ in _children_snapshot_by_parent.get(
-                                    parent_id, []
-                                )
-                                if c_status == TaskStatus.COMPLETED
-                            ),
-                            None,
-                        )
-                        trigger_child_id = completed_child_id or _nudge_child_id
-                        if trigger_child_id is not None:
-                            try:
-                                child = await session.get(Task, trigger_child_id)
-                                if child is not None:
-                                    # C3: pass the heartbeat so _check_and_trigger_rollup's
-                                    # per-child PR-verify loop keeps the reaper
-                                    # liveness fresh on a fan-heavy parent.
-                                    await _check_and_trigger_rollup(
-                                        child,
-                                        session,
-                                        progress_cb=_mark_reaper_progress,
-                                    )
-                                    # C6 rework (B): the nudge ran without raising —
-                                    # drop the write-ahead recovery marker on the
-                                    # child that carried it (the rollup has now been
-                                    # re-evaluated). Best-effort: a leftover marker
-                                    # is self-healing (next sweep re-runs an
-                                    # idempotent check).
-                                    if _nudge_child_id is not None:
-                                        _nudged = await session.get(
-                                            Task, _nudge_child_id
-                                        )
-                                        if _nudged is not None and (
-                                            _nudged.context or {}
-                                        ).get("_rollup_nudge_pending"):
-                                            _nc = dict(_nudged.context or {})
-                                            _nc.pop("_rollup_nudge_pending", None)
-                                            _nudged.context = _nc
-                                            flag_modified(_nudged, "context")
-                                            session.add(_nudged)
-                                            await session.commit()
-                                    # Completion-side warm-reuse: if the sweep's
-                                    # rollup trigger landed this parent, stamp the
-                                    # _deps_satisfied marker on the dependents it
-                                    # just unblocked (see helper docstring) so a
-                                    # polling warm VM claims them before cold
-                                    # teardown rather than waiting for a later
-                                    # window-bounded dispatch scan.
-                                    await _mark_landed_parent_dependents(
-                                        parent_id, session
-                                    )
-                            except Exception as e:  # noqa: BLE001
-                                logger.warning(
-                                    f"[REAPER] Evaluating sweep rollup failed for parent {parent_id}: {e}",
-                                    exc_info=True,
-                                )
-                    if evaluating_parents:
-                        logger.info(
-                            f"[REAPER] Swept {len(evaluating_parents)} stale EVALUATING parents"
-                        )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        f"[REAPER] Evaluating parent sweep error: {e}", exc_info=True
-                    )
-                    # C1: a sub-helper (e.g. _check_and_trigger_rollup) that
-                    # raised may have left the shared ``session`` in
-                    # PendingRollback — roll back here so Steps 4-10 run on a
-                    # clean session rather than cascading silent failures /
-                    # rollback-expiry MissingGreenlet. Mirrors Step 6/7/8/10.
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
-
-                # Step 4: Rescue EVALUATING parents whose children ALL terminated without
-                # any completing successfully.  These parents have no COMPLETED child to
-                # trigger _check_and_trigger_rollup, so they stay EVALUATING forever.
-                # Iterates the plain-tuple snapshot from Step 3 — see the comment
-                # at ``_children_snapshot_by_parent`` for why we don't touch
-                # live ORM children here.
-                try:
-                    _terminal = {
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                        TaskStatus.CANCELLED,
-                    }
-                    rescued = 0
-                    for parent_id in _parent_ids:
-                        # Heartbeat: this rescue loop calls _requeue_parent_task
-                        # (child clone + dep remap, multiple queries) per parent —
-                        # another per-cycle cost that can extend wall time under a
-                        # large EVALUATING backlog. Mark progress every parent.
-                        _mark_reaper_progress()
-                        children_snap = _children_snapshot_by_parent.get(parent_id, [])
-                        if not children_snap:
-                            continue
-                        if any(
-                            status not in _terminal for _, status, _ in children_snap
-                        ):
-                            # At least one child still running — not safe to rescue yet.
-                            continue
-                        if any(
-                            status == TaskStatus.COMPLETED
-                            for _, status, _ in children_snap
-                        ):
-                            # Step 3 handles this; skip.
-                            continue
-                        # All children are terminal and none completed — attempt re-evaluation
-                        # via _requeue_parent_task which clones failed children with retry
-                        # guidance (up to MAX_PARENT_REQUEUES attempts).  If attempts are
-                        # exhausted it marks the parent FAILED and fires a failure alert.
-                        # Re-fetch the parent fresh — Step 3 may have committed or
-                        # rolled back, expiring the live ``evaluating_parents`` batch.
-                        parent = await session.get(Task, parent_id)
-                        if parent is None:
-                            continue
-                        failed_children = [
-                            (cid, ctx)
-                            for cid, status, ctx in children_snap
-                            if status == TaskStatus.FAILED
-                        ]
-                        cancelled_children = [
-                            cid
-                            for cid, status, _ in children_snap
-                            if status == TaskStatus.CANCELLED
-                        ]
-                        # Build a diagnostic message including child failure classes.
-                        parts = []
-                        if failed_children:
-                            classes = [
-                                (ctx or {}).get("failure_category") or "unknown"
-                                for _, ctx in failed_children
-                            ]
-                            class_summary = ", ".join(f"{cls}" for cls in classes)
-                            parts.append(
-                                f"{len(failed_children)} failed ({class_summary})"
-                            )
-                        if cancelled_children:
-                            parts.append(f"{len(cancelled_children)} cancelled")
-                        diag = (
-                            "; ".join(parts)
-                            if parts
-                            else f"{len(children_snap)} terminal"
-                        )
-                        parent.latest_status_message = (
-                            f"All child tasks terminated without success: {diag}"
-                        )
-                        session.add(parent)
-                        await _requeue_parent_task(parent, session)
-                        rescued += 1
-                        logger.warning(
-                            f"[REAPER] Rescued stuck EVALUATING parent {parent.id}: {diag}"
-                        )
-                    if rescued:
-                        await session.commit()
-                        logger.info(
-                            f"[REAPER] Rescued {rescued} all-children-failed EVALUATING parents"
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"[REAPER] All-children-failed rescue error: {e}", exc_info=True
-                    )
-                    # C1: _requeue_parent_task commits internally and an
-                    # IntegrityError (e.g. idempotency-key collision on the
-                    # cloned retry child) leaves the shared ``session`` aborted.
-                    # Roll back so Steps 5-10 don't inherit the poison. Mirrors
-                    # the Step 6/7/8/10 handlers and the Step 3 guard above.
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
+                # Steps 3+4: Sweep stale EVALUATING parents (rollup re-trigger)
+                # and rescue all-children-failed EVALUATING parents. Extracted to
+                # reaper_evaluating_sweeps.sweep_evaluating_parents().
+                await sweep_evaluating_parents(
+                    session,
+                    now,
+                    _mark_reaper_progress,
+                    landed_cb=_mark_landed_parent_dependents,
+                )
 
                 # Step 5: Infrastructure recovery sweep + hold maintenance.
                 # Delegates to reaper_infra_recovery for resurrection (5),
@@ -4385,10 +2745,11 @@ async def reaper_service():
         except Exception as e:
             consecutive_errors += 1
             logger.error(f"[REAPER] Error: {e}", exc_info=True)
-            try:
-                await session.rollback()
-            except Exception:
-                logger.exception("[REAPER] Rollback after reaper error failed")
+            if session is not None:
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception("[REAPER] Rollback after reaper error failed")
             _halt_threshold = _runtime_config.get(
                 "reaper_cycle_halt_threshold", _REAPER_CYCLE_HALT_THRESHOLD
             )
@@ -4461,7 +2822,9 @@ async def reaper_service():
                     )
 
         # Sleep before next cycle; use exponential backoff on consecutive errors
-        sleep_seconds = min(60 * (2**consecutive_errors), 300)
+        sleep_seconds = exponential_backoff(
+            consecutive_errors + 1, base=60.0, cap=300.0, jitter=0.0
+        )
         try:
             await asyncio.sleep(sleep_seconds)
         except asyncio.CancelledError:

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildContextPrefix, formatRejectionPatternsSection } from './context-prefix.js';
+import { buildContextPrefix, formatRejectionPatternsSection, formatDomainOverview } from './context-prefix.js';
 
 describe('buildContextPrefix', () => {
   it('preserves strategic intent when project context is present', () => {
@@ -531,5 +531,61 @@ describe('buildContextPrefix self-review calibration', () => {
     expect(prefix).not.toContain('**Key conventions:**');
     expect(prefix).not.toContain('**Environment requirements:**');
     expect(prefix).not.toContain('**Provenance:**');
+  });
+});
+
+// ── formatDomainOverview ─────────────────────────────────────────────────────
+describe('formatDomainOverview', () => {
+  it('renders Domain Knowledge block when summary and body are both present', () => {
+    const out = formatDomainOverview({ summary: 'An e-commerce platform.', body: 'Handles orders and inventory.' });
+    expect(out).toContain('## Domain Knowledge');
+    expect(out).toContain('An e-commerce platform.');
+    expect(out).toContain('Handles orders and inventory.');
+  });
+
+  it('returns empty string when input is absent', () => {
+    expect(formatDomainOverview(undefined)).toBe('');
+    expect(formatDomainOverview(null)).toBe('');
+  });
+
+  it('returns empty string when input is not an object', () => {
+    expect(formatDomainOverview('string')).toBe('');
+    expect(formatDomainOverview(42)).toBe('');
+  });
+
+  it('returns empty string when summary is missing', () => {
+    expect(formatDomainOverview({ body: 'Some body text.' })).toBe('');
+  });
+
+  it('returns empty string when body is missing', () => {
+    expect(formatDomainOverview({ summary: 'Some summary.' })).toBe('');
+  });
+
+  it('returns empty string when both fields are empty strings', () => {
+    expect(formatDomainOverview({ summary: '', body: '' })).toBe('');
+  });
+});
+
+// ── buildContextPrefix — domain_overview wiring ──────────────────────────────
+describe('buildContextPrefix — domain overview', () => {
+  it('renders Domain Knowledge block when domain_overview is present', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create' }],
+      domain_overview: {
+        summary: 'A project management SaaS.',
+        body: 'Core concepts: projects, tasks, assignees, sprints.',
+      },
+    });
+    expect(prefix).toContain('## Domain Knowledge');
+    expect(prefix).toContain('A project management SaaS.');
+    expect(prefix).toContain('Core concepts: projects, tasks, assignees, sprints.');
+  });
+
+  it('omits Domain Knowledge block and stays byte-identical when domain_overview is absent', () => {
+    const base = { payloads: [{ type: 'create' }] };
+    const without = buildContextPrefix(base);
+    const withUndefined = buildContextPrefix({ ...base, domain_overview: undefined });
+    expect(without).not.toContain('## Domain Knowledge');
+    expect(withUndefined).toEqual(without);
   });
 });

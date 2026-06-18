@@ -27,6 +27,7 @@ from app.models import (
     PoolVm,
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
+    _LANE_MAX_PHASE_REQUEUES,
 )
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user, require_admin
@@ -1476,6 +1477,8 @@ async def get_improvement_lanes(
             )
             reserved_vm_instance_id = pvm.vm_instance_id
 
+        at_risk = (lane.phase_requeues or 0) >= (_LANE_MAX_PHASE_REQUEUES - 1)
+
         rows.append(
             {
                 "id": str(lane.id),
@@ -1494,6 +1497,7 @@ async def get_improvement_lanes(
                 "reserved_vm_instance_id": reserved_vm_instance_id,
                 "pilot_arm": lane.pilot_arm,
                 "phase_requeues": lane.phase_requeues,
+                "at_risk": at_risk,
                 # Operator-visible checkpoint-recovery state (reason/attempt/
                 # exhausted) so a requeued or KILLED lane explains *why* rather
                 # than surfacing only a phase_requeues counter. None until a
@@ -1534,7 +1538,10 @@ async def get_improvement_lanes(
     trial_metrics: Dict[str, Any] | None = None
     try:
         from app.review_fix_lane_pilot import compute_lane_pilot_aggregates
-        from app.capability_trial_verdict import evaluate_lane_pilot_verdict
+        from app.capability_trial_verdict import (
+            evaluate_lane_pilot_verdict,
+            LANE_PILOT_CAP_NAME,
+        )
 
         aggregates = await compute_lane_pilot_aggregates(session, project_id)
         trial_metrics = evaluate_lane_pilot_verdict(aggregates)
@@ -1542,6 +1549,25 @@ async def get_improvement_lanes(
         logger.exception(
             "Failed to compute lane pilot trial metrics for %s", project_id
         )
+
+    # Merge stored lane_relay_comparison from capability_adoption_verdicts into
+    # trial_metrics so operators see timing deltas without switching panels.
+    if trial_metrics is not None:
+        try:
+            _verdicts_row = (
+                await session.execute(
+                    select(Project.capability_adoption_verdicts).where(
+                        Project.id == project_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if _verdicts_row:
+                _cap_entry = (_verdicts_row or {}).get(LANE_PILOT_CAP_NAME) or {}
+                _relay_cmp = _cap_entry.get("lane_relay_comparison")
+                if _relay_cmp is not None:
+                    trial_metrics["lane_relay_comparison"] = _relay_cmp
+        except Exception:
+            logger.exception("Failed to fetch lane_relay_comparison for %s", project_id)
 
     return {
         "lanes": rows,
@@ -1551,6 +1577,105 @@ async def get_improvement_lanes(
         "project_id": str(project_id),
         "shadow_health": shadow_health,
         "trial_metrics": trial_metrics,
+    }
+
+
+# GET /api/admin/improvement-lanes/{lane_id}
+# ---------------------------------------------------------------------------
+
+
+@router.get("/improvement-lanes/{lane_id:uuid}")
+async def get_improvement_lane_detail(
+    lane_id: uuid.UUID,
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return full detail for a single improvement lane.
+
+    Returns identity/timeline fields, the full checkpoints[] rolling window
+    (bounded at 50 entries — not all-time history), the full manifest dict,
+    workspace/reservation/accounting state, and a light current_task sub-object
+    when current_task_id is set (null when the lane is idle/parked).
+
+    Returns 404 when the lane is not found or does not belong to project_id.
+    """
+    lane = await session.get(ImprovementLane, lane_id)
+    if lane is None or lane.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Lane not found")
+
+    current_task_obj: Dict[str, Any] | None = None
+    if lane.current_task_id is not None:
+        task_row = (
+            (
+                await session.execute(
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.id,
+                            Task.status,
+                            Task.title,
+                            Task.payloads,
+                            raiseload=True,
+                        )
+                    )
+                    .where(Task.id == lane.current_task_id)
+                )
+            )
+            .scalars()
+            .one_or_none()
+        )
+        if task_row is not None:
+            current_task_obj = {
+                "task_id": str(task_row.id),
+                "status": task_row.status.value
+                if hasattr(task_row.status, "value")
+                else task_row.status,
+                "title": task_row.title,
+                "task_type": task_row.first_payload.get("type"),
+            }
+
+    at_risk = (lane.phase_requeues or 0) >= (_LANE_MAX_PHASE_REQUEUES - 1)
+
+    return {
+        "id": str(lane.id),
+        "title": lane.title,
+        "goal": lane.goal,
+        "direction_id": lane.direction_id,
+        "version_number": lane.version_number,
+        "status": lane.status,
+        "branch_name": lane.branch_name,
+        "base_branch": lane.base_branch,
+        "created_at": lane.created_at.isoformat() if lane.created_at else None,
+        "parked_at": lane.parked_at.isoformat() if lane.parked_at else None,
+        "last_resumed_at": (
+            lane.last_resumed_at.isoformat() if lane.last_resumed_at else None
+        ),
+        "retired_at": lane.retired_at.isoformat() if lane.retired_at else None,
+        "updated_at": lane.updated_at.isoformat() if lane.updated_at else None,
+        "last_checkpoint_sha": lane.last_checkpoint_sha,
+        "last_checkpoint_phase": lane.last_checkpoint_phase,
+        "checkpoint_seq": lane.checkpoint_seq,
+        "phase_requeues": lane.phase_requeues,
+        "at_risk": at_risk,
+        "checkpoints": lane.checkpoints or [],
+        "manifest": lane.manifest or {},
+        "workspace_state": lane.workspace_state,
+        "workspace_vm_instance_id": lane.workspace_vm_instance_id,
+        "pilot_arm": lane.pilot_arm,
+        "llm_input_tokens_total": lane.llm_input_tokens_total,
+        "llm_output_tokens_total": lane.llm_output_tokens_total,
+        "vm_cost_usd_total": round(lane.vm_cost_usd_total or 0.0, 6),
+        "reserved_idle_cost_usd_total": round(
+            lane.reserved_idle_cost_usd_total or 0.0, 6
+        ),
+        "reservation_claimed_by_fix_count": lane.reservation_claimed_by_fix_count or 0,
+        "reservation_expired_before_fix_count": (
+            lane.reservation_expired_before_fix_count or 0
+        ),
+        "reservation_force_expired_count": lane.reservation_force_expired_count or 0,
+        "current_task_id": str(lane.current_task_id) if lane.current_task_id else None,
+        "current_task": current_task_obj,
     }
 
 
@@ -1768,6 +1893,55 @@ async def drain_improvement_lane_pilot(
 
     return {
         "project_id": str(project_id),
+        **report,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/improvement-lanes/{lane_id}/kill
+# ---------------------------------------------------------------------------
+
+
+@router.post("/improvement-lanes/{lane_id:uuid}/kill")
+async def kill_improvement_lane(
+    lane_id: uuid.UUID,
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Kill a single stuck improvement lane.
+
+    Operator-triggered kill for an individual lane: transitions the lane to
+    KILLED state and releases any warm-pool reservation so the member rejoins
+    the general pool immediately. The lane must belong to the specified project.
+
+    Idempotent: killing an already-terminal lane returns zero counts and
+    succeeds. Returns the kill report (lanes_killed, reservations_cleared).
+    """
+    from app.review_fix_lane_pilot import kill_single_lane  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    lane = await session.get(ImprovementLane, lane_id)
+    if lane is None or lane.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Lane not found in this project")
+
+    report = await kill_single_lane(session, lane_id)
+    await session.commit()
+
+    logger.info(
+        "[LANE-PILOT] operator kill lane=%s project=%s killed=%s reservations=%s",
+        lane_id,
+        project_id,
+        report["lanes_killed"],
+        report["reservations_cleared"],
+    )
+
+    return {
+        "project_id": str(project_id),
+        "lane_id": str(lane_id),
         **report,
     }
 

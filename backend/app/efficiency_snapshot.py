@@ -99,6 +99,10 @@ AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
 FORMAT_COMPLIANCE_KEY = "format_compliance"
 FORMAT_COMPLIANCE_RATE_KEY = "format_compliance_rate"
 SELF_REPAIR_SUCCESS_RATE_KEY = "self_repair_success_rate"
+# Minimum repair_attempts in the current snapshot window before self_repair_success_rate
+# drift is meaningful. Below this threshold the ratio is too noisy (rare-event denominator)
+# and drift_pct is suppressed to None to avoid phantom regression signals.
+SELF_REPAIR_MIN_ATTEMPTS = 10
 
 ALL_AXES: tuple[str, ...] = (
     AXIS_COST_PER_MERGED_PR,
@@ -327,7 +331,8 @@ async def _load_recent_tasks(
                 # triggering an async lazy-load (used by compute_llm_cost_by_task_type
                 # and compute_effort_model_efficiency when called from this path).
                 Task.payloads,
-            raiseload=True,)
+                raiseload=True,
+            )
         )
         .limit(5000)
     )
@@ -2385,7 +2390,11 @@ def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
 
     total_usd = round(breakdown["totals"]["total_cost_usd"], 6)
     by_model = [
-        {"provider": r["provider"], "model": r["model"], "cost_usd": r["total_cost_usd"]}
+        {
+            "provider": r["provider"],
+            "model": r["model"],
+            "cost_usd": r["total_cost_usd"],
+        }
         for r in breakdown["by_model"]
         if r.get("priced") and r["total_cost_usd"] > 0
     ]
@@ -2554,7 +2563,11 @@ async def write_snapshot(
                         "seeded_at": captured_at,
                         "snapshot_captured_at": captured_at,
                     }
-            for _key in ("agent_timeout_rate", FORMAT_COMPLIANCE_KEY, "llm_cost_attribution"):
+            for _key in (
+                "agent_timeout_rate",
+                FORMAT_COMPLIANCE_KEY,
+                "llm_cost_attribution",
+            ):
                 if snapshot.get(_key) is not None:
                     _prov[_key] = {
                         "seeded_at": captured_at,
@@ -2576,7 +2589,12 @@ async def write_snapshot(
             # calls find provenance already populated and skip this block.
             existing_snapshots = list(container.get("snapshots") or [])
             if not provenance and existing_snapshots:
-                for _member in [*ALL_AXES, "agent_timeout_rate", FORMAT_COMPLIANCE_KEY, "llm_cost_attribution"]:
+                for _member in [
+                    *ALL_AXES,
+                    "agent_timeout_rate",
+                    FORMAT_COMPLIANCE_KEY,
+                    "llm_cost_attribution",
+                ]:
                     _bval = baseline.get(_member)
                     if _bval is None:
                         continue
@@ -2803,6 +2821,7 @@ async def read_baseline_with_drift(
     llm_cost_attribution_trend = [
         {
             "captured_at": snap.get("captured_at"),
+            "by_model": (snap.get("llm_cost_attribution") or {}).get("by_model"),
             "rework_share": (snap.get("llm_cost_attribution") or {}).get(
                 "rework_share"
             ),
@@ -2820,7 +2839,12 @@ async def read_baseline_with_drift(
     # here — the next write_snapshot will persist it inside the lock).
     member_provenance: Dict[str, Any] = dict(baseline.get("_member_provenance") or {})
     if not member_provenance and snapshots:
-        for _member in [*ALL_AXES, "agent_timeout_rate", FORMAT_COMPLIANCE_KEY, "llm_cost_attribution"]:
+        for _member in [
+            *ALL_AXES,
+            "agent_timeout_rate",
+            FORMAT_COMPLIANCE_KEY,
+            "llm_cost_attribution",
+        ]:
             _bval = baseline.get(_member)
             if _bval is None:
                 continue
@@ -2967,11 +2991,15 @@ async def read_baseline_with_drift(
     latest_format = latest.get(FORMAT_COMPLIANCE_KEY) or {}
     baseline_format = baseline.get(FORMAT_COMPLIANCE_KEY) or {}
 
-    def _format_rate_axis(rate_key: str) -> Dict[str, Any]:
+    def _format_rate_axis(
+        rate_key: str, *, suppress_drift: bool = False
+    ) -> Dict[str, Any]:
         return {
             "current": latest_format.get(rate_key),
             "baseline": baseline_format.get(rate_key),
-            "drift_pct": _rate_drift_pct(
+            "drift_pct": None
+            if suppress_drift
+            else _rate_drift_pct(
                 latest_format.get(rate_key), baseline_format.get(rate_key)
             ),
             "history": [
@@ -2984,9 +3012,13 @@ async def read_baseline_with_drift(
             ],
         }
 
+    _current_repair_attempts = latest_format.get("repair_attempts") or 0
     format_compliance = {
         FORMAT_COMPLIANCE_RATE_KEY: _format_rate_axis(FORMAT_COMPLIANCE_RATE_KEY),
-        SELF_REPAIR_SUCCESS_RATE_KEY: _format_rate_axis(SELF_REPAIR_SUCCESS_RATE_KEY),
+        SELF_REPAIR_SUCCESS_RATE_KEY: _format_rate_axis(
+            SELF_REPAIR_SUCCESS_RATE_KEY,
+            suppress_drift=_current_repair_attempts < SELF_REPAIR_MIN_ATTEMPTS,
+        ),
         "tasks_measured": latest_format.get("tasks_measured"),
         "well_formed_tasks": latest_format.get("well_formed_tasks"),
         "format_error_total": latest_format.get("format_error_total"),
@@ -3565,7 +3597,8 @@ async def compute_project_window_spend_usd(
                 Task.llm_input_tokens_banked_db,
                 Task.llm_output_tokens_banked_db,
                 Task.llm_call_count_banked_db,
-            raiseload=True,)
+                raiseload=True,
+            )
         )
     )
     now = _utcnow()

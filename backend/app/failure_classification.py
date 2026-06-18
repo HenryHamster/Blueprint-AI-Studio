@@ -33,12 +33,16 @@ from app.failure_residual import (  # noqa: F401
     _schedule_residual_db_upsert,
     _spawn_bg_task,
     _upsert_residual_case_async,
+    _viewport_residual_seen_task_ids,
+    _viewport_residual_store,
     get_account_failure_class_counts,
     get_account_failure_class_records,
     get_top_residual_fingerprints,
+    get_top_viewport_residual_fingerprints,
     normalize_error_fingerprint,
     record_account_failure_class,
     record_residual_fingerprint,
+    record_viewport_regression_fingerprint,
 )
 
 if TYPE_CHECKING:
@@ -268,6 +272,27 @@ DEAD_AUTH = "DEAD_AUTH"
 # treated as CODE_ERROR, PR_REJECTED, or direction-health damage.
 APPROVED_CAP_PR_CLOSED = "APPROVED_CAP_PR_CLOSED"
 
+# A compute_experiment declared a kind=metric success_criterion but produced NO
+# numeric value for that metric (the experiment ran, yet the hypothesis was never
+# measured). Written by ``task_completion._handle_compute_experiment_completion``
+# as a DISTINCT, visible failure_category so 'the job ran' can never masquerade as
+# 'the hypothesis was measured' under a clean outcome=SUCCESS. This is a genuine
+# work/measurement defect — the command must be fixed to emit the declared metric
+# — so it routes to CODE_ERROR (burns the retry budget, drives the diagnosis
+# pipeline), NOT an infra class. Distinct from kind=artifact_produced criteria
+# (which gate on durable_file_count) and from intentional budget/deadline kills
+# (which stay clean terminal outcomes).
+COMPUTE_UNMEASURED_CRITERION = "compute_unmeasured_criterion"
+
+# Administrative cancellation — orchestrator or operator terminated the task before
+# it ran meaningful work: cascade cancels ("Cancelled: dependency task failed"),
+# parent-dependency cancels ("Cancelled: parent evaluation timeout"), or system
+# supersession ("Superseded by fix on PR #N"). These are never-started
+# administrative operations, not genuine LLM hangs or code defects. Distinct from
+# AGENT_TIMEOUT so agent_timeout_rate stays a clean signal for real LLM/VM deaths.
+# Budget-exempt (INFRA_CLASSES) — no retry burn, no direction-health penalty.
+ADMIN_CANCEL = "ADMIN_CANCEL"
+
 # Context key stamped on a co-deferred dependent task's context. When a research
 # cycle decomposes findings, a dependent finding whose prerequisite was deferred
 # in the SAME cycle is "co-deferred": its spawned task is set to CANCELLED and the
@@ -464,6 +489,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         PARK_WAKE_STRANDED,
         DEAD_AUTH,
         APPROVED_CAP_PR_CLOSED,
+        ADMIN_CANCEL,
     }
 )
 
@@ -519,6 +545,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     PARK_WAKE_TIMEOUT,
     PARK_WAKE_STRANDED,
     APPROVED_CAP_PR_CLOSED,
+    ADMIN_CANCEL,
 )
 
 
@@ -781,6 +808,13 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # classes (see INFRA_CLASSES) so neither burns the retry budget.
     "park_wake_timeout": PARK_WAKE_TIMEOUT,
     "park_wake_stranded": PARK_WAKE_STRANDED,
+    # ``compute_unmeasured_criterion`` — a compute_experiment declared a
+    # kind=metric success_criterion but produced no numeric value for it. A
+    # genuine measurement/work defect (the command must emit the declared
+    # metric), so it routes to CODE_ERROR for retry-budget + diagnosis while the
+    # distinct failure_category literal stays visible on task.context for the
+    # spawning agent and operator panels.
+    "compute_unmeasured_criterion": CODE_ERROR,
     # ``panel_review_lens_failed`` — the panel_review task posted a failure because
     # a lens subprocess exited non-zero. Normally an infra-level failure (→
     # PROVISION_FAILURE) but requires a dead-auth text check first: when a Codex
@@ -1192,6 +1226,16 @@ _CRED_REDACT_SUBS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"sk-proj-[A-Za-z0-9_-]{10,}"), "sk-proj-***"),
     # OpenAI generic API keys (sk-…); minimum 20 chars to avoid false positives
     (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "sk-***"),
+    # AWS IAM access keys (AKIA + exactly 16 uppercase alphanumeric)
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA***"),
+    # Stripe API keys (sk_live_, sk_test_, rk_live_) and webhook signing secrets (whsec_)
+    (re.compile(r"sk_live_[A-Za-z0-9_-]+"), "sk_live_***"),
+    (re.compile(r"sk_test_[A-Za-z0-9_-]+"), "sk_test_***"),
+    (re.compile(r"rk_live_[A-Za-z0-9_-]+"), "rk_live_***"),
+    (re.compile(r"whsec_[A-Za-z0-9_-]+"), "whsec_***"),
+    # Database connection strings with embedded user:password (including driver-qualified forms)
+    (re.compile(r"postgresql(?:\+\w+)?://[^:/@]+:[^@]+@"), "postgresql://***:***@"),
+    (re.compile(r"postgres://[^:/@]+:[^@]+@"), "postgres://***:***@"),
     # Google AIza API keys (AIza + 20+ alphanumeric — open-ended to catch truncated or over-length keys)
     (re.compile(r"AIza[A-Za-z0-9_-]{20,}"), "AIza***"),
     # Google OAuth access tokens (ya29.…)
@@ -1218,10 +1262,13 @@ _CRED_REDACT_SUBS: tuple[tuple[re.Pattern, str], ...] = (
 def _redact_credentials(text: str) -> str:
     """Redact known credential patterns from *text* before storage.
 
-    Covers GitHub tokens, Anthropic/OpenAI/Google API keys, JWTs, Bearer and
-    OAuth tokens, PEM private keys, and named credential fields in JSON/key-value
-    pairs (access_token, refresh_token, id_token, api_key, client_secret,
-    private_key, token). Preserves field names; replaces values with ``***``.
+    Covers GitHub tokens, Anthropic/OpenAI/Google API keys, AWS IAM access keys
+    (AKIA…), Stripe API keys (sk_live_, sk_test_, rk_live_) and webhook secrets
+    (whsec_), database connection strings with embedded passwords
+    (postgresql:// and postgres://), JWTs, Bearer and OAuth tokens, PEM private
+    keys, and named credential fields in JSON/key-value pairs (access_token,
+    refresh_token, id_token, api_key, client_secret, private_key, token).
+    Preserves field names; replaces values with ``***``.
     """
     if not text:
         return text
@@ -2303,6 +2350,15 @@ def _classify_failure_class(
             return RATE_LIMIT
         return AGENT_TIMEOUT
 
+    # Cascade cancellations and supersessions — administrative orchestrator decisions
+    # that must be classified before ANY keyword-matching loop so that substrings
+    # in the tail (e.g. "evaluation timeout" inside "Cancelled: parent evaluation
+    # timeout") cannot override the administrative intent.
+    if status_msg.startswith("cancelled:"):
+        return ADMIN_CANCEL
+    if "superseded" in status_msg:
+        return ADMIN_CANCEL
+
     # Migration-specific failures — alembic chain/head errors, missing migration
     # column drift, schema-revision mismatches, downgrade failures. Checked before
     # the database-connection EXTERNAL_API bank because UndefinedColumn errors
@@ -2553,17 +2609,6 @@ def _classify_failure_class(
     ):
         return "AGENT_TIMEOUT"
 
-    # Cascade cancellations — any task cancelled by the orchestrator/services is an infrastructure
-    # decision, not a code defect. Matches: "Cancelled: dependency task failed",
-    # "Cancelled: parent dependency failed", "Cancelled: parent evaluation timeout", etc.
-    if combined.startswith("cancelled:"):
-        return "AGENT_TIMEOUT"
-
-    # System-initiated supersession — review pipeline cancels stale tasks with
-    # "Superseded by fix on PR #N: ...". Same family as "cancelled:" above.
-    if "superseded" in combined:
-        return AGENT_TIMEOUT
-
     # Viewport gate infra-unavailable sentinel — Chromium missing or Docker fallback absent.
     # Checked before VIEWPORT_REGRESSION so infra shortfalls don't land in CODE_ERROR residuals.
     if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
@@ -2572,6 +2617,7 @@ def _classify_failure_class(
     # Viewport rendering regression — must be checked before the generic CODE_ERROR
     # fallthrough so it doesn't dissolve into residual fingerprints.
     if any(kw in combined for kw in _VIEWPORT_PATTERNS):
+        record_viewport_regression_fingerprint(task)
         return VIEWPORT_REGRESSION
 
     # Structured agent error report — a generic failure (no keywords matched

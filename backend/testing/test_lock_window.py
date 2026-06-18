@@ -1975,7 +1975,7 @@ async def _run_reaper_preguard_body(db_session, mocker, bind):
     mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
-    mocker.patch("app.reaper._capture_serial_for_vm", return_value=None)
+    mocker.patch("app.reaper_orphan_io._capture_serial_for_vm", return_value=None)
     mocker.patch("app.reaper.record_zone_failure")
     mocker.patch("app.reaper.any_zone_available", return_value=True)
 

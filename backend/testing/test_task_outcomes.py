@@ -28,6 +28,7 @@ from app.task_outcomes import (
     KIND_VERIFICATION_VERDICT,
     OUTCOME_EVALUATORS,
     TaskOutcome,
+    _panel_lens_passed,
     build_task_evaluation_summary,
     evaluate_task_outcome,
     is_successful_outcome,
@@ -857,7 +858,9 @@ def test_summary_compute_experiment_surfaces_met_goal():
     )
     summary = build_task_evaluation_summary(task)
     goal_items = [e for e in summary["evidence"] if e["label"] == "Goal"]
-    assert goal_items == [{"label": "Goal", "value": "met: accuracy >= 0.9 (measured 0.95)"}]
+    assert goal_items == [
+        {"label": "Goal", "value": "met: accuracy >= 0.9 (measured 0.95)"}
+    ]
 
 
 def test_summary_web_research_recorded():
@@ -900,7 +903,11 @@ def _panel_review_verdict_plan(
         "lenses": lenses
         if lenses is not None
         else {
-            "correctness": {"verdict": "APPROVE", "summary": "Logic correct", "issues": []},
+            "correctness": {
+                "verdict": "APPROVE",
+                "summary": "Logic correct",
+                "issues": [],
+            },
             "security": {"verdict": "APPROVE", "summary": "No issues", "issues": []},
             "code_quality": {"verdict": "APPROVE", "summary": "Clean", "issues": []},
             "test_coverage": {"verdict": "APPROVE", "summary": "Covered", "issues": []},
@@ -917,9 +924,7 @@ def _panel_review_verdict_plan(
 def test_summary_panel_review_clean_approve_is_not_none():
     # A clean APPROVE with no issues must still produce a summary — the verdict
     # itself is the signal — never an empty/None result.
-    task = _make_task(
-        "panel_review", plan_output=_panel_review_verdict_plan("APPROVE")
-    )
+    task = _make_task("panel_review", plan_output=_panel_review_verdict_plan("APPROVE"))
     summary = build_task_evaluation_summary(task)
     assert summary is not None
     assert summary["verdict"] == "approve"
@@ -1032,9 +1037,7 @@ def test_summary_write_degraded_merge_with_reproduced_verdict_is_shipped_unverif
 
     context = _merged_context()
     context["reproduce_verdict"] = {"status": "reproduced"}
-    context[REVIEW_LOOP_KEY] = {
-        UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"
-    }
+    context[REVIEW_LOOP_KEY] = {UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"}
     task = _make_task("fix", context=context)
     summary = build_task_evaluation_summary(task)
     assert summary is not None
@@ -1281,43 +1284,76 @@ def test_first_attempt_succeeded_degraded_returns_false():
     """A degraded-unverified merge_verification makes first_attempt False."""
     from app.task_completion import _compute_first_attempt_succeeded
 
-    assert _compute_first_attempt_succeeded(
-        0, TaskStatus.COMPLETED, merge_verification="unverified_degraded"
-    ) is False
-    assert _compute_first_attempt_succeeded(
-        1, TaskStatus.COMPLETED, merge_verification="unverified_degraded"
-    ) is False
+    assert (
+        _compute_first_attempt_succeeded(
+            0, TaskStatus.COMPLETED, merge_verification="unverified_degraded"
+        )
+        is False
+    )
+    assert (
+        _compute_first_attempt_succeeded(
+            1, TaskStatus.COMPLETED, merge_verification="unverified_degraded"
+        )
+        is False
+    )
 
 
 def test_first_attempt_succeeded_benign_unverified_is_unaffected():
     """Benign-unverified merge does not suppress the flag."""
     from app.task_completion import _compute_first_attempt_succeeded
 
-    assert _compute_first_attempt_succeeded(
-        0, TaskStatus.COMPLETED, merge_verification="unverified_benign"
-    ) is True
+    assert (
+        _compute_first_attempt_succeeded(
+            0, TaskStatus.COMPLETED, merge_verification="unverified_benign"
+        )
+        is True
+    )
 
 
 def test_first_attempt_succeeded_verified_is_unaffected():
     """A verified merge keeps the normal first-attempt semantics."""
     from app.task_completion import _compute_first_attempt_succeeded
 
-    assert _compute_first_attempt_succeeded(
-        0, TaskStatus.COMPLETED, merge_verification="verified"
-    ) is True
-    assert _compute_first_attempt_succeeded(
-        2, TaskStatus.COMPLETED, merge_verification="verified"
-    ) is False
+    assert (
+        _compute_first_attempt_succeeded(
+            0, TaskStatus.COMPLETED, merge_verification="verified"
+        )
+        is True
+    )
+    assert (
+        _compute_first_attempt_succeeded(
+            2, TaskStatus.COMPLETED, merge_verification="verified"
+        )
+        is False
+    )
 
 
 def test_first_attempt_succeeded_none_verification_backward_compat():
     """Passing None merge_verification preserves pre-change semantics."""
     from app.task_completion import _compute_first_attempt_succeeded
 
-    assert _compute_first_attempt_succeeded(0, TaskStatus.COMPLETED, merge_verification=None) is True
-    assert _compute_first_attempt_succeeded(1, TaskStatus.COMPLETED, merge_verification=None) is True
-    assert _compute_first_attempt_succeeded(2, TaskStatus.COMPLETED, merge_verification=None) is False
-    assert _compute_first_attempt_succeeded(0, TaskStatus.FAILED, merge_verification=None) is False
+    assert (
+        _compute_first_attempt_succeeded(
+            0, TaskStatus.COMPLETED, merge_verification=None
+        )
+        is True
+    )
+    assert (
+        _compute_first_attempt_succeeded(
+            1, TaskStatus.COMPLETED, merge_verification=None
+        )
+        is True
+    )
+    assert (
+        _compute_first_attempt_succeeded(
+            2, TaskStatus.COMPLETED, merge_verification=None
+        )
+        is False
+    )
+    assert (
+        _compute_first_attempt_succeeded(0, TaskStatus.FAILED, merge_verification=None)
+        is False
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1411,6 +1447,56 @@ def test_summary_acceptance_evidence_absent_no_findings_stays_none():
     """No declaration AND no findings ⇒ summary stays None (unchanged)."""
     task = _make_task("create", status=TaskStatus.COMPLETED, context={})
     assert build_task_evaluation_summary(task) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _panel_lens_passed: full synonym-table coverage
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestPanelLensPassed:
+    """_panel_lens_passed normalizes panel-review lens verdicts to True/False/None.
+
+    The production set is {approve, pass, passed, ok} -> True and
+    {request_changes, fail, failed} -> False; everything else -> None.
+    Tests here document the exact contract and catch divergence when the
+    synonym table changes.
+    """
+
+    def test_pass_tokens_return_true(self):
+        for token in ("approve", "pass", "passed", "ok"):
+            assert _panel_lens_passed(token) is True, (
+                f"token {token!r} should return True"
+            )
+
+    def test_fail_tokens_return_false(self):
+        for token in ("request_changes", "fail", "failed"):
+            assert _panel_lens_passed(token) is False, (
+                f"token {token!r} should return False"
+            )
+
+    def test_case_insensitive(self):
+        assert _panel_lens_passed("APPROVE") is True
+        assert _panel_lens_passed("REQUEST_CHANGES") is False
+        assert _panel_lens_passed("Pass") is True
+        assert _panel_lens_passed("Failed") is False
+
+    def test_absent_aliases_return_none(self):
+        """Tokens present in other parsers but not this one must return None."""
+        for token in ("accept", "approved", "reject", "rejected"):
+            result = _panel_lens_passed(token)
+            assert result is None, (
+                f"token {token!r} is not in _panel_lens_passed synonym table; "
+                f"expected None, got {result!r}"
+            )
+
+    def test_empty_and_none_return_none(self):
+        assert _panel_lens_passed("") is None
+        assert _panel_lens_passed(None) is None
+
+    def test_unrecognized_token_returns_none(self):
+        assert _panel_lens_passed("unknown") is None
+        assert _panel_lens_passed("yes") is None
 
 
 if __name__ == "__main__":

@@ -173,10 +173,10 @@ def test_empty_status_and_logs_classify_as_agent_timeout():
     assert classify_failure(t, logs="   \n\t") == "AGENT_TIMEOUT"
 
 
-def test_superseded_message_classifies_as_agent_timeout():
-    """'Superseded by fix on PR #N: ...' is system cancellation → AGENT_TIMEOUT."""
+def test_superseded_message_classifies_as_admin_cancel():
+    """'Superseded by fix on PR #N: ...' is system cancellation → ADMIN_CANCEL."""
     msg = "Superseded by fix on PR #1234: review was scoped to a pre-conflict snapshot"
-    assert classify_failure(_task(msg)) == "AGENT_TIMEOUT"
+    assert classify_failure(_task(msg)) == "ADMIN_CANCEL"
 
 
 def test_real_code_error_still_classifies_as_code_error():
@@ -311,35 +311,34 @@ def test_classify_failure_respects_scope_overflow_agent_category():
 # ── Cascade cancellation classifier ───────────────────────────────────────────
 
 
-def test_cascade_dependency_task_failed_is_agent_timeout():
-    """'Cancelled: dependency task failed' (set on directly-cancelled parent task)
-    must classify as AGENT_TIMEOUT — it's an orchestrator decision, not a code defect."""
+def test_cascade_dependency_task_failed_is_admin_cancel():
+    """'Cancelled: dependency task failed' is an orchestrator decision → ADMIN_CANCEL."""
     assert (
-        classify_failure(_task("Cancelled: dependency task failed")) == "AGENT_TIMEOUT"
+        classify_failure(_task("Cancelled: dependency task failed")) == "ADMIN_CANCEL"
     )
 
 
-def test_cascade_parent_dependency_failed_is_agent_timeout():
-    """'Cancelled: parent dependency failed' (set on children) must classify as AGENT_TIMEOUT."""
+def test_cascade_parent_dependency_failed_is_admin_cancel():
+    """'Cancelled: parent dependency failed' (set on children) → ADMIN_CANCEL."""
     assert (
         classify_failure(_task("Cancelled: parent dependency failed"))
-        == "AGENT_TIMEOUT"
+        == "ADMIN_CANCEL"
     )
 
 
-def test_cascade_parent_evaluation_timeout_is_agent_timeout():
-    """Existing 'cancelled: parent evaluation timeout' pattern still matches after broadening."""
+def test_cascade_parent_evaluation_timeout_is_admin_cancel():
+    """'Cancelled: parent evaluation timeout' routes to ADMIN_CANCEL."""
     assert (
         classify_failure(_task("Cancelled: parent evaluation timeout"))
-        == "AGENT_TIMEOUT"
+        == "ADMIN_CANCEL"
     )
 
 
 def test_cancelled_prefix_broad_match():
-    """Any message starting with 'cancelled:' is treated as AGENT_TIMEOUT."""
+    """Any message starting with 'cancelled:' is treated as ADMIN_CANCEL."""
     assert (
         classify_failure(_task("Cancelled: some new orchestrator reason"))
-        == "AGENT_TIMEOUT"
+        == "ADMIN_CANCEL"
     )
 
 

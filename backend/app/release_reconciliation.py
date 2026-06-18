@@ -51,7 +51,7 @@ from app.release_promotion import (
     _resolve_github_with_session,
 )
 from app.rollup_migration_validation import _validate_migration_chain_post_merge
-from app.release_scoring import (
+from app.ci_resolution import (
     _CI_GREEN,
     _CI_NO_CHECKS,
     _CI_PENDING,

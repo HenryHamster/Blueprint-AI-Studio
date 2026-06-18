@@ -4892,6 +4892,7 @@ class TestFailureClassificationInvariants:
 
     def test_infra_classes_membership_exact(self):
         from app.failure_classification import (
+            ADMIN_CANCEL,
             AGENT_STALLED,
             AGENT_TIMEOUT,
             APPROVED_CAP_PR_CLOSED,
@@ -4934,6 +4935,9 @@ class TestFailureClassificationInvariants:
                 # Approved PR closed by cap burn — not a code defect, so it
                 # must not penalize direction health or consume retry budget.
                 APPROVED_CAP_PR_CLOSED,
+                # Administrative cancellation (cascade cancel / supersession) —
+                # not a code defect or genuine LLM hang.
+                ADMIN_CANCEL,
             }
         ), (
             "INFRA_CLASSES membership changed — direction_outcomes and "
@@ -9402,7 +9406,10 @@ def test_serving_status_reads_route_through_aggregate():
             continue
 
         # Quick text filter before expensive parse.
-        if "_version_serving_summary" not in source and "version_serving_summary" not in source:
+        if (
+            "_version_serving_summary" not in source
+            and "version_serving_summary" not in source
+        ):
             continue
 
         try:
@@ -9427,4 +9434,86 @@ def test_serving_status_reads_route_through_aggregate():
         "Duplicate definitions diverge from the aggregate-first algorithm and "
         "cause serving-status inconsistency across UI/CLI/strategist surfaces.\n"
         + "\n".join(duplicates)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dead-column guard: confirm five dropped columns stay gone from models.py
+# and their write sites stay removed from production code.
+# ---------------------------------------------------------------------------
+
+#: Columns confirmed dead (migration 0300) and removed from the ORM.
+#: Each entry is (model_class_name, field_name, canonical_write_site).
+_DEAD_ORM_COLUMNS = [
+    ("Task", "infra_wait_until", None),
+    ("Task", "spawn_failed", "agent_status_spawn.py"),
+    ("Task", "last_remediation_at", None),
+    ("Project", "regression_signal_state", None),
+    ("DeploymentState", "prior_deployed_at", "main.py"),
+]
+
+
+def test_dropped_dead_orm_columns_absent_from_models():
+    """Verify the five dead ORM columns are not re-introduced in models.py.
+
+    Migration 0300 dropped Task.infra_wait_until, Task.spawn_failed,
+    Task.last_remediation_at, Project.regression_signal_state, and
+    DeploymentState.prior_deployed_at.  This guard makes re-adding any of them
+    a CI failure so the dead-schema signal is durable.
+    """
+    backend_dir = Path(__file__).resolve().parent.parent
+    models_path = backend_dir / "app" / "models.py"
+    source = models_path.read_text(encoding="utf-8")
+
+    violations: list[str] = []
+    for model_name, field_name, _ in _DEAD_ORM_COLUMNS:
+        # Look for the field as an ORM attribute assignment (e.g. "    field_name: ...")
+        # or a direct attribute access (e.g. "task.field_name =").
+        pattern = re.compile(
+            r"^\s+" + re.escape(field_name) + r"\s*[:=]",
+            re.MULTILINE,
+        )
+        if pattern.search(source):
+            violations.append(
+                f"  {model_name}.{field_name} found in models.py — "
+                "this column was confirmed dead and dropped in migration 0300"
+            )
+
+    assert not violations, (
+        "Dead ORM columns were re-introduced in models.py.\n"
+        "These columns have no live readers and were dropped in migration 0300.\n"
+        + "\n".join(violations)
+    )
+
+
+def test_dropped_dead_orm_columns_write_sites_removed():
+    """Verify known write sites for the dead columns are gone from production code.
+
+    Migration 0300 removed the only write sites for Task.spawn_failed
+    (agent_status_spawn.py) and DeploymentState.prior_deployed_at (main.py).
+    This guard ensures those write sites are not reintroduced.
+    """
+    backend_dir = Path(__file__).resolve().parent.parent
+    app_dir = backend_dir / "app"
+
+    violations: list[str] = []
+    for model_name, field_name, write_file in _DEAD_ORM_COLUMNS:
+        if write_file is None:
+            continue
+        target = app_dir / write_file
+        if not target.exists():
+            continue
+        source = target.read_text(encoding="utf-8")
+        # Match attribute assignment: ".field_name = " or ".field_name=" patterns
+        pattern = re.compile(r"\." + re.escape(field_name) + r"\s*=")
+        if pattern.search(source):
+            violations.append(
+                f"  {write_file}: still contains a write to .{field_name} "
+                f"({model_name}.{field_name} was dropped in migration 0300)"
+            )
+
+    assert not violations, (
+        "Write sites for dead ORM columns were reintroduced.\n"
+        "These columns have no live readers and were dropped in migration 0300.\n"
+        + "\n".join(violations)
     )

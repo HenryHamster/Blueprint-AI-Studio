@@ -28,6 +28,7 @@ from app.review_pipeline import (
     SPAWN_REASON_BLOCKED_REPEAT,
     SPAWN_REASON_KEY,
     SPAWN_REASON_PERSISTENT_CONFLICT,
+    SPAWN_REASON_SUPERSEDE_CHURN,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR,
@@ -6836,6 +6837,92 @@ async def test_supersede_churn_resets_after_counted_run(db_session, mocker):
     await db_session.refresh(original_task)
     assert (original_task.context or {}).get("_review_supersede_churn_count") == 1
     assert (original_task.context or {}).get("review_loop_terminal_outcome") is None
+
+
+@pytest.mark.asyncio
+async def test_supersede_churn_bounded_when_orig_task_unloadable(db_session, mocker):
+    """A supersession whose original_task_id resolves to a missing/unloadable task
+    must still remain bounded (does not supersede unboundedly) and fails safe.
+
+    When the chain-root task cannot be loaded, the counter increment and halt are
+    both skipped in the normal flow. This test verifies the fail-safe: the spawn
+    is halted with SPAWN_REASON_SUPERSEDE_CHURN when orig_task is unloadable and
+    a supersession would occur, preventing unbounded churn."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    # Create a source task with an invalid/unresolvable original_task_id (e.g., a
+    # task ID that doesn't exist in the DB).
+    unloadable_original_id = str(uuid.uuid4())
+
+    stale_started = _utcnow_for_test() - timedelta(
+        minutes=PIPELINE_TASK_STALE_MINUTES + 5
+    )
+    stale_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 703,
+                "branch": "feat/u",
+                "base_branch": "main",
+                "original_task_id": unloadable_original_id,
+            }
+        ],
+        started_at=stale_started,
+    )
+    db_session.add(stale_review)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 703,
+                "branch": "feat/u",
+                "base_branch": "main",
+                "prompt": "Build X",
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {
+                "iteration": 0,
+                "original_task_id": unloadable_original_id,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(stale_review)
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=703,
+        branch="feat/u",
+        base_branch="main",
+        original_task_id=unloadable_original_id,
+    )
+    await db_session.commit()
+
+    # Spawn should be halted, not created. The stale task is superseded
+    # (CANCELLED), but the new task is not spawned because orig_task is unloadable.
+    assert result is None, "Spawn must be halted when orig_task is unloadable"
+    assert created is False
+    assert (source_task.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_SUPERSEDE_CHURN
+
+    # Verify the stale task was actually superseded (cancelled).
+    await db_session.refresh(stale_review)
+    assert stale_review.status == TaskStatus.CANCELLED
+    assert (stale_review.context or {}).get("failure_detail") == (
+        "superseded_by_review_pipeline"
+    )
 
 
 def _utcnow_for_test():

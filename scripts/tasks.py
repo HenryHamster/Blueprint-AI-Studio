@@ -104,243 +104,41 @@ def cmd_cancel(_args):
     sys.exit(1)
 
 
-def cmd_cancel_all(args):
-    """Cancel tasks in bulk, filtered by status, project, and/or category.
-
-    Usage: cancel-all [--status STATUS] [--project PROJECT] [--category CATEGORY]
-
-    Without --status, cancels all non-terminal tasks (QUEUED / PROVISIONING /
-    IN_PROGRESS / EVALUATING). --category restricts to tasks whose
-    context.failure_category matches exactly — e.g.
-    `cancel-all --status FAILED --category SCOPE_EMPTY` clears SCOPE_EMPTY
-    pre-emption artifacts without touching genuine failures. Results are
-    paged (the admin API caps each page at 500), so the whole backlog is
-    covered, not just the first page.
-    """
-    from blueprint_api import api
-    status_filter = None
-    project_filter = None
-    category_filter = None
-    i = 0
-    positional_args = list(args)
-    while i < len(positional_args):
-        if positional_args[i] == "--status" and i + 1 < len(positional_args):
-            status_filter = positional_args[i + 1]
-            i += 2
-        elif positional_args[i] == "--project" and i + 1 < len(positional_args):
-            project_filter = positional_args[i + 1]
-            i += 2
-        elif positional_args[i] == "--category" and i + 1 < len(positional_args):
-            category_filter = positional_args[i + 1]
-            i += 2
-        else:
-            # Legacy: first positional arg is status
-            if not status_filter:
-                status_filter = positional_args[i]
-            i += 1
-
-    # Resolve project filter to ID
-    project_id = None
-    if project_filter:
-        projects = api("GET", "/api/admin/projects")
-        for p in (projects.get("items", []) if isinstance(projects, dict) else projects):
-            if p["id"].startswith(project_filter) or project_filter.lower() in p.get("name", "").lower():
-                project_id = p["id"]
-                print(f"Filtering to project: {p.get('name', p['id'][:8])}")
-                break
-        if not project_id:
-            print(f"ERROR: No project matching '{project_filter}'")
-            return
-
-    statuses = [status_filter] if status_filter else ["QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"]
-    cancelled = 0
-    skipped = 0
-    for status in statuses:
-        # Page through every task of this status — the admin API caps each
-        # page at 500, so a single list_tasks call silently drops the tail
-        # of a large backlog.
-        tasks = []
-        offset = 0
-        while True:
-            batch = list_tasks(status=status, limit=500, offset=offset)
-            if not batch:
-                break
-            tasks.extend(batch)
-            offset += len(batch)
-            if len(batch) < 500:
-                break
-        for t in tasks:
-            if project_id and t.get("project_id") != project_id:
-                continue
-            if (
-                category_filter
-                and (t.get("context") or {}).get("failure_category") != category_filter
-            ):
-                skipped += 1
-                continue
-            tid = t["id"]
-            title = _safe(t["title"], 50)
-            print(f"  Cancelling [{status[:4]}] {tid[:8]} {title}...", end=" ")
-            try:
-                patch_task(tid, {"status": "CANCELLED"})
-                print("done")
-                cancelled += 1
-            except Exception as e:
-                print(f"FAILED: {e}")
-    if category_filter:
-        print(
-            f"\nCancelled {cancelled} task(s) with failure_category={category_filter}; "
-            f"left {skipped} non-matching task(s) untouched."
-        )
-    else:
-        print(f"\nCancelled {cancelled} tasks.")
+def cmd_cancel_all(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks cancel-all"""
+    print(
+        "DEPRECATED: tasks.py cancel-all is superseded.\n"
+        "Use: python scripts/blueprint.py tasks cancel-all [--status STATUS] "
+        "[--category CATEGORY] [--yes]"
+    )
+    sys.exit(1)
 
 
-def cmd_evaluating(args):
-    """Show all EVALUATING tasks with scope, research question, and blocking info."""
-    from blueprint_api import api
-    tasks = list_tasks(status="EVALUATING")
-    if not tasks:
-        print("No EVALUATING tasks.")
-        return
-    verbose = "-v" in args or "--verbose" in args
-    for t in tasks:
-        ctx = t.get("context") or {}
-        loop = ctx.get("review_loop", {})
-        ci = loop.get("ci_waiting", False)
-        pr = loop.get("pr_number", "-")
-        ptype = (t.get("payloads") or [{}])[0].get("type", t.get("task_type", "?"))
-        msg = _safe(t.get("latest_status_message") or "", 80)
-        print(f"  {t['id'][:8]}  [{ptype:8}]  {_safe(t['title'], 50):<50}  ci={ci}  pr={pr}")
-        if msg:
-            print(f"           {msg}")
-        # Show scope for research/plan parents
-        if verbose and ptype in ("research", "plan"):
-            try:
-                full = api("GET", f"/api/admin/tasks/{t['id']}")
-                ft = full.get("task", full)
-                payloads = ft.get("payloads") or []
-                if payloads:
-                    prompt = payloads[0].get("prompt", "")
-                    scope = (ft.get("context") or {}).get("scope", "")
-                    rq = (ft.get("context") or {}).get("research_question", "")
-                    if rq:
-                        print(f"           Q: {_safe(rq, 120)}")
-                    if scope:
-                        print(f"           Scope: {_safe(scope, 100)}")
-                    if prompt and not rq:
-                        print(f"           Prompt: {_safe(prompt, 120)}")
-                # Show child summary
-                children = _get_children(t['id'][:8])
-                if children:
-                    by_status = {}
-                    for c in children:
-                        by_status.setdefault(c["status"], []).append(c)
-                    parts = [f"{s}={len(v)}" for s, v in sorted(by_status.items())]
-                    merged = sum(1 for c in children if (c.get("context") or {}).get("pr_merged"))
-                    print(f"           Children: {len(children)} ({', '.join(parts)}, merged={merged})")
-            except Exception:
-                pass
+def cmd_evaluating(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks evaluating"""
+    print(
+        "DEPRECATED: tasks.py evaluating is superseded.\n"
+        "Use: python scripts/blueprint.py tasks evaluating [-v]"
+    )
+    sys.exit(1)
 
 
-def cmd_requeue_ci(args):
-    """Requeue all CI-waiting EVALUATING tasks."""
-    tasks = list_tasks(status="EVALUATING")
-    for t in tasks:
-        ctx = t.get("context") or {}
-        loop = ctx.get("review_loop", {})
-        if not loop.get("ci_waiting"):
-            continue
-        tid = t["id"]
-        pr = loop.get("pr_number", "?")
-        print(f"  Requeuing {tid[:8]} (PR #{pr})...", end=" ")
-        try:
-            resp = patch_task(tid, {"status": "QUEUED"})
-            print(f"-> {resp.get('status', 'ok')}")
-        except Exception as e:
-            print(f"FAILED: {e}")
+def cmd_requeue_ci(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks requeue-ci"""
+    print(
+        "DEPRECATED: tasks.py requeue-ci is superseded.\n"
+        "Use: python scripts/blueprint.py tasks requeue-ci [--yes]"
+    )
+    sys.exit(1)
 
 
-def cmd_trigger_rollup(args):
-    """Mark unmerged COMPLETED children as merged to trigger rollup on stuck parents.
-
-    Finds EVALUATING research/plan parents with COMPLETED children missing
-    pr_merged, patches them to set pr_merged=true, which triggers the backend
-    rollup check. Run without args to scan all, or pass a parent ID.
-    """
-    if args:
-        parents = [_resolve_task(args[0])]
-        if not parents[0]:
-            print(f"Task '{args[0]}' not found.")
-            return
-    else:
-        parents = list_tasks(status="EVALUATING", limit=200)
-
-    parents = [p for p in parents if p and p["status"] == "EVALUATING"
-               and (p.get("payloads") or [{}])[0].get("type") in ("research", "plan")]
-
-    if not parents:
-        print("No stuck EVALUATING research/plan parents found.")
-        return
-
-    all_tasks = all_tasks_by_status("COMPLETED", "FAILED", "CANCELLED", "QUEUED",
-                                    "IN_PROGRESS", "PROVISIONING", "EVALUATING",
-                                    limit=500)
-
-    for parent in parents:
-        pid = parent["id"]
-        children = [t for t in all_tasks if t.get("parent_task_id") == pid]
-        work_children = [c for c in children
-                         if (c.get("payloads") or [{}])[0].get("type") not in ("review", "fix", "debug")]
-
-        unmerged = [c for c in work_children
-                    if c["status"] == "COMPLETED"
-                    and not (c.get("context") or {}).get("pr_merged")]
-
-        failed = [c for c in work_children if c["status"] == "FAILED"]
-        active = [c for c in work_children
-                  if c["status"] in ("QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING")]
-
-        print(f"\n  {pid[:8]}  {_safe(parent['title'], 60)}")
-        total = len(work_children)
-        merged = len([c for c in work_children if (c.get("context") or {}).get("pr_merged")])
-        cancelled = len([c for c in work_children if c["status"] == "CANCELLED"])
-        print(f"  Children: {total} total, {merged} merged, {len(unmerged)} unmerged, "
-              f"{len(failed)} failed, {len(active)} active, {cancelled} cancelled")
-
-        if active:
-            print(f"  Skipping -- {len(active)} children still active")
-            continue
-
-        if not unmerged:
-            if failed:
-                print(f"  No unmerged children, but {len(failed)} failed. Use: tasks.py requeue {pid[:8]}")
-                continue
-            # All merged but parent still EVALUATING -- force rollup PR creation via admin endpoint
-            any_merged = next((c for c in work_children
-                               if c["status"] == "COMPLETED" and (c.get("context") or {}).get("pr_merged")), None)
-            if any_merged:
-                print(f"  All children merged but rollup didn't fire. Forcing rollup PR via admin endpoint...")
-                try:
-                    result = api("POST", f"/api/admin/tasks/{pid}/rollup")
-                    pr_num = result.get("rollup_pr_number") or result.get("pr_number")
-                    pr_url = result.get("rollup_pr_url") or result.get("pr_url") or ""
-                    print(f"    Rollup PR created: #{pr_num} {pr_url}")
-                except Exception as e:
-                    print(f"    FAILED: {e}")
-            else:
-                print(f"  Nothing to do -- all children cancelled")
-            continue
-
-        for c in unmerged:
-            title = _safe(c["title"], 50)
-            print(f"    Patching {c['id'][:8]}  {title}")
-            try:
-                patch_task(c["id"], {"context": {"pr_merged": True}})
-            except Exception as e:
-                print(f"    FAILED: {e}")
-
-        print(f"  Patched {len(unmerged)} children. Rollup should trigger.")
+def cmd_trigger_rollup(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks trigger-rollup"""
+    print(
+        "DEPRECATED: tasks.py trigger-rollup is superseded.\n"
+        "Use: python scripts/blueprint.py tasks trigger-rollup <parent_id> [--yes]"
+    )
+    sys.exit(1)
 
 
 def cmd_diagnose(args):
@@ -349,63 +147,23 @@ def cmd_diagnose(args):
     sys.exit(1)
 
 
-def cmd_complete(args):
-    """Mark a task as COMPLETED with optional message."""
-    if not args:
-        print("Usage: tasks.py complete <task_id> [--message MSG]")
-        return
-    tid = args[0]
-    message = None
-    for i, a in enumerate(args):
-        if a in ("--message", "-m") and i + 1 < len(args):
-            message = args[i + 1]
-
-    t = _resolve_task(tid)
-    if not t:
-        print(f"Task '{tid}' not found.")
-        return
-
-    payload = {"status": "COMPLETED"}
-    if message:
-        payload["latest_status_message"] = message
-    try:
-        resp = patch_task(t["id"], payload)
-        print(f"  {t['id'][:8]}: {resp.get('status', 'ok')} — marked COMPLETED")
-    except Exception as e:
-        print(f"  {t['id'][:8]}: FAILED -- {e}")
+def cmd_complete(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks complete"""
+    print(
+        "DEPRECATED: tasks.py complete is superseded.\n"
+        "Use: python scripts/blueprint.py tasks complete <task_id> [--message MSG] [--yes]"
+    )
+    sys.exit(1)
 
 
-def cmd_set_status(args):
-    """Set arbitrary status on a task with optional message."""
-    if len(args) < 2:
-        print("Usage: tasks.py set-status <task_id> <STATUS> [--message MSG]")
-        print("  STATUS: QUEUED, PROVISIONING, IN_PROGRESS, EVALUATING, COMPLETED, FAILED, CANCELLED")
-        return
-    tid = args[0]
-    new_status = args[1].upper()
-    valid = {"QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING", "COMPLETED", "FAILED", "CANCELLED"}
-    if new_status not in valid:
-        print(f"Invalid status '{new_status}'. Must be one of: {', '.join(sorted(valid))}")
-        return
-
-    message = None
-    for i, a in enumerate(args):
-        if a in ("--message", "-m") and i + 1 < len(args):
-            message = args[i + 1]
-
-    t = _resolve_task(tid)
-    if not t:
-        print(f"Task '{tid}' not found.")
-        return
-
-    payload = {"status": new_status}
-    if message:
-        payload["latest_status_message"] = message
-    try:
-        resp = patch_task(t["id"], payload)
-        print(f"  {t['id'][:8]}: {t['status']} -> {resp.get('status', new_status)}")
-    except Exception as e:
-        print(f"  {t['id'][:8]}: FAILED -- {e}")
+def cmd_set_status(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks set-status"""
+    print(
+        "DEPRECATED: tasks.py set-status is superseded.\n"
+        "Use: python scripts/blueprint.py tasks set-status <task_id> <STATUS> "
+        "[--message MSG] [--yes]"
+    )
+    sys.exit(1)
 
 
 def cmd_scope(_args):
@@ -625,392 +383,79 @@ def _cmd_failures_impl(args):
         print(f"         Diagnose child failures first. Parent IDs: " + " ".join(t["id"][:8] for t in buckets["SUBTASK_FAILURES"]))
 
 
-def cmd_health(args):
-    """Check system health: autonomy state, deploy status, settings, circuit breakers."""
-    from blueprint_api import api
-
-    # Fetch all endpoints in sequence (can't parallelize in sync code)
-    settings = {}
-    try:
-        settings = api("GET", "/api/admin/settings")
-    except Exception as e:
-        print(f"  Settings fetch failed: {e}")
-
-    autonomy = {}
-    try:
-        autonomy = api("GET", "/api/admin/autonomous-status")
-    except Exception as e:
-        print(f"  Autonomy status fetch failed: {e}")
-
-    deploy = {}
-    try:
-        deploy = api("GET", "/api/admin/deploy-state")
-    except Exception as e:
-        print(f"  Deploy state fetch failed: {e}")
-
-    zone_health = {}
-    try:
-        zone_health = api("GET", "/api/admin/zone-health")
-    except Exception:
-        pass
-
-    print("=== SYSTEM HEALTH ===\n")
-
-    # Settings
-    if settings:
-        print("--- Runtime Settings ---")
-        for key in ["max_concurrent_vms", "max_retries", "max_autonomous_tasks_per_hour",
-                     "autonomous_research_interval_minutes", "autonomous_direction_cooldown_minutes",
-                     "min_research_interval_hours", "autonomous_research_model",
-                     "autonomous_research_effort"]:
-            val = settings.get(key, "?")
-            print(f"  {key}: {val}")
-        print()
-
-    # Autonomy
-    if autonomy:
-        print("--- Autonomy State ---")
-        projects = autonomy.get("projects", [])
-        for p in projects:
-            print(f"  Project: {p.get('project_name', '?')}")
-            print(f"    enabled: {p.get('autonomous_enabled')}")
-            print(f"    consecutive_failures: {p.get('consecutive_failures', 0)}")
-            print(f"    tasks_spawned_last_hour: {p.get('tasks_spawned_last_hour', 0)}")
-            print(f"    last_research_at: {p.get('last_research_at', 'never')}")
-        print()
-
-    # Deploy
-    if deploy:
-        print("--- Deploy State ---")
-        for key in ["status", "current_revision", "deployed_at",
-                     "pause_reason", "paused_at", "max_concurrent_vms",
-                     "failure_rate", "rollback_count"]:
-            val = deploy.get(key)
-            if val is not None:
-                print(f"  {key}: {val}")
-        ext = deploy.get("external_health", {})
-        if ext:
-            failed = ext.get("failed_deps", [])
-            if failed:
-                print(f"  UNHEALTHY deps: {', '.join(failed)}")
-            else:
-                print(f"  external_health: all OK")
-        monitoring = deploy.get("monitoring_window", {})
-        if monitoring:
-            pct = monitoring.get("percent", 0)
-            elapsed = monitoring.get("elapsed_seconds", 0)
-            total = monitoring.get("total_seconds", 0)
-            print(f"  monitoring_window: {elapsed}s / {total}s ({pct}%)")
-        print()
-
-    # Zone health
-    if zone_health:
-        zones = zone_health if isinstance(zone_health, dict) else {}
-        unhealthy = {z: d for z, d in zones.items()
-                     if isinstance(d, dict) and d.get("status") != "healthy"}
-        if unhealthy:
-            print("--- Zone Health (unhealthy) ---")
-            for z, d in unhealthy.items():
-                print(f"  {z}: {d.get('status')} (failures={d.get('consecutive_failures', 0)}, cooldown={d.get('cooldown_active')})")
-            print()
-
-    # Task counts
-    print("--- Task Counts ---")
-    for st in ["QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING", "FAILED"]:
-        all_t = list_tasks(status=st, limit=200)
-        print(f"  {st}: {len(all_t)}")
+def cmd_health(_args):
+    """DEPRECATED — use: python scripts/blueprint.py health deploy"""
+    print(
+        "DEPRECATED: tasks.py health is superseded.\n"
+        "  Deploy health:  python scripts/blueprint.py health deploy\n"
+        "  Autonomy state: python scripts/blueprint.py health autonomy\n"
+        "  Settings:       python scripts/blueprint.py settings"
+    )
+    sys.exit(1)
 
 
 def cmd_directions(args):
-    """Show research directions for a project. Use -v for full text."""
-    from blueprint_api import api, get_project_id
-    verbose = "-v" in args or "--verbose" in args
-    clean_args = [a for a in args if not a.startswith("-")]
-    pid = clean_args[0] if clean_args else get_project_id()
-    data = api("GET", f"/api/admin/projects/{pid}/directions")
-    dirs = data.get("directions", data) if isinstance(data, dict) else data
-    if not dirs:
-        print("No research directions configured.")
-        return
-    print(f"=== RESEARCH DIRECTIONS ({len(dirs)}) ===")
-    for d in dirs:
-        prio = d.get("priority", "?")
-        full_text = d.get("text") or d.get("summary") or "?"
-        did = d.get("id") or "?"
-        status = d.get("status", "active")
-        saturated = d.get("saturated", False)
-        sat_str = " [SATURATED]" if saturated else ""
-        status_str = f" [{status}]" if status != "active" else ""
-        history = d.get("research_history") or []
-        hist_str = f"  ({len(history)} cycles)" if history else ""
-        if verbose:
-            print(f"\n  [{prio:6}] {did}{sat_str}{status_str}{hist_str}")
-            print(f"  {full_text}")
-            notes = d.get("notes") or []
-            if notes:
-                print(f"  Notes ({len(notes)}):")
-                for n in notes[-3:]:
-                    print(f"    • {_safe(n.get('text', ''), 200)}")
-        else:
-            print(f"  [{prio:6}] {did[:8]}  {_safe(full_text, 120)}{sat_str}{hist_str}")
+    """DEPRECATED — use: python scripts/blueprint.py directions list"""
+    print(
+        "DEPRECATED: tasks.py directions is superseded.\n"
+        "  Use: python scripts/blueprint.py directions [list|show|add|update|unhold]"
+    )
+    import sys; sys.exit(1)
 
 
-def cmd_reset_iteration_cap(args):
-    """Reset the review-fix iteration cap for a stuck rollup/parking task.
-
-    Archives FAILED review/fix tasks on the PR (drops them from the global
-    count) and resets the per-chain iteration counter to 0. Use when the cap
-    tripped on infra failures rather than real review iterations.
-
-    Usage: tasks.py reset-iteration-cap <task_id>
-    """
-    from blueprint_api import api
-    if not args:
-        print("Usage: tasks.py reset-iteration-cap <task_id>")
-        return
-    tid = args[0]
-    result = api("POST", f"/api/admin/tasks/{tid}/reset-iteration-cap")
-    print(f"PR #{result.get('pr_number')}: archived {result.get('archived_count')} failed review/fix tasks, "
-          f"per-chain iteration {result.get('previous_per_chain_iteration')}->0"
-          + (" (cleared requires_approval)" if result.get('requires_approval_cleared') else ""))
+def cmd_reset_iteration_cap(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks reset-iteration-cap"""
+    print(
+        "DEPRECATED: tasks.py reset-iteration-cap is superseded.\n"
+        "Use: python scripts/blueprint.py tasks reset-iteration-cap <task_id> [--yes]"
+    )
+    sys.exit(1)
 
 
 def cmd_unhold_direction(args):
-    """Clear a direction's consecutive-failure hold.
-
-    Usage: tasks.py unhold-direction <direction_id>
-    """
-    from blueprint_api import api, get_project_id
-    if not args:
-        print("Usage: tasks.py unhold-direction <direction_id>")
-        return
-    did = args[0]
-    pid = get_project_id()
-    result = api("POST", f"/api/admin/projects/{pid}/directions/{did}/unhold")
-    was_held = result.get("was_held", False)
-    if was_held:
-        print(f"Unheld direction {did}")
-    else:
-        print(f"Direction {did} was not held (idempotent)")
+    """DEPRECATED — use: python scripts/blueprint.py directions unhold <direction_id>"""
+    print(
+        "DEPRECATED: tasks.py unhold-direction is superseded.\n"
+        "  Use: python scripts/blueprint.py directions unhold <direction_id>"
+    )
+    import sys; sys.exit(1)
 
 
 def cmd_add_direction(args):
-    """Add a new research direction.
-
-    Usage: tasks.py add-direction "direction text" [--priority high|medium|low]
-           tasks.py add-direction --text "direction text" --priority high
-    """
-    from blueprint_api import api, get_project_id
-    if not args:
-        print("Usage: tasks.py add-direction 'direction text' [--priority high|medium|low]")
-        return
-    text = None
-    priority = "medium"
-    for i, a in enumerate(args):
-        if a == "--priority" and i + 1 < len(args):
-            priority = args[i + 1]
-        elif a == "--text" and i + 1 < len(args):
-            text = args[i + 1]
-    # If no --text flag, first non-flag arg is the text
-    if text is None:
-        positional = [a for a in args if not a.startswith("--") and a not in (priority,)]
-        text = positional[0] if positional else None
-    if not text:
-        print("Error: direction text required")
-        return
-    pid = get_project_id()
-    result = api("POST", f"/api/admin/projects/{pid}/directions", {"text": text, "priority": priority})
-    d = result.get("direction", {})
-    print(f"Added direction {d.get('id', '?')} [{priority}]: {text[:80]}")
+    """DEPRECATED — use: python scripts/blueprint.py directions add "text" [--priority ...]"""
+    print(
+        "DEPRECATED: tasks.py add-direction is superseded.\n"
+        "  Use: python scripts/blueprint.py directions add \"text\" [--priority high|medium|low]"
+    )
+    import sys; sys.exit(1)
 
 
 def cmd_update_direction(args):
-    """Update a direction's text, priority, or status.
-
-    Usage:
-        tasks.py update-direction <direction_id> [--text "new text"] [--priority high|medium|low] [--status active|paused|completed]
-        tasks.py update-direction <direction_id> --reset-context        — wipe research_context
-        tasks.py update-direction <direction_id> --reset-history        — wipe research_history
-        tasks.py update-direction <direction_id> --reset-agent-notes    — remove agent-added notes (keep user notes)
-        tasks.py update-direction all --reset-all                       — full blank slate (context + history + agent notes)
-    """
-    from blueprint_api import api, get_project_id
-    if not args:
-        print("Usage: tasks.py update-direction <direction_id> [--text '...'] [--priority ...] [--status ...] [--reset-context] [--reset-history] [--reset-agent-notes] [--reset-all]")
-        return
-    did = args[0]
-    reset_all = "--reset-all" in args
-
-    def _build_reset_patch(direction_data):
-        """Build patch dict for reset flags, optionally using direction data for note filtering."""
-        patch = {}
-        if "--reset-context" in args or reset_all:
-            patch["research_context"] = "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
-        if "--reset-history" in args or reset_all:
-            patch["research_history"] = []
-        if "--reset-agent-notes" in args or reset_all:
-            notes = direction_data.get("notes", []) if direction_data else []
-            # Keep only user-added notes (no added_by_task field)
-            user_notes = [n for n in notes if not n.get("added_by_task")]
-            patch["notes"] = user_notes
-        return patch
-
-    # Handle "all" target for bulk resets
-    if did.lower() == "all":
-        pid = get_project_id()
-        dirs_data = api("GET", f"/api/admin/projects/{pid}/directions")
-        all_dirs = dirs_data if isinstance(dirs_data, list) else dirs_data.get("directions", [])
-        for d in all_dirs:
-            d_id = d.get("id", "?")
-            d_name = (d.get("text") or "?")[:50]
-            patch = _build_reset_patch(d)
-            if patch:
-                api("PATCH", f"/api/admin/projects/{pid}/directions/{d_id}", patch)
-                actions = []
-                if "research_context" in patch:
-                    actions.append("context")
-                if "research_history" in patch:
-                    actions.append("history")
-                if "notes" in patch:
-                    kept = len(patch["notes"])
-                    removed = len(d.get("notes", [])) - kept
-                    actions.append(f"notes (-{removed}, kept {kept} user)")
-                print(f"  Reset {d_id[:12]} ({d_name}): {', '.join(actions)}")
-        return
-
-    patch = {}
-    for i, a in enumerate(args):
-        if a == "--text" and i + 1 < len(args):
-            patch["text"] = args[i + 1]
-        if a == "--priority" and i + 1 < len(args):
-            patch["priority"] = args[i + 1]
-        if a == "--status" and i + 1 < len(args):
-            patch["status"] = args[i + 1]
-        if a == "--reset-context" or reset_all:
-            patch["research_context"] = "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
-        if a == "--reset-history" or reset_all:
-            patch["research_history"] = []
-        if a == "--reset-agent-notes" or reset_all:
-            # Need direction data for filtering — fetch it
-            pid_tmp = get_project_id()
-            dirs_tmp = api("GET", f"/api/admin/projects/{pid_tmp}/directions")
-            all_tmp = dirs_tmp if isinstance(dirs_tmp, list) else dirs_tmp.get("directions", [])
-            for dt in all_tmp:
-                if dt.get("id") == did:
-                    user_notes = [n for n in dt.get("notes", []) if not n.get("added_by_task")]
-                    patch["notes"] = user_notes
-                    break
-    if not patch:
-        print("Nothing to update. Use --text, --priority, or --status.")
-        return
-    pid = get_project_id()
-    result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", patch)
-    print(f"Updated {did}: {json.dumps(patch)}")
-    # Show the updated direction
-    updated = result.get("direction", {})
-    if updated:
-        print(f"  New text: {updated.get('text', '?')}")
+    """DEPRECATED — use: python scripts/blueprint.py directions update <id> [--text ...] [--priority ...] [--status ...]"""
+    print(
+        "DEPRECATED: tasks.py update-direction is superseded.\n"
+        "  Use: python scripts/blueprint.py directions update <direction_id> "
+        "[--text ...] [--priority ...] [--status ...] [--reset-context] [--reset-history] [--reset-agent-notes] [--reset-all]"
+    )
+    import sys; sys.exit(1)
 
 
-def cmd_autonomy_debug(args):
-    """Show why autonomy is or isn't spawning — blocking guards, eligible directions."""
-    from blueprint_api import api, get_project_id
-    pid = args[0] if args and not args[0].startswith("-") else get_project_id()
-    data = api("GET", f"/api/admin/projects/{pid}/autonomy-debug")
-
-    print("=== AUTONOMY DEBUG ===")
-    blocked = data.get('spawn_blocked')
-    if blocked is True:
-        print("  can_spawn: NO (blocked)")
-    elif blocked is False:
-        print("  can_spawn: YES — no guards; next tick will try to spawn")
-    else:
-        print("  can_spawn: ?")
-
-    guards = data.get('blocking_guards', [])
-    if guards:
-        print(f"\n--- Blocking Guards ({len(guards)}) ---")
-        for g in guards:
-            print(f"  {g.get('guard', '?')}: {g.get('reason', '?')}")
-            for k, v in g.items():
-                if k not in ('guard', 'reason'):
-                    print(f"    {k}: {v}")
-    else:
-        print("  No blocking guards — autonomy should spawn on next tick.")
-
-    cb = data.get('circuit_breaker', {})
-    if cb:
-        print(f"\n--- Circuit Breaker ---")
-        print(f"  state={cb.get('state')}  failures={cb.get('failure_count')}  successes={cb.get('success_count')}")
-        if cb.get('cooldown_ends_at'):
-            print(f"  cooldown_until={cb['cooldown_ends_at']}")
-
-    dirs = data.get('directions', [])
-    if dirs:
-        eligible = [d for d in dirs if d.get('is_eligible')]
-        print(f"\n--- Directions ({len(eligible)}/{len(dirs)} eligible) ---")
-        for d in dirs:
-            did = (d.get('id') or '?')[:10]
-            text = (d.get('text') or '?')[:70]
-            markers = []
-            if d.get('seconds_until_eligible'):
-                secs = d['seconds_until_eligible']
-                markers.append(f"cooldown {secs // 60}m")
-            if d.get('busy_reason'):
-                markers.append("busy")
-            if d.get('is_eligible'):
-                markers.append("eligible")
-            tag = f" [{', '.join(markers)}]" if markers else ""
-            print(f"  {did}  {text}{tag}")
-
-    spawn = data.get('spawn_readiness', {})
-    if spawn:
-        print(f"\n--- Spawn Readiness ---")
-        for k, v in spawn.items():
-            print(f"  {k}: {v}")
+def cmd_autonomy_debug(_args):
+    """DEPRECATED — use: python scripts/blueprint.py health autonomy"""
+    print(
+        "DEPRECATED: tasks.py autonomy-debug is superseded.\n"
+        "  Use: python scripts/blueprint.py health autonomy"
+    )
+    sys.exit(1)
 
 
-def cmd_archive(args):
-    """Archive old completed/failed tasks."""
-    from blueprint_api import api, all_tasks_by_status
-    if '--pipelines' in args:
-        # Archive fully-terminal pipelines: parent + all children in COMPLETED/CANCELLED
-        TERMINAL = {'COMPLETED', 'FAILED', 'CANCELLED'}
-        all_tasks = all_tasks_by_status(None, limit=1000)
-        non_archived = [t for t in all_tasks if not t.get('archived')]
-
-        # Build parent → children map
-        children_by_parent = {}
-        for t in non_archived:
-            pid = t.get('parent_task_id')
-            if pid:
-                children_by_parent.setdefault(pid, []).append(t)
-
-        # Find top-level parents (no parent themselves) that are terminal
-        top_parents = [t for t in non_archived if not t.get('parent_task_id') and t['status'] in TERMINAL]
-
-        to_archive = []
-        for parent in top_parents:
-            children = children_by_parent.get(parent['id'], [])
-            all_terminal = all(c['status'] in TERMINAL for c in children)
-            if all_terminal:
-                to_archive.append(parent['id'])
-                to_archive.extend(c['id'] for c in children)
-
-        if not to_archive:
-            print("No fully-terminal pipelines to archive.")
-            return
-        pipeline_count = sum(1 for p in top_parents if p['id'] in to_archive)
-        result = api("POST", "/api/admin/tasks/bulk-archive", {"task_ids": to_archive})
-        print(f"Archived {result.get('archived_count', '?')} tasks across {pipeline_count} pipelines.")
-        return
-
-    filter_type = 'terminal'  # default: archive all terminal tasks
-    for i, a in enumerate(args):
-        if a == '--completed':
-            filter_type = 'completed'
-    result = api("POST", "/api/admin/tasks/bulk-archive", {"filter": filter_type})
-    print(f"Archived {result.get('archived_count', '?')} tasks (filter={filter_type}).")
+def cmd_archive(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks archive"""
+    print(
+        "DEPRECATED: tasks.py archive is superseded.\n"
+        "Use: python scripts/blueprint.py tasks archive [--completed] [--pipelines] [--yes]"
+    )
+    sys.exit(1)
 
 
 def cmd_payload(_args):
@@ -1022,59 +467,13 @@ def cmd_payload(_args):
     sys.exit(1)
 
 
-def cmd_research(args):
-    """Show recent research results — findings, proposed tasks, and outcomes.
-
-    Usage:
-        tasks.py research                — last 5 completed research tasks
-        tasks.py research --limit 10     — last N
-        tasks.py research <id>           — detailed view of one research task
-        tasks.py research -v             — verbose (show full finding prompts)
-    """
-    from blueprint_api import api
-
-    verbose = "-v" in args or "--verbose" in args
-    limit = 5
-    query = None
-    for i, a in enumerate(args):
-        if a == "--limit" and i + 1 < len(args):
-            limit = int(args[i + 1])
-        elif not a.startswith("-"):
-            query = a
-
-    # Single research task detail
-    if query:
-        t = _resolve_task(query)
-        if not t:
-            print(f"Task '{query}' not found.")
-            return
-        try:
-            full = api("GET", f"/api/admin/tasks/{t['id']}")
-            t = full.get("task", full)
-        except Exception:
-            pass
-        _print_research_detail(t, verbose)
-        return
-
-    # List recent research tasks
-    all_completed = list_tasks(status="COMPLETED", limit=100)
-    all_evaluating = list_tasks(status="EVALUATING", limit=50)
-    all_failed = list_tasks(status="FAILED", limit=50)
-    research_tasks = [t for t in all_completed + all_evaluating + all_failed
-                      if t.get("task_type") == "research"][:limit]
-
-    if not research_tasks:
-        print("No recent research tasks found.")
-        return
-
-    for t in research_tasks:
-        try:
-            full = api("GET", f"/api/admin/tasks/{t['id']}")
-            t = full.get("task", full)
-        except Exception:
-            pass
-        _print_research_detail(t, verbose)
-        print()
+def cmd_research(_args):
+    """DEPRECATED — use: python scripts/blueprint.py tasks research"""
+    print(
+        "DEPRECATED: tasks.py research is superseded.\n"
+        "Use: python scripts/blueprint.py tasks research [<task_id>] [--limit N] [-v]"
+    )
+    sys.exit(1)
 
 
 def _print_research_detail(t, verbose=False):

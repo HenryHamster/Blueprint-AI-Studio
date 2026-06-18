@@ -17,7 +17,7 @@ import re
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,6 +53,8 @@ from app.compute_jobs import (
     stamp_compute_job_result_reference,
 )
 from app.artifact_prerequisites import (
+    ARTIFACT_PREREQUISITES_KEY,
+    _artifact_pointer,
     deliver_artifact_to_dependents,
     stamp_artifact_logical_key,
 )
@@ -100,6 +102,11 @@ from app.task_locking import (
     with_directions_locked,
 )
 from app.vm_cost_rates import get_vm_rate_per_second
+from app.json_extract import (  # noqa: F401  (re-exported; callers import from here)
+    _extract_json_array,
+    _extract_last_json_array,
+    _extract_json_object,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,52 +114,6 @@ logger = logging.getLogger(__name__)
 _COMPUTE_WAKE_POST_COMMIT_META_KEY = "_compute_wake_post_commit_meta"
 _COMPUTE_WAKE_NEXT_RETRY_KEY = "_compute_wake_next_retry_after"
 _COMPUTE_WAKE_MAX_ATTEMPTS = 12
-
-# VM-substrate analysis routing. When the backend-side cited-LLM attempt reports
-# the missing-backend-key ``precondition-not-met`` cause (operator policy
-# p-13f153e9 permanently forbids a backend ANTHROPIC_API_KEY), the analysis is
-# routed onto the agent-VM centralized-accounts substrate instead of grading
-# measured_only forever: the compute_experiment task is re-queued with an optional
-# request bundle stamped into ``task.context`` so the resumed handler runs the
-# ``claude`` CLI and submits the produced analysis back. Bounded by a per-task
-# attempt counter so a structurally-stuck job can never loop forever.
-_COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY = "compute_vm_analysis_request"
-_COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY = "compute_vm_analysis_attempts"
-_COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS = 12
-
-# Auto-delivery of the cited LLM analysis classifies the
-# ``analyze_compute_experiment_knowledge`` unavailable-cause tokens by whether a
-# retry could ever change the outcome.
-#
-# * TERMINAL — structurally measured-only forever: no durable artifact / no
-#   usable evidence (``no-evidence``), the analysis cited nothing durable
-#   (``citations-ungrounded``), the operator disabled it (``analysis-disabled``),
-#   or the credential precondition is absent (``precondition-not-met``). These
-#   persist a measured-only ``unavailable_cause`` and are NEVER retried.
-# * RECOVERABLE — a transient runtime/API error (``llm-error``) worth a bounded
-#   re-attempt through the existing compute-wake Pass 0 sweep until it converges
-#   on an ``llm`` upgrade or the attempt ceiling clears the marker.
-#
-# Any unrecognised reason fails closed as TERMINAL so a stuck job cannot loop the
-# LLM forever.
-_ANALYSIS_RECOVERABLE_CAUSES = frozenset({"llm-error"})
-_ANALYSIS_TERMINAL_CAUSES = frozenset(
-    {"no-evidence", "citations-ungrounded", "analysis-disabled", "precondition-not-met"}
-)
-
-
-class _ComputeKnowledgeOutcome(NamedTuple):
-    """Disposition of the best-effort durable-knowledge step for a compute task.
-
-    * ``deterministic_ok`` — the deterministic measured KnowledgeDocument is
-      durably persisted (or there was no measurement to record).
-    * ``analysis_retry_pending`` — the deterministic doc exists but the cited LLM
-      analysis hit a RECOVERABLE error; the caller should keep the durable wake
-      marker and schedule a bounded backoff retry so the sweep re-attempts.
-    """
-
-    deterministic_ok: bool
-    analysis_retry_pending: bool
 
 
 # Shared marker used by both the TypeScript agent handler (review-fix.ts
@@ -1154,94 +1115,6 @@ async def _record_remediation_if_terminal(
 # ---------------------------------------------------------------------------
 # Parser / Validator helpers
 # ---------------------------------------------------------------------------
-
-
-def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:
-    """Find the first JSON array in text containing objects with the required keys.
-
-    Uses bracket-depth counting (O(n)) instead of regex with greedy groups,
-    which can cause O(n*k) backtracking on malformed input and block the
-    async event loop for seconds.
-    """
-    # Cap input to prevent scanning megabytes of raw output
-    text = text[:500_000]
-    for key in required_keys:
-        if f'"{key}"' not in text:
-            return None
-    # Find outermost [ ... ] containing the required keys
-    start = text.find("[")
-    while start != -1:
-        depth = 0
-        in_string = False
-        escape_next = False
-        for i in range(start, len(text)):
-            c = text[i]
-            if escape_next:
-                escape_next = False
-                continue
-            if c == "\\" and in_string:
-                escape_next = True
-                continue
-            if c == '"' and not escape_next:
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if c == "[":
-                depth += 1
-            elif c == "]":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start : i + 1]
-                    if all(f'"{k}"' in candidate for k in required_keys):
-                        return candidate
-                    break  # This bracket pair didn't match, try next [
-        start = text.find("[", start + 1)
-    return None
-
-
-def _extract_last_json_array(text: str, *required_keys: str) -> Optional[str]:
-    """Find the LAST JSON array in text containing objects with the required keys.
-
-    Identical scan logic to _extract_json_array but collects all matching spans
-    and returns the last one. Used by parse_adversarial_finding_verdicts so that
-    an echoed schema/example array that appears before the real final verdict
-    array does not shadow the intended output.
-    """
-    text = text[:500_000]
-    for key in required_keys:
-        if f'"{key}"' not in text:
-            return None
-    last_match: Optional[str] = None
-    start = text.find("[")
-    while start != -1:
-        depth = 0
-        in_string = False
-        escape_next = False
-        for i in range(start, len(text)):
-            c = text[i]
-            if escape_next:
-                escape_next = False
-                continue
-            if c == "\\" and in_string:
-                escape_next = True
-                continue
-            if c == '"' and not escape_next:
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if c == "[":
-                depth += 1
-            elif c == "]":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start : i + 1]
-                    if all(f'"{k}"' in candidate for k in required_keys):
-                        last_match = candidate
-                    break
-        start = text.find("[", start + 1)
-    return last_match
 
 
 def _normalize_findings_array(parsed: Any) -> list[dict]:
@@ -2456,226 +2329,33 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 # ---------------------------------------------------------------------------
 
 
-async def _route_compute_analysis_to_vm(
-    task: Task, logs: str, criterion: Optional[dict], session: AsyncSession
-) -> bool:
-    """Re-queue a compute_experiment onto the agent-VM substrate for cited analysis.
-
-    Invoked ONLY for the missing-backend-key ``precondition-not-met`` cause. Builds
-    the authoritative analysis prompt + evidence bundle backend-side, stamps it onto
-    ``task.context`` under an OPTIONAL key, and returns the task to the dispatch
-    queue (``QUEUED``) so a fresh agent VM resumes it, runs the centralized
-    ``claude`` CLI, and submits the produced analysis back through the agent
-    endpoint (where citation grounding is re-enforced). The deterministic
-    measured_only document has already persisted and stays the durable base record.
-
-    Bounded and best-effort:
-
-    * a per-task attempt counter (``task.context``) caps re-queues at
-      ``_COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS`` so a structurally-stuck job can never
-      loop forever;
-    * a no-op when the durable doc is already an ``llm`` upgrade (a prior VM
-      submission already succeeded) or there is no durable evidence to cite;
-    * any failure rolls back and leaves the terminal measured_only outcome intact.
-
-    Returns ``True`` iff it re-queued the task.
-    """
-    from app.models import KnowledgeDocument, SourceKind
-
-    try:
-        existing = (
-            (
-                await session.execute(
-                    select(KnowledgeDocument).where(
-                        KnowledgeDocument.project_id == task.project_id,
-                        KnowledgeDocument.source_task_id == task.id,
-                        KnowledgeDocument.source_kind
-                        == SourceKind.COMPUTE_EXPERIMENT.value,
-                    )
-                )
-            )
-            .scalars()
-            .first()
-        )
-        if existing is not None:
-            mode = str(
-                (existing.forward_quality_verdict or {}).get("analysis_mode") or ""
-            )
-            if mode == "llm":
-                # Already upgraded by a prior VM submission — nothing to route.
-                return False
-
-        ctx = dict(task.context or {})
-        attempts = int(ctx.get(_COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY, 0) or 0)
-        if attempts >= _COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS:
-            logger.warning(
-                "[COMPUTE] VM analysis attempt ceiling (%d) reached for task %s; "
-                "leaving deterministic measured_only doc intact",
-                _COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS,
-                task.id,
-            )
-            return False
-
-        measurement = _extract_compute_measurement(logs)
-        if measurement is None:
-            return False
-        outcome, cost = measurement
-
-        from app.knowledge_completion import build_compute_vm_analysis_request
-
-        bundle = await build_compute_vm_analysis_request(
-            task,
-            outcome=outcome,
-            cost=cost,
-            criterion=criterion,
-            result_reference=_extract_compute_result_reference(logs),
-            session=session,
-            logs=logs,
-        )
-        if bundle is None:
-            # No durable evidence to cite — genuinely terminal, do not dispatch.
-            return False
-
-        # Carry the authoritative COMPUTE_RESULT artifact so the resumed handler
-        # can post its honest terminal completion (re-gated, upgrade-only) after
-        # submitting the analysis — the backend never has to trust the VM for it.
-        bundle["result_logs"] = logs
-
-        ctx[_COMPUTE_VM_ANALYSIS_REQUEST_CONTEXT_KEY] = bundle
-        ctx[_COMPUTE_VM_ANALYSIS_ATTEMPTS_CONTEXT_KEY] = attempts + 1
-        # Clear the slot-released marker so re-dispatch acquires a fresh slot,
-        # mirroring the RESUME wake-delivery path in task_lifecycle.deliver_wake.
-        ctx.pop("_slot_released", None)
-        task.context = ctx
-        flag_modified(task, "context")
-        task.status = TaskStatus.QUEUED
-        task.parked_at = None
-        task.park_reason = None
-        task.vm_instance_id = None
-        task.latest_status_message = (
-            "Compute analysis routed to VM substrate (centralized accounts): "
-            "backend has no Anthropic key"
-        )[:500]
-        session.add(task)
-        await session.commit()
-        logger.info(
-            "[COMPUTE] routed compute analysis for task %s to VM substrate "
-            "(attempt %d/%d)",
-            task.id,
-            attempts + 1,
-            _COMPUTE_VM_ANALYSIS_MAX_ATTEMPTS,
-        )
-        return True
-    except Exception:  # noqa: BLE001 — routing must never break completion
-        logger.warning(
-            "[COMPUTE] failed to route compute analysis to VM for task %s",
-            task.id,
-            exc_info=True,
-        )
-        with contextlib.suppress(Exception):
-            await session.rollback()
-        return False
-
-
-async def _auto_analyze_compute_experiment_best_effort(
-    task: Task,
-    logs: str,
-    criterion: Optional[dict],
-    session: AsyncSession,
-    *,
-    route_precondition_to_vm: bool = False,
-) -> str:
-    """Auto-attempt the cited LLM analysis once the deterministic doc exists.
-
-    Reuses the SAME machinery the admin analyze endpoint calls
-    (:func:`knowledge_completion.analyze_compute_experiment_knowledge`) so the
-    autonomous path and the manual operator path converge on one persisted
-    outcome — either an ``analysis_mode="llm"`` upgrade or a machine-readable
-    ``unavailable_cause`` stamp. It is strictly best-effort: it NEVER raises into
-    the completion gate, never mutates ``task.status`` or
-    ``plan_output['compute_result']``, and the task has already COMPLETED before
-    it runs, so acceptance-grade analysis is never coupled to artifact completion.
-
-    Returns a compact disposition token: ``"upgraded"`` (now llm), ``"terminal"``
-    (structurally measured-only — persisted, do NOT retry), ``"recoverable"`` (a
-    transient error worth a bounded retry), or ``"skipped"`` (no measurement).
-    """
-    measurement = _extract_compute_measurement(logs)
-    if measurement is None:
-        return "skipped"
-    outcome, cost = measurement
-    try:
-        from app.knowledge_completion import analyze_compute_experiment_knowledge
-
-        envelope = await analyze_compute_experiment_knowledge(
-            task,
-            outcome=outcome,
-            cost=cost,
-            criterion=criterion,
-            result_reference=_extract_compute_result_reference(logs),
-            session=session,
-            logs=logs,
-        )
-    except Exception:  # noqa: BLE001 — auto analysis must never break completion
-        logger.warning(
-            "[COMPUTE] Auto LLM analysis raised for task %s", task.id, exc_info=True
-        )
-        return "recoverable"
-    if (envelope or {}).get("status") == "upgraded":
-        return "upgraded"
-    reason = str((envelope or {}).get("reason") or "").strip()
-    if reason in _ANALYSIS_RECOVERABLE_CAUSES:
-        return "recoverable"
-    if reason == "precondition-not-met":
-        # The backend has no Anthropic key (operator policy p-13f153e9 permanently
-        # forbids one). Instead of grading measured_only forever, route the cited
-        # analysis onto the agent-VM centralized-accounts substrate. Only the
-        # production autonomous wake post-commit path routes (``route_precondition_to_vm``):
-        # the direct owns_commit=True completion is also the path the RESUMED VM
-        # task completes through, and re-routing there would loop. The routing is
-        # bounded internally (per-task attempt counter) and a no-op once the doc is
-        # already an llm upgrade or there is no durable evidence; either way the
-        # deterministic measured_only doc stays intact. The LLM is NOT re-attempted
-        # in-process, so this is a terminal disposition for the wake retry sweep.
-        if route_precondition_to_vm:
-            await _route_compute_analysis_to_vm(task, logs, criterion, session)
-        return "terminal"
-    # Genuinely terminal causes (no-evidence, citations-ungrounded,
-    # analysis-disabled) — and any unrecognised reason — fail closed: the
-    # measured-only outcome with its unavailable_cause is durably persisted and
-    # must not be retried so a structurally-stuck job cannot loop the LLM forever.
-    return "terminal"
-
-
 async def _persist_compute_experiment_knowledge_best_effort(
     task: Task,
     logs: str,
     criterion: Optional[dict],
     session: AsyncSession,
-    *,
-    route_precondition_to_vm: bool = False,
-) -> _ComputeKnowledgeOutcome:
-    """Persist a compute_experiment's measured verdict as durable knowledge, then
-    auto-attempt the cited LLM analysis.
+) -> bool:
+    """Persist a compute_experiment's measured verdict as durable knowledge.
 
     Best-effort, additive, and self-contained: it runs only when the experiment
     produced a measurement (terminal ``outcome`` + measured ``cost``) and records
     the verdict — including an honest negative result when the declared criterion
     was NOT met — as a queryable ``KnowledgeDocument`` discoverable as prior
-    knowledge by future research/strategist cycles. Wrapped so durable-knowledge
-    persistence can NEVER break the compute task's completion semantics.
+    knowledge by future research/strategist cycles. The deterministic capture is
+    faithful (it records the real reported metrics and any A/B arms; see
+    :func:`knowledge_completion.persist_compute_experiment_knowledge`) and applies
+    NO interpretation — judgment is the opt-in agent's job. Wrapped so
+    durable-knowledge persistence can NEVER break the compute task's completion
+    semantics.
 
-    After the deterministic record exists it autonomously attempts the cited LLM
-    analysis (:func:`_auto_analyze_compute_experiment_best_effort`). The return
-    value reports both whether the deterministic doc persisted and whether the
-    analysis hit a RECOVERABLE error worth a bounded retry through the sweep.
+    Returns ``True`` when the deterministic document is durably persisted (or
+    there was no measurement to record), ``False`` when persistence failed and a
+    bounded retry through the wake sweep is warranted.
     """
     measurement = _extract_compute_measurement(logs)
     if measurement is None:
         # No measured verdict (crash / no terminal outcome) — nothing durable to record.
-        return _ComputeKnowledgeOutcome(
-            deterministic_ok=True, analysis_retry_pending=False
-        )
+        return True
     outcome, cost = measurement
     try:
         from app.knowledge_completion import persist_compute_experiment_knowledge
@@ -2710,24 +2390,8 @@ async def _persist_compute_experiment_knowledge_best_effort(
             await session.commit()
         except Exception:  # noqa: BLE001
             pass
-        return _ComputeKnowledgeOutcome(
-            deterministic_ok=False, analysis_retry_pending=False
-        )
-    # Deterministic knowledge is durable. Autonomously attempt the cited LLM
-    # analysis so acceptance-grade delivery does not depend on an operator
-    # manually hitting the analyze endpoint — best-effort, decoupled from the
-    # already-committed completion.
-    analysis = await _auto_analyze_compute_experiment_best_effort(
-        task,
-        logs,
-        criterion,
-        session,
-        route_precondition_to_vm=route_precondition_to_vm,
-    )
-    return _ComputeKnowledgeOutcome(
-        deterministic_ok=True,
-        analysis_retry_pending=(analysis == "recoverable"),
-    )
+        return False
+    return True
 
 
 async def _finalize_compute_experiment(
@@ -2871,15 +2535,12 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
             return False
         logs = build_compute_result_logs(job)
         criterion = (task.context or {}).get("compute_success_criterion")
-        knowledge = await _persist_compute_experiment_knowledge_best_effort(
-            task, logs, criterion, session, route_precondition_to_vm=True
+        persisted = await _persist_compute_experiment_knowledge_best_effort(
+            task, logs, criterion, session
         )
-        if not knowledge.deterministic_ok or knowledge.analysis_retry_pending:
-            # Either durable knowledge did not persist, OR it persisted but the
-            # cited LLM analysis hit a RECOVERABLE error. Keep the durable marker
-            # and schedule a bounded backoff retry so Pass 0 re-attempts until it
-            # converges on an llm upgrade or the attempt ceiling clears the marker
-            # (leaving a terminal measured-only outcome). Bounded by
+        if not persisted:
+            # Durable knowledge did not persist. Keep the durable marker and
+            # schedule a bounded backoff retry so Pass 0 re-attempts. Bounded by
             # _COMPUTE_WAKE_MAX_ATTEMPTS so a stuck job never retries forever.
             with contextlib.suppress(Exception):
                 await _schedule_post_commit_backoff(session, registration, attempts)
@@ -2907,6 +2568,224 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
             attempts = int(marker_meta.get("attempts", 0) or 0)
             await _schedule_post_commit_backoff(session, registration, attempts)
         return False
+
+
+# Terminal outcomes that are INTENTIONAL kills (the substrate deliberately stopped
+# the job by budget/deadline, or it was cancelled). An unmeasured declared metric
+# under one of these is EXPECTED — the experiment never got to finish — so it must
+# NOT trip the loud unmeasured-criterion failure; it stays a clean terminal outcome
+# exactly as today. A genuine SUCCESS (or FAILURE) with an unmeasured declared
+# metric is the misleading state the loud failure exists to catch.
+_COMPUTE_INTENTIONAL_KILL_OUTCOMES: frozenset[str] = frozenset(
+    {"SPEND_CAP_EXCEEDED", "TIMED_OUT", "CANCELLED"}
+)
+
+
+def _is_unmeasured_declared_metric(task: Task, criterion: Optional[dict]) -> bool:
+    """True when ``task`` declared a kind=metric criterion that produced NO value.
+
+    The loud unmeasured-criterion failure applies ONLY to ``kind="metric"``
+    criteria that came back unmeasurable (no numeric value in the terminal
+    result). It explicitly excludes:
+
+      * ``kind="artifact_produced"`` criteria — they gate on ``durable_file_count``
+        through the artifact-delivery path, not a reported numeric metric;
+      * a measured criterion (real numeric ``value``) that merely missed its
+        threshold — that is faithfully recorded negative evidence, not a failure;
+      * the no-criterion case — presence-based behavior is preserved.
+    """
+    if not isinstance(criterion, dict):
+        return False
+    # measurable is False ONLY when the metric was absent/non-numeric in the
+    # result. A measured-but-missed criterion has measurable True and is evidence.
+    if criterion.get("measurable") is not False:
+        return False
+    payload = task.first_payload or {}
+    raw = payload.get("success_criterion") if isinstance(payload, dict) else None
+    if not isinstance(raw, dict):
+        return False
+    kind = str(raw.get("kind") or "metric")
+    return kind == "metric"
+
+
+# Context key stamped on a spawned reason-and-ship follow-on identifying its
+# originating compute_experiment. Doubles as the replay guard so a re-dispatched
+# completion never spawns a duplicate follow-on — mirroring security_audit's
+# ``security_audit_task_id`` marker.
+_ACT_ON_VERDICT_SOURCE_KEY = "act_on_verdict_source_task_id"
+
+# Cap on the raw faithful-capture bytes embedded in the follow-on prompt so the
+# spawned create task's payload stays comfortably under the payload byte budget
+# (_MAX_PAYLOAD_BYTES). The structured compute_result is always included in full;
+# only the raw result record is truncated.
+_ACT_ON_VERDICT_LOG_CHARS = 16000
+
+
+def _build_act_on_verdict_prompt(
+    task: Task, compute_result: dict[str, Any], logs: str
+) -> str:
+    """Author the fresh reason-and-ship follow-on agent's prompt.
+
+    Embeds the experiment identity, the ORIGINAL hypothesis/goal/criterion from
+    the originating payload, and the FULL faithful results (both arms + real
+    numbers from the captured ``compute_result`` and the raw result record) so a
+    fresh, independent agent can judge whether the result warrants a change. No
+    success rubric and no A-vs-B verdict is hardcoded — that judgment is the
+    agent's job.
+    """
+    payload = task.first_payload or {}
+    experiment = payload.get("experiment") or "(unnamed experiment)"
+    benchmark = payload.get("benchmark")
+    hypothesis = payload.get("hypothesis") or "(no explicit hypothesis declared)"
+    metric = payload.get("metric")
+    success_criterion = payload.get("success_criterion")
+
+    lines = [
+        "You are a fresh, independent engineer acting on a COMPLETED compute "
+        "experiment. Reason over its results and SHIP in this same task.",
+        "",
+        f"Experiment: {experiment}",
+    ]
+    if benchmark:
+        lines.append(f"Benchmark: {benchmark}")
+    lines.append(f"Originating experiment task id: {task.id}")
+    lines.append("")
+    lines.append(f"Original hypothesis / goal:\n{hypothesis}")
+    if metric:
+        lines.append(f"\nDeclared metric: {metric}")
+    if success_criterion is not None:
+        lines.append(
+            "\nDeclared success criterion:\n"
+            + json.dumps(success_criterion, indent=2, default=str)
+        )
+    lines.append("")
+    lines.append(
+        "Full experiment results (faithful capture — both A/B arms and the real "
+        "numbers):\n" + json.dumps(compute_result, indent=2, default=str)
+    )
+    raw = (logs or "").strip()
+    if raw:
+        if len(raw) > _ACT_ON_VERDICT_LOG_CHARS:
+            raw = raw[:_ACT_ON_VERDICT_LOG_CHARS] + "\n…(truncated)…"
+        lines.append("\nRaw result record:\n" + raw)
+    lines.append("")
+    lines.append(
+        "Reason about whether this result warrants a change to the codebase. "
+        "Compare the arms yourself — do NOT assume a success rubric. If the "
+        "result warrants a change, implement it and open a PR. If it does not, "
+        "conclude with a recorded no-op that explains why the result does not "
+        "warrant a change."
+    )
+    return "\n".join(lines)
+
+
+async def _spawn_act_on_verdict_followon(
+    session: AsyncSession,
+    task: Task,
+    compute_result: dict[str, Any],
+    logs: str,
+) -> Task | None:
+    """Spawn ONE write-capable reason-and-ship follow-on for a completed experiment.
+
+    Mirrors the security_audit completion→spawn-create pattern: builds a
+    ``type=create`` child (``created_by="ORCHESTRATOR"``, ``QUEUED``,
+    ``requires_approval=False``, ``parent_task_id=task.id``), records a SPAWNED
+    ``TaskHistory`` row, and — when the experiment produced a durable
+    COMPUTE_RESULT artifact — wires that artifact forward into the child's
+    ``context[artifact_prerequisites]`` (Pillar 5 spawn-forward) using the
+    canonical artifact-pointer shape, so the follow-on arrives with a fetchable
+    pointer it can resolve via ``GET /api/agent/artifacts/download-url``.
+
+    The ORCHESTRATOR does this spawn; the strategist allowlist
+    (``task_capabilities.strategist_spawnable``) is deliberately NOT touched.
+
+    Idempotent: if a follow-on for this task already exists (a prior completion
+    attempt committed it before dying), returns it without spawning a duplicate.
+    The caller adds nothing else to the session before its single commit, so the
+    child INSERT + parent advance land atomically.
+    """
+    existing_children = (
+        (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    for ct in existing_children:
+        if (ct.context or {}).get(_ACT_ON_VERDICT_SOURCE_KEY) == str(task.id):
+            logger.info(
+                "[COMPUTE] act_on_verdict follow-on already spawned for task %s; "
+                "skipping duplicate",
+                task.id,
+            )
+            return ct
+
+    project = await session.get(Project, task.project_id)
+    base_branch = (task.first_payload or {}).get(
+        "base_branch"
+    ) or get_project_integration_branch(project)
+    create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
+    prompt = _build_act_on_verdict_prompt(task, compute_result, logs)
+
+    context: dict[str, Any] = {_ACT_ON_VERDICT_SOURCE_KEY: str(task.id)}
+    # Pillar 5 spawn-forward: when a durable COMPUTE_RESULT artifact exists, stamp
+    # its canonical pointer onto the follow-on so the fresh agent can mint a signed
+    # URL. Best-effort: a missing/unresolvable artifact must not block the spawn.
+    artifact_id = compute_result.get("artifact_id")
+    if artifact_id:
+        try:
+            artifact = await session.get(Artifact, uuid.UUID(str(artifact_id)))
+        except (ValueError, TypeError):
+            artifact = None
+        if artifact is not None:
+            context[ARTIFACT_PREREQUISITES_KEY] = [
+                _artifact_pointer(artifact, str(task.id))
+            ]
+
+    child = Task(
+        project_id=task.project_id,
+        title=f"act-on-verdict: {(task.first_payload or {}).get('experiment') or 'compute experiment'}"[
+            :200
+        ],
+        description=(
+            "Reason over a completed compute experiment's results and ship if warranted"
+        ),
+        parent_task_id=task.id,
+        payloads=[
+            validate_internal_payload(
+                {
+                    "type": "create",
+                    "prompt": prompt,
+                    "base_branch": base_branch,
+                    **({"prompt_suffix": create_suffix} if create_suffix else {}),
+                },
+                "task_completion:act_on_verdict",
+            )
+        ],
+        context=context,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        requires_approval=False,  # review/CI gate handles quality on its own PR
+        depends_on=[],
+    )
+    session.add(child)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=child.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "ACT_ON_VERDICT",
+                "parent_experiment_id": str(task.id),
+            },
+        )
+    )
+    logger.info(
+        "[COMPUTE] Spawned act_on_verdict reason-and-ship follow-on %s for "
+        "experiment %s",
+        child.id,
+        task.id,
+    )
+    return child
 
 
 async def _handle_compute_experiment_completion(
@@ -3120,6 +2999,47 @@ async def _handle_compute_experiment_completion(
                 owns_commit=owns_commit,
             )
             return
+        # LOUD: a declared kind=metric success_criterion that produced no numeric
+        # value must terminate as a measurable FAILURE — never complete clean as
+        # the misleading 'outcome=SUCCESS / goal missed (value=null)'. The
+        # criterion evidence is already recorded on plan_output above. Excludes
+        # kind=artifact_produced (gated on durable_file_count) and intentional
+        # budget/deadline/cancel kills (those stay exactly as today). A
+        # measured-but-missed criterion is evidence, not this failure.
+        if (
+            _is_unmeasured_declared_metric(task, criterion)
+            and outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES
+        ):
+            from app.failure_classification import (  # noqa: PLC0415
+                COMPUTE_UNMEASURED_CRITERION,
+                persist_failure_category,
+            )
+
+            metric_name = (criterion or {}).get("metric")
+            miss_reason = (
+                f"compute_unmeasured_criterion: declared metric {metric_name!r} "
+                f"produced no numeric value (outcome={outcome}); the experiment "
+                f"ran but the declared hypothesis was never measured"
+            )
+            record_failed_gate(
+                task,
+                EvaluationVerdict(False, miss_reason, "compute-unmeasured-criterion"),
+            )
+            persist_failure_category(task, COMPUTE_UNMEASURED_CRITERION)
+            logger.info(
+                "[COMPUTE] Task %s failed loud (unmeasured declared metric): %s",
+                task.id,
+                miss_reason,
+            )
+            await _finalize_compute_experiment(
+                session,
+                task,
+                TaskStatus.FAILED,
+                logs,
+                criterion,
+                owns_commit=owns_commit,
+            )
+            return
         task.latest_status_message = (
             f"Compute experiment terminal: outcome={outcome}, "
             f"final_cost=${cost}, artifact_delivery={delivery['durability']}"
@@ -3128,15 +3048,37 @@ async def _handle_compute_experiment_completion(
         task.latest_status_message = "Compute experiment completed"
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
-    task.status = TaskStatus.COMPLETED
-    logger.info("[COMPUTE] Task %s delivered a compute artifact and completed", task.id)
+
+    # Axis B (opt-in): when the originating payload set ``act_on_verdict``, the
+    # ORCHESTRATOR spawns ONE write-capable reason-and-ship follow-on over this
+    # experiment's faithful result and the parent advances to EVALUATING to await
+    # it (mirroring the security_audit completion→spawn-create pattern). Faithful
+    # capture (axis A) below runs in BOTH cases — ``act_on_verdict`` ONLY gates the
+    # immediate follow-on spawn, never the capture. Absent/false: complete clean.
+    final_status = TaskStatus.COMPLETED
+    if bool((task.first_payload or {}).get("act_on_verdict")):
+        child = await _spawn_act_on_verdict_followon(
+            session, task, plan_output.get("compute_result") or {}, logs
+        )
+        if child is not None:
+            final_status = TaskStatus.EVALUATING
+            task.latest_status_message = (
+                f"Compute experiment terminal; spawned reason-and-ship "
+                f"follow-on {child.id}"
+            )[:500]
+    task.status = final_status
+    logger.info(
+        "[COMPUTE] Task %s delivered a compute artifact (status=%s)",
+        task.id,
+        final_status,
+    )
     # Persist the measured verdict as durable, queryable knowledge so future
     # research/strategist cycles can discover that this experiment already ran
     # and what it found, the same way web_research/design results survive.
     await _finalize_compute_experiment(
         session,
         task,
-        TaskStatus.COMPLETED,
+        final_status,
         logs,
         criterion,
         owns_commit=owns_commit,
@@ -3155,43 +3097,6 @@ _PANEL_REVIEW_REQUIRED_LENSES = (
     "test_coverage",
 )
 _PANEL_REVIEW_ARTIFACT_TYPE = "PANEL_REVIEW_VERDICT"
-
-
-def _extract_json_object(text: str, *required_keys: str) -> Optional[str]:
-    """Find the first balanced JSON object in ``text`` containing ``required_keys``."""
-    text = text[:500_000]
-    for key in required_keys:
-        if f'"{key}"' not in text:
-            return None
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        in_string = False
-        escape_next = False
-        for i in range(start, len(text)):
-            c = text[i]
-            if escape_next:
-                escape_next = False
-                continue
-            if c == "\\" and in_string:
-                escape_next = True
-                continue
-            if c == '"' and not escape_next:
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start : i + 1]
-                    if all(f'"{key}"' in candidate for key in required_keys):
-                        return candidate
-                    break
-        start = text.find("{", start + 1)
-    return None
 
 
 def _normalize_panel_review_verdict(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:

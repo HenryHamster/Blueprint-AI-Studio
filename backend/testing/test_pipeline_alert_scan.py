@@ -312,10 +312,8 @@ class TestStrategicCycleStarvation:
     @pytest.mark.asyncio
     async def test_fires_for_autonomous_project_with_no_cycle(self, db_session):
         """An older autonomous project with no StrategicCycle in window gets one WARNING."""
-        from app.reaper import (
-            _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
-            _sweep_strategic_cycle_starvation,
-        )
+        from app.reaper import _sweep_strategic_cycle_starvation
+        from app.reaper_sweeps import _STRATEGIC_CYCLE_STALL_ALERT_TITLE
 
         now = _utcnow()
         project = make_project(
@@ -338,10 +336,8 @@ class TestStrategicCycleStarvation:
     @pytest.mark.asyncio
     async def test_no_alert_when_recent_cycle_exists(self, db_session):
         """A recent StrategicCycle row suppresses the starvation alert."""
-        from app.reaper import (
-            _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
-            _sweep_strategic_cycle_starvation,
-        )
+        from app.reaper import _sweep_strategic_cycle_starvation
+        from app.reaper_sweeps import _STRATEGIC_CYCLE_STALL_ALERT_TITLE
 
         now = _utcnow()
         project = make_project(
@@ -370,10 +366,8 @@ class TestStrategicCycleStarvation:
     @pytest.mark.asyncio
     async def test_skips_new_project_within_window(self, db_session):
         """A brand-new autonomous project (younger than the window) is not flagged."""
-        from app.reaper import (
-            _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
-            _sweep_strategic_cycle_starvation,
-        )
+        from app.reaper import _sweep_strategic_cycle_starvation
+        from app.reaper_sweeps import _STRATEGIC_CYCLE_STALL_ALERT_TITLE
 
         now = _utcnow()
         project = make_project(
@@ -393,10 +387,8 @@ class TestStrategicCycleStarvation:
     @pytest.mark.asyncio
     async def test_skips_non_autonomous_project(self, db_session):
         """A non-autonomous project is never flagged, even with no cycles."""
-        from app.reaper import (
-            _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
-            _sweep_strategic_cycle_starvation,
-        )
+        from app.reaper import _sweep_strategic_cycle_starvation
+        from app.reaper_sweeps import _STRATEGIC_CYCLE_STALL_ALERT_TITLE
 
         now = _utcnow()
         project = make_project(
@@ -416,10 +408,8 @@ class TestStrategicCycleStarvation:
     @pytest.mark.asyncio
     async def test_deduped_on_second_sweep(self, db_session):
         """A second sweep with an open starvation alert does not duplicate it."""
-        from app.reaper import (
-            _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
-            _sweep_strategic_cycle_starvation,
-        )
+        from app.reaper import _sweep_strategic_cycle_starvation
+        from app.reaper_sweeps import _STRATEGIC_CYCLE_STALL_ALERT_TITLE
 
         now = _utcnow()
         project = make_project(
@@ -448,10 +438,8 @@ class TestStrategicCycleStarvation:
         """The batched (non-N+1) sweep flags only the starved project when several
         projects with mixed cycle/alert state are scanned together: one starved,
         one with a recent cycle, one with an existing open alert."""
-        from app.reaper import (
-            _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
-            _sweep_strategic_cycle_starvation,
-        )
+        from app.reaper import _sweep_strategic_cycle_starvation
+        from app.reaper_sweeps import _STRATEGIC_CYCLE_STALL_ALERT_TITLE
 
         now = _utcnow()
         old = now - timedelta(days=10)

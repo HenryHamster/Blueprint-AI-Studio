@@ -28,7 +28,6 @@ from app.payload_schemas import (
     PayloadTooLargeError,
     _MAX_PAYLOAD_BYTES,
 )
-from app.routers.admin_analytics import _derive_completed_at
 import app.shared_state as _shared_state
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
@@ -141,6 +140,7 @@ async def _project_spend_ceiling_spawn_defer_reason(
             session,
             window_spend_usd=recent_spend,
             ceiling_usd=spend_ceiling,
+            spend_window_days=spend_window_days,
         )
         return (
             f"project spend ceiling reached: ${recent_spend:.2f}/${spend_ceiling:.2f} "
@@ -156,6 +156,7 @@ async def _project_spend_ceiling_spawn_defer_reason(
             window_spend_usd=recent_spend,
             ceiling_usd=spend_ceiling,
             warning_fraction=warning_fraction,
+            spend_window_days=spend_window_days,
         )
     return None
 
@@ -308,60 +309,6 @@ async def _undirected_research_recently_active(project_id, session) -> bool:
         )
     ).scalar() or 0
     return recent > 0
-
-
-async def _directed_research_recently_completed(
-    project_id, direction_id: str, session
-) -> bool:
-    """True when a directed research task for this direction COMPLETED within the
-    cooldown window.
-
-    Protects against re-commissioning when ``_handle_research_completion`` dies
-    before it can update ``last_researched_at`` on the direction — the
-    direction-level cooldown guard then sees no cooldown and allows a re-spawn
-    (incident 2026-06-10: tasks 55ed71f5 / 32758199 both completed childless
-    within 80 min of the successful cycle 63231d77 on the same direction).
-
-    Mirrors ``_undirected_research_recently_active`` for the directed case; the
-    undirected guard already covers all statuses, so this companion only checks
-    COMPLETED.  Set ``completed_research_cooldown_minutes`` <= 0 to disable.
-
-    Absent an explicit ``completed_research_cooldown_minutes`` value the window
-    derives from the operator's ``autonomous_direction_cooldown_minutes`` knob
-    (same single-knob semantics as the refractory derivation in
-    research_direction_state.py) instead of a hardcoded constant — otherwise
-    this guard silently outlives every operator-tuned cooldown and holds all
-    recently-cycled directions at once.
-    """
-    cooldown_minutes = _runtime_config.get("completed_research_cooldown_minutes")
-    if not isinstance(cooldown_minutes, (int, float)) or isinstance(
-        cooldown_minutes, bool
-    ):
-        cooldown_minutes = _runtime_config.get(
-            "autonomous_direction_cooldown_minutes", 120
-        )
-        if not isinstance(cooldown_minutes, (int, float)) or isinstance(
-            cooldown_minutes, bool
-        ):
-            cooldown_minutes = 120.0
-    if cooldown_minutes <= 0:
-        return False
-    cutoff = _utcnow() - timedelta(minutes=cooldown_minutes)
-    completed = (
-        await session.execute(
-            select(Task).where(
-                Task.project_id == project_id,
-                Task.status == TaskStatus.COMPLETED,
-                Task.payloads[0]["type"].as_string() == "research",
-                Task.payloads[0]["current_direction_id"].as_string()
-                == str(direction_id),
-            )
-        )
-    ).scalars()
-    for task in completed:
-        if _derive_completed_at(task) >= cutoff:
-            return True
-    return False
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
@@ -518,9 +465,109 @@ async def _fetch_direction_reasoning_memos(
     return result
 
 
+async def _check_half_open_test_task(
+    project_id: uuid.UUID,
+    session: AsyncSession,
+    breaker: dict,
+) -> bool:
+    """Check a HALF_OPEN circuit breaker's test task for failure conditions.
+
+    Handles two failure modes: stuck-for-30m+ and deleted/reaped.  In either
+    case the breaker is mutated back to OPEN (with doubled cooldown) and an
+    alert is created.
+
+    Returns True when the breaker was re-opened — the caller must return
+    immediately.  Returns False when the test task is still in-flight and the
+    caller may proceed normally.
+
+    Must only be called when breaker["state"] == "HALF_OPEN".
+    """
+    from app.alert_dispatch import _maybe_create_circuit_breaker_alert
+
+    test_id = breaker.get("half_open_task_id")
+    if not test_id:
+        return False
+
+    test_task = await session.get(Task, uuid.UUID(test_id))
+    if (
+        test_task
+        and test_task.started_at
+        and (_utcnow() - test_task.started_at).total_seconds() > 1800
+    ):
+        logger.warning(
+            f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN"
+        )
+        breaker["state"] = "OPEN"
+        breaker["opened_at"] = _utcnow()
+        breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
+        breaker["half_open_task_id"] = None
+        await _maybe_create_circuit_breaker_alert(
+            project_id,
+            session,
+            f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
+        )
+        return True
+    elif not test_task:
+        logger.warning(
+            f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} no longer exists (deleted/reaped) → OPEN"
+        )
+        breaker["state"] = "OPEN"
+        breaker["opened_at"] = _utcnow()
+        breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
+        breaker["half_open_task_id"] = None
+        await _maybe_create_circuit_breaker_alert(
+            project_id,
+            session,
+            f"HALF_OPEN test task deleted/reaped — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
+        )
+        return True
+
+    return False
+
+
+async def _advance_circuit_breaker_and_check(
+    project: "Project",
+    session: AsyncSession,
+    breaker: dict,
+    spawn_label: str,
+) -> bool:
+    """Advance OPEN→HALF_OPEN if cooldown elapsed; re-check HALF_OPEN test task.
+
+    Returns True if the circuit breaker is blocking the spawn (caller should
+    return immediately), False if spawn is allowed to proceed.
+    """
+    if breaker["state"] == "OPEN":
+        if (
+            breaker["opened_at"]
+            and (_utcnow() - breaker["opened_at"]).total_seconds()
+            >= breaker["cooldown_seconds"]
+        ):
+            breaker["state"] = "HALF_OPEN"
+            logger.warning(
+                f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)"
+            )
+        else:
+            logger.warning(
+                f"[CIRCUIT BREAKER] Skipping {spawn_label} for project={project.id} "
+                f"— circuit breaker state=OPEN (still in cooldown)"
+            )
+            await _maybe_notify_operator_refresh_deferred(
+                project, session, "paused while the research circuit breaker is open"
+            )
+            return True
+    elif breaker["state"] == "HALF_OPEN":
+        if await _check_half_open_test_task(project.id, session, breaker):
+            await _maybe_notify_operator_refresh_deferred(
+                project,
+                session,
+                "paused while the research circuit breaker is open",
+            )
+            return True
+    return False
+
+
 async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     """Inner implementation — always called under the per-project spawn lock."""
-    from app.alert_dispatch import _maybe_create_circuit_breaker_alert
     from app.research_completion import (
         _compute_momentum_factor,
         _compute_productivity_score,
@@ -580,87 +627,16 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         )
         return
     # Guard: circuit breaker must allow spawning
+    # A struggling project (breaker OPEN) is exactly when an operator is
+    # most likely to steer; never swallow that silently. Notify (once)
+    # that steering is queued while the breaker cools down. The marker is
+    # preserved — only the spawn returns — so steering still lands once
+    # the breaker clears.
     breaker = _shared_state.get_circuit_breaker(str(project.id))
-    if breaker["state"] == "OPEN":
-        # Check if cooldown has elapsed → transition to HALF-OPEN
-        if (
-            breaker["opened_at"]
-            and (_utcnow() - breaker["opened_at"]).total_seconds()
-            >= breaker["cooldown_seconds"]
-        ):
-            breaker["state"] = "HALF_OPEN"
-            logger.warning(
-                f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)"
-            )
-        else:
-            logger.warning(
-                f"[CIRCUIT BREAKER] Skipping autonomous research spawn for project={project.id} "
-                f"— circuit breaker state=OPEN (still in cooldown)"
-            )
-            # A struggling project (breaker OPEN) is exactly when an operator is
-            # most likely to steer; never swallow that silently. Notify (once)
-            # that steering is queued while the breaker cools down. The marker is
-            # preserved — only the spawn returns — so steering still lands once
-            # the breaker clears.
-            await _maybe_notify_operator_refresh_deferred(
-                project, session, "paused while the research circuit breaker is open"
-            )
-            return  # Still in cooldown
-    elif breaker["state"] == "HALF_OPEN":
-        # Check if existing test task is stuck — treat as failure after 30 min
-        test_id = breaker.get("half_open_task_id")
-        if test_id:
-            test_task = await session.get(Task, uuid.UUID(test_id))
-            if (
-                test_task
-                and test_task.started_at
-                and (_utcnow() - test_task.started_at).total_seconds() > 1800
-            ):
-                logger.warning(
-                    f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN"
-                )
-                breaker["state"] = "OPEN"
-                breaker["opened_at"] = _utcnow()
-                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
-                breaker["half_open_task_id"] = None
-                await _maybe_create_circuit_breaker_alert(
-                    project.id,
-                    session,
-                    f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
-                )
-                # Re-opened breaker is still a circuit-breaker halt: surface the
-                # deferral to any pending operator steering (once). Marker is
-                # preserved. Placed after the breaker mutation/alert so the
-                # helper's commit also flushes the alert.
-                await _maybe_notify_operator_refresh_deferred(
-                    project,
-                    session,
-                    "paused while the research circuit breaker is open",
-                )
-                return  # Back to cooldown
-            elif not test_task:
-                logger.warning(
-                    f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} no longer exists (deleted/reaped) → OPEN"
-                )
-                breaker["state"] = "OPEN"
-                breaker["opened_at"] = _utcnow()
-                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
-                breaker["half_open_task_id"] = None
-                await _maybe_create_circuit_breaker_alert(
-                    project.id,
-                    session,
-                    f"HALF_OPEN test task deleted/reaped — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
-                )
-                # Re-opened breaker is still a circuit-breaker halt: surface the
-                # deferral to any pending operator steering (once). Marker is
-                # preserved. Placed after the breaker mutation/alert so the
-                # helper's commit also flushes the alert.
-                await _maybe_notify_operator_refresh_deferred(
-                    project,
-                    session,
-                    "paused while the research circuit breaker is open",
-                )
-                return  # Back to cooldown
+    if await _advance_circuit_breaker_and_check(
+        project, session, breaker, "autonomous research spawn"
+    ):
+        return
     # Guard: defer autonomous research until repo_bootstrap completes for external-repo
     # projects. Strategic cycles already defer this way; keeping research consistent
     # prevents ungrounded findings against a half-onboarded repo. Terminal bootstraps
@@ -681,7 +657,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         return
 
     # Guard: must have active directions that aren't in cooldown or mid-cycle
-    cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
     now = _utcnow()
 
     # Build set of direction IDs that already have an active research cycle.
@@ -884,7 +859,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     active_directions = await _process_direction_lifecycle(
         project,
         session,
-        cooldown_minutes,
         busy_direction_ids,
         now,
     )
@@ -1403,32 +1377,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         is_strategic = False
 
     if is_strategic:
-        from sqlalchemy import func as _strat_func
+        from app.task_lifecycle import _has_active_strategic_task
 
-        has_active_strategic = (
-            await session.execute(
-                select(_strat_func.count())
-                .select_from(Task)
-                .where(
-                    Task.project_id == project.id,
-                    Task.payloads[0]["type"]
-                    .as_string()
-                    .in_(sorted(STRATEGIC_TASK_TYPES)),
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                            TaskStatus.EVALUATING,
-                        ]
-                    ),
-                )
-            )
-        ).scalar() or 0
-        if has_active_strategic > 0:
+        has_active_strategic = await _has_active_strategic_task(project.id, session)
+        if has_active_strategic:
             logger.debug(
-                f"[STRATEGIC] Skipping strategic spawn — {has_active_strategic} active "
-                f"strategic task(s) exist for project {project.id}; falling through to tactical"
+                f"[STRATEGIC] Skipping strategic spawn — active strategic task exists for "
+                f"project {project.id}; falling through to tactical"
             )
             # An operator steering request is deferred behind the running cycle
             # (it will consume on the follow-up tick). Surface that once so the
@@ -1442,6 +1397,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 False  # skip the spawn block; tactical research below may still fire
             )
         else:
+            from sqlalchemy import func as _strat_func
+
             cooldown_minutes = _runtime_config.get(
                 "strategic_spawn_cooldown_minutes", 30
             )
@@ -1931,22 +1888,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         current_dir_id = (
             None if chosen_direction is None else chosen_direction.get("id")
         )
-        # Guard: skip directed research that recently COMPLETED — covers the gap
-        # when _handle_research_completion fails before updating last_researched_at
-        # on the direction (incident 2026-06-10: 3x same-direction re-runs within
-        # 80 min). Undirected research is already covered by
-        # _undirected_research_recently_active above.
-        if current_dir_id is not None and await _directed_research_recently_completed(
-            project.id, current_dir_id, session
-        ):
-            logger.info(
-                "[AUTONOMOUS] Skipping research for project %s direction %s "
-                "— a research task on this direction completed within the "
-                "cooldown window.",
-                project.id,
-                current_dir_id,
-            )
-            continue
         direction_summaries = []
         for d in all_active_directions:
             summary: dict = {
@@ -2639,7 +2580,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
 async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncSession):
     """Spawn a periodic non-research task (qa, security_audit, deps) if its schedule is due."""
-    from app.alert_dispatch import _maybe_create_circuit_breaker_alert
     from sqlalchemy import func
 
     # Guard: task_type must be a known type
@@ -2662,44 +2602,10 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
 
     # Guard: circuit breaker must allow spawning
     breaker = _shared_state.get_circuit_breaker(str(project.id))
-    if breaker["state"] == "OPEN":
-        if (
-            breaker["opened_at"]
-            and (_utcnow() - breaker["opened_at"]).total_seconds()
-            >= breaker["cooldown_seconds"]
-        ):
-            breaker["state"] = "HALF_OPEN"
-            logger.warning(
-                f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)"
-            )
-        else:
-            logger.warning(
-                f"[CIRCUIT BREAKER] Skipping periodic task spawn (type={task_type}) for project={project.id} "
-                f"— circuit breaker state=OPEN (still in cooldown)"
-            )
-            return  # Still in cooldown
-    elif breaker["state"] == "HALF_OPEN":
-        test_id = breaker.get("half_open_task_id")
-        if test_id:
-            test_task = await session.get(Task, uuid.UUID(test_id))
-            if (
-                test_task
-                and test_task.started_at
-                and (_utcnow() - test_task.started_at).total_seconds() > 1800
-            ):
-                logger.warning(
-                    f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN"
-                )
-                breaker["state"] = "OPEN"
-                breaker["opened_at"] = _utcnow()
-                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
-                breaker["half_open_task_id"] = None
-                await _maybe_create_circuit_breaker_alert(
-                    project.id,
-                    session,
-                    f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
-                )
-                return
+    if await _advance_circuit_breaker_and_check(
+        project, session, breaker, f"periodic task spawn (type={task_type})"
+    ):
+        return
 
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(
         task_type, {}
@@ -2922,6 +2828,7 @@ async def _check_autonomous_research(owner: str, repo: str):
 # ---------------------------------------------------------------------------
 from app.autonomous_research_residual import (
     _spawn_residual_fingerprint_remediation,
+    _spawn_viewport_regression_remediation,
 )
 
 
@@ -3024,6 +2931,7 @@ async def _check_idle_research():
                     )
                 else:
                     await _spawn_residual_fingerprint_remediation(project, session)
+                    await _spawn_viewport_regression_remediation(project, session)
                 await session.commit()
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)

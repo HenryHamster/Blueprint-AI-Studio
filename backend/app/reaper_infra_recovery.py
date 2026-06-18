@@ -27,7 +27,7 @@ from app.shared_state import (
     external_health as _external_health,
     runtime_config as _runtime_config,
 )
-from app.time_utils import RETRY_AFTER_MAX_MINUTES, _utcnow
+from app.time_utils import RETRY_AFTER_MAX_MINUTES, _utcnow, clear_retry_after
 
 logger = logging.getLogger(__name__)
 
@@ -415,14 +415,15 @@ async def run_infra_recovery_and_hold_maintenance(
             _new_ctx.pop("provision_failed_accounts", None)
             _new_ctx = clear_task_llm_runtime_context(_new_ctx)
             _new_ctx.pop("_slot_released", None)
-            _t.retry_after_until = None  # audit W1: column source of truth
             _new_ctx.pop("failure_category", None)
+            _new_ctx.pop("failure_class", None)
             # Clear EXTERNAL_API retry counter: a resurrected task that hits another
             # API error would otherwise see stale _api_failure_retries > 5 and
             # bypass the EXTERNAL_API-specific backoff, falling through to the
             # general retry path with a depleted budget.
             _new_ctx.pop("_api_failure_retries", None)
             _t.context = _new_ctx
+            clear_retry_after(_t)
             _t.attempt_count = 0
             bank_task_current_attempt(_t, stopped_at=_utcnow())
             _t.status = TaskStatus.QUEUED
@@ -613,7 +614,6 @@ async def run_infra_recovery_and_hold_maintenance(
             _qt.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             _qt.last_heartbeat = None
             _qt.started_at = None
-            _qt.retry_after_until = None
             _qt.latest_status_message = (
                 "Park-and-retarget budget expired — cold requeueing"
             )
@@ -622,8 +622,8 @@ async def run_infra_recovery_and_hold_maintenance(
             _ctx.pop("warm_target_vm_id", None)
             _ctx.pop("warm_handoff_deadline", None)
             _ctx.pop("warm_target_pr", None)
-            _ctx.pop("_retry_after_resets", None)
             _qt.context = _ctx
+            clear_retry_after(_qt)
             session.add(_qt)
             expired_parked += 1
         if expired_parked:
@@ -677,10 +677,7 @@ async def run_infra_recovery_and_hold_maintenance(
                 )
             else:
                 continue
-            _qt.retry_after_until = None
-            _new_ctx = dict(_qt.context or {})
-            _new_ctx.pop("_retry_after_resets", None)
-            _qt.context = _new_ctx
+            clear_retry_after(_qt)
             session.add(_qt)
             _cleared += 1
         if _cleared:

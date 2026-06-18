@@ -35,6 +35,7 @@ from app.models import (
 )
 from app.task_locking import with_directions_locked
 from app.time_utils import _utcnow
+from app.json_extract import _extract_json_array
 
 logger = logging.getLogger(__name__)
 
@@ -86,51 +87,6 @@ def _record_auto_clear_note(direction: dict, cleared_from: str, count: int) -> N
         }
     )
     direction["notes"] = notes
-
-
-def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:
-    """Find the first JSON array in *text* containing objects with the required keys.
-
-    Uses bracket-depth counting (O(n)) instead of regex with greedy groups,
-    which can cause O(n*k) backtracking on malformed input and block the
-    async event loop for seconds.
-
-    Copied here from ``app.task_completion`` so this module does not need a
-    lazy circular import back into the file that re-exports its own symbols.
-    """
-    text = text[:500_000]
-    for key in required_keys:
-        if f'"{key}"' not in text:
-            return None
-    start = text.find("[")
-    while start != -1:
-        depth = 0
-        in_string = False
-        escape_next = False
-        for i in range(start, len(text)):
-            c = text[i]
-            if escape_next:
-                escape_next = False
-                continue
-            if c == "\\" and in_string:
-                escape_next = True
-                continue
-            if c == '"' and not escape_next:
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if c == "[":
-                depth += 1
-            elif c == "]":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start : i + 1]
-                    if all(f'"{k}"' in candidate for k in required_keys):
-                        return candidate
-                    break
-        start = text.find("[", start + 1)
-    return None
 
 
 # Allowed values for SystemMaturity.recommended_mode. Rows with a value outside

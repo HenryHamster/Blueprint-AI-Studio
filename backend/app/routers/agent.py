@@ -35,6 +35,8 @@ from app.models import (
     Artifact,
     ArtifactType,
     VmContact,
+    KnowledgeDocument,
+    SourceKind,
     _on_task_terminal_callbacks,
     _on_task_revive_callbacks,
     _utcnow,
@@ -3797,6 +3799,29 @@ async def claim_task(
                 if _repo_provenance:
                     _repo_overview["provenance"] = _repo_provenance
             response["repo_overview"] = _repo_overview
+
+    # Inject domain_overview for repo-reading task types when a domain
+    # KnowledgeDocument exists (produced by repo_bootstrap completion).
+    # Best-effort: exceptions are swallowed so a DB hiccup never breaks claim.
+    if task_type in _REPO_OVERVIEW_TASK_TYPES and project_for_playbook:
+        try:
+            _domain_result = await session.execute(
+                select(KnowledgeDocument)
+                .where(
+                    KnowledgeDocument.project_id == _claimed_project_id,
+                    KnowledgeDocument.topic == "domain-knowledge",
+                    KnowledgeDocument.source_kind == SourceKind.REPO_DOMAIN.value,
+                )
+                .limit(1)
+            )
+            _domain_doc = _domain_result.scalar_one_or_none()
+            if _domain_doc is not None:
+                response["domain_overview"] = {
+                    "summary": _domain_doc.summary,
+                    "body": _domain_doc.body,
+                }
+        except Exception:
+            pass
 
     # Inject bootstrap_guidance for repo_bootstrap tasks: structured prompting
     # for the agent to read README/manifests, produce a repo overview payload,

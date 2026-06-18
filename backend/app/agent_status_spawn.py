@@ -396,10 +396,6 @@ async def maybe_spawn_smoketest_fix(
                                 f"[SMOKETEST] Spawned {'hotfix ' if is_post_promotion else ''}plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests"
                             )
         except Exception as e:
-            # Audit W5/A6: smoketest plan-task spawn used to silently log-and-continue.
-            # That hid genuine breakage of the smoketest → fix-spawn → CI loop. Now
-            # we surface the failure: set spawn_failed=True so operators can query,
-            # AND create a persistent alert so the situation can't be missed.
             logger.error(
                 f"[SMOKETEST] Failed to spawn plan task after smoketest failure for task {task_id_str}: {e}",
                 exc_info=True,
@@ -409,7 +405,7 @@ async def maybe_spawn_smoketest_fix(
             # state and any subsequent session op (including session.add below
             # and downstream commits) raises PendingRollbackError. Recover the
             # session, then re-apply the in-memory task mutations from the
-            # status-update block (lines ~623-671) before re-staging spawn_failed.
+            # status-update block (lines ~623-671).
             _rolled_back = await _recover_poisoned_session(session, task_id_str)
             if _rolled_back:
                 task.status = payload.status
@@ -417,7 +413,6 @@ async def maybe_spawn_smoketest_fix(
                     not payload.artifact_type or payload.status == TaskStatus.FAILED
                 ):
                     task.latest_status_message = payload.logs[-8000:]
-            task.spawn_failed = True
             try:
                 spawn_alert = Alert(
                     project_id=task.project_id,

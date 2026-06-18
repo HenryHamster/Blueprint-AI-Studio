@@ -407,6 +407,7 @@ async def _record_qualification_verdict(
             test_erosion_detail=base_record.get("test_erosion_detail"),
             smoketest_detail=base_record.get("smoketest_detail"),
             audit_reconciliation=base_record.get("audit_reconciliation"),
+            theme_delivery=base_record.get("theme_delivery"),
             promotion_pr_url=base_record.get("pr_url"),
             promotion_conflict=(conflict if isinstance(conflict, bool) else None),
             promotion_error_detail=promotion_error_detail,

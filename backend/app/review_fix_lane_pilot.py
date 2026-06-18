@@ -1247,6 +1247,62 @@ async def kill_project_lanes(
     return killed
 
 
+async def kill_single_lane(
+    session: AsyncSession,
+    lane_id: uuid.UUID,
+) -> dict:
+    """Kill a single stuck lane and release its warm-pool reservation.
+
+    Transitions the lane from ACTIVE, PARKED, or PROPOSED to KILLED, and
+    force-expires any PoolVm reservation held for this lane.  Best-effort:
+    LaneCASError (concurrent kill by another worker) is logged and ignored.
+    Idempotent: returns zero counts if the lane is already terminal.
+
+    Returns a dict with lanes_killed and reservations_cleared counts.
+    """
+    from app.improvement_lane_ops import (
+        LaneCASError,
+        _TERMINAL_STATUSES,
+        cas_transition,
+    )
+    from app.models import ImprovementLane, ImprovementLaneStatus, PoolVm
+
+    lane = await session.get(ImprovementLane, lane_id)
+    if lane is None or lane.status in _TERMINAL_STATUSES:
+        return {"lanes_killed": 0, "reservations_cleared": 0}
+
+    try:
+        current = ImprovementLaneStatus(lane.status)
+        await cas_transition(session, lane.id, current, ImprovementLaneStatus.KILLED)
+    except LaneCASError:
+        logger.debug("[LANE-PILOT] kill_single_lane CAS miss lane=%s", lane_id)
+        return {"lanes_killed": 0, "reservations_cleared": 0}
+
+    # Release any warm-pool member reserved for this lane.
+    reserved_members = (
+        (
+            await session.execute(
+                select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    from app.warm_pool import record_lane_reservation_cause
+
+    cleared = 0
+    for member in reserved_members:
+        member.reserved_lane_id = None
+        member.reservation_expires_at = None
+        member.reservation_hard_expires_at = None
+        session.add(member)
+        await record_lane_reservation_cause(session, lane_id, "force_expired")
+        cleared += 1
+
+    logger.info("[LANE-PILOT] KILL lane %s (operator) killed=1 reservations=%d", lane_id, cleared)
+    return {"lanes_killed": 1, "reservations_cleared": cleared}
+
+
 async def apply_lane_pilot_kill(
     session: AsyncSession, project_id: uuid.UUID, *, reason: str
 ) -> dict:

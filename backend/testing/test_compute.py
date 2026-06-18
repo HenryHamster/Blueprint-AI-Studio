@@ -4112,20 +4112,24 @@ class TestZoneHealthRestoreDeque:
 class TestZoneCooldownSeconds:
     """Cover _zone_cooldown_seconds exponential backoff with 1800s cap."""
 
-    def test_zero_failures_baseline(self):
+    def test_zero_failures_baseline(self, mocker):
+        mocker.patch("app.time_utils.random.uniform", return_value=1.0)
         assert compute._zone_cooldown_seconds(0) == compute.ZONE_COOLDOWN_SECONDS
 
-    def test_doubling_on_each_failure(self):
+    def test_doubling_on_each_failure(self, mocker):
+        mocker.patch("app.time_utils.random.uniform", return_value=1.0)
         base = compute.ZONE_COOLDOWN_SECONDS
         assert compute._zone_cooldown_seconds(1) == min(base * 2, 1800)
         assert compute._zone_cooldown_seconds(2) == min(base * 4, 1800)
         assert compute._zone_cooldown_seconds(3) == min(base * 8, 1800)
 
-    def test_cap_at_1800_seconds(self):
+    def test_cap_at_1800_seconds(self, mocker):
+        mocker.patch("app.time_utils.random.uniform", return_value=1.0)
         assert compute._zone_cooldown_seconds(10) == 1800
         assert compute._zone_cooldown_seconds(100) == 1800
 
-    def test_monotonically_non_decreasing(self):
+    def test_monotonically_non_decreasing(self, mocker):
+        mocker.patch("app.time_utils.random.uniform", return_value=1.0)
         prev = 0
         for n in range(0, 15):
             current = compute._zone_cooldown_seconds(n)
@@ -6412,6 +6416,83 @@ def test_build_compute_result_logs_omits_command_log_when_absent():
     result = json.loads(compute_jobs.build_compute_result_logs(job))
     assert "command_log_text" not in result
     assert "command_log_truncated" not in result
+
+
+def test_build_compute_result_logs_stdout_metrics_fallback():
+    """When NO result file metrics exist but the command printed a JSON object to
+    stdout, the builder recovers its numeric keys as top-level metrics so a metric
+    that only reached stdout is still measurable."""
+    job = _make_job_with_command_log(
+        'training run complete\n{"accuracy": 0.93, "loss": "0.12", "label": "run-a"}\n'
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    # Numeric keys recovered (numeric strings coerced); non-numeric dropped.
+    assert result["accuracy"] == pytest.approx(0.93)
+    assert result["loss"] == pytest.approx(0.12)
+    assert "label" not in result
+    # The bounded command-log text is still embedded alongside the metrics.
+    assert "training run complete" in result["command_log_text"]
+
+
+def test_build_compute_result_logs_result_file_wins_over_stdout():
+    """An explicit $BLUEPRINT_RESULT_FILE write (result_metrics) ALWAYS wins over a
+    conflicting value the command also printed to stdout."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="g2-standard-4",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+        polling_metadata={
+            "result_metrics": {"accuracy": 0.99},
+            "command_log": {"text": '{"accuracy": 0.10}\n', "truncated": False},
+        },
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert result["accuracy"] == pytest.approx(0.99)
+
+
+def test_build_compute_result_logs_stdout_fallback_last_object_wins():
+    """When the command prints several JSON objects, the LAST balanced object wins —
+    the final reported result, not an intermediate one."""
+    job = _make_job_with_command_log(
+        '{"accuracy": 0.50}\nepoch 1\n{"accuracy": 0.88}\nfinal\n'
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert result["accuracy"] == pytest.approx(0.88)
+
+
+def test_build_compute_result_logs_stdout_fallback_skips_reserved_keys():
+    """The stdout fallback can never overwrite a reserved job-level field or a
+    backend-derived durable key."""
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="g2-standard-4",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+        polling_metadata={
+            "durable_file_count": 3,
+            "command_log": {
+                "text": '{"final_cost_usd": 999, "durable_file_count": 0, "f1": 0.7}\n',
+                "truncated": False,
+            },
+        },
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    # Reserved/backend-derived keys untouched by the stdout fallback.
+    assert result["final_cost_usd"] == pytest.approx(0.5)
+    assert result["durable_file_count"] == pytest.approx(3)
+    # A genuine new metric from stdout is still surfaced.
+    assert result["f1"] == pytest.approx(0.7)
 
 
 def test_build_compute_result_logs_falls_back_to_accrued_cost():
@@ -9482,6 +9563,133 @@ async def test_attach_repo_clone_skips_when_project_has_no_repo(
     assert calls["n"] == 0
 
 
+@pytest.mark.asyncio
+async def test_attach_repo_clone_falls_back_on_deleted_plan_branch(
+    db_session, monkeypatch
+):
+    """When base_branch is a plan/* branch that no longer exists, _attach_repo_clone
+    degrades to the project's promotion_target instead of cloning a dead ref.
+
+    This covers compute_experiment tasks that were delayed past plan-branch cleanup:
+    the plan merged to integration, the plan/* branch was deleted, but the compute
+    job is only now launching.
+    """
+    project = Project(
+        name="plan-fallback",
+        user_id="u",
+        github_owner="octo",
+        github_repo="demo",
+        promotion_target="integration",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "plan/abc123"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    async def fake_token(_project, _session):
+        return "ghs_FAKE"
+
+    async def branch_not_found(_token, _owner, _repo, _branch):
+        raise Exception("404 branch not found")
+
+    monkeypatch.setattr("app.branch_cleanup._get_project_github_token", fake_token)
+    monkeypatch.setattr("app.github_refs.get_branch_sha", branch_not_found)
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    spec = await compute_jobs._attach_repo_clone(
+        session_factory, job, compute_jobs._build_launch_spec(job)
+    )
+    # Must degrade to promotion_target, not the deleted plan branch.
+    assert spec.repo_clone == {
+        "owner": "octo",
+        "repo": "demo",
+        "ref": "integration",
+    }
+    assert spec.repo_token == "ghs_FAKE"
+
+
+@pytest.mark.asyncio
+async def test_attach_repo_clone_uses_plan_branch_when_it_exists(
+    db_session, monkeypatch
+):
+    """When base_branch is a plan/* branch that still exists, use it directly."""
+    project = Project(
+        name="plan-exists",
+        user_id="u",
+        github_owner="octo",
+        github_repo="demo",
+        promotion_target="integration",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "plan/abc123"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    async def fake_token(_project, _session):
+        return "ghs_FAKE"
+
+    async def branch_exists(_token, _owner, _repo, _branch):
+        return "abc123sha"
+
+    monkeypatch.setattr("app.branch_cleanup._get_project_github_token", fake_token)
+    monkeypatch.setattr("app.github_refs.get_branch_sha", branch_exists)
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    spec = await compute_jobs._attach_repo_clone(
+        session_factory, job, compute_jobs._build_launch_spec(job)
+    )
+    # Branch exists — use it as-is.
+    assert spec.repo_clone == {
+        "owner": "octo",
+        "repo": "demo",
+        "ref": "plan/abc123",
+    }
+
+
 def test_parse_serial_status_extracts_release_echo():
     """_parse_serial_status decodes BLUEPRINT_COMPUTE_RELEASE_ECHO into echoed_release_sha."""
     sha = "abc123def456"
@@ -9747,3 +9955,160 @@ def test_serialize_compute_job_response_safe_redacts_command_log():
     text = data["polling_metadata"]["command_log"]["text"]
     assert "TOP_SECRET" not in text
     assert "result: 42" in text
+
+
+def test_command_runner_redacts_credentials(tmp_path):
+    """command_runner.py redacts credentials at capture time before writing command.log.json.
+
+    Runs the actual script (subprocess) so the test exercises the production
+    code path, not a re-implementation.  Verifies that every major credential
+    family is scrubbed while ordinary experiment output survives verbatim.
+    """
+    import pathlib
+    import subprocess
+    import sys
+
+    script = (
+        pathlib.Path(__file__).parent.parent
+        / "app"
+        / "_compute_scripts"
+        / "command_runner.py"
+    )
+    log_file = tmp_path / "command.log.json"
+
+    # Build a shell command that echoes representative credential formats to stdout.
+    credential_lines = [
+        # GitHub tokens
+        "echo ghp_ABCDEF1234567890abcdefGHIJKLMNOPQRST",
+        "echo ghs_SECRETTOKEN123456789012",
+        "echo ghu_SomeGitHubUserToken123456",
+        # Embedded git URL credential
+        "echo https://x-access-token:ghp_SECRETTOKEN123@github.com/org/repo",
+        # Generic user:pass URL
+        "echo https://myuser:mypassword@example.com/repo",
+        # Anthropic key
+        "echo sk-ant-api03-SUPERSECRETKEYVALUE1234567890",
+        # OpenAI project key (>=10 suffix chars)
+        "echo sk-proj-PROJECTKEYVALUE1234567890abcdef",
+        # Google AIza key (>=20 suffix chars)
+        "echo AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ01234567",
+        # Google OAuth token
+        "echo ya29.A0ARrdaM-GOOGLEOAUTHTOKEN1234",
+        # Bearer token
+        "echo 'Authorization: Bearer MYSECRETBEARERTOKEN'",
+        # Named field — access_token
+        "echo 'access_token=FIELDTOKEN1234567890'",
+        # AWS IAM access key
+        "echo AKIAIOSFODNN7EXAMPLE",
+        # Stripe keys
+        "echo sk_live_STRIPELIVEKEY1234567890",
+        "echo whsec_STRIPEWEBHOOKSECRET123456",
+        # PostgreSQL DSN with embedded password
+        "echo postgresql://dbuser:DBPASSWORD123@db.host:5432/mydb",
+        # Benign output that must survive
+        "echo 'metric: loss=0.042'",
+        "echo 'step 100 complete'",
+    ]
+    command = " && ".join(credential_lines)
+
+    proc = subprocess.run(
+        [sys.executable, str(script), command, str(log_file)],
+        capture_output=True,
+        text=True,
+    )
+    # Script exits with the command exit code (0 for all echoes)
+    assert proc.returncode == 0, f"command_runner failed: {proc.stderr}"
+    assert log_file.exists(), "command.log.json was not written"
+
+    record = json.loads(log_file.read_text())
+    text = record["text"]
+
+    # --- credentials must be absent ---
+    assert "ghp_ABCDEF1234567890abcdefGHIJKLMNOPQRST" not in text, (
+        "ghp_ must be redacted"
+    )
+    assert "ghs_SECRETTOKEN123456789012" not in text, "ghs_ must be redacted"
+    assert "ghu_SomeGitHubUserToken123456" not in text, "ghu_ must be redacted"
+    assert "ghp_SECRETTOKEN123" not in text, "embedded git URL token must be redacted"
+    assert "mypassword" not in text, "user:pass URL must be redacted"
+    assert "sk-ant-api03-SUPERSECRETKEYVALUE1234567890" not in text, (
+        "sk-ant- must be redacted"
+    )
+    assert "sk-proj-PROJECTKEYVALUE1234567890abcdef" not in text, (
+        "sk-proj- must be redacted"
+    )
+    assert "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ01234567" not in text, (
+        "AIza key must be redacted"
+    )
+    assert "ya29.A0ARrdaM-GOOGLEOAUTHTOKEN1234" not in text, "ya29. must be redacted"
+    assert "MYSECRETBEARERTOKEN" not in text, "Bearer token must be redacted"
+    assert "FIELDTOKEN1234567890" not in text, (
+        "named access_token field must be redacted"
+    )
+    assert "AKIAIOSFODNN7EXAMPLE" not in text, "AWS IAM access key must be redacted"
+    assert "STRIPELIVEKEY1234567890" not in text, "Stripe live key must be redacted"
+    assert "STRIPEWEBHOOKSECRET123456" not in text, (
+        "Stripe webhook secret must be redacted"
+    )
+    assert "DBPASSWORD123" not in text, "PostgreSQL DSN password must be redacted"
+
+    # --- benign output must survive verbatim ---
+    assert "metric: loss=0.042" in text, "benign metric line must survive"
+    assert "step 100 complete" in text, "benign log line must survive"
+
+
+def test_terminal_record_b64_file_redacts_command_log(tmp_path):
+    """_b64_file with redact_command_log=True redacts credentials in the text field.
+
+    Imports and calls the production function directly so the defense-in-depth path
+    and its fail-soft branch are exercised, not a re-implementation.
+    """
+    import base64
+    import importlib.util
+    import json as json_mod
+    import pathlib
+
+    script_path = (
+        pathlib.Path(__file__).parent.parent
+        / "app"
+        / "_compute_scripts"
+        / "terminal_record.py"
+    )
+    spec = importlib.util.spec_from_file_location("terminal_record", script_path)
+    assert spec is not None
+    tr = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(tr)  # type: ignore[attr-defined]
+
+    # --- normal case: credential is redacted; benign text and other fields survive ---
+    log_file = tmp_path / "command.log.json"
+    payload = {
+        "text": "cloning https://x-access-token:ghp_SECRETTOKEN123@github.com/org/repo\nstep 1 done",
+        "truncated": False,
+        "byte_count": 77,
+    }
+    log_file.write_text(json_mod.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    b64 = tr._b64_file(str(log_file), redact_command_log=True)
+    decoded = json_mod.loads(base64.b64decode(b64).decode("utf-8"))
+
+    assert "ghp_SECRETTOKEN123" not in decoded["text"], "credential must be redacted"
+    assert "step 1 done" in decoded["text"], "benign text must survive"
+    assert decoded["truncated"] is False, "truncated field must survive"
+    assert decoded["byte_count"] == 77, "byte_count field must survive"
+
+    # --- fail-soft: non-JSON input is base64-encoded verbatim (no crash) ---
+    bad_file = tmp_path / "bad.log.json"
+    bad_file.write_bytes(b"not-json-at-all")
+    b64_bad = tr._b64_file(str(bad_file), redact_command_log=True)
+    assert base64.b64decode(b64_bad) == b"not-json-at-all", (
+        "non-JSON input must pass through verbatim"
+    )
+
+    # --- fail-soft: dict with non-str text is encoded verbatim (no crash) ---
+    non_str_file = tmp_path / "non_str.log.json"
+    non_str_payload = {"text": 42, "truncated": False, "byte_count": 2}
+    non_str_file.write_text(json_mod.dumps(non_str_payload), encoding="utf-8")
+    b64_non_str = tr._b64_file(str(non_str_file), redact_command_log=True)
+    decoded_non_str = json_mod.loads(base64.b64decode(b64_non_str).decode("utf-8"))
+    assert decoded_non_str["text"] == 42, "non-str text field must be encoded verbatim"

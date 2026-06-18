@@ -26,7 +26,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
-from app.capability_registry import compose_capability_markers, normalize_capability_name
+from app.capability_registry import (
+    compose_capability_markers,
+    normalize_capability_name,
+)
 from app.failure_classification import INFRA_CLASSES, classify_failure
 from app.landed_signal import suppresses_redispatch
 from app.models import Task, TaskStatus
@@ -176,8 +179,19 @@ def is_duplicate(
     rarely produce true duplicates, so a higher threshold avoids false
     positives. If either direction is unknown (None), treat as same-direction
     (safer default).
+
+    Secondary gates catch paraphrased duplicates that slip past the word-overlap
+    threshold:
+    - Technical token overlap: shared identifiers/paths/function names are strong
+      signals of same intent even when prose is reworded. Threshold: 1 token
+      same-direction, 2 tokens cross-direction.
+    - Bigram Jaccard: high similarity in the sequence of non-stopword term pairs
+      indicates near-identical phrasing. Threshold: 0.65 same-direction, 0.80
+      cross-direction.
     """
     words = set(finding_title.lower().split()) - _STOPWORDS
+    finding_tech = _extract_technical_tokens(finding_title)
+    finding_bgs = _title_bigrams(finding_title)
     for candidate_raw in existing:
         candidate = _coerce_overlap_candidate(candidate_raw)
         if candidate is None:
@@ -191,6 +205,19 @@ def is_duplicate(
         threshold = 4 if same_direction else 6
         if len(overlap) >= threshold:
             return True
+        # Technical token secondary gate
+        if finding_tech:
+            cand_tech = _extract_technical_tokens(title)
+            tech_threshold = 1 if same_direction else 2
+            if len(finding_tech & cand_tech) >= tech_threshold:
+                return True
+        # Bigram Jaccard secondary gate
+        if finding_bgs:
+            cand_bgs = _title_bigrams(title)
+            if cand_bgs:
+                jac_threshold = 0.65 if same_direction else 0.80
+                if _jaccard_overlap(finding_bgs, cand_bgs) >= jac_threshold:
+                    return True
     return False
 
 
@@ -957,8 +984,13 @@ def _find_overlap_match(
     unknown direction, 6 words cross-direction). Returns ``None`` when no
     match is found, so callers can build a reason string with the matched
     title.
+
+    Secondary gates (technical token overlap and bigram Jaccard) mirror those
+    in :func:`is_duplicate` so both entry-points enforce consistent semantics.
     """
     words = set(finding_title.lower().split()) - _STOPWORDS
+    finding_tech = _extract_technical_tokens(finding_title)
+    finding_bgs = _title_bigrams(finding_title)
     for candidate_raw in existing:
         candidate = _coerce_overlap_candidate(candidate_raw)
         if candidate is None:
@@ -974,6 +1006,19 @@ def _find_overlap_match(
         threshold = 4 if same_direction else 6
         if len(overlap) >= threshold:
             return title
+        # Technical token secondary gate
+        if finding_tech:
+            cand_tech = _extract_technical_tokens(title)
+            tech_threshold = 1 if same_direction else 2
+            if len(finding_tech & cand_tech) >= tech_threshold:
+                return title
+        # Bigram Jaccard secondary gate
+        if finding_bgs:
+            cand_bgs = _title_bigrams(title)
+            if cand_bgs:
+                jac_threshold = 0.65 if same_direction else 0.80
+                if _jaccard_overlap(finding_bgs, cand_bgs) >= jac_threshold:
+                    return title
     return None
 
 
@@ -1025,3 +1070,44 @@ def _normalize_task_type(value: object) -> Optional[str]:
 
 def _optional_str(value: object) -> Optional[str]:
     return str(value) if value is not None else None
+
+
+def _extract_technical_tokens(title: str) -> set[str]:
+    """Extract tokens that are likely identifiers, file paths, or function names.
+
+    A token is "technical" when it contains '_', '/', '::', or '.' (file-path or
+    attribute notation) or is mixed-case (camelCase / PascalCase), after stripping
+    boundary punctuation. These tokens reliably anchor semantic identity even when
+    surrounding prose is reworded — they are the specific referents the finding
+    addresses. Stopwords are excluded.
+    """
+    technical: set[str] = set()
+    for word in title.split():
+        stripped = word.strip("'\"()[]{}.,;:!?")
+        if not stripped or stripped.lower() in _STOPWORDS:
+            continue
+        if (
+            "_" in stripped
+            or "/" in stripped
+            or "::" in stripped
+            or "." in stripped
+            or (
+                stripped != stripped.lower()
+                and stripped != stripped.upper()
+                and len(stripped) > 3
+            )
+        ):
+            technical.add(stripped.lower())
+    return technical
+
+
+def _title_bigrams(title: str) -> set[tuple[str, str]]:
+    """Compute bigrams of non-stopword tokens for similarity scoring.
+
+    Used to catch paraphrased titles where prose is rewritten but the
+    sequence structure of key terms is preserved.
+    """
+    tokens = [w.lower() for w in title.split() if w.lower() not in _STOPWORDS]
+    if len(tokens) < 2:
+        return set()
+    return {(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)}

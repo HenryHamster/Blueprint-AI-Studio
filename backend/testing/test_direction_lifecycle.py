@@ -5,8 +5,11 @@ import pytest
 from sqlmodel import select
 
 import app.shared_state as _ss
+import uuid
+
 from app.direction_lifecycle import (
     _process_direction_lifecycle,
+    _process_direction_lifecycle_locked,
 )
 from app.models import Project, Task, TaskStatus
 
@@ -79,7 +82,6 @@ async def test_process_lifecycle_pauses_on_cost_budget_exceeded(db_session, mock
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -116,7 +118,6 @@ async def test_process_lifecycle_no_pause_when_cost_within_budget(db_session, mo
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -150,7 +151,6 @@ async def test_process_lifecycle_no_cost_pause_without_budget_configured(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -247,7 +247,6 @@ async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_pe
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=now,
     )
@@ -354,7 +353,6 @@ async def test_retirement_evidence_includes_provider_model_split(db_session, moc
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=now,
     )
@@ -462,7 +460,6 @@ async def test_retirement_consideration_still_flagged_without_provider_model_spl
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=now,
     )
@@ -506,7 +503,6 @@ async def test_process_lifecycle_uses_default_cpm_config_when_runtime_values_inv
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -586,7 +582,6 @@ async def test_process_lifecycle_cpm_unchanged_for_fully_autonomous_direction(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=now,
     )
@@ -678,7 +673,6 @@ async def test_process_lifecycle_lifetime_burn_pause_via_aggregate(db_session, m
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=now,
     )
@@ -767,7 +761,6 @@ async def test_lifetime_burn_manual_intervention_survives_ttl_window(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=now,
     )
@@ -842,7 +835,6 @@ async def test_remediation_stuck_manual_intervention_cleared_by_ttl_window(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=now,
     )
@@ -940,7 +932,6 @@ async def test_process_lifecycle_churn_pause_emits_blocker_notification(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=now,
     )
@@ -1042,7 +1033,6 @@ async def test_process_lifecycle_already_built_routes_to_possibly_complete(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=now,
     )
@@ -1104,7 +1094,6 @@ async def test_process_lifecycle_productive_direction_not_churn_paused(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=now,
     )
@@ -1159,7 +1148,6 @@ async def test_process_lifecycle_productive_direction_still_pauses_on_code_failu
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=now,
     )
@@ -1214,7 +1202,6 @@ async def test_grace_period_blocks_unproductive_repause_on_stale_history(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1275,7 +1262,6 @@ async def test_grace_period_expires_after_new_cycle_appended_triggers_pause(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1336,7 +1322,6 @@ async def test_grace_period_does_not_block_code_failure_pause(db_session, mocker
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1404,7 +1389,6 @@ async def test_lifecycle_flags_outcome_scaffolding_and_notifies_once(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1419,7 +1403,6 @@ async def test_lifecycle_flags_outcome_scaffolding_and_notifies_once(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1442,7 +1425,6 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1463,7 +1445,6 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1486,7 +1467,6 @@ async def test_scaffolding_memo_spawned_on_first_flag(db_session, mocker):
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1536,7 +1516,6 @@ async def test_scaffolding_memo_not_respawned_on_evidence_refresh(db_session, mo
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1547,7 +1526,6 @@ async def test_scaffolding_memo_not_respawned_on_evidence_refresh(db_session, mo
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1600,7 +1578,6 @@ async def test_outcome_scaffolding_memo_completed_at_spawn(db_session, mocker):
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1706,7 +1683,6 @@ async def test_scaffolding_flag_counter_increments_on_new_cycle(db_session, mock
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1743,7 +1719,6 @@ async def test_scaffolding_counter_does_not_increment_without_new_cycle(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1777,7 +1752,6 @@ async def test_scaffolding_legacy_missing_watermark_backfills_without_increment(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1817,7 +1791,6 @@ async def test_scaffolding_escalation_fires_at_mid_threshold(db_session, mocker)
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1852,7 +1825,6 @@ async def test_scaffolding_escalation_does_not_refire_without_new_cycle(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1862,7 +1834,6 @@ async def test_scaffolding_escalation_does_not_refire_without_new_cycle(
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1899,7 +1870,6 @@ async def test_scaffolding_auto_retires_at_high_threshold(db_session, mocker):
     active_directions = await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1943,7 +1913,6 @@ async def test_scaffolding_flag_clear_resets_counter(db_session, mocker):
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -1993,7 +1962,6 @@ async def test_scaffolding_stale_verdict_does_not_freeze_counter(db_session, moc
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=0.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -2307,4 +2275,79 @@ async def test_already_fixed_deadlock_auto_completes_via_apply_post_spawn(db_ses
     assert result.scalars().first() is not None, (
         "expected a 'Direction auto-completed' alert"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Crash-guard: _directed_research_recently_completed folded into lifecycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_skips_direction_with_recently_completed_research(
+    db_session, mocker
+):
+    """A direction with no refractory_until but a recently-COMPLETED directed
+    research task is excluded from active_directions by
+    _process_direction_lifecycle_locked (crash guard)."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    direction_id = "d-crash-guard-01"
+    _runtime_config["completed_research_cooldown_minutes"] = 120
+
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+
+    try:
+        direction = {
+            "id": direction_id,
+            "text": "Crash guard direction",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            # No refractory_until — Gate 1 would allow this direction
+        }
+        project = Project(
+            name="Crash Guard Test",
+            user_id="u-crash-guard",
+            autonomous_enabled=True,
+            directions=[direction],
+            vision={"purpose": "test"},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Insert a COMPLETED research task for this direction within the cooldown window
+        completed_task = Task(
+            project_id=project.id,
+            title=f"Research: direction-{direction_id}",
+            description="x",
+            payloads=[
+                {
+                    "type": "research",
+                    "current_direction_id": direction_id,
+                    "directions": [],
+                    "base_branch": "main",
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(completed_task)
+        await db_session.commit()
+
+        active = await _process_direction_lifecycle_locked(
+            project, db_session, set(), datetime.utcnow()
+        )
+        assert active == [], (
+            "Direction with a recently-completed research task must be excluded "
+            "from active_directions by the crash guard"
+        )
+    finally:
+        _runtime_config.pop("completed_research_cooldown_minutes", None)
 

@@ -327,6 +327,7 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "promotion_pr_url": qual.get("promotion_pr_url"),
         "promotion_conflict": qual.get("promotion_conflict"),
         "promotion_error_detail": qual.get("promotion_error_detail"),
+        "theme_delivery": qual.get("theme_delivery"),
     }
 
 
@@ -417,6 +418,8 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         # proven claim state next to the raw merged counts. ``None`` on legacy
         # rows that predate the aggregate.
         "acceptance_aggregate": acceptance_aggregate,
+        # Theme-delivery cert (additive; None on legacy rows predating migration 0305).
+        "theme_delivery": verdict.theme_delivery,
     }
 
 

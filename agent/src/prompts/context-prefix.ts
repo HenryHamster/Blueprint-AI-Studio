@@ -287,6 +287,20 @@ export function formatRepoOverview(overview: unknown): string {
   return lines.join('\n') + '\n';
 }
 
+// Render the domain_overview block injected by the backend at claim time.
+// The domain knowledge producer (SourceKind.REPO_DOMAIN) captures product/domain
+// context during repo bootstrap; the backend injects it as {summary, body}.
+// Presence-gated: returns '' when either required field is absent so the prompt
+// is byte-identical for projects that never produced domain knowledge.
+export function formatDomainOverview(overview: unknown): string {
+  if (!overview || typeof overview !== 'object') return '';
+  const o = overview as Record<string, unknown>;
+  const summary = typeof o.summary === 'string' ? o.summary.trim() : '';
+  const body = typeof o.body === 'string' ? o.body.trim() : '';
+  if (!summary || !body) return '';
+  return `## Domain Knowledge\n${summary}\n\n${body}\n\n`;
+}
+
 export function formatStrategicIntent(intent: Record<string, unknown> | undefined): string {
   if (!intent || typeof intent !== 'object') return '';
   const lines: string[] = ['## Operator Steering'];
@@ -367,6 +381,11 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
   // Repo Overview — tech stack, directory layout, and first steps discovered
   // during repo_bootstrap. Presence-gated: no-op when absent.
   prefix += formatRepoOverview(task.repo_overview);
+
+  // Domain Knowledge — product/domain context captured at bootstrap via
+  // SourceKind.REPO_DOMAIN and injected by the backend at claim time.
+  // Presence-gated: no-op when absent so existing prompts stay byte-identical.
+  prefix += formatDomainOverview(task.domain_overview);
 
   // Existing knowledge documents — a compact, body-omitted index of
   // web_research / design output so the strategist / research agent knows what

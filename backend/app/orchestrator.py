@@ -31,7 +31,6 @@ import asyncio
 import faulthandler
 import logging
 import os
-import random
 import sys
 import threading
 import time
@@ -108,9 +107,12 @@ from app.shared_state import (
     sync_runtime_config_from_state as _sync_runtime_config_from_state,
 )
 from app.task_locking import task_lock
+from app.task_blocked import strip_fresh_attempt_context
 from app.time_utils import (
+    _is_cadence_due,
     _utcnow,
     clear_retry_after,
+    exponential_backoff,
     rate_limit_retry_minutes,
     set_retry_after,
 )
@@ -402,11 +404,11 @@ _last_post_commit_sweep: datetime = _utcnow()
 _last_sidecar_sweep: datetime = _utcnow()
 _last_bootstrap_recovery_sweep: datetime = _utcnow()
 _last_lane_baseline_backfill: datetime = _utcnow()
-_last_deadlock_check: float = 0.0
+_last_deadlock_check: datetime | None = None
 _last_zone_exhaustion_log: datetime | None = None
-_last_concurrency_broadcast: float = 0.0
-_last_type_throttle_broadcast: dict[str, float] = {}
-_last_type_unthrottle_broadcast: dict[str, float] = {}
+_last_concurrency_broadcast: datetime | None = None
+_last_type_throttle_broadcast: dict[str, datetime | None] = {}
+_last_type_unthrottle_broadcast: dict[str, datetime | None] = {}
 _previously_failing_types: set[str] = set()
 
 # No-CI merge gate: how many times a CRASHED verify_tests task (FAILED/CANCELLED,
@@ -813,7 +815,9 @@ def _hard_watchdog_step(is_guarded, should_abort, abort) -> bool:
     return False
 
 
-def _hard_watchdog_loop(*, is_guarded, should_abort, abort, stop_event, poll_interval) -> None:
+def _hard_watchdog_loop(
+    *, is_guarded, should_abort, abort, stop_event, poll_interval
+) -> None:
     # ``stop_event.wait`` returns True only when the event is set (clean
     # shutdown) → exit the loop; otherwise it returns False after ``poll_interval``
     # and we re-check. Using the event as the sleep makes shutdown immediate.
@@ -1084,13 +1088,22 @@ async def _filter_project_resource_dispatch_eligible(
         task = task_by_id.get(task_id)
         if task is None:
             continue
-        defer_msg = await _project_resource_dispatch_defer_message(
-            session,
-            task,
-            projected_counts,
-            project_cache=project_cache,
-            spend_cache=spend_cache,
-        )
+        try:
+            defer_msg = await _project_resource_dispatch_defer_message(
+                session,
+                task,
+                projected_counts,
+                project_cache=project_cache,
+                spend_cache=spend_cache,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[ORCHESTRATOR] Error checking resource eligibility for task %s (project %s): %s",
+                task.id,
+                task.project_id,
+                exc,
+            )
+            defer_msg = f"Deferred due to resource check error: {type(exc).__name__}"
         if defer_msg:
             logger.info(
                 "[ORCHESTRATOR] Deferring task %s for project %s before slot slice: %s",
@@ -1776,13 +1789,13 @@ async def orchestrator_worker():
             tasks_recovered = 0
 
             # Periodic pool refresh — pick up admin changes without restart
-            if (_utcnow() - _last_pool_refresh).total_seconds() >= 300:
+            if _is_cadence_due(_last_pool_refresh, 300):
                 await load_max_plan_pool()
                 _last_pool_refresh = _utcnow()
 
             # Periodic zone health persist — prevents retry storms after restart
             global _last_zone_health_persist
-            if (_utcnow() - _last_zone_health_persist).total_seconds() >= 60:
+            if _is_cadence_due(_last_zone_health_persist, 60):
                 await _persist_zone_health()
                 _last_zone_health_persist = _utcnow()
 
@@ -1790,7 +1803,7 @@ async def orchestrator_worker():
             # All three live on the same DeploymentState row, so coalesce into a
             # single session/commit (M-P6) instead of three round-trips.
             global _last_anomaly_state_persist
-            if (_utcnow() - _last_anomaly_state_persist).total_seconds() >= 60:
+            if _is_cadence_due(_last_anomaly_state_persist, 60):
                 await _persist_self_healing_state_bundle()
                 _last_anomaly_state_persist = _utcnow()
 
@@ -1806,7 +1819,7 @@ async def orchestrator_worker():
             # Independent anomaly maintenance — expires stale entries and restores
             # pipeline adjustments without depending on autonomous research cycles.
             global _last_anomaly_sweep
-            if (_utcnow() - _last_anomaly_sweep).total_seconds() >= 600:
+            if _is_cadence_due(_last_anomaly_sweep, 600):
                 from app.anomaly_detection import anomaly_maintenance_sweep
 
                 try:
@@ -2127,8 +2140,9 @@ async def orchestrator_worker():
                         )
                     ).scalar() or 0
                     global _last_concurrency_broadcast
-                    if (time.monotonic() - _last_concurrency_broadcast) > 60:
-                        _last_concurrency_broadcast = time.monotonic()
+                    now_broadcast = _utcnow()
+                    if _is_cadence_due(_last_concurrency_broadcast, 60, now_broadcast):
+                        _last_concurrency_broadcast = now_broadcast
                         try:
                             await ws_manager.broadcast_to_all(
                                 "pipeline_throttle",
@@ -2185,8 +2199,8 @@ async def orchestrator_worker():
                     # up until a slot frees, which under a long pause may be never.
                     # Honor the same 60s throttle as the in-dispatch deadlock scan.
                     global _last_deadlock_check
-                    _idle_now = time.time()
-                    if _idle_now - _last_deadlock_check > 60:
+                    _idle_now = _utcnow()
+                    if _is_cadence_due(_last_deadlock_check, 60, _idle_now):
                         _last_deadlock_check = _idle_now
                         try:
                             _idle_broken = await _recover_stale_dependency_deadlocks(
@@ -2285,13 +2299,10 @@ async def orchestrator_worker():
                     _last_type_throttle_broadcast, \
                     _last_type_unthrottle_broadcast, \
                     _previously_failing_types
-                _now_mono = time.monotonic()
                 if _failing_types:
                     for _ftype in _failing_types:
-                        if (
-                            _now_mono - _last_type_throttle_broadcast.get(_ftype, 0.0)
-                        ) > 60:
-                            _last_type_throttle_broadcast[_ftype] = _now_mono
+                        if _is_cadence_due(_last_type_throttle_broadcast.get(_ftype), 60):
+                            _last_type_throttle_broadcast[_ftype] = _utcnow()
                             _frate, _fsample = _shared_state.get_task_type_failure_rate(
                                 _ftype, window_minutes=15
                             )
@@ -2314,10 +2325,8 @@ async def orchestrator_worker():
                 # now recovered (aged out of _failing_types). Debounced 60s per type like throttle.
                 _recovered_types = _previously_failing_types - _failing_types
                 for _rtype in _recovered_types:
-                    if (
-                        _now_mono - _last_type_unthrottle_broadcast.get(_rtype, 0.0)
-                    ) > 60:
-                        _last_type_unthrottle_broadcast[_rtype] = _now_mono
+                    if _is_cadence_due(_last_type_unthrottle_broadcast.get(_rtype), 60):
+                        _last_type_unthrottle_broadcast[_rtype] = _utcnow()
                         _rrate, _rsample = _shared_state.get_task_type_failure_rate(
                             _rtype, window_minutes=15
                         )
@@ -2607,6 +2616,9 @@ async def orchestrator_worker():
                             )
                             if locked_task is None:
                                 continue
+                            locked_task.context = strip_fresh_attempt_context(
+                                locked_task.context or {}
+                            )
                             _clear_retry_after_state(locked_task)
                             session.add(locked_task)
                             await session.commit()
@@ -2631,6 +2643,7 @@ async def orchestrator_worker():
                             continue
                         ctx = dict(locked_task.context or {})
                         ctx.pop("_infra_wait", None)
+                        ctx = strip_fresh_attempt_context(ctx)
                         locked_task.context = ctx
                         _clear_retry_after_state(locked_task)
                         session.add(locked_task)
@@ -2807,8 +2820,8 @@ async def orchestrator_worker():
 
                 # Step 2.4: Deadlock detection — break circular deps among stuck QUEUED tasks
                 # (_last_deadlock_check declared global in the idle-cycle branch above)
-                now = time.time()
-                if now - _last_deadlock_check > 60:
+                now = _utcnow()
+                if _is_cadence_due(_last_deadlock_check, 60, now):
                     _last_deadlock_check = now
                     stuck_tasks = [
                         t
@@ -3180,10 +3193,7 @@ async def orchestrator_worker():
                     # previously this subtracted a naive _utcnow() and raised
                     # TypeError, firing this 60s-gated error path repeatedly).
                     now_check = _utcnow()
-                    if (
-                        _last_zone_exhaustion_log is None
-                        or (now_check - _last_zone_exhaustion_log).total_seconds() >= 60
-                    ):
+                    if _is_cadence_due(_last_zone_exhaustion_log, 60, now_check):
                         _last_zone_exhaustion_log = now_check
                         wait_sec = zone_recovery_wait_seconds()
                         if wait_sec is not None:
@@ -7188,9 +7198,7 @@ async def orchestrator_worker():
             break
         except Exception:
             _orchestrator_consecutive_errors += 1
-            backoff = min(
-                0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60
-            ) * random.uniform(0.8, 1.2)
+            backoff = exponential_backoff(_orchestrator_consecutive_errors)
             logger.error(
                 "orchestrator_cycle_error",
                 extra={
@@ -7234,7 +7242,7 @@ async def orchestrator_worker():
             # is now bounded (per-cycle row cap + per-GitHub-call asyncio.wait_for
             # + per-row heartbeat in services._recover_orphaned_tasks, C3) so it
             # can no longer saturate the cycle on a large orphan backlog.
-            if (_utcnow() - _last_orphan_check).total_seconds() >= 120:
+            if _is_cadence_due(_last_orphan_check, 120):
                 _last_orphan_check = _utcnow()
                 await _bounded_leader_step(
                     "recover_orphaned_tasks", _recover_orphaned_tasks(), budget=120
@@ -7249,7 +7257,7 @@ async def orchestrator_worker():
             # processing for terminal tasks whose prior attempt timed out
             # (GitHub quota exhaustion, transient failures, etc.) without
             # waiting for the agent to retry (the VM has usually terminated).
-            if (_utcnow() - _last_post_commit_sweep).total_seconds() >= 60:
+            if _is_cadence_due(_last_post_commit_sweep, 60):
                 _last_post_commit_sweep = _utcnow()
                 # Self-heartbeats per task internally; the 120s outer bound only
                 # trips if it stops making progress (e.g. a single relock-starved
@@ -7262,7 +7270,7 @@ async def orchestrator_worker():
             # tasks whose side-car challenger died without posting status (reaper
             # kill, VM death with retries exhausted, cancellation). Calls the
             # lane resolver with a synthetic FAILED payload for fail-closed semantics.
-            if (_utcnow() - _last_sidecar_sweep).total_seconds() >= 120:
+            if _is_cadence_due(_last_sidecar_sweep, 120):
                 _last_sidecar_sweep = _utcnow()
                 await _bounded_leader_step(
                     "stranded_sidecar_sweep",
@@ -7272,7 +7280,7 @@ async def orchestrator_worker():
             # Bootstrap-recovery sweep — every 300s. Finds external projects with
             # no active bootstrap task and no bootstrap_completed_at, and enqueues
             # one recovery repo_bootstrap each. Idempotent via the spawn helper.
-            if (_utcnow() - _last_bootstrap_recovery_sweep).total_seconds() >= 300:
+            if _is_cadence_due(_last_bootstrap_recovery_sweep, 300):
                 _last_bootstrap_recovery_sweep = _utcnow()
                 try:
                     await _bounded_leader_step(
@@ -7283,7 +7291,7 @@ async def orchestrator_worker():
             # Lane-baseline backfill sweep — every 600s. Finds closed versions
             # lacking a stored baseline and persists one retroactively.
             # First-write-wins idempotent; best-effort/non-fatal.
-            if (_utcnow() - _last_lane_baseline_backfill).total_seconds() >= 600:
+            if _is_cadence_due(_last_lane_baseline_backfill, 600):
                 _last_lane_baseline_backfill = _utcnow()
                 try:
                     await _bounded_leader_step(
@@ -7319,9 +7327,9 @@ async def orchestrator_worker():
             _orchestrator_consecutive_monitoring_errors = 0
         except Exception as e:
             _orchestrator_consecutive_monitoring_errors += 1
-            monitoring_backoff = min(
-                0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60
-            ) * random.uniform(0.8, 1.2)
+            monitoring_backoff = exponential_backoff(
+                _orchestrator_consecutive_monitoring_errors
+            )
             logger.error(
                 f"[ORCHESTRATOR] Monitoring check error (consecutive={_orchestrator_consecutive_monitoring_errors}, backoff={monitoring_backoff:.1f}s): {e}",
                 exc_info=True,
@@ -7330,14 +7338,12 @@ async def orchestrator_worker():
         # Sleep based on whether we found tasks
         try:
             if _orchestrator_consecutive_errors > 0:
-                backoff = min(
-                    0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60
-                ) * random.uniform(0.8, 1.2)
+                backoff = exponential_backoff(_orchestrator_consecutive_errors)
                 await asyncio.sleep(backoff)
             elif _orchestrator_consecutive_monitoring_errors > 0:
-                monitoring_backoff = min(
-                    0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60
-                ) * random.uniform(0.8, 1.2)
+                monitoring_backoff = exponential_backoff(
+                    _orchestrator_consecutive_monitoring_errors
+                )
                 await asyncio.sleep(monitoring_backoff)
             elif queued_tasks:
                 await asyncio.sleep(0.5)

@@ -323,6 +323,19 @@ async def client(override_get_session, override_get_current_user):
         yield ac
 
 
+@pytest_asyncio.fixture(scope="function")
+async def unauthenticated_client(override_get_session):
+    """HTTP client with no Firebase auth — get_current_user_optional returns None.
+
+    Use this to test endpoints that should return a 302 redirect for browser
+    users who have no credentials (e.g. operator clicking a PR-body link).
+    """
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as ac:
+        yield ac
+
+
 @pytest.fixture
 def mock_provision_vm(mocker):
     return mocker.patch("app.main.provision_agent_vm", return_value=None)

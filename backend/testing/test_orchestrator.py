@@ -2549,6 +2549,7 @@ class TestProjectConcurrencyCap:
             _orch_module._last_zone_health_persist = now
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
+            _orch_module._last_deadlock_check = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 
@@ -3914,6 +3915,7 @@ class TestWarmVMSkipProvision:
             _orch_module._last_zone_health_persist = now
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
+            _orch_module._last_deadlock_check = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 
@@ -4027,7 +4029,7 @@ class TestWarmVMSkipProvision:
         )
         _orch_module._runtime_config["max_concurrent_vms"] = 0
         # Open the deadlock-scan throttle so the recovery runs this cycle.
-        _orch_module._last_deadlock_check = 0.0
+        _orch_module._last_deadlock_check = None
         prov_mock = mocker.patch(
             "app.orchestrator.provision_agent_vm",
             new_callable=AsyncMock,
@@ -6379,6 +6381,68 @@ class TestCrossBaseDependencyGate:
         assert eligible == "eligible"
 
     @pytest.mark.asyncio
+    async def test_compute_experiment_same_base_eligible_after_pr_merged(
+        self, db_session
+    ):
+        """A compute_experiment depending on a same-plan-branch create dep is
+        eligible once the create is COMPLETED with pr_merged — no
+        landed_on_integration required.
+
+        Regression guard: before the plan_completion fix, compute_experiment
+        payloads omitted base_branch, making them appear cross-base relative to
+        sibling create tasks. The dep resolver then required landed_on_integration
+        (a signal that never fires for plan-branch merges), permanently wedging
+        the compute subtask in QUEUED.
+        """
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = make_project(name="ComputeSameBase", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Both tasks share the same plan branch — same-base relationship.
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/xyz789"}],
+            context={"related_files": ["backend/app/search_agent.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        compute_task = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "base_branch": "plan/xyz789",
+                    "command": "python bench.py",
+                    "spend_cap_usd": 2.0,
+                    "deadline_seconds": 600,
+                }
+            ],
+            context={"related_files": ["backend/app/search_agent.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, compute_task])
+        await db_session.commit()
+
+        # Same-base create dep COMPLETED with PR merged → compute is eligible.
+        # _verify_true simulates pr_merged=True (a verifier that returns True).
+        result, _ = await _check_candidate_task_deps(
+            compute_task, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert result == "eligible", (
+            f"compute_experiment should be eligible after same-base dep PR merged, got {result!r}"
+        )
+
+        # Without PR merged (verifier returns False), same-base logic holds.
+        waiting, _ = await _check_candidate_task_deps(
+            compute_task, [dep], [dep.id], db_session, self._verify_false
+        )
+        assert waiting == "waiting", (
+            "compute_experiment must wait when same-base dep PR not yet merged"
+        )
+
+    @pytest.mark.asyncio
     async def test_terminally_failed_cross_base_code_dep_cascade_cancels(
         self, db_session
     ):
@@ -7308,6 +7372,7 @@ class TestDispatchCrashContainment:
             _orch_module._last_zone_health_persist = now
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
+            _orch_module._last_deadlock_check = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 
@@ -7725,3 +7790,168 @@ class TestDispatchCrashContainment:
             "Successful dispatch must clear the containment counter, got "
             f"{(row.context or {}).get('_dispatch_prep_failures')!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_filter_resource_eligible_continues_on_per_task_exception(
+        self, db_session, mocker
+    ):
+        """When _project_resource_dispatch_defer_message raises an exception for
+        one task, _filter_project_resource_dispatch_eligible must catch it, defer
+        that task with an error message, and continue filtering remaining tasks.
+
+        Without per-task exception containment, the exception would abort the loop
+        and prevent filtering of all remaining tasks — starving lower-ranked
+        dispatch and the post-loop CI-merge stage."""
+        from app.orchestrator import _filter_project_resource_dispatch_eligible
+        from sqlmodel import select as _select
+
+        project = make_project(name="Resource Filter Test", user_id=_TEST_USER)
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Create three tasks: one that will raise an exception, and two healthy ones
+        poison = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create", "prompt": "poison task"}],
+        )
+        healthy1 = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create", "prompt": "healthy task 1"}],
+        )
+        healthy2 = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create", "prompt": "healthy task 2"}],
+        )
+        db_session.add(poison)
+        db_session.add(healthy1)
+        db_session.add(healthy2)
+        await db_session.commit()
+        await db_session.refresh(poison)
+        await db_session.refresh(healthy1)
+        await db_session.refresh(healthy2)
+
+        poison_id = poison.id
+        healthy1_id = healthy1.id
+        healthy2_id = healthy2.id
+        eligible_ids = [poison_id, healthy1_id, healthy2_id]
+
+        # Mock the defer message function to raise an exception for the poison task
+        async def _mock_defer_msg(session, task, *args, **kwargs):
+            if task.id == poison_id:
+                raise ValueError("poisoned defer check")
+            return None
+
+        mocker.patch(
+            "app.orchestrator._project_resource_dispatch_defer_message",
+            side_effect=_mock_defer_msg,
+        )
+        broadcast_mock = mocker.patch(
+            "app.broadcast.broadcast_to_project", new_callable=AsyncMock
+        )
+
+        # Run the filter function
+        filtered = await _filter_project_resource_dispatch_eligible(
+            db_session,
+            eligible_ids,
+            [poison, healthy1, healthy2],
+            {project.id: 0},
+            broadcast_mock,
+        )
+
+        # Verify the results
+        assert healthy1_id in filtered, (
+            "Healthy task 1 must be included in filtered list despite poison task's exception"
+        )
+        assert healthy2_id in filtered, (
+            "Healthy task 2 must be included in filtered list despite poison task's exception"
+        )
+        assert poison_id not in filtered, (
+            "Task with defer check exception must be deferred (excluded from filtered list)"
+        )
+
+        # Verify the poison task is deferred with an error message
+        poison_row = (
+            (await db_session.execute(_select(Task).where(Task.id == poison_id)))
+            .scalars()
+            .first()
+        )
+        assert poison_row is not None
+        assert "error" in (poison_row.latest_status_message or "").lower(), (
+            f"Poison task must have error deferral message, got: "
+            f"{poison_row.latest_status_message!r}"
+        )
+        assert "ValueError" in (poison_row.latest_status_message or ""), (
+            f"Poison task deferral message must include exception type, got: "
+            f"{poison_row.latest_status_message!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_retry_after_release_clears_failure_class(db_session, mocker):
+    """
+    Regression: When the orchestrator releases a task from a rate-limit hold
+    via retry_after early-release, it must clear the stale failure_class from
+    the task context. Without this fix, _classify_failure_class short-circuits
+    on the persisted value and misclassifies the new failure.
+    """
+    from sqlmodel import select as _select
+    from app.orchestrator import _clear_retry_after_state
+    from app.task_blocked import strip_fresh_attempt_context
+    from app.time_utils import _utcnow
+
+    project = make_project(name="Retry After Test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create task with expired retry_after and stale failure_class
+    now = _utcnow()
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "test task"}],
+        context={
+            "failure_class": "RATE_LIMIT",  # Stale failure class from previous attempt
+            "failure_category": "RATE_LIMIT",
+        },
+    )
+    # Set retry_after_until to the past (already expired)
+    task.retry_after_until = now - timedelta(minutes=5)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    # Verify initial state
+    initial_task = (
+        (await db_session.execute(_select(Task).where(Task.id == task_id)))
+        .scalars()
+        .first()
+    )
+    assert initial_task is not None
+    assert initial_task.retry_after_until is not None
+    assert initial_task.retry_after_until < now
+    assert (initial_task.context or {}).get("failure_class") == "RATE_LIMIT"
+
+    # Simulate the orchestrator's retry-after-release path by calling the same
+    # functions that orchestrator_worker calls when clearing retry_after
+    initial_task.context = strip_fresh_attempt_context(initial_task.context or {})
+    _clear_retry_after_state(initial_task)
+    db_session.add(initial_task)
+    await db_session.commit()
+    await db_session.refresh(initial_task)
+
+    # Verify the failure_class was cleared
+    assert (initial_task.context or {}).get("failure_class") is None, (
+        "failure_class must be cleared when releasing from retry_after hold"
+    )
+    assert (initial_task.context or {}).get("failure_category") is None, (
+        "failure_category must be cleared when releasing from retry_after hold"
+    )
+    assert initial_task.retry_after_until is None, (
+        "retry_after_until must be cleared when releasing from retry_after hold"
+    )

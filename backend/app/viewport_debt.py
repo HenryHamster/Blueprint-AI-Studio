@@ -17,12 +17,13 @@ from pathlib import Path as _Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin import _get_user_project_with_role
 from app.auth import require_admin
 from app.database import get_session
-from app.models import Project
+from app.models import Project, ResidualCaseStatus, ResidualRemediationCase
 
 router = APIRouter()
 
@@ -253,18 +254,49 @@ async def get_viewport_debt(
     untested_rows = [dict(r) for r in top_untested]
 
     if rows or untested_rows:
-        # The per-component regression-case enrichment was sourced from
-        # RegressionRemediationCase rows written by the pipeline-regression
-        # dispatcher, which has been removed. No live writer remains, so the
-        # case-count/breakdown fields are kept as empty defaults to preserve
-        # the response shape; only the source_url annotation is still derived.
+        # Per-component regression enrichment is sourced from the residual
+        # remediation system: VIEWPORT_REGRESSION failures are fingerprinted as
+        # ``viewport:{component}:{assertion_type}`` and persisted to
+        # ResidualRemediationCase (the same table CODE_ERROR fingerprints use).
+        # IGNORED/RESOLVED cases are excluded so the panel reflects only active
+        # recurring regressions.
+        vp_cases = (
+            await session.execute(
+                select(
+                    ResidualRemediationCase.fingerprint,
+                    ResidualRemediationCase.hit_count,
+                    ResidualRemediationCase.status,
+                ).where(
+                    ResidualRemediationCase.project_id == project_id,
+                    ResidualRemediationCase.fingerprint.like("viewport:%"),
+                    ResidualRemediationCase.status.notin_(
+                        [ResidualCaseStatus.IGNORED, ResidualCaseStatus.RESOLVED]
+                    ),
+                )
+            )
+        ).all()
+
+        # component stem -> {assertion_type: summed hit_count}
+        breakdown_by_stem: Dict[str, Dict[str, int]] = {}
+        for fingerprint, hit_count, _status in vp_cases:
+            parts = (fingerprint or "").split(":")
+            if len(parts) < 3 or not parts[1] or not parts[2]:
+                continue
+            component, assertion_type = parts[1], parts[2]
+            per_assertion = breakdown_by_stem.setdefault(component, {})
+            per_assertion[assertion_type] = per_assertion.get(assertion_type, 0) + (
+                hit_count or 0
+            )
+
         project = await session.get(Project, project_id)
         gh_owner = project.github_owner if project else None
         gh_repo = project.github_repo if project else None
 
         for row in (*rows, *untested_rows):
-            row["regression_case_count"] = 0
-            row["regression_case_breakdown"] = {}
+            stem = _Path(row["component"]).stem
+            breakdown = breakdown_by_stem.get(stem, {})
+            row["regression_case_count"] = sum(breakdown.values())
+            row["regression_case_breakdown"] = dict(breakdown)
             if gh_owner and gh_repo:
                 row["source_url"] = (
                     f"https://github.com/{gh_owner}/{gh_repo}/blob/main/{row['component']}"

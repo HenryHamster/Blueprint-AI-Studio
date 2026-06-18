@@ -14,6 +14,8 @@ import { fileURLToPath } from 'url';
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SNAPSHOT_SH = path.join(REPO_ROOT, 'scripts', 'viewport-snapshot.sh');
 const MANIFEST_PY = path.join(REPO_ROOT, 'scripts', 'viewport_manifest.py');
+const LIVE_SH = path.join(REPO_ROOT, 'scripts', 'viewport-live.sh');
+const LIVE_CAPTURE_JS = path.join(REPO_ROOT, 'scripts', 'viewport-live-capture.js');
 
 describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
   it('is valid bash (bash -n)', () => {
@@ -147,5 +149,154 @@ describe('writeViewportSnapshotHelper — generated ./viewport-snapshot wrapper'
     const { VIEWPORT_SNAPSHOT_HINT } = await import('./prompt.js');
     expect(VIEWPORT_SNAPSHOT_HINT).toContain('./viewport-snapshot');
     expect(VIEWPORT_SNAPSHOT_HINT).not.toContain('bash scripts/viewport-snapshot.sh`');
+  });
+});
+
+describe('scripts/viewport-live.sh — live capture script', () => {
+  it('is valid bash (bash -n)', () => {
+    expect(() => execFileSync('bash', ['-n', LIVE_SH])).not.toThrow();
+  });
+
+  it('drives the external capture helper and manifest by reference (no inline heredoc)', () => {
+    const src = readFileSync(LIVE_SH, 'utf-8');
+    // Infra-skip sentinel surfaces a Chromium bootstrap failure as exit 75.
+    expect(src).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
+    // Delegates to the real .js helper rather than embedding Node in a heredoc.
+    expect(src).toContain('scripts/viewport-live-capture.js');
+    // PNGs land under the live-capture tmp tree.
+    expect(src).toContain('/tmp/viewport_live/');
+    // Builds the SPA with the firebase.ts token-bypass env var.
+    expect(src).toContain('VITE_DASHBOARD_API_TOKEN');
+    // --upload guard requires a task id.
+    expect(src).toContain('--upload requires --task-id');
+    // Builds and serves the SPA against the live backend.
+    expect(src).toContain('npm run build');
+    expect(src).toContain('vite preview');
+    // Reuses the shared manifest helper.
+    expect(src).toContain('viewport_manifest.py');
+  });
+
+  it('exits 1 when --upload is passed without --task-id', () => {
+    let status = 0;
+    let stderr = '';
+    try {
+      execFileSync('bash', [LIVE_SH, '--upload'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err: unknown) {
+      const e = err as { status?: number; stderr?: string };
+      status = e.status ?? -1;
+      stderr = e.stderr ?? '';
+    }
+    expect(status).toBe(1);
+    expect(stderr).toContain('--upload requires --task-id');
+  });
+});
+
+describe('scripts/viewport-live-capture.js — Playwright capture helper', () => {
+  it('is valid node syntax (node --check)', () => {
+    expect(() => execFileSync('node', ['--check', LIVE_CAPTURE_JS])).not.toThrow();
+  });
+
+  it('uses playwright and captures full-page screenshots over the given args', () => {
+    const src = readFileSync(LIVE_CAPTURE_JS, 'utf-8');
+    // Requires the real playwright package, not an inline browser heredoc.
+    expect(src).toContain("require('playwright')");
+    // Accepts the url/outDir/widths positional args.
+    expect(src).toContain('url, outDir, widthsArg');
+    // Captures full-page screenshots.
+    expect(src).toContain('fullPage: true');
+  });
+
+  it('writes PNGs with the px suffix required by viewport_manifest.py width regex', () => {
+    // viewport_manifest.py uses _WIDTH_RE = re.compile(r"-(\d+)px\.png$").
+    // If the capture helper omits "px", the manifest emits width: null and every
+    // upload returns 422 from the backend (width: int = Field(ge=1, le=4096)).
+    // This test creates a sample capture directory with a correctly-named file,
+    // runs viewport_manifest.py over it, and asserts the width is a non-null integer.
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'vl-manifest-test-'));
+    const outManifest = path.join(tmpDir, 'manifest.json');
+    try {
+      // Simulate what viewport-live-capture.js writes: live-<width>px.png
+      writeFileSync(path.join(tmpDir, 'live-375px.png'), Buffer.alloc(0));
+      // Also write a file with the OLD (broken) naming to confirm manifest yields null width.
+      writeFileSync(path.join(tmpDir, 'live-375.png'), Buffer.alloc(0));
+
+      // viewport_manifest.py argv: before_dir after_dir base run_id out_manifest
+      // (mirrors how viewport-live.sh calls it: before_dir="" after_dir="$OUT_DIR" …)
+      execFileSync(
+        'python3',
+        [MANIFEST_PY, '', tmpDir, 'live', 'test-run', outManifest],
+        { encoding: 'utf-8' },
+      );
+      const manifest = JSON.parse(readFileSync(outManifest, 'utf-8')) as {
+        pairs: Array<{ width: number | null; test: string; test_file: string }>;
+      };
+
+      // live-375px.png: _test_name strips "-375px.png" → test="live", width=375.
+      const withPx = manifest.pairs.find((p) => p.test_file === 'live-375px.png');
+      expect(withPx).toBeDefined();
+      if (!withPx) throw new Error('pair for live-375px.png not found in manifest');
+      expect(withPx.width).toBe(375);
+
+      // live-375.png (broken name): regex doesn't match → width=null.
+      const withoutPx = manifest.pairs.find((p) => p.test_file === 'live-375.png');
+      expect(withoutPx).toBeDefined();
+      if (!withoutPx) throw new Error('pair for live-375.png not found in manifest');
+      expect(withoutPx.width).toBeNull();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('writeViewportLiveHelper — generated ./viewport-live wrapper', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), 'vl-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('generates a valid bash wrapper that delegates to viewport-live.sh --upload', async () => {
+    const { writeViewportLiveHelper } = await import('./prompt.js');
+    writeViewportLiveHelper('live-task-id-1234', tmpDir);
+
+    const wrapperPath = path.join(tmpDir, 'viewport-live');
+    const src = readFileSync(wrapperPath, 'utf-8');
+
+    // Must invoke viewport-live.sh with --upload and the baked-in task ID.
+    expect(src).toContain('viewport-live.sh --upload --task-id');
+    expect(src).toContain('live-task-id-1234');
+    // Must be valid bash.
+    expect(() => execFileSync('bash', ['-n', wrapperPath])).not.toThrow();
+  });
+
+  it('bakes the task ID into the script as a literal assignment', async () => {
+    const { writeViewportLiveHelper } = await import('./prompt.js');
+    writeViewportLiveHelper('live-abc-xyz', tmpDir);
+
+    const src = readFileSync(path.join(tmpDir, 'viewport-live'), 'utf-8');
+    expect(src).toMatch(/TASK_ID="live-abc-xyz"/);
+  });
+
+  it('writes the wrapper as an executable file', async () => {
+    const { writeViewportLiveHelper } = await import('./prompt.js');
+    writeViewportLiveHelper('mode-task', tmpDir);
+
+    const { statSync } = await import('fs');
+    const mode = statSync(path.join(tmpDir, 'viewport-live')).mode;
+    // Owner-execute bit must be set (0o100).
+    expect(mode & 0o100).toBe(0o100);
+  });
+
+  it('VIEWPORT_LIVE_HINT references ./viewport-live and the infra-skip contract', async () => {
+    const { VIEWPORT_LIVE_HINT } = await import('./prompt.js');
+    expect(VIEWPORT_LIVE_HINT).toContain('./viewport-live');
+    expect(VIEWPORT_LIVE_HINT).toContain('/tmp/viewport_live/');
+    expect(VIEWPORT_LIVE_HINT).toContain('ORCHESTRATOR_URL');
+    expect(VIEWPORT_LIVE_HINT).toContain('ADMIN_API_KEY');
+    expect(VIEWPORT_LIVE_HINT).toContain('75');
   });
 });

@@ -668,4 +668,33 @@ describe('BootstrapStatusPanel', () => {
     expect(screen.getByRole('button', { name: /refresh bootstrap/i })).toBeTruthy();
     expect(screen.queryByRole('button', { name: /retry bootstrap/i })).toBeNull();
   });
+
+  test('shows domain knowledge captured timestamp in COMPLETED state when present', async () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: {
+            bootstrap_completed_at: '2026-06-01T12:00:00Z',
+            bootstrap_domain_knowledge_refreshed_at: '2026-06-01T12:05:00Z',
+          },
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.getByText(/Domain knowledge captured/i)).toBeTruthy();
+  });
+
+  test('does not show domain knowledge line when bootstrap_domain_knowledge_refreshed_at is absent', async () => {
+    fetchBuildConfigCommands.mockResolvedValue({ project_id: 'proj-1', directories: [] });
+    render(
+      <BootstrapStatusPanel
+        project={makeProject({
+          build_config: { bootstrap_completed_at: '2026-06-01T12:00:00Z' },
+        })}
+        tasks={[]}
+      />
+    );
+    expect(screen.queryByText(/Domain knowledge captured/i)).toBeNull();
+  });
 });

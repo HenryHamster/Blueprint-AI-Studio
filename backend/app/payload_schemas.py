@@ -606,15 +606,25 @@ class ComputeSuccessCriterion(BaseModel):
     Two kinds are supported:
 
     ``kind="metric"`` (default — backward-compatible): a numeric threshold check.
-    Declares a ``metric`` (a key read by name out of the terminal COMPUTE_RESULT
-    artifact), a comparison ``operator``, and a numeric ``threshold``. The metric
-    may name a reserved job-level field (final_cost_usd, durable_file_count, …)
-    OR any experiment-domain metric the command reports (accuracy, tokens_per_sec,
-    final_loss, …): the compute substrate carries reported metrics through
-    ``ComputeJob.polling_metadata.result_metrics``, which the agent flattens to
-    top-level numeric keys on the COMPUTE_RESULT, so the gate enforces them by
-    name. A declared metric the experiment does not report fails the gate
-    closed at completion (it is not silently treated as unmeasurable).
+    Declares a ``metric`` name, a comparison ``operator``, and a numeric
+    ``threshold``. Make the metric available in ONE of two ways — the success
+    criterion reads exactly that value:
+
+      1. write a JSON object ``{metric: value}`` to the file path in the
+         ``$BLUEPRINT_RESULT_FILE`` environment variable, or
+      2. print a JSON object containing the metric to stdout.
+
+    One-line example for a command declaring ``metric="accuracy"``::
+
+        python eval.py && echo "{\\"accuracy\\": 0.93}" > "$BLUEPRINT_RESULT_FILE"
+
+    (or simply ``print(json.dumps({"accuracy": 0.93}))`` — stdout works too). An
+    explicit ``$BLUEPRINT_RESULT_FILE`` write always wins when both are present.
+    The metric may also name a built-in run field (``final_cost_usd``,
+    ``durable_file_count``, …). A declared metric for which the experiment
+    produces NO numeric value does not quietly pass: the run terminates as a
+    measurable FAILURE (``compute_unmeasured_criterion``) so "the job ran" can
+    never masquerade as "the hypothesis was measured".
 
     ``kind="artifact_produced"``: artifact-existence check. The criterion is met
     when the job produced at least ``min_file_count`` durable artifact files. Use
@@ -751,15 +761,24 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     benchmark: str | None = None
     hypothesis: str | None = None
     metric: str | None = None
-    # Optional goal-level acceptance criterion. When declared, the metric gate
-    # checks the reported result against it at completion (a compute artifact
-    # that finishes but misses its declared goal fails the gate honestly);
-    # when absent, the gate preserves presence-based behavior.
+    # Optional goal-level acceptance criterion. When declared, make the metric
+    # available by writing {metric: value} JSON to $BLUEPRINT_RESULT_FILE OR by
+    # printing a JSON object containing it to stdout; the criterion reads THAT
+    # value at completion. A measured-but-missed goal is recorded as honest
+    # negative evidence; a declared metric with NO numeric value fails loud
+    # (compute_unmeasured_criterion). When absent, presence-based behavior holds.
     success_criterion: ComputeSuccessCriterion | None = None
     # Optional strict-delivery gate. When True, completion FAILS unless the job
     # links a COMPUTE_RESULT artifact whose storage URI is durable-class (gs://,
     # s3://, az://, file:). Absent/False preserves existing fail-soft behavior.
     require_durable_artifact: bool | None = None
+    # Opt-in "act now" axis (axis B). When True, a SUCCESSFUL completion makes the
+    # ORCHESTRATOR spawn ONE write-capable reason-and-ship follow-on task that
+    # reasons over the faithful result AND ships in the same task (and forwards any
+    # durable COMPUTE_RESULT artifact to it). Absent/False (default) preserves
+    # axis-A behavior exactly: the experiment still gets full faithful capture but
+    # spawns no follow-on. This flag ONLY gates the immediate follow-on spawn.
+    act_on_verdict: bool | None = None
 
 
 class WebResearchPayload(BasePayload):

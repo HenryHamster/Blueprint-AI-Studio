@@ -21,7 +21,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Project, Task, TaskHistory, TaskStatus
-from app.time_utils import _coerce_naive_utc, _utcnow
+from app.time_utils import _coerce_naive_utc, _utcnow, exponential_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +60,13 @@ def coerce_recovery_attempts(value: object) -> int:
 
 def next_recovery_backoff(attempts: int) -> timedelta:
     """Return the automatic bootstrap recovery delay for a degraded attempt."""
-    delay_hours = BOOTSTRAP_RECOVERY_BASE_BACKOFF_HOURS * (2 ** max(attempts - 1, 0))
-    return timedelta(hours=delay_hours)
+    delay_seconds = exponential_backoff(
+        max(attempts, 1),
+        base=BOOTSTRAP_RECOVERY_BASE_BACKOFF_HOURS * 3600,
+        cap=(2 ** (BOOTSTRAP_RECOVERY_MAX_ATTEMPTS - 1)) * BOOTSTRAP_RECOVERY_BASE_BACKOFF_HOURS * 3600,
+        jitter=0,
+    )
+    return timedelta(seconds=delay_seconds)
 
 
 # A refresh is a one-shot operator action against an already-COMPLETED project.

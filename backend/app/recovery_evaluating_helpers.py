@@ -764,6 +764,69 @@ async def _emit_spend_hold_created_signals(
     _dispatch_spend_hold_notification(task, "SPEND_HOLD_CREATED", window_hours)
 
 
+async def _apply_rollup_merge_classification(
+    task: Task,
+    proj,
+    session,
+    *,
+    pr_number: int | None,
+    merged_base_branch: str | None,
+    source: str,
+    msg_terminal: str,
+    msg_non_terminal: str,
+    hotfix_lane: bool | None,
+    ctx_override: dict | None = None,
+    non_merge_reason: str | None = None,
+) -> tuple[bool, bool, str]:
+    """Shared classify→status→signal sequence for rollup-merge recovery sites.
+
+    Steps: classify_rollup_merge_outcome → task.status/vm_instance_id/last_heartbeat
+    → latest_status_message → conditional landed-signal write.
+
+    ``msg_terminal`` / ``msg_non_terminal`` may contain a ``{landed}`` placeholder
+    expanded with the resolved landing branch. ``hotfix_lane=None`` routes through
+    ``mark_landed_on_integration``; a bool value routes through
+    ``apply_merged_landed_signal``. ``ctx_override`` is staged onto ``task.context``
+    before the signal write when supplied (used at site 1 where _ctx2 must be
+    committed after the signal).
+
+    Returns (record_merged, terminal, landed_branch).
+    """
+    from app.branch_resolution import classify_rollup_merge_outcome
+    from app.landed_signal import apply_merged_landed_signal, mark_landed_on_integration
+
+    record_merged, terminal, landed = await classify_rollup_merge_outcome(
+        task,
+        proj,
+        session,
+        pr_number=pr_number,
+        merged_base_branch=merged_base_branch,
+        source=source,
+    )
+    task.status = TaskStatus.COMPLETED if terminal else TaskStatus.EVALUATING
+    task.vm_instance_id = None
+    task.last_heartbeat = None
+    task.latest_status_message = (
+        msg_terminal.format(landed=landed)
+        if terminal
+        else msg_non_terminal.format(landed=landed)
+    )
+    if record_merged:
+        if ctx_override is not None:
+            task.context = ctx_override
+        if hotfix_lane is None:
+            mark_landed_on_integration(task)
+        else:
+            apply_merged_landed_signal(
+                task,
+                proj,
+                base_branch=landed,
+                hotfix_lane=hotfix_lane,
+                non_merge_reason=non_merge_reason,
+            )
+    return record_merged, terminal, landed
+
+
 async def _heal_direction_outcomes_best_effort(task_id, *, label: str) -> None:
     """Heal a direction's research-history merge counts after an out-of-band
     reconcile, in a FRESH session re-fetching by id.

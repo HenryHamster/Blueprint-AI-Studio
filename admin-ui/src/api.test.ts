@@ -7,6 +7,7 @@ import {
   retryProjectBootstrap,
   resolveViewportFailureDownloadUrl,
   fetchImprovementLanes,
+  fetchImprovementLaneDetail,
 } from './api';
 
 vi.mock('./firebase', () => ({
@@ -256,5 +257,33 @@ describe('analyzeComputeJob', () => {
       status: 'analysis_unavailable',
       reason: 'analysis-disabled',
     });
+  });
+});
+
+describe('fetchImprovementLaneDetail', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('builds the correct URL with project_id param and encodes the lane id', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ id: 'lane/special id', checkpoints: [], manifest: {}, current_task: null }), { status: 200 }),
+    );
+
+    await fetchImprovementLaneDetail('proj-1', 'lane/special id');
+
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('/api/admin/improvement-lanes/lane%2Fspecial%20id');
+    expect(url).toContain('project_id=proj-1');
+  });
+
+  it('throws on non-ok responses', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ detail: 'not found' }), { status: 404 }),
+    );
+
+    await expect(fetchImprovementLaneDetail('proj-1', 'lane-1')).rejects.toThrow(
+      'Failed to fetch improvement lane detail: 404',
+    );
   });
 });

@@ -18,6 +18,9 @@ import logging
 import re
 from typing import Any
 
+from app.ci_resolution import (
+    _CI_RED,
+)
 from app.migration_reconciliation import AUTHORIZED_DIVERGENCES
 
 logger = logging.getLogger(__name__)
@@ -52,9 +55,10 @@ def compute_composite(
     policy: dict[str, Any],
     *,
     smoketest_enabled: bool = True,
-    ci_state: str = "red",  # _CI_RED — defined later in module; use literal here
+    ci_state: str = _CI_RED,
     migration_collision: bool = False,
     migration_apply_blocked: bool = False,
+    theme_delivery_blocked: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -170,6 +174,12 @@ def compute_composite(
         # from the filename-identity collision above — checked after it so a
         # candidate failing both reports the identity collision first.
         blocker = "migration_apply_drift"
+    elif theme_delivery_blocked:
+        # The candidate's diffstat directionally contradicts its stated theme
+        # (e.g. a leanness candidate that added net LOC) and the operator has
+        # raised theme_block_threshold above 0.0 to arm hard-blocking.
+        # Ships dark by default (threshold=0.0 never fires).
+        blocker = "theme_delivery_shortfall"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.
@@ -213,30 +223,6 @@ def compute_composite(
         "sub_scores": sub_scores,
         "blocker": None,
     }
-
-
-# CI resolution states for a qualifier candidate commit.
-_CI_GREEN = "green"  # a real completed, all-passing build exists
-_CI_RED = "red"  # a completed build with at least one failure
-_CI_PENDING = "pending"  # checks in progress, or no check-runs found anywhere
-_CI_NO_CHECKS = "no_checks"  # the commit itself carries no check-runs
-
-
-def _classify_check_runs(result: dict[str, Any] | None) -> str:
-    """Map a strict ``get_check_runs`` result to a qualifier CI state."""
-    if not isinstance(result, dict):
-        return _CI_PENDING
-    status = result.get("status")
-    if status == "no_checks":
-        return _CI_NO_CHECKS
-    if status == "completed":
-        conclusion = result.get("conclusion")
-        if conclusion == "success":
-            return _CI_GREEN
-        if conclusion == "failure":
-            return _CI_RED
-        return _CI_PENDING
-    return _CI_PENDING
 
 
 _AUDIT_DEDUCTIONS: dict[str, float] = {

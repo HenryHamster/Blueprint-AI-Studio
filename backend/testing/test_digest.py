@@ -3011,15 +3011,11 @@ async def test_failure_group_agent_timeout_subtypes(client: AsyncClient, db_sess
     await db_session.refresh(project)
 
     curr = _curr_ts()
-    cases = [
+    # Cascade cancellations are ADMIN_CANCEL (not AGENT_TIMEOUT) since PR #10508.
+    timeout_cases = [
         ("Heartbeat Task", "No heartbeat received after 300s", "heartbeat_lost"),
         ("OOM Task", "exit code 137 out of memory", "oom"),
         ("Exec Task", "execution timed out after 1800s", "execution_timeout"),
-        (
-            "Cascade Task",
-            "Cancelled: parent evaluation timeout",
-            "cascade_cancellation",
-        ),
         (
             "Iter Task",
             "merge blocked, fix not spawned (iteration cap)",
@@ -3027,7 +3023,10 @@ async def test_failure_group_agent_timeout_subtypes(client: AsyncClient, db_sess
         ),
         ("Crash Task", "[FATAL:uncaughtException] boom", "process_crash"),
     ]
-    for title, msg, _ in cases:
+    cascade_title = "Cascade Task"
+    cascade_msg = "Cancelled: parent evaluation timeout"
+    all_tasks = timeout_cases + [(cascade_title, cascade_msg, None)]
+    for title, msg, _ in all_tasks:
         db_session.add(
             make_task(
                 project_id=project.id,
@@ -3050,15 +3049,17 @@ async def test_failure_group_agent_timeout_subtypes(client: AsyncClient, db_sess
     title_to_subtype = {
         t["title"]: t["timeout_subtype"] for t in timeout_group["tasks"]
     }
-    for title, _, expected_subtype in cases:
+    for title, _, expected_subtype in timeout_cases:
         assert title_to_subtype[title] == expected_subtype, (
             title,
             title_to_subtype[title],
         )
 
     rf_by_title = {f["title"]: f for f in data["recent_failures"]}
-    for title, _, expected_subtype in cases:
+    for title, _, expected_subtype in timeout_cases:
         assert rf_by_title[title]["timeout_subtype"] == expected_subtype
+    # Cascade cancellations are ADMIN_CANCEL — timeout_subtype is not populated.
+    assert rf_by_title[cascade_title]["timeout_subtype"] is None
 
 
 @pytest.mark.asyncio
@@ -8352,6 +8353,86 @@ async def test_viewport_debt_coverage_summary_counts_full_set(
     assert len(body["rows"]) == 15
     # untested_components capped at 50
     assert len(cs["untested_components"]) == 50
+
+
+@pytest.mark.asyncio
+async def test_viewport_debt_regression_cases_from_residual_records(
+    client: AsyncClient, db_session
+):
+    """regression_case_count/breakdown are populated from ResidualRemediationCase
+    viewport:* fingerprints; IGNORED/RESOLVED cases are excluded."""
+    from unittest.mock import patch
+
+    from app.models import ResidualCaseStatus, ResidualRemediationCase
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    membership = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(membership)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def _case(fingerprint, hit_count, status):
+        return ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint=fingerprint,
+            status=status,
+            hit_count=hit_count,
+            first_seen_at=now,
+            last_seen_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+
+    db_session.add_all(
+        [
+            _case("viewport:TestComp:overflow", 3, ResidualCaseStatus.ACTIVE),
+            _case("viewport:TestComp:text_truncation", 1, ResidualCaseStatus.ACTIVE),
+            # Excluded: IGNORED/RESOLVED cases must not contribute to counts.
+            # (distinct fingerprints — (project_id, fingerprint) is unique.)
+            _case("viewport:TestComp:blank_render", 99, ResidualCaseStatus.IGNORED),
+            _case("viewport:TestComp:small_target", 50, ResidualCaseStatus.RESOLVED),
+        ]
+    )
+    await db_session.commit()
+
+    top_rows = [
+        {
+            "component": "admin-ui/src/components/TestComp.tsx",
+            "eslint_disable_count": 1,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 1,
+            "has_viewport_test": False,
+            "regression_case_count": 0,
+            "regression_case_breakdown": {},
+            "source_url": None,
+        }
+    ]
+    summary = {
+        "total_components": 1,
+        "untested_count": 0,
+        "untested_components": [],
+    }
+
+    with patch(
+        "app.viewport_debt._scan_viewport_debt_rows",
+        return_value=(top_rows, [], summary),
+    ):
+        response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+    assert response.status_code == 200
+    row = next(
+        r
+        for r in response.json()["rows"]
+        if r["component"] == "admin-ui/src/components/TestComp.tsx"
+    )
+    assert row["regression_case_count"] == 4
+    assert row["regression_case_breakdown"] == {"overflow": 3, "text_truncation": 1}
 
 
 @pytest.mark.asyncio

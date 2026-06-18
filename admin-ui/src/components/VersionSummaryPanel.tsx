@@ -62,20 +62,70 @@ function TaskRow({ entry }: { entry: ChangelogEntry }): JSX.Element {
 function TypeSection({
   taskType,
   entries,
+  defaultOpen,
 }: {
   taskType: string;
   entries: ChangelogEntry[];
+  defaultOpen?: boolean;
 }): JSX.Element {
+  const [open, setOpen] = useState(defaultOpen ?? true);
+
   return (
-    <div className="mb-3 last:mb-0">
-      <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
-        {taskType} <span className="text-slate-600 font-normal">({entries.length})</span>
-      </div>
-      <ul className="space-y-0.5 pl-1">
-        {entries.map((entry, i) => (
-          <TaskRow key={i} entry={entry} />
-        ))}
-      </ul>
+    <div className="mb-2 last:mb-0">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        data-testid={`type-section-toggle-${taskType}`}
+        className="flex items-center gap-1 w-full text-left min-h-[44px] py-0.5 group"
+        aria-expanded={open}
+      >
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 group-hover:text-slate-400 transition-colors">
+          {taskType}
+        </span>
+        <span className="text-slate-600 font-normal text-[10px]">({entries.length})</span>
+        <span className="ml-auto text-[10px] text-slate-600 group-hover:text-slate-400 transition-colors">
+          {open ? '▾' : '▸'}
+        </span>
+      </button>
+      {open && (
+        <ul className="space-y-0.5 pl-1 pb-1">
+          {entries.map((entry, i) => (
+            <TaskRow key={i} entry={entry} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function TypeCountBadge({ taskType, count }: { taskType: string; count: number }): JSX.Element {
+  return (
+    <span className="inline-flex items-center gap-0.5 rounded bg-slate-700/60 px-1.5 py-0.5 text-[10px] text-slate-400">
+      <span className="font-medium">{count}</span>
+      <span className="text-slate-500">{taskType}</span>
+    </span>
+  );
+}
+
+const BUCKET_META: Record<string, { label: string; className: string }> = {
+  undeclared:                { label: 'no criteria',    className: 'text-amber-400' },
+  declared_unsatisfied:      { label: 'criteria failed', className: 'text-red-400' },
+  satisfied_unproven:        { label: 'satisfied',       className: 'text-slate-400' },
+  merged_unverified_degraded:{ label: 'degraded',        className: 'text-amber-400' },
+  malformed:                 { label: 'malformed',       className: 'text-red-400' },
+};
+
+function AcceptanceBucketBreakdown({ aggregate }: { aggregate: Record<string, number> }): JSX.Element | null {
+  const entries = Object.entries(BUCKET_META)
+    .map(([key, meta]) => ({ key, count: aggregate[key] ?? 0, ...meta }))
+    .filter(e => e.count > 0);
+  if (entries.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] mb-2" data-testid="acceptance-bucket-breakdown">
+      {entries.map(e => (
+        <span key={e.key} className={e.className}>
+          {e.count} {e.label}
+        </span>
+      ))}
     </div>
   );
 }
@@ -83,11 +133,14 @@ function TypeSection({
 export function VersionSummaryPanel({
   tasksMerged,
   heading,
+  acceptanceAggregate,
 }: {
   tasksMerged: ChangelogEntry[] | undefined;
   heading?: string;
+  acceptanceAggregate?: Record<string, number> | null;
 }): JSX.Element | null {
   const [copied, setCopied] = useState(false);
+  const [filter, setFilter] = useState('');
 
   if (tasksMerged === undefined) return null;
 
@@ -102,7 +155,16 @@ export function VersionSummaryPanel({
     );
   }
 
-  const groups = groupByType(tasksMerged);
+  const normalizedFilter = filter.trim().toLowerCase();
+  const filteredEntries = normalizedFilter
+    ? tasksMerged.filter((e) => {
+        const titleMatch = (e.title ?? '').toLowerCase().includes(normalizedFilter);
+        const prMatch = e.pr_number != null && String(e.pr_number).includes(normalizedFilter);
+        return titleMatch || prMatch;
+      })
+    : tasksMerged;
+
+  const groups = groupByType(filteredEntries);
 
   const handleCopyMarkdown = () => {
     const md = exportChangelogMarkdown(tasksMerged, heading ?? 'What shipped');
@@ -111,6 +173,9 @@ export function VersionSummaryPanel({
       setTimeout(() => setCopied(false), 2000);
     }).catch(() => {});
   };
+
+  // Default: collapse sections when total tasks > 20 to keep the panel scannable
+  const defaultOpen = tasksMerged.length <= 20;
 
   return (
     <div
@@ -130,10 +195,32 @@ export function VersionSummaryPanel({
           {copied ? 'Copied!' : 'Copy markdown'}
         </button>
       </div>
-      <div className="max-h-48 overflow-y-auto pr-1">
-        {Array.from(groups.entries()).map(([type, entries]) => (
-          <TypeSection key={type} taskType={type} entries={entries} />
+      {acceptanceAggregate && <AcceptanceBucketBreakdown aggregate={acceptanceAggregate} />}
+      {/* Per-type count summary — lets operator grasp shape of release at a glance */}
+      <div className="flex flex-wrap gap-1 mb-2" data-testid="type-count-summary">
+        {Array.from(groupByType(tasksMerged).entries()).map(([type, entries]) => (
+          <TypeCountBadge key={type} taskType={type} count={entries.length} />
         ))}
+      </div>
+      <input
+        type="search"
+        data-testid="changelog-filter-input"
+        placeholder="Filter by title or PR…"
+        value={filter}
+        onChange={(e) => setFilter(e.target.value)}
+        className="w-full mb-2 rounded bg-slate-700/50 border border-slate-600/50 px-2 py-1 text-[11px] text-slate-300 placeholder-slate-500 outline-none focus:border-slate-500"
+        aria-label="Filter changelog entries"
+      />
+      <div className="max-h-64 overflow-y-auto pr-1">
+        {filteredEntries.length === 0 ? (
+          <div data-testid="changelog-filter-no-results" className="text-[11px] text-slate-500 italic py-1">
+            No entries match &ldquo;{filter}&rdquo;.
+          </div>
+        ) : (
+          Array.from(groups.entries()).map(([type, entries]) => (
+            <TypeSection key={type} taskType={type} entries={entries} defaultOpen={defaultOpen} />
+          ))
+        )}
       </div>
     </div>
   );

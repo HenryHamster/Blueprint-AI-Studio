@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broadcast import broadcast_to_project
+from app.json_extract import _extract_json_object
 from app.capability_registry import (
     off_registry_capability_refs,
     registry_capability_names,
@@ -66,33 +67,10 @@ def _parse_plan_output(text: str) -> Dict[str, Any] | None:
     """
     text = text[:500_000]
     try:
-        match = re.search(r'\{\s*"subtasks"\s*:\s*\[', text)
-        if not match:
+        candidate = _extract_json_object(text, "subtasks")
+        if candidate is None:
             return None
-        start = match.start()
-        depth = 0
-        in_string = False
-        escape_next = False
-        for i in range(start, len(text)):
-            c = text[i]
-            if escape_next:
-                escape_next = False
-                continue
-            if c == "\\" and in_string:
-                escape_next = True
-                continue
-            if c == '"' and not escape_next:
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start : i + 1]
-                    return json.loads(candidate)
+        return json.loads(candidate)
     except (json.JSONDecodeError, AttributeError) as e:
         logger.warning(f"[PLAN] Failed to parse plan JSON: {e}", exc_info=True)
     return None
@@ -459,27 +437,31 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     if len(subtasks) > 10:
         dropped_count = len(subtasks) - 10
         dropped_subtasks = subtasks[10:]
-        dropped_titles = [st.get("title", f"#{10 + i}") for i, st in enumerate(dropped_subtasks)]
+        dropped_titles = [
+            st.get("title", f"#{10 + i}") for i, st in enumerate(dropped_subtasks)
+        ]
 
         # Check if any of the kept subtasks depend on a dropped subtask
         broken_deps = []
         for i in range(min(10, len(subtasks))):
             for dep_idx in subtasks[i].get("depends_on_indices", []):
                 if dep_idx >= 10:
-                    broken_deps.append({
-                        "subtask_index": i,
-                        "subtask_title": subtasks[i].get("title", f"#{i}"),
-                        "broken_dep_index": dep_idx,
-                        "broken_dep_title": (
-                            subtasks[dep_idx].get("title", f"#{dep_idx}")
-                            if dep_idx < len(subtasks)
-                            else f"#{dep_idx}"
-                        ),
-                    })
+                    broken_deps.append(
+                        {
+                            "subtask_index": i,
+                            "subtask_title": subtasks[i].get("title", f"#{i}"),
+                            "broken_dep_index": dep_idx,
+                            "broken_dep_title": (
+                                subtasks[dep_idx].get("title", f"#{dep_idx}")
+                                if dep_idx < len(subtasks)
+                                else f"#{dep_idx}"
+                            ),
+                        }
+                    )
 
         task.latest_status_message = (
             f"Plan exceeds 10-subtask limit: {len(subtasks)} subtasks provided, "
-            f"dropped {dropped_count} (indices 10-{len(subtasks)-1}). "
+            f"dropped {dropped_count} (indices 10-{len(subtasks) - 1}). "
             f"Kept subtasks have {len(broken_deps)} unsatisfiable "
             f"dependency/dependencies on dropped subtasks."
         )[:500]
@@ -509,9 +491,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         }
         task.context = ctx
         session.add(task)
-        await _maybe_create_failure_alert(
-            task, session, task.latest_status_message
-        )
+        await _maybe_create_failure_alert(task, session, task.latest_status_message)
         await session.commit()
         logger.error(
             "[PLAN] Plan %s failed — decomposition exceeded 10-subtask cap: "
@@ -593,9 +573,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     }
     parent_direction_id = (task.context or {}).get("direction_id")
     parent_research_task_id = (task.context or {}).get("research_task_id")
-    parent_parent_research_task_id = (task.context or {}).get(
-        "parent_research_task_id"
-    )
+    parent_parent_research_task_id = (task.context or {}).get("parent_research_task_id")
     parent_finding_index = (task.context or {}).get("finding_index")
     parent_finding_hash = (task.context or {}).get("finding_hash")
     parent_finding_challenge = (task.context or {}).get("finding_challenge")
@@ -613,7 +591,10 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     type_coercions: dict[int, tuple[str, str]] = {}
     for i, subtask_def in enumerate(subtasks):
         raw_type = subtask_def.get("type", "create")
-        if raw_type not in plan_child_allowlist and raw_type in PLAN_SUBTASK_TYPE_COERCIONS:
+        if (
+            raw_type not in plan_child_allowlist
+            and raw_type in PLAN_SUBTASK_TYPE_COERCIONS
+        ):
             target = PLAN_SUBTASK_TYPE_COERCIONS[raw_type]
             subtask_def["type"] = target
             type_coercions[i] = (raw_type, target)
@@ -897,6 +878,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                     "command": compute_contract["command"],
                     "spend_cap_usd": float(compute_contract["spend_cap_usd"]),
                     "deadline_seconds": int(compute_contract["deadline_seconds"]),
+                    "base_branch": plan_branch,
                     **(
                         {"success_criterion": compute_contract["success_criterion"]}
                         if compute_contract.get("success_criterion") is not None
@@ -994,9 +976,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                     else {}
                 ),
                 **(
-                    {"finding_hash": parent_finding_hash}
-                    if parent_finding_hash
-                    else {}
+                    {"finding_hash": parent_finding_hash} if parent_finding_hash else {}
                 ),
                 **(
                     {"finding_challenge": parent_finding_challenge}

@@ -170,4 +170,194 @@ describe('VersionSummaryPanel — viewport regression', () => {
     );
     expect(spans.length).toBe(1);
   });
+
+  test('renders without horizontal overflow at 768px', async () => {
+    await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+      });
+    });
+  });
+
+  test('per-type count summary badges render at 768px', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+    const summary = host.querySelector('[data-testid="type-count-summary"]');
+    if (summary === null) {
+      throw new Error('Expected type-count-summary element to be present');
+    }
+    // SAMPLE_TASKS has create (2), fix (2), research (1)
+    const text = summary.textContent ?? '';
+    if (!text.includes('2') || !text.includes('create')) {
+      throw new Error('Expected type-count-summary to include count badges');
+    }
+  });
+
+  test('type section toggle collapses and expands entries', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+    const toggle = host.querySelector('[data-testid="type-section-toggle-create"]') as HTMLButtonElement | null;
+    if (toggle === null) {
+      throw new Error('Expected type-section-toggle-create button');
+    }
+    // Initially open (≤20 tasks)
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    // Collapse
+    await act(async () => {
+      toggle.click();
+    });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    // Expand again
+    await act(async () => {
+      toggle.click();
+    });
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  test('acceptance bucket breakdown renders non-zero non-proven buckets', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <VersionSummaryPanel
+          tasksMerged={SAMPLE_TASKS}
+          acceptanceAggregate={{ proven: 2, undeclared: 3, declared_unsatisfied: 1, satisfied_unproven: 0 }}
+        />,
+      );
+    });
+    const breakdown = host.querySelector('[data-testid="acceptance-bucket-breakdown"]');
+    if (breakdown === null) throw new Error('Expected acceptance-bucket-breakdown element');
+    const text = breakdown.textContent ?? '';
+    if (!text.includes('3') || !text.includes('no criteria')) throw new Error('Expected undeclared bucket in breakdown');
+    if (!text.includes('1') || !text.includes('criteria failed')) throw new Error('Expected declared_unsatisfied bucket in breakdown');
+    // proven is excluded from breakdown; satisfied_unproven is 0 so also excluded
+    if (text.includes('proven')) throw new Error('proven should not appear in bucket breakdown');
+  });
+
+  test('acceptance bucket breakdown is absent when aggregate is not provided', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+    const breakdown = host.querySelector('[data-testid="acceptance-bucket-breakdown"]');
+    if (breakdown !== null) throw new Error('Expected no acceptance-bucket-breakdown when acceptanceAggregate is absent');
+  });
+
+  test('filters changelog entries by title and PR substring', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+
+    const input = host.querySelector('[data-testid="changelog-filter-input"]') as HTMLInputElement | null;
+    if (input === null) throw new Error('Expected changelog-filter-input to be present');
+
+    // Filter by title substring — only the 'create' entry matching 'VersionSummaryPanel' should appear
+    await act(async () => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+      nativeInputValueSetter?.call(input, 'VersionSummaryPanel');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+
+    // Expect no-results sentinel to be absent (there is a match)
+    const noResults = host.querySelector('[data-testid="changelog-filter-no-results"]');
+    if (noResults !== null) throw new Error('Expected matching entries but got no-results message');
+
+    // The matching title should be visible
+    const titles = Array.from(host.querySelectorAll('li span.text-xs'));
+    const visibleTitles = titles.map((el) => el.textContent ?? '');
+    if (!visibleTitles.some((t) => t.includes('VersionSummaryPanel'))) {
+      throw new Error(`Expected title containing "VersionSummaryPanel" but got: ${JSON.stringify(visibleTitles)}`);
+    }
+    // Unrelated entries should not be visible
+    if (visibleTitles.some((t) => t.includes('Fix viewport test coverage'))) {
+      throw new Error('Expected fix entry to be filtered out');
+    }
+
+    // Filter by PR number substring
+    await act(async () => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+      nativeInputValueSetter?.call(input, '10260');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const prSpans = Array.from(host.querySelectorAll('li span')).filter((el) => el.textContent === '#10260');
+    if (prSpans.length === 0) throw new Error('Expected entry with PR #10260 to appear when filtering by "10260"');
+
+    // Clear filter — all entries should return
+    await act(async () => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+      nativeInputValueSetter?.call(input, '');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const allTitles = Array.from(host.querySelectorAll('li span.text-xs')).map((el) => el.textContent ?? '');
+    if (allTitles.length !== SAMPLE_TASKS.length) {
+      throw new Error(`Expected all ${SAMPLE_TASKS.length} tasks after clearing filter, got ${allTitles.length}`);
+    }
+  });
+
+  test('filter shows no-results message when nothing matches', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+    const input = host.querySelector('[data-testid="changelog-filter-input"]') as HTMLInputElement | null;
+    if (input === null) throw new Error('Expected changelog-filter-input');
+    await act(async () => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+      nativeInputValueSetter?.call(input, 'xyznonexistent');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const noResults = host.querySelector('[data-testid="changelog-filter-no-results"]');
+    if (noResults === null) throw new Error('Expected no-results message for unmatched filter');
+    if (!noResults.textContent?.includes('xyznonexistent')) {
+      throw new Error('Expected no-results message to include the filter query');
+    }
+  });
+
+  test('large version (>20 tasks) defaults sections to collapsed', async () => {
+    const manyTasks: ChangelogEntry[] = Array.from({ length: 25 }, (_, i) => ({
+      task_type: 'create',
+      title: `Task ${i}`,
+      pr_number: 10000 + i,
+      pr_url: null,
+    }));
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={manyTasks} />);
+    });
+    const toggle = host.querySelector('[data-testid="type-section-toggle-create"]') as HTMLButtonElement | null;
+    if (toggle === null) {
+      throw new Error('Expected type-section-toggle-create button');
+    }
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  });
 });

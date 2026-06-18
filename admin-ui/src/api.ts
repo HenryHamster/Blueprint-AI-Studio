@@ -683,6 +683,7 @@ export interface ImprovementLaneRow {
   reservation_force_expired_count: number | null;
   pilot_arm: string | null;
   phase_requeues: number;
+  at_risk: boolean;
   recovery: { reason: string; attempt: number; exhausted: boolean; at: string } | null;
   llm_input_tokens_total: number | null;
   llm_output_tokens_total: number | null;
@@ -702,6 +703,23 @@ export interface ShadowLaneHealth {
   miss_rate: number | null;
 }
 
+export interface LaneRelayTimingFields {
+  wall_clock_seconds: number | null;
+  active_seconds: number | null;
+  gap_seconds: number | null;
+}
+
+export interface LaneRelayComparison {
+  source_version: {
+    version_number: number;
+    captured_at: string | null;
+    terminal_status: string | null;
+  };
+  relay: LaneRelayTimingFields;
+  lane: LaneRelayTimingFields;
+  deltas: LaneRelayTimingFields;
+}
+
 export interface LanePilotTrialMetrics {
   verdict: 'KILL' | 'ADOPT' | 'CONTINUE';
   verdict_reason: string;
@@ -718,6 +736,7 @@ export interface LanePilotTrialMetrics {
   lane_fix_tasks_sampled: number;
   control_warm_resume_count: number;
   gate_integrity_violations: number;
+  lane_relay_comparison?: LaneRelayComparison | null;
   [key: string]: unknown;
 }
 
@@ -802,6 +821,92 @@ export async function fetchLanePilotPreflight(
     signal,
   );
   if (!res.ok) throw new Error(`Failed to fetch lane pilot preflight: ${res.status}`);
+  return res.json();
+}
+
+export interface ImprovementLaneCheckpoint {
+  seq: number;
+  phase: string;
+  task_id: string;
+  sha: string;
+  parent_sha: string | null;
+  created_at: string;
+  summary: string | null;
+  validated: { lint: boolean | null; tests: boolean | null };
+  wip_failing: boolean | null;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  vm_cost_usd: number | null;
+  warm_resume: boolean | null;
+}
+
+export interface ImprovementLaneManifest {
+  phase_log?: unknown[] | null;
+  remaining?: unknown[] | null;
+  critical_files?: string[] | null;
+  failing_tests?: string[] | null;
+  risks?: string[] | null;
+  progress?: string | null;
+  recovery?: unknown | null;
+  [key: string]: unknown;
+}
+
+export interface ImprovementLaneCurrentTask {
+  task_id: string;
+  status: string;
+  title: string | null;
+  task_type: string | null;
+}
+
+export interface ImprovementLaneDetail {
+  id: string;
+  title: string | null;
+  goal: string | null;
+  direction_id: string | null;
+  version_number: number | null;
+  status: string;
+  branch_name: string | null;
+  base_branch: string | null;
+  created_at: string | null;
+  parked_at: string | null;
+  last_resumed_at: string | null;
+  retired_at: string | null;
+  updated_at: string | null;
+  last_checkpoint_sha: string | null;
+  last_checkpoint_phase: string | null;
+  checkpoint_seq: number;
+  phase_requeues: number;
+  at_risk: boolean;
+  checkpoints: ImprovementLaneCheckpoint[];
+  manifest: ImprovementLaneManifest;
+  workspace_state: string | null;
+  workspace_vm_instance_id: string | null;
+  pilot_arm: string | null;
+  llm_input_tokens_total: number | null;
+  llm_output_tokens_total: number | null;
+  vm_cost_usd_total: number;
+  reserved_idle_cost_usd_total: number;
+  reservation_claimed_by_fix_count: number;
+  reservation_expired_before_fix_count: number;
+  reservation_force_expired_count: number;
+  current_task_id: string | null;
+  current_task: ImprovementLaneCurrentTask | null;
+}
+
+export async function fetchImprovementLaneDetail(
+  projectId: string,
+  laneId: string,
+  signal?: AbortSignal,
+): Promise<ImprovementLaneDetail> {
+  const params = new URLSearchParams({ project_id: projectId });
+  const res = await apiFetch(
+    `/api/admin/improvement-lanes/${encodeURIComponent(laneId)}?${params.toString()}`,
+    undefined,
+    2,
+    15000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch improvement lane detail: ${res.status}`);
   return res.json();
 }
 
@@ -1503,6 +1608,14 @@ export interface AuditReconciliation {
   excluded_findings_count: number;
 }
 
+export interface ThemeDeliveryCert {
+  theme_class?: string | null;
+  assessed_grade?: number | null;
+  net_loc?: number | null;
+  directional_contradiction?: boolean | null;
+  state?: string | null;
+}
+
 export interface AuditFinding {
   severity: string;
   summary: string;
@@ -1571,6 +1684,7 @@ export interface VersionQualification {
   promotion_pr_url?: string | null;
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
+  theme_delivery?: ThemeDeliveryCert | null;
 }
 
 /** Single resolved serving block — the canonical answer to "is this version live?"
@@ -1736,6 +1850,8 @@ export interface CurrentVersion {
    *  each merged task, newest-first. Allows operators to see what shipped without
    *  manual release notes. */
   tasks_merged?: ChangelogEntry[];
+  /** Acceptance-criteria bucket counts for all merged tasks in this version. */
+  acceptance_aggregate?: Record<string, number> | null;
 }
 
 export interface RecentVersion {
@@ -1947,6 +2063,7 @@ export interface VersionSummaryHighlights {
   total_merged_for_acceptance: number;
   qualification_confidence: number | null;
   qualification_threshold: number | null;
+  narrative?: string | null;
 }
 
 export interface VersionSummaryResponse {
@@ -2147,6 +2264,7 @@ export interface QualificationVerdictRecord {
   promotion_pr_url?: string | null;
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
+  theme_delivery?: ThemeDeliveryCert | null;
 }
 
 export interface QualificationVerdictsInfraContext {

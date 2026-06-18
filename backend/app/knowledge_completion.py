@@ -49,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
+from app.json_extract import _extract_json_object
 from app.schemas import sanitize_rpc_diagnostic
 from app.knowledge_query import (
     KnowledgeSubstance,
@@ -602,43 +603,15 @@ def _parse_web_research_document(text: str | None) -> dict[str, Any] | None:
         return parsed
 
     # Fallback: scan for a balanced JSON object carrying the required keys.
-    if not all(f'"{k}"' in snippet for k in _DOCUMENT_REQUIRED_KEYS):
+    candidate = _extract_json_object(snippet, *_DOCUMENT_REQUIRED_KEYS)
+    if candidate is None:
         return None
-    start = snippet.find("{")
-    while start != -1:
-        depth = 0
-        in_string = False
-        escape_next = False
-        for i in range(start, len(snippet)):
-            c = snippet[i]
-            if escape_next:
-                escape_next = False
-                continue
-            if c == "\\" and in_string:
-                escape_next = True
-                continue
-            if c == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = snippet[start : i + 1]
-                    if all(f'"{k}"' in candidate for k in _DOCUMENT_REQUIRED_KEYS):
-                        try:
-                            obj = json.loads(candidate)
-                        except (json.JSONDecodeError, ValueError):
-                            obj = None
-                        if isinstance(obj, dict) and all(
-                            k in obj for k in _DOCUMENT_REQUIRED_KEYS
-                        ):
-                            return obj
-                    break
-        start = snippet.find("{", start + 1)
+    try:
+        obj = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(obj, dict) and all(k in obj for k in _DOCUMENT_REQUIRED_KEYS):
+        return obj
     return None
 
 
@@ -1170,6 +1143,8 @@ def _build_compute_experiment_document(
     criterion: dict[str, Any] | None,
     result_reference: str | None,
     terminal_diagnostics: dict[str, Any] | None = None,
+    result_metrics: dict[str, Any] | None = None,
+    arms: Any | None = None,
 ) -> dict[str, Any]:
     """Build the DETERMINISTIC compute-experiment knowledge document.
 
@@ -1183,6 +1158,12 @@ def _build_compute_experiment_document(
     (``terminal_reason``, ``vm_phase``, ``accelerator_type``, ``machine_type``).
     When present it is appended to the human-readable summary and body and stored
     in ``verdict_record`` so a failed run is attributable at a glance.
+
+    ``result_metrics`` (the experiment's reported numbers) and ``arms`` (an A/B /
+    multi-arm comparison block, when the experiment reported one) are captured
+    FAITHFULLY — verbatim, no interpretation — into the body and the
+    ``verdict_record`` so the strategist and the later opt-in judgment agent can
+    query the real result rather than a truncated narrative.
     """
     payload = task.first_payload or {}
     experiment = str(payload.get("experiment") or "").strip()
@@ -1307,6 +1288,23 @@ def _build_compute_experiment_document(
                 body_lines.append(
                     f"- **Provisioning model:** {td_contract['provisioning_model']}"
                 )
+    # Faithful capture of the reported numbers and any A/B arms — verbatim, no
+    # interpretation. The flattened scalar metrics render as a list; the arms
+    # block (mapping / list of arm records) is preserved as a JSON fence so a
+    # multi-arm result survives intact for downstream comparison.
+    if result_metrics:
+        scalar_metrics = {k: v for k, v in result_metrics.items() if k != "arms"}
+        if scalar_metrics:
+            body_lines.append("")
+            body_lines.append("## Reported result metrics")
+            for k, v in scalar_metrics.items():
+                body_lines.append(f"- **{k}:** {v}")
+    if arms is not None:
+        body_lines.append("")
+        body_lines.append("## Experiment arms")
+        body_lines.append("```json")
+        body_lines.append(json.dumps(arms, sort_keys=True, default=str))
+        body_lines.append("```")
     body = "\n".join(body_lines)
 
     raw_tags = payload.get("tags")
@@ -1331,6 +1329,12 @@ def _build_compute_experiment_document(
     }
     if terminal_diagnostics:
         verdict_record["terminal_diagnostics"] = terminal_diagnostics
+    # Faithful, queryable home for the real numbers and any A/B arms so future
+    # cycles can act on the measured result without re-running the experiment.
+    if result_metrics:
+        verdict_record["result_metrics"] = result_metrics
+    if arms is not None:
+        verdict_record["arms"] = arms
 
     return {
         "title": title,
@@ -1774,13 +1778,10 @@ def _ground_and_assemble_compute_analysis(
 ) -> tuple[dict[str, Any] | None, str]:
     """Ground a produced analysis document and assemble the upgrade payload.
 
-    Backend-authoritative grounding shared by BOTH the backend-key LLM path and
-    the VM-substrate submission path (:func:`submit_compute_vm_analysis`). The
-    producer's citations — whether they came from the backend Anthropic call or
-    from the agent VM running the centralized-accounts ``claude`` CLI — are kept
-    only if they are members of the durable candidate set, and at least one must
-    resolve to real artifact/metric evidence. The VM is NEVER trusted to
-    self-certify grounding; this same gate runs on submission.
+    Backend-authoritative grounding for the explicit (operator-invoked) LLM
+    analysis path. The producer's citations are kept only if they are members of
+    the durable candidate set, and at least one must resolve to real
+    artifact/metric evidence.
 
     Returns ``(document, "")`` on success or ``(None, reason)`` with a compact
     machine-readable cause (``"llm-error"``, ``"citations-ungrounded"``).
@@ -2131,6 +2132,49 @@ def _extract_job_terminal_diagnostics(job: Any) -> dict[str, Any] | None:
     return diag
 
 
+# Defensive bound on how many reported metric keys are captured verbatim into a
+# single faithful document, so an adversarial / runaway result object can never
+# bloat the knowledge store. A real experiment reports far fewer.
+_COMPUTE_FAITHFUL_METRICS_MAX_KEYS = 200
+
+
+def _extract_faithful_result_metrics(job: ComputeJob | None) -> dict[str, Any] | None:
+    """Return the experiment's reported result metrics, captured FAITHFULLY.
+
+    Reads the raw reported result object preserved on the job row
+    (``polling_metadata['result_metrics']``). Unlike the COMPUTE_RESULT logs —
+    which keep only the flattened top-level NUMERIC keys — this preserves the
+    reported object verbatim, so non-scalar structure (e.g. an A/B ``arms``
+    block) survives. Returns ``None`` when nothing was reported.
+    """
+    if job is None:
+        return None
+    meta = getattr(job, "polling_metadata", None) or {}
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get("result_metrics")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    # Bound the captured key set defensively (faithful, not interpretive).
+    return dict(list(raw.items())[:_COMPUTE_FAITHFUL_METRICS_MAX_KEYS])
+
+
+def _extract_experiment_arms(result_metrics: dict[str, Any] | None) -> Any | None:
+    """Return the A/B (multi-arm) comparison block when the result reported one.
+
+    Faithful and structure-only: an experiment that compared arms reports them
+    under an ``arms`` key in its result object (a mapping of arm name -> metrics,
+    or a list of arm records). Captured verbatim so the strategist and the later
+    opt-in judgment agent can compare arms — the backend applies no interpretation.
+    """
+    if not isinstance(result_metrics, dict):
+        return None
+    arms = result_metrics.get("arms")
+    if isinstance(arms, (dict, list)) and arms:
+        return arms
+    return None
+
+
 async def _prepare_deterministic_compute_document(
     task: Task,
     *,
@@ -2144,6 +2188,8 @@ async def _prepare_deterministic_compute_document(
     """Build the primary deterministic artifact-grounded compute document."""
     job = await _load_compute_job_from_logs(logs, session)
     terminal_diagnostics = _extract_job_terminal_diagnostics(job)
+    result_metrics = _extract_faithful_result_metrics(job)
+    arms = _extract_experiment_arms(result_metrics)
     document = _build_compute_experiment_document(
         task,
         outcome=outcome,
@@ -2151,6 +2197,8 @@ async def _prepare_deterministic_compute_document(
         criterion=criterion,
         result_reference=result_reference,
         terminal_diagnostics=terminal_diagnostics,
+        result_metrics=result_metrics,
+        arms=arms,
     )
     try:
         grounding_stamp = await _compute_citation_grounding_stamp(
@@ -2341,131 +2389,6 @@ async def _stamp_compute_analysis_unavailable(
     if stamped_doc_id is not None:
         envelope["knowledge_document_id"] = stamped_doc_id
     return envelope
-
-
-async def build_compute_vm_analysis_request(
-    task: Task,
-    *,
-    outcome: str,
-    cost: float | None,
-    criterion: dict[str, Any] | None,
-    result_reference: str | None,
-    session: AsyncSession,
-    logs: str | None = None,
-) -> dict[str, Any] | None:
-    """Build the prompt + evidence bundle the agent VM runs the model on.
-
-    The backend constructs the authoritative analysis prompt (constrained to the
-    durable candidate citations) so the VM only has to run the centralized
-    ``claude`` CLI and return the produced JSON — citation grounding stays
-    backend-side at submission. Returns ``None`` when there is no durable evidence
-    to analyze (the genuinely terminal ``no-evidence`` case), so callers leave the
-    measured_only document intact rather than dispatching a VM with nothing to
-    cite.
-    """
-    evidence = await _gather_compute_evidence(
-        task,
-        logs=logs,
-        result_reference=result_reference,
-        criterion=criterion,
-        session=session,
-    )
-    if evidence is None:
-        return None
-    fallback, _compute_job_id = await _prepare_deterministic_compute_document(
-        task,
-        outcome=outcome,
-        cost=cost,
-        criterion=criterion,
-        result_reference=result_reference,
-        session=session,
-        logs=logs,
-    )
-    prompt = _build_compute_analysis_prompt(
-        task,
-        outcome=outcome,
-        cost=cost,
-        criterion=criterion,
-        evidence=evidence,
-        fallback=fallback,
-    )
-    return {
-        "prompt": prompt,
-        # Informational allowlist mirrored from the prompt; grounding is still
-        # re-enforced backend-side on submission and never trusts the VM.
-        "allowed_citations": list(evidence["citations"]),
-    }
-
-
-async def submit_compute_vm_analysis(
-    task: Task,
-    *,
-    vm_document: dict[str, Any],
-    outcome: str,
-    cost: float | None,
-    criterion: dict[str, Any] | None,
-    result_reference: str | None,
-    session: AsyncSession,
-    logs: str | None = None,
-) -> dict[str, Any]:
-    """Ground a VM-produced compute analysis backend-side and upgrade the doc.
-
-    The agent VM ran the model on the centralized-accounts substrate (operator
-    policy p-13f153e9 permanently forbids a backend ANTHROPIC_API_KEY) and POSTed
-    the produced analysis JSON. This re-grounds its citations against the REAL
-    durable artifact via the SAME gate the backend-key path uses (never trusting
-    VM-supplied grounding) and, when grounded, UPGRADES the deterministic
-    KnowledgeDocument to ``analysis_mode='llm'`` through the existing upgrade-only
-    persistence machinery. An ungrounded or empty submission never downgrades —
-    it stamps a machine-readable cause and leaves the measured_only doc intact.
-    """
-    fallback, compute_job_id = await _prepare_deterministic_compute_document(
-        task,
-        outcome=outcome,
-        cost=cost,
-        criterion=criterion,
-        result_reference=result_reference,
-        session=session,
-        logs=logs,
-    )
-    if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1":
-        return await _stamp_compute_analysis_unavailable(
-            task, "analysis-disabled", session
-        )
-    evidence = await _gather_compute_evidence(
-        task,
-        logs=logs,
-        result_reference=result_reference,
-        criterion=criterion,
-        session=session,
-    )
-    if evidence is None:
-        return await _stamp_compute_analysis_unavailable(task, "no-evidence", session)
-    if not isinstance(vm_document, dict):
-        return await _stamp_compute_analysis_unavailable(task, "llm-error", session)
-    analysis, reason = _ground_and_assemble_compute_analysis(
-        vm_document,
-        evidence,
-        fallback,
-        execution="vm_substrate",
-    )
-    if analysis is None:
-        return await _stamp_compute_analysis_unavailable(
-            task, reason or "llm-error", session
-        )
-    doc = await _persist_compute_knowledge_document(
-        task,
-        analysis,
-        "llm",
-        session,
-        compute_job_id=compute_job_id,
-    )
-    return {
-        "status": "upgraded",
-        "reason": None,
-        "analysis_mode": "llm",
-        "knowledge_document_id": str(doc.id),
-    }
 
 
 async def _handle_web_research_completion(

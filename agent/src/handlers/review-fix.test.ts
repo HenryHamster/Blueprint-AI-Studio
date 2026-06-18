@@ -3549,6 +3549,72 @@ describe('handleFix — surviving_issues from challenge reconciliation', () => {
   });
 });
 
+// ── handleReview: domain_overview reaches review prompt ─────────────────────
+describe('handleReview — domain overview', () => {
+  it('renders ## Domain Knowledge in review prompt when task.domain_overview is present', async () => {
+    await handleReview(
+      'task-review-domain',
+      { pr_number: 1, branch: 'feat/x', base_branch: 'main', original_prompt: '' },
+      {
+        context: { scope: 'medium' },
+        domain_overview: {
+          summary: 'A healthcare scheduling platform.',
+          body: 'Manages appointments, providers, and patient records.',
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('## Domain Knowledge');
+    expect(prompt).toContain('A healthcare scheduling platform.');
+    expect(prompt).toContain('Manages appointments, providers, and patient records.');
+  });
+
+  it('omits ## Domain Knowledge from review prompt when domain_overview is absent', async () => {
+    await handleReview(
+      'task-review-no-domain',
+      { pr_number: 2, branch: 'feat/y', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'medium' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain('## Domain Knowledge');
+  });
+});
+
+// ── handleFix: domain_overview reaches fix prompt ────────────────────────────
+describe('handleFix — domain overview', () => {
+  it('renders ## Domain Knowledge in fix prompt when task.domain_overview is present', async () => {
+    await handleFix(
+      'task-fix-domain',
+      { branch: 'feat/x', base_branch: 'main', pr_number: 1, prompt: 'address review' },
+      {
+        context: { scope: 'small' },
+        domain_overview: {
+          summary: 'A logistics routing service.',
+          body: 'Core entities: shipments, routes, depots.',
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Domain Knowledge');
+    expect(prompt).toContain('A logistics routing service.');
+    expect(prompt).toContain('Core entities: shipments, routes, depots.');
+  });
+
+  it('omits ## Domain Knowledge from fix prompt when domain_overview is absent', async () => {
+    await handleFix(
+      'task-fix-no-domain',
+      { branch: 'feat/y', base_branch: 'main', pr_number: 2, prompt: 'address review' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).not.toContain('## Domain Knowledge');
+  });
+});
+
 // ── handleReview: PR metadata fetch aborts on timeout ────────────────────────
 describe('handleReview — pr metadata fetch aborts on timeout', () => {
   it('aborts the PR metadata fetch after the timeout fires and still completes the review', async () => {

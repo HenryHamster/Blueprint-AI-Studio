@@ -3933,7 +3933,6 @@ async def test_stuck_manual_intervention_cleared_after_ttl(db_session):
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=60.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -3979,7 +3978,6 @@ async def test_stuck_manual_intervention_preserved_when_monitor_active(db_sessio
     await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=60.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )
@@ -8103,7 +8101,6 @@ async def test_completion_suggestion_toggles_off_when_no_longer_complete(db_sess
     active = await _process_direction_lifecycle(
         project,
         db_session,
-        cooldown_minutes=60.0,
         busy_direction_ids=set(),
         now=datetime.utcnow(),
     )

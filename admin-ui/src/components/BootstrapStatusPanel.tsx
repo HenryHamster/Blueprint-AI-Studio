@@ -255,6 +255,12 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
                 )}
               </div>
             )}
+            {displayState === 'completed' &&
+              project.build_config?.bootstrap_domain_knowledge_refreshed_at && (
+              <div className="text-[10px] text-neutral-400 mt-0.5">
+                Domain knowledge captured {formatAbsolute(project.build_config.bootstrap_domain_knowledge_refreshed_at)}
+              </div>
+            )}
             {displayState === 'completed' && commandMemoryMarker && (
               <div className="text-[10px] text-amber-300 mt-0.5 flex items-start gap-1">
                 <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />

@@ -21,8 +21,10 @@ from app.failure_residual import (
     get_account_failure_class_counts,
     get_account_failure_class_records,
     get_top_residual_fingerprints,
+    get_top_viewport_residual_fingerprints,
     record_account_failure_class,
     record_residual_fingerprint,
+    record_viewport_regression_fingerprint,
 )
 from app.failure_classification import (
     AGENT_TIMEOUT,
@@ -725,3 +727,149 @@ class TestResidualFingerprintDbWrite:
             )
         assert row is not None
         assert row.hit_count == N
+
+
+class TestViewportResidualStore:
+    def setup_method(self):
+        import app.failure_residual as fr
+
+        fr._viewport_residual_store.clear()
+        fr._viewport_residual_seen_task_ids.clear()
+
+    def _task_with_id(self, msg: str, task_id: str, ctx=None, status=None):
+        from app.models import TaskStatus
+
+        t = MagicMock(spec=Task)
+        t.latest_status_message = msg
+        t.context = ctx or {}
+        t.id = task_id
+        t.project_id = None
+        t.status = status if status is not None else TaskStatus.FAILED
+        return t
+
+    def test_record_viewport_regression_fingerprint_stores_component_key(self):
+        """Acceptance test: FAILED task with a context key stores a viewport fingerprint."""
+        t = self._task_with_id(
+            "expectNoOverflowAt(375): overflow detected",
+            "task-vp-1",
+            ctx={"viewport_regression:TaskCard:overflow@375": True},
+        )
+        record_viewport_regression_fingerprint(t)
+        results = get_top_viewport_residual_fingerprints(window_seconds=3600)
+        assert len(results) == 1
+        assert results[0]["fingerprint"] == "viewport:TaskCard:overflow"
+        assert results[0]["component"] == "TaskCard"
+        assert results[0]["assertion_type"] == "overflow"
+        assert results[0]["count"] == 1
+        assert results[0]["task_ids"] == ["task-vp-1"]
+
+    def test_records_on_failed_status(self):
+        from app.models import TaskStatus
+
+        t = self._task_with_id(
+            "expectNoOverflowAt failed",
+            "task-vp-2",
+            ctx={"viewport_regression:HeaderPanel:overflow@375": True},
+            status=TaskStatus.FAILED,
+        )
+        record_viewport_regression_fingerprint(t)
+        results = get_top_viewport_residual_fingerprints()
+        assert len(results) == 1
+        assert results[0]["count"] == 1
+
+    def test_gates_non_failed_status(self):
+        from app.models import TaskStatus
+
+        for non_failed in (
+            TaskStatus.COMPLETED,
+            TaskStatus.CANCELLED,
+            TaskStatus.IN_PROGRESS,
+        ):
+            import app.failure_residual as fr
+
+            fr._viewport_residual_store.clear()
+            fr._viewport_residual_seen_task_ids.clear()
+            t = self._task_with_id(
+                "expectNoOverflowAt failed",
+                f"task-vp-nonfailed-{non_failed}",
+                ctx={"viewport_regression:TaskCard:overflow@375": True},
+                status=non_failed,
+            )
+            record_viewport_regression_fingerprint(t)
+            assert get_top_viewport_residual_fingerprints() == []
+
+    def test_dedup_same_task_id(self):
+        t = self._task_with_id(
+            "expectNoOverflowAt failed",
+            "task-vp-dedup",
+            ctx={"viewport_regression:TaskCard:overflow@375": True},
+        )
+        record_viewport_regression_fingerprint(t)
+        record_viewport_regression_fingerprint(t)
+        results = get_top_viewport_residual_fingerprints()
+        assert results[0]["count"] == 1
+
+    def test_context_key_extraction_via_parse_viewport_regression_class(self):
+        t = self._task_with_id(
+            "viewport test failed",
+            "task-vp-ctx",
+            ctx={"viewport_regression:MessagesPanel:text_truncation@375": True},
+        )
+        record_viewport_regression_fingerprint(t)
+        results = get_top_viewport_residual_fingerprints()
+        assert len(results) == 1
+        assert results[0]["fingerprint"] == "viewport:MessagesPanel:text_truncation"
+        assert results[0]["component"] == "MessagesPanel"
+        assert results[0]["assertion_type"] == "text_truncation"
+
+    def test_status_message_fallback_to_assertion_type_patterns(self):
+        t = self._task_with_id(
+            "expectNoTextTruncationAt(375) clipped text detected",
+            "task-vp-msgfb",
+            ctx={},
+        )
+        record_viewport_regression_fingerprint(t)
+        results = get_top_viewport_residual_fingerprints()
+        assert len(results) == 1
+        assert results[0]["assertion_type"] == "text_truncation"
+        assert results[0]["component"] == "unknown"
+
+    def test_missing_component_noop(self):
+        """No viewport context key and no assertion pattern → no fingerprint recorded."""
+        t = self._task_with_id(
+            "some other non-viewport failure",
+            "task-vp-noop",
+            ctx={},
+        )
+        record_viewport_regression_fingerprint(t)
+        assert get_top_viewport_residual_fingerprints() == []
+
+    def test_fingerprint_strips_width(self):
+        """Different widths for the same component+assertion cluster into one fingerprint."""
+        t1 = self._task_with_id(
+            "viewport fail 1",
+            "task-vp-w1",
+            ctx={"viewport_regression:TaskCard:overflow@375": True},
+        )
+        t2 = self._task_with_id(
+            "viewport fail 2",
+            "task-vp-w2",
+            ctx={"viewport_regression:TaskCard:overflow@768": True},
+        )
+        record_viewport_regression_fingerprint(t1)
+        record_viewport_regression_fingerprint(t2)
+        results = get_top_viewport_residual_fingerprints()
+        assert len(results) == 1
+        assert results[0]["count"] == 2
+        assert results[0]["fingerprint"] == "viewport:TaskCard:overflow"
+
+    def test_min_touch_target_assertion_type_from_status_message(self):
+        t = self._task_with_id(
+            "expectMinTouchTargetAt(375): button too small",
+            "task-vp-touch",
+            ctx={},
+        )
+        record_viewport_regression_fingerprint(t)
+        results = get_top_viewport_residual_fingerprints()
+        assert len(results) == 1
+        assert results[0]["assertion_type"] == "min_touch_target"

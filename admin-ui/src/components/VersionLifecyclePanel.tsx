@@ -878,6 +878,33 @@ function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadines
   );
 }
 
+function PinnedServingVersionCallout({ version }: { version: RecentVersion }) {
+  const servingStatus = version.serving?.status ?? version.serving_status;
+  if (servingStatus !== 'serving_confirmed') return null;
+  const mergedCount = version.merged_count ?? version.merged_task_count ?? version.highlights?.merged_count ?? null;
+  const promotedAt = version.promoted_at ?? version.serving?.confirmed_at ?? version.served_at;
+  return (
+    <div
+      data-testid="pinned-serving-version"
+      className="flex flex-col gap-0.5 px-2 py-1.5 rounded border bg-emerald-500/10 border-emerald-500/30"
+    >
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-[10px] font-semibold text-emerald-400">✓ currently serving</span>
+        <span className="text-[10px] font-mono text-emerald-300">v{version.version_number}</span>
+        {mergedCount != null && (
+          <span className="text-[10px] text-emerald-600">{mergedCount} merged</span>
+        )}
+        {promotedAt && (
+          <span className="text-[10px] text-emerald-700">promoted {timeAgo(promotedAt)}</span>
+        )}
+      </div>
+      {version.highlights?.headline && (
+        <p className="text-[10px] text-emerald-300/80 italic">{version.highlights.headline}</p>
+      )}
+    </div>
+  );
+}
+
 function StagedDirectionsSummary({ staged }: { staged: StagedDirection[] }) {
   if (!staged.length) return null;
   return (
@@ -1048,6 +1075,9 @@ function VersionHighlightsLine({
         {conf && thresh && <span>conf {conf} / thr {thresh}</span>}
         {phase && <span className="text-neutral-500">{phase} · {status}</span>}
       </div>
+      {highlights.narrative && (
+        <p className="text-neutral-400 mt-1 leading-relaxed" data-testid="version-narrative">{highlights.narrative}</p>
+      )}
     </div>
   );
 }
@@ -1072,7 +1102,7 @@ function VersionHistorySummary({ versionId }: { versionId: string }) {
   return (
     <div className="mt-1 pl-2 border-l-2 border-neutral-700/40 space-y-0.5 text-[10px]">
       <VersionHighlightsLine highlights={summary.highlights} phase={summary.phase} status={summary.status} />
-      <VersionSummaryPanel tasksMerged={summary.tasks_merged} />
+      <VersionSummaryPanel tasksMerged={summary.tasks_merged} acceptanceAggregate={summary.acceptance_aggregate} />
     </div>
   );
 }
@@ -1468,6 +1498,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         {policySource && (
           <PromotionPolicyBadge source={policySource} error={policyError} />
         )}
+        {(() => {
+          const serving = recent.find(
+            v => (v.serving?.status ?? v.serving_status) === 'serving_confirmed',
+          );
+          return serving ? <PinnedServingVersionCallout version={serving} /> : null;
+        })()}
         {cv && (
           <div className="space-y-1">
             <div className="flex flex-wrap items-center gap-2">
@@ -1720,7 +1756,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 <HistoricalAuditContext audit={cv.stale_audit} activeCandidateSha={cv.active_candidate_sha} />
               </div>
             )}
-            <VersionSummaryPanel tasksMerged={cv.tasks_merged} />
+            <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} />
             {projectId && (
               <div data-testid="phase-controls" className="flex flex-wrap items-center gap-2 pt-1">
                 {cv.phase === 'build' ? (

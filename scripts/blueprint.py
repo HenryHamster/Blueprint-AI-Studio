@@ -16,7 +16,10 @@ Subcommand groups:
     diagnostics       stuck tasks, circuit breakers, grouped failure modes
     tasks list|show   list/filter tasks, or show one by id
     versions list|show  release versions with phase/status/sha and a summary
+    trials            capability-trial verdict, arm counts, days-to-decision projection
+    fleet pool|warm|accounts|zones  VM account pool, warm pool, and zone health
     promote-recover   promotion + recovery operator levers (confirm before mutate)
+    ops               system intervention: repair state, health reset, requeue, restart
     logs tail|errors|search|task   Cloud Logging reads (via gcloud)
 
 Examples:
@@ -26,6 +29,9 @@ Examples:
     python scripts/blueprint.py tasks list --status IN_PROGRESS --type create
     python scripts/blueprint.py tasks show 7ab3f93a
     python scripts/blueprint.py versions show
+    python scripts/blueprint.py trials
+    python scripts/blueprint.py fleet pool
+    python scripts/blueprint.py fleet accounts --disable evan --yes
     python scripts/blueprint.py promote-recover qualify --yes
     python scripts/blueprint.py logs errors --minutes 30
 """
@@ -85,16 +91,19 @@ def first_payload(task: dict) -> dict:
 # ── status ───────────────────────────────────────────────────────────────────
 
 def cmd_status(args: argparse.Namespace) -> None:
-    """Fetch canonical system state from GET /api/admin/state."""
+    """Fetch canonical system state from GET /api/admin/state and version-lifecycle."""
     pid = get_project_id(getattr(args, "project_id", None))
     state, state_err = _safe_read(f"/api/admin/state?project_id={pid}")
     state = state or {}
+    lifecycle, lifecycle_err = _safe_read(f"/api/admin/projects/{pid}/version-lifecycle")
+    lifecycle = lifecycle or {}
     deploy = state.get("deploy") or {}
     version = state.get("version")
     fleet_raw = state.get("fleet") or {}
 
     serving = (version.get("serving") or {}) if version else {}
 
+    errors = {k: v for k, v in (("state", state_err), ("lifecycle", lifecycle_err)) if v}
     data = {
         "project_id": pid,
         "deploy_state": {
@@ -126,16 +135,12 @@ def cmd_status(args: argparse.Namespace) -> None:
             "stale_heartbeat_count": fleet_raw.get("stale_heartbeat_count"),
         },
         "promotion": {
-            "enabled_effective": None,
-            "enabled_source": None,
+            "enabled_effective": lifecycle.get("promotion_enabled_effective"),
+            "enabled_source": lifecycle.get("promotion_enabled_source"),
             "ready": None,
             "reason": None,
         },
-        "errors": {
-            k: v
-            for k, v in (("state", state_err),)
-            if v
-        },
+        "errors": errors,
     }
     _emit(args, data, _render_status)
 
@@ -265,7 +270,9 @@ def _render_diagnostics(data: dict) -> None:
 # ── tasks ──────────────────────────────────────────────────────────────────--
 
 def cmd_tasks(args: argparse.Namespace) -> None:
-    """Dispatch task subcommands: list / show / cancel / requeue / scope / tree / failures."""
+    """Dispatch task subcommands: list / show / cancel / requeue / scope / tree / failures /
+    evaluating / cancel-all / requeue-ci / trigger-rollup / complete / set-status /
+    reset-iteration-cap / archive / research / autonomy-debug."""
     sub = getattr(args, "tasks_cmd", None) or "list"
     if sub == "show":
         _tasks_show(args)
@@ -279,6 +286,26 @@ def cmd_tasks(args: argparse.Namespace) -> None:
         _tasks_tree(args)
     elif sub == "failures":
         _tasks_failures(args)
+    elif sub == "evaluating":
+        _tasks_evaluating(args)
+    elif sub == "cancel-all":
+        _tasks_cancel_all(args)
+    elif sub == "requeue-ci":
+        _tasks_requeue_ci(args)
+    elif sub == "trigger-rollup":
+        _tasks_trigger_rollup(args)
+    elif sub == "complete":
+        _tasks_complete(args)
+    elif sub == "set-status":
+        _tasks_set_status(args)
+    elif sub == "reset-iteration-cap":
+        _tasks_reset_iteration_cap(args)
+    elif sub == "archive":
+        _tasks_archive(args)
+    elif sub == "research":
+        _tasks_research(args)
+    elif sub == "autonomy-debug":
+        _tasks_autonomy_debug(args)
     else:
         _tasks_list(args)
 
@@ -581,6 +608,130 @@ def _render_failures(data: dict) -> None:
         print(f"  {cause}: {len(group)} tasks{suffix}")
 
 
+def _tasks_evaluating(args: argparse.Namespace) -> None:
+    """List EVALUATING tasks with CI/PR status and latest message."""
+    pid = get_project_id(getattr(args, "project_id", None))
+    resp = api("GET", f"/api/admin/tasks?project_id={pid}&status=EVALUATING&limit=200")
+    tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+    _emit(args, {"tasks": tasks, "total": len(tasks)}, _render_evaluating_list)
+
+
+def _render_evaluating_list(data: dict) -> None:
+    tasks = data.get("tasks") or []
+    print(f"=== EVALUATING TASKS ({len(tasks)}) ===")
+    if not tasks:
+        print("  (none)")
+        return
+    for t in tasks:
+        tid = (t.get("id") or "?")[:8]
+        loop = (t.get("context") or {}).get("review_loop") or {}
+        ci = loop.get("ci_waiting", False)
+        pr = loop.get("pr_number", "-")
+        ttype = t.get("task_type", "?")
+        title = (t.get("title") or "")[:55]
+        msg = (t.get("latest_status_message") or "")[:70]
+        print(f"  {tid}  [{ttype:8}]  ci={str(ci):<5}  pr={pr:<4}  {title}")
+        if msg:
+            print(f"           {msg}")
+
+
+def _tasks_cancel_all(args: argparse.Namespace) -> None:
+    """Bulk-cancel tasks filtered by status (and optional category)."""
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print("ERROR: 'cancel-all' requires an admin API key.", file=sys.stderr)
+        sys.exit(1)
+    statuses = [args.status] if getattr(args, "status", None) else [
+        "QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"]
+    category = getattr(args, "category", None)
+    if not _confirm(
+        f"Cancel all tasks with status={statuses}"
+        + (f" category={category}" if category else "") + "?",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+    pid = get_project_id(getattr(args, "project_id", None))
+    cancelled = skipped = 0
+    for status in statuses:
+        offset = 0
+        while True:
+            resp = api("GET", f"/api/admin/tasks?project_id={pid}&status={status}"
+                              f"&limit=500&offset={offset}")
+            batch = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+            if not batch:
+                break
+            for t in batch:
+                if category and (t.get("context") or {}).get("failure_category") != category:
+                    skipped += 1
+                    continue
+                try:
+                    api("PATCH", f"/api/admin/tasks/{t['id']}", {"status": "CANCELLED"})
+                    cancelled += 1
+                except Exception:  # noqa: BLE001
+                    pass
+            offset += len(batch)
+            if len(batch) < 500:
+                break
+    suffix = f" ({skipped} skipped, category filter)" if skipped else ""
+    print(f"Cancelled {cancelled} tasks{suffix}.")
+
+
+def _tasks_set_status(args: argparse.Namespace) -> None:
+    """Force a task to an arbitrary status (power-user recovery lever)."""
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print("ERROR: 'set-status' requires an admin API key.", file=sys.stderr)
+        sys.exit(1)
+    if not _confirm(
+        f"Set task {args.task_id} to {args.new_status}?", getattr(args, "yes", False)
+    ):
+        print("Aborted.")
+        return
+    body: dict = {"status": args.new_status}
+    if getattr(args, "message", None):
+        body["latest_status_message"] = args.message
+    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", body)
+    _emit(args, result, lambda d: print(f"  {args.task_id[:8]}: {d.get('status', 'ok')}"))
+
+
+def _tasks_autonomy_debug(args: argparse.Namespace) -> None:
+    """Fetch autonomy-debug for a project: blocking guards, eligible directions."""
+    pid = get_project_id(getattr(args, "project_id", None))
+    data = api("GET", f"/api/admin/projects/{pid}/autonomy-debug")
+    _emit(args, data, _render_autonomy_debug)
+
+
+def _render_autonomy_debug(data: dict) -> None:
+    print("=== AUTONOMY DEBUG ===")
+    blocked = data.get("spawn_blocked")
+    if blocked is True:
+        print("  can_spawn: NO (blocked)")
+    elif blocked is False:
+        print("  can_spawn: YES — no guards; next tick will spawn")
+    else:
+        print("  can_spawn: ?")
+    guards = data.get("blocking_guards") or []
+    if guards:
+        print(f"\n--- Blocking Guards ({len(guards)}) ---")
+        for g in guards:
+            print(f"  {g.get('guard', '?')}: {g.get('reason', '?')}")
+    dirs = data.get("directions") or []
+    eligible = [d for d in dirs if d.get("is_eligible")]
+    if dirs:
+        print(f"\n--- Directions ({len(eligible)}/{len(dirs)} eligible) ---")
+        for d in dirs:
+            did = (d.get("id") or "?")[:10]
+            text = (d.get("text") or "?")[:70]
+            markers = []
+            if d.get("seconds_until_eligible"):
+                markers.append(f"cooldown {d['seconds_until_eligible'] // 60}m")
+            if d.get("is_eligible"):
+                markers.append("eligible")
+            tag = f" [{', '.join(markers)}]" if markers else ""
+            print(f"  {did}  {text}{tag}")
+
+
 def _render_task_detail(t: dict) -> None:
     print(f"=== TASK {t.get('id', '?')} ===")
     print(f"  Title:    {t.get('title', '?')}")
@@ -601,15 +752,214 @@ def _render_task_detail(t: dict) -> None:
         print(f"\n  Description:\n    {desc[:500]}")
 
 
+# ── tasks: bulk and manual-state extensions ──────────────────────────────────
+
+def _require_write_config(action: str) -> None:
+    """Exit 1 with a clear error when the resolved config is read-only."""
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            f"ERROR: '{action}' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _tasks_evaluating(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    resp = api("GET", f"/api/admin/tasks?project_id={pid}&status=EVALUATING&limit=100")
+    tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+    verbose = getattr(args, "verbose", False)
+    if not tasks:
+        print("No EVALUATING tasks.")
+        return
+    for t in tasks:
+        ctx = t.get("context") or {}
+        loop = ctx.get("review_loop") or {}
+        ci = loop.get("ci_waiting", False)
+        pr = loop.get("pr_number", "-")
+        print(f"  {(t.get('id') or '?')[:8]}  [{t.get('task_type', '?'):8}]  "
+              f"{(t.get('title') or '')[:50]:<50}  ci={ci}  pr={pr}")
+        msg = (t.get("latest_status_message") or "")[:80]
+        if msg:
+            print(f"           {msg}")
+        if verbose:
+            for key, label in [("research_question", "Q"), ("scope", "Scope")]:
+                val = ctx.get(key, "")
+                if val:
+                    print(f"           {label}: {val[:120]}")
+
+
+def _tasks_cancel_all(args: argparse.Namespace) -> None:
+    _require_write_config("cancel-all")
+    pid = get_project_id(getattr(args, "project_id", None))
+    status_filter = getattr(args, "status", None)
+    category_filter = getattr(args, "category", None)
+    statuses = ([status_filter] if status_filter
+                else ["QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"])
+    to_cancel = []
+    for status in statuses:
+        offset = 0
+        while True:
+            resp = api("GET",
+                       f"/api/admin/tasks?project_id={pid}&status={status}"
+                       f"&limit=500&offset={offset}")
+            batch = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+            if not batch:
+                break
+            for t in batch:
+                if (category_filter
+                        and (t.get("context") or {}).get("failure_category") != category_filter):
+                    continue
+                to_cancel.append(t)
+            offset += len(batch)
+            if len(batch) < 500:
+                break
+    if not to_cancel:
+        print("No matching tasks to cancel.")
+        return
+    if not _confirm(f"Cancel {len(to_cancel)} task(s)?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    cancelled = 0
+    for t in to_cancel:
+        try:
+            api("PATCH", f"/api/admin/tasks/{t['id']}", {"status": "CANCELLED"})
+            cancelled += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {t['id'][:8]}: FAILED — {exc}")
+    suffix = f" (category={category_filter})" if category_filter else ""
+    print(f"Cancelled {cancelled}/{len(to_cancel)} tasks{suffix}.")
+
+
+def _tasks_requeue_ci(args: argparse.Namespace) -> None:
+    _require_write_config("requeue-ci")
+    pid = get_project_id(getattr(args, "project_id", None))
+    resp = api("GET", f"/api/admin/tasks?project_id={pid}&status=EVALUATING&limit=100")
+    tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+    ci_tasks = [t for t in tasks
+                if (t.get("context") or {}).get("review_loop", {}).get("ci_waiting")]
+    if not ci_tasks:
+        print("No CI-waiting EVALUATING tasks.")
+        return
+    if not _confirm(f"Requeue {len(ci_tasks)} CI-waiting task(s)?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    for t in ci_tasks:
+        pr = (t.get("context") or {}).get("review_loop", {}).get("pr_number", "?")
+        try:
+            api("PATCH", f"/api/admin/tasks/{t['id']}", {"status": "QUEUED"})
+            print(f"  {t['id'][:8]}  (PR #{pr}): requeued")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {t['id'][:8]}: FAILED — {exc}")
+
+
+def _tasks_trigger_rollup(args: argparse.Namespace) -> None:
+    _require_write_config("trigger-rollup")
+    parent_id = args.parent_id
+    if not _confirm(f"Force rollup for task {parent_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", f"/api/admin/tasks/{parent_id}/rollup")
+    pr_num = result.get("rollup_pr_number") or result.get("pr_number")
+    pr_url = result.get("rollup_pr_url") or result.get("pr_url") or ""
+    _emit(args, result, lambda r: print(f"  Rollup PR created: #{pr_num} {pr_url}"))
+
+
+def _tasks_complete(args: argparse.Namespace) -> None:
+    _require_write_config("complete")
+    if not _confirm(f"Mark task {args.task_id} COMPLETED?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {"status": "COMPLETED"}
+    if getattr(args, "message", None):
+        body["latest_status_message"] = args.message
+    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", body)
+    _emit(args, result, lambda r: print(f"  {args.task_id}: marked COMPLETED"))
+
+
+def _tasks_set_status(args: argparse.Namespace) -> None:
+    _require_write_config("set-status")
+    if not _confirm(f"Set task {args.task_id} to {args.new_status}?",
+                    getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {"status": args.new_status}
+    if getattr(args, "message", None):
+        body["latest_status_message"] = args.message
+    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", body)
+    _emit(args, result, lambda r: print(f"  {args.task_id}: -> {args.new_status}"))
+
+
+def _tasks_reset_iteration_cap(args: argparse.Namespace) -> None:
+    _require_write_config("reset-iteration-cap")
+    if not _confirm(f"Reset iteration cap for task {args.task_id}?",
+                    getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", f"/api/admin/tasks/{args.task_id}/reset-iteration-cap")
+    _emit(args, result, lambda r: print(
+        f"  PR #{r.get('pr_number')}: archived {r.get('archived_count')} failed review/fix tasks, "
+        f"per-chain iteration {r.get('previous_per_chain_iteration')}->0"
+        + (" (cleared requires_approval)" if r.get("requires_approval_cleared") else "")
+    ))
+
+
+def _tasks_archive(args: argparse.Namespace) -> None:
+    _require_write_config("archive")
+    pipelines = getattr(args, "pipelines", False)
+    completed_only = getattr(args, "completed", False)
+    filter_type = "completed" if completed_only else "terminal"
+    label = "all fully-terminal pipelines" if pipelines else f"all {filter_type} tasks"
+    if not _confirm(f"Archive {label}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {"filter": "terminal"} if pipelines else {"filter": filter_type}
+    result = api("POST", "/api/admin/tasks/bulk-archive", body)
+    _emit(args, result, lambda r: print(f"Archived {r.get('archived_count', '?')} tasks."))
+
+
+def _tasks_research(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    task_id = getattr(args, "task_id", None)
+    limit = getattr(args, "limit", 5)
+    if task_id:
+        task = api("GET", f"/api/admin/tasks/{task_id}")
+        _emit(args, task, _render_task_detail)
+        return
+    resp = api("GET",
+               f"/api/admin/tasks?project_id={pid}&status=COMPLETED"
+               f"&task_type=research&limit={limit}")
+    tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
+    if not tasks:
+        print("No recent research tasks found.")
+        return
+    _emit(args, {"tasks": tasks, "total": len(tasks)}, _render_task_list)
+
+
 # ── versions ──────────────────────────────────────────────────────────────--
 
 def cmd_versions(args: argparse.Namespace) -> None:
     """Dispatch ``versions list`` / ``versions show`` (defaults to list)."""
     pid = get_project_id(getattr(args, "project_id", None))
+
+    # Full-history browsing (``versions list --all`` or ``--limit/--offset``) goes
+    # through the paginated release-versions endpoint rather than the cached
+    # version-lifecycle read. Default ``versions list`` keeps using lifecycle below
+    # so the no-flag UX is unchanged.
+    sub = getattr(args, "versions_cmd", None) or "list"
+    if sub == "list" and (
+        getattr(args, "all_versions", False)
+        or getattr(args, "limit", None) is not None
+    ):
+        _versions_list_paginated(args, pid)
+        return
+
     lifecycle = api("GET", f"/api/admin/projects/{pid}/version-lifecycle")
     cv = lifecycle.get("current_version")
     recent = lifecycle.get("recent_versions") or []
-    sub = getattr(args, "versions_cmd", None) or "list"
 
     if sub == "export-changelog":
         target = getattr(args, "version_number", None)
@@ -792,6 +1142,69 @@ def _render_version_list(data: dict) -> None:
             print(_version_line(v))
 
 
+def _versions_list_paginated(args: argparse.Namespace, pid: str) -> None:
+    """Browse the full version history via the paginated release-versions endpoint.
+
+    ``--all`` walks every page (fixed internal page size); ``--limit/--offset``
+    fetch a single explicit window. Either way the rendered output shows the
+    pre-pagination ``total`` and the window currently in view.
+    """
+    base = f"/api/admin/projects/{pid}/release-versions"
+    offset = getattr(args, "offset", 0) or 0
+
+    if getattr(args, "all_versions", False):
+        page_size = 100
+        versions: list = []
+        total = 0
+        cursor = offset
+        while True:
+            resp, err = _safe_read(f"{base}?limit={page_size}&offset={cursor}")
+            if err or resp is None:
+                print(err or "no response from release-versions", file=sys.stderr)
+                return
+            total = resp.get("total", 0)
+            batch = resp.get("versions") or []
+            versions.extend(batch)
+            cursor += len(batch)
+            # Stop on a short page or once we've covered the reported total.
+            if not batch or len(batch) < page_size or cursor >= total:
+                break
+        data = {
+            "versions": versions,
+            "total": total,
+            "limit": None,
+            "offset": offset,
+        }
+    else:
+        limit = getattr(args, "limit", None) or 20
+        resp, err = _safe_read(f"{base}?limit={limit}&offset={offset}")
+        if err or resp is None:
+            print(err or "no response from release-versions", file=sys.stderr)
+            return
+        data = {
+            "versions": resp.get("versions") or [],
+            "total": resp.get("total", 0),
+            "limit": resp.get("limit", limit),
+            "offset": resp.get("offset", offset),
+        }
+
+    _emit(args, data, _render_versions_paginated)
+
+
+def _render_versions_paginated(data: dict) -> None:
+    total = data.get("total", 0)
+    versions = data.get("versions") or []
+    print(f"=== RELEASE VERSIONS ({total} total) ===")
+    if not versions:
+        print("  (no versions in this window)")
+        return
+    for v in versions:
+        print(_version_line(v))
+    offset = data.get("offset", 0) or 0
+    end = offset + len(versions) - 1
+    print(f"\n  (showing {offset}-{end} of {total})")
+
+
 def _changelog_to_markdown(tasks_merged: list, heading: str | None = None) -> str:
     """Format a tasks_merged list as a Markdown release-notes block.
 
@@ -837,8 +1250,11 @@ def _render_version_summary(s: dict) -> None:
         print(f"  goal:         {s['goal'][:200]}")
     highlights = s.get("highlights") or {}
     headline = highlights.get("headline") if isinstance(highlights, dict) else None
+    narrative = highlights.get("narrative") if isinstance(highlights, dict) else None
     if headline:
         print(f"\n  Summary: {headline}")
+    if narrative:
+        print(f"  {narrative}")
     tasks_merged = s.get("tasks_merged") or []
     if tasks_merged:
         print(f"\n  Changelog ({len(tasks_merged)} tasks):")
@@ -853,6 +1269,891 @@ def _render_version_summary(s: dict) -> None:
                 title = (item.get("title") or "")[:70]
                 pr_str = f"  #{pr}" if pr else ""
                 print(f"      {title}{pr_str}")
+
+
+# ── system ────────────────────────────────────────────────────────────────────
+
+def cmd_system(args: argparse.Namespace) -> None:
+    """Break-glass system commands: repair, restart, zones, autonomy."""
+    sub = getattr(args, "system_cmd", None)
+    dispatch = {
+        "repair": _system_repair,
+        "restart": _system_restart,
+        "zones": _system_zones,
+        "autonomy": _system_autonomy,
+    }
+    if sub not in dispatch:
+        print("system: subcommand required. Run `blueprint system --help`.", file=sys.stderr)
+        sys.exit(1)
+    dispatch[sub](args)
+
+
+def _system_repair(args: argparse.Namespace) -> None:
+    if load_config().get("read_only"):
+        print("ERROR: 'repair' requires an admin API key.", file=sys.stderr)
+        sys.exit(1)
+    if not _confirm("Trigger repair-state (fix stuck/orphaned tasks)?",
+                    getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", "/api/admin/repair-state", {})
+    repairs = result.get("repairs", [])
+    def _render_repair(d: dict) -> None:
+        print(f"Repairs: {d.get('count', 0)}")
+        for r in d.get("repairs", []):
+            print(f"  - {r}")
+        if not d.get("repairs"):
+            print("  (no repairs needed)")
+    _emit(args, result, _render_repair)
+
+
+def _system_restart(args: argparse.Namespace) -> None:
+    if load_config().get("read_only"):
+        print("ERROR: 'restart' requires an admin API key.", file=sys.stderr)
+        sys.exit(1)
+    if not _confirm("Restart orchestrator background loops?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", "/api/admin/restart-orchestrator", {})
+    _emit(args, result, lambda d: print(f"Restart: {json.dumps(d, indent=2, default=str)}"))
+
+
+def _system_zones(args: argparse.Namespace) -> None:
+    zones, err = _safe_read("/api/admin/zone-health")
+    _emit(args, {"zones": zones or {}, "error": err}, _render_zones)
+
+
+def _render_zones(data: dict) -> None:
+    print("=== ZONE HEALTH ===")
+    if data.get("error"):
+        print(f"  error: {data['error']}")
+        return
+    zones = data.get("zones") or {}
+    if isinstance(zones, dict):
+        for zone, info in sorted(zones.items()):
+            i = info or {}
+            status = i.get("status", "?")
+            fails = i.get("consecutive_failures", 0)
+            last = i.get("last_success", "?")
+            print(f"  {zone:30}: {status:12} fails={fails} last_ok={last}")
+    else:
+        print(f"  {zones}")
+
+
+def _system_autonomy(args: argparse.Namespace) -> None:
+    data, err = _safe_read("/api/admin/autonomous-status")
+    result = {"projects": (data or {}).get("projects", []), "error": err}
+    _emit(args, result, _render_autonomy)
+
+
+def _render_autonomy(data: dict) -> None:
+    print("=== AUTONOMY ===")
+    if data.get("error"):
+        print(f"  error: {data['error']}")
+        return
+    projects = data.get("projects") or []
+    if not projects:
+        print("  (none)")
+        return
+    for p in projects:
+        print(f"  {p.get('project_name', '?')}: "
+              f"enabled={p.get('autonomous_enabled')}  "
+              f"failures={p.get('consecutive_failures', 0)}  "
+              f"last_research={p.get('last_research_at', 'never')}")
+
+
+# ── monitor ───────────────────────────────────────────────────────────────────
+
+def cmd_monitor(args: argparse.Namespace) -> None:
+    """Show system alerts, digest, and activity feed for situational awareness."""
+    sub = getattr(args, "monitor_cmd", None)
+    dispatch = {
+        "alerts": _monitor_alerts,
+        "digest": _monitor_digest,
+        "activity": _monitor_activity,
+    }
+    if sub not in dispatch:
+        print("monitor: subcommand required. Run `blueprint monitor --help`.", file=sys.stderr)
+        sys.exit(1)
+    dispatch[sub](args)
+
+
+def _monitor_alerts(args: argparse.Namespace) -> None:
+    alerts, err = _safe_read("/api/admin/alerts")
+    result = {"alerts": alerts or [], "error": err}
+    _emit(args, result, _render_alerts)
+
+
+def _render_alerts(data: dict) -> None:
+    print("=== ALERTS ===")
+    if data.get("error"):
+        print(f"  error: {data['error']}")
+        return
+    alerts = data.get("alerts") or []
+    if not alerts:
+        print("  (no active alerts)")
+        return
+    for a in alerts:
+        severity = a.get("severity", "?")
+        title = a.get("title", "?")
+        msg = (a.get("message") or "")[:120]
+        ts = (a.get("created_at") or "")[:19]
+        aid = a.get("id", "?")[:8]
+        tid = (a.get("task_id") or "")[:8]
+        task_ref = f"  task={tid}" if tid else ""
+        print(f"  [{severity:8}] {aid}  {ts}  {title}{task_ref}")
+        if msg:
+            print(f"             {msg}")
+
+
+def _monitor_digest(args: argparse.Namespace) -> None:
+    hours = getattr(args, "hours", 24)
+    data, err = _safe_read(f"/api/admin/digest?hours={hours}")
+    result = {"digest": data or {}, "hours": hours, "error": err}
+    _emit(args, result, _render_digest)
+
+
+def _render_digest(data: dict) -> None:
+    hours = data.get("hours", "?")
+    print(f"=== DIGEST (last {hours}h) ===")
+    if data.get("error"):
+        print(f"  error: {data['error']}")
+        return
+    d = data.get("digest") or {}
+    print(f"  Completed:        {d.get('completed_count', '?')}")
+    print(f"  Failed:           {d.get('failed_count', '?')}")
+    print(f"  PRs opened:       {d.get('prs_opened', '?')}")
+    print(f"  Research cycles:  {d.get('research_cycles', '?')}")
+    print(f"  Pending approval: {d.get('pending_approval_count', '?')}")
+    print(f"  Active now:       {d.get('active_count', '?')} ({d.get('running_count', '?')} running, {d.get('queued_count', '?')} queued)")
+
+
+def _monitor_activity(args: argparse.Namespace) -> None:
+    limit = getattr(args, "limit", 20)
+    resp, err = _safe_read(f"/api/admin/activity?limit={limit}")
+    # Handle both list and dict responses (endpoint may evolve)
+    events = (resp.get("events", []) if isinstance(resp, dict) else resp) if resp else []
+    result = {"events": events, "limit": limit, "error": err}
+    _emit(args, result, _render_activity)
+
+
+def _render_activity(data: dict) -> None:
+    print(f"=== ACTIVITY (last {len(data.get('events', []))} events) ===")
+    if data.get("error"):
+        print(f"  error: {data['error']}")
+        return
+    events = data.get("events") or []
+    if not events:
+        print("  (no recent activity)")
+        return
+    icons = {
+        "TASK_COMPLETED": "done",
+        "TASK_FAILED": "FAIL",
+        "RESEARCH_FINDINGS": "research",
+        "DEPLOY": "deploy",
+    }
+    for e in events:
+        etype = e.get("type", "?")
+        icon = icons.get(etype, etype)
+        ts = (e.get("timestamp") or "")[:16]
+        title = (e.get("title") or "?")[:55]
+        tid = (e.get("task_id") or "")[:8]
+        pr = e.get("pr_url") or ""
+        err = (e.get("error_summary") or "")[:80]
+        dur = e.get("duration_seconds")
+        dur_str = f"  {int(dur)}s" if dur else ""
+        pr_str = f"  {pr}" if pr else ""
+        print(f"  {ts}  [{icon:10}]  {tid}  {title}{dur_str}{pr_str}")
+        if err:
+            print(f"                              {err}")
+
+
+# ── directions ───────────────────────────────────────────────────────────────
+
+def cmd_directions(args: argparse.Namespace) -> None:
+    """Dispatch directions subcommands: list / show / add / update / unhold."""
+    sub = getattr(args, "directions_cmd", None) or "list"
+    if sub == "show":
+        _directions_show(args)
+    elif sub == "add":
+        _directions_add(args)
+    elif sub == "update":
+        _directions_update(args)
+    elif sub == "unhold":
+        _directions_unhold(args)
+    else:
+        _directions_list(args)
+
+
+def _directions_list(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    resp = api("GET", f"/api/admin/projects/{pid}/directions")
+    directions = resp.get("directions", []) if isinstance(resp, dict) else resp
+
+    show_all = getattr(args, "all", False)
+    if not show_all:
+        directions = [d for d in directions
+                      if d.get("status") in ("active", "proposed")]
+
+    _emit(args, {"directions": directions}, _render_directions_list)
+
+
+def _render_directions_list(data: dict) -> None:
+    directions = data.get("directions") or []
+    print(f"=== DIRECTIONS ({len(directions)}) ===")
+    if not directions:
+        print("  (none)")
+        return
+    for d in directions:
+        did = (d.get("id") or "?")
+        status = d.get("status", "active")
+        prio = d.get("priority", "?")
+        text = (d.get("text") or "")[:100]
+        history = d.get("research_history") or []
+        notes = d.get("notes") or []
+        held = d.get("held", False)
+        flags = []
+        if d.get("possibly_complete"):
+            flags.append("possibly_complete")
+        if d.get("possibly_saturated"):
+            flags.append("saturated")
+        if held:
+            flags.append("held")
+        if d.get("pending_update"):
+            flags.append("pending_update")
+        flag_str = f"  [{', '.join(flags)}]" if flags else ""
+        print(f"  {did[:12]}  [{prio:6}] {status:8}  {text}{flag_str}"
+              f"  ({len(history)} cycles, {len(notes)} notes)")
+
+
+def _directions_show(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    resp = api("GET", f"/api/admin/projects/{pid}/directions")
+    directions = resp.get("directions", []) if isinstance(resp, dict) else resp
+    id_arg = args.direction_id
+    matches = [d for d in directions if (d.get("id") or "").startswith(id_arg)]
+    if not matches:
+        print(f"Direction not found: {id_arg}", file=sys.stderr)
+        sys.exit(1)
+    d = matches[0]
+    _emit(args, d, _render_direction_detail)
+
+
+def _render_direction_detail(d: dict) -> None:
+    print(f"=== DIRECTION: {d.get('id', '?')} ===")
+    print(f"  Text:       {d.get('text', '?')}")
+    print(f"  Status:     {d.get('status', '?')}")
+    print(f"  Priority:   {d.get('priority', '?')}")
+    print(f"  Category:   {d.get('category', '-')}")
+    print(f"  Added:      {(d.get('added_at') or '?')[:19]}")
+    if d.get("held"):
+        print(f"  Held:       yes  reason={d.get('held_reason', '?')}")
+    if d.get("status") == "paused" or d.get("paused_reason"):
+        print(f"  Paused why: {d.get('paused_reason', '(none recorded)')}")
+        print(f"  Paused at:  {(d.get('paused_at') or '?')[:19]}")
+    if d.get("needs_manual_intervention"):
+        print(f"  ** NEEDS MANUAL INTERVENTION "
+              f"(since {(d.get('needs_manual_intervention_at') or '?')[:19]})")
+    if d.get("paths"):
+        print(f"  Paths:      {', '.join(d['paths'])}")
+    if d.get("completion_criteria"):
+        print(f"  Criteria:   {d['completion_criteria']}")
+    if d.get("possibly_complete"):
+        print(f"  ** Possibly complete: {d.get('completion_suggestion', '(no suggestion)')}")
+    if d.get("possibly_saturated"):
+        print(f"  ** Possibly saturated")
+
+    notes = d.get("notes") or []
+    if notes:
+        print(f"\n  --- Notes ({len(notes)}) ---")
+        for n in notes:
+            ts = (n.get("added_at") or n.get("timestamp") or "?")[:16]
+            text = (n.get("text") or "?")[:200]
+            print(f"    [{ts}] {text}")
+
+    history = d.get("research_history") or []
+    agg = d.get("history_aggregate") or {}
+    if history or agg:
+        total_cycles = len(history) + int(agg.get("total_cycles") or 0)
+        total_merged = (sum(e.get("prs_merged", 0) for e in history)
+                        + int(agg.get("total_prs_merged") or 0))
+        total_tasks = (sum(e.get("tasks_created", 0) for e in history)
+                       + int(agg.get("total_tasks_created") or 0))
+        print(f"\n  --- Research History ({total_cycles} cycles, "
+              f"{total_tasks} tasks, {total_merged} merged) ---")
+        for h in history[-5:]:
+            ts = (h.get("researched_at") or "?")[:16]
+            tc = h.get("tasks_created", 0)
+            pm = h.get("prs_merged", 0)
+            print(f"    {ts}  tasks={tc}  merged={pm}")
+
+    ctx = d.get("research_context", "")
+    if ctx:
+        print(f"\n  --- Research Context ---")
+        lines = ctx.strip().split("\n")
+        for line in lines[:20]:
+            print(f"    {line}")
+        if len(lines) > 20:
+            print(f"    ... ({len(lines) - 20} more lines)")
+
+
+def _directions_add(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'add' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    text = args.text
+    priority = getattr(args, "priority", "medium") or "medium"
+    paths = getattr(args, "paths", None) or []
+    completion_criteria = getattr(args, "completion_criteria", None)
+    body: dict = {"text": text, "priority": priority}
+    if paths:
+        body["paths"] = paths
+    if completion_criteria:
+        body["completion_criteria"] = completion_criteria
+    if not _confirm(f"Add direction: {text[:60]}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    pid = get_project_id(getattr(args, "project_id", None))
+    result = api("POST", f"/api/admin/projects/{pid}/directions", body)
+    d = result.get("direction", {})
+    _emit(args, result, lambda r: print(
+        f"Added {d.get('id', '?')} [{priority}]: {text[:80]}"
+    ))
+
+
+def _directions_update(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'update' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    pid = get_project_id(getattr(args, "project_id", None))
+    did = args.direction_id
+    reset_all = getattr(args, "reset_all", False)
+
+    patch: dict = {}
+    if getattr(args, "text", None):
+        patch["text"] = args.text
+    if getattr(args, "priority", None):
+        patch["priority"] = args.priority
+    if getattr(args, "status", None):
+        patch["status"] = args.status
+    if getattr(args, "reset_context", False) or reset_all:
+        patch["research_context"] = (
+            "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
+        )
+    if getattr(args, "reset_history", False) or reset_all:
+        patch["research_history"] = []
+    if getattr(args, "reset_agent_notes", False) or reset_all:
+        # Fetch current direction to filter out agent-added notes
+        resp = api("GET", f"/api/admin/projects/{pid}/directions")
+        directions = resp.get("directions", []) if isinstance(resp, dict) else resp
+        direction_data = next(
+            (d for d in directions if (d.get("id") or "").startswith(did)), None
+        )
+        notes = (direction_data.get("notes") or []) if direction_data else []
+        patch["notes"] = [n for n in notes if not n.get("added_by_task")]
+
+    if not patch:
+        print("Nothing to update. Use --text, --priority, --status, or a reset flag.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not _confirm(f"Update direction {did}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+
+    result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", patch)
+    _emit(args, result, lambda r: print(
+        f"Updated {did}: {', '.join(patch.keys())}"
+    ))
+
+
+def _directions_unhold(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'unhold' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    did = args.direction_id
+    if not _confirm(f"Clear hold on direction {did}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    pid = get_project_id(getattr(args, "project_id", None))
+    result = api("POST", f"/api/admin/projects/{pid}/directions/{did}/unhold")
+    was_held = result.get("was_held", False)
+    _emit(args, result, lambda r: print(
+        f"Unheld {did} (was_held={was_held})"
+        if was_held else f"Direction {did} was not held (idempotent)"
+    ))
+
+
+# ── trials ───────────────────────────────────────────────────────────────────
+
+def cmd_trials(args: argparse.Namespace) -> None:
+    """List capability-trial verdicts with convergence projection and arm composition."""
+    pid = get_project_id(getattr(args, "project_id", None))
+    digest, err = _safe_read(f"/api/admin/digest?project_id={pid}")
+    digest = digest or {}
+
+    if err:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return
+
+    verdicts = digest.get("capability_adoption_verdicts") or {}
+    data = {
+        "trials": [
+            {
+                "cap_name": cap,
+                "verdict": v.get("verdict"),
+                "lift": v.get("lift"),
+                "arm_composition": v.get("arm_composition") or {},
+                "accrual_projection": v.get("accrual_projection") or {},
+                "containment_rate": v.get("containment_rate"),
+                "delivery_rate": v.get("delivery_rate"),
+            }
+            for cap, v in verdicts.items()
+        ],
+        "errors": {"digest": err} if err else {},
+    }
+    _emit(args, data, _render_trials)
+
+
+def _render_trials(data: dict) -> None:
+    trials = data.get("trials") or []
+    print("=== CAPABILITY TRIALS ===")
+    if not trials:
+        print("  (none)")
+        return
+    for trial in trials:
+        cap = trial.get("cap_name", "?")
+        verdict = trial.get("verdict", "?")
+        lift = trial.get("lift")
+        arm_comp = trial.get("arm_composition") or {}
+        with_n = arm_comp.get("with_assigned", 0)
+        without_n = arm_comp.get("without_assigned", 0)
+        accrual = trial.get("accrual_projection") or {}
+        days_to_decision = accrual.get("days_to_min_n")
+
+        print(f"\n  {cap}  verdict={verdict}  lift={lift}")
+        print(f"    with_assigned={with_n}  without_assigned={without_n}")
+        if days_to_decision is not None:
+            print(f"    days_to_decision={days_to_decision:.1f}")
+        alt_proj = accrual.get("alternative_projections") or {}
+        if alt_proj:
+            holdback = accrual.get("holdback_fraction", 0)
+            print(f"    holdback_fraction={holdback:.2f}  alternative_projections={alt_proj}")
+
+
+# ── settings ─────────────────────────────────────────────────────────────────
+
+def cmd_settings(args: argparse.Namespace) -> None:
+    """Dispatch settings subcommands: show (default) / set."""
+    sub = getattr(args, "settings_cmd", None) or "show"
+    if sub == "set":
+        _settings_set(args)
+    else:
+        _settings_show(args)
+
+
+def _settings_show(args: argparse.Namespace) -> None:
+    data, err = _safe_read("/api/admin/settings")
+    if err or data is None:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return
+    _emit(args, data, _render_settings)
+
+
+def _settings_set(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'settings set' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    updates: dict = {}
+    for kv in args.assignments:
+        if "=" not in kv:
+            print(f"ERROR: invalid KEY=VALUE format: {kv!r}", file=sys.stderr)
+            sys.exit(1)
+        k, v = kv.split("=", 1)
+        if v.lower() in ("true", "false"):
+            v = v.lower() == "true"
+        else:
+            try:
+                v = int(v)
+            except ValueError:
+                try:
+                    v = float(v)
+                except ValueError:
+                    pass
+        updates[k] = v
+
+    if not _confirm(
+        f"Update {len(updates)} setting(s): {', '.join(updates.keys())}?",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+
+    result = api("PATCH", "/api/admin/settings", updates)
+    _emit(args, result, _render_settings)
+
+
+def _render_settings(data: dict) -> None:
+    print("=== RUNTIME SETTINGS ===")
+    for k, v in sorted(data.items()):
+        print(f"  {k}: {v}")
+
+
+# ── envelope ─────────────────────────────────────────────────────────────────
+
+def cmd_envelope(args: argparse.Namespace) -> None:
+    """Dispatch envelope subcommands: show / set."""
+    sub = getattr(args, "envelope_cmd", None) or "show"
+    if sub == "set":
+        _envelope_set(args)
+    else:
+        _envelope_show(args)
+
+
+def _envelope_show(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    data, err = _safe_read(f"/api/admin/projects/{pid}/resource-envelope")
+    if err or data is None:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return
+    _emit(args, data, _render_envelope)
+
+
+def _envelope_set(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'envelope set' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    updates: dict = {}
+    for kv in args.assignments:
+        if "=" not in kv:
+            print(f"ERROR: invalid KEY=VALUE format: {kv!r}", file=sys.stderr)
+            sys.exit(1)
+        k, v = kv.split("=", 1)
+        try:
+            v = int(v)
+        except ValueError:
+            try:
+                v = float(v)
+            except ValueError:
+                pass
+        updates[k] = v
+
+    if not updates:
+        print("ERROR: at least one KEY=VALUE assignment required.", file=sys.stderr)
+        sys.exit(1)
+
+    pid = get_project_id(getattr(args, "project_id", None))
+    if not _confirm(
+        f"Update envelope for project {pid}: {', '.join(f'{k}={v}' for k, v in updates.items())}?",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+
+    result = api("PATCH", f"/api/admin/projects/{pid}/resource-envelope", updates)
+    _emit(args, result, _render_envelope)
+
+
+def _render_envelope(data: dict) -> None:
+    pid = data.get("project_id", "?")
+    print(f"=== RESOURCE ENVELOPE (project {pid}) ===")
+    print(f"  max_concurrent_vms:           {data.get('max_concurrent_vms')}")
+    print(f"  spend_ceiling_usd:            {data.get('spend_ceiling_usd')}")
+    print(f"  spend_window_days:            {data.get('spend_window_days')}")
+    print(f"  spend_warning_fraction:       {data.get('spend_warning_fraction')}")
+    print(f"  max_concurrent_compute_jobs:  {data.get('max_concurrent_compute_jobs')}")
+    print(f"  active_vm_count:              {data.get('active_vm_count')}")
+    recent = data.get("recent_spend_usd")
+    if recent is not None:
+        print(f"  recent_spend_usd:             ${float(recent):.4f}")
+    throttled = data.get("is_throttled")
+    if throttled is not None:
+        print(f"  is_throttled:                 {throttled}")
+
+
+# ── messages ─────────────────────────────────────────────────────────────────
+
+def cmd_messages(args: argparse.Namespace) -> None:
+    """Dispatch messages subcommands: list / send."""
+    sub = getattr(args, "messages_cmd", None) or "list"
+    if sub == "send":
+        _messages_send(args)
+    else:
+        _messages_list(args)
+
+
+def _messages_list(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    status = getattr(args, "status", "open")
+    url = f"/api/admin/projects/{pid}/messages"
+    if status:
+        url += f"?status={status}"
+    msgs = api("GET", url)
+    _emit(args, {"messages": msgs}, _render_messages)
+
+
+_MSG_ICONS = {"BUG_REPORT": "BUG", "FEEDBACK": "FB", "NOTE": "NOTE",
+              "QUESTION": "Q", "BLOCKER": "BLOCK"}
+
+
+def _render_messages(data: dict) -> None:
+    msgs = data.get("messages") or []
+    if not msgs:
+        print("No messages.")
+        return
+    for m in msgs:
+        icon = _MSG_ICONS.get(m.get("type", ""), "?")
+        src = m.get("from", "?")
+        age = (m.get("created_at") or "?")[:16]
+        print(f"  [{icon}] ({src}, {age}) {(m.get('content') or '')[:120]}")
+
+
+def _messages_send(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'send' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    pid = get_project_id(getattr(args, "project_id", None))
+    result = api("POST", f"/api/admin/projects/{pid}/messages", {
+        "content": args.content,
+        "message_type": getattr(args, "type", "FEEDBACK"),
+    })
+    _emit(args, result, lambda d: print(f"  Message sent: {d.get('id', '?')}"))
+
+
+# ── fleet (pool / warm / accounts / zones) ────────────────────────────────────
+
+def cmd_fleet(args: argparse.Namespace) -> None:
+    """Dispatch fleet subcommands: pool / warm / accounts / zones."""
+    sub = getattr(args, "fleet_cmd", None) or "pool"
+    if sub == "warm":
+        _fleet_warm(args)
+    elif sub == "accounts":
+        _fleet_accounts(args)
+    elif sub == "zones":
+        _fleet_zones(args)
+    else:
+        _fleet_pool(args)
+
+
+def _fleet_pool(args: argparse.Namespace) -> None:
+    data, err = _safe_read("/api/admin/settings")
+    if err:
+        print(f"Pool: error ({err})")
+        return
+    accounts = (data or {}).get("max_plan_accounts", [])
+    _emit(args, {"accounts": accounts}, _render_fleet_pool)
+
+
+def _render_fleet_pool(data: dict) -> None:
+    accounts = data.get("accounts") or []
+    print("=== MAX PLAN POOL ===")
+    print(f"  Total:     {len(accounts)}")
+    print(f"  Enabled:   {sum(1 for a in accounts if a.get('enabled', True))}")
+    for a in accounts:
+        name = a.get("name", a.get("id", "?")[:8])
+        status = "OK" if a.get("enabled", True) else "DISABLED"
+        rl = a.get("rl_hit_count", 0)
+        suffix = f" (rate-limited x{rl})" if rl else ""
+        print(f"  {name:20}: active={a.get('active_tasks', 0)} {status}{suffix}")
+        for model, info in (a.get("disabled_models") or {}).items():
+            at = (info.get("at") or "")[:19]
+            print(f"    {model}: BLOCKED (hit #{info.get('hits', 0)}, since {at})")
+
+
+def _fleet_warm(args: argparse.Namespace) -> None:
+    ov, err = _safe_read("/api/admin/warm-vm-state")
+    if err:
+        print(f"Warm pool: error ({err})")
+        return
+    _emit(args, ov or {}, _render_fleet_warm)
+
+
+def _render_fleet_warm(data: dict) -> None:
+    pm = data.get("pool_metrics") or {}
+    wpm = data.get("warm_pin_metrics") or {}
+    if not pm:
+        print("=== WARM VM POOL ===\n  (pool_metrics empty — pool disabled or backend error)")
+        return
+    print("=== WARM VM POOL ===")
+    print(f"  enabled:        {pm.get('enabled')}")
+    allow = pm.get("project_allowlist") or []
+    print(f"  scope:          {allow if allow else 'fleet-wide (no allowlist)'}")
+    print(f"  target_size:    {pm.get('target_size')}   idle_ttl_secs: {pm.get('idle_ttl_secs')}")
+    print(f"  current_size:   {pm.get('current_size')}   idle_now: {pm.get('idle_count')}")
+    print(f"  idle_cost_usd:  projected={pm.get('projected_idle_cost_usd')} "
+          f"settled={pm.get('settled_idle_cost_usd')} live={pm.get('live_idle_cost_usd')}")
+
+    print("\n=== CLAIM CIRCUIT BREAKER ===")
+    sup_until = wpm.get("pool_suppressed_until")
+    print(f"  suppressed:     {wpm.get('pool_circuit_breaker_suppressed')}"
+          + (f" until {sup_until}" if sup_until else ""))
+    print(f"  failures/1h:    {wpm.get('pool_claim_failures_last_hour')} "
+          f"(threshold {wpm.get('pool_failure_rate_threshold')})")
+    print(f"  active pool-origin claims: {wpm.get('active_pool_origin_claims')}  "
+          f"pool_origin_share: {wpm.get('pool_origin_share')}")
+
+    cg = pm.get("cost_guard")
+    if cg is not None:
+        print("\n=== COST GUARD ===")
+        print(f"  engaged:        {cg.get('engaged')}"
+              + (f"  reason={cg.get('reason')}" if cg.get("reason") else ""))
+        print(f"  eligible_rate:  {cg.get('hit_rate')}  (min {cg.get('min_hit_rate')})  "
+              f"[raw {cg.get('raw_hit_rate')}]")
+        print(f"  eligible_disp:  {cg.get('total_dispatches')}  "
+              f"[raw {cg.get('raw_total_dispatches')}]")
+        print(f"  idle_cost_usd:  {cg.get('idle_cost_usd')}  (min {cg.get('min_idle_cost_usd')})")
+
+    funnel = pm.get("funnel") or {}
+    print(f"\n=== DISPATCH FUNNEL (last {funnel.get('window_hours', '?')}h) ===")
+    er = funnel.get("eligible_hit_rate")
+    rr = funnel.get("pool_hit_rate")
+    print(f"  eligible_rate:  {er if er is not None else 'n/a (no eligible demand)'}"
+          f"  ({funnel.get('pool_lease_hits')} hits / {funnel.get('eligible_dispatches')} eligible)")
+    print(f"  raw_rate:       {rr if rr is not None else 'n/a (no dispatches)'}"
+          f"  ({funnel.get('pool_lease_hits')} hits / {funnel.get('total_dispatches')} total)")
+    print(f"  cold:           {funnel.get('cold_dispatches')}")
+    misses = funnel.get("lease_miss_by_reason") or {}
+    print(f"  lease misses:   {funnel.get('lease_miss_total')} "
+          f"(eligible {funnel.get('eligible_miss_total')})")
+    for reason, n in sorted(misses.items(), key=lambda kv: -kv[1]):
+        print(f"    - {reason:22}: {n}")
+    by_acct = funnel.get("by_account") or {}
+    if by_acct:
+        print("\n=== PER-ACCOUNT ===")
+        for acct, b in sorted(by_acct.items(), key=lambda kv: -(kv[1].get("total_dispatches") or 0)):
+            ehr = b.get("eligible_hit_rate")
+            print(f"  {acct:36} elig_rate={ehr if ehr is not None else 'n/a':<8} "
+                  f"raw={b.get('pool_hit_rate')} hits={b.get('pool_lease_hits')} "
+                  f"cold={b.get('cold_dispatches')} misses={b.get('lease_miss_total')}")
+            for reason, n in sorted((b.get("lease_miss_by_reason") or {}).items(), key=lambda kv: -kv[1]):
+                print(f"      - {reason}: {n}")
+
+
+def _fleet_resolve_account(query: str) -> dict | None:
+    """Resolve a Max Plan account by name (case-insensitive substring) or ID prefix."""
+    s = api("GET", "/api/admin/settings")
+    q = query.lower()
+    for a in s.get("max_plan_accounts", []):
+        if a["id"].lower().startswith(q) or q in a.get("name", "").lower():
+            return a
+    return None
+
+
+def _fleet_accounts(args: argparse.Namespace) -> None:
+    disable = getattr(args, "disable", None)
+    enable = getattr(args, "enable", None)
+    remove = getattr(args, "remove", None)
+
+    if disable or enable:
+        cfg = load_config()
+        if cfg.get("read_only"):
+            print("ERROR: mutating action requires an admin API key.", file=sys.stderr)
+            sys.exit(1)
+        target = disable or enable
+        is_enable = bool(enable)
+        verb = "Enable" if is_enable else "Disable"
+        if not _confirm(f"{verb} account {target}?", getattr(args, "yes", False)):
+            print("Aborted.")
+            return
+        if target.lower() == "all":
+            s = api("GET", "/api/admin/settings")
+            for a in s.get("max_plan_accounts", []):
+                if a.get("enabled", True) != is_enable:
+                    result = api("PATCH", f"/api/admin/max-plan-accounts/{a['id']}", {"enabled": is_enable})
+                    print(f"  {verb}d: {result.get('name', a['id'][:8])}")
+                else:
+                    state = "enabled" if is_enable else "disabled"
+                    print(f"  {a.get('name', a['id'][:8])}: already {state}")
+            return
+        acct = _fleet_resolve_account(target)
+        if not acct:
+            print(f"Account not found: {target}")
+            return
+        result = api("PATCH", f"/api/admin/max-plan-accounts/{acct['id']}", {"enabled": is_enable})
+        print(f"{verb}d: {result.get('name', acct['id'][:8])}")
+        return
+
+    if remove:
+        cfg = load_config()
+        if cfg.get("read_only"):
+            print("ERROR: mutating action requires an admin API key.", file=sys.stderr)
+            sys.exit(1)
+        if not _confirm(f"Remove account {remove}?", getattr(args, "yes", False)):
+            print("Aborted.")
+            return
+        acct = _fleet_resolve_account(remove)
+        if not acct:
+            print(f"Account not found: {remove}")
+            return
+        path = f"/api/admin/max-plan-accounts/{acct['id']}"
+        if getattr(args, "force", False):
+            path += "?force=true"
+        result = api("DELETE", path)
+        print(f"Removed: {result.get('message', 'done')}")
+        return
+
+    _fleet_pool(args)
+
+
+def _fleet_zones(args: argparse.Namespace) -> None:
+    zones, err = _safe_read("/api/admin/zone-health")
+    if err:
+        print(f"Zones: error ({err})")
+        return
+    _emit(args, {"zones": zones or {}}, _render_fleet_zones)
+
+
+def _render_fleet_zones(data: dict) -> None:
+    zones = data.get("zones") or {}
+    print("=== ZONE HEALTH ===")
+    if isinstance(zones, dict):
+        for zone, zdata in sorted(zones.items()):
+            zdata = zdata or {}
+            status = zdata.get("status", "?")
+            last = zdata.get("last_success", "?")
+            fails = zdata.get("consecutive_failures", 0)
+            print(f"  {zone:30}: {status:12} fails={fails} last_ok={last}")
+    else:
+        print(f"  {zones}")
 
 
 # ── promote-recover ──────────────────────────────────────────────────────────
@@ -944,6 +2245,119 @@ def cmd_promote_recover(args: argparse.Namespace) -> None:
 def _render_promote_recover(data: dict) -> None:
     print(f"=== {data['action']} ===")
     print(json.dumps(data.get("result"), indent=2, default=str))
+
+
+# ── ops (system intervention) ────────────────────────────────────────────────
+
+def cmd_ops(args: argparse.Namespace) -> None:
+    """Dispatch ops subcommands: repair / reset-health / requeue-failed / restart-orchestrator / circuit-breaker."""
+    sub = getattr(args, "ops_cmd", None)
+    if sub == "repair":
+        _ops_repair(args)
+    elif sub == "reset-health":
+        _ops_reset_health(args)
+    elif sub == "requeue-failed":
+        _ops_requeue_failed(args)
+    elif sub == "restart-orchestrator":
+        _ops_restart_orchestrator(args)
+    elif sub == "circuit-breaker":
+        _ops_circuit_breaker(args)
+    else:
+        print("ERROR: ops requires a subcommand", file=sys.stderr)
+        sys.exit(1)
+
+
+def _ops_repair(args: argparse.Namespace) -> None:
+    """Repair stuck state."""
+    result = api("POST", "/api/admin/repair-state", {})
+    repairs = result.get('repairs', [])
+    data = {"action": "repair", "count": result.get('count', 0), "repairs": repairs}
+    def _render(d):
+        print(f"Repairs: {d.get('count')}")
+        if d.get('repairs'):
+            for r in d.get('repairs', []):
+                print(f"  - {r}")
+        else:
+            print("  (no repairs needed)")
+    _emit(args, data, _render)
+
+
+def _ops_reset_health(args: argparse.Namespace) -> None:
+    """Force-reset health checks."""
+    result = api("POST", "/api/admin/deploy-state/reset-health", {})
+    _emit(args, result, lambda d: print(json.dumps(d, indent=2, default=str)))
+
+
+def _ops_requeue_failed(args: argparse.Namespace) -> None:
+    """Requeue all FAILED tasks."""
+    from blueprint_api import list_tasks
+    failed = list_tasks(status="FAILED", limit=100)
+    if not failed:
+        _emit(args, {"count": 0}, lambda d: print("No failed tasks."))
+        return
+    requeued = []
+    failed_requeue = []
+    for t in failed:
+        tid = t['id']
+        try:
+            api("PATCH", f"/api/admin/tasks/{tid}", {"status": "QUEUED"})
+            requeued.append(tid)
+        except Exception as e:
+            failed_requeue.append((tid, str(e)))
+    data = {
+        "count": len(failed),
+        "requeued": len(requeued),
+        "failed": len(failed_requeue),
+        "requeued_ids": requeued,
+        "failed_requeue": failed_requeue,
+    }
+    def _render(d):
+        print(f"Requeued {d['requeued']}/{d['count']} failed tasks")
+        if d.get('failed_requeue'):
+            print("Failed to requeue:")
+            for tid, err in d['failed_requeue']:
+                print(f"  {tid[:8]} FAILED: {err}")
+    _emit(args, data, _render)
+
+
+def _ops_restart_orchestrator(args: argparse.Namespace) -> None:
+    """Restart background loops."""
+    result = api("POST", "/api/admin/restart-orchestrator", {})
+    _emit(args, result, lambda d: print(json.dumps(d, indent=2, default=str)))
+
+
+def _ops_circuit_breaker(args: argparse.Namespace) -> None:
+    """Show circuit breaker state, optionally reset for a project."""
+    if getattr(args, "reset", None):
+        pid = args.reset if args.reset else get_project_id()
+        result = api("POST", f"/api/admin/projects/{pid}/circuit-breaker/reset", {})
+        _emit(args, {"action": "reset", "project_id": pid, "result": result},
+              lambda d: print(json.dumps(d.get('result'), indent=2, default=str)))
+        return
+    data = api("GET", "/api/admin/diagnostics")
+    cbs = data.get('circuit_breakers', {})
+    cb_list = []
+    for pid, cb in cbs.items():
+        cb_list.append({
+            "project_id": pid,
+            "state": cb.get('state', '?'),
+            "failure_count": cb.get('failure_count', 0),
+            "success_count": cb.get('success_count', 0),
+            "opened_at": cb.get('opened_at', ''),
+            "cooldown_ends_at": cb.get('cooldown_ends_at', ''),
+        })
+    def _render(d):
+        if not d:
+            print("No circuit breakers registered.")
+            return
+        print("=== CIRCUIT BREAKERS ===")
+        for cb in d:
+            print(f"  {cb['project_id'][:8]}  state={cb['state']}  "
+                  f"failures={cb['failure_count']}  successes={cb['success_count']}")
+            if cb['opened_at']:
+                print(f"           opened_at={cb['opened_at']}  "
+                      f"cooldown_until={cb['cooldown_ends_at'] or '?'}")
+    _emit(args, cb_list, _render)
 
 
 # ── logs (ported from scripts/logs.py) ───────────────────────────────────────
@@ -1109,6 +2523,414 @@ def _render_logs(data: dict, full: bool) -> None:
             print(f"  {ts}  [{sev:5}] {text.splitlines()[0] if text else ''}")
 
 
+# ── health ───────────────────────────────────────────────────────────────────
+
+def cmd_health(args: argparse.Namespace) -> None:
+    """Dispatch health subcommands: deploy / autonomy / alerts / digest / activity."""
+    sub = getattr(args, "health_cmd", None) or "deploy"
+    dispatch = {
+        "deploy": _health_deploy,
+        "autonomy": _health_autonomy,
+        "alerts": _health_alerts,
+        "digest": _health_digest,
+        "activity": _health_activity,
+    }
+    dispatch[sub](args)
+
+
+def _age_str(iso_or_dt) -> str:
+    """Return human-readable age ('Ns ago' / 'Nm ago') from an ISO string or datetime."""
+    if not iso_or_dt:
+        return "never"
+    try:
+        if isinstance(iso_or_dt, str):
+            ts = datetime.fromisoformat(iso_or_dt.replace("Z", "+00:00"))
+        else:
+            ts = iso_or_dt
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        delta = (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:
+        return str(iso_or_dt)
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    if delta < 3600:
+        return f"{int(delta // 60)}m{int(delta % 60)}s ago"
+    return f"{int(delta // 3600)}h{int((delta % 3600) // 60)}m ago"
+
+
+def _health_deploy(args: argparse.Namespace) -> None:
+    """Deploy health deep-dive: probe ring buffer, external deps, orchestrator cycle."""
+    ds, ds_err = _safe_read("/api/admin/deploy-state")
+    ds = ds or {}
+    hd, hd_err = _safe_read("/api/health/detailed")
+    hd = hd or {}
+    orch = (hd.get("components") or {}).get("orchestrator") or {}
+    eh = ds.get("external_health") or {}
+    data = {
+        "status": ds.get("status"),
+        "pause_reason": ds.get("pause_reason"),
+        "paused_at": ds.get("paused_at"),
+        "health_check_interval_seconds": ds.get("health_check_interval_seconds"),
+        "health_recovery_streak": ds.get("health_recovery_streak"),
+        "health_recovery_streak_required": ds.get("health_recovery_streak_required"),
+        "health_recovery_history": ds.get("health_recovery_history") or [],
+        "health_recovery_history_size": ds.get("health_recovery_history_size"),
+        "health_failure_streak": ds.get("health_failure_streak"),
+        "health_failure_streak_threshold": ds.get("health_failure_streak_threshold"),
+        "external_health": eh,
+        "orchestrator": {
+            "status": orch.get("status"),
+            "cycle_age_seconds": orch.get("cycle_age_seconds"),
+            "queued_tasks": orch.get("queued_tasks"),
+            "active_tasks": orch.get("active_tasks"),
+        },
+        "errors": {k: v for k, v in (("deploy_state", ds_err), ("health_detailed", hd_err)) if v},
+    }
+    _emit(args, data, _render_health_deploy)
+
+
+def _render_health_deploy(data: dict) -> None:
+    print("=== DEPLOY HEALTH ===")
+    print(f"  Status:       {data.get('status', '?')}")
+    if data.get("pause_reason"):
+        print(f"  Pause reason: {data['pause_reason']}")
+    if data.get("paused_at"):
+        print(f"  Paused:       {_age_str(data['paused_at'])}")
+    eh = data.get("external_health") or {}
+    errs = eh.get("errors") or {}
+    print("\n=== EXTERNAL DEPS ===")
+    for dep in ("github_api", "db", "dispatch_api", "anthropic_api", "openai_api", "gemini_api", "gcp"):
+        val = eh.get(dep)
+        if val is None:
+            continue
+        status_str = "OK" if val else "DOWN"
+        err_str = errs.get(dep, "")
+        suffix = f" — {err_str}" if err_str else ""
+        print(f"  {dep:12}: {status_str}{suffix}")
+    hist = data.get("health_recovery_history") or []
+    size = data.get("health_recovery_history_size") or 5
+    streak = data.get("health_recovery_streak") or 0
+    required = data.get("health_recovery_streak_required") or 3
+    dots = ["OK " if hist[i] else "FAIL" for i in range(min(len(hist), size))]
+    dots += ["--  "] * (size - len(dots))
+    print(f"\n=== RING BUFFER (3-of-5 gate) ===")
+    print(f"  Recovery: [{' | '.join(dots)}]  {streak}/{required} healthy")
+    orch = data.get("orchestrator") or {}
+    print(f"\n=== ORCHESTRATOR CYCLE ===")
+    print(f"  Status:    {orch.get('status', '?')}")
+    cycle_age = orch.get("cycle_age_seconds")
+    if cycle_age is None:
+        print("  Last cycle: never (loop has not completed a cycle since process start)")
+    else:
+        print(f"  Last cycle: {int(cycle_age)}s ago"
+              + ("  WARNING: cycle >30s old — loop may be stuck" if cycle_age > 30 else ""))
+    errors = data.get("errors") or {}
+    if errors:
+        print("\n=== READ ERRORS ===")
+        for endpoint, e in errors.items():
+            print(f"  {endpoint}: {e}")
+
+
+def _health_autonomy(args: argparse.Namespace) -> None:
+    """Autonomous research state per project."""
+    data, err = _safe_read("/api/admin/autonomous-status")
+    data = data or {}
+    projects = data.get("projects") or []
+    out = {
+        "projects": [
+            {
+                "project_name": p.get("project_name"),
+                "autonomous_enabled": p.get("autonomous_enabled"),
+                "consecutive_failures": p.get("consecutive_failures", 0),
+                "tasks_spawned_last_hour": p.get("tasks_spawned_last_hour", 0),
+                "last_research_at": p.get("last_research_at"),
+                "current_direction": p.get("current_direction"),
+            }
+            for p in projects
+        ],
+        "errors": {"autonomy": err} if err else {},
+    }
+    _emit(args, out, _render_health_autonomy)
+
+
+def _render_health_autonomy(data: dict) -> None:
+    projects = data.get("projects") or []
+    print("=== AUTONOMY STATE ===")
+    if not projects:
+        print("  No projects configured.")
+        return
+    for p in projects:
+        print(f"  Project: {p.get('project_name', '?')}")
+        print(f"    enabled:              {p.get('autonomous_enabled')}")
+        print(f"    consecutive_failures: {p.get('consecutive_failures', 0)}")
+        print(f"    tasks_last_hour:      {p.get('tasks_spawned_last_hour', 0)}")
+        print(f"    last_research_at:     {p.get('last_research_at', 'never')}")
+        direction = p.get("current_direction") or {}
+        if direction:
+            print(f"    direction:            {(direction.get('summary') or '?')[:100]}")
+
+
+def _health_alerts(args: argparse.Namespace) -> None:
+    """Show system alerts; optionally dismiss one or all."""
+    dismiss = getattr(args, "dismiss", None)
+    dismiss_all = getattr(args, "dismiss_all", False)
+    if dismiss_all or dismiss:
+        cfg = load_config()
+        if cfg.get("read_only"):
+            print(
+                "ERROR: 'dismiss' is a mutating action but the resolved config is "
+                "read-only (agent-JWT fallback). Provide an admin API key "
+                "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if dismiss_all:
+            result = api("POST", "/api/admin/alerts/dismiss-all", {})
+            _emit(args, result, lambda d: print(f"Dismissed: {d.get('dismissed_count', '?')} alerts"))
+            return
+        result = api("POST", f"/api/admin/alerts/{dismiss}/dismiss", {})
+        _emit(args, result, lambda d: print(f"Dismissed: {d.get('status', 'ok')}"))
+        return
+    alerts, err = _safe_read("/api/admin/alerts")
+    alerts = alerts if isinstance(alerts, list) else []
+    out = {"alerts": alerts, "errors": {"alerts": err} if err else {}}
+    _emit(args, out, _render_health_alerts)
+
+
+def _render_health_alerts(data: dict) -> None:
+    alerts = data.get("alerts") or []
+    if not alerts:
+        print("No active alerts.")
+        return
+    print(f"=== ALERTS ({len(alerts)}) ===")
+    for a in alerts:
+        severity = a.get("severity", "?")
+        title = a.get("title", "?")
+        msg = (a.get("message") or "")[:120]
+        ts = (a.get("created_at") or "")[:19]
+        aid = (a.get("id") or "?")[:8]
+        tid = (a.get("task_id") or "")[:8]
+        task_ref = f"  task={tid}" if tid else ""
+        print(f"  [{severity:8}] {aid}  {ts}  {title}{task_ref}")
+        if msg:
+            print(f"             {msg}")
+
+
+def _health_digest(args: argparse.Namespace) -> None:
+    """Catch-up digest for the last N hours."""
+    hours = getattr(args, "hours", 24) or 24
+    pid = get_project_id(getattr(args, "project_id", None))
+    data, err = _safe_read(f"/api/admin/digest?project_id={pid}&hours={hours}")
+    data = data or {}
+    out = {
+        "hours": hours,
+        "completed_count": data.get("completed_count"),
+        "failed_count": data.get("failed_count"),
+        "prs_opened": data.get("prs_opened"),
+        "research_cycles": data.get("research_cycles"),
+        "pending_approval_count": data.get("pending_approval_count"),
+        "active_count": data.get("active_count"),
+        "running_count": data.get("running_count"),
+        "queued_count": data.get("queued_count"),
+        "needs_attention": data.get("needs_attention") or [],
+        "recent_completions": data.get("recent_completions") or [],
+        "recent_failures": data.get("recent_failures") or [],
+        "errors": {"digest": err} if err else {},
+    }
+    _emit(args, out, _render_health_digest)
+
+
+def _render_health_digest(data: dict) -> None:
+    hours = data.get("hours", 24)
+    print(f"=== DIGEST (last {hours}h) ===")
+    print(f"  Completed:        {data.get('completed_count', '?')}")
+    print(f"  Failed:           {data.get('failed_count', '?')}")
+    print(f"  PRs opened:       {data.get('prs_opened', '?')}")
+    print(f"  Research cycles:  {data.get('research_cycles', '?')}")
+    print(f"  Pending approval: {data.get('pending_approval_count', '?')}")
+    print(f"  Active now:       {data.get('active_count', '?')} "
+          f"({data.get('running_count', '?')} running, {data.get('queued_count', '?')} queued)")
+    for item in (data.get("needs_attention") or []):
+        reason = item.get("reason", "?")
+        title = (item.get("title") or "?")[:55]
+        wait_h = item.get("waiting_hours")
+        tid = (item.get("task_id") or "?")[:8]
+        wait_str = f"{wait_h}h ago" if wait_h is not None else "?"
+        print(f"\n--- Needs Attention ---") if item == (data.get("needs_attention") or [])[0] else None
+        print(f"  {tid}  [{reason:18}]  {title}  ({wait_str})")
+    for c in (data.get("recent_completions") or []):
+        print(f"\n--- Recent Completions ---") if c == (data.get("recent_completions") or [])[0] else None
+        tid = (c.get("task_id") or "?")[:8]
+        title = (c.get("title") or "?")[:50]
+        ttype = c.get("task_type", "?")
+        pr = c.get("pr_url", "")
+        ts = (c.get("completed_at") or "")[:16]
+        pr_str = f"  {pr}" if pr else ""
+        print(f"  {tid}  [{ttype:8}]  {ts}  {title}{pr_str}")
+    for f in (data.get("recent_failures") or []):
+        print(f"\n--- Recent Failures ---") if f == (data.get("recent_failures") or [])[0] else None
+        tid = (f.get("task_id") or "?")[:8]
+        title = (f.get("title") or "?")[:50]
+        ts = (f.get("failed_at") or "")[:16]
+        err = (f.get("error_snippet") or "")[:100]
+        print(f"  {tid}  {ts}  {title}")
+        if err:
+            print(f"           {err}")
+
+
+def _health_activity(args: argparse.Namespace) -> None:
+    """Recent activity feed: completions, failures, research events."""
+    limit = getattr(args, "limit", 20) or 20
+    data, err = _safe_read(f"/api/admin/activity?limit={limit}")
+    events = data.get("events", []) if isinstance(data, dict) else (data or [])
+    out = {
+        "events": events,
+        "total": data.get("total") if isinstance(data, dict) else None,
+        "errors": {"activity": err} if err else {},
+    }
+    _emit(args, out, _render_health_activity)
+
+
+_ACTIVITY_ICONS = {
+    "TASK_COMPLETED": "done", "TASK_FAILED": "FAIL",
+    "RESEARCH_FINDINGS": "research", "DEPLOY": "deploy",
+}
+
+
+def _render_health_activity(data: dict) -> None:
+    events = data.get("events") or []
+    if not events:
+        print("No recent activity.")
+        return
+    print(f"=== ACTIVITY (last {len(events)} events) ===")
+    for e in events:
+        etype = e.get("type", "?")
+        icon = _ACTIVITY_ICONS.get(etype, etype)
+        ts = (e.get("timestamp") or "")[:16]
+        title = (e.get("title") or "?")[:55]
+        tid = (e.get("task_id") or "")[:8]
+        pr = e.get("pr_url") or ""
+        err = (e.get("error_summary") or "")[:80]
+        dur = e.get("duration_seconds")
+        dur_str = f"  {int(dur)}s" if dur else ""
+        pr_str = f"  {pr}" if pr else ""
+        print(f"  {ts}  [{icon:10}]  {tid}  {title}{dur_str}{pr_str}")
+        if err:
+            print(f"                              {err}")
+
+
+# ── analytics ────────────────────────────────────────────────────────────────
+
+def cmd_analytics(args: argparse.Namespace) -> None:
+    """Dispatch analytics subcommands: cost / duration / pause-stats / failing-types."""
+    sub = getattr(args, "analytics_cmd", None) or "cost"
+    pid = get_project_id(getattr(args, "project_id", None))
+
+    if sub == "cost":
+        window = getattr(args, "window", "1h")
+        data, err = _safe_read(f"/api/admin/task-cost-breakdown?project_id={pid}&window={window}")
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return
+        _emit(args, data, _render_analytics_cost)
+
+    elif sub == "duration":
+        data, err = _safe_read(f"/api/admin/task-duration-stats?project_id={pid}")
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return
+        _emit(args, data, _render_analytics_duration)
+
+    elif sub == "pause-stats":
+        hours = getattr(args, "hours", 24)
+        data, err = _safe_read(
+            f"/api/admin/direction-auto-pause-stats?project_id={pid}&window_hours={hours}"
+        )
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return
+        _emit(args, data, _render_analytics_pause_stats)
+
+    elif sub == "failing-types":
+        data, err = _safe_read("/api/admin/failing-task-types")
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return
+        _emit(args, data, _render_analytics_failing_types)
+
+    else:
+        print(
+            f"analytics: unknown subcommand '{sub}'. Run `blueprint analytics --help`.",
+            file=sys.stderr,
+        )
+
+
+def _render_analytics_cost(data: dict) -> None:
+    window = data.get("window", "?")
+    total = data.get("total_estimated_cost_usd", 0.0)
+    task_count = data.get("task_count", 0)
+    print(f"=== TASK COST BREAKDOWN (window={window}, {task_count} tasks) ===")
+    print(f"  Total estimated cost: ${total:.4f}")
+    for row in data.get("task_type_breakdown") or []:
+        tt = row.get("task_type", "?")
+        cost = row.get("estimated_cost_usd", 0.0)
+        n = row.get("task_count", 0)
+        print(f"  {tt:20}  ${cost:.4f}  ({n} tasks)")
+    top = data.get("top_tasks") or []
+    if top:
+        print("  --- top tasks ---")
+        for t in top:
+            print(f"  {t.get('task_id','')[:8]}  ${t.get('estimated_cost_usd',0):.4f}  {(t.get('task_title') or '')[:60]}")
+
+
+def _render_analytics_duration(data: dict) -> None:
+    print("=== TASK DURATION STATS (last 7 days) ===")
+    for tt, s in (data.get("stats") or {}).items():
+        p50 = s.get("p50_seconds", 0)
+        n = s.get("sample_count", 0)
+        print(f"  {tt:20}  p50={int(p50)}s  n={n}")
+    scope = data.get("scope_duration_stats") or {}
+    if scope:
+        print("  --- by scope ---")
+        for sc, s in scope.items():
+            p50 = s.get("p50_seconds", 0)
+            p90 = s.get("p90_seconds", 0)
+            n = s.get("sample_size", 0)
+            print(f"  {sc:10}  p50={int(p50)}s  p90={int(p90)}s  n={n}")
+
+
+def _render_analytics_pause_stats(data: dict) -> None:
+    window = data.get("window_hours", "?")
+    paused = data.get("auto_paused_count", 0)
+    recovered = data.get("auto_recovered_count", 0)
+    retired = data.get("auto_retired_count", 0)
+    current = data.get("currently_auto_paused", 0)
+    trend = data.get("trend", "?")
+    print(f"=== DIRECTION AUTO-PAUSE STATS (window={window}h) ===")
+    print(f"  auto-paused={paused}  recovered={recovered}  retired={retired}")
+    print(f"  currently paused={current}  trend={trend}")
+    for r in data.get("top_reasons") or []:
+        print(f"  reason: {r.get('reason','?')}  ({r.get('count',0)}x)")
+
+
+def _render_analytics_failing_types(data: dict) -> None:
+    gated = data.get("gated_types") or []
+    threshold = data.get("global_failure_threshold", "?")
+    tightened = data.get("anomaly_tightened", False)
+    window = data.get("window_minutes", "?")
+    print(f"=== FAILING TASK TYPES (last {window}min, global_threshold={threshold}"
+          f"{', anomaly-tightened' if tightened else ''}) ===")
+    if not gated:
+        print("  (no types currently gated)")
+        return
+    for g in gated:
+        tt = g.get("task_type", "?")
+        rate = g.get("failure_rate", 0)
+        n = g.get("sample_size", 0)
+        print(f"  {tt:20}  failure_rate={rate:.1%}  n={n}")
+
+
 # ── argument parser ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1141,6 +2963,29 @@ def build_parser() -> argparse.ArgumentParser:
     # diagnostics
     sub.add_parser("diagnostics", parents=[common],
                    help="Stuck tasks, circuit breakers, and grouped failure modes.")
+
+    # ops
+    p_ops = sub.add_parser("ops", parents=[common],
+                           help="System intervention: repair state, health reset, requeue, restart.",
+                           description="System intervention subcommands for stuck-state recovery, "
+                                       "health resets, task requeuing, and orchestrator restarts.")
+    ops_sub = p_ops.add_subparsers(dest="ops_cmd")
+    ops_sub.add_parser("repair", parents=[common],
+                       help="Repair stuck state (orphaned parents, stale locks).")
+    ops_sub.add_parser("reset-health", parents=[common],
+                       help="Force-reset health checks.")
+    ops_sub.add_parser("requeue-failed", parents=[common],
+                       help="Requeue all FAILED tasks.")
+    ops_sub.add_parser("restart-orchestrator", parents=[common],
+                       help="Restart background loops.")
+    p_ops_cb = ops_sub.add_parser("circuit-breaker", parents=[common],
+                                  help="Show circuit breaker state or reset for a project.")
+    p_ops_cb.add_argument("--reset", metavar="PROJECT_ID", default=None,
+                          help="Reset circuit breaker for a project (defaults to current project).")
+
+    # trials
+    sub.add_parser("trials", parents=[common],
+                   help="Capability-trial convergence status, arm counts, and days-to-decision.")
 
     # tasks
     p_tasks = sub.add_parser("tasks", parents=[common], help="List or show tasks.",
@@ -1182,6 +3027,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show recent FAILED tasks grouped by root cause for incident triage.")
     p_tasks_failures.add_argument("--limit", type=int, default=50,
                                   help="Max failed tasks to fetch (default 50).")
+    p_tasks_evaluating = tasks_sub.add_parser(
+        "evaluating", parents=[common],
+        help="Show all EVALUATING tasks with CI/PR state.")
+    p_tasks_evaluating.add_argument("-v", "--verbose", action="store_true",
+                                    help="Show research question and scope.")
+    p_tasks_cancel_all = tasks_sub.add_parser(
+        "cancel-all", parents=[common],
+        help="Cancel tasks in bulk (confirms before mutating).")
+    p_tasks_cancel_all.add_argument("--status", help="Filter by status (default: non-terminal).")
+    p_tasks_cancel_all.add_argument("--category",
+                                    help="Filter by context.failure_category.")
+    p_tasks_cancel_all.add_argument("--yes", action="store_true",
+                                    help="Skip the confirmation prompt.")
+    p_tasks_requeue_ci = tasks_sub.add_parser(
+        "requeue-ci", parents=[common],
+        help="Requeue all CI-waiting EVALUATING tasks (confirms before mutating).")
+    p_tasks_requeue_ci.add_argument("--yes", action="store_true",
+                                    help="Skip the confirmation prompt.")
+    p_tasks_trigger_rollup = tasks_sub.add_parser(
+        "trigger-rollup", parents=[common],
+        help="Force rollup PR creation for a stuck parent task (confirms before mutating).")
+    p_tasks_trigger_rollup.add_argument("parent_id", help="Parent task id (full uuid).")
+    p_tasks_trigger_rollup.add_argument("--yes", action="store_true",
+                                        help="Skip the confirmation prompt.")
+    p_tasks_complete = tasks_sub.add_parser(
+        "complete", parents=[common],
+        help="Mark a task COMPLETED (confirms before mutating).")
+    p_tasks_complete.add_argument("task_id", help="Task id.")
+    p_tasks_complete.add_argument("--message", "-m", help="Status message to record.")
+    p_tasks_complete.add_argument("--yes", action="store_true",
+                                  help="Skip the confirmation prompt.")
+    p_tasks_set_status = tasks_sub.add_parser(
+        "set-status", parents=[common],
+        help="Set a task to an arbitrary status (confirms before mutating).")
+    p_tasks_set_status.add_argument("task_id", help="Task id.")
+    p_tasks_set_status.add_argument(
+        "new_status",
+        choices=["QUEUED", "PROVISIONING", "IN_PROGRESS",
+                 "EVALUATING", "COMPLETED", "FAILED", "CANCELLED"],
+        help="Target status.")
+    p_tasks_set_status.add_argument("--message", "-m", help="Status message to record.")
+    p_tasks_set_status.add_argument("--yes", action="store_true",
+                                    help="Skip the confirmation prompt.")
+    p_tasks_reset_cap = tasks_sub.add_parser(
+        "reset-iteration-cap", parents=[common],
+        help="Reset the review-fix iteration cap for a stuck task (confirms before mutating).")
+    p_tasks_reset_cap.add_argument("task_id", help="Task id.")
+    p_tasks_reset_cap.add_argument("--yes", action="store_true",
+                                   help="Skip the confirmation prompt.")
+    p_tasks_archive = tasks_sub.add_parser(
+        "archive", parents=[common],
+        help="Archive old terminal tasks (confirms before mutating).")
+    p_tasks_archive.add_argument("--completed", action="store_true",
+                                 help="Archive only COMPLETED tasks (not FAILED/CANCELLED).")
+    p_tasks_archive.add_argument("--pipelines", action="store_true",
+                                 help="Archive fully-terminal pipelines (parent+all children).")
+    p_tasks_archive.add_argument("--yes", action="store_true",
+                                 help="Skip the confirmation prompt.")
+    p_tasks_research = tasks_sub.add_parser(
+        "research", parents=[common],
+        help="Show recent completed research tasks.")
+    p_tasks_research.add_argument("task_id", nargs="?", default=None,
+                                  help="Research task id (show detail; default lists recent).")
+    p_tasks_research.add_argument("--limit", type=int, default=5,
+                                  help="Max tasks to show (default 5).")
+    p_tasks_research.add_argument("-v", "--verbose", action="store_true",
+                                  help="Verbose output.")
+    tasks_sub.add_parser(
+        "autonomy-debug", parents=[common],
+        help="Show why autonomy is or isn't spawning: blocking guards and eligible directions.")
 
     # versions
     p_versions = sub.add_parser("versions", parents=[common],
@@ -1189,7 +3104,18 @@ def build_parser() -> argparse.ArgumentParser:
                                 description="List release versions or show a detailed summary "
                                             "for a specific version.")
     versions_sub = p_versions.add_subparsers(dest="versions_cmd")
-    versions_sub.add_parser("list", parents=[common], help="List current + recent versions.")
+    p_versions_list = versions_sub.add_parser(
+        "list", parents=[common],
+        help="List current + recent versions (or browse full history with --all/--limit).")
+    p_versions_list.add_argument(
+        "--all", action="store_true", dest="all_versions",
+        help="Browse the full version history (paginated) instead of current + recent.")
+    p_versions_list.add_argument(
+        "--limit", type=int, default=None,
+        help="Page size for history browsing (1-100). Implies the full-history view.")
+    p_versions_list.add_argument(
+        "--offset", type=int, default=0,
+        help="Rows to skip for history browsing (use with --limit).")
     p_versions_show = versions_sub.add_parser("show", parents=[common],
                                               help="Show a version summary (current by default).")
     p_versions_show.add_argument("version_number", nargs="?", default=None,
@@ -1202,6 +3128,99 @@ def build_parser() -> argparse.ArgumentParser:
     p_versions_export.add_argument("--out", metavar="FILE", default=None,
                                    help="Write output to FILE instead of stdout.")
 
+    # system
+    p_system = sub.add_parser(
+        "system", parents=[common],
+        help="Break-glass system ops: repair, restart, zones, autonomy.",
+        description="System-level operator commands. Repair stuck state, restart the "
+                    "orchestrator, inspect zone health, or view autonomy state.")
+    system_sub = p_system.add_subparsers(dest="system_cmd")
+    p_sys_repair = system_sub.add_parser("repair", parents=[common],
+                                         help="Repair stuck/orphaned state (confirms before mutating).")
+    p_sys_repair.add_argument("--yes", action="store_true", help="Skip confirmation.")
+    p_sys_restart = system_sub.add_parser("restart", parents=[common],
+                                          help="Restart orchestrator background loops (confirms).")
+    p_sys_restart.add_argument("--yes", action="store_true", help="Skip confirmation.")
+    system_sub.add_parser("zones", parents=[common], help="Show zone health.")
+    system_sub.add_parser("autonomy", parents=[common],
+                          help="Show autonomous research state per project.")
+
+    # monitor
+    p_monitor = sub.add_parser(
+        "monitor", parents=[common],
+        help="Situational awareness: alerts, digest, activity feed.",
+        description="Monitor system state: show active alerts, catch-up digest, or "
+                    "recent activity feed for operational awareness.")
+    monitor_sub = p_monitor.add_subparsers(dest="monitor_cmd")
+    monitor_sub.add_parser("alerts", parents=[common], help="Show active system alerts.")
+    p_mon_digest = monitor_sub.add_parser("digest", parents=[common],
+                                          help="Catch-up digest (last N hours, default 24).")
+    p_mon_digest.add_argument("--hours", type=int, default=24, help="Lookback window in hours.")
+    p_mon_activity = monitor_sub.add_parser("activity", parents=[common],
+                                            help="Recent activity feed (completions, failures, research).")
+    p_mon_activity.add_argument("--limit", type=int, default=20,
+                               help="Max activity events to show (default 20).")
+
+    # directions
+    p_dirs = sub.add_parser(
+        "directions", parents=[common],
+        help="View and steer research directions.",
+        description="View and steer research directions. Defaults to `list` "
+                    "when no subcommand is given.")
+    dirs_sub = p_dirs.add_subparsers(dest="directions_cmd")
+
+    p_dirs_list = dirs_sub.add_parser("list", parents=[common],
+                                      help="List active/proposed directions.")
+    p_dirs_list.add_argument("--all", action="store_true",
+                             help="Include paused/completed/expired directions.")
+
+    p_dirs_show = dirs_sub.add_parser("show", parents=[common],
+                                      help="Show one direction in detail.")
+    p_dirs_show.add_argument("direction_id", help="Direction id or prefix.")
+
+    p_dirs_add = dirs_sub.add_parser("add", parents=[common],
+                                     help="Add a new direction (confirms before posting).")
+    p_dirs_add.add_argument("text", help="Direction text.")
+    p_dirs_add.add_argument("--priority", choices=["high", "medium", "low"],
+                            default="medium", help="Priority (default medium).")
+    p_dirs_add.add_argument("--paths", nargs="+", metavar="PATH",
+                            help="File paths associated with this direction.")
+    p_dirs_add.add_argument("--completion-criteria", dest="completion_criteria",
+                            metavar="TEXT", help="Completion criteria text.")
+    p_dirs_add.add_argument("--yes", action="store_true",
+                            help="Skip the confirmation prompt.")
+
+    p_dirs_update = dirs_sub.add_parser("update", parents=[common],
+                                        help="Update a direction (confirms before patching).")
+    p_dirs_update.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_update.add_argument("--text", help="New direction text.")
+    p_dirs_update.add_argument("--priority", choices=["high", "medium", "low"],
+                               help="New priority.")
+    p_dirs_update.add_argument("--status",
+                               choices=["active", "paused", "completed",
+                                        "staged", "proposed", "expired"],
+                               help="New status.")
+    p_dirs_update.add_argument("--reset-context", dest="reset_context",
+                               action="store_true",
+                               help="Wipe research_context back to blank template.")
+    p_dirs_update.add_argument("--reset-history", dest="reset_history",
+                               action="store_true",
+                               help="Wipe research_history (sets to []).")
+    p_dirs_update.add_argument("--reset-agent-notes", dest="reset_agent_notes",
+                               action="store_true",
+                               help="Remove agent-added notes; keep user notes.")
+    p_dirs_update.add_argument("--reset-all", dest="reset_all",
+                               action="store_true",
+                               help="Apply all reset flags at once.")
+    p_dirs_update.add_argument("--yes", action="store_true",
+                               help="Skip the confirmation prompt.")
+
+    p_dirs_unhold = dirs_sub.add_parser("unhold", parents=[common],
+                                        help="Clear a direction's hold (confirms before posting).")
+    p_dirs_unhold.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_unhold.add_argument("--yes", action="store_true",
+                               help="Skip the confirmation prompt.")
+
     # promote-recover
     p_pr = sub.add_parser("promote-recover", parents=[common],
                           help="Promotion + recovery levers (confirms before mutating).")
@@ -1213,6 +3232,27 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Reason recorded for cut / clear-deploy-failed.")
     p_pr.add_argument("--force", action="store_true",
                       help="Force clear-deploy-failed when serving SHA is unobservable.")
+
+    # messages
+    p_msgs = sub.add_parser(
+        "messages", parents=[common],
+        help="Read or send operator<->system messages.",
+        description="List open messages or send a new one to the autonomous system. "
+                    "Defaults to `list` when no subcommand is given.",
+    )
+    msgs_sub = p_msgs.add_subparsers(dest="messages_cmd")
+    p_msgs_list = msgs_sub.add_parser("list", parents=[common], help="List messages.")
+    p_msgs_list.add_argument(
+        "--status", default="open",
+        help="Filter by status (default: open; pass empty string for all).",
+    )
+    p_msgs_send = msgs_sub.add_parser("send", parents=[common],
+                                      help="Send a message to the autonomous system.")
+    p_msgs_send.add_argument("content", help="Message content.")
+    p_msgs_send.add_argument(
+        "--type", default="FEEDBACK",
+        help="Message type: FEEDBACK|NOTE|BUG_REPORT|QUESTION|BLOCKER (default FEEDBACK).",
+    )
 
     # logs
     p_logs = sub.add_parser("logs", parents=[common], help="Read Cloud Run logs via gcloud.",
@@ -1239,16 +3279,148 @@ def build_parser() -> argparse.ArgumentParser:
     p_log_task.add_argument("task_id", help="Task id to grep for.")
     _add_log_common(p_log_task)
 
+    # fleet
+    p_fleet = sub.add_parser(
+        "fleet", parents=[common],
+        help="VM account pool, warm pool, and zone health.",
+        description="Show Max Plan account pool, warm VM pool, and zone health. "
+                    "Defaults to `pool` when no subcommand is given.")
+    fleet_sub = p_fleet.add_subparsers(dest="fleet_cmd")
+    fleet_sub.add_parser("pool", parents=[common], help="Show Max Plan account pool.")
+    fleet_sub.add_parser("warm", parents=[common],
+                         help="Warm VM pool funnel: sizing, dispatch hit rate, and cost guard.")
+    p_fleet_accounts = fleet_sub.add_parser(
+        "accounts", parents=[common],
+        help="Show or manage Max Plan accounts (--disable/--enable/--remove).")
+    p_fleet_accounts.add_argument("--disable", metavar="NAME",
+                                  help="Disable account by name/prefix, or 'all'.")
+    p_fleet_accounts.add_argument("--enable", metavar="NAME",
+                                  help="Enable account by name/prefix, or 'all'.")
+    p_fleet_accounts.add_argument("--remove", metavar="NAME",
+                                  help="Remove account by name/prefix.")
+    p_fleet_accounts.add_argument("--force", action="store_true",
+                                  help="Force remove even with active tasks.")
+    p_fleet_accounts.add_argument("--yes", action="store_true",
+                                  help="Skip the confirmation prompt.")
+    fleet_sub.add_parser("zones", parents=[common], help="Show zone health.")
+
+    # health
+    p_health = sub.add_parser(
+        "health", parents=[common],
+        help="System health: deploy state, autonomy, alerts, digest, activity.",
+        description="System health subcommands. Defaults to `deploy` when no subcommand is given.")
+    health_sub = p_health.add_subparsers(dest="health_cmd")
+    health_sub.add_parser("deploy", parents=[common],
+                          help="Deploy health deep-dive: probe ring buffer, external deps, orchestrator.")
+    health_sub.add_parser("autonomy", parents=[common],
+                          help="Autonomous research state per project.")
+    p_health_alerts = health_sub.add_parser("alerts", parents=[common],
+                                            help="Show or dismiss system alerts.")
+    p_health_alerts.add_argument("--dismiss", metavar="ALERT_ID",
+                                 help="Dismiss a specific alert by id (confirms via read-only guard).")
+    p_health_alerts.add_argument("--dismiss-all", dest="dismiss_all", action="store_true",
+                                 help="Dismiss all active alerts.")
+    p_health_digest = health_sub.add_parser("digest", parents=[common],
+                                            help="Catch-up digest (default last 24h).")
+    p_health_digest.add_argument("--hours", type=int, default=24,
+                                 help="Lookback window in hours (default 24).")
+    p_health_activity = health_sub.add_parser("activity", parents=[common],
+                                              help="Recent activity feed.")
+    p_health_activity.add_argument("--limit", type=int, default=20,
+                                   help="Max activity events to show (default 20).")
+
+    # settings
+    p_settings = sub.add_parser(
+        "settings", parents=[common],
+        help="Show or update runtime settings (autonomy flags, cost ceilings, pool sizing).",
+        description="Read or patch runtime configuration. Defaults to `show` when no "
+                    "subcommand is given.")
+    settings_sub = p_settings.add_subparsers(dest="settings_cmd")
+    settings_sub.add_parser("show", parents=[common], help="Show all runtime settings.")
+    p_settings_set = settings_sub.add_parser(
+        "set", parents=[common],
+        help="Update one or more settings (KEY=VALUE ...).")
+    p_settings_set.add_argument(
+        "assignments", nargs="+", metavar="KEY=VALUE",
+        help="Setting assignments (e.g. max_concurrent_vms=5 promotion_enabled=true).")
+    p_settings_set.add_argument("--yes", action="store_true",
+                                help="Skip the confirmation prompt (for scripting).")
+
+    # envelope
+    p_envelope = sub.add_parser(
+        "envelope", parents=[common],
+        help="Show or update the per-project resource envelope (VM cap, spend ceiling).",
+        description="Read or patch the resource envelope for a project. "
+                    "Defaults to `show` when no subcommand is given.")
+    envelope_sub = p_envelope.add_subparsers(dest="envelope_cmd")
+    envelope_sub.add_parser("show", parents=[common],
+                            help="Show the current resource envelope.")
+    p_env_set = envelope_sub.add_parser(
+        "set", parents=[common],
+        help="Patch one or more envelope fields (KEY=VALUE ...).")
+    p_env_set.add_argument("assignments", nargs="+", metavar="KEY=VALUE",
+                           help="Fields to update (e.g. max_concurrent_vms=5 "
+                                "spend_ceiling_usd=100.0).")
+    p_env_set.add_argument("--yes", action="store_true",
+                           help="Skip the confirmation prompt (for scripting).")
+
+    # analytics
+    p_envelope = sub.add_parser(
+        "envelope", parents=[common],
+        help="View or update a project's resource envelope (VM caps, spend ceilings).",
+        description="Per-project resource envelope management.",
+    )
+    envelope_sub = p_envelope.add_subparsers(dest="envelope_cmd")
+    envelope_sub.add_parser("show", parents=[common],
+                            help="Show the resource envelope and live usage.")
+    p_env_set = envelope_sub.add_parser("set", parents=[common],
+                                        help="Update resource envelope fields.")
+    p_env_set.add_argument("assignments", nargs="+", metavar="KEY=VALUE",
+                           help="Fields to update, e.g. max_concurrent_vms=4 spend_ceiling_usd=10.0")
+    p_env_set.add_argument("-y", "--yes", action="store_true",
+                           help="Skip confirmation prompt.")
+
+    p_analytics = sub.add_parser(
+        "analytics", parents=[common],
+        help="Pipeline analytics: cost, duration, pause-stats, failing-types.",
+        description="Analytics subcommands. Defaults to `cost` when no subcommand is given.")
+    analytics_sub = p_analytics.add_subparsers(dest="analytics_cmd")
+    p_analytics_cost = analytics_sub.add_parser("cost", parents=[common],
+                                                help="Task cost breakdown by type and direction.")
+    p_analytics_cost.add_argument("--window", default="1h",
+                                  choices=["15m", "30m", "1h", "2h", "3h", "6h", "12h", "24h", "all"],
+                                  help="Time window (default 1h).")
+    analytics_sub.add_parser("duration", parents=[common],
+                             help="Task duration stats (p50/p90 by type and scope).")
+    p_analytics_pause = analytics_sub.add_parser("pause-stats", parents=[common],
+                                                 help="Direction auto-pause/recovery stats.")
+    p_analytics_pause.add_argument("--hours", type=int, default=24,
+                                   help="Lookback window in hours (default 24).")
+    analytics_sub.add_parser("failing-types", parents=[common],
+                             help="Task types currently gated by high failure rate.")
+
     return parser
 
 
 _DISPATCH = {
     "status": cmd_status,
     "diagnostics": cmd_diagnostics,
+    "ops": cmd_ops,
     "tasks": cmd_tasks,
     "versions": cmd_versions,
+    "system": cmd_system,
+    "monitor": cmd_monitor,
+    "directions": cmd_directions,
+    "trials": cmd_trials,
+    "fleet": cmd_fleet,
     "promote-recover": cmd_promote_recover,
     "logs": cmd_logs,
+    "messages": cmd_messages,
+    "settings": cmd_settings,
+    "envelope": cmd_envelope,
+    "health": cmd_health,
+    "analytics": cmd_analytics,
+    "envelope": cmd_envelope,
 }
 
 

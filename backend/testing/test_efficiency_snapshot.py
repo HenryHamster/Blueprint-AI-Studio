@@ -25,6 +25,7 @@ from app.efficiency_snapshot import (
     LLM_TOKEN_PRICING,
     METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
+    SELF_REPAIR_MIN_ATTEMPTS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
     _compute_checkpoint_loss_rate,
     _compute_cold_start_breakdown_p50,
@@ -6055,3 +6056,89 @@ async def test_read_baseline_surfaces_llm_cost_attribution_breakdown(db_session)
         assert "captured_at" in entry
         assert "rework_share" in entry
         assert "total_llm_usd" in entry
+
+
+@pytest.mark.asyncio
+async def test_self_repair_drift_suppressed_below_min_attempts(db_session):
+    """drift_pct for self_repair_success_rate is None when the current snapshot
+    has fewer than SELF_REPAIR_MIN_ATTEMPTS repair attempts (rare-event gate).
+
+    A sufficiently-sampled window must still report the regression so the gate
+    does not hide real degradation — this test asserts BOTH sides.
+    """
+    # Pre-seed the baseline with a healthy rate (1.0) and plenty of attempts.
+    # Using a pre-seeded design_doc bypasses the 7-day task window so we can
+    # control the baseline independently of the tasks we add below.
+    baseline_fc = {
+        FORMAT_COMPLIANCE_KEY: {
+            "format_compliance_rate": 0.9,
+            SELF_REPAIR_SUCCESS_RATE_KEY: 1.0,
+            "repair_attempts": 50,
+            "repair_successes": 50,
+            "tasks_measured": 50,
+            "well_formed_tasks": 45,
+            "format_error_total": 5,
+            "by_schema": {},
+        }
+    }
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {"captured_at": "2026-01-01T00:00:00", **baseline_fc},
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00", **baseline_fc}],
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # --- Current window: below-MIN attempts (should suppress drift_pct) ---
+    # Add SELF_REPAIR_MIN_ATTEMPTS - 1 tasks so total attempts stay below gate.
+    for _ in range(SELF_REPAIR_MIN_ATTEMPTS - 1):
+        db_session.add(
+            _make_format_compliance_task(
+                project.id, errors=1, repair_attempts=1, repair_successes=0
+            )
+        )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    fc = drift[FORMAT_COMPLIANCE_KEY]
+    sr = fc[SELF_REPAIR_SUCCESS_RATE_KEY]
+    # Rate is computable but drift_pct must be suppressed (rare-event gate).
+    assert sr["current"] is not None, (
+        "self_repair_success_rate should still be computed"
+    )
+    assert sr["drift_pct"] is None, (
+        f"drift_pct must be None when repair_attempts ({SELF_REPAIR_MIN_ATTEMPTS - 1}) "
+        f"< SELF_REPAIR_MIN_ATTEMPTS ({SELF_REPAIR_MIN_ATTEMPTS})"
+    )
+
+    # --- Current window: at-or-above MIN attempts (must report regression) ---
+    # Add one more task to cross the threshold; it also fails repair → regression.
+    db_session.add(
+        _make_format_compliance_task(
+            project.id, errors=1, repair_attempts=1, repair_successes=0
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift2 = await read_baseline_with_drift(db_session, project.id)
+    fc2 = drift2[FORMAT_COMPLIANCE_KEY]
+    sr2 = fc2[SELF_REPAIR_SUCCESS_RATE_KEY]
+    assert fc2["repair_attempts"] == SELF_REPAIR_MIN_ATTEMPTS, (
+        "repair_attempts should be forwarded in the format_compliance block"
+    )
+    assert sr2["drift_pct"] is not None, (
+        "drift_pct must be reported once repair_attempts >= SELF_REPAIR_MIN_ATTEMPTS"
+    )
+    assert sr2["drift_pct"] < 0, (
+        "all-failures window must show a negative drift vs baseline=1.0"
+    )

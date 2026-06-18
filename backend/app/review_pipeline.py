@@ -1335,7 +1335,8 @@ async def _check_fix_mid_retry_defer(
                             Task.context,
                             Task.payloads,
                             Task.updated_at,
-                        raiseload=True,)
+                            raiseload=True,
+                        )
                     )
                     .where(
                         Task.project_id == source_task.project_id,
@@ -1776,9 +1777,9 @@ async def _spawn_pipeline_task(
         return (None, False)
 
     # Guard: don't spawn if PR was closed without merge.
-    _pr_closed = (orig_task is not None and (orig_task.context or {}).get("pr_closed_unmerged")) or (
-        (source_task.context or {}).get("pr_closed_unmerged")
-    )
+    _pr_closed = (
+        orig_task is not None and (orig_task.context or {}).get("pr_closed_unmerged")
+    ) or ((source_task.context or {}).get("pr_closed_unmerged"))
     if _pr_closed:
         logger.info(
             f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR closed without merge"
@@ -1794,7 +1795,10 @@ async def _spawn_pipeline_task(
 
             await _retire_lane(session, source_task.context or {})
         except Exception:  # noqa: BLE001
-            logger.debug("[PIPELINE] retire_chain_lane (pr_closed_unmerged) failed (non-critical)", exc_info=True)
+            logger.debug(
+                "[PIPELINE] retire_chain_lane (pr_closed_unmerged) failed (non-critical)",
+                exc_info=True,
+            )
         return (None, False)
 
     # ── verify_tests fast-path ──────────────────────────────────────────────
@@ -1935,6 +1939,24 @@ async def _spawn_pipeline_task(
                 orig_task.context = orig_ctx
                 flag_modified(orig_task, "context")
                 session.add(orig_task)
+            else:
+                # Fail-safe for unloadable original task: cannot track churn counter,
+                # so halt the spawn to prevent unbounded supersession. The counter is
+                # the only bound; we must stop when we can't record it.
+                logger.warning(
+                    f"[PIPELINE] Halting {task_type} spawn for PR #{pr_number} — "
+                    f"cannot track supersession churn (original task unloadable). "
+                    f"Superseding stale task {t.id} but cannot persist count."
+                )
+                await session.flush()
+                source_task.latest_status_message = (
+                    f"Review/fix spawn halted for PR #{pr_number}: original task "
+                    f"unloadable and supersession counter cannot be persisted. "
+                    f"Manual review required."
+                )
+                _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
+                session.add(source_task)
+                return (None, False)
             logger.warning(
                 f"[PIPELINE] Superseding stale {t_type} task {t.id} "
                 f"(last_heartbeat={t.last_heartbeat}, started_at={t.started_at}) "
@@ -1993,6 +2015,24 @@ async def _spawn_pipeline_task(
                 orig_task.context = orig_ctx
                 flag_modified(orig_task, "context")
                 session.add(orig_task)
+            else:
+                # Fail-safe for unloadable original task: cannot track churn counter,
+                # so halt the spawn to prevent unbounded supersession. The counter is
+                # the only bound; we must stop when we can't record it.
+                logger.warning(
+                    f"[PIPELINE] Halting {task_type} spawn for PR #{pr_number} — "
+                    f"cannot track supersession churn (original task unloadable). "
+                    f"Superseding review {t.id} but cannot persist count."
+                )
+                await session.flush()
+                source_task.latest_status_message = (
+                    f"Review/fix spawn halted for PR #{pr_number}: original task "
+                    f"unloadable and supersession counter cannot be persisted. "
+                    f"Manual review required."
+                )
+                _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
+                session.add(source_task)
+                return (None, False)
             logger.warning(
                 f"[PIPELINE] Cancelling in-flight review {t.id} on PR #{pr_number} "
                 f"so fix can proceed (review snapshot is stale)"
@@ -2190,7 +2230,8 @@ async def _spawn_pipeline_task(
                         # latest_status_message on the most-recent failed task; without
                         # this column the mutation crashes mid-cycle.
                         Task.status_log,
-                    raiseload=True,)
+                        raiseload=True,
+                    )
                 )
                 .where(
                     Task.project_id == source_task.project_id,
@@ -2747,6 +2788,13 @@ async def _spawn_pipeline_task(
 
     if task_type == "review":
         title = f"Review PR #{pr_number}"
+        # Forward viewport screenshots captured by the implementer so the
+        # independent reviewer can visually inspect before/after/diff PNGs.
+        _impl_shots: list = (
+            (orig.context or {}).get("viewport_screenshots", [])
+            if orig is not None
+            else []
+        )
         payload_data = {
             "type": "review",
             "pr_number": pr_number,
@@ -2758,6 +2806,14 @@ async def _spawn_pipeline_task(
             **({"hotfix": True} if orig_hotfix else {}),
             **({"model": type_model} if type_model else {}),
             **({"effort": type_effort} if type_effort else {}),
+            **(
+                {
+                    "viewport_shot_entries": _impl_shots,
+                    "viewport_source_task_id": resolved_original_id,
+                }
+                if _impl_shots
+                else {}
+            ),
         }
     else:
         title = f"Fix PR #{pr_number}"

@@ -1,4 +1,4 @@
-import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach } from 'vitest';
 
 // Mock the main agent runner so the handler's API + status helpers are stubbed,
 // while keeping the real strVal/sanitize implementations (we only override the
@@ -22,7 +22,7 @@ vi.mock('../index.js', async (importOriginal) => {
 import { handleComputeExperiment } from './compute-experiment.js';
 import { apiPost, apiGet, persistAndPostStatus } from '../index.js';
 import { ALL_AGENT_TASK_TYPES } from '../taskCapabilities.js';
-import { expectCalledWith, expectNotCalledWith } from '../utils/typed-mock-call.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 const TASK = { title: 'Compute experiment', description: '', context: {} };
 
@@ -213,95 +213,5 @@ describe('handleComputeExperiment', () => {
     expect(park.status).toBe('PARKED');
     const req = park.park_request as Record<string, unknown>;
     expect(req.deadline_seconds).toBe(600 + 600); // fallback: deadline + COMPUTE_PARK_GRACE_SECONDS
-  });
-});
-
-// ── handleComputeExperiment: VM-substrate analysis mode ──────────────────────
-// When the backend re-queues a compute_experiment with an analysis request
-// bundle on task.context (because it has no ANTHROPIC_API_KEY), the handler calls
-// the Anthropic Messages API directly (non-agentic, no subprocess), submits the
-// produced analysis to the backend for authoritative grounding, then posts the
-// honest completion using the backend-supplied COMPUTE_RESULT logs. It must NOT
-// launch a new job.
-describe('handleComputeExperiment — VM analysis mode', () => {
-  const RESULT_LOGS = JSON.stringify({ job_id: 'job-123', outcome: 'SUCCESS', final_cost_usd: 0.37 });
-  const ANALYSIS_TASK = {
-    title: 'Compute experiment',
-    description: '',
-    context: {
-      compute_vm_analysis_request: {
-        prompt: 'Analyze the durable artifacts and cite gs://bucket/bundle.tar.gz ...',
-        result_logs: RESULT_LOGS,
-      },
-    },
-  };
-  const ANALYSIS_DOC = {
-    title: 'VM analysis',
-    summary: 'Grounded summary citing the artifact bundle.',
-    body: '# Analysis\n\nThe run cleared the bar.',
-    source_citations: ['gs://bucket/bundle.tar.gz'],
-  };
-
-  beforeEach(() => {
-    process.env.ANTHROPIC_API_KEY = 'test-key';
-  });
-
-  afterEach(() => {
-    delete process.env.ANTHROPIC_API_KEY;
-    vi.unstubAllGlobals();
-  });
-
-  it('calls Anthropic API directly, submits the analysis, and completes — without launching a job', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({
-        content: [{
-          type: 'text',
-          text: 'Here is the analysis:\n```json\n' + JSON.stringify(ANALYSIS_DOC) + '\n```\n',
-        }],
-      }),
-    });
-    vi.stubGlobal('fetch', fetchMock);
-    vi.mocked(apiPost).mockResolvedValue({ status: 'success' });
-
-    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, ANALYSIS_TASK, '', 'o', 'r', null, { value: '' });
-
-    // The Anthropic Messages API was called directly (non-agentic, no runClaudeCode subprocess).
-    expect(fetchMock).toHaveBeenCalledWith(
-      'https://api.anthropic.com/v1/messages',
-      expect.objectContaining({ method: 'POST' }),
-    );
-    // No compute job was launched — this is the analysis leg, not the launch leg.
-    expectNotCalledWith(apiPost, '/api/agent/compute-jobs', expect.anything());
-    // The produced analysis was submitted to the backend grounding endpoint.
-    const submitCall = vi.mocked(apiPost).mock.calls.find((c) => c[0] === '/api/agent/compute-analysis');
-    if (!submitCall) throw new Error('expected a POST to /api/agent/compute-analysis');
-    const submitBody = submitCall[1] as Record<string, unknown>;
-    expect(submitBody.job_id).toBe('job-123');
-    const submittedAnalysis = submitBody.analysis as Record<string, unknown>;
-    expect(submittedAnalysis.summary).toBe('Grounded summary citing the artifact bundle.');
-    expect(submittedAnalysis.source_citations).toEqual(['gs://bucket/bundle.tar.gz']);
-    // The honest terminal completion carries the backend-authoritative logs.
-    const completion = lastCompletionPayload();
-    expect(completion.status).toBe('COMPLETED');
-    expect(completion.artifact_type).toBe('COMPUTE_RESULT');
-    expect(completion.logs as string).toContain('job-123');
-  });
-
-  it('still completes (no analysis submitted) when the API call fails', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: false,
-      status: 500,
-      text: () => Promise.resolve('Internal Server Error'),
-    }));
-
-    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, ANALYSIS_TASK, '', 'o', 'r', null, { value: '' });
-
-    // No submission when the model produced nothing usable.
-    expectNotCalledWith(apiPost, '/api/agent/compute-analysis', expect.anything());
-    // The honest completion still posts so the bounded retry can re-attempt.
-    const completion = lastCompletionPayload();
-    expect(completion.status).toBe('COMPLETED');
-    expect(completion.artifact_type).toBe('COMPUTE_RESULT');
   });
 });

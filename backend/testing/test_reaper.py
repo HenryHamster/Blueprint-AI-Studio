@@ -36,6 +36,10 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.reaper_evaluating_sweeps import (
+    _snap_all_terminal,
+    _snap_any_completed,
+)
 from app.reaper import (
     reaper_service,
     _copy_analysis_artifacts_to_previous,
@@ -358,6 +362,8 @@ async def reaper_db(mocker):
         expire_on_commit=False,
     )
     mocker.patch("app.reaper.AsyncSessionLocal", Session)
+    mocker.patch("app.reaper_halt.AsyncSessionLocal", Session)
+    mocker.patch("app.reaper_post_orphan_sweep.AsyncSessionLocal", Session)
 
     async with Session() as s:
         yield s
@@ -386,7 +392,7 @@ def reaper_side_effects(mocker):
     mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
-    mocker.patch("app.reaper._capture_serial_for_vm", return_value=None)
+    mocker.patch("app.reaper_orphan_io._capture_serial_for_vm", return_value=None)
     mocker.patch("app.reaper.record_zone_failure")
     # Disable infra-recovery resurrection so FAILED tasks stay FAILED where asserted.
     mocker.patch("app.reaper.any_zone_available", return_value=True)
@@ -2039,7 +2045,7 @@ async def test_general_exponential_backoff_capped_at_15_minutes(
             }
         },
     )
-    mocker.patch("app.reaper.random.uniform", return_value=1.0)
+    mocker.patch("app.time_utils.random.uniform", return_value=1.0)
 
     project = await _make_project(reaper_db)
     t = Task(
@@ -3812,18 +3818,70 @@ async def test_step5_idempotency_collision_with_parked_holder_skipped(
     assert parked_holder.status == TaskStatus.PARKED
 
 
+@pytest.mark.asyncio
+async def test_step5_resurrection_clears_failure_class(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Resurrection sweep clears stale failure_class so subsequent failures
+    are reclassified instead of short-circuited to the old verdict.
+
+    When a task is resurrected from an infra failure, both failure_category
+    AND failure_class must be cleared so the resurrected task's next failure
+    is properly classified via _classify_failure_class, not short-circuited
+    to the stale verdict. Without this fix, a CODE_ERROR on the resurrected
+    task would be misclassified as the old PROVISION_FAILURE."""
+    project = await _make_project(reaper_db)
+
+    # Create a FAILED task with a stale infra failure_class that will be
+    # short-circuited by _classify_failure_class if not cleared.
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        attempt_count=4,
+        context={
+            "failure_category": "PROVISION_FAILURE",
+            "failure_class": "PROVISION_FAILURE",
+            "provision_failures": 3,
+            "provision_failures_infra": 2,
+            "_infra_wait": True,
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    # Resurrect via the infra-recovery sweep.
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+
+    # Verify resurrection occurred.
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 0
+    assert ctx.get("_resurrection_count") == 1
+
+    # Verify BOTH failure_class AND failure_category are cleared
+    # so the next failure is properly reclassified.
+    assert "failure_class" not in ctx, "failure_class must be cleared on resurrection"
+    assert "failure_category" not in ctx, (
+        "failure_category must be cleared on resurrection"
+    )
+
+
 # ── Dependent-task unblocking on terminal failure ────────────────────────
 
 
 def _install_dep_unblock_compat(mocker, blocked_id_str: str):
-    """Replace app.reaper.AsyncSessionLocal with a smart factory that routes
-    the dep-unblock session through a Python-level filter (SQLite lacks the
-    JSONB @> operator used by Task.depends_on.contains(...)). The first call
-    (main reaper session) returns the underlying session unchanged; every
-    subsequent call returns a proxy that rewrites the dep-unblock query."""
-    import app.reaper as _reaper_mod
+    """Replace app.reaper_post_orphan_sweep.AsyncSessionLocal with a proxy
+    factory that routes the dep-unblock session through a Python-level filter
+    (SQLite lacks the JSONB @> operator used by Task.depends_on.contains(...)).
+    The dep-unblocking logic was extracted to reaper_post_orphan_sweep.py and
+    opens its own session via AsyncSessionLocal() — every call through that
+    module returns a proxy that rewrites the dep-unblock query."""
+    import app.reaper_post_orphan_sweep as _post_sweep_mod
 
-    real_asl = _reaper_mod.AsyncSessionLocal
+    real_asl = _post_sweep_mod.AsyncSessionLocal
     call_count = {"n": 0}
 
     class _DepSessionProxy:
@@ -3865,11 +3923,11 @@ def _install_dep_unblock_compat(mocker, blocked_id_str: str):
         def __call__(self):
             call_count["n"] += 1
             inner = real_asl()
-            if call_count["n"] == 1:
-                return inner
+            # All calls in reaper_post_orphan_sweep are dep-unblock or
+            # safeguard sessions — always return the proxy.
             return _DepSessionProxy(inner)
 
-    mocker.patch("app.reaper.AsyncSessionLocal", _SmartASL())
+    mocker.patch("app.reaper_post_orphan_sweep.AsyncSessionLocal", _SmartASL())
     return call_count
 
 
@@ -4057,8 +4115,10 @@ async def test_dep_unblocking_skipped_when_task_is_retried_not_failed(
     assert retrying.status == TaskStatus.QUEUED
     assert retrying.attempt_count == 1
     assert waiting.depends_on == [str(retrying.id)]
-    # Only the main reaper session should have opened — never the dep-session.
-    assert call_tracker["n"] == 1
+    # No dep-unblock session should open — the tracker only counts
+    # reaper_post_orphan_sweep.AsyncSessionLocal calls (dep-unblock + safeguard),
+    # neither of which fires for a retried (non-terminal) task.
+    assert call_tracker["n"] == 0
 
 
 def test_resolve_retry_budget_external_api_scope_aware():
@@ -5040,8 +5100,9 @@ async def test_serial_log_survives_requeue_via_context_copy(
     """last_serial_log set from a previous cycle must survive the requeue
     context copy — clear_task_llm_runtime_context must not strip it."""
     # Serial capture returns None this cycle (VM is gone), but previous cycle
-    # wrote a log into task.context already.
-    mocker.patch("app.reaper._capture_serial_for_vm", return_value=None)
+    # wrote a log into task.context already. reaper_side_effects already patches
+    # app.reaper_orphan_io._capture_serial_for_vm to return None; we only need to
+    # suppress the zone lookup in reaper.py's provision-failure path.
     mocker.patch("app.reaper.get_vm_zone", return_value=None)
 
     project = await _make_project(reaper_db)
@@ -7276,6 +7337,15 @@ async def test_relock_orphan_no_cutoff_does_not_consult_vm_contact(reaper_db):
         "must be preserved (Fix 3a)"
     )
     assert relocked.id == t.id
+
+
+def test_relock_orphan_task_re_export_identity():
+    """app.reaper._relock_orphan_task must be the same object as
+    app.reaper_relock._relock_orphan_task (re-export points at the moved definition)."""
+    import app.reaper as _reaper_mod
+    import app.reaper_relock as _reaper_relock_mod
+
+    assert _reaper_mod._relock_orphan_task is _reaper_relock_mod._relock_orphan_task
 
 
 # ── Per-cycle orphan-loop wall-time budget (FIX c) ──────────────────────────
@@ -12672,12 +12742,14 @@ async def test_event_driven_unblock_fail_open(reaper_db, mocker, monkeypatch):
     )
 
     # Inject a failure into _classify_blocker_needs to simulate an unexpected error.
-    import app.reaper_sweeps as _rs_mod
+    # Patch the module where the function is defined (blocked_task_unblock_sweeps)
+    # since _event_driven_unblock_project references it as a module-local there.
+    import app.blocked_task_unblock_sweeps as _btu_mod
 
     async def _raise(*args, **kwargs):
         raise RuntimeError("simulated classification error")
 
-    monkeypatch.setattr(_rs_mod, "_classify_blocker_needs", _raise)
+    monkeypatch.setattr(_btu_mod, "_classify_blocker_needs", _raise)
 
     # Must not raise; must return 0.
     result = await event_driven_unblock_dependents(foundation, reaper_db)
@@ -14203,3 +14275,425 @@ def test_extracted_sweeps_reexported_from_reaper_sweeps():
             f"app.reaper_bug_message_sweeps.{name} — the re-export is a "
             "stale copy, not a live reference to the sub-module symbol"
         )
+
+
+def test_blocked_unblock_helpers_reexport_identity():
+    """Helpers extracted to blocked_task_unblock_sweeps must remain importable from
+    app.reaper_sweeps and resolve to the SAME objects (identity check), so every
+    existing import site keeps working without change.
+    """
+    import app.blocked_task_unblock_sweeps as _sub
+    import app.reaper_sweeps as _rs
+
+    helper_names = [
+        "_apply_needs_disposition",
+        "_blocked_precondition_state",
+        "_cancel_blocker_as_dead",
+        "_classify_blocker_needs",
+        "_clear_blocked_fields",
+        "_fetch_active_candidates",
+        "_fetch_completed_candidates",
+        "_fetch_dead_candidates",
+        "_fetch_knowledge_substance_index",
+        "_fetch_working_capability_names",
+        "_next_recheck_delay",
+        "_partition_completed_needs_base_safe",
+        "_persist_residual_needs",
+        "_wire_edges",
+    ]
+    for name in helper_names:
+        assert hasattr(_rs, name), (
+            f"app.reaper_sweeps is missing re-export '{name}' — "
+            "callers that import it from reaper_sweeps will break"
+        )
+        assert hasattr(_sub, name), (
+            f"app.blocked_task_unblock_sweeps is missing '{name}'"
+        )
+        rs_obj = getattr(_rs, name)
+        sub_obj = getattr(_sub, name)
+        assert rs_obj is sub_obj, (
+            f"app.reaper_sweeps.{name} is NOT the same object as "
+            f"app.blocked_task_unblock_sweeps.{name} — the re-export is a "
+            "stale copy, not a live reference to the sub-module symbol"
+        )
+
+
+# ── _apply_rollup_merge_classification helper ────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_rollup_merge",
+    [True, False],
+    ids=["terminal", "non-terminal"],
+)
+async def test_apply_rollup_merge_classification_hotfix_lane_bool(
+    terminal_rollup_merge, mocker
+):
+    """hotfix_lane=False → apply_merged_landed_signal called when record_merged;
+    task.status, vm_instance_id, last_heartbeat, and message set correctly."""
+    import app.services  # noqa: F401 — prime circular-import chain before importing helpers
+    from app.recovery_evaluating_helpers import _apply_rollup_merge_classification
+    from app.models import Task, TaskStatus
+
+    task = Task(
+        status=TaskStatus.EVALUATING,
+        context={"some_key": "value"},
+        vm_instance_id="vm-old",
+        last_heartbeat=datetime(2026, 1, 1),
+    )
+    task.payloads = [{"type": "create", "hotfix": False}]
+
+    mock_classify = mocker.patch(
+        "app.branch_resolution.classify_rollup_merge_outcome",
+        new_callable=AsyncMock,
+        return_value=(True, terminal_rollup_merge, "main"),
+    )
+    mock_apply = mocker.patch(
+        "app.landed_signal.apply_merged_landed_signal",
+        return_value=True,
+    )
+    mocker.patch(
+        "app.landed_signal.mark_landed_on_integration",
+    )
+
+    mock_proj = object()
+    mock_session = AsyncMock()
+    ctx_override = {"staged": True}
+
+    record_merged, terminal, landed = await _apply_rollup_merge_classification(
+        task,
+        mock_proj,
+        mock_session,
+        pr_number=42,
+        merged_base_branch="main",
+        source="test",
+        msg_terminal="PR merged out-of-band",
+        msg_non_terminal="PR merged into {landed}; awaiting downstream landing",
+        hotfix_lane=False,
+        ctx_override=ctx_override,
+        non_merge_reason="merged_pr_non_integration_branch",
+    )
+
+    assert record_merged is True
+    assert terminal is terminal_rollup_merge
+    assert landed == "main"
+
+    assert task.status == (
+        TaskStatus.COMPLETED if terminal_rollup_merge else TaskStatus.EVALUATING
+    )
+    assert task.vm_instance_id is None
+    assert task.last_heartbeat is None
+    if terminal_rollup_merge:
+        assert task.latest_status_message == "PR merged out-of-band"
+    else:
+        assert (
+            task.latest_status_message
+            == "PR merged into main; awaiting downstream landing"
+        )
+
+    mock_classify.assert_awaited_once_with(
+        task,
+        mock_proj,
+        mock_session,
+        pr_number=42,
+        merged_base_branch="main",
+        source="test",
+    )
+    mock_apply.assert_called_once_with(
+        task,
+        mock_proj,
+        base_branch="main",
+        hotfix_lane=False,
+        non_merge_reason="merged_pr_non_integration_branch",
+    )
+    assert task.context is ctx_override
+
+
+@pytest.mark.asyncio
+async def test_apply_rollup_merge_classification_no_signal_when_not_record_merged(
+    mocker,
+):
+    """When record_merged=False, neither apply_merged_landed_signal nor
+    mark_landed_on_integration is called."""
+    import app.services  # noqa: F401 — prime circular-import chain before importing helpers
+    from app.recovery_evaluating_helpers import _apply_rollup_merge_classification
+    from app.models import Task, TaskStatus
+
+    task = Task(status=TaskStatus.EVALUATING)
+    task.payloads = [{"type": "create"}]
+
+    mocker.patch(
+        "app.branch_resolution.classify_rollup_merge_outcome",
+        new_callable=AsyncMock,
+        return_value=(False, True, "main"),
+    )
+    mock_apply = mocker.patch("app.landed_signal.apply_merged_landed_signal")
+    mock_mark = mocker.patch("app.landed_signal.mark_landed_on_integration")
+
+    record_merged, terminal, landed = await _apply_rollup_merge_classification(
+        task,
+        object(),
+        AsyncMock(),
+        pr_number=7,
+        merged_base_branch="main",
+        source="test",
+        msg_terminal="done",
+        msg_non_terminal="pending {landed}",
+        hotfix_lane=False,
+    )
+
+    assert record_merged is False
+    assert terminal is True
+    mock_apply.assert_not_called()
+    mock_mark.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_rollup_merge_classification_hotfix_lane_none_routes_mark_landed(
+    mocker,
+):
+    """hotfix_lane=None → mark_landed_on_integration called; apply_merged_landed_signal skipped."""
+    import app.services  # noqa: F401 — prime circular-import chain before importing helpers
+    from app.recovery_evaluating_helpers import _apply_rollup_merge_classification
+    from app.models import Task, TaskStatus
+
+    task = Task(status=TaskStatus.EVALUATING, context={"rollup_pr_number": 5})
+    task.payloads = [{"type": "create"}]
+
+    mocker.patch(
+        "app.branch_resolution.classify_rollup_merge_outcome",
+        new_callable=AsyncMock,
+        return_value=(True, True, "automain"),
+    )
+    mock_apply = mocker.patch("app.landed_signal.apply_merged_landed_signal")
+    mock_mark = mocker.patch("app.landed_signal.mark_landed_on_integration")
+
+    record_merged, terminal, landed = await _apply_rollup_merge_classification(
+        task,
+        object(),
+        AsyncMock(),
+        pr_number=5,
+        merged_base_branch="automain",
+        source="recovery_sweeps.lost_marker",
+        msg_terminal="✓ rollup PR #5 already merged to {landed}; converged",
+        msg_non_terminal="Lost-marker: merged into {landed}; awaiting",
+        hotfix_lane=None,
+    )
+
+    assert record_merged is True
+    assert terminal is True
+    assert landed == "automain"
+    assert task.status == TaskStatus.COMPLETED
+    assert task.vm_instance_id is None
+    assert task.last_heartbeat is None
+    assert (
+        task.latest_status_message
+        == "✓ rollup PR #5 already merged to automain; converged"
+    )
+    mock_apply.assert_not_called()
+    mock_mark.assert_called_once_with(task)
+
+
+def test_apply_rollup_merge_classification_reexported_from_recovery_evaluating():
+    """_apply_rollup_merge_classification must be importable from recovery_evaluating
+    so existing patch targets continue to work."""
+    import app.services  # noqa: F401 — prime circular-import chain
+    import app.recovery_evaluating as _re
+
+    assert hasattr(_re, "_apply_rollup_merge_classification"), (
+        "app.recovery_evaluating must re-export _apply_rollup_merge_classification"
+    )
+
+
+def test_recover_orphaned_tasks_reexported_from_recovery_post_commit():
+    """_recover_orphaned_tasks must be importable from recovery_post_commit and
+    recovery_post_commit_orphans, and both must resolve to the same callable."""
+    import app.services  # noqa: F401 — prime circular-import chain
+    import app.recovery_post_commit as _rpc
+    import app.recovery_post_commit_orphans as _rpo
+
+    assert callable(_rpc._recover_orphaned_tasks), (
+        "app.recovery_post_commit must re-export _recover_orphaned_tasks"
+    )
+    assert _rpc._recover_orphaned_tasks is _rpo._recover_orphaned_tasks, (
+        "re-export must be the same object as the canonical definition"
+    )
+    assert callable(_rpc._spawn_review_for_recovered_task), (
+        "app.recovery_post_commit must re-export _spawn_review_for_recovered_task"
+    )
+    assert (
+        _rpc._spawn_review_for_recovered_task is _rpo._spawn_review_for_recovered_task
+    ), "re-export must be the same object as the canonical definition"
+
+
+@pytest.mark.asyncio
+async def test_recover_orphaned_tasks_skips_non_write_type(reaper_db, mocker):
+    """_recover_orphaned_tasks must skip candidates whose task type is not in
+    WRITE_TASK_TYPES — no GitHub token fetch should occur for research tasks."""
+    from app.models import Task, TaskStatus, Project
+    from app.recovery_post_commit_orphans import _recover_orphaned_tasks
+
+    project = Project(
+        name="orphan-test-proj",
+        user_id="user1",
+        github_repo="owner/repo",
+        github_installation_id="inst-1",
+    )
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    now = _utcnow()
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        description="research task",
+        payloads=[{"type": "research", "prompt": "investigate something"}],
+        created_at=now - timedelta(minutes=10),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+
+    mock_get_token = mocker.AsyncMock(return_value=("gh_token", "owner", "repo"))
+    mocker.patch("app.routers.agent.get_github_token_for_task", mock_get_token)
+
+    await _recover_orphaned_tasks()
+
+    # research type is not in WRITE_TASK_TYPES — no GitHub lookup should occur
+    mock_get_token.assert_not_called()
+
+
+def test_unblock_sweep_entrypoints_reexport_identity():
+    """The four moved sweep entry points accessed via reaper_sweeps ARE the same
+    objects as in blocked_task_unblock_sweeps (not copies or re-definitions)."""
+    import app.reaper_sweeps as rs
+    import app.blocked_task_unblock_sweeps as btu
+
+    assert rs.sweep_unblock_blocked_tasks is btu.sweep_unblock_blocked_tasks
+    assert rs._event_driven_unblock_project is btu._event_driven_unblock_project
+    assert rs.event_driven_unblock_dependents is btu.event_driven_unblock_dependents
+    assert rs.event_driven_unblock_on_knowledge is btu.event_driven_unblock_on_knowledge
+
+
+def test_snap_all_terminal_and_snap_any_completed():
+    """Unit test for _snap_all_terminal and _snap_any_completed helpers."""
+    import uuid
+    from app.models import TaskStatus
+
+    tid = uuid.uuid4()
+    snap_empty = []
+    snap_all_done = [
+        (tid, TaskStatus.FAILED, {}),
+        (uuid.uuid4(), TaskStatus.CANCELLED, {}),
+    ]
+    snap_with_completed = [
+        (tid, TaskStatus.COMPLETED, {}),
+        (uuid.uuid4(), TaskStatus.FAILED, {}),
+    ]
+    snap_running = [
+        (tid, TaskStatus.IN_PROGRESS, {}),
+        (uuid.uuid4(), TaskStatus.FAILED, {}),
+    ]
+
+    # empty snapshot: vacuously all-terminal, none completed
+    assert _snap_all_terminal(snap_empty) is True
+    assert _snap_any_completed(snap_empty) is False
+
+    # all terminal, none completed
+    assert _snap_all_terminal(snap_all_done) is True
+    assert _snap_any_completed(snap_all_done) is False
+
+    # has a completed child
+    assert _snap_all_terminal(snap_with_completed) is True
+    assert _snap_any_completed(snap_with_completed) is True
+
+    # one child still running
+    assert _snap_all_terminal(snap_running) is False
+    assert _snap_any_completed(snap_running) is False
+
+
+# ── _run_orphan_io / OrphanIoSnapshot ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_orphan_external_io_gather_result_bundle(mocker):
+    """_run_orphan_io() bundles all four external I/O calls into an
+    OrphanIoSnapshot with the correct field values.
+
+    Acceptance gate: exercises the extracted production function, not just
+    the dataclass — verifies PR-state lookup and spot-preemption outcomes
+    are wired into the returned snapshot.
+    """
+    from app.reaper_orphan_io import OrphanIoSnapshot, _run_orphan_io
+    from datetime import datetime, timezone
+
+    # ── task / fresh_task stubs ──────────────────────────────────────────
+    class _Task:
+        id = "task-abc"
+        project_id = "proj-1"
+        context = {}
+        first_payload = {"type": "create"}
+        vm_instance_id = None
+        vm_spot = False
+        last_heartbeat = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        started_at = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
+        status = "IN_PROGRESS"
+
+    task = _Task()
+    fresh_task = _Task()
+
+    # ── mock the DB-backed PR artifact check (no PR) ─────────────────────
+    mocker.patch(
+        "app.reaper_orphan_io._task_has_open_pr",
+        new=AsyncMock(return_value=(False, None)),
+    )
+
+    # ── mock the max_plan_pool deferred imports ───────────────────────────
+    mocker.patch(
+        "app.max_plan_pool.db_account_was_rate_limited",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.max_plan_pool.db_pool_wide_rate_limit_cooldown",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.max_plan_pool.get_task_llm_account_id",
+        return_value=None,
+    )
+    mocker.patch(
+        "app.max_plan_pool.get_task_rate_limit_scope",
+        return_value={},
+    )
+
+    session = object()  # not used for real DB calls in this path
+
+    snapshot = await _run_orphan_io(
+        task=task,
+        fresh_task=fresh_task,
+        reap_reason_code="heartbeat_timeout_post_claim",
+        is_provision_failure=False,
+        is_rate_limited=False,
+        is_dead_auth=False,
+        session=session,
+        runtime_config={},
+    )
+
+    assert isinstance(snapshot, OrphanIoSnapshot)
+    # Pre-IO status captured from fresh_task before any external call
+    assert snapshot.pre_io_status == "IN_PROGRESS"
+    assert snapshot.pre_io_last_hb == fresh_task.last_heartbeat
+    # No spot VM, no preemption
+    assert snapshot.is_spot_preemption is False
+    # No rate-limit signal — remains False
+    assert snapshot.is_rate_limited is False
+    # No PR artifact — GH lookup skipped
+    assert snapshot.has_pr_artifact is False
+    assert snapshot.pr_num is None
+    assert snapshot.gh_pr_state is None
+    assert snapshot.gh_pr_merged is False
+    # No provision failure — serial capture skipped
+    assert snapshot.io_serial_log is None
+    assert snapshot.io_prov_zone is None

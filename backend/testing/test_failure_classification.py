@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.failure_classification import (
+    ADMIN_CANCEL,
     AGENT_ERROR_REPORT_CONTEXT_KEY,
     AGENT_TIMEOUT,
     ALL_FAILURE_CLASSES,
@@ -430,13 +431,13 @@ class TestStuckLlmCallReclassifiedToRateLimit:
 
     def test_cancellation_with_zero_output_not_reclassified(self):
         # A deliberate orchestration cancellation also has 0 output tokens but is
-        # NOT a provider hang — it lacks an execution-stall signature, so it must
-        # stay AGENT_TIMEOUT (proves the reclassification is narrowly scoped).
+        # NOT a provider hang — it lacks an execution-stall signature and routes to
+        # ADMIN_CANCEL, not RATE_LIMIT (proves the reclassification is narrowly scoped).
         t = self._stalled(
             "Cancelled: dependency task failed",
             {"llm_call_count": 1, "total_input_tokens": 0, "total_output_tokens": 0},
         )
-        assert classify_failure(t) == AGENT_TIMEOUT
+        assert classify_failure(t) == ADMIN_CANCEL
 
     def test_missing_summary_stays_agent_timeout(self):
         t = _task("Fatal error: Claude Code exceeded 45-minute time limit")
@@ -1144,6 +1145,28 @@ class TestClassifyFailureViewportGateInfra:
             == PROVISION_FAILURE
         )
 
+    def test_failed_viewport_task_records_viewport_fingerprint(self):
+        """FAILED task with viewport pattern populates _viewport_residual_store."""
+        import app.failure_residual as fr
+        from app.failure_residual import get_top_viewport_residual_fingerprints
+        from app.models import TaskStatus
+
+        fr._viewport_residual_store.clear()
+        fr._viewport_residual_seen_task_ids.clear()
+
+        t = MagicMock(spec=Task)
+        t.latest_status_message = "expectnooverflowat( failed at 375px"
+        t.context = {}
+        t.id = "task-vp-record-classify"
+        t.project_id = None
+        t.status = TaskStatus.FAILED
+
+        result = classify_failure(t)
+        assert result == VIEWPORT_REGRESSION
+
+        results = get_top_viewport_residual_fingerprints()
+        assert any("task-vp-record-classify" in r["task_ids"] for r in results)
+
 
 class TestClassifyFailureProvision:
     @pytest.mark.parametrize(
@@ -1203,9 +1226,6 @@ class TestClassifyFailureAgentTimeout:
             "backstop timeout fired",
             "waiting on dependency PR",
             "Waiting: serializing migration — task 7af4d393 is already producing a migration in this project",
-            "Cancelled: parent evaluation timeout",
-            "Cancelled: some new orchestrator reason",
-            "Superseded by fix on PR #1234",
         ],
     )
     def test_timeout_keywords(self, msg):
@@ -1240,9 +1260,39 @@ class TestClassifyFailureAgentTimeout:
         assert classify_failure(_task(msg)) == AGENT_TIMEOUT
 
     def test_cascade_beats_code_error_default(self):
-        """A 'Cancelled:' prefix routes to AGENT_TIMEOUT even if tail looks like code."""
+        """A 'Cancelled:' prefix routes to ADMIN_CANCEL even if tail looks like code."""
         msg = "Cancelled: AssertionError in downstream"
-        assert classify_failure(_task(msg)) == AGENT_TIMEOUT
+        assert classify_failure(_task(msg)) == ADMIN_CANCEL
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "Cancelled: dependency task failed",
+            "Cancelled: parent dependency failed",
+            "Cancelled: parent evaluation timeout",
+            "Cancelled: AssertionError in downstream",
+        ],
+    )
+    def test_cancelled_prefix_routes_to_admin_cancel(self, msg):
+        """Tasks cancelled by orchestrator route to ADMIN_CANCEL, not AGENT_TIMEOUT."""
+        assert classify_failure(_task(msg)) == ADMIN_CANCEL
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "Superseded by fix on PR #42",
+            "superseded by newer revision",
+        ],
+    )
+    def test_superseded_routes_to_admin_cancel(self, msg):
+        """System-initiated supersession routes to ADMIN_CANCEL, not AGENT_TIMEOUT."""
+        assert classify_failure(_task(msg)) == ADMIN_CANCEL
+
+    def test_admin_cancel_in_infra_classes(self):
+        """ADMIN_CANCEL must be budget-exempt (in INFRA_CLASSES)."""
+        from app.failure_classification import INFRA_CLASSES
+
+        assert ADMIN_CANCEL in INFRA_CLASSES
 
 
 class TestClassifyFailureExternalApi:
@@ -3322,6 +3372,78 @@ class TestRedactCredentials:
 
         text = "No credentials here, just a normal error message."
         assert _redact_credentials(text) == text
+
+    # ── AWS IAM access keys ──────────────────────────────────────────────────
+
+    def test_aws_iam_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE")
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+        assert "AKIA***" in out
+
+    def test_aws_iam_key_too_short_not_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        # 15 chars after AKIA — one short of the required 16
+        out = _redact_credentials("AKIA123456789AB")
+        assert "AKIA123456789AB" in out
+
+    # ── Stripe keys ──────────────────────────────────────────────────────────
+
+    def test_stripe_live_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("STRIPE_SECRET=sk_live_abcdef123456")
+        assert "sk_live_abcdef123456" not in out
+        assert "sk_live_***" in out
+
+    def test_stripe_test_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("STRIPE_SECRET=sk_test_abcdef123456")
+        assert "sk_test_abcdef123456" not in out
+        assert "sk_test_***" in out
+
+    def test_stripe_restricted_key_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("key=rk_live_abcdef123456")
+        assert "rk_live_abcdef123456" not in out
+        assert "rk_live_***" in out
+
+    def test_stripe_webhook_secret_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials("WEBHOOK_SECRET=whsec_abcdef123456")
+        assert "whsec_abcdef123456" not in out
+        assert "whsec_***" in out
+
+    # ── Database DSNs with embedded credentials ──────────────────────────────
+
+    def test_postgresql_url_credentials_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        dsn = "postgresql://dbuser:s3cr3t@db.host/mydb"
+        out = _redact_credentials(dsn)
+        assert "s3cr3t" not in out
+        assert "postgresql://***:***@db.host/mydb" in out
+
+    def test_postgres_alias_url_credentials_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        dsn = "postgres://dbuser:s3cr3t@db.host/mydb"
+        out = _redact_credentials(dsn)
+        assert "s3cr3t" not in out
+        assert "postgres://***:***@db.host/mydb" in out
+
+    def test_postgresql_asyncpg_url_credentials_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        dsn = "postgresql+asyncpg://dbuser:s3cr3t@db.host/mydb"
+        out = _redact_credentials(dsn)
+        assert "s3cr3t" not in out
+        assert "postgresql://***:***@db.host/mydb" in out
 
     # ── Multiple patterns in one string ─────────────────────────────────────
 

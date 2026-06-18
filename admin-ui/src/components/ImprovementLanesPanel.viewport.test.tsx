@@ -11,6 +11,7 @@ import {
 vi.mock('../api', () => ({
   drainLanePilot: vi.fn(),
   fetchLanePilotPreflight: vi.fn(async () => null),
+  fetchImprovementLaneDetail: vi.fn(async () => ({ id: 'lane-1', checkpoints: [], manifest: {}, current_task: null })),
   fetchImprovementLanes: vi.fn(async () => ({
     total: 2,
     lanes: [

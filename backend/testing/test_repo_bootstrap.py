@@ -3498,3 +3498,102 @@ class TestRepoDomainKnowledgeDocument:
             "none-found source must produce empty citations"
         )
         assert "No documentation found" in doc.body
+
+
+class DomainOverviewClaimInjectionTest:
+    """Verify that claim_task injects domain_overview when a KnowledgeDocument exists."""
+
+    _VALID_OVERVIEW = {
+        "tech_stack": "Python, FastAPI",
+        "directory_layout": "backend/ — FastAPI app",
+        "first_steps_summary": "pip install && pytest",
+    }
+
+    async def _make_project_with_task(self, db_session, *, task_type="create"):
+        project = Project(
+            name=f"acme/claim-domain-{uuid.uuid4().hex[:8]}",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="claim-domain-test",
+            build_config={"language": "python"},
+            integration_branch="main",
+            design_doc={"repo_overview": self._VALID_OVERVIEW},
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        vm_id = f"agent-vm-{uuid.uuid4().hex}"
+        task = Task(
+            project_id=project.id,
+            title="Create: add feature",
+            description="add a feature",
+            payloads=[{"type": task_type, "prompt": "Add a feature"}],
+            vm_instance_id=vm_id,
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(task)
+        return project, task, vm_id
+
+    @pytest.mark.asyncio
+    async def test_claim_injects_domain_overview_when_doc_exists(
+        self, client: AsyncClient, db_session
+    ):
+        """Claim response includes domain_overview when a domain KnowledgeDocument exists."""
+        project, task, vm_id = await self._make_project_with_task(db_session)
+
+        source_task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/claim-domain-test",
+            description="bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(source_task)
+        await db_session.flush()
+
+        doc = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=source_task.id,
+            source_kind=SourceKind.REPO_DOMAIN.value,
+            title="acme/claim-domain-test — Product Domain Knowledge",
+            summary="A platform that helps teams ship software faster.",
+            body="## Product Purpose\nA platform that helps teams ship software faster.",
+            topic="domain-knowledge",
+        )
+        db_session.add(doc)
+        await db_session.commit()
+
+        token = create_agent_token(str(task.id), vm_id)
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "domain_overview" in body, (
+            f"Expected domain_overview in claim response, got keys: {list(body.keys())}"
+        )
+        domain = body["domain_overview"]
+        assert "summary" in domain
+        assert "body" in domain
+        assert "A platform that helps teams ship software faster" in domain["summary"]
+        assert "Product Purpose" in domain["body"]
+
+    @pytest.mark.asyncio
+    async def test_claim_omits_domain_overview_when_no_doc(
+        self, client: AsyncClient, db_session
+    ):
+        """Claim response omits domain_overview when no KnowledgeDocument exists."""
+        project, task, vm_id = await self._make_project_with_task(db_session)
+
+        token = create_agent_token(str(task.id), vm_id)
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "domain_overview" not in body, (
+            "domain_overview must be absent when no KnowledgeDocument exists"
+        )

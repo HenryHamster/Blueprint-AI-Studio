@@ -29,6 +29,7 @@ from app.models import (
     ProjectStatus,
     ReleaseDeployArtifact,
     ReleaseVersion,
+    SourceKind,
     Task,
     TaskStatus,
     TaskWakeRegistration,
@@ -2443,6 +2444,151 @@ async def test_agent_claim_omits_repo_overview_for_non_repo_context_tasks(
 
     assert resp.status_code == 200
     assert "repo_overview" not in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_includes_domain_overview_for_repo_reading_tasks(
+    client: AsyncClient, db_session
+):
+    """Claim response includes domain_overview when a REPO_DOMAIN KnowledgeDocument exists."""
+    project = Project(
+        name="Domain Overview Test",
+        user_id="test-user-domain-1",
+        github_owner="acme",
+        github_repo="myapp",
+        build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
+        design_doc=_valid_repo_overview_doc(),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "repo_bootstrap", "prompt": "bootstrap"}],
+        vm_instance_id="agent-vm-domain-source-1",
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    long_body = "A" * 2000
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task.id,
+        title="Domain Overview",
+        summary="This is the domain summary.",
+        body=long_body,
+        source_kind=SourceKind.REPO_DOMAIN.value,
+        topic="domain-knowledge",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add a feature"}],
+        vm_instance_id="agent-vm-domain-claim-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-domain-claim-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "domain_overview" in data
+    dov = data["domain_overview"]
+    assert dov["summary"] == "This is the domain summary."
+    assert dov["body"] == long_body
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_omits_domain_overview_when_absent(
+    client: AsyncClient, db_session
+):
+    """Claim response omits domain_overview when no REPO_DOMAIN KnowledgeDocument exists."""
+    project = Project(
+        name="No Domain Overview Test",
+        user_id="test-user-domain-2",
+        build_config={},
+        design_doc=_valid_repo_overview_doc(),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add a feature"}],
+        vm_instance_id="agent-vm-no-domain-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-domain-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "domain_overview" not in resp.json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", ["repo_bootstrap", "web_research"])
+async def test_agent_claim_omits_domain_overview_for_non_repo_context_tasks(
+    client: AsyncClient, db_session, task_type
+):
+    """Claim response omits domain_overview for task types outside _REPO_OVERVIEW_TASK_TYPES."""
+    project = Project(
+        name="Non-Repo Domain Overview Test",
+        user_id="test-user-domain-3",
+        github_owner="acme",
+        github_repo="myapp",
+        build_config={"bootstrap_completed_at": "2026-01-15T10:00:00Z"},
+        design_doc=_valid_repo_overview_doc(),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "repo_bootstrap", "prompt": "bootstrap"}],
+        vm_instance_id=f"agent-vm-domain-source-excl-{task_type}",
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task.id,
+        title="Domain Overview",
+        summary="Domain summary.",
+        body="Domain body.",
+        source_kind=SourceKind.REPO_DOMAIN.value,
+        topic="domain-knowledge",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": task_type, "prompt": "some prompt"}],
+        vm_instance_id=f"agent-vm-domain-excl-{task_type}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), f"agent-vm-domain-excl-{task_type}")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert "domain_overview" not in resp.json()
 
 
 @pytest.mark.asyncio
@@ -19128,7 +19274,9 @@ async def test_viewport_screenshot_upload_url_cap_enforced(
 
 
 @pytest.mark.asyncio
-async def test_viewport_shots_download_url(client: AsyncClient, db_session, mocker):
+async def test_viewport_shots_download_url(
+    unauthenticated_client: AsyncClient, db_session, mocker
+):
     """Admin download endpoint redirects to a signed GCS URL (unauthenticated, 302)."""
     project = Project(name="VP Shot Download Test", user_id="user-vpshot-dl-001")
     db_session.add(project)
@@ -19145,7 +19293,7 @@ async def test_viewport_shots_download_url(client: AsyncClient, db_session, mock
         new=AsyncMock(return_value=fake_url),
     )
 
-    resp = await client.get(
+    resp = await unauthenticated_client.get(
         "/api/admin/viewport-shots/download-url",
         params={
             "project_id": str(project.id),
@@ -19159,7 +19307,7 @@ async def test_viewport_shots_download_url(client: AsyncClient, db_session, mock
 
 @pytest.mark.asyncio
 async def test_viewport_shots_download_url_unauthenticated_succeeds(
-    client: AsyncClient, db_session, mocker
+    unauthenticated_client: AsyncClient, db_session, mocker
 ):
     """Endpoint is public: no auth token required to follow a PR-body view link."""
     project = Project(name="VP Shot Download Auth Test", user_id="user-vpshot-dl-002")
@@ -19175,7 +19323,7 @@ async def test_viewport_shots_download_url_unauthenticated_succeeds(
         new=AsyncMock(return_value=fake_url),
     )
 
-    resp = await client.get(
+    resp = await unauthenticated_client.get(
         "/api/admin/viewport-shots/download-url",
         params={
             "project_id": str(project.id),
@@ -23341,15 +23489,13 @@ async def test_admin_viewport_shots_download_url_agent_token_cross_task_rejected
 
 @pytest.mark.asyncio
 async def test_admin_viewport_shots_download_url_no_auth_redirect(
-    client: AsyncClient, db_session, mocker
+    unauthenticated_client: AsyncClient, db_session, mocker
 ):
-    """Admin viewport-shots endpoint has two intentionally different response shapes.
+    """No-auth browser request gets a 302 redirect (operator clicking a PR-body link).
 
-    Without authentication (operator navigating via browser/PR body link):
-      - Returns 302 redirect to the signed GCS URL for the browser to fetch directly.
-
-    With agent JWT (agent reading screenshots programmatically):
-      - Returns JSON {"url": ...} with the signed URL so the agent can parse it.
+    The endpoint intentionally returns a redirect for unauthenticated requests so
+    operators can follow links from GitHub PR bodies directly in their browser.
+    The JWT path (agent → JSON) is covered by test_admin_viewport_shots_download_url_agent_token.
     """
     project = Project(
         name="Admin VP Shot No-Auth Test", user_id="user-admin-vp-shot-no-auth-001"
@@ -23374,8 +23520,9 @@ async def test_admin_viewport_shots_download_url_no_auth_redirect(
         new=AsyncMock(return_value=fake_url),
     )
 
-    # Test 1: No authentication => 302 redirect
-    resp = await client.get(
+    # No authentication => 302 redirect (unauthenticated_client has no get_current_user_optional
+    # override, so the dependency returns None and return_json stays False)
+    resp = await unauthenticated_client.get(
         "/api/admin/viewport-shots/download-url",
         params={
             "project_id": str(project.id),
@@ -23386,18 +23533,48 @@ async def test_admin_viewport_shots_download_url_no_auth_redirect(
     assert resp.status_code == 302
     assert resp.headers["location"] == fake_url
 
-    # Test 2: With JWT => JSON response
-    token = create_agent_token(
-        str(task.id), "vm-admin-vp-shot-no-auth-001", project_id=str(project.id)
+
+@pytest.mark.asyncio
+async def test_admin_viewport_shots_download_url_firebase_user_returns_json(
+    client: AsyncClient, db_session, mocker
+):
+    """Firebase-authenticated admin user gets JSON {url: ...}, not a 302 redirect."""
+    project = Project(
+        name="Admin VP Shot Firebase Test", user_id="user-admin-vp-shot-firebase-001"
     )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # conftest overrides get_current_user_optional to return {"user_id": "test-user-123"}
+    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    db_session.add(member)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix vp shot firebase"}],
+        vm_instance_id="vm-admin-vp-shot-firebase-001",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/firebase?X-Goog-Signature=fb"
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    # Firebase user (no x-agent-token) — should return 200 JSON, not 302
     resp = await client.get(
         "/api/admin/viewport-shots/download-url",
         params={
             "project_id": str(project.id),
             "task_id": str(task.id),
-            "name": "TestPanel-375-before",
+            "name": "TaskCard-375-after",
         },
-        headers={"x-agent-token": token},
     )
     assert resp.status_code == 200
     assert resp.json()["url"] == fake_url
