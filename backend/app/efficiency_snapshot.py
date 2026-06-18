@@ -173,6 +173,10 @@ NESTED_METRIC_CONSUMERS: dict[str, dict] = {
         "ground_truth": "Task.llm_*_tokens_banked + api_call_summary tokens priced via LLM_TOKEN_PRICING",
         "consumer": "read_baseline_with_drift -> llm_cost_attribution (strategic_spawning digest payload)",
     },
+    "panel_review_effectiveness": {
+        "ground_truth": "Task.context.review_second_opinion.state (challenged_confirmed / challenged_revised / challenged_rejected)",
+        "consumer": "efficiency_snapshot.write_snapshot (durable gate ROI signal in daily snapshot)",
+    },
 }
 
 # LLM token pricing table: (provider, model) -> (input_$/token, output_$/token).
@@ -1797,6 +1801,67 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
     return rows
 
 
+def compute_vm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
+    """Per-task-type VM cost rollup over the given tasks.
+
+    Buckets each task by ``task.first_payload.get("type", "unspecified")``
+    and accumulates :func:`get_task_total_vm_cost_usd` per bucket. Mirrors
+    the structure of :func:`compute_llm_cost_by_task_type` so the two surfaces
+    reconcile via the same task set. Returns a list sorted by ``total_cost_usd``
+    descending so the heaviest VM-cost type is first.
+
+    .. note::
+        ``cost_per_merge`` here divides by ``merged_count`` (all merged completions
+        via :func:`is_merged_completion`), which is consistent with the VM-cost
+        ``cost_per_merged_pr`` axis. The sibling
+        :func:`compute_llm_cost_by_task_type` uses ``verified_merged_count``
+        (CI-gated subset via :func:`is_verified_merge`) for its ``cost_per_merge``
+        field. Callers comparing ``cost_per_merge`` across the two surfaces should
+        be aware of this denominator difference.
+    """
+    from collections import defaultdict
+
+    buckets: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"task_count": 0, "merged_count": 0, "cost_usd": 0.0}
+    )
+    total_cost = 0.0
+
+    for t in tasks:
+        task_type = (t.first_payload or {}).get("type") or "unspecified"
+        merged = is_merged_completion(t)
+        vm_cost = get_task_total_vm_cost_usd(t)
+        b = buckets[task_type]
+        b["task_count"] += 1
+        if merged:
+            b["merged_count"] += 1
+        b["cost_usd"] += vm_cost
+        total_cost += vm_cost
+
+    def _share(cost: float) -> float | None:
+        if total_cost <= 0:
+            return None
+        return round(cost / total_cost, 4)
+
+    def _cost_per_merge(cost: float, merged: float) -> float | None:
+        if cost <= 0 or merged <= 0:
+            return None
+        return round(cost / merged, 6)
+
+    return [
+        {
+            "task_type": task_type,
+            "task_count": int(b["task_count"]),
+            "merged_count": int(b["merged_count"]),
+            "total_cost_usd": round(b["cost_usd"], 6),
+            "share_of_total_cost": _share(b["cost_usd"]),
+            "cost_per_merge": _cost_per_merge(b["cost_usd"], b["merged_count"]),
+        }
+        for task_type, b in sorted(
+            buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
+        )
+    ]
+
+
 def _compute_llm_cost_pricing_coverage(
     tasks: list[Task],
 ) -> Dict[str, Any]:
@@ -2412,6 +2477,56 @@ def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
     }
 
 
+def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | None:
+    """Panel review gate effectiveness: overturn, confirmation, and revision counts.
+
+    Reads ``context["review_second_opinion"]`` from every terminal task in the
+    window and buckets each record by its reconciliation state:
+      * ``challenged_confirmed``  — panel upholds the primary verdict unchanged.
+      * ``challenged_revised``    — same verdict direction, surviving issue set changed.
+      * ``challenged_rejected``   — panel overturns the verdict direction (the ROI signal).
+
+    The ``unchallenged`` state (gate off or primary was not an APPROVE) is excluded
+    because it does not represent a gate invocation.
+
+    Returns ``None`` when no gate invocations exist in the window.
+
+    ``overturn_rate`` = challenged_rejected / total_challenged — the share of
+    primary APPROVEs that the independent panel flipped to REQUEST_CHANGES. A rate
+    near 0 means the gate is expensive (full Opus-tier run) with marginal catch;
+    a high rate justifies the spend.
+    """
+    from app.task_completion import (  # noqa: PLC0415
+        REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
+    )
+
+    confirmed = 0
+    revised = 0
+    rejected = 0
+    for t in tasks:
+        recon = (t.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
+        if not isinstance(recon, dict):
+            continue
+        state = recon.get("state")
+        if state == "challenged_confirmed":
+            confirmed += 1
+        elif state == "challenged_revised":
+            revised += 1
+        elif state == "challenged_rejected":
+            rejected += 1
+
+    total = confirmed + revised + rejected
+    if total == 0:
+        return None
+    return {
+        "challenged_confirmed": confirmed,
+        "challenged_revised": revised,
+        "challenged_rejected": rejected,
+        "total_challenged": total,
+        "overturn_rate": round(rejected / total, 4),
+    }
+
+
 async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
@@ -2513,6 +2628,22 @@ async def compute_current_axes(
         # (which only covers the current window). Reconciles with the scalar
         # llm_cost_per_merged_pr axis via the shared _task_llm_attempts path.
         "llm_cost_attribution": _compact_llm_cost_attribution(tasks),
+        # VM cost by-task-type attribution: compact breakdown of total VM dollars
+        # by task type so operators can see how much of cost_per_merged_pr drift
+        # comes from primary tasks (review, create) vs quality-gate side-cars
+        # (panel_review, investigate graders). Reconciles with cost_per_merged_pr
+        # via the shared get_task_total_vm_cost_usd path.
+        "vm_cost_attribution": {
+            "by_task_type": compute_vm_cost_by_task_type(tasks),
+            "total_vm_usd": round(sum(get_task_total_vm_cost_usd(t) for t in tasks), 6),
+        },
+        # Panel review gate ROI: overturn/confirmation/revision counts over the
+        # window. Null when no gate invocations exist (gate disabled or no
+        # APPROVE primary verdicts in the window). overturn_rate is the headline
+        # signal: near-zero = gate is expensive with marginal catch; high =
+        # gate earns its Opus-tier cost. Reads context.review_second_opinion
+        # which the task_lifecycle path stamps on every challenged review task.
+        "panel_review_effectiveness": compute_panel_review_effectiveness(tasks),
     }
 
 
@@ -2567,6 +2698,7 @@ async def write_snapshot(
                 "agent_timeout_rate",
                 FORMAT_COMPLIANCE_KEY,
                 "llm_cost_attribution",
+                "panel_review_effectiveness",
             ):
                 if snapshot.get(_key) is not None:
                     _prov[_key] = {
@@ -2594,6 +2726,7 @@ async def write_snapshot(
                     "agent_timeout_rate",
                     FORMAT_COMPLIANCE_KEY,
                     "llm_cost_attribution",
+                    "panel_review_effectiveness",
                 ]:
                     _bval = baseline.get(_member)
                     if _bval is None:
@@ -2688,6 +2821,17 @@ async def write_snapshot(
             ):
                 baseline["llm_cost_attribution"] = snapshot["llm_cost_attribution"]
                 provenance["llm_cost_attribution"] = {
+                    "seeded_at": captured_at,
+                    "snapshot_captured_at": captured_at,
+                }
+            if (
+                baseline.get("panel_review_effectiveness") is None
+                and snapshot.get("panel_review_effectiveness") is not None
+            ):
+                baseline["panel_review_effectiveness"] = snapshot[
+                    "panel_review_effectiveness"
+                ]
+                provenance["panel_review_effectiveness"] = {
                     "seeded_at": captured_at,
                     "snapshot_captured_at": captured_at,
                 }
@@ -2813,14 +2957,18 @@ async def read_baseline_with_drift(
     ]
 
     # Durable per-driver LLM cost attribution trend: day-over-day series of
-    # the compact attribution block's headline scalars (rework_share +
-    # total_llm_usd) so an operator can confirm that a fix reduced rework spend
-    # or that a specific model's share contracted across consecutive snapshots.
+    # the compact attribution block's headline scalars (by_task_type, by_model,
+    # rework_share, total_llm_usd) so an operator can confirm that a fix reduced
+    # rework spend, that a specific model's share contracted, or that a task-type
+    # (review vs create vs side-car) drove the drift across consecutive snapshots.
     # Mirrors the reuse_dropout_trend pattern: omits snapshots that predate v8
     # (those have no llm_cost_attribution key and are naturally excluded).
     llm_cost_attribution_trend = [
         {
             "captured_at": snap.get("captured_at"),
+            "by_task_type": (snap.get("llm_cost_attribution") or {}).get(
+                "by_task_type"
+            ),
             "by_model": (snap.get("llm_cost_attribution") or {}).get("by_model"),
             "rework_share": (snap.get("llm_cost_attribution") or {}).get(
                 "rework_share"
@@ -2844,6 +2992,7 @@ async def read_baseline_with_drift(
             "agent_timeout_rate",
             FORMAT_COMPLIANCE_KEY,
             "llm_cost_attribution",
+            "panel_review_effectiveness",
         ]:
             _bval = baseline.get(_member)
             if _bval is None:
@@ -3418,6 +3567,28 @@ async def get_efficiency_axes(
     return await read_baseline_with_drift(session, project_id)
 
 
+def _format_rework_attribution(rework_breakdown: Dict[str, Any]) -> Dict[str, Any]:
+    """Transform compute_pr_rework_chain_breakdown output to rework_attribution API format.
+
+    Maps internal field names to API contract: rework_share_of_total_llm_cost ->
+    rework_share, rework_llm_usd -> rework_llm_cost_usd, etc. Filters top_rework_prs
+    to only include fields needed by the frontend.
+    """
+    return {
+        "rework_share": rework_breakdown.get("rework_share_of_total_llm_cost"),
+        "first_pass_llm_cost_usd": rework_breakdown["first_pass_llm_usd"],
+        "rework_llm_cost_usd": rework_breakdown["rework_llm_usd"],
+        "top_rework_prs": [
+            {
+                "pr_number": pr["pr_number"],
+                "rework_llm_cost_usd": pr["rework_llm_usd"],
+                "rework_vm_cost_usd": pr["rework_vm_usd"],
+            }
+            for pr in rework_breakdown["top_rework_prs"]
+        ],
+    }
+
+
 @router.get("/projects/{project_id}/llm-cost-breakdown")
 async def get_llm_cost_breakdown(
     project_id: uuid.UUID,
@@ -3472,7 +3643,19 @@ async def get_llm_cost_breakdown(
             "unpriced_task_count": int,
             "unpriced_coverage_fraction": float|None
           },
-          "unpriced_combos": [str, ...]
+          "unpriced_combos": [str, ...],
+          "rework_attribution": {
+            "rework_share": float|None,
+            "first_pass_llm_cost_usd": float,
+            "rework_llm_cost_usd": float,
+            "top_rework_prs": [
+              {
+                "pr_number": int,
+                "rework_llm_cost_usd": float,
+                "rework_vm_cost_usd": float
+              }, ...
+            ]
+          }
         }
     """
     await _get_user_project_with_role(
@@ -3480,12 +3663,13 @@ async def get_llm_cost_breakdown(
     )
     tasks = await _load_recent_tasks(session, project_id, window_days=window_days)
     breakdown = compute_llm_cost_breakdown(tasks)
+    rework_breakdown = compute_pr_rework_chain_breakdown(tasks)
     return {
         "window_days": window_days,
         "generated_at": _utcnow().isoformat(),
         **breakdown,
         "by_task_type": compute_llm_cost_by_task_type(tasks),
-        "pr_chain_rework": compute_pr_rework_chain_breakdown(tasks),
+        "rework_attribution": _format_rework_attribution(rework_breakdown),
     }
 
 

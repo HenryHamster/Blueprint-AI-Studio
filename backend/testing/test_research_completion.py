@@ -4695,6 +4695,7 @@ async def test_spawn_forward_quality_grader_is_single_shot(db_session):
     g1 = await spawn_forward_quality_grader(task, "artifact text", db_session)
     assert g1 is not None
     assert (g1.first_payload or {}).get("type") == "investigate"
+    assert (g1.first_payload or {}).get("quality_tier") == "sonnet"
     assert (g1.context or {}).get(QUALITY_GRADER_SOURCE_KEY) == str(task.id)
     assert g1.parent_task_id is None
     await db_session.refresh(task)
@@ -4750,6 +4751,7 @@ async def test_research_finding_second_opinion_sidecar_parks_and_records_verdict
     assert sidecar is not None
     assert (sidecar.first_payload or {}).get("type") == "investigate"
     assert (sidecar.first_payload or {}).get("scope") == "small"
+    assert (sidecar.first_payload or {}).get("quality_tier") == "sonnet"
     assert (sidecar.context or {}).get(FINDING_CHALLENGE_SOURCE_KEY) == str(task.id)
     assert (sidecar.context or {}).get("challenged_boundary") == (
         CHALLENGE_BOUNDARY_REPRODUCE_ABSENT

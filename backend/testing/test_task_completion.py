@@ -3537,6 +3537,33 @@ class TestSafeguardMergeGateChallenge:
             "spawn must return None when a challenge is already in flight"
         )
 
+    @pytest.mark.asyncio
+    async def test_spawn_safeguard_challenge_sets_sonnet_quality_tier(self, db_session):
+        """spawn_safeguard_challenge must set quality_tier='sonnet' in the spawned
+        challenge task's payload — regression guard against accidental tier removal."""
+        from app.task_evaluators import spawn_safeguard_challenge
+
+        project = make_project(name="SpawnGuardTierProj")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        safeguard = make_task(
+            project_id=project.id,
+            payloads=[{"type": "security_audit", "base_branch": "main"}],
+        )
+        db_session.add(safeguard)
+        await db_session.commit()
+        await db_session.refresh(safeguard)
+
+        challenge = await spawn_safeguard_challenge(
+            safeguard, "some critical finding text", db_session
+        )
+        assert challenge is not None
+        assert (challenge.first_payload or {}).get("quality_tier") == "sonnet", (
+            "Spawned safeguard challenge must carry quality_tier='sonnet'"
+        )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Review second-opinion reconciliation (reconcile_review_second_opinion)
@@ -3718,6 +3745,52 @@ def test_parse_panel_review_embedded_json_in_prose():
     panel = _parse_panel_review_output(prose)
     assert panel is not None
     assert panel["overall_verdict"] == "APPROVE"
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_second_opinion_sets_sonnet_quality_tier(db_session):
+    """spawn_review_second_opinion must set quality_tier='sonnet' in the spawned
+    challenger task's payload — regression guard against accidental tier removal."""
+    from app.task_evaluators import spawn_review_second_opinion
+
+    project = make_project(name="ReviewSecondOpinionTierProj")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    review_task = make_task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "panel_review",
+                "pr_number": 99,
+                "branch": "feat/test",
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    challenger = await spawn_review_second_opinion(
+        review_task,
+        db_session,
+        verdict="REQUEST_CHANGES",
+        issues=[{"description": "bug", "severity": "high"}],
+        feedback="There is a bug.",
+        pr_number=99,
+        branch="feat/test",
+        base_branch="main",
+        original_task_id=str(review_task.id),
+        original_prompt="review this PR",
+        investigated_files=None,
+    )
+    assert challenger is not None
+    assert (challenger.first_payload or {}).get("quality_tier") == "sonnet", (
+        "Spawned review second-opinion challenger must carry quality_tier='sonnet'"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

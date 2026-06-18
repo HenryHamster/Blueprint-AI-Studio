@@ -2476,6 +2476,61 @@ async def test_llm_cost_breakdown_endpoint_window_days_validation(
 
 
 @pytest.mark.asyncio
+async def test_llm_cost_breakdown_endpoint_rework_attribution_shape(
+    client: AsyncClient, db_session
+):
+    """llm-cost-breakdown endpoint must return rework_attribution with the mapped
+    API-contract field names (not the internal names from compute_pr_rework_chain_breakdown).
+    Regression guard for the rework_attribution key/field remapping introduced after
+    commit 40380b3 ('rework_attribution key/field mismatch kills rework section in UI').
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/llm-cost-breakdown")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # The key must be 'rework_attribution', not the old 'pr_chain_rework'.
+    assert "rework_attribution" in data, (
+        "Response must contain 'rework_attribution' key (not 'pr_chain_rework')"
+    )
+    assert "pr_chain_rework" not in data, (
+        "Old key 'pr_chain_rework' must not appear in response"
+    )
+
+    ra = data["rework_attribution"]
+
+    # API-contract field names (mapped from internal names by _format_rework_attribution).
+    assert "rework_share" in ra, (
+        "'rework_share' must be present (mapped from internal 'rework_share_of_total_llm_cost')"
+    )
+    assert "first_pass_llm_cost_usd" in ra, (
+        "'first_pass_llm_cost_usd' must be present (mapped from internal 'first_pass_llm_usd')"
+    )
+    assert "rework_llm_cost_usd" in ra, (
+        "'rework_llm_cost_usd' must be present (mapped from internal 'rework_llm_usd')"
+    )
+    assert "top_rework_prs" in ra
+    assert isinstance(ra["top_rework_prs"], list)
+
+    # Internal names must NOT leak through.
+    assert "rework_share_of_total_llm_cost" not in ra, (
+        "Internal field 'rework_share_of_total_llm_cost' must not appear in API response"
+    )
+    assert "first_pass_llm_usd" not in ra, (
+        "Internal field 'first_pass_llm_usd' must not appear in API response"
+    )
+    assert "rework_llm_usd" not in ra, (
+        "Internal field 'rework_llm_usd' must not appear in API response"
+    )
+
+
+@pytest.mark.asyncio
 async def test_read_baseline_with_drift_includes_reuse_funnel(db_session):
     """read_baseline_with_drift must include a reuse_funnel key with rolling counters."""
     import app.warm_backlog_reuse as wbr
@@ -6048,14 +6103,95 @@ async def test_read_baseline_surfaces_llm_cost_attribution_breakdown(db_session)
     assert attr["total_llm_usd"] == pytest.approx(expected_total, abs=1e-9)
 
     # llm_cost_attribution_trend is a list with one entry per snapshot that
-    # carries an llm_cost_attribution block.
+    # carries an llm_cost_attribution block, including by_task_type breakdown.
     trend = drift.get("llm_cost_attribution_trend")
     assert isinstance(trend, list), "llm_cost_attribution_trend must be a list"
     assert len(trend) >= 1, "at least one trend entry must be present"
     for entry in trend:
         assert "captured_at" in entry
+        assert "by_task_type" in entry
+        assert "by_model" in entry
         assert "rework_share" in entry
         assert "total_llm_usd" in entry
+
+
+@pytest.mark.asyncio
+async def test_vm_cost_attribution_by_task_type_in_write_snapshot(db_session):
+    """write_snapshot stores vm_cost_attribution.by_task_type populated with
+    per-type VM cost rows that reconcile with cost_per_merged_pr.
+
+    Acceptance criterion (declared in task payload):
+    test that vm_cost_attribution.by_task_type is populated in write_snapshot
+    output and reconciles with cost_per_merged_pr.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # review task: 10 min on-demand VM, merged
+    review_task = _make_efficient_task(
+        project.id,
+        payloads=[{"type": "review", "pr_number": 1}],
+        vm_provisioned_at=now - timedelta(minutes=10),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+    # create task: 5 min on-demand VM, merged
+    create_task = _make_efficient_task(
+        project.id,
+        payloads=[{"type": "create", "pr_number": 2}],
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+    # panel_review side-car: 3 min on-demand VM, not merged
+    panel_task = _make_efficient_task(
+        project.id,
+        payloads=[{"type": "panel_review"}],
+        context={},  # no pr_merged
+        vm_provisioned_at=now - timedelta(minutes=3),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+    db_session.add(review_task)
+    db_session.add(create_task)
+    db_session.add(panel_task)
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    vm_attr = snap.get("vm_cost_attribution")
+    assert vm_attr is not None, "vm_cost_attribution must be present in snapshot"
+    assert "by_task_type" in vm_attr, "vm_cost_attribution must have by_task_type"
+    assert "total_vm_usd" in vm_attr, "vm_cost_attribution must have total_vm_usd"
+
+    by_type = {r["task_type"]: r for r in vm_attr["by_task_type"]}
+    assert "review" in by_type, "review task type must appear in by_task_type"
+    assert "create" in by_type, "create task type must appear in by_task_type"
+    assert "panel_review" in by_type, "panel_review task type must appear in by_task_type"
+
+    # total_vm_usd reconciles: sum of by_task_type costs equals total_vm_usd
+    summed = round(sum(r["total_cost_usd"] for r in vm_attr["by_task_type"]), 6)
+    assert summed == pytest.approx(vm_attr["total_vm_usd"], abs=1e-9), (
+        "sum of by_task_type costs must reconcile with total_vm_usd"
+    )
+
+    # total_vm_usd reconciles with cost_per_merged_pr:
+    # cost_per_merged_pr = total_vm_cost / merged_count, with rounding.
+    # Verify the relationship holds within rounding tolerance.
+    cost_per_pr = snap.get(AXIS_COST_PER_MERGED_PR)
+    assert cost_per_pr is not None
+    # 2 merged tasks => cost_per_merged_pr ≈ total_vm_usd / 2 (4-decimal rounding)
+    assert abs(vm_attr["total_vm_usd"] / 2 - cost_per_pr) < 0.001, (
+        "cost_per_merged_pr must be approximately total_vm_usd / merged_count"
+    )
+
+    # panel_review side-car has no merges — cost_per_merge must be None
+    assert by_type["panel_review"]["merged_count"] == 0
+    assert by_type["panel_review"]["cost_per_merge"] is None
 
 
 @pytest.mark.asyncio
@@ -6141,4 +6277,106 @@ async def test_self_repair_drift_suppressed_below_min_attempts(db_session):
     )
     assert sr2["drift_pct"] < 0, (
         "all-failures window must show a negative drift vs baseline=1.0"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Panel review effectiveness tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_panel_review_effectiveness_in_write_snapshot(db_session):
+    """write_snapshot must populate panel_review_effectiveness with correct
+    overturn/confirmed/revision counts from tasks with reconciliation records.
+
+    Three review tasks carry different reconciliation states:
+      - 2 challenged_confirmed  (panel upholds)
+      - 1 challenged_revised    (panel same direction, different issues)
+      - 1 challenged_rejected   (panel overturns — the ROI signal)
+
+    The 'unchallenged' task must be excluded (not a gate invocation).
+    Expected overturn_rate = 1 / 4 = 0.25.
+    """
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    def _review_task(state):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "pr_merged": True,
+                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": state},
+            },
+            vm_provisioned_at=now - timedelta(minutes=10),
+            vm_stopped_at=now,
+        )
+
+    db_session.add(_review_task("challenged_confirmed"))
+    db_session.add(_review_task("challenged_confirmed"))
+    db_session.add(_review_task("challenged_revised"))
+    db_session.add(_review_task("challenged_rejected"))
+    # unchallenged must be ignored (gate not invoked)
+    db_session.add(_review_task("unchallenged"))
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    eff = snap.get("panel_review_effectiveness")
+    assert eff is not None, (
+        "write_snapshot must include panel_review_effectiveness when gate invocations exist"
+    )
+    assert eff["challenged_confirmed"] == 2, (
+        f"expected 2 confirmed, got {eff['challenged_confirmed']}"
+    )
+    assert eff["challenged_revised"] == 1, (
+        f"expected 1 revised, got {eff['challenged_revised']}"
+    )
+    assert eff["challenged_rejected"] == 1, (
+        f"expected 1 rejected, got {eff['challenged_rejected']}"
+    )
+    assert eff["total_challenged"] == 4, (
+        f"expected total_challenged=4, got {eff['total_challenged']}"
+    )
+    assert eff["overturn_rate"] == 0.25, (
+        f"expected overturn_rate=0.25, got {eff['overturn_rate']}"
+    )
+
+
+def test_panel_review_effectiveness_returns_none_when_no_gate_invocations():
+    """compute_panel_review_effectiveness returns None when no tasks have
+    gate invocations (all unchallenged or no review_second_opinion key).
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    # Task with no reconciliation key
+    t1 = make_task(
+        project_id=None,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+    )
+    # Task with unchallenged state (gate not invoked)
+    t2 = make_task(
+        project_id=None,
+        status=TaskStatus.COMPLETED,
+        context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "unchallenged"}},
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+    )
+    result = compute_panel_review_effectiveness([t1, t2])
+    assert result is None, (
+        "must return None when no tasks carry a challenged reconciliation state"
     )

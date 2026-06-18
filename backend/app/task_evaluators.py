@@ -288,6 +288,7 @@ async def spawn_review_second_opinion(
                 "is_challenge": True,
                 "primary_verdict": verdict,
                 "primary_issues": list(issues or []),
+                "quality_tier": "sonnet",
             }
         ],
         context={
@@ -1372,6 +1373,7 @@ async def spawn_forward_quality_grader(
                 "prompt": prompt,
                 "base_branch": base_branch,
                 "scope": "small",
+                "quality_tier": "sonnet",
             }
         ],
         context={
@@ -1477,6 +1479,7 @@ async def spawn_safeguard_challenge(
                 "prompt": prompt,
                 "base_branch": base_branch,
                 "scope": "small",
+                "quality_tier": "sonnet",
             }
         ],
         context={
@@ -1815,6 +1818,7 @@ async def spawn_finding_challenge(
                 "prompt": prompt,
                 "base_branch": base_branch,
                 "scope": "small",
+                "quality_tier": "sonnet",
             }
         ],
         context={
