@@ -1384,6 +1384,9 @@ async def spawn_forward_quality_grader(
                 "prompt": prompt,
                 "base_branch": base_branch,
                 "scope": "small",
+                # Deliberate cost-efficiency tier: mid-pipeline second opinion,
+                # not the final merge gate (spawn_review_second_opinion = Opus).
+                # Accepted finding; pinned by test_spawn_forward_quality_grader_sets_sonnet_quality_tier.
                 "quality_tier": "sonnet",
             }
         ],
@@ -1490,6 +1493,9 @@ async def spawn_safeguard_challenge(
                 "prompt": prompt,
                 "base_branch": base_branch,
                 "scope": "small",
+                # Deliberate cost-efficiency tier: mid-pipeline second opinion,
+                # not the final merge gate. Accepted finding; pinned by
+                # test_spawn_safeguard_challenge_sets_sonnet_quality_tier.
                 "quality_tier": "sonnet",
             }
         ],
@@ -1829,6 +1835,9 @@ async def spawn_finding_challenge(
                 "prompt": prompt,
                 "base_branch": base_branch,
                 "scope": "small",
+                # Deliberate cost-efficiency tier: mid-pipeline second opinion,
+                # not the final merge gate. Accepted finding; pinned by
+                # test_spawn_finding_challenge_sets_sonnet_quality_tier.
                 "quality_tier": "sonnet",
             }
         ],
