@@ -17,12 +17,19 @@ export async function signInWithGoogle() {
 }
 
 export async function getIdToken(): Promise<string> {
+  if (import.meta.env.VITE_DASHBOARD_API_TOKEN) {
+    return import.meta.env.VITE_DASHBOARD_API_TOKEN as string;
+  }
   const user = auth.currentUser;
   if (!user) throw new Error('Not authenticated');
   return user.getIdToken();
 }
 
 export function onAuthChange(callback: (user: User | null) => void) {
+  if (import.meta.env.VITE_DASHBOARD_API_TOKEN) {
+    setTimeout(() => callback({ email: 'dashboard-agent@system.local' } as unknown as User), 0);
+    return () => {};
+  }
   return onAuthStateChanged(auth, callback);
 }
 

@@ -59,6 +59,7 @@ vi.mock('../prompt.js', async (importOriginal) => {
     writePlaybookHelper: vi.fn(),
     writeMessagesHelper: vi.fn(),
     writeViewportSnapshotHelper: vi.fn(),
+    writeViewportLiveHelper: vi.fn(),
     writeCodeChangeHelpers: vi.fn(),
     formatPlaybook: vi.fn().mockReturnValue(''),
     buildRetryContext: vi.fn().mockReturnValue(''),

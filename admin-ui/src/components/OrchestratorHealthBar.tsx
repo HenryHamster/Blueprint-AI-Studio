@@ -260,7 +260,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
   const autonomousFailures = detailedHealth?.autonomous.consecutive_failures ?? 0;
 
   return (
-    <div className={`min-h-7 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-3 py-1 bg-neutral-900 border border-neutral-800 rounded-lg text-xs mb-3 shrink-0${apiHealthy ? '' : ' bg-red-950/20'}`}>
+    <div data-testid="orchestrator-health-bar" className={`min-h-7 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-3 py-1 bg-neutral-900 border border-neutral-800 rounded-lg text-xs mb-3 shrink-0${apiHealthy ? '' : ' bg-red-950/20'}`}>
       {/* Left: API + WS status */}
       <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
         <div className="flex items-center gap-1.5" title={apiHealthy ? undefined : 'API connection error — data may be stale'}>

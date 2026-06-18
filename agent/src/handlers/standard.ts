@@ -14,7 +14,7 @@ import {
   getTaskTypeFocusBlock,
   assembleFailureGuidanceBlocks,
   readClaudeMd, buildContextPrefix, buildFileTree, buildRepoMap, discoverRelatedTests, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, writeViewportSnapshotHelper, formatPlaybook, buildRetryContext,
+  writePlaybookHelper, writeMessagesHelper, writeViewportSnapshotHelper, writeViewportLiveHelper, formatPlaybook, buildRetryContext,
   buildAnalysisPrompt, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, extractModuleInterfaces,
   discoverAffectedConsumers, type PlaybookEntry, computePromptFingerprint,
   formatProvenanceWarnings, formatAcceptanceEvidence,
@@ -383,7 +383,10 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
-  if (isBlueprintSelfRepo(owner, repo)) writeViewportSnapshotHelper(taskId);
+  if (isBlueprintSelfRepo(owner, repo)) {
+    writeViewportSnapshotHelper(taskId);
+    writeViewportLiveHelper(taskId);
+  }
 
   // Build ctags symbol index for language-aware navigation (./symbols helper).
   // Graceful fallback: if ctags is unavailable or indexing fails, agents still
