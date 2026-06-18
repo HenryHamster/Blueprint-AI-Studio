@@ -246,15 +246,18 @@ def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None
     """
     from app.task_blocked import clear_blocker_metadata
 
-    # Snapshot keys that must survive an onset-preserving (optimistic) requeue
-    # BEFORE clear_blocker_metadata runs: strip_fresh_attempt_context (called
-    # inside clear_blocker_metadata) unconditionally removes
-    # _precondition_escalated_key because it is in FRESH_ATTEMPT_CONTEXT_STRIP_KEYS.
-    # We save it here and restore it below when preserve_first_blocked=True so the
-    # defer counter and escalation stamp survive the BLOCKED→QUEUED→BLOCKED cycle.
+    # Explicitly snapshot _precondition_escalated_key BEFORE clear_blocker_metadata
+    # runs: strip_fresh_attempt_context (called inside clear_blocker_metadata)
+    # unconditionally removes it because it is in FRESH_ATTEMPT_CONTEXT_STRIP_KEYS.
+    # We save it here and restore it below (line 288) when preserve_first_blocked=True.
+    # The defer counter (_precondition_defer) survives passively: it is NOT in
+    # FRESH_ATTEMPT_CONTEXT_STRIP_KEYS and is only deleted by the keys-to-pop list
+    # when preserve_first_blocked=False, so it persists when requeue-optimizing.
     ctx_before = task.context or {}
     saved_escalated_key = (
-        ctx_before.get("_precondition_escalated_key") if preserve_first_blocked else None
+        ctx_before.get("_precondition_escalated_key")
+        if preserve_first_blocked
+        else None
     )
 
     # Drops blocker columns, the structured blocker record, and the stale
