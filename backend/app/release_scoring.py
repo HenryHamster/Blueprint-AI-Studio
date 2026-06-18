@@ -467,12 +467,14 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
 
     deleted = erosion.get("deleted_test_files")
     if isinstance(deleted, list) and len(deleted) > 0:
-        # Exclude authorized dead-code deletions (matching by path suffix).
+        # Exclude authorized dead-code deletions (anchored path-suffix match:
+        # requires a '/' before the suffix so that e.g. "evilFoo.test.ts"
+        # does not accidentally authorize "Foo.test.ts").
         unauthorized = [
             f
             for f in deleted
             if not any(
-                str(f).endswith(entry.path_suffix)
+                str(f) == entry.path_suffix or str(f).endswith("/" + entry.path_suffix)
                 for entry in AUTHORIZED_TEST_DELETIONS
             )
         ]

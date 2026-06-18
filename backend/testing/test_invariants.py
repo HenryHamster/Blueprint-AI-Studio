@@ -9521,10 +9521,12 @@ def test_dropped_dead_orm_columns_write_sites_removed():
 
 def test_authorized_test_deletions_require_documentation():
     """Each AUTHORIZED_TEST_DELETIONS entry must have non-empty co_deleted_subject,
-    commit_ref, and rationale fields.
+    commit_ref, and rationale fields, and each path_suffix must be properly anchored
+    so that only a genuine path-segment match (not a prefix-collision) is authorized.
 
     A bare or undocumented entry can silently widen the promotion gate bypass.
-    This tripwire fails CI when any entry omits required documentation.
+    This tripwire fails CI when any entry omits required documentation or when the
+    path_suffix matching would authorize files in unintended directories.
     """
     from app.release_scoring import AUTHORIZED_TEST_DELETIONS
 
@@ -9545,4 +9547,36 @@ def test_authorized_test_deletions_require_documentation():
         "Each entry must supply co_deleted_subject, commit_ref, and rationale.\n"
         "Add the missing fields to the AuthorizedTestDeletion(...) constructor in "
         "backend/app/release_scoring.py:\n" + "\n".join(missing)
+    )
+
+    # Verify that the production matching logic is anchored at a path separator:
+    # a file whose name merely ends with the suffix string but is NOT separated by
+    # a '/' must NOT be authorized.  This catches e.g. "evilviewportRegression.test.ts"
+    # being silently bypassed when "viewportRegression.test.ts" is in the allowlist.
+    def _is_authorized(path: str) -> bool:
+        return any(
+            path == entry.path_suffix or path.endswith("/" + entry.path_suffix)
+            for entry in AUTHORIZED_TEST_DELETIONS
+        )
+
+    unanchored: list[str] = []
+    for entry in AUTHORIZED_TEST_DELETIONS:
+        # A path that shares the suffix but has no preceding separator must NOT match.
+        spoofed = "evil" + entry.path_suffix
+        if _is_authorized(spoofed):
+            unanchored.append(
+                f"  {entry.path_suffix!r}: unanchored — '{spoofed}' is incorrectly authorized"
+            )
+        # The canonical suffixed path (with separator) MUST match.
+        canonical = "some/dir/" + entry.path_suffix
+        if not _is_authorized(canonical):
+            unanchored.append(
+                f"  {entry.path_suffix!r}: broken — '{canonical}' is not authorized"
+            )
+
+    assert not unanchored, (
+        "AUTHORIZED_TEST_DELETIONS path_suffix matching is not anchored at a path separator.\n"
+        "The production matcher in release_scoring.py must use:\n"
+        "  str(f) == entry.path_suffix or str(f).endswith('/' + entry.path_suffix)\n"
+        "Failures:\n" + "\n".join(unanchored)
     )
