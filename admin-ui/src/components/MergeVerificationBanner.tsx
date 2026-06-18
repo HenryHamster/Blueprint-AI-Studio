@@ -9,6 +9,9 @@ interface MergeVerificationBannerProps {
   verdict?: MergeVerificationVerdict | null;
   /** Optional runtime evidence from the live no-CI merge gate. */
   runtime?: MergeGateRuntime | null;
+  /** When true, the honest-block policy is active: degraded fall-opens are held
+   *  instead of merging unverified. Only relevant when the no-CI gate is active. */
+  blockDegradedEnabled?: boolean;
   className?: string;
 }
 
@@ -21,7 +24,7 @@ interface MergeVerificationBannerProps {
  * Shared between the onboarding success step (NewProjectModal) and project settings
  * (ProjectBuildConfigSection) so both surfaces stay consistent.
  */
-export function MergeVerificationBanner({ verdict, runtime, className }: MergeVerificationBannerProps) {
+export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled, className }: MergeVerificationBannerProps) {
   if (!verdict) return null;
 
   const wrap = `rounded-lg border px-3 py-2.5 ${className ?? ''}`;
@@ -29,6 +32,8 @@ export function MergeVerificationBanner({ verdict, runtime, className }: MergeVe
   const unverifiedAt = runtime?.last_unverified_at ? parseTimestamp(runtime.last_unverified_at) : null;
   const unverifiedReason = runtime?.last_unverified_reason ? humanizeUnverifiedReason(runtime.last_unverified_reason) : null;
   const summaryLine = formatMergeGateSummary(runtime?.summary);
+  const lastBlockAt = runtime?.last_degraded_block_at ? parseTimestamp(runtime.last_degraded_block_at) : null;
+  const lastBlockReason = runtime?.last_degraded_block_reason ? humanizeUnverifiedReason(runtime.last_degraded_block_reason) : null;
   const mismatch = verdict.state === 'tests_gated' && Boolean(unverifiedAt && (!verifiedAt || unverifiedAt.getTime() > verifiedAt.getTime()));
   const runtimeState = runtime
     ? (mismatch
@@ -127,6 +132,18 @@ export function MergeVerificationBanner({ verdict, runtime, className }: MergeVe
                 {summaryLine}
               </p>
             ) : null}
+            {blockDegradedEnabled ? (
+              <div className="mt-2 rounded-md border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5 space-y-0.5" data-testid="honest-block-badge">
+                <p className="text-[10px] text-indigo-300 font-medium">
+                  Honest-block policy active — degraded fall-opens are held
+                </p>
+                {lastBlockAt ? (
+                  <p className="text-[10px] text-neutral-400">
+                    Last block: {formatAbsolute(lastBlockAt.getTime())}{lastBlockReason ? ` — ${lastBlockReason}` : ''}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </div>
       </div>
@@ -167,6 +184,18 @@ export function MergeVerificationBanner({ verdict, runtime, className }: MergeVe
             <p className="text-[10px] text-neutral-400 mt-1 break-words" data-testid="merge-gate-summary">
               {summaryLine}
             </p>
+          ) : null}
+          {blockDegradedEnabled ? (
+            <div className="mt-2 rounded-md border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5 space-y-0.5" data-testid="honest-block-badge">
+              <p className="text-[10px] text-indigo-300 font-medium">
+                Honest-block policy active — degraded fall-opens are held
+              </p>
+              {lastBlockAt ? (
+                <p className="text-[10px] text-neutral-400">
+                  Last block: {formatAbsolute(lastBlockAt.getTime())}{lastBlockReason ? ` — ${lastBlockReason}` : ''}
+                </p>
+              ) : null}
+            </div>
           ) : null}
         </div>
       </div>

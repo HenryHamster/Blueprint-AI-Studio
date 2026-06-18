@@ -252,6 +252,35 @@ export async function createComputeExperiment(
   return res.json();
 }
 
+export async function getBlockDegradedUnverifiedMerge(
+  projectId: string,
+): Promise<{ block_degraded_unverified_merge: boolean; is_default: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/block-degraded-unverified-merge`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch block-degraded-unverified-merge: ${res.status}`);
+  return res.json();
+}
+
+export async function setBlockDegradedUnverifiedMerge(
+  projectId: string,
+  enabled: boolean,
+): Promise<{ block_degraded_unverified_merge: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/block-degraded-unverified-merge`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ block_degraded_unverified_merge: enabled }),
+    },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update block-degraded-unverified-merge: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update block-degraded-unverified-merge: ${res.status}`);
+  }
+  return res.json();
+}
+
 export type ResourceEnvelopePatch = Partial<ResourceEnvelopeConfig>;
 
 export async function fetchProjectResourceEnvelope(

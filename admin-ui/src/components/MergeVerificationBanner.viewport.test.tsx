@@ -18,7 +18,7 @@ describe('MergeVerificationBanner — viewport regression', () => {
     if (host) { host.remove(); host = null; }
   });
 
-  function renderVerdict(verdict: MergeVerificationVerdict | null, runtime?: MergeGateRuntime | null) {
+  function renderVerdict(verdict: MergeVerificationVerdict | null, runtime?: MergeGateRuntime | null, blockDegradedEnabled?: boolean) {
     return async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
@@ -27,7 +27,7 @@ describe('MergeVerificationBanner — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => {
-        r.render(<MergeVerificationBanner verdict={verdict} runtime={runtime} />);
+        r.render(<MergeVerificationBanner verdict={verdict} runtime={runtime} blockDegradedEnabled={blockDegradedEnabled} />);
       });
     };
   }
@@ -95,6 +95,23 @@ describe('MergeVerificationBanner — viewport regression', () => {
     };
     await renderVerdict({ state: 'tests_gated', test_commands: [{ path: 'backend/', test_cmd: 'pytest' }] }, runtime)();
     expect(host!.querySelector('[data-testid="merge-gate-summary"]')).toBeNull();
+  });
+
+  test('honest-block badge renders without overflow at 375px when blockDegradedEnabled', async () => {
+    const runtime: MergeGateRuntime = {
+      last_run_at: '2026-04-24T11:00:00Z',
+      executed_real_tests: false,
+      last_degraded_block_at: '2026-04-24T10:00:00Z',
+      last_degraded_block_reason: 'setup_failure',
+    };
+    await expectNoOverflowAt(375, renderVerdict(
+      { state: 'tests_gated', test_commands: [{ path: 'backend/', test_cmd: 'pytest' }] },
+      runtime,
+      true,
+    ));
+    const badge = host!.querySelector('[data-testid="honest-block-badge"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toContain('Honest-block policy active');
   });
 
   test('null verdict renders nothing', async () => {
