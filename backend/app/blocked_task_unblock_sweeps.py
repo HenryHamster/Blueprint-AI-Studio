@@ -238,11 +238,38 @@ def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None
     recovery path and the canonical out-transition cannot drift. This sweep
     then clears its own recheck/escalation bookkeeping keys on top.
 
-    ``preserve_first_blocked`` keeps the ``_blocked_first_at`` onset stamp so a
-    blocker that is only *optimistically* requeued — a conflict/rollup blocker
-    with no dependency edge, which dispatch may immediately re-block — still
-    measures its escalation deadline from the true onset rather than restarting
-    each requeue episode. A genuine dependency clear wipes everything.
+    **Keys preserved vs. cleared by ``preserve_first_blocked``:**
+
+    When ``preserve_first_blocked=True`` (optimistic requeue — a conflict/rollup
+    blocker with no resolved dependency edge, which dispatch may immediately
+    re-block), four context keys survive the transition:
+
+    - ``_blocked_first_at`` — the original onset timestamp; preserved so the
+      escalation deadline is measured from the true start of the block episode
+      rather than restarting on every requeue.
+    - ``_blocked_optimistic_retries`` — the count of optimistic requeue attempts;
+      preserved so a transient agent/lifecycle blocker keeps accumulating toward
+      its cap across requeue cycles.
+    - ``_precondition_defer`` — the per-blocker-kind defer counter; preserved so
+      a persistent conflict/rollup blocker escalates to FAILED instead of
+      cycling forever.
+    - ``_precondition_escalated_key`` — the blocker kind that triggered
+      escalation; **requires special handling** because
+      ``task_blocked.clear_blocker_metadata`` calls
+      ``strip_fresh_attempt_context`` internally, which unconditionally strips
+      this key (it is in ``FRESH_ATTEMPT_CONTEXT_STRIP_KEYS``). This function
+      therefore snapshots the value *before* calling ``clear_blocker_metadata``
+      and restores it afterward when ``preserve_first_blocked=True``.
+
+    Note that ``clear_blocker_metadata`` itself always calls
+    ``strip_fresh_attempt_context`` with ``preserve_blocked_optimistic_retries=True``,
+    which means ``_blocked_optimistic_retries`` is never removed by
+    ``clear_blocker_metadata`` alone — it survives every unblock transition and
+    is only wiped here when ``preserve_first_blocked=False`` (a genuine
+    dependency clear), so a later unrelated block starts with a fresh budget.
+
+    When ``preserve_first_blocked=False`` (genuine dependency clear), all four
+    keys above are removed, giving the next block episode a clean slate.
     """
     from app.task_blocked import clear_blocker_metadata
 
