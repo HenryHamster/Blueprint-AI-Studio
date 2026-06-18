@@ -9517,3 +9517,32 @@ def test_dropped_dead_orm_columns_write_sites_removed():
         "These columns have no live readers and were dropped in migration 0300.\n"
         + "\n".join(violations)
     )
+
+
+def test_authorized_test_deletions_require_documentation():
+    """Each AUTHORIZED_TEST_DELETIONS entry must have non-empty co_deleted_subject,
+    commit_ref, and rationale fields.
+
+    A bare or undocumented entry can silently widen the promotion gate bypass.
+    This tripwire fails CI when any entry omits required documentation.
+    """
+    from app.release_scoring import AUTHORIZED_TEST_DELETIONS
+
+    missing: list[str] = []
+    for entry in AUTHORIZED_TEST_DELETIONS:
+        gaps = []
+        if not entry.co_deleted_subject.strip():
+            gaps.append("co_deleted_subject")
+        if not entry.commit_ref.strip():
+            gaps.append("commit_ref")
+        if not entry.rationale.strip():
+            gaps.append("rationale")
+        if gaps:
+            missing.append(f"  {entry.path_suffix!r}: missing {', '.join(gaps)}")
+
+    assert not missing, (
+        "AUTHORIZED_TEST_DELETIONS entries are missing required documentation fields.\n"
+        "Each entry must supply co_deleted_subject, commit_ref, and rationale.\n"
+        "Add the missing fields to the AuthorizedTestDeletion(...) constructor in "
+        "backend/app/release_scoring.py:\n" + "\n".join(missing)
+    )

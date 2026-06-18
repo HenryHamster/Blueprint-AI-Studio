@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from app.ci_resolution import (
@@ -25,22 +26,38 @@ from app.migration_reconciliation import AUTHORIZED_DIVERGENCES
 
 logger = logging.getLogger(__name__)
 
-# Authorized dead-code test deletions — file basenames (or path suffixes) that
-# the qualifier treats as non-erosion.  Mirrors the AUTHORIZED_DIVERGENCES
+
+@dataclass(frozen=True)
+class AuthorizedTestDeletion:
+    """A test-file deletion that the qualifier treats as non-erosion.
+
+    Each entry requires three documentation fields so the allowlist cannot be
+    widened silently — ``test_invariants.py::test_authorized_test_deletions_require_documentation``
+    enforces their presence in CI.
+    """
+
+    path_suffix: str  # file basename or path suffix matched against deleted test paths
+    co_deleted_subject: str  # the module/file/function co-deleted with this test
+    commit_ref: str  # commit SHA or ref where the deletion was made
+    rationale: str  # why this deletion is safe (non-erosion)
+
+
+# Authorized dead-code test deletions.  Mirrors the AUTHORIZED_DIVERGENCES
 # pattern in migration_reconciliation.py.  A deleted test file whose path ends
-# with any entry here is excluded from the hard-blocker gate so a clean
-# dead-code removal does not veto a promotion.
+# with any entry's path_suffix is excluded from the hard-blocker gate so a
+# clean dead-code removal does not veto a promotion.
 #
 # Entry criteria: the test file must have zero live callers / test subjects
 # remaining in the candidate (the code it exercised was also co-deleted), AND
 # the deletion must be explicitly authorized here so it cannot silently suppress
 # a genuine test-erosion signal.
-AUTHORIZED_TEST_DELETIONS: frozenset[str] = frozenset(
-    {
-        # viewportRegression.test.ts: co-deleted with viewportRegression.ts
-        # (commit 3085d8d8); parseViewportSubkey had zero production callers.
-        "viewportRegression.test.ts",
-    }
+AUTHORIZED_TEST_DELETIONS: tuple[AuthorizedTestDeletion, ...] = (
+    AuthorizedTestDeletion(
+        path_suffix="viewportRegression.test.ts",
+        co_deleted_subject="viewportRegression.ts (parseViewportSubkey)",
+        commit_ref="3085d8d8",
+        rationale="parseViewportSubkey had zero production callers; test and subject co-deleted together.",
+    ),
 )
 
 # Hardcoded fallback used when promotion_policy.yaml is missing, unreadable, or
@@ -454,7 +471,10 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
         unauthorized = [
             f
             for f in deleted
-            if not any(str(f).endswith(auth) for auth in AUTHORIZED_TEST_DELETIONS)
+            if not any(
+                str(f).endswith(entry.path_suffix)
+                for entry in AUTHORIZED_TEST_DELETIONS
+            )
         ]
         if unauthorized:
             # Hard blocker — any non-authorized deleted test file forces a non-promote.

@@ -1026,7 +1026,10 @@ class TestScoreAudit:
         assert erosion == pytest.approx(1.0)
 
         # Confirm the authorized set is consulted via rs directly too.
-        assert "viewportRegression.test.ts" in rs.AUTHORIZED_TEST_DELETIONS
+        assert any(
+            e.path_suffix == "viewportRegression.test.ts"
+            for e in rs.AUTHORIZED_TEST_DELETIONS
+        )
 
         # A mix of authorized + unauthorized still hard-blocks.
         mixed_report = {
