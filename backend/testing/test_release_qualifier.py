@@ -13016,6 +13016,157 @@ async def test_sweep_leaves_deferred_unsynced_when_still_behind(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_redrive_requalifies_resolved_blocker_stale_verdict(db_session, mocker):
+    """A stabilize version at a conclusive not_promoted verdict with all gating
+    findings ledger-resolved and automain HEAD advanced past the candidate SHA
+    is re-driven into run_qualification by the sweep; a fresh qualification spawns.
+
+    Acceptance proof: version transitions from not_promoted to pending and an
+    audit task is created — matching the declared task acceptance evidence."""
+    from app.release_readiness import apply_finding_resolution
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Stale not_promoted verdict pinned to an old SHA.
+    old_sha = "oldsha0" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {
+                "key": "FINDING_A",
+                "severity": "high",
+                "summary": "some finding",
+            }
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # Resolve the gating finding in the ledger.
+    await apply_finding_resolution(
+        db_session,
+        project.id,
+        version.id,
+        "FINDING_A",
+        "resolved",
+        severity="high",
+    )
+    await db_session.commit()
+
+    # automain has advanced to a NEW SHA (different from old_sha).
+    new_sha = "automn0" * 5 + "00000"
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    # Synced — LTS gate passes.
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+    await db_session.refresh(version)
+    # Stale verdict overwritten — qualification started.
+    assert version.last_qualification["status"] == "pending"
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_not_promoted_when_findings_unresolved(db_session, mocker):
+    """A not_promoted version whose gating audit findings are NOT yet
+    ledger-resolved is left untouched by the sweep — blockers have not cleared."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "oldsha0" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {
+                "key": "FINDING_UNRESOLVED",
+                "severity": "high",
+                "summary": "still open",
+            }
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # No ledger rows — finding is unresolved.
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 0
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_not_promoted_when_head_unchanged(db_session, mocker):
+    """A not_promoted version whose gating findings ARE resolved but automain
+    HEAD has NOT advanced (same candidate SHA) is left as-is — run_qualification
+    returns cached_verdict and nothing spawns."""
+    from app.release_readiness import apply_finding_resolution
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Candidate SHA matches what _branch_sha_mock returns for automain.
+    same_sha = "automn0" * 5 + "00000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": same_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {
+                "key": "FINDING_B",
+                "severity": "medium",
+                "summary": "resolved finding",
+            }
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # Mark the finding as resolved in the ledger.
+    await apply_finding_resolution(
+        db_session,
+        project.id,
+        version.id,
+        "FINDING_B",
+        "resolved",
+        severity="medium",
+    )
+    await db_session.commit()
+
+    # automain HEAD is UNCHANGED — same SHA as candidate.
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=same_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 0
+    await db_session.refresh(version)
+    # Still not_promoted — cached_verdict guard fired.
+    assert version.last_qualification["status"] == "not_promoted"
+    assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
 async def test_sweep_skips_already_finalized_version(db_session):
     """A version whose last_qualification is not 'pending' is skipped — the
     sweep only acts on stuck pending records."""

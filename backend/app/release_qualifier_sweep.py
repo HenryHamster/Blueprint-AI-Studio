@@ -304,6 +304,88 @@ async def _redrive_deferred_unsynced_qualification(
         return bool(result) and result.get("status") == "spawned"
 
 
+async def _redrive_not_promoted_qualification(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Re-enter the qualifier for a ``not_promoted`` version whose blockers cleared.
+
+    When a stabilize-phase version receives a conclusive ``not_promoted`` verdict,
+    ``run_qualification`` caches that verdict by candidate SHA and will not re-run
+    as long as the candidate SHA is unchanged.  But once the gating audit findings
+    are ledger-resolved AND ``automain`` has advanced past the ``not_promoted``
+    candidate's SHA, the stale verdict is no longer valid — a fresh qualification
+    against the new HEAD is warranted.  Neither the strategic ``qualify_request``
+    path nor the admin endpoint drive this re-entry automatically: the strategist
+    reads the standing ``not_promoted`` status as "qualification settled" and stops
+    emitting, so the version strands indefinitely even after all blockers clear.
+
+    This is that missing scheduled re-driver.  For each sweep it checks an open,
+    stabilize-phase version whose ``last_qualification.status == "not_promoted"``
+    and:
+
+      1. Calls ``compute_requalification_readiness`` to verify ALL gating
+         high/medium audit findings are ledger-resolved (``resolved`` or ``stale``).
+         If not, returns False immediately — the blockers have NOT cleared.
+      2. Re-invokes ``run_qualification``, which under its own ``FOR UPDATE`` lock
+         re-resolves the candidate SHA.  If ``automain`` has NOT advanced (same
+         SHA), ``run_qualification`` returns ``cached_verdict`` and this returns
+         False — nothing to do.  If ``automain`` HAS advanced, the cached-verdict
+         guard is a miss (new SHA) and a fresh qualification spawns.
+
+    Returns True only when the re-entry actually STARTED a new qualification
+    (``status == "spawned"``).  Any guard no-op or readiness miss returns False.
+
+    ``run_qualification`` is fully self-defending (phase check, in-flight check,
+    cached-verdict check, all under a ``FOR UPDATE`` lock), so a version that
+    changed state between the scan and the re-drive is a safe no-op.
+    """
+    # Both ``run_qualification`` and ``compute_requalification_readiness`` live
+    # in modules that import this one (directly or transitively), so import
+    # them lazily to avoid load-time import cycles.
+    from app import release_qualifier
+    from app.release_readiness import compute_requalification_readiness
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        version = await redrive_session.get(
+            release_version.ReleaseVersion, version_id
+        )
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "not_promoted"
+            or version.phase != "stabilize"
+        ):
+            return False
+        # Guard: only re-drive when there are gating findings AND all are resolved.
+        # A version with zero gating findings (e.g. blocked by ci_not_green or
+        # other non-audit blockers) has nothing to re-drive via the finding-
+        # resolution path — skip it so the lifecycle stall checks (calcification)
+        # see the original not_promoted state unchanged.
+        readiness = await compute_requalification_readiness(
+            redrive_session, version.project_id
+        )
+        if not readiness.get("requalification_ready"):
+            return False
+        if readiness.get("gating_total", 0) == 0:
+            return False
+        result = await release_qualifier.run_qualification(
+            redrive_session, version.project_id, version
+        )
+        if result and result.get("status") == "spawned":
+            await redrive_session.commit()
+            return True
+        # run_qualification returned a non-spawned status (error, cached_verdict,
+        # already_pending, etc.) — rollback so last_qualification is not corrupted
+        # and the identity map is expired for subsequent session reads.
+        await redrive_session.rollback()
+        return False
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -478,6 +560,41 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove deferred_unsynced version %s "
                 "(now synced — qualification spawned)",
+                version_id,
+            )
+
+    # Re-drive qualifications stranded in ``not_promoted`` once blockers clear.
+    # When a stabilize-phase version receives a conclusive ``not_promoted`` verdict,
+    # ``run_qualification`` caches it by candidate SHA; neither the strategist nor
+    # the admin endpoint re-enters automatically once the standing verdict reads
+    # "settled".  So once all gating audit findings are ledger-resolved AND
+    # ``automain`` advances past the ``not_promoted`` SHA, the version strands
+    # indefinitely with a stale verdict.  This loop is the scheduled re-driver:
+    # for any open ``not_promoted`` stabilize-phase version it first checks
+    # readiness (all gating findings resolved), then re-invokes
+    # ``run_qualification`` which under its own FOR UPDATE lock re-resolves the
+    # candidate SHA — if the SHA advanced, the cached-verdict guard is a miss and
+    # a fresh qualification spawns; if unchanged, it returns ``cached_verdict``
+    # and this is a no-op.  ``run_qualification`` is fully self-defending, so a
+    # version that changed state since the scan is a safe no-op.
+    for version_id in version_ids:
+        try:
+            redriven = await _redrive_not_promoted_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: not_promoted re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove not_promoted version %s "
+                "(blockers resolved and HEAD advanced — qualification spawned)",
                 version_id,
             )
 
