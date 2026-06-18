@@ -103,6 +103,7 @@ describe('MergeVerificationBanner — viewport regression', () => {
       executed_real_tests: false,
       last_degraded_block_at: '2026-04-24T10:00:00Z',
       last_degraded_block_reason: 'setup_failure',
+      degraded_block_counts: { setup_failure: 3, timeout: 2 },
     };
     await expectNoOverflowAt(375, renderVerdict(
       { state: 'tests_gated', test_commands: [{ path: 'backend/', test_cmd: 'pytest' }] },
@@ -112,6 +113,7 @@ describe('MergeVerificationBanner — viewport regression', () => {
     const badge = host!.querySelector('[data-testid="honest-block-badge"]');
     expect(badge).not.toBeNull();
     expect(badge?.textContent).toContain('Honest-block policy active');
+    expect(badge?.textContent).toContain('(5 total)');
   });
 
   test('no-test-block badge renders without overflow at 375px when blockNoTestEnabled', async () => {
@@ -120,6 +122,7 @@ describe('MergeVerificationBanner — viewport regression', () => {
       last_unverified_reason: 'no_detectable_test_command',
       last_no_test_block_at: '2026-04-24T10:00:00Z',
       last_no_test_block_reason: 'no_detectable_test_command',
+      no_test_block_counts: { no_detectable_test_command: 7 },
     };
     await expectNoOverflowAt(375, renderVerdict(
       { state: 'unverified', test_commands: [] },
@@ -130,6 +133,7 @@ describe('MergeVerificationBanner — viewport regression', () => {
     const badge = host!.querySelector('[data-testid="no-test-block-badge"]');
     expect(badge).not.toBeNull();
     expect(badge?.textContent).toContain('No-test hold policy active');
+    expect(badge?.textContent).toContain('(7 total)');
     expect(badge?.textContent).toContain('Last hold:');
   });
 
