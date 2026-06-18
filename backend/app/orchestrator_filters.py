@@ -100,13 +100,13 @@ async def _record_defer_and_maybe_escalate(
     if reserved_files:
         # Persist the full contested-file set (the blocker key is truncated to
         # 120 chars and is lossy) so the seniority pass can reserve those files
-        # for this task across cycles. Lifecycle caveat:
-        # reaper_sweeps._clear_blocked_fields wipes _precondition_defer on EVERY
-        # requeue (optimistic OR genuine), so this record does not itself survive
-        # a requeue episode. The reservation still holds across the parked-BLOCKED
-        # window — there _precondition_defer['files'] is intact and the
-        # blocked_conflict_tasks query feeds it to _file_conflict_reserved_files —
-        # and is re-earned on the next deferral after the task requeues to QUEUED.
+        # for this task across cycles. Lifecycle note:
+        # reaper_sweeps._clear_blocked_fields preserves _precondition_defer on
+        # optimistic (conflict/rollup) requeues so the counter accumulates across
+        # episodes and can escalate to FAILED. On a genuine dependency clear, the
+        # record is wiped. The reservation holds across the parked-BLOCKED window
+        # — _precondition_defer['files'] is intact and the blocked_conflict_tasks
+        # query feeds it to _file_conflict_reserved_files.
         defer_record["files"] = sorted(set(reserved_files))
     ctx["_precondition_defer"] = defer_record
 
@@ -271,7 +271,7 @@ def _file_conflict_reserved_files(task: Task) -> set[str]:
     # (or the preserved onset stamp, which survives the BLOCKED requeue).
     for src in (defer.get("key"), (ctx.get("_blocked_first_at") or {}).get("key")):
         if isinstance(src, str) and src.startswith("file conflict on "):
-            raw = src[len("file conflict on "):]
+            raw = src[len("file conflict on ") :]
             return _prod_files([p.strip() for p in raw.split(",") if p.strip()])
     return set()
 
@@ -665,9 +665,7 @@ async def filter_file_conflicts(
                     {"task_id": str(eid), "status": "QUEUED", "message": defer_msg},
                 )
             except Exception:
-                logger.debug(
-                    f"Failed to broadcast deferral for {eid}", exc_info=True
-                )
+                logger.debug(f"Failed to broadcast deferral for {eid}", exc_info=True)
         logger.info(
             f"[DISPATCH] Deferring task {eid} — file conflict "
             f"({len(overlap)}/{len(candidate_files)} files, scope={scope}): {overlapping_files}"
@@ -1319,7 +1317,8 @@ async def filter_pipeline_duplicates(
                     )
                 except Exception:
                     logger.debug(
-                        f"Failed to broadcast dedup cancel for {_task_id}", exc_info=True
+                        f"Failed to broadcast dedup cancel for {_task_id}",
+                        exc_info=True,
                     )
                 logger.warning(
                     f"[DISPATCH] Cancelling duplicate {fp.get('type')} {eid} — "
@@ -1364,9 +1363,7 @@ async def cap_pipeline_slots(
             select(func.count())
             .select_from(Task)
             .where(
-                Task.status.in_(
-                    [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                ),
+                Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
                 Task.payloads[0]["type"].as_string().in_(("review", "fix")),
             )
         )
@@ -1406,9 +1403,7 @@ def reserve_slots_for_types(
     first ``slots_available`` positions, displacing non-reserved tasks).
     """
     reserved_config = (
-        runtime_config.get(
-            "reserved_slots_for_types", {"create": 1, "research": 1}
-        )
+        runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1})
         or {}
     )
     if not (reserved_config and len(eligible_ids) > slots_available):
@@ -1710,9 +1705,7 @@ async def reorder_by_completion_priority(
     if parent_ids_to_fetch:
         rows = (
             await session.execute(
-                select(Task.id, Task.context).where(
-                    Task.id.in_(parent_ids_to_fetch)
-                )
+                select(Task.id, Task.context).where(Task.id.in_(parent_ids_to_fetch))
             )
         ).all()
         for row_id, row_context in rows:

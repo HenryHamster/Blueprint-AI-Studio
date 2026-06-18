@@ -246,13 +246,22 @@ def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None
     """
     from app.task_blocked import clear_blocker_metadata
 
+    # Snapshot keys that must survive an onset-preserving (optimistic) requeue
+    # BEFORE clear_blocker_metadata runs: strip_fresh_attempt_context (called
+    # inside clear_blocker_metadata) unconditionally removes
+    # _precondition_escalated_key because it is in FRESH_ATTEMPT_CONTEXT_STRIP_KEYS.
+    # We save it here and restore it below when preserve_first_blocked=True so the
+    # defer counter and escalation stamp survive the BLOCKED→QUEUED→BLOCKED cycle.
+    ctx_before = task.context or {}
+    saved_escalated_key = (
+        ctx_before.get("_precondition_escalated_key") if preserve_first_blocked else None
+    )
+
     # Drops blocker columns, the structured blocker record, and the stale
     # BLOCKED_PRECONDITION failure_class/failure_category tags.
     clear_blocker_metadata(task)
     ctx = task.context or {}
     keys = [
-        "_precondition_defer",
-        "_precondition_escalated_key",
         "_blocked_escalated",
         "_blocked_recheck_attempts",
     ]
@@ -263,8 +272,20 @@ def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None
         # its cap), but wiped on a genuine dependency clear so a later, unrelated
         # block starts with a fresh budget.
         keys.append("_blocked_optimistic_retries")
+        # The defer counter and escalation stamp must also survive an
+        # onset-preserving (optimistic) requeue: if dispatch re-blocks on the
+        # same blocker identity, _record_defer_and_maybe_escalate increments
+        # from the preserved count rather than restarting at 1, so a persistent
+        # conflict/rollup blocker escalates to FAILED instead of cycling forever.
+        keys.append("_precondition_defer")
+        keys.append("_precondition_escalated_key")
     for k in keys:
         ctx.pop(k, None)
+    # Restore the escalated-key for optimistic requeues: it was stripped above by
+    # clear_blocker_metadata but must survive so dispatch can accumulate the defer
+    # counter toward the escalation threshold on repeated conflict re-blocks.
+    if preserve_first_blocked and saved_escalated_key is not None:
+        ctx["_precondition_escalated_key"] = saved_escalated_key
     task.context = ctx
 
 

@@ -51,7 +51,13 @@ export function sanitize(text: string): string {
     .replace(/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, 'eyJ***')
     .replace(/Bearer\s+[^\s,'"]+/gi, 'Bearer ***')
     .replace(/oauth_token[=:]\s*[^\s&'"]+/gi, 'oauth_token=***')
-    .replace(/-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----/g, '***PRIVATE KEY***');
+    .replace(/-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----/g, '***PRIVATE KEY***')
+    // Known secret env-var names and HTTP header names — redact the value regardless of format
+    // Covers cases where the value is not a recognized token pattern (e.g. non-JWT AGENT_SECRET_TOKEN)
+    .replace(
+      /\b(AGENT_SECRET_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|CODEX_API_KEY|GEMINI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|X-Agent-Token)\s*[=:]\s*([^\s,'";&\])\n]{4,})/gi,
+      '$1=***',
+    );
 }
 
 /**

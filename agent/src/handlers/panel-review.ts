@@ -1,4 +1,5 @@
 import fs from 'fs';
+import path from 'path';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
@@ -454,7 +455,7 @@ export async function handlePanelReview(
         `?project_id=${encodeURIComponent(panelProjectIdForShots)}` +
         `&task_id=${encodeURIComponent(viewportSourceTaskId)}` +
         `&name=${encodeURIComponent(name)}`;
-      const dest = `${shotDir}/${name}.png`;
+      const dest = `${shotDir}/${path.basename(name)}.png`;
       try {
         execFileSync('curl', ['-sfL', '--max-time', '30', '-o', dest, downloadUrl]);
         downloadedShotPaths.push(dest);

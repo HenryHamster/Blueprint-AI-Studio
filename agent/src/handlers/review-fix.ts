@@ -1,4 +1,5 @@
 import fs from 'fs';
+import path from 'path';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
@@ -511,7 +512,7 @@ export async function handleReview(
         `?project_id=${encodeURIComponent(reviewProjectIdEarly)}` +
         `&task_id=${encodeURIComponent(viewportSourceTaskId)}` +
         `&name=${encodeURIComponent(name)}`;
-      const dest = `${shotDir}/${name}.png`;
+      const dest = `${shotDir}/${path.basename(name)}.png`;
       try {
         execFileSync('curl', ['-sfL', '--max-time', '30', '-o', dest, downloadUrl]);
         downloadedShotPaths.push(dest);
@@ -906,7 +907,7 @@ export async function handleFix(
         `?project_id=${encodeURIComponent(fixViewportProjectId)}` +
         `&task_id=${encodeURIComponent(viewportSourceTaskId)}` +
         `&name=${encodeURIComponent(name)}`;
-      const dest = `${shotDir}/${name}.png`;
+      const dest = `${shotDir}/${path.basename(name)}.png`;
       try {
         execFileSync('curl', ['-sfL', '--max-time', '30', '-o', dest, downloadUrl]);
         downloadedFixShotPaths.push(dest);

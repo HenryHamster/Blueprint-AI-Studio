@@ -305,9 +305,10 @@ describe('sanitize', () => {
   });
 
   it('redacts OpenAI sk-proj- API keys', () => {
+    // The env-var pattern fires after the sk-proj pattern, fully redacting the env var
     expect(
       sanitize('codex failed with OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456'),
-    ).toBe('codex failed with OPENAI_API_KEY=sk-proj-***');
+    ).toBe('codex failed with OPENAI_API_KEY=***');
   });
 
   it('redacts Google API keys', () => {
@@ -420,6 +421,35 @@ describe('sanitize', () => {
     expect(sanitize('postgresql+asyncpg://dbuser:s3cr3t@db.host/mydb')).toBe(
       'postgresql+asyncpg://***:***@db.host/mydb',
     );
+  });
+
+  it('redacts AGENT_SECRET_TOKEN value in env-var key=value format', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0YXNrLTEyMyJ9.SIG';
+    expect(sanitize(`AGENT_SECRET_TOKEN=${jwt}`)).toBe('AGENT_SECRET_TOKEN=***');
+    // Non-JWT opaque token value
+    expect(sanitize('AGENT_SECRET_TOKEN=some-opaque-token-value')).toBe('AGENT_SECRET_TOKEN=***');
+    // Should not redact very short values (below the 4-char floor)
+    expect(sanitize('AGENT_SECRET_TOKEN=abc')).toBe('AGENT_SECRET_TOKEN=abc');
+  });
+
+  it('redacts provider API key env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN)', () => {
+    expect(sanitize('ANTHROPIC_API_KEY=sk-ant-api03-secretkey123')).toBe('ANTHROPIC_API_KEY=***');
+    expect(sanitize('OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123')).toBe('OPENAI_API_KEY=***');
+    expect(sanitize('GEMINI_API_KEY=AIzaSyabcdefghijklmnop')).toBe('GEMINI_API_KEY=***');
+    // CLAUDE_CODE_OAUTH_TOKEN: the oauth_token sub-pattern fires first, normalising the suffix to lowercase
+    const oauthOut = sanitize('CLAUDE_CODE_OAUTH_TOKEN=some-long-oauth-token-value-here');
+    expect(oauthOut).toContain('***');
+    expect(oauthOut).not.toContain('some-long-oauth-token-value-here');
+    expect(sanitize('CODEX_API_KEY=sk-proj-codex-abcdefghijklmnop')).toBe('CODEX_API_KEY=***');
+  });
+
+  it('redacts X-Agent-Token HTTP header value', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0YXNrLTEyMyJ9.SIG';
+    // The credential-field \btoken\b pattern fires first and redacts the value
+    expect(sanitize(`X-Agent-Token: ${jwt}`)).toBe('X-Agent-Token: ***');
+    const headerArg = sanitize(`-H "X-Agent-Token: ${jwt}"`);
+    expect(headerArg).toContain('***');
+    expect(headerArg).not.toContain(jwt);
   });
 });
 

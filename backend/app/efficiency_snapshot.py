@@ -2495,6 +2495,9 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
     primary APPROVEs that the independent panel flipped to REQUEST_CHANGES. A rate
     near 0 means the gate is expensive (full Opus-tier run) with marginal catch;
     a high rate justifies the spend.
+
+    ``cost_per_challenge_usd`` = total LLM cost of panel_review tasks / total_challenged.
+    Provides the spend-per-invocation needed to compute gate ROI alongside overturn_rate.
     """
     from app.task_completion import (  # noqa: PLC0415
         REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
@@ -2518,12 +2521,22 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
     total = confirmed + revised + rejected
     if total == 0:
         return None
+
+    # Sum LLM cost across panel_review challenger tasks in the window.
+    panel_review_llm_cost = sum(
+        _task_llm_cost(t)[0]
+        for t in tasks
+        if (t.first_payload or {}).get("type") == "panel_review"
+    )
+    cost_per_challenge = round(panel_review_llm_cost / total, 4) if total > 0 else None
+
     return {
         "challenged_confirmed": confirmed,
         "challenged_revised": revised,
         "challenged_rejected": rejected,
         "total_challenged": total,
         "overturn_rate": round(rejected / total, 4),
+        "cost_per_challenge_usd": cost_per_challenge,
     }
 
 

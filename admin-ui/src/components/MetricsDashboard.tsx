@@ -609,6 +609,9 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             <span>revised: {data.panel_review_effectiveness.challenged_revised ?? '—'}</span>
             <span>rejected: {data.panel_review_effectiveness.challenged_rejected ?? '—'}</span>
             <span>total: {data.panel_review_effectiveness.total_challenged ?? '—'}</span>
+            {data.panel_review_effectiveness.cost_per_challenge_usd != null && (
+              <span>cost/challenge: ${data.panel_review_effectiveness.cost_per_challenge_usd.toFixed(4)}</span>
+            )}
           </div>
         </div>
       )}

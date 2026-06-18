@@ -353,7 +353,9 @@ async def test_read_baseline_surfaces_warm_start_origin_breakdown(db_session):
 
 
 @pytest.mark.asyncio
-async def test_read_baseline_with_drift_includes_panel_review_effectiveness_and_vm_cost_attribution(db_session):
+async def test_read_baseline_with_drift_includes_panel_review_effectiveness_and_vm_cost_attribution(
+    db_session,
+):
     """read_baseline_with_drift surfaces panel_review_effectiveness (overturn_rate,
     challenged counts) and vm_cost_attribution (task-type cost breakdown) from the
     latest snapshot alongside other efficiency-axes data."""
@@ -374,7 +376,9 @@ async def test_read_baseline_with_drift_includes_panel_review_effectiveness_and_
             status=TaskStatus.COMPLETED,
             context={
                 "pr_merged": True,
-                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "challenged_confirmed"},
+                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
+                    "state": "challenged_confirmed"
+                },
             },
             vm_provisioned_at=now - timedelta(minutes=5),
             vm_stopped_at=now,
@@ -393,7 +397,9 @@ async def test_read_baseline_with_drift_includes_panel_review_effectiveness_and_
             status=TaskStatus.COMPLETED,
             context={
                 "pr_merged": True,
-                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "challenged_confirmed"},
+                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
+                    "state": "challenged_confirmed"
+                },
             },
             vm_provisioned_at=now - timedelta(minutes=5),
             vm_stopped_at=now,
@@ -412,7 +418,9 @@ async def test_read_baseline_with_drift_includes_panel_review_effectiveness_and_
             status=TaskStatus.COMPLETED,
             context={
                 "pr_merged": True,
-                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "challenged_revised"},
+                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
+                    "state": "challenged_revised"
+                },
             },
             vm_provisioned_at=now - timedelta(minutes=5),
             vm_stopped_at=now,
@@ -431,7 +439,9 @@ async def test_read_baseline_with_drift_includes_panel_review_effectiveness_and_
             status=TaskStatus.COMPLETED,
             context={
                 "pr_merged": True,
-                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "challenged_rejected"},
+                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
+                    "state": "challenged_rejected"
+                },
             },
             vm_provisioned_at=now - timedelta(minutes=5),
             vm_stopped_at=now,
@@ -6329,7 +6339,9 @@ async def test_vm_cost_attribution_by_task_type_in_write_snapshot(db_session):
     by_type = {r["task_type"]: r for r in vm_attr["by_task_type"]}
     assert "review" in by_type, "review task type must appear in by_task_type"
     assert "create" in by_type, "create task type must appear in by_task_type"
-    assert "panel_review" in by_type, "panel_review task type must appear in by_task_type"
+    assert "panel_review" in by_type, (
+        "panel_review task type must appear in by_task_type"
+    )
 
     # total_vm_usd reconciles: sum of by_task_type costs equals total_vm_usd
     summed = round(sum(r["total_cost_usd"] for r in vm_attr["by_task_type"]), 6)
@@ -6537,4 +6549,62 @@ def test_panel_review_effectiveness_returns_none_when_no_gate_invocations():
     result = compute_panel_review_effectiveness([t1, t2])
     assert result is None, (
         "must return None when no tasks carry a challenged reconciliation state"
+    )
+
+
+def test_panel_review_effectiveness_cost_per_challenge_usd():
+    """compute_panel_review_effectiveness includes cost_per_challenge_usd.
+
+    Two panel_review challenger tasks carry known LLM token usage.
+    Four review tasks carry reconciliation states (total_challenged=4).
+    Expected cost_per_challenge_usd = total_panel_review_llm_cost / 4.
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    def _challenged_review(state):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": state}},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    def _panel_review_task(input_tokens, output_tokens):
+        t = make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "panel_review"}],
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+        t.api_call_summary = {
+            "llm_call_count": 1,
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+        }
+        return t
+
+    tasks = [
+        _challenged_review("challenged_confirmed"),
+        _challenged_review("challenged_confirmed"),
+        _challenged_review("challenged_revised"),
+        _challenged_review("challenged_rejected"),
+        _panel_review_task(1000, 200),
+        _panel_review_task(2000, 400),
+    ]
+
+    result = compute_panel_review_effectiveness(tasks)
+    assert result is not None
+    assert result["total_challenged"] == 4
+    expected_total_cost = (1000 + 2000) * input_rate + (200 + 400) * output_rate
+    expected_per_challenge = round(expected_total_cost / 4, 4)
+    assert result["cost_per_challenge_usd"] == expected_per_challenge, (
+        f"expected cost_per_challenge_usd={expected_per_challenge}, got {result['cost_per_challenge_usd']}"
     )

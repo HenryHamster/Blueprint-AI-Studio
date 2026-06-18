@@ -1461,6 +1461,7 @@ export interface PanelReviewEffectiveness {
   challenged_rejected: number;
   total_challenged: number;
   overturn_rate: number;
+  cost_per_challenge_usd?: number | null;
 }
 
 export interface VmCostAttributionEntry {
