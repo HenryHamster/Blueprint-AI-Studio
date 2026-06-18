@@ -795,6 +795,19 @@ export async function drainLanePilot(projectId: string): Promise<LanePilotDrainR
   return res.json();
 }
 
+export async function reclaimOrphanedLaneWorkspaces(projectId: string): Promise<{ reclaimed: number }> {
+  const res = await apiFetch(
+    `/api/admin/improvement-lanes/reclaim-orphaned?project_id=${encodeURIComponent(projectId)}`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || data?.error?.message || `Failed to reclaim orphaned workspaces: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to reclaim orphaned workspaces: ${res.status}`);
+  }
+  return res.json();
+}
+
 export interface LanePilotPreflightCheck {
   name: string;
   met: boolean;
