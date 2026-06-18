@@ -188,6 +188,12 @@ export interface MergeGateRuntime {
   last_degraded_block_at?: string | null;
   last_degraded_block_reason?: string | null;
   degraded_block_counts?: Record<string, number>;
+  /** No-test-command hold fields — present only when the project has opted into
+   *  the `block_no_test_unverified_merge` policy AND a hold event has occurred.
+   *  Absent on legacy records and projects where the policy has never fired. */
+  last_no_test_block_at?: string;
+  last_no_test_block_reason?: string;
+  no_test_block_counts?: Record<string, number>;
 }
 
 export interface CapabilityProofSummary {

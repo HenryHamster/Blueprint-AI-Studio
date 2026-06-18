@@ -2308,7 +2308,9 @@ async def orchestrator_worker():
                     _previously_failing_types
                 if _failing_types:
                     for _ftype in _failing_types:
-                        if _is_cadence_due(_last_type_throttle_broadcast.get(_ftype), 60):
+                        if _is_cadence_due(
+                            _last_type_throttle_broadcast.get(_ftype), 60
+                        ):
                             _last_type_throttle_broadcast[_ftype] = _utcnow()
                             _frate, _fsample = _shared_state.get_task_type_failure_rate(
                                 _ftype, window_minutes=15
@@ -7020,6 +7022,83 @@ async def orchestrator_worker():
                                         f"the project's opt-in honest-block "
                                         f"policy — the suite could not run, so "
                                         f"the PR is held open for operator "
+                                        f"attention",
+                                    )
+                                await session.commit()
+                                await broadcast_to_project(
+                                    str(ci_task.project_id),
+                                    "task_updated",
+                                    {
+                                        "task_id": str(ci_task.id),
+                                        "status": ci_task.status,
+                                    },
+                                )
+                                continue
+
+                        # ── Opt-in honest-block for no-detectable-test merges ──
+                        # Default-OFF per-project policy
+                        # (build_config.block_no_test_unverified_merge). When ON
+                        # and the no-CI gate fell open with
+                        # ``no_detectable_test_command`` (a BENIGN reason — the
+                        # repo has no detectable suite), HOLD the PR open instead
+                        # of merging it UNVERIFIED. DEGRADED reasons and
+                        # policy-OFF projects take no branch here, so default
+                        # behavior is byte-for-byte unchanged. Sticky
+                        # ci_loop marker prevents re-alerting across polls.
+                        if _unverified_merge_reason:
+                            if _block_proj is None and ci_task.project_id:
+                                from app.models import Project as _NTProject
+
+                                _block_proj = await session.get(
+                                    _NTProject, ci_task.project_id
+                                )
+                            from app import ci_resolution as _nt_ci_res
+
+                            if _nt_ci_res.should_block_no_test_unverified_merge(
+                                _block_proj, _unverified_merge_reason
+                            ):
+                                from sqlalchemy.orm.attributes import (
+                                    flag_modified as _nt_flag_modified,
+                                )
+
+                                _already_nt_blocked = bool(
+                                    ci_loop.get("no_ci_no_test_blocked")
+                                )
+                                if not _already_nt_blocked:
+                                    _nt_ci_res.record_no_ci_gate_no_test_block(
+                                        session,
+                                        _block_proj,
+                                        unverified_reason=_unverified_merge_reason,
+                                        when=_utcnow(),
+                                    )
+                                ci_loop["no_ci_no_test_blocked"] = True
+                                ci_loop["no_ci_no_test_block_reason"] = (
+                                    _unverified_merge_reason
+                                )
+                                ci_task.latest_status_message = (
+                                    f"PR #{ci_pr_number}: no-CI merge gate found "
+                                    f"no detectable test command "
+                                    f"({_unverified_merge_reason}); the project's "
+                                    f"block-no-test-unverified-merge policy is ON "
+                                    f"— holding the PR open instead of merging "
+                                    f"UNVERIFIED"
+                                )
+                                ci_task.context = {
+                                    **(ci_task.context or {}),
+                                    "review_loop": ci_loop,
+                                }
+                                _nt_flag_modified(ci_task, "context")
+                                session.add(ci_task)
+                                if not _already_nt_blocked:
+                                    await _maybe_create_failure_alert(
+                                        ci_task,
+                                        session,
+                                        f"PR #{ci_pr_number}: no-CI merge gate "
+                                        f"BLOCKED an unverified merge (no-test "
+                                        f"reason: {_unverified_merge_reason}) per "
+                                        f"the project's opt-in no-test-block "
+                                        f"policy — no test command was detectable, "
+                                        f"so the PR is held open for operator "
                                         f"attention",
                                     )
                                 await session.commit()

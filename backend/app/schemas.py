@@ -891,6 +891,8 @@ class BuildConfig(BaseModel):
     # fully additive and backward-compatible; onboarding never turns it on.
     # Read by ``ci_resolution.should_block_degraded_unverified_merge``.
     block_degraded_unverified_merge: bool = False
+    # Read by ci_resolution.should_block_no_test_unverified_merge.
+    block_no_test_unverified_merge: bool = False
     # Per-project alembic versions directory path. None means "use the project default".
     # NOTE: this single string feeds only the backend-side migration-file guard;
     # it is NOT the agent's full layout resolver — see ``migration`` below.

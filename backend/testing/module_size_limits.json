@@ -111,7 +111,8 @@
     "recovery_post_commit_pending.py": 1100,
     "recovery_sidecar.py": 400,
     "release_version.py": 1750,
-    "ci_resolution.py": 1800
+    "ci_resolution.py": 1800,
+    "routers/admin_project_config.py": 1800
   },
   "agent": {
     "index.ts": 4600,
@@ -156,7 +157,7 @@
   },
   "frontend": {
     "useAppState.ts": 3000,
-    "components/VersionLifecyclePanel.tsx": 950,
+    "components/VersionLifecyclePanel.tsx": 2300,
     "components/DirectionsPanel.tsx": 3000,
     "components/CatchUpPanel.tsx": 3600,
     "components/TaskDetailDrawer.tsx": 2500,

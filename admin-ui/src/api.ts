@@ -281,6 +281,35 @@ export async function setBlockDegradedUnverifiedMerge(
   return res.json();
 }
 
+export async function getBlockNoTestUnverifiedMerge(
+  projectId: string,
+): Promise<{ block_no_test_unverified_merge: boolean; is_default: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/block-no-test-unverified-merge`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch block-no-test-unverified-merge: ${res.status}`);
+  return res.json();
+}
+
+export async function setBlockNoTestUnverifiedMerge(
+  projectId: string,
+  enabled: boolean,
+): Promise<{ block_no_test_unverified_merge: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/block-no-test-unverified-merge`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ block_no_test_unverified_merge: enabled }),
+    },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update block-no-test-unverified-merge: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update block-no-test-unverified-merge: ${res.status}`);
+  }
+  return res.json();
+}
+
 export type ResourceEnvelopePatch = Partial<ResourceEnvelopeConfig>;
 
 export async function fetchProjectResourceEnvelope(

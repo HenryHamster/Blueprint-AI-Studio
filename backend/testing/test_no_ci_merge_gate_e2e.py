@@ -54,9 +54,11 @@ from app.ci_resolution import (
     probe_is_clear_failure,
     proceed_on_no_checks,
     record_no_ci_gate_degraded_block,
+    record_no_ci_gate_no_test_block,
     record_no_ci_gate_runtime,
     resolve_no_checks_escalation,
     should_block_degraded_unverified_merge,
+    should_block_no_test_unverified_merge,
     should_run_no_ci_test_gate,
 )
 from app.build_config_detection import maybe_redetect_ci_presence
@@ -1700,6 +1702,94 @@ def test_orchestrator_consults_degraded_block_helper():
         "orchestrator no-CI honest-block wiring changed — missing: "
         f"{missing}. The degraded-block branch must consult "
         "should_block_degraded_unverified_merge and park the PR; update "
+        "orchestrator.py AND this guard together."
+    )
+
+
+@pytest.mark.asyncio
+async def test_block_no_test_unverified_merge_held_and_sticky(db_session):
+    """Opt-in no-test honest-block policy: with the flag ON and
+    ``no_detectable_test_command`` the predicate returns True; with the flag OFF
+    or a different reason it returns False.
+
+    Also exercises ``record_no_ci_gate_no_test_block`` and verifies that
+    ``merge_gate_runtime_block`` surfaces the new JSONB fields.
+    """
+    # ── Part 1: predicate behaviour ──────────────────────────────────────────
+    project = await _make_no_ci_project(db_session, with_test_cmd=False)
+    bc = dict(project.build_config or {})
+    bc["block_no_test_unverified_merge"] = True
+    from sqlalchemy.orm.attributes import flag_modified as _fm
+
+    project.build_config = bc
+    _fm(project, "build_config")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert (
+        should_block_no_test_unverified_merge(project, "no_detectable_test_command")
+        is True
+    ), "policy ON + no_detectable_test_command must block"
+
+    assert (
+        should_block_no_test_unverified_merge(project, "verify_setup_failed") is False
+    ), "a DEGRADED reason must NOT be caught by the no-test policy"
+
+    off_project = await _make_no_ci_project(db_session, with_test_cmd=False)
+    assert (
+        should_block_no_test_unverified_merge(off_project, "no_detectable_test_command")
+        is False
+    ), "policy OFF must never block"
+
+    # ── Part 2: recorder stamps the expected JSONB keys ───────────────────
+    record_no_ci_gate_no_test_block(
+        db_session,
+        project,
+        unverified_reason="no_detectable_test_command",
+        when=_RUNTIME_WHEN,
+    )
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    runtime = merge_gate_runtime_block(project)
+    assert runtime is not None
+    assert runtime["last_no_test_block_at"] == _RUNTIME_WHEN.isoformat()
+    assert runtime["last_no_test_block_reason"] == "no_detectable_test_command"
+    assert runtime["no_test_block_counts"]["no_detectable_test_command"] == 1
+    # The block is a fall-open that did NOT run a real suite.
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_reason"] == "no_detectable_test_command"
+
+    # ── Part 3: second block call increments count (sticky tally) ─────────
+    record_no_ci_gate_no_test_block(
+        db_session,
+        project,
+        unverified_reason="no_detectable_test_command",
+        when=_RUNTIME_WHEN,
+    )
+    await db_session.commit()
+    project = await db_session.get(Project, project.id)
+    runtime2 = merge_gate_runtime_block(project)
+    assert runtime2["no_test_block_counts"]["no_detectable_test_command"] == 2
+
+
+def test_orchestrator_consults_no_test_block_helper():
+    """Drift guard: the orchestrator's no-CI gate must consult
+    ``should_block_no_test_unverified_merge`` and, when it returns True, BLOCK
+    (record the block and ``continue`` without calling ``handle_ci_completion``).
+    Uses sticky ``ci_loop["no_ci_no_test_blocked"]`` to prevent re-alerting."""
+    src = _orchestrator_source()
+    required = [
+        "should_block_no_test_unverified_merge",
+        "record_no_ci_gate_no_test_block",
+        'ci_loop["no_ci_no_test_blocked"] = True',
+    ]
+    missing = [needle for needle in required if needle not in src]
+    assert not missing, (
+        "orchestrator no-CI no-test-block wiring changed — missing: "
+        f"{missing}. The no-test-block branch must consult "
+        "should_block_no_test_unverified_merge and park the PR; update "
         "orchestrator.py AND this guard together."
     )
 

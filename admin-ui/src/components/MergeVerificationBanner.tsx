@@ -12,6 +12,10 @@ interface MergeVerificationBannerProps {
   /** When true, the honest-block policy is active: degraded fall-opens are held
    *  instead of merging unverified. Only relevant when the no-CI gate is active. */
   blockDegradedEnabled?: boolean;
+  /** When true, the no-test-command hold policy is active: unverified merges with
+   *  no detectable test command are held instead of merged. Only relevant when the
+   *  no-CI gate is active. */
+  blockNoTestEnabled?: boolean;
   className?: string;
 }
 
@@ -24,7 +28,7 @@ interface MergeVerificationBannerProps {
  * Shared between the onboarding success step (NewProjectModal) and project settings
  * (ProjectBuildConfigSection) so both surfaces stay consistent.
  */
-export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled, className }: MergeVerificationBannerProps) {
+export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled, blockNoTestEnabled, className }: MergeVerificationBannerProps) {
   if (!verdict) return null;
 
   const wrap = `rounded-lg border px-3 py-2.5 ${className ?? ''}`;
@@ -34,6 +38,8 @@ export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled
   const summaryLine = formatMergeGateSummary(runtime?.summary);
   const lastBlockAt = runtime?.last_degraded_block_at ? parseTimestamp(runtime.last_degraded_block_at) : null;
   const lastBlockReason = runtime?.last_degraded_block_reason ? humanizeUnverifiedReason(runtime.last_degraded_block_reason) : null;
+  const lastNoTestBlockAt = runtime?.last_no_test_block_at ? parseTimestamp(runtime.last_no_test_block_at) : null;
+  const lastNoTestBlockReason = runtime?.last_no_test_block_reason ? humanizeUnverifiedReason(runtime.last_no_test_block_reason) : null;
   const mismatch = verdict.state === 'tests_gated' && Boolean(unverifiedAt && (!verifiedAt || unverifiedAt.getTime() > verifiedAt.getTime()));
   const runtimeState = runtime
     ? (mismatch
@@ -193,6 +199,18 @@ export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled
               {lastBlockAt ? (
                 <p className="text-[10px] text-neutral-400">
                   Last block: {formatAbsolute(lastBlockAt.getTime())}{lastBlockReason ? ` — ${lastBlockReason}` : ''}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+          {blockNoTestEnabled ? (
+            <div className="mt-2 rounded-md border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5 space-y-0.5" data-testid="no-test-block-badge">
+              <p className="text-[10px] text-indigo-300 font-medium">
+                No-test hold policy active — unverified merges are held
+              </p>
+              {lastNoTestBlockAt ? (
+                <p className="text-[10px] text-neutral-400">
+                  Last hold: {formatAbsolute(lastNoTestBlockAt.getTime())}{lastNoTestBlockReason ? ` — ${lastNoTestBlockReason}` : ''}
                 </p>
               ) : null}
             </div>

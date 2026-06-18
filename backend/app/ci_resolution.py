@@ -434,6 +434,24 @@ def merge_gate_runtime_block(project) -> dict[str, Any] | None:
     if block_counts:
         block["degraded_block_counts"] = block_counts
 
+    # Additive no-test honest-block fields — present only when the opt-in
+    # ``block_no_test_unverified_merge`` policy actually HELD a PR. A project
+    # that never blocked (or never opted in) omits all three, so the shape stays
+    # backward-compatible.
+    if raw.get("last_no_test_block_at") is not None:
+        block["last_no_test_block_at"] = raw.get("last_no_test_block_at")
+    if raw.get("last_no_test_block_reason") is not None:
+        block["last_no_test_block_reason"] = raw.get("last_no_test_block_reason")
+    raw_no_test_counts = raw.get("no_test_block_counts")
+    no_test_counts: dict[str, int] = {}
+    if isinstance(raw_no_test_counts, dict):
+        for reason_key, count in raw_no_test_counts.items():
+            if isinstance(count, bool) or not isinstance(count, (int, float)):
+                continue
+            no_test_counts[str(reason_key)] = int(count)
+    if no_test_counts:
+        block["no_test_block_counts"] = no_test_counts
+
     # Additive history fields. A legacy four-key-only record (no list, no tally)
     # simply omits these — older consumers keep working unchanged.
     raw_outcomes = raw.get("recent_outcomes")
@@ -1156,6 +1174,101 @@ def should_block_degraded_unverified_merge(project, unverified_reason) -> bool:
     if not block_degraded_unverified_merge_enabled(project):
         return False
     return is_degraded_unverified_reason(unverified_reason)
+
+
+def block_no_test_unverified_merge_enabled(project) -> bool:
+    """Whether the project opted into the no-test honest-block policy (default OFF).
+
+    Reads ``build_config.block_no_test_unverified_merge``. Absent / falsy ==
+    OFF == today's behavior for every existing project. Defensive about a
+    missing / malformed ``build_config`` so it can be called on any project.
+    """
+    return bool(
+        (getattr(project, "build_config", None) or {}).get(
+            "block_no_test_unverified_merge", False
+        )
+    )
+
+
+def should_block_no_test_unverified_merge(project, unverified_reason) -> bool:
+    """Whether the no-CI merge gate should HONESTLY BLOCK when there is no
+    detectable test command, instead of merging UNVERIFIED.
+
+    Returns True ONLY when BOTH hold:
+      - the project's opt-in policy flag is ON
+        (``build_config.block_no_test_unverified_merge``); AND
+      - the fall-open reason is ``'no_detectable_test_command'`` (a BENIGN
+        reason — nothing to verify — but the operator wants human review).
+
+    NEVER True for DEGRADED reasons (those are covered by the separate
+    ``block_degraded_unverified_merge`` policy) and NEVER True when the policy
+    is off (the default), so today's behavior is byte-for-byte unchanged for
+    every existing project. Defensive about ``project is None`` / missing
+    build_config.
+    """
+    if not block_no_test_unverified_merge_enabled(project):
+        return False
+    return unverified_reason == "no_detectable_test_command"
+
+
+def record_no_ci_gate_no_test_block(
+    db_session,
+    project,
+    *,
+    unverified_reason: str | None,
+    when,
+) -> None:
+    """Best-effort persist that the no-CI gate HONESTLY BLOCKED a no-test
+    unverified merge — the opt-in ``block_no_test_unverified_merge`` policy is
+    ON and the gate fell open with ``no_detectable_test_command`` (no suite to run).
+
+    Records the same terminal-outcome trend as any other fall-open via
+    :func:`record_no_ci_gate_runtime` (the suite did NOT run, so
+    ``executed_real_tests`` is False and the reason is tallied) AND additionally
+    stamps block-specific fields so an operator can distinguish a PR that was
+    deliberately HELD from one that merged UNVERIFIED:
+      - ``last_no_test_block_at`` / ``last_no_test_block_reason``;
+      - ``no_test_block_counts``: ``{reason_key: count}`` tally.
+
+    Best-effort by contract: mutates the in-memory ``project`` and stages it on
+    ``db_session`` (the caller's commit persists it) but NEVER raises — a
+    failure here must not block or break the gate hot path.
+    """
+    try:
+        if project is None:
+            return
+        record_no_ci_gate_runtime(
+            db_session,
+            project,
+            executed_real_tests=False,
+            unverified_reason=unverified_reason,
+            when=when,
+        )
+        when_iso = when.isoformat() if hasattr(when, "isoformat") else str(when)
+        runtime: dict[str, Any] = dict(
+            getattr(project, "merge_gate_runtime", None) or {}
+        )
+        runtime["last_no_test_block_at"] = when_iso
+        if unverified_reason:
+            runtime["last_no_test_block_reason"] = str(unverified_reason)
+            prior_counts = runtime.get("no_test_block_counts")
+            counts: dict[str, int] = (
+                dict(prior_counts) if isinstance(prior_counts, dict) else {}
+            )
+            key = str(unverified_reason)
+            counts[key] = int(counts.get(key, 0) or 0) + 1
+            runtime["no_test_block_counts"] = counts
+        project.merge_gate_runtime = runtime
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(project, "merge_gate_runtime")
+        if db_session is not None:
+            db_session.add(project)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[CI_RESOLUTION] failed to record no-CI gate no-test block",
+            exc_info=True,
+        )
 
 
 def classify_unverified_fall_open_reason(
