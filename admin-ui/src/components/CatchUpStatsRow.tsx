@@ -152,19 +152,26 @@ export function CatchUpStatsRow({ digest }: CatchUpStatsRowProps) {
               if (!byType) return null;
               const entries = Object.entries(byType)
                 .filter(([, v]) => typeof v === 'number')
-                .sort((a, b) => a[0].localeCompare(b[0]));
+                .sort((a, b) => b[1] - a[1]);
               if (entries.length === 0) return null;
               return (
                 <span
                   className="flex items-center gap-1 text-neutral-400"
                   title="First-attempt success rate by task type"
                 >
-                  <span>By type:</span>
-                  {entries.map(([type, rate], i) => (
-                    <span key={type} className={tone(rate)}>
-                      {type}: {Math.round(rate * 100)}%{i < entries.length - 1 ? ' |' : ''}
-                    </span>
-                  ))}
+                  <span>Type:</span>
+                  {entries.map(([type, rate]) => {
+                    const style = TASK_TYPE_STYLES[type];
+                    return (
+                      <span
+                        key={type}
+                        className={`${style?.bg ?? 'bg-neutral-500/10 border-neutral-500/20'} ${style?.text ?? 'text-neutral-400'} border px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider`}
+                        title={`${type}: ${Math.round(rate * 100)}% first-attempt success`}
+                      >
+                        {style?.label ?? type} {Math.round(rate * 100)}%
+                      </span>
+                    );
+                  })}
                 </span>
               );
             })()}
