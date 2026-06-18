@@ -1,5 +1,4 @@
 import fs from 'fs';
-import path from 'path';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
@@ -64,6 +63,7 @@ import { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajector
 export { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajectorySection, formatDriftSection, verifyStepsOk } from './review-fix-history.js';
 import { detectMigrationConflict, buildMigrationConflictGuidance, extractReservedMigrationRevision } from './review-fix-migration.js';
 import { resolveMigrationLayout } from './specialized.js';
+import { downloadViewportShots } from '../utils/viewport-shot-download.js';
 export { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
 export type { MigrationConflict } from './review-fix-migration.js';
 
@@ -501,25 +501,16 @@ export async function handleReview(
   const reviewProjectMetaEarly = task.project_metadata as Record<string, unknown> | undefined;
   const reviewProjectIdEarly = strVal(reviewProjectMetaEarly?.project_id as string | undefined);
   const reviewOrchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
-  const downloadedShotPaths: string[] = [];
+  let downloadedShotPaths: string[] = [];
   if (viewportShotEntries.length > 0 && viewportSourceTaskId && reviewProjectIdEarly) {
-    const shotDir = `/tmp/viewport_review_${taskId}`;
-    try { fs.mkdirSync(shotDir, { recursive: true }); } catch { /* ignore */ }
-    for (const entry of viewportShotEntries.slice(0, 8)) {
-      const name = strVal(entry.name);
-      if (!name) continue;
-      const downloadUrl = `${reviewOrchestratorUrl}/api/admin/viewport-shots/download-url` +
-        `?project_id=${encodeURIComponent(reviewProjectIdEarly)}` +
-        `&task_id=${encodeURIComponent(viewportSourceTaskId)}` +
-        `&name=${encodeURIComponent(name)}`;
-      const dest = `${shotDir}/${path.basename(name)}.png`;
-      try {
-        execFileSync('curl', ['-sfL', '--max-time', '30', '-o', dest, downloadUrl]);
-        downloadedShotPaths.push(dest);
-      } catch {
-        sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`);
-      }
-    }
+    downloadedShotPaths = downloadViewportShots({
+      entries: viewportShotEntries,
+      shotDir: `/tmp/viewport_review_${taskId}`,
+      orchestratorUrl: reviewOrchestratorUrl,
+      projectId: reviewProjectIdEarly,
+      sourceTaskId: viewportSourceTaskId,
+      onError: (name) => { sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`); },
+    });
     if (downloadedShotPaths.length > 0) {
       sendLog(ws, `[VIEWPORT] Downloaded ${downloadedShotPaths.length} screenshot(s) for visual review\n`);
     }
@@ -896,25 +887,16 @@ export async function handleFix(
   const fixViewportProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
   const fixViewportProjectId = strVal(fixViewportProjectMeta?.project_id as string | undefined);
   const fixViewportOrchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
-  const downloadedFixShotPaths: string[] = [];
+  let downloadedFixShotPaths: string[] = [];
   if (viewportShotEntries.length > 0 && viewportSourceTaskId && fixViewportProjectId) {
-    const shotDir = `/tmp/viewport_fix_${taskId}`;
-    try { fs.mkdirSync(shotDir, { recursive: true }); } catch { /* ignore */ }
-    for (const entry of viewportShotEntries.slice(0, 8)) {
-      const name = strVal(entry.name);
-      if (!name) continue;
-      const downloadUrl = `${fixViewportOrchestratorUrl}/api/admin/viewport-shots/download-url` +
-        `?project_id=${encodeURIComponent(fixViewportProjectId)}` +
-        `&task_id=${encodeURIComponent(viewportSourceTaskId)}` +
-        `&name=${encodeURIComponent(name)}`;
-      const dest = `${shotDir}/${path.basename(name)}.png`;
-      try {
-        execFileSync('curl', ['-sfL', '--max-time', '30', '-o', dest, downloadUrl]);
-        downloadedFixShotPaths.push(dest);
-      } catch {
-        sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`);
-      }
-    }
+    downloadedFixShotPaths = downloadViewportShots({
+      entries: viewportShotEntries,
+      shotDir: `/tmp/viewport_fix_${taskId}`,
+      orchestratorUrl: fixViewportOrchestratorUrl,
+      projectId: fixViewportProjectId,
+      sourceTaskId: viewportSourceTaskId,
+      onError: (name) => { sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`); },
+    });
     if (downloadedFixShotPaths.length > 0) {
       sendLog(ws, `[VIEWPORT] Downloaded ${downloadedFixShotPaths.length} screenshot(s) for visual context\n`);
     }

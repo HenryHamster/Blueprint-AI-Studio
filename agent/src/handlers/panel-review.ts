@@ -1,5 +1,3 @@
-import fs from 'fs';
-import path from 'path';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
@@ -45,6 +43,7 @@ import {
   buildReviewSeverityGuideSection,
 } from '../prompts/review-prompt.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
+import { downloadViewportShots } from '../utils/viewport-shot-download.js';
 
 export const PANEL_REVIEW_LENSES = [
   {
@@ -444,25 +443,16 @@ export async function handlePanelReview(
   const panelProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
   const panelProjectIdForShots = strVal(panelProjectMeta?.project_id as string | undefined);
   const panelOrchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
-  const downloadedShotPaths: string[] = [];
+  let downloadedShotPaths: string[] = [];
   if (viewportShotEntries.length > 0 && viewportSourceTaskId && panelProjectIdForShots) {
-    const shotDir = `/tmp/viewport_review_${taskId}`;
-    try { fs.mkdirSync(shotDir, { recursive: true }); } catch { /* ignore */ }
-    for (const entry of viewportShotEntries.slice(0, 8)) {
-      const name = strVal(entry.name);
-      if (!name) continue;
-      const downloadUrl = `${panelOrchestratorUrl}/api/admin/viewport-shots/download-url` +
-        `?project_id=${encodeURIComponent(panelProjectIdForShots)}` +
-        `&task_id=${encodeURIComponent(viewportSourceTaskId)}` +
-        `&name=${encodeURIComponent(name)}`;
-      const dest = `${shotDir}/${path.basename(name)}.png`;
-      try {
-        execFileSync('curl', ['-sfL', '--max-time', '30', '-o', dest, downloadUrl]);
-        downloadedShotPaths.push(dest);
-      } catch {
-        sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`);
-      }
-    }
+    downloadedShotPaths = downloadViewportShots({
+      entries: viewportShotEntries,
+      shotDir: `/tmp/viewport_review_${taskId}`,
+      orchestratorUrl: panelOrchestratorUrl,
+      projectId: panelProjectIdForShots,
+      sourceTaskId: viewportSourceTaskId,
+      onError: (name) => { sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`); },
+    });
     if (downloadedShotPaths.length > 0) {
       sendLog(ws, `[VIEWPORT] Downloaded ${downloadedShotPaths.length} screenshot(s) for panel review\n`);
     }
