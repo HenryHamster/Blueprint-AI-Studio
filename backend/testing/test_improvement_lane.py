@@ -3469,3 +3469,187 @@ class TestImprovementLaneDrain:
         assert member.reserved_lane_id is None
         assert member.reservation_expires_at is None
         assert member.reservation_hard_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_orphaned_lane_workspace_reclaimed_when_member_torn_down(
+    db: AsyncSession, mocker
+):
+    """retire_and_delete_pool_vm must clear workspace_state and
+    workspace_vm_instance_id on any lane whose backing VM is torn down,
+    regardless of the teardown reason (drain, cost-guard, idle-reaper, etc.)."""
+    from unittest.mock import patch
+
+    from app.warm_pool_maintainer import retire_and_delete_pool_vm
+
+    project_id = await _make_project(db)
+
+    lane = await create_lane(
+        db,
+        project_id=project_id,
+        direction_id="d-orphan-vm-test",
+        title="Orphan workspace test",
+        goal="Verify workspace cleared on VM teardown",
+        branch_name="lane/orphan-vm",
+        base_branch="main",
+    )
+    lane.status = ImprovementLaneStatus.ACTIVE.value
+    lane.workspace_state = "WARM_RESERVED"
+    lane.workspace_vm_instance_id = "pool-vm-orphan-teardown-1"
+    db.add(lane)
+
+    member = PoolVm(
+        vm_instance_id="pool-vm-orphan-teardown-1",
+        project_id=project_id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+    )
+    db.add(member)
+    await db.commit()
+
+    with patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock):
+        ok = await retire_and_delete_pool_vm(
+            db, member, reason="pool_idle_ttl", claim_grace_seconds=0
+        )
+
+    assert ok is True
+    # Pool VM row must be gone.
+    assert await db.get(PoolVm, member.id) is None
+    # Lane workspace state must be cleared — no dangling reference to deleted VM.
+    refreshed = await db.get(ImprovementLane, lane.id)
+    assert refreshed.workspace_state == "COLD"
+    assert refreshed.workspace_vm_instance_id is None
+
+
+# ---------------------------------------------------------------------------
+# lane control-plane durability across simulated orchestrator restart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lane_control_plane_survives_simulated_restart():
+    """Lane control-plane state (checkpoints, manifest, accounting, workspace)
+    reconstructs exactly from DB across a simulated orchestrator restart (session
+    close + reopen).  Also verifies that a lane whose backing pool VM vanished
+    during downtime is reclaimed to COLD by reclaim_orphaned_lane_workspace_states.
+    """
+    from app.improvement_lane_ops import reclaim_orphaned_lane_workspace_states
+    from app.models import Project
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    Session = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+
+    # ── Phase 1: build full lane state and commit ──────────────────────────
+    vm_instance_id = "pool-vm-restart-test-1"
+    lane_id = None
+    vm_pk = None
+
+    async with Session() as s1:
+        project_id = uuid.uuid4()
+        s1.add(
+            Project(
+                id=project_id,
+                user_id="test-user",
+                name="test-project",
+                github_owner="owner",
+                github_repo="repo",
+                status="DEPLOYING",
+            )
+        )
+        await s1.commit()
+
+        lane = await create_lane(
+            s1,
+            project_id=project_id,
+            direction_id="d-restart-test",
+            title="Restart durability test",
+            goal="Verify DB state survives session close",
+            branch_name="lane/restart-test",
+            base_branch="main",
+        )
+        task_id = uuid.uuid4()
+        lane.status = ImprovementLaneStatus.ACTIVE.value
+        lane.current_task_id = task_id
+        await s1.commit()
+
+        cp = LaneCheckpointPayload(
+            sha="restart-sha-abc1234",
+            summary="pre-restart checkpoint",
+            validated=LaneCheckpointValidated(lint=True, tests="green"),
+            manifest_patch={"progress": ["restart test pass"]},
+            tokens_in=500,
+            tokens_out=250,
+            vm_cost_usd=0.02,
+        )
+        await checkpoint_lane(s1, lane.id, "create", task_id, cp)
+        await s1.commit()
+
+        # Attach a PoolVm reservation and record WARM_RESERVED workspace state.
+        member = PoolVm(
+            vm_instance_id=vm_instance_id,
+            project_id=project_id,
+            state=PoolVmState.IDLE,
+            reserved_lane_id=lane.id,
+        )
+        s1.add(member)
+        lane_row = await s1.get(ImprovementLane, lane.id)
+        lane_row.workspace_state = "WARM_RESERVED"
+        lane_row.workspace_vm_instance_id = vm_instance_id
+        await s1.commit()
+
+        lane_id = lane.id
+        vm_pk = member.id
+    # s1 is closed here — simulates process exit / orchestrator restart.
+
+    # ── Phase 2: fresh session reconstructs control-plane state from DB ───
+    async with Session() as s2:
+        recovered = await s2.get(ImprovementLane, lane_id)
+
+        assert recovered is not None, "lane must persist across session close"
+        assert recovered.status == ImprovementLaneStatus.PARKED.value
+        assert recovered.checkpoint_seq == 1
+        assert recovered.last_checkpoint_sha == "restart-sha-abc1234"
+        assert recovered.last_checkpoint_phase == "create"
+        assert len(recovered.checkpoints) == 1
+        assert recovered.checkpoints[0]["sha"] == "restart-sha-abc1234"
+        assert recovered.checkpoints[0]["validated"]["tests"] == "green"
+        assert "restart test pass" in recovered.manifest.get("progress", [])
+        assert recovered.llm_input_tokens_total == 500
+        assert recovered.llm_output_tokens_total == 250
+        assert abs(recovered.vm_cost_usd_total - 0.02) < 1e-6
+        assert recovered.workspace_state == "WARM_RESERVED"
+        assert recovered.workspace_vm_instance_id == vm_instance_id
+
+        # Simulate the pool VM being torn down during downtime (crash / external
+        # deletion bypassing retire_and_delete_pool_vm).
+        vm_row = await s2.get(PoolVm, vm_pk)
+        await s2.delete(vm_row)
+        await s2.commit()
+
+        # Startup recovery sweep must reclaim the dangling workspace pointer.
+        reclaimed = await reclaim_orphaned_lane_workspace_states(s2)
+        await s2.commit()
+
+        assert reclaimed == 1
+        await s2.refresh(recovered)
+        assert recovered.workspace_state == "COLD", (
+            "workspace_state must be reclaimed to COLD when backing VM is gone"
+        )
+        assert recovered.workspace_vm_instance_id is None
+
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await engine.dispose()

@@ -45,6 +45,7 @@ from app.models import (
 from app.time_utils import _utcnow
 from app.warm_pool import (
     clear_lane_warm_workspace_if_matching_member,
+    clear_lanes_for_torn_down_vm,
     IDLE_POOL_STATES,
     LIVE_POOL_STATES,
     WARM_POOL_PIN_KEY,
@@ -548,6 +549,17 @@ async def retire_and_delete_pool_vm(
             )
         await session.delete(fresh)
         await session.commit()
+    # Clear workspace state on any lane that was warm-reserved or leased to
+    # this VM — covers ALL teardown paths (drain, cost-guard, stale-image,
+    # idle-reaper) so no lane is left with a dangling workspace_vm_instance_id.
+    cleared = await clear_lanes_for_torn_down_vm(session, vm_id)
+    if cleared:
+        await session.commit()
+        logger.info(
+            "[WARM-POOL] cleared %d lane workspace(s) for torn-down VM %s",
+            cleared,
+            vm_id,
+        )
     logger.info(
         "[WARM-POOL] retired pool VM vm_instance_id=%s reason=%s", vm_id, reason
     )

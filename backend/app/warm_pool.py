@@ -883,6 +883,27 @@ async def clear_lane_warm_workspace_if_matching_member(
     return bool(result.rowcount)
 
 
+async def clear_lanes_for_torn_down_vm(session, vm_instance_id: str) -> int:
+    """Clear workspace state for all lanes whose backing VM was just torn down.
+
+    Handles both WARM_RESERVED and LEASED states across ALL teardown paths
+    (drain, cost-guard, stale-image retirement, idle-reaper) by matching on
+    workspace_vm_instance_id rather than the pool VM's reserved_lane_id pointer.
+    Returns the number of lanes cleared.
+    """
+    from app.models import ImprovementLane
+
+    result = await session.execute(
+        update(ImprovementLane)
+        .where(
+            ImprovementLane.workspace_vm_instance_id == vm_instance_id,
+            ImprovementLane.workspace_state != "COLD",
+        )
+        .values(workspace_state="COLD", workspace_vm_instance_id=None)
+    )
+    return result.rowcount or 0
+
+
 async def mark_pool_vm_retiring(
     session,
     vm_instance_id: str,
