@@ -3459,6 +3459,31 @@ export async function fetchEvergreenFillSettings(signal?: AbortSignal): Promise<
   };
 }
 
+export interface StructuralHealthRowMeasurement {
+  task_id: string;
+  project_id: string;
+  bytes: number;
+}
+
+export interface StructuralHealthObservabilityResponse {
+  cycles: number;
+  enrolled_total: number;
+  last_decision: Record<string, unknown> | null;
+  largest_rows: StructuralHealthRowMeasurement[];
+  recent: Record<string, unknown>[];
+  last_jsonb_bloat_decision: Record<string, unknown> | null;
+  last_gin_overhead_decision: Record<string, unknown> | null;
+  last_pool_saturation_decision: Record<string, unknown> | null;
+}
+
+export async function fetchStructuralHealthObservability(
+  signal?: AbortSignal,
+): Promise<StructuralHealthObservabilityResponse> {
+  const res = await apiFetch('/api/admin/evergreen/structural-health-observability', undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch structural health observability: ${res.status}`);
+  return res.json();
+}
+
 export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSettings>): Promise<void> {
   const res = await apiFetch('/api/admin/settings', {
     method: 'PATCH',

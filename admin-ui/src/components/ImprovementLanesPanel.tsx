@@ -383,6 +383,10 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
     setPreflight(null);
     setPreflightError(null);
     setLoading(Boolean(projectId));
+    setDrainResult(null);
+    setDrainError(null);
+    setReclaimResult(null);
+    setReclaimError(null);
   }, [projectId]);
 
   usePoller((signal) => load(signal), {

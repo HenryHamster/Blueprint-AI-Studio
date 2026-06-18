@@ -7,6 +7,7 @@ import {
   type EvergreenFillSettings,
 } from '../api';
 import { EvergreenFillObservabilityPanel } from './EvergreenFillObservabilityPanel';
+import { StructuralHealthObservabilityPanel } from './StructuralHealthObservabilityPanel';
 import { EvergreenBacklogPanel } from './EvergreenBacklogPanel';
 
 interface SettingsOrchestratorSectionProps {
@@ -572,6 +573,9 @@ export function SettingsOrchestratorSection({
 
       {/* Evergreen Fill Observability */}
       <EvergreenFillObservabilityPanel />
+
+      {/* Structural Health Observability */}
+      <StructuralHealthObservabilityPanel />
 
       {/* Evergreen Backlog (project-scoped) */}
       <EvergreenBacklogPanel projectId={selectedProjectId} />

@@ -710,4 +710,32 @@ describe('ImprovementLanesPanel', () => {
     expect(await screen.findByTestId('reclaim-error')).toBeTruthy();
     expect(screen.getByTestId('reclaim-error').textContent).toBe('reclaim failed');
   });
+
+  test('clears drain and reclaim result/error banners when projectId changes', async () => {
+    fetchImprovementLanes.mockResolvedValue(LANE_RESPONSE);
+    drainLanePilot.mockResolvedValueOnce({ reservations_cleared: 1, lanes_killed: 0, reason: 'operator_drain' });
+    reclaimOrphanedLaneWorkspaces.mockResolvedValueOnce({ reclaimed: 2 });
+
+    const { rerender } = render(<ImprovementLanesPanel projectId="proj-1" />);
+    await screen.findAllByTestId('improvement-lane-row');
+
+    // trigger drain result banner
+    fireEvent.click(screen.getByTestId('drain-lane-pilot-button'));
+    fireEvent.click(await screen.findByTestId('confirm-dialog-confirm'));
+    expect(await screen.findByTestId('drain-result-summary')).toBeTruthy();
+
+    // trigger reclaim result banner
+    reclaimOrphanedLaneWorkspaces.mockResolvedValueOnce({ reclaimed: 2 });
+    fireEvent.click(screen.getByTestId('reclaim-orphaned-button'));
+    expect(await screen.findByTestId('reclaim-result-summary')).toBeTruthy();
+
+    // switch project — both banners should disappear
+    fetchImprovementLanes.mockResolvedValue({ lanes: [], shadow_health: null, trial_metrics: null });
+    rerender(<ImprovementLanesPanel projectId="proj-2" />);
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('drain-result-summary')).toBeNull();
+      expect(screen.queryByTestId('reclaim-result-summary')).toBeNull();
+    });
+  });
 });
