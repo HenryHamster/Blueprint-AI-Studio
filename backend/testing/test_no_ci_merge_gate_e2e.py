@@ -2874,6 +2874,29 @@ def test_orchestrator_no_ci_gate_bypass_reason_wiring():
     )
 
 
+def test_orchestrator_no_ci_gate_redetects_missing_test_command_wiring():
+    """Drift guard: the orchestrator's no-CI gate must still call
+    ``maybe_redetect_missing_test_command`` when a repo has no detectable test
+    command at gate-time, before falling back to the unverified merge. If this
+    call is dropped, the gate silently regresses to always merging UNVERIFIED
+    without attempting re-detection, even though a test command might be
+    recoverable."""
+    src = _orchestrator_source()
+    required = [
+        "maybe_redetect_missing_test_command",
+        "_redetected = await",
+        "_no_ci_verify_gate = True",
+        '"no_detectable_test_command"',
+    ]
+    missing = [needle for needle in required if needle not in src]
+    assert not missing, (
+        "orchestrator no-CI gate re-detection wiring changed — missing: "
+        f"{missing}. Before merging a no-CI repo UNVERIFIED, the gate must "
+        "attempt maybe_redetect_missing_test_command and route to verify_tests "
+        "if successful; update orchestrator.py AND this guard together."
+    )
+
+
 # ---------------------------------------------------------------------------
 # PR-caused self-suppression: the PR's OWN diff disabled tests AND the suite
 # stopped verifying (all-skipped, or a mostly-skipped pass). The gate must BLOCK
