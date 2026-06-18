@@ -34,6 +34,7 @@ from app.admin import _get_user_project_with_role
 from app.resource_envelope import (
     get_project_recent_spend_usd,
     resolve_project_spend_ceiling,
+    resolve_project_spend_warning_fraction,
     resolve_project_spend_window_days,
     resolve_project_vm_cap,
 )
@@ -812,6 +813,7 @@ def _resource_envelope_response(
         "max_concurrent_vms": resolve_project_vm_cap(project),
         "spend_ceiling_usd": spend_ceiling_usd,
         "spend_window_days": resolve_project_spend_window_days(project),
+        "spend_warning_fraction": resolve_project_spend_warning_fraction(project),
         "max_concurrent_compute_jobs": resolve_project_compute_job_concurrency_cap(
             project.id
         ),
@@ -1198,6 +1200,7 @@ async def update_resource_envelope_config(
         "max_concurrent_vms",
         "spend_ceiling_usd",
         "spend_window_days",
+        "spend_warning_fraction",
         "max_concurrent_compute_jobs",
     }
     if not body:

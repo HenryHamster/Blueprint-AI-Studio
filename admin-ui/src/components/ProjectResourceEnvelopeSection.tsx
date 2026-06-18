@@ -32,6 +32,7 @@ export function ProjectResourceEnvelopeSection({
   const [maxConcurrentVmsInput, setMaxConcurrentVmsInput] = useState('');
   const [spendCeilingUsdInput, setSpendCeilingUsdInput] = useState('');
   const [spendWindowDaysInput, setSpendWindowDaysInput] = useState('30');
+  const [spendWarningPctInput, setSpendWarningPctInput] = useState('');
   const [maxConcurrentComputeJobsInput, setMaxConcurrentComputeJobsInput] = useState('');
   const [saving, setSaving] = useState(false);
 
@@ -39,6 +40,7 @@ export function ProjectResourceEnvelopeSection({
     setMaxConcurrentVmsInput(data?.max_concurrent_vms != null ? String(data.max_concurrent_vms) : '');
     setSpendCeilingUsdInput(data?.spend_ceiling_usd != null ? String(data.spend_ceiling_usd) : '');
     setSpendWindowDaysInput(String(data?.spend_window_days ?? 30));
+    setSpendWarningPctInput(data?.spend_warning_fraction != null ? String(Math.round(data.spend_warning_fraction * 100)) : '');
     setMaxConcurrentComputeJobsInput(data?.max_concurrent_compute_jobs != null ? String(data.max_concurrent_compute_jobs) : '');
   }, [data]);
 
@@ -59,6 +61,12 @@ export function ProjectResourceEnvelopeSection({
     return Number.isInteger(parsed) && parsed >= 1 ? parsed : Number.NaN;
   }, [spendWindowDaysInput]);
 
+  const parsedSpendWarningFraction = useMemo(() => {
+    if (!spendWarningPctInput.trim()) return null;
+    const parsed = Number(spendWarningPctInput);
+    return Number.isFinite(parsed) && parsed > 0 && parsed <= 100 ? parsed / 100 : Number.NaN;
+  }, [spendWarningPctInput]);
+
   const parsedMaxConcurrentComputeJobs = useMemo(() => {
     if (!maxConcurrentComputeJobsInput.trim()) return null;
     const parsed = Number(maxConcurrentComputeJobsInput);
@@ -70,6 +78,7 @@ export function ProjectResourceEnvelopeSection({
     max_concurrent_vms: null,
     spend_ceiling_usd: null,
     spend_window_days: 30,
+    spend_warning_fraction: null,
     max_concurrent_compute_jobs: null,
     active_vm_count: 0,
     recent_spend_usd: 0,
@@ -98,23 +107,28 @@ export function ProjectResourceEnvelopeSection({
       ? String(current.spend_ceiling_usd ?? '') !== spendCeilingUsdInput.trim()
       : current.spend_ceiling_usd !== null;
     const windowChanged = String(current.spend_window_days ?? 30) !== spendWindowDaysInput.trim();
+    const warningChanged = spendWarningPctInput.trim()
+      ? String(Math.round((current.spend_warning_fraction ?? 0.8) * 100)) !== spendWarningPctInput.trim()
+      : current.spend_warning_fraction != null;
     const computeJobsChanged = maxConcurrentComputeJobsInput.trim()
       ? String(current.max_concurrent_compute_jobs ?? '') !== maxConcurrentComputeJobsInput.trim()
       : current.max_concurrent_compute_jobs !== null;
-    return maxChanged || spendChanged || windowChanged || computeJobsChanged;
+    return maxChanged || spendChanged || windowChanged || warningChanged || computeJobsChanged;
   }, [
     current.max_concurrent_vms,
     current.spend_ceiling_usd,
     current.spend_window_days,
+    current.spend_warning_fraction,
     current.max_concurrent_compute_jobs,
     maxConcurrentVmsInput,
     spendCeilingUsdInput,
     spendWindowDaysInput,
+    spendWarningPctInput,
     maxConcurrentComputeJobsInput,
   ]);
 
   const handleSave = async () => {
-    if (!canSave || Number.isNaN(parsedMaxConcurrent) || Number.isNaN(parsedSpendCeiling) || Number.isNaN(parsedSpendWindowDays) || Number.isNaN(parsedMaxConcurrentComputeJobs)) {
+    if (!canSave || Number.isNaN(parsedMaxConcurrent) || Number.isNaN(parsedSpendCeiling) || Number.isNaN(parsedSpendWindowDays) || Number.isNaN(parsedSpendWarningFraction) || Number.isNaN(parsedMaxConcurrentComputeJobs)) {
       return;
     }
     setSaving(true);
@@ -123,6 +137,7 @@ export function ProjectResourceEnvelopeSection({
         max_concurrent_vms: parsedMaxConcurrent,
         spend_ceiling_usd: parsedSpendCeiling,
         spend_window_days: parsedSpendWindowDays,
+        spend_warning_fraction: parsedSpendWarningFraction,
         max_concurrent_compute_jobs: parsedMaxConcurrentComputeJobs,
       });
     } finally {
@@ -131,7 +146,7 @@ export function ProjectResourceEnvelopeSection({
   };
 
   const inputDisabled = !canSave || saving;
-  const canSubmit = canSave && hasChanges && !Number.isNaN(parsedMaxConcurrent) && !Number.isNaN(parsedSpendCeiling) && !Number.isNaN(parsedSpendWindowDays) && !Number.isNaN(parsedMaxConcurrentComputeJobs);
+  const canSubmit = canSave && hasChanges && !Number.isNaN(parsedMaxConcurrent) && !Number.isNaN(parsedSpendCeiling) && !Number.isNaN(parsedSpendWindowDays) && !Number.isNaN(parsedSpendWarningFraction) && !Number.isNaN(parsedMaxConcurrentComputeJobs);
 
   return (
     <div className="space-y-6">
@@ -147,7 +162,7 @@ export function ProjectResourceEnvelopeSection({
 
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Configured Limits</h3>
-        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-5 gap-3">
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
             <div className="text-[10px] uppercase tracking-wider text-neutral-500">Concurrent VMs</div>
             <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? currentCapLabel}</div>
@@ -159,6 +174,10 @@ export function ProjectResourceEnvelopeSection({
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
             <div className="text-[10px] uppercase tracking-wider text-neutral-500">Spend window</div>
             <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? `${current.spend_window_days} days`}</div>
+          </div>
+          <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
+            <div className="text-[10px] uppercase tracking-wider text-neutral-500">Warning threshold</div>
+            <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? `${Math.round((current.spend_warning_fraction ?? 0.8) * 100)}%`}</div>
           </div>
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
             <div className="text-[10px] uppercase tracking-wider text-neutral-500">Concurrent compute jobs</div>
@@ -223,7 +242,7 @@ export function ProjectResourceEnvelopeSection({
         <p className="text-[11px] text-neutral-600 mb-3">
           Blank concurrent-VM or spend-ceiling fields clear the cap. Spend window stays required.
         </p>
-        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-5 gap-3">
           <label className="block">
             <span className="block text-xs text-neutral-400 mb-1">Max concurrent VMs</span>
             <input
@@ -261,6 +280,21 @@ export function ProjectResourceEnvelopeSection({
               value={spendWindowDaysInput}
               disabled={inputDisabled}
               onChange={e => setSpendWindowDaysInput(e.target.value)}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 disabled:opacity-60"
+            />
+          </label>
+          <label className="block">
+            <span className="block text-xs text-neutral-400 mb-1">Spend warning threshold (%)</span>
+            <input
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              inputMode="numeric"
+              value={spendWarningPctInput}
+              disabled={inputDisabled}
+              onChange={e => setSpendWarningPctInput(e.target.value)}
+              placeholder="80 (default)"
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 disabled:opacity-60"
             />
           </label>

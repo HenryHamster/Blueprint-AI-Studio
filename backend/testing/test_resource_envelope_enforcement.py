@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock
 
 import pytest
+from httpx import AsyncClient
 from sqlalchemy import select
 
 import app.shared_state as _shared_state
@@ -13,12 +14,12 @@ from app.alert_dispatch import (
 from app.autonomous_research import _spawn_periodic_task, _spawn_research_task
 from app.autonomous_research import _project_spend_ceiling_spawn_defer_reason
 from app.max_plan_pool import _account_by_id, _max_plan_pools
-from app.models import Alert, Task
+from app.models import Alert, Project, Task
 from app.orchestrator import (
     _filter_project_resource_dispatch_eligible,
     _project_resource_dispatch_defer_message,
 )
-from testing.factories import make_project, make_task
+from testing.factories import make_membership, make_project, make_task
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +64,9 @@ async def test_spend_ceiling_blocks_autonomous_research_spawn(db_session, mocker
 
     spend_mock = mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}),
+        new=AsyncMock(
+            return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}
+        ),
     )
 
     await _spawn_research_task(project, db_session)
@@ -105,7 +108,9 @@ async def test_spend_ceiling_blocks_autonomous_periodic_spawn(db_session, mocker
 
     spend_mock = mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value={"total": 7.5, "compute": 7.5, "agent_vm": 0.0, "idle": 0.0}),
+        new=AsyncMock(
+            return_value={"total": 7.5, "compute": 7.5, "agent_vm": 0.0, "idle": 0.0}
+        ),
     )
     previous_periodic = _shared_state.runtime_config.get("autonomous_periodic_tasks")
     _shared_state.runtime_config["autonomous_periodic_tasks"] = {
@@ -177,7 +182,9 @@ async def test_spend_ceiling_blocks_residual_remediation_spawn(db_session, mocke
     # Simulate over-budget spend
     mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value={"total": 15.0, "compute": 15.0, "agent_vm": 0.0, "idle": 0.0}),
+        new=AsyncMock(
+            return_value={"total": 15.0, "compute": 15.0, "agent_vm": 0.0, "idle": 0.0}
+        ),
     )
     # Stub other spawn functions to avoid side-effects
     mocker.patch("app.autonomous_research._spawn_research_task", new_callable=AsyncMock)
@@ -300,7 +307,9 @@ async def test_dispatch_defers_task_at_spend_ceiling(db_session, mocker):
 
     mocker.patch(
         "app.orchestrator.get_project_recent_spend_usd",
-        new=AsyncMock(return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}),
+        new=AsyncMock(
+            return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}
+        ),
     )
 
     msg = await _project_resource_dispatch_defer_message(db_session, task, {})
@@ -331,7 +340,9 @@ async def test_dispatch_passes_task_under_spend_ceiling(db_session, mocker):
 
     mocker.patch(
         "app.orchestrator.get_project_recent_spend_usd",
-        new=AsyncMock(return_value={"total": 9.99, "compute": 9.99, "agent_vm": 0.0, "idle": 0.0}),
+        new=AsyncMock(
+            return_value={"total": 9.99, "compute": 9.99, "agent_vm": 0.0, "idle": 0.0}
+        ),
     )
 
     msg = await _project_resource_dispatch_defer_message(db_session, task, {})
@@ -515,7 +526,9 @@ async def test_approaching_ceiling_warning_fires_in_configured_band(db_session, 
     # Spend at 85% of ceiling — above the 0.8 threshold but below the ceiling
     mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value={"total": 8.5, "compute": 8.5, "agent_vm": 0.0, "idle": 0.0}),
+        new=AsyncMock(
+            return_value={"total": 8.5, "compute": 8.5, "agent_vm": 0.0, "idle": 0.0}
+        ),
     )
 
     result = await _project_spend_ceiling_spawn_defer_reason(project, db_session)
@@ -562,7 +575,9 @@ async def test_approaching_ceiling_warning_not_fired_below_threshold(
     # Spend at 70% of ceiling — below the 0.8 threshold
     mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value={"total": 7.0, "compute": 7.0, "agent_vm": 0.0, "idle": 0.0}),
+        new=AsyncMock(
+            return_value={"total": 7.0, "compute": 7.0, "agent_vm": 0.0, "idle": 0.0}
+        ),
     )
 
     result = await _project_spend_ceiling_spawn_defer_reason(project, db_session)
@@ -604,7 +619,9 @@ async def test_at_ceiling_creates_ceiling_alert_not_approaching(db_session, mock
     # Spend exactly at the ceiling
     mocker.patch(
         "app.autonomous_research.get_project_recent_spend_usd",
-        new=AsyncMock(return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}),
+        new=AsyncMock(
+            return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}
+        ),
     )
 
     result = await _project_spend_ceiling_spawn_defer_reason(project, db_session)
@@ -639,3 +656,48 @@ async def test_at_ceiling_creates_ceiling_alert_not_approaching(db_session, mock
     )
     assert len(ceiling_alerts) == 1
     assert approaching_alerts == []
+
+
+# ---------------------------------------------------------------------------
+# spend_warning_fraction API round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_spend_warning_fraction_patch_round_trip(client: AsyncClient, db_session):
+    """PATCH spend_warning_fraction=0.7, then GET returns 0.7; clearing returns default 0.8."""
+    project = Project(
+        name="Warning Fraction Test", user_id="test-user-123", is_self_repo=True
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(member)
+    await db_session.commit()
+
+    # PATCH with spend_warning_fraction=0.7
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/resource-envelope",
+        json={"spend_warning_fraction": 0.7},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["spend_warning_fraction"] == pytest.approx(0.7)
+
+    # GET returns the persisted value
+    resp2 = await client.get(f"/api/admin/projects/{project.id}/resource-envelope")
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["spend_warning_fraction"] == pytest.approx(0.7)
+
+    # PATCH with null clears the override; GET returns the default (0.8)
+    resp3 = await client.patch(
+        f"/api/admin/projects/{project.id}/resource-envelope",
+        json={"spend_warning_fraction": None},
+    )
+    assert resp3.status_code == 200, resp3.text
+    assert resp3.json()["spend_warning_fraction"] == pytest.approx(0.8)
+
+    resp4 = await client.get(f"/api/admin/projects/{project.id}/resource-envelope")
+    assert resp4.status_code == 200, resp4.text
+    assert resp4.json()["spend_warning_fraction"] == pytest.approx(0.8)

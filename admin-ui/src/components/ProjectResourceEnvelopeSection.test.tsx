@@ -192,6 +192,7 @@ describe('ProjectResourceEnvelopeSection', () => {
       spend_ceiling_usd: null,
       spend_window_days: 21,
       max_concurrent_compute_jobs: null,
+      spend_warning_fraction: null,
     });
   });
 });

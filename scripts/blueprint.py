@@ -1825,6 +1825,84 @@ def _render_settings(data: dict) -> None:
         print(f"  {k}: {v}")
 
 
+# ── envelope ─────────────────────────────────────────────────────────────────
+
+def cmd_envelope(args: argparse.Namespace) -> None:
+    """Dispatch envelope subcommands: show / set."""
+    sub = getattr(args, "envelope_cmd", None) or "show"
+    if sub == "set":
+        _envelope_set(args)
+    else:
+        _envelope_show(args)
+
+
+def _envelope_show(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    data, err = _safe_read(f"/api/admin/projects/{pid}/resource-envelope")
+    if err or data is None:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return
+    _emit(args, data, _render_envelope)
+
+
+def _envelope_set(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'envelope set' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    updates: dict = {}
+    for kv in args.assignments:
+        if "=" not in kv:
+            print(f"ERROR: invalid KEY=VALUE format: {kv!r}", file=sys.stderr)
+            sys.exit(1)
+        k, v = kv.split("=", 1)
+        try:
+            v = int(v)
+        except ValueError:
+            try:
+                v = float(v)
+            except ValueError:
+                pass
+        updates[k] = v
+
+    if not updates:
+        print("ERROR: at least one KEY=VALUE assignment required.", file=sys.stderr)
+        sys.exit(1)
+
+    pid = get_project_id(getattr(args, "project_id", None))
+    if not _confirm(
+        f"Update envelope for project {pid}: {', '.join(f'{k}={v}' for k, v in updates.items())}?",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+
+    result = api("PATCH", f"/api/admin/projects/{pid}/resource-envelope", updates)
+    _emit(args, result, _render_envelope)
+
+
+def _render_envelope(data: dict) -> None:
+    pid = data.get("project_id", "?")
+    print(f"=== RESOURCE ENVELOPE (project {pid}) ===")
+    print(f"  max_concurrent_vms:           {data.get('max_concurrent_vms')}")
+    print(f"  spend_ceiling_usd:            {data.get('spend_ceiling_usd')}")
+    print(f"  spend_window_days:            {data.get('spend_window_days')}")
+    print(f"  max_concurrent_compute_jobs:  {data.get('max_concurrent_compute_jobs')}")
+    print(f"  active_vm_count:              {data.get('active_vm_count')}")
+    recent = data.get("recent_spend_usd")
+    if recent is not None:
+        print(f"  recent_spend_usd:             ${float(recent):.4f}")
+    throttled = data.get("is_throttled")
+    if throttled is not None:
+        print(f"  is_throttled:                 {throttled}")
+
+
 # ── messages ─────────────────────────────────────────────────────────────────
 
 def cmd_messages(args: argparse.Namespace) -> None:
@@ -3268,6 +3346,21 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="Skip the confirmation prompt (for scripting).")
 
     # analytics
+    p_envelope = sub.add_parser(
+        "envelope", parents=[common],
+        help="View or update a project's resource envelope (VM caps, spend ceilings).",
+        description="Per-project resource envelope management.",
+    )
+    envelope_sub = p_envelope.add_subparsers(dest="envelope_cmd")
+    envelope_sub.add_parser("show", parents=[common],
+                            help="Show the resource envelope and live usage.")
+    p_env_set = envelope_sub.add_parser("set", parents=[common],
+                                        help="Update resource envelope fields.")
+    p_env_set.add_argument("assignments", nargs="+", metavar="KEY=VALUE",
+                           help="Fields to update, e.g. max_concurrent_vms=4 spend_ceiling_usd=10.0")
+    p_env_set.add_argument("-y", "--yes", action="store_true",
+                           help="Skip confirmation prompt.")
+
     p_analytics = sub.add_parser(
         "analytics", parents=[common],
         help="Pipeline analytics: cost, duration, pause-stats, failing-types.",
@@ -3307,6 +3400,7 @@ _DISPATCH = {
     "settings": cmd_settings,
     "health": cmd_health,
     "analytics": cmd_analytics,
+    "envelope": cmd_envelope,
 }
 
 

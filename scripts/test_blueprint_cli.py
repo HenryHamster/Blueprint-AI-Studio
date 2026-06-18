@@ -79,6 +79,9 @@ HELP_INVOCATIONS = [
     ["fleet", "warm"],
     ["fleet", "accounts"],
     ["fleet", "zones"],
+    ["envelope"],
+    ["envelope", "show"],
+    ["envelope", "set"],
 ]
 
 
@@ -477,6 +480,34 @@ def mock_api(monkeypatch):
                 "top_reasons": [{"reason": "stale_tasks", "count": 2}],
                 "trend": "flat",
                 "prev_window_auto_paused_count": 2,
+            }
+        if "/resource-envelope" in path and method == "GET":
+            return {
+                "project_id": "proj-test-uuid",
+                "max_concurrent_vms": 4,
+                "spend_ceiling_usd": 50.0,
+                "spend_window_days": 7,
+                "max_concurrent_compute_jobs": 2,
+                "active_vm_count": 1,
+                "recent_spend_usd": 12.34,
+                "recent_spend_compute_usd": 8.0,
+                "recent_spend_agent_vm_usd": 4.0,
+                "recent_spend_idle_usd": 0.34,
+                "is_throttled": False,
+            }
+        if "/resource-envelope" in path and method == "PATCH":
+            return {
+                "project_id": "proj-test-uuid",
+                "max_concurrent_vms": 6,
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 7,
+                "max_concurrent_compute_jobs": 2,
+                "active_vm_count": 1,
+                "recent_spend_usd": 12.34,
+                "recent_spend_compute_usd": 8.0,
+                "recent_spend_agent_vm_usd": 4.0,
+                "recent_spend_idle_usd": 0.34,
+                "is_throttled": False,
             }
         if "/admin/failing-task-types" in path:
             return {
@@ -2472,3 +2503,36 @@ def test_analytics_failing_types_json(mock_api, capsys):
     assert parsed["gated_types"][0]["task_type"] == "create"
     assert parsed["global_failure_threshold"] == 0.8
     assert any("failing-task-types" in path for _, path, _ in mock_api)
+
+
+def test_envelope_show_json(mock_api, capsys):
+    """envelope show --json returns valid JSON with envelope fields."""
+    rc = blueprint.main(["--json", "envelope", "show"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["project_id"] == "proj-test-uuid"
+    assert parsed["max_concurrent_vms"] == 4
+    assert parsed["spend_ceiling_usd"] == 50.0
+    assert parsed["is_throttled"] is False
+    assert any("resource-envelope" in path for _, path, _ in mock_api)
+
+
+def test_envelope_set_read_only_refused(mock_api, monkeypatch):
+    """envelope set refuses under a read-only config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["envelope", "set", "max_concurrent_vms=6"])
+    assert exc.value.code == 1
+
+
+def test_envelope_set_patches_envelope(mock_api, monkeypatch, capsys):
+    """envelope set --yes PATCHes the resource-envelope endpoint."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["envelope", "set", "--yes", "max_concurrent_vms=6"])
+    assert rc == 0
+    assert any(
+        m == "PATCH" and "resource-envelope" in p
+        for m, p, _ in mock_api
+    )
