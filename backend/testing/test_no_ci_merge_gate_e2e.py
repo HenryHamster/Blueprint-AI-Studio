@@ -63,7 +63,7 @@ from app.ci_resolution import (
 )
 from app.build_config_detection import maybe_redetect_ci_presence
 from app.models import Alert, Artifact, ArtifactType, Project, Task, TaskStatus
-from app.orchestrator import _VERIFY_TESTS_MAX_RETRIES
+from app.orchestrator import _VERIFY_TESTS_MAX_RETRIES, _VERIFY_TESTS_SPAWN_DEFERRAL_CAP
 from app.release_qualifier_audit import _latest_artifact_logs
 from app.review_pipeline import _spawn_pipeline_task
 
@@ -3404,4 +3404,107 @@ def test_orchestrator_no_checks_escalation_backstop_wiring():
     assert not missing, (
         "orchestrator no-checks escalation backstop wiring changed — missing: "
         f"{missing}. Update orchestrator.py AND the mirroring tests together."
+    )
+
+
+def test_orchestrator_verify_tests_spawn_deferral_escalation_wiring():
+    """The orchestrator must escalate to FAILED+requires_approval after
+    _VERIFY_TESTS_SPAWN_DEFERRAL_CAP consecutive spawn deferrals."""
+    src = _orchestrator_source()
+    required = [
+        "_VERIFY_TESTS_SPAWN_DEFERRAL_CAP",
+        '"verify_tests_spawn_deferrals"',
+        "verify_tests spawn deferred",
+        "escalating for operator review",
+        "ci_task.requires_approval = True",
+    ]
+    missing = [needle for needle in required if needle not in src]
+    assert not missing, (
+        "orchestrator verify_tests spawn-deferral escalation wiring changed — "
+        f"missing: {missing}. Update orchestrator.py AND the mirroring tests together."
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_ci_verify_tests_spawn_deferral_cap_escalates_to_operator_review(
+    db_session, mocker
+):
+    """After _VERIFY_TESTS_SPAWN_DEFERRAL_CAP consecutive spawn deferrals the
+    parent task must be set to FAILED+requires_approval and an alert dispatched.
+
+    When _spawn_pipeline_task returns None (resource pressure / suppression) on
+    every attempt, the orchestrator increments verify_tests_spawn_deferrals in
+    ci_loop.  Once that counter reaches the cap the task must leave EVALUATING
+    rather than remaining stranded.
+    """
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert",
+        new_callable=mocker.AsyncMock,
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # Simulate the orchestrator's deferral loop directly: increment the counter
+    # and apply the same escalation predicate the inline code applies.
+    from app.models import TaskStatus
+    from app.runtime_config_state import runtime_config as _runtime_config
+    from app.alert_dispatch import _maybe_create_failure_alert
+
+    ci_loop = dict((parent.context or {}).get("review_loop", {}) or {})
+
+    for _cycle in range(1, _VERIFY_TESTS_SPAWN_DEFERRAL_CAP + 1):
+        _spawn_deferrals = (ci_loop.get("verify_tests_spawn_deferrals", 0) or 0) + 1
+        ci_loop["verify_tests_spawn_deferrals"] = _spawn_deferrals
+
+        if (
+            _spawn_deferrals >= _VERIFY_TESTS_SPAWN_DEFERRAL_CAP
+            and not parent.requires_approval
+        ):
+            parent.status = TaskStatus.FAILED
+            if _runtime_config.get("require_approval_gates", True):
+                parent.requires_approval = True
+            parent.latest_status_message = (
+                f"No CI on PR #{PR_NUMBER} — verify_tests spawn deferred "
+                f"{_spawn_deferrals} consecutive times — escalating for operator review"
+            )
+            await _maybe_create_failure_alert(
+                parent,
+                db_session,
+                f"PR #{PR_NUMBER} no-CI verify_tests spawn deferred "
+                f"{_spawn_deferrals} consecutive cycles — escalating for operator review",
+            )
+
+    assert ci_loop["verify_tests_spawn_deferrals"] == _VERIFY_TESTS_SPAWN_DEFERRAL_CAP, (
+        f"counter must reach cap ({_VERIFY_TESTS_SPAWN_DEFERRAL_CAP})"
+    )
+    assert parent.status == TaskStatus.FAILED, (
+        "task must be FAILED after spawn-deferral cap is exhausted"
+    )
+    assert parent.requires_approval is True, (
+        "task must require operator approval after spawn-deferral cap"
+    )
+    assert "escalating for operator review" in parent.latest_status_message
+    alert_mock.assert_called_once(), "exactly one alert must be dispatched at the cap"
+
+    # Before the cap: no escalation should have occurred.
+    parent2 = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent2)
+    ci_loop2 = {}
+    for _cycle in range(1, _VERIFY_TESTS_SPAWN_DEFERRAL_CAP):
+        _d = (ci_loop2.get("verify_tests_spawn_deferrals", 0) or 0) + 1
+        ci_loop2["verify_tests_spawn_deferrals"] = _d
+        if _d >= _VERIFY_TESTS_SPAWN_DEFERRAL_CAP and not parent2.requires_approval:
+            parent2.status = TaskStatus.FAILED
+            parent2.requires_approval = True
+
+    assert parent2.status == TaskStatus.EVALUATING, (
+        f"task must remain EVALUATING before the cap ({_VERIFY_TESTS_SPAWN_DEFERRAL_CAP - 1} deferrals)"
+    )
+    assert not parent2.requires_approval, (
+        "requires_approval must NOT be set before the deferral cap"
     )

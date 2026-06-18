@@ -1430,6 +1430,7 @@ def _build_cycle_start_reconciliation(
         for d in direction_stats
         if isinstance(d, dict) and d.get("status") == "active"
     ]
+    active_dir_ids: set[str] = {str(d["id"]) for d in active_dirs if d.get("id")}
     referenced_gap_ids: set[str] = {
         str(d["gap_id"]) for d in active_dirs if d.get("gap_id")
     }
@@ -1510,6 +1511,27 @@ def _build_cycle_start_reconciliation(
                 "direction_id": d.get("id"),
                 "text": _label(d.get("text")),
                 "reason": reason,
+            }
+        )
+
+    # 3b. Stale active_moves: gap.active_moves references a direction that is no
+    # longer active (retired, completed, deleted, or simply absent from the known
+    # direction set). The forward-linkage check (ungrounded_directions) catches
+    # directions whose gap_id is stale; this is the reverse: gap entries whose
+    # active_moves list is stale.
+    stale_active_moves: list[dict] = []
+    for g in gaps:
+        if not isinstance(g, dict) or g.get("status") not in ("active", "blocked"):
+            continue
+        moves = [str(m) for m in (g.get("active_moves") or []) if m]
+        stale = [m for m in moves if m not in active_dir_ids]
+        if not stale:
+            continue
+        stale_active_moves.append(
+            {
+                "gap_id": str(g.get("id") or ""),
+                "gap_name": _label(g.get("name")),
+                "stale_direction_ids": stale,
             }
         )
 
@@ -1693,6 +1715,7 @@ def _build_cycle_start_reconciliation(
         and not capability_contradictions
         and not orphaned_gaps
         and not deferred_gap_count
+        and not stale_active_moves
         and not merge_accounting
         and not phantom_direction_refs
     ):
@@ -1706,6 +1729,7 @@ def _build_cycle_start_reconciliation(
     capped_caps, caps_total = _cap(capability_contradictions)
     capped_orphans, orphans_total = _cap(orphaned_gaps)
     capped_ungrounded, ungrounded_total = _cap(ungrounded_directions)
+    capped_stale, stale_total = _cap(stale_active_moves)
     capped_pipeline, pipeline_dropped = _cap(direction_pipeline)
     capped_merge, merge_dropped = _cap(merge_accounting)
     capped_phantoms, phantoms_total = _cap(phantom_direction_refs)
@@ -1724,6 +1748,7 @@ def _build_cycle_start_reconciliation(
         "capability_contradictions": capped_caps,
         "orphaned_gaps": capped_orphans,
         "ungrounded_directions": capped_ungrounded,
+        "stale_active_moves": capped_stale,
         "direction_pipeline": capped_pipeline,
         "merge_accounting": capped_merge,
         "phantom_direction_refs": capped_phantoms,
@@ -1732,6 +1757,7 @@ def _build_cycle_start_reconciliation(
             "capability_contradictions": len(capped_caps) + caps_total,
             "orphaned_gaps": len(capped_orphans) + orphans_total,
             "ungrounded_directions": len(capped_ungrounded) + ungrounded_total,
+            "stale_active_moves": len(capped_stale) + stale_total,
             "deferred_gaps": deferred_gap_count,
             "active_directions": len(active_dirs),
             "direction_pipeline": len(direction_pipeline),

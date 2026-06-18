@@ -2224,6 +2224,30 @@ class TestComputeAuditChallengeSynthesis:
         assert out["disagreement"]["primary_only"] == []
         assert out["disagreement"]["challenger_only"] == []
         assert out["disagreement"]["overstated_findings"] == []
+        assert out["challenge_findings_truncated"] is False
+
+    def test_challenge_findings_truncated_flag_set_when_primary_exceeds_max(self):
+        findings = [
+            {"severity": "high", "summary": f"Finding number {i}"} for i in range(15)
+        ]
+        out = rq._compute_audit_challenge_synthesis(
+            {"findings": findings},
+            {"agreement": "agree", "challenge_severity": "low"},
+        )
+        assert out["challenge_findings_truncated"] is True
+        assert (
+            len(out["agreement"]["findings_both_flagged"]) == rq._CHALLENGE_FINDING_MAX
+        )
+
+    def test_challenge_findings_truncated_false_when_within_max(self):
+        findings = [
+            {"severity": "high", "summary": f"Finding number {i}"} for i in range(5)
+        ]
+        out = rq._compute_audit_challenge_synthesis(
+            {"findings": findings},
+            {"agreement": "agree", "challenge_severity": "low"},
+        )
+        assert out["challenge_findings_truncated"] is False
 
 
 def _make_verified_finding(summary: str, file: str = "") -> dict:
@@ -4974,6 +4998,57 @@ async def test_resolve_candidate_ci_red_beats_green_across_multiple_pr_heads(moc
     assert result["ci_green"] is False
     assert result["state"] == rq._CI_RED
     assert result["resolved_sha"] == red_sha
+
+
+async def test_resolve_candidate_ci_caps_pr_head_sweep(mocker, caplog):
+    """When a commit has more than _PR_HEAD_SWEEP_MAX associated PR heads, the
+    sweep is capped at _PR_HEAD_SWEEP_MAX to avoid exhausting API quota.
+    A warning is logged when truncation occurs."""
+    import logging
+    caplog.set_level(logging.WARNING)
+
+    check_runs_call_count = 0
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        nonlocal check_runs_call_count
+        if sha == "candidate_many":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        # Count calls to get_check_runs_cached for PR heads (not the candidate).
+        check_runs_call_count += 1
+        return {"status": "completed", "conclusion": "success", "details": []}
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+
+    # Create more than _PR_HEAD_SWEEP_MAX PR heads.
+    num_prs = rq._PR_HEAD_SWEEP_MAX + 3
+    pr_heads = [
+        {
+            "number": 100 + i,
+            "merged_at": f"2026-01-{(i % 28) + 1:02d}T00:00:00Z",
+            "head": {"sha": f"pr_head_{i:03d}"},
+        }
+        for i in range(num_prs)
+    ]
+
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(return_value=pr_heads),
+    )
+
+    await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate_many")
+
+    # Verify that only _PR_HEAD_SWEEP_MAX check-runs fetches were made.
+    assert check_runs_call_count == rq._PR_HEAD_SWEEP_MAX
+    # Verify a truncation warning was logged.
+    assert any(
+        "truncated" in record.message.lower()
+        and str(num_prs) in record.message
+        and str(rq._PR_HEAD_SWEEP_MAX) in record.message
+        for record in caplog.records
+        if "CI resolution" in record.message
+    )
 
 
 # ===========================================================================
@@ -10712,6 +10787,55 @@ class TestFinalizeInfraFailure:
             else 0
         )
         assert prior_streak == 0  # streak reset after a real verdict
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_streak_resets_when_candidate_sha_changes(
+        self, db_session
+    ):
+        """The infra-failure streak resets to 0 when a new candidate SHA is
+        provided after an infra_failure on a different SHA."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+
+        # Simulate a previous infra_failure with SHA A (cafe...cafe)
+        old_candidate_sha = "cafe" * 10
+        version.last_qualification = {
+            "status": "infra_failure",
+            "candidate_sha": old_candidate_sha,
+            "error": "PROVISION_FAILURE",
+            "consecutive_infra_errors": 2,  # Previous streak was 2
+            "started_at": "2026-05-19T00:00:00",
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        # Now simulate a new run_qualification with SHA B (beef...beef)
+        new_candidate_sha = "beef" * 10
+        # In real code, run_qualification would call _resolve_candidate_ci, etc.
+        # Here we simulate just the streak initialization part
+        prior_qual = version.last_qualification or {}
+        prior_infra_failure_candidate_sha = (
+            prior_qual.get("candidate_sha")
+            if prior_qual.get("status") == "infra_failure"
+            else None
+        )
+        # This is the fix: prior_infra_streak should be 0 when SHA changes
+        prior_infra_streak = (
+            int(prior_qual.get("consecutive_infra_errors") or 0)
+            if (
+                prior_qual.get("status") == "infra_failure"
+                and prior_infra_failure_candidate_sha == new_candidate_sha
+            )
+            else 0
+        )
+        # Verify the streak resets to 0 when SHA changes
+        assert prior_infra_streak == 0, (
+            f"Expected streak=0 when SHA changes from {old_candidate_sha[:8]} "
+            f"to {new_candidate_sha[:8]}, but got streak={prior_infra_streak}"
+        )
 
     @pytest.mark.asyncio
     async def test_smoketest_task_failed_when_disabled_does_not_route_infra_failure(

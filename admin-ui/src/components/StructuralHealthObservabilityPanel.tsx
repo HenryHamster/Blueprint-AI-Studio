@@ -12,6 +12,26 @@ function fmtBytes(b: number): string {
   return `${b} B`;
 }
 
+function DecisionCard({ label, decision }: { label: string; decision: Record<string, unknown> | null }) {
+  return (
+    <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800 min-w-0">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wider mb-1 truncate">{label}</p>
+      {decision == null ? (
+        <p className="text-xs text-neutral-600 italic">No decision yet</p>
+      ) : (
+        <dl className="space-y-0.5">
+          {Object.entries(decision).map(([k, v]) => (
+            <div key={k} className="flex gap-1 text-xs min-w-0">
+              <dt className="text-neutral-500 shrink-0">{k}:</dt>
+              <dd className="text-neutral-300 font-mono truncate">{String(v ?? '—')}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </div>
+  );
+}
+
 export function StructuralHealthObservabilityPanel() {
   const [data, setData] = useState<StructuralHealthObservabilityResponse | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -129,6 +149,16 @@ export function StructuralHealthObservabilityPanel() {
                   </div>
                 </div>
               )}
+
+              <div>
+                <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-2">Audit Category Decisions</p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                  <DecisionCard label="Fat Row" decision={data.last_decision} />
+                  <DecisionCard label="JSONB Bloat" decision={data.last_jsonb_bloat_decision} />
+                  <DecisionCard label="GIN Overhead" decision={data.last_gin_overhead_decision} />
+                  <DecisionCard label="Pool Saturation" decision={data.last_pool_saturation_decision} />
+                </div>
+              </div>
 
               {recent.length === 0 && largestRows.length === 0 && (
                 <p className="text-xs text-neutral-600">No structural health audit cycles recorded yet.</p>

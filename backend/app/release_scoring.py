@@ -708,14 +708,17 @@ def _compact_challenge_finding(finding: Any) -> dict[str, str] | None:
     return compact
 
 
-def _compact_challenge_findings(findings: list[Any]) -> list[dict[str, str]]:
+def _compact_challenge_findings(
+    findings: list[Any],
+) -> tuple[list[dict[str, str]], bool]:
     compacted = [
         compact
         for finding in findings
         if (compact := _compact_challenge_finding(finding)) is not None
     ]
     compacted.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 3))
-    return compacted[:_CHALLENGE_FINDING_MAX]
+    truncated = len(compacted) > _CHALLENGE_FINDING_MAX
+    return compacted[:_CHALLENGE_FINDING_MAX], truncated
 
 
 def _finding_match_key(finding: dict[str, str]) -> tuple[str, str]:
@@ -764,24 +767,27 @@ def _compute_audit_challenge_synthesis(
             },
             "counts": {
                 "primary_findings": len(
-                    _compact_challenge_findings(_raw_audit_findings(primary_report))
+                    _compact_challenge_findings(_raw_audit_findings(primary_report))[0]
                 ),
                 "challenger_missing": 0,
                 "challenger_overstated": 0,
             },
+            "challenge_findings_truncated": False,
         }
     if not isinstance(challenge_report, dict):
         return _compute_audit_challenge_synthesis(
             primary_report, None, challenge_reason="challenge_absent"
         )
 
-    primary_findings = _compact_challenge_findings(_raw_audit_findings(primary_report))
+    primary_findings, primary_truncated = _compact_challenge_findings(
+        _raw_audit_findings(primary_report)
+    )
     missing_raw = challenge_report.get("missing_findings")
     overstated_raw = challenge_report.get("overstated_findings")
-    missing_findings = _compact_challenge_findings(
+    missing_findings, missing_truncated = _compact_challenge_findings(
         missing_raw if isinstance(missing_raw, list) else []
     )
-    overstated_findings = _compact_challenge_findings(
+    overstated_findings, overstated_truncated = _compact_challenge_findings(
         overstated_raw if isinstance(overstated_raw, list) else []
     )
 
@@ -851,6 +857,9 @@ def _compute_audit_challenge_synthesis(
             "challenger_missing": len(missing_findings),
             "challenger_overstated": len(overstated_findings),
         },
+        "challenge_findings_truncated": primary_truncated
+        or missing_truncated
+        or overstated_truncated,
     }
 
 

@@ -420,6 +420,13 @@ _previously_failing_types: set[str] = set()
 # never retries — it falls open immediately, as before.
 _VERIFY_TESTS_MAX_RETRIES = 1
 
+# No-CI merge gate: how many consecutive cycles the verify_tests spawn may be
+# deferred (i.e. _spawn_pipeline_task returns None due to resource pressure)
+# before the parent task is escalated to FAILED + operator review.  A single
+# transient deferral is expected during resource pressure, but a persistent
+# deferral across 5 cycles means the PR is stranded with no self-recovery path.
+_VERIFY_TESTS_SPAWN_DEFERRAL_CAP = 5
+
 # Debounce: fire the all-accounts-blocked alert once per stall episode.
 # Reset when any task dispatches successfully (stall resolved), then re-arm
 # if every eligible task is again blocked by account rate limits.
@@ -6413,15 +6420,57 @@ async def orchestrator_worker():
                                         f"spawned verify_tests → {_verify_task.id}"
                                     )
                                 else:
-                                    ci_task.latest_status_message = (
-                                        f"No CI on PR #{ci_pr_number} — verify_tests "
-                                        f"spawn deferred, will retry"
-                                    )
-                                    logger.info(
-                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
-                                        f"verify_tests spawn suppressed/deferred — "
-                                        f"retrying"
-                                    )
+                                    _spawn_deferrals = (
+                                        ci_loop.get(
+                                            "verify_tests_spawn_deferrals", 0
+                                        )
+                                        or 0
+                                    ) + 1
+                                    ci_loop[
+                                        "verify_tests_spawn_deferrals"
+                                    ] = _spawn_deferrals
+                                    if (
+                                        _spawn_deferrals
+                                        >= _VERIFY_TESTS_SPAWN_DEFERRAL_CAP
+                                        and not ci_task.requires_approval
+                                    ):
+                                        ci_task.status = TaskStatus.FAILED
+                                        if ci_task.vm_provisioned_at:
+                                            ci_task.vm_stopped_at = _utcnow()
+                                        if _runtime_config.get(
+                                            "require_approval_gates", True
+                                        ):
+                                            ci_task.requires_approval = True
+                                        ci_task.latest_status_message = (
+                                            f"No CI on PR #{ci_pr_number} — verify_tests "
+                                            f"spawn deferred {_spawn_deferrals} consecutive "
+                                            f"times — escalating for operator review"
+                                        )
+                                        await _maybe_create_failure_alert(
+                                            ci_task,
+                                            session,
+                                            f"PR #{ci_pr_number} no-CI verify_tests spawn "
+                                            f"deferred {_spawn_deferrals} consecutive cycles "
+                                            f"— escalating for operator review",
+                                        )
+                                        logger.warning(
+                                            f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                            f"verify_tests spawn deferred "
+                                            f"{_spawn_deferrals} times — task "
+                                            f"{ci_task.id} FAILED (requires_approval)"
+                                        )
+                                    else:
+                                        ci_task.latest_status_message = (
+                                            f"No CI on PR #{ci_pr_number} — verify_tests "
+                                            f"spawn deferred ({_spawn_deferrals}/"
+                                            f"{_VERIFY_TESTS_SPAWN_DEFERRAL_CAP}), will retry"
+                                        )
+                                        logger.info(
+                                            f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                            f"verify_tests spawn suppressed/deferred "
+                                            f"({_spawn_deferrals}/"
+                                            f"{_VERIFY_TESTS_SPAWN_DEFERRAL_CAP}) — retrying"
+                                        )
                                 ci_loop["ci_poll_interval"] = _v_poll_interval
                                 ci_loop["ci_last_polled"] = _utcnow().isoformat()
                                 ci_loop["head_sha"] = ci_head_sha

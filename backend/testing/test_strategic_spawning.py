@@ -10017,6 +10017,51 @@ class TestBuildCycleStartReconciliation:
             assert out["phantom_direction_refs"] == []
             assert out["counts"]["phantom_direction_refs"] == 0
 
+    def test_stale_active_moves_conflict(self):
+        # gap.active_moves references a direction that is no longer active → surfaced
+        # as stale_active_moves. An active direction in active_moves is NOT stale.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "gaps": [
+                # Stale: active_moves points at a retired direction not in active_dirs.
+                {
+                    "id": "g-stale",
+                    "name": "stale gap",
+                    "status": "active",
+                    "active_moves": ["d-retired"],
+                },
+                # Clean: active_moves points at a live active direction.
+                {
+                    "id": "g-clean",
+                    "name": "clean gap",
+                    "status": "active",
+                    "active_moves": ["d-live"],
+                },
+                # Closed gaps are never checked.
+                {
+                    "id": "g-closed",
+                    "name": "closed gap",
+                    "status": "closed",
+                    "active_moves": ["d-retired"],
+                },
+            ]
+        }
+        direction_stats = [
+            {"id": "d-live", "status": "active", "gap_id": "g-clean"},
+            # d-retired is NOT in direction_stats at all (deleted/missing).
+        ]
+        out = _build_cycle_start_reconciliation(direction_stats, pm, {})
+        assert out is not None
+        stale = out["stale_active_moves"]
+        assert len(stale) == 1
+        assert stale[0]["gap_id"] == "g-stale"
+        assert stale[0]["gap_name"] == "stale gap"
+        assert stale[0]["stale_direction_ids"] == ["d-retired"]
+        assert out["counts"]["stale_active_moves"] == 1
+        # Clean gap is not surfaced.
+        assert not any(s["gap_id"] == "g-clean" for s in stale)
+
 
 # ── _build_prune_candidates: concrete cleanup list when the model is heavy ─────
 
