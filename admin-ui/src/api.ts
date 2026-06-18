@@ -1439,6 +1439,28 @@ export interface PoolPayoffVerdict {
   recommended_action: string;
 }
 
+export interface PanelReviewEffectiveness {
+  challenged_confirmed: number;
+  challenged_revised: number;
+  challenged_rejected: number;
+  total_challenged: number;
+  overturn_rate: number;
+}
+
+export interface VmCostAttributionEntry {
+  task_type: string;
+  task_count: number;
+  merged_count: number;
+  total_cost_usd: number;
+  share_of_total_cost: number | null;
+  cost_per_merge: number | null;
+}
+
+export interface VmCostAttribution {
+  by_task_type: VmCostAttributionEntry[];
+  total_vm_usd: number;
+}
+
 export interface EfficiencyAxesResponse {
   axes: Record<string, EfficiencyAxis>;
   baseline_captured_at: string | null;
@@ -1461,6 +1483,14 @@ export interface EfficiencyAxesResponse {
   // Optional nested blocks surfaced by the backend for the operator dashboard.
   format_compliance?: FormatComplianceResponse;
   agent_timeout_rate?: AgentTimeoutRateResponse;
+  // Panel review effectiveness: overturn_rate, challenged outcome counts, and
+  // total gate invocations from the latest snapshot. Null when no gate
+  // invocations exist in the window. Optional for older backends.
+  panel_review_effectiveness?: PanelReviewEffectiveness | null;
+  // VM cost attribution: per-task-type breakdown of infrastructure spend from
+  // the latest snapshot, showing which task types (review, create, side-car, etc.)
+  // dominate VM spend. Optional for older backends.
+  vm_cost_attribution?: VmCostAttribution | null;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {

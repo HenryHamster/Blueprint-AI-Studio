@@ -586,6 +586,55 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           </div>
         );
       })}
+      {data.panel_review_effectiveness && (
+        <div data-testid="panel-review-effectiveness-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+          <div className="flex justify-between items-center gap-4">
+            <span className="text-neutral-400">Panel review effectiveness</span>
+            <div className="space-y-1 min-w-0">
+              <NestedAxisLine
+                label="overturn_rate"
+                axis={{
+                  current: data.panel_review_effectiveness.overturn_rate,
+                  baseline: null,
+                  drift_pct: null,
+                }}
+                unit="%"
+                favorableDirection="higher"
+                percent
+              />
+            </div>
+          </div>
+          <div className="mt-1 text-[10px] text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
+            <span>challenged confirmed: {data.panel_review_effectiveness.challenged_confirmed ?? '—'}</span>
+            <span>revised: {data.panel_review_effectiveness.challenged_revised ?? '—'}</span>
+            <span>rejected: {data.panel_review_effectiveness.challenged_rejected ?? '—'}</span>
+            <span>total: {data.panel_review_effectiveness.total_challenged ?? '—'}</span>
+          </div>
+        </div>
+      )}
+      {data.vm_cost_attribution && data.vm_cost_attribution.by_task_type.length > 0 && (
+        <div data-testid="vm-cost-attribution-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+          <div className="flex justify-between items-center gap-4 mb-2">
+            <span className="text-neutral-400">VM cost by task type</span>
+            <span className="text-neutral-500 font-mono">${data.vm_cost_attribution.total_vm_usd.toFixed(2)} total</span>
+          </div>
+          <div className="space-y-1">
+            {data.vm_cost_attribution.by_task_type.map((row) => (
+              <div key={row.task_type} className="flex items-center justify-between gap-3 text-[10px]">
+                <span className="text-neutral-500">{row.task_type}</span>
+                <div className="flex items-center gap-2 text-neutral-400 font-mono">
+                  <span>${row.total_cost_usd.toFixed(2)}</span>
+                  <span className="text-neutral-600">· {row.task_count}</span>
+                  <span className="text-neutral-600">· {row.merged_count}↓</span>
+                  {row.cost_per_merge != null && (
+                    <span className="text-neutral-600">· ${row.cost_per_merge.toFixed(4)}/merge</span>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {data.format_compliance && (
         <div data-testid="format-compliance-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
           <div className="flex justify-between items-center gap-4">

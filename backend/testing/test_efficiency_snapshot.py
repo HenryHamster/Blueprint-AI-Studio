@@ -353,6 +353,131 @@ async def test_read_baseline_surfaces_warm_start_origin_breakdown(db_session):
 
 
 @pytest.mark.asyncio
+async def test_read_baseline_with_drift_includes_panel_review_effectiveness_and_vm_cost_attribution(db_session):
+    """read_baseline_with_drift surfaces panel_review_effectiveness (overturn_rate,
+    challenged counts) and vm_cost_attribution (task-type cost breakdown) from the
+    latest snapshot alongside other efficiency-axes data."""
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    # Create tasks with panel review second opinion and different task types
+    # 2 confirmed, 1 revised, 1 rejected = 4 total challenged
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "pr_merged": True,
+                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "challenged_confirmed"},
+            },
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            api_call_summary={
+                "llm_call_count": 10,
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "pr_merged": True,
+                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "challenged_confirmed"},
+            },
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            api_call_summary={
+                "llm_call_count": 5,
+                "total_input_tokens": 500,
+                "total_output_tokens": 250,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "pr_merged": True,
+                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "challenged_revised"},
+            },
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            api_call_summary={
+                "llm_call_count": 3,
+                "total_input_tokens": 300,
+                "total_output_tokens": 150,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "pr_merged": True,
+                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "challenged_rejected"},
+            },
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            api_call_summary={
+                "llm_call_count": 2,
+                "total_input_tokens": 200,
+                "total_output_tokens": 100,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+
+    # Verify panel_review_effectiveness is present
+    assert "panel_review_effectiveness" in drift
+    eff = drift["panel_review_effectiveness"]
+    assert eff is not None
+    assert eff["challenged_confirmed"] == 2
+    assert eff["challenged_revised"] == 1
+    assert eff["challenged_rejected"] == 1
+    assert eff["total_challenged"] == 4
+    assert eff["overturn_rate"] == 0.25
+
+    # Verify vm_cost_attribution is present
+    assert "vm_cost_attribution" in drift
+    vm_attr = drift["vm_cost_attribution"]
+    assert vm_attr is not None
+    assert isinstance(vm_attr, dict)
+    assert "by_task_type" in vm_attr
+    assert isinstance(vm_attr["by_task_type"], list)
+    assert len(vm_attr["by_task_type"]) > 0
+    assert "total_vm_usd" in vm_attr
+    # Each entry in by_task_type should have task_type and cost info
+    for entry in vm_attr["by_task_type"]:
+        assert "task_type" in entry
+        assert "total_cost_usd" in entry
+        assert "task_count" in entry
+
+
+@pytest.mark.asyncio
 async def test_compute_current_axes_empty_returns_none(db_session):
     project = make_project()
     db_session.add(project)

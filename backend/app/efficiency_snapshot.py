@@ -3265,6 +3265,15 @@ async def read_baseline_with_drift(
         # of only reading that llm_cost_per_merged_pr changed.
         "llm_cost_attribution": latest.get("llm_cost_attribution"),
         "llm_cost_attribution_trend": llm_cost_attribution_trend,
+        # Panel review effectiveness: the overturn rate, count of challenges by
+        # outcome (confirmed/revised/rejected), and total gate invocations. Null
+        # when no gate invocations exist in the window.
+        "panel_review_effectiveness": latest.get("panel_review_effectiveness"),
+        # VM cost attribution: per-task-type breakdown of VM spend, mirroring the
+        # structure of llm_cost_attribution but for infrastructure costs. Allows
+        # operators to see which task types (review, create, side-car, etc.)
+        # dominate VM spend and whether that distribution has shifted.
+        "vm_cost_attribution": latest.get("vm_cost_attribution"),
     }
 
 
