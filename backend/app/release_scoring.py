@@ -25,6 +25,24 @@ from app.migration_reconciliation import AUTHORIZED_DIVERGENCES
 
 logger = logging.getLogger(__name__)
 
+# Authorized dead-code test deletions — file basenames (or path suffixes) that
+# the qualifier treats as non-erosion.  Mirrors the AUTHORIZED_DIVERGENCES
+# pattern in migration_reconciliation.py.  A deleted test file whose path ends
+# with any entry here is excluded from the hard-blocker gate so a clean
+# dead-code removal does not veto a promotion.
+#
+# Entry criteria: the test file must have zero live callers / test subjects
+# remaining in the candidate (the code it exercised was also co-deleted), AND
+# the deletion must be explicitly authorized here so it cannot silently suppress
+# a genuine test-erosion signal.
+AUTHORIZED_TEST_DELETIONS: frozenset[str] = frozenset(
+    {
+        # viewportRegression.test.ts: co-deleted with viewportRegression.ts
+        # (commit 3085d8d8); parseViewportSubkey had zero production callers.
+        "viewportRegression.test.ts",
+    }
+)
+
 # Hardcoded fallback used when promotion_policy.yaml is missing, unreadable, or
 # malformed.  MUST match the documented defaults in promotion_policy.yaml so a
 # parse failure degrades to the intended rubric rather than a silent surprise.
@@ -432,8 +450,15 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
 
     deleted = erosion.get("deleted_test_files")
     if isinstance(deleted, list) and len(deleted) > 0:
-        # Hard blocker — any deleted test file forces a non-promote.
-        return audit_score, None
+        # Exclude authorized dead-code deletions (matching by path suffix).
+        unauthorized = [
+            f
+            for f in deleted
+            if not any(str(f).endswith(auth) for auth in AUTHORIZED_TEST_DELETIONS)
+        ]
+        if unauthorized:
+            # Hard blocker — any non-authorized deleted test file forces a non-promote.
+            return audit_score, None
 
     # Graded penalty for net assertion / test-count reduction.  Each negative
     # delta knocks the score down; positive deltas leave it at the ceiling.

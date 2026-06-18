@@ -1000,6 +1000,52 @@ class TestScoreAudit:
         assert audit == pytest.approx(1.0)
         assert erosion is None
 
+    def test_authorized_test_deletion_is_not_erosion(self):
+        """An authorized dead-code test deletion is NOT treated as erosion.
+
+        AUTHORIZED_TEST_DELETIONS lists file basenames whose removal is
+        pre-approved (the code they exercised was co-deleted with zero live
+        callers remaining).  _score_audit must return a non-None erosion score
+        when ALL deleted test files are in the authorized set, so the
+        test_file_deleted hard-blocker does not fire for a clean dead-code removal.
+        """
+        report = {
+            "audit_score": 0.9,
+            "test_erosion": {
+                "deleted_test_files": ["admin-ui/src/utils/viewportRegression.test.ts"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        audit, erosion = rq._score_audit(report)
+        # No findings → derived audit = 1.0
+        assert audit == pytest.approx(1.0)
+        # Authorized deletion must NOT produce the None hard-blocker.
+        assert erosion is not None
+        assert erosion == pytest.approx(1.0)
+
+        # Confirm the authorized set is consulted via rs directly too.
+        assert "viewportRegression.test.ts" in rs.AUTHORIZED_TEST_DELETIONS
+
+        # A mix of authorized + unauthorized still hard-blocks.
+        mixed_report = {
+            "audit_score": 0.9,
+            "test_erosion": {
+                "deleted_test_files": [
+                    "admin-ui/src/utils/viewportRegression.test.ts",
+                    "testing/test_gone.py",
+                ],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, mixed_erosion = rq._score_audit(mixed_report)
+        assert mixed_erosion is None, (
+            "A mix of authorized and unauthorized deletions must still hard-block"
+        )
+
     def test_net_test_count_reduction_penalized(self):
         """A negative test_count_delta drops the erosion score below 1.0."""
         report = {
