@@ -3274,6 +3274,23 @@ async def read_baseline_with_drift(
         # operators to see which task types (review, create, side-car, etc.)
         # dominate VM spend and whether that distribution has shifted.
         "vm_cost_attribution": latest.get("vm_cost_attribution"),
+        # Day-over-day trend of VM cost attribution headline scalars (by_task_type,
+        # total_vm_usd) so operators can track infrastructure spend drift over time.
+        # Mirrors llm_cost_attribution_trend; omits pre-v8 snapshots that have no
+        # vm_cost_attribution key.
+        "vm_cost_attribution_trend": [
+            {
+                "captured_at": snap.get("captured_at"),
+                "by_task_type": (snap.get("vm_cost_attribution") or {}).get(
+                    "by_task_type"
+                ),
+                "total_vm_usd": (snap.get("vm_cost_attribution") or {}).get(
+                    "total_vm_usd"
+                ),
+            }
+            for snap in snapshots
+            if snap.get("vm_cost_attribution")
+        ],
     }
 
 

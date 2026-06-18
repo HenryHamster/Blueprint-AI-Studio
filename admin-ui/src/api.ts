@@ -1471,6 +1471,12 @@ export interface VmCostAttribution {
   total_vm_usd: number;
 }
 
+export interface VmCostAttributionTrendEntry {
+  captured_at: string | null;
+  by_task_type: VmCostAttributionEntry[] | null;
+  total_vm_usd: number | null;
+}
+
 export interface EfficiencyAxesResponse {
   axes: Record<string, EfficiencyAxis>;
   baseline_captured_at: string | null;
@@ -1501,6 +1507,9 @@ export interface EfficiencyAxesResponse {
   // the latest snapshot, showing which task types (review, create, side-car, etc.)
   // dominate VM spend. Optional for older backends.
   vm_cost_attribution?: VmCostAttribution | null;
+  // Day-over-day VM cost trend (one entry per daily snapshot). Optional/null
+  // for older backends that omit it.
+  vm_cost_attribution_trend?: VmCostAttributionTrendEntry[] | null;
   // Per-task-type format-compliance breakdown from the latest snapshot. Keyed
   // by task type; each entry mirrors FormatComplianceByTypeEntry. Optional/null
   // for older snapshots.

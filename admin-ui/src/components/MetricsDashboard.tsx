@@ -618,6 +618,24 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             <span className="text-neutral-400">VM cost by task type</span>
             <span className="text-neutral-500 font-mono">${data.vm_cost_attribution.total_vm_usd.toFixed(2)} total</span>
           </div>
+          {data.vm_cost_attribution_trend && data.vm_cost_attribution_trend.length >= 2 && (() => {
+            const trendPoints = data.vm_cost_attribution_trend!
+              .filter((e): e is typeof e & { total_vm_usd: number } => e.total_vm_usd != null)
+              .map(e => ({ v: e.total_vm_usd }));
+            if (trendPoints.length < 2) return null;
+            const first = trendPoints[0].v;
+            const last = trendPoints[trendPoints.length - 1].v;
+            const color = last <= first ? '#10b981' : '#ef4444';
+            return (
+              <div style={{ height: 24 }} className="mb-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={trendPoints} margin={{ top: 2, right: 0, left: 0, bottom: 2 }}>
+                    <Area dataKey="v" stroke={color} fill={color} fillOpacity={0.15} dot={false} strokeWidth={1.5} isAnimationActive={false} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            );
+          })()}
           <div className="space-y-1">
             {data.vm_cost_attribution.by_task_type.map((row) => (
               <div key={row.task_type} className="flex items-center justify-between gap-3 text-[10px]">

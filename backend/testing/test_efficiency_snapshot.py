@@ -6241,6 +6241,39 @@ async def test_read_baseline_surfaces_llm_cost_attribution_breakdown(db_session)
 
 
 @pytest.mark.asyncio
+async def test_read_baseline_surfaces_vm_cost_attribution_trend(db_session):
+    """read_baseline_with_drift surfaces vm_cost_attribution_trend as a
+    day-over-day series mirroring llm_cost_attribution_trend but for VM spend.
+
+    Acceptance criterion: >=2 snapshots written; read_baseline_with_drift
+    returns vm_cost_attribution_trend as a list with captured_at/by_task_type/
+    total_vm_usd entries.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+
+    trend = drift.get("vm_cost_attribution_trend")
+    assert isinstance(trend, list), "vm_cost_attribution_trend must be a list"
+    assert len(trend) >= 1, "at least one trend entry must be present"
+    for entry in trend:
+        assert "captured_at" in entry
+        assert "by_task_type" in entry
+        assert "total_vm_usd" in entry
+
+
+@pytest.mark.asyncio
 async def test_vm_cost_attribution_by_task_type_in_write_snapshot(db_session):
     """write_snapshot stores vm_cost_attribution.by_task_type populated with
     per-type VM cost rows that reconcile with cost_per_merged_pr.
