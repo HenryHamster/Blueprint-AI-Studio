@@ -24,7 +24,7 @@ import { PoolAccountHealthPanel } from './PoolAccountHealthPanel';
 import { SystemMaturityCard } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
 import { type DirectionSrEntry } from './SrTrendBreakdown';
-import { ReviewQualitySection, type SrFixIterationBucket, type SrTrendWithFixIterations } from './ReviewQualitySection';
+import { ReviewQualitySection } from './ReviewQualitySection';
 import { SrDiagnosticsStack } from './SrDiagnosticsStack';
 import {
   MetricCard,
@@ -73,9 +73,6 @@ export type DigestData = DigestDataBase<DirectionProgress>;
 export type { FailureGroup };
 
 // ---------- local types ----------
-
-// SrFixIterationBucket and SrTrendWithFixIterations are defined and exported from ReviewQualitySection
-export type { SrFixIterationBucket, SrTrendWithFixIterations };
 
 // DirectionSrEntry is re-exported from SrTrendBreakdown (canonical model)
 export type { DirectionSrEntry };

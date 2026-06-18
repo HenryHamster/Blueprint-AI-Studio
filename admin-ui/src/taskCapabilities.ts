@@ -240,11 +240,6 @@ export const FILTER_TASK_TYPE_OPTIONS = FILTER_TASK_TYPE_IDS.map(id => ({
   label: TASK_CAPABILITY_BY_ID[id].label,
 }));
 
-export const PROVIDER_ROUTABLE_TASK_TYPE_OPTIONS = PROVIDER_ROUTABLE_TASK_TYPE_IDS.map(id => ({
-  value: id,
-  label: TASK_CAPABILITY_BY_ID[id].label,
-}));
-
 /**
  * Shape of a launchable-task-type option rendered by the New Task launcher.
  * `value` is a plain string (not the compile-time `UserLaunchableTaskType`

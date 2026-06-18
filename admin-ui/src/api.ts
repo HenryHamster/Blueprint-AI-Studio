@@ -1202,14 +1202,6 @@ export interface SrCategoryTrend {
   precision_recall_alert?: boolean | null;
 }
 
-export interface SrFixIterationBucket {
-  hit_rate?: number | null;
-  miss_rate?: number | null;
-  sample_count?: number | null;
-}
-
-export type SrFixIterationBreakdown = Record<string, SrFixIterationBucket>;
-
 export interface SrFalsePositiveCategoryStat {
   category: string;
   sample_size: number;
@@ -2441,26 +2433,6 @@ export interface StagingBranchPrefixesResponse {
   is_default: boolean;
 }
 
-export async function fetchStagingBranchPrefixes(
-  projectId: string,
-): Promise<StagingBranchPrefixesResponse> {
-  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/staging-branch-prefixes`);
-  if (!res.ok) throw new Error(`Failed to fetch staging branch prefixes: ${res.status}`);
-  return res.json();
-}
-
-export async function updateStagingBranchPrefixes(
-  projectId: string,
-  prefixes: string[] | null,
-): Promise<StagingBranchPrefixesResponse> {
-  const res = await apiFetch(
-    `/api/admin/projects/${encodeURIComponent(projectId)}/staging-branch-prefixes`,
-    { method: 'PATCH', body: JSON.stringify({ staging_branch_prefixes: prefixes }) },
-  );
-  if (!res.ok) throw new Error(`Failed to update staging branch prefixes: ${res.status}`);
-  return res.json();
-}
-
 export interface ApprovalGateConfig {
   infra_files: string[];
   critical_files: string[];
@@ -2778,50 +2750,6 @@ export async function setWarmPoolTargetForProject(
     const msg = data?.detail || `Failed to set warm-pool target: ${res.status}`;
     throw new Error(typeof msg === 'string' ? msg : `Failed to set warm-pool target: ${res.status}`);
   }
-  return res.json();
-}
-
-export interface SrDisagreementTask {
-  task_id: string;
-  title: string;
-  task_type?: string | null;
-  scope?: string | null;
-  created_at?: string | null;
-  pr_url?: string | null;
-  sr_check_results?: Record<string, { passed: boolean; issue?: string | null; origin?: string | null }>;
-  reviewer_findings?: Array<{ category: string; severity?: string | null; description: string }>;
-}
-
-export interface SrReviewerDisagreementTasksResponse {
-  items: SrDisagreementTask[];
-  total: number;
-  page?: number;
-  page_size?: number;
-  category_counts?: Record<string, number>;
-}
-
-export async function fetchSrReviewerDisagreementTasks(
-  projectId: string,
-  params?: {
-    category?: string;
-    task_type?: string;
-    severity?: string;
-    days?: number;
-    page?: number;
-    page_size?: number;
-  },
-): Promise<SrReviewerDisagreementTasksResponse> {
-  const searchParams = new URLSearchParams();
-  if (params?.category) searchParams.set('category', params.category);
-  if (params?.task_type) searchParams.set('task_type', params.task_type);
-  if (params?.severity) searchParams.set('severity', params.severity);
-  if (params?.days !== undefined) searchParams.set('days', String(params.days));
-  if (params?.page !== undefined) searchParams.set('page', String(params.page));
-  if (params?.page_size !== undefined) searchParams.set('page_size', String(params.page_size));
-  const query = searchParams.toString();
-  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/sr-reviewer-disagreements/tasks${query ? `?${query}` : ''}`;
-  const res = await apiFetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch SR reviewer disagreement tasks: ${res.status}`);
   return res.json();
 }
 
