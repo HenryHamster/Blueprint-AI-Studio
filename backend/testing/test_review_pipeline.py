@@ -17326,6 +17326,9 @@ async def test_stuck_cycle_still_detected_after_feedback_cap(db_session, mocker)
     )
     await db_session.refresh(original_task)
     assert original_task.requires_approval is True
+    assert "stuck" in (original_task.latest_status_message or "").lower(), (
+        f"Status message should mention stuck cycle: {original_task.latest_status_message!r}"
+    )
 
 
 @pytest.mark.asyncio
