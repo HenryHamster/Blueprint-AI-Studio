@@ -878,6 +878,33 @@ function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadines
   );
 }
 
+function PinnedServingVersionCallout({ version }: { version: RecentVersion }) {
+  const servingStatus = version.serving?.status ?? version.serving_status;
+  if (servingStatus !== 'serving_confirmed') return null;
+  const mergedCount = version.merged_count ?? version.merged_task_count ?? version.highlights?.merged_count ?? null;
+  const promotedAt = version.promoted_at ?? version.serving?.confirmed_at ?? version.served_at;
+  return (
+    <div
+      data-testid="pinned-serving-version"
+      className="flex flex-col gap-0.5 px-2 py-1.5 rounded border bg-emerald-500/10 border-emerald-500/30"
+    >
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-[10px] font-semibold text-emerald-400">✓ currently serving</span>
+        <span className="text-[10px] font-mono text-emerald-300">v{version.version_number}</span>
+        {mergedCount != null && (
+          <span className="text-[10px] text-emerald-600">{mergedCount} merged</span>
+        )}
+        {promotedAt && (
+          <span className="text-[10px] text-emerald-700">promoted {timeAgo(promotedAt)}</span>
+        )}
+      </div>
+      {version.highlights?.headline && (
+        <p className="text-[10px] text-emerald-300/80 italic">{version.highlights.headline}</p>
+      )}
+    </div>
+  );
+}
+
 function StagedDirectionsSummary({ staged }: { staged: StagedDirection[] }) {
   if (!staged.length) return null;
   return (
@@ -1471,6 +1498,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         {policySource && (
           <PromotionPolicyBadge source={policySource} error={policyError} />
         )}
+        {(() => {
+          const serving = recent.find(
+            v => (v.serving?.status ?? v.serving_status) === 'serving_confirmed',
+          );
+          return serving ? <PinnedServingVersionCallout version={serving} /> : null;
+        })()}
         {cv && (
           <div className="space-y-1">
             <div className="flex flex-wrap items-center gap-2">
