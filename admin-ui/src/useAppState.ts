@@ -152,7 +152,7 @@ export function useAppState() {
     () => resolveTaskCapabilities(taskCapabilityContract).filterIds,
     [taskCapabilityContract],
   );
-  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter } = useSearchFilters(taskTypeFilterValues);
+  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter, directionFilter, setDirectionFilter } = useSearchFilters(taskTypeFilterValues);
 
   // useTaskModal runs after useSettings so it can consume the published
   // task-capability contract for its launchable-type guard.
@@ -216,7 +216,7 @@ export function useAppState() {
     fetchArchiveTasks,
     selectedTaskIds, setSelectedTaskIds, setSelectionMode, setConfirmDialog,
     fetchTasksRef, prevTasksRef,
-    selectedProjectId,
+    selectedProjectId, directionFilter,
   });
 
   // ── Project-scoped config domain ─────────────────────────────────────────
@@ -577,7 +577,7 @@ export function useAppState() {
     // Column preferences
     columnPrefs, setColumnPrefs,
     // Search/filter
-    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter,
+    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter, directionFilter, setDirectionFilter,
     // Projects
     projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous, fetchProjects,
     // Log viewer

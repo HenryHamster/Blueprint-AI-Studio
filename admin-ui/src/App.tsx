@@ -963,6 +963,8 @@ export default function App() {
               onDateRangeChange={s.setDateRange}
               blockedFilter={s.blockedFilter}
               onBlockedFilterChange={s.setBlockedFilter}
+              directionFilter={s.directionFilter}
+              onDirectionFilterChange={s.setDirectionFilter}
               onDownloadCsv={handleDownloadTasksCsv}
               inputRef={searchInputRef}
             />

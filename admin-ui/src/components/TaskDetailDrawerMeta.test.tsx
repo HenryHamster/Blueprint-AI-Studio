@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { DetailsTab } from './TaskDetailDrawerMeta';
 import type { Task } from '../types/task';
-import { fetchComputeJobs, resolveArtifactDownloadUrl, resolveViewportFailureDownloadUrl, resolveViewportShotDownloadUrl } from '../api';
+import { authGet, fetchComputeJobs, resolveArtifactDownloadUrl, resolveViewportFailureDownloadUrl, resolveViewportShotDownloadUrl } from '../api';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -1225,6 +1225,126 @@ describe('DetailsTab — Liveness signals', () => {
 
     render(<DetailsTab task={makeTask()} />);
     expect(screen.getByText('No tool use recorded')).toBeInTheDocument();
+  });
+});
+
+describe('DetailsTab — p50 ETA progress for active tasks', () => {
+  afterEach(() => {
+    vi.mocked(authGet).mockResolvedValue(new Response(JSON.stringify({ stats: {} }), { status: 200 }));
+    cleanup();
+  });
+
+  it('shows p50 duration and progress percentage when task is IN_PROGRESS', async () => {
+    const now = new Date('2026-06-08T12:00:00Z').getTime();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const startedAt = new Date(now - 30 * 60 * 1000).toISOString(); // 30 minutes ago
+
+    vi.mocked(authGet).mockResolvedValue(
+      new Response(JSON.stringify({ stats: { create: { p50_seconds: 3600, sample_count: 50 } } }), { status: 200 }),
+    );
+
+    const task = makeTask({
+      status: 'IN_PROGRESS',
+      task_type: 'create',
+      started_at: startedAt,
+      project_id: 'p50-test-progress',
+    });
+
+    render(<DetailsTab task={task} />);
+
+    // Check for p50 duration row showing 1h
+    expect(await screen.findByText('p50 Duration')).toBeInTheDocument();
+    expect(screen.getByText('1h')).toBeInTheDocument();
+
+    // Check for progress row showing ~50% progress
+    expect(screen.getByText('Progress')).toBeInTheDocument();
+    expect(screen.getByText(/50% Within p50/)).toBeInTheDocument();
+
+    // Check for est. remaining showing ~30m left
+    expect(screen.getByText('Est. remaining')).toBeInTheDocument();
+    expect(screen.getByText(/~30m left/)).toBeInTheDocument();
+
+    nowSpy.mockRestore();
+  });
+
+  it('marks task as Over p50 when elapsed time exceeds p50 duration', async () => {
+    const now = new Date('2026-06-08T12:00:00Z').getTime();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const startedAt = new Date(now - 90 * 60 * 1000).toISOString(); // 90 minutes ago
+
+    vi.mocked(authGet).mockResolvedValue(
+      new Response(JSON.stringify({ stats: { create: { p50_seconds: 3600, sample_count: 50 } } }), { status: 200 }),
+    );
+
+    const task = makeTask({
+      status: 'IN_PROGRESS',
+      task_type: 'create',
+      started_at: startedAt,
+      project_id: 'p50-test-over',
+    });
+
+    render(<DetailsTab task={task} />);
+
+    // Should show Over p50 and amber color
+    const progressText = await screen.findByText(/Over p50/);
+    expect(progressText).toBeInTheDocument();
+    expect(progressText.className).toContain('amber');
+
+    // Est. remaining should show "longer than usual" in amber
+    expect(screen.getByText('longer than usual')).toBeInTheDocument();
+
+    nowSpy.mockRestore();
+  });
+
+  it('hides p50 progress when duration stats are unavailable', async () => {
+    const now = new Date('2026-06-08T12:00:00Z').getTime();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const startedAt = new Date(now - 10 * 60 * 1000).toISOString();
+
+    // base mock returns { stats: {} } — no override needed
+    const task = makeTask({
+      status: 'IN_PROGRESS',
+      task_type: 'create',
+      started_at: startedAt,
+      project_id: 'p50-test-unavail',
+    });
+
+    render(<DetailsTab task={task} />);
+
+    // Wait for the async fetch to settle, then confirm no p50 rows rendered
+    await waitFor(() => {
+      expect(screen.queryByText('p50 Duration')).toBeNull();
+      expect(screen.queryByText('Progress')).toBeNull();
+    });
+
+    nowSpy.mockRestore();
+  });
+
+  it('hides p50 progress for completed tasks', async () => {
+    const now = new Date('2026-06-08T12:00:00Z').getTime();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const startedAt = new Date(now - 30 * 60 * 1000).toISOString();
+
+    vi.mocked(authGet).mockResolvedValue(
+      new Response(JSON.stringify({ stats: { create: { p50_seconds: 3600, sample_count: 50 } } }), { status: 200 }),
+    );
+
+    const task = makeTask({
+      status: 'COMPLETED',
+      task_type: 'create',
+      started_at: startedAt,
+      project_id: 'p50-test-completed',
+    });
+
+    render(<DetailsTab task={task} />);
+
+    // Wait for fetch to settle; completed tasks should never show p50 rows
+    await waitFor(() => {
+      expect(screen.queryByText('p50 Duration')).toBeNull();
+      expect(screen.queryByText('Progress')).toBeNull();
+    });
+
+    nowSpy.mockRestore();
   });
 });
 

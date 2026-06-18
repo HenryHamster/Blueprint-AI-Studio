@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { ChevronDown, ChevronRight, ExternalLink } from 'lucide-react';
 import { getHeartbeatStatus, useElapsedTime, ResearchFindings, useDurationStats } from './TaskCard';
-import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
+import { formatAbsolute, parseTimestamp, timeAgo, formatDurationSec } from '../utils/time';
 import { hasTransitiveCycle } from '../utils/taskGraph';
 import { authGet, API_BASE_URL } from '../api';
 import { TaskFixLoopPanel } from './TaskFixLoopPanel';
@@ -156,14 +156,37 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         if (!typeStat || typeStat.sample_count < 3) return null;
         const elapsedSec = (now30 - parseTimestamp(task.started_at).getTime()) / 1000;
         const remaining = typeStat.p50_seconds - elapsedSec;
-        const label = remaining > 0 ? `~${Math.ceil(remaining / 60)}m left` : 'longer than usual';
+        const progressPct = Math.round((elapsedSec / typeStat.p50_seconds) * 100);
         const isOver = remaining <= 0;
+        const label = remaining > 0 ? `~${Math.ceil(remaining / 60)}m left` : 'longer than usual';
+        const statusLabel = isOver ? 'Over p50' : 'Within p50';
+        const statusColor = isOver ? 'text-amber-400' : 'text-emerald-400';
         return (
-          <DetailRow label="Est. remaining">
-            <span className={`font-mono text-sm ${isOver ? 'text-amber-400' : 'text-neutral-200'}`} title={`Based on ${typeStat.sample_count} recent ${taskType} tasks`}>
-              {label}
-            </span>
-          </DetailRow>
+          <>
+            <DetailRow label="p50 Duration">
+              <span className="font-mono text-sm text-neutral-200" title={`Based on ${typeStat.sample_count} recent ${taskType} tasks`}>
+                {formatDurationSec(typeStat.p50_seconds)}
+              </span>
+            </DetailRow>
+            <DetailRow label="Progress">
+              <div className="flex items-center gap-2">
+                <div className="flex-1 bg-neutral-700 rounded-full h-2 max-w-xs overflow-hidden">
+                  <div
+                    className={`h-full transition-all ${isOver ? 'bg-amber-500' : 'bg-emerald-500'}`}
+                    style={{ width: `${Math.min(progressPct, 100)}%` }}
+                  />
+                </div>
+                <span className={`font-mono text-sm whitespace-nowrap ${statusColor}`} title={`${progressPct}% of p50 duration elapsed`}>
+                  {progressPct}% {statusLabel}
+                </span>
+              </div>
+            </DetailRow>
+            <DetailRow label="Est. remaining">
+              <span className={`font-mono text-sm ${isOver ? 'text-amber-400' : 'text-neutral-200'}`} title={`Based on ${typeStat.sample_count} recent ${taskType} tasks`}>
+                {label}
+              </span>
+            </DetailRow>
+          </>
         );
       })()}
       <DetailRow label="Heartbeat">
@@ -186,9 +209,13 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         const calls = s.llm_call_count ?? 0;
         const input = s.total_input_tokens ?? 0;
         const output = s.total_output_tokens ?? 0;
+        const cost = task.estimated_cost_usd;
         return (
           <DetailRow label="LLM Usage">
-            <span className="font-mono text-sm">{calls.toLocaleString()} calls · {input.toLocaleString()} in / {output.toLocaleString()} out tokens</span>
+            <span className="font-mono text-sm">
+              {calls.toLocaleString()} calls · {input.toLocaleString()} in / {output.toLocaleString()} out tokens
+              {cost != null && <span className="text-neutral-400"> · ${cost.toFixed(2)}</span>}
+            </span>
           </DetailRow>
         );
       })()}

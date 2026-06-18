@@ -18,6 +18,8 @@ interface SearchFilterBarProps {
   onDateRangeChange: (range: DateRange) => void;
   blockedFilter: boolean;
   onBlockedFilterChange: (v: boolean) => void;
+  directionFilter?: string;
+  onDirectionFilterChange?: (v: string) => void;
   onDownloadCsv: () => void;
   inputRef?: RefObject<HTMLInputElement | null>;
 }
@@ -178,7 +180,7 @@ const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
 const DATE_RANGE_SELECT_OPTIONS: { label: string; value: string }[] = DATE_RANGE_OPTIONS.map(o => ({ label: o.label, value: o.value }));
 const FAILURE_CLASS_OPTIONS = Object.entries(FAILURE_CLASS_CONFIG).map(([value, config]) => ({ value, label: config.label }));
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, failureClassFilter = [], onFailureClassFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, onDownloadCsv, inputRef }: SearchFilterBarProps) {
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, failureClassFilter = [], onFailureClassFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, directionFilter = '', onDirectionFilterChange, onDownloadCsv, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const { filterOptions: typeOptions } = useTaskCapabilities();
   useEffect(() => {
@@ -198,6 +200,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
     onFailureClassFilterChange != null && failureClassFilter.length > 0,
     dateRange !== 'all',
     blockedFilter,
+    directionFilter !== '',
   ].filter(Boolean).length;
 
   const hasActiveFilters = activeFilterCount > 0;
@@ -208,6 +211,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
     onFailureClassFilterChange?.([]);
     onDateRangeChange('all');
     onBlockedFilterChange(false);
+    onDirectionFilterChange?.('');
   }
 
   return (
@@ -258,6 +262,20 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
         <GitFork className="w-3 h-3" />
         <span>Blocked</span>
       </button>
+
+      {onDirectionFilterChange && (
+        <input
+          type="text"
+          value={directionFilter}
+          onChange={e => onDirectionFilterChange(e.target.value)}
+          placeholder="Direction ID..."
+          className={`px-2.5 py-1.5 min-h-11 rounded-lg text-xs font-medium border w-36 outline-none transition-all ${
+            directionFilter
+              ? 'bg-white/5 border-neutral-600 text-neutral-100'
+              : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 placeholder-neutral-600 hover:border-neutral-700'
+          }`}
+        />
+      )}
 
       <button
         onClick={onDownloadCsv}

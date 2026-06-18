@@ -56,6 +56,8 @@ interface UseTasksStateDeps {
   prevTasksRef: React.MutableRefObject<Task[]>;
   // Project scope — when set, task list and counts are scoped to this project.
   selectedProjectId: string | null;
+  // Direction filter — when set, only tasks belonging to this direction are shown.
+  directionFilter?: string | null;
 }
 
 export function useTasksState(deps: UseTasksStateDeps) {
@@ -65,7 +67,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
     fetchArchiveTasks,
     selectedTaskIds, setSelectedTaskIds, setSelectionMode, setConfirmDialog,
     fetchTasksRef, prevTasksRef,
-    selectedProjectId,
+    selectedProjectId, directionFilter,
   } = deps;
 
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -93,8 +95,9 @@ export function useTasksState(deps: UseTasksStateDeps) {
   const [apiHealthy, setApiHealthy] = useState(true);
   const [lastFetchTime, setLastFetchTime] = useState<number>(0);
 
-  // Reset page when status filter changes
+  // Reset page when status or direction filter changes
   useEffect(() => { setPage(1); }, [statusFilter]);
+  useEffect(() => { setPage(1); }, [directionFilter]);
 
   // Reset page and selection when project scope changes
   useEffect(() => {
@@ -121,6 +124,9 @@ export function useTasksState(deps: UseTasksStateDeps) {
       }
       if (selectedProjectId) {
         url += `&project_id=${encodeURIComponent(selectedProjectId)}`;
+      }
+      if (directionFilter) {
+        url += `&direction_id=${encodeURIComponent(directionFilter)}`;
       }
       const res = await authGet(url);
       if (res.ok) {
