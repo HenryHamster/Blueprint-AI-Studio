@@ -369,6 +369,55 @@ describe('MetricsDashboard', () => {
     apiFetch.mockImplementation(original);
   });
 
+  it('renders per-task-type format compliance breakdown when format_compliance_by_type is present', async () => {
+    const original = apiFetch.getMockImplementation();
+    if (!original) throw new Error('apiFetch mock implementation missing');
+    apiFetch.mockImplementation(async (url: string) => {
+      if (url.includes('/efficiency-axes')) {
+        return new Response(JSON.stringify({
+          axes: { cost_per_merged_pr: { current: 45.2, baseline: 50.0, drift_pct: -9.6, history: [] } },
+          baseline_captured_at: '2026-05-01T00:00:00Z',
+          last_snapshot_at: '2026-05-08T00:00:00Z',
+          format_compliance: {
+            format_compliance_rate: { current: 0.85, baseline: 0.8, drift_pct: 6.25, history: [] },
+            self_repair_success_rate: { current: 0.9, baseline: 0.85, drift_pct: 5.88, history: [] },
+            tasks_measured: 10, well_formed_tasks: 9, format_error_total: 1, repair_attempts: 1, repair_successes: 1,
+          },
+          format_compliance_by_type: {
+            create: { tasks_measured: 6, well_formed_tasks: 6, format_compliance_rate: 1.0, format_error_total: 0, repair_attempts: 0, repair_successes: 0, self_repair_success_rate: null },
+            review: { tasks_measured: 4, well_formed_tasks: 3, format_compliance_rate: 0.75, format_error_total: 1, repair_attempts: 1, repair_successes: 1, self_repair_success_rate: 1.0 },
+          },
+        }), { status: 200 });
+      }
+      return original(url);
+    });
+
+    render(
+      <MetricsDashboard
+        metricsHistory={[]}
+        cumulativeCost={0}
+        cumulativeVmHours={0}
+        maxConcurrentVMs={4}
+        tasks={[]}
+        metricsWindow="6h"
+        onWindowChange={vi.fn()}
+        projectId="project-1"
+      />,
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    const byTypeBlock = screen.getByTestId('format-compliance-by-type-block');
+    expect(byTypeBlock).toHaveTextContent('create');
+    expect(byTypeBlock).toHaveTextContent('100%');
+    expect(byTypeBlock).toHaveTextContent('review');
+    expect(byTypeBlock).toHaveTextContent('75%');
+    // format_error_total > 0 for review → error indicator rendered
+    expect(byTypeBlock).toHaveTextContent('1 err');
+    // create has format_error_total == 0 → no error label
+    expect(byTypeBlock).not.toHaveTextContent('0 err');
+    apiFetch.mockImplementation(original);
+  });
+
   it('renders efficiency axis baseline provenance when seeded_at differs from baseline_captured_at', async () => {
     const original = apiFetch.getMockImplementation();
     if (!original) throw new Error('apiFetch mock implementation missing');

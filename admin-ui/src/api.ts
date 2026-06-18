@@ -1403,6 +1403,16 @@ export interface FormatComplianceResponse {
   repair_successes: number | null;
 }
 
+export interface FormatComplianceByTypeEntry {
+  tasks_measured: number | null;
+  well_formed_tasks: number | null;
+  format_compliance_rate: number | null;
+  format_error_total: number | null;
+  repair_attempts: number | null;
+  repair_successes: number | null;
+  self_repair_success_rate: number | null;
+}
+
 export interface AgentTimeoutRateResponse {
   overall: EfficiencyDriftAxis;
   by_subtype: Record<string, { current: number | null; baseline: number | null; drift_pct: number | null }>;
@@ -1491,6 +1501,10 @@ export interface EfficiencyAxesResponse {
   // the latest snapshot, showing which task types (review, create, side-car, etc.)
   // dominate VM spend. Optional for older backends.
   vm_cost_attribution?: VmCostAttribution | null;
+  // Per-task-type format-compliance breakdown from the latest snapshot. Keyed
+  // by task type; each entry mirrors FormatComplianceByTypeEntry. Optional/null
+  // for older snapshots.
+  format_compliance_by_type?: Record<string, FormatComplianceByTypeEntry> | null;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {

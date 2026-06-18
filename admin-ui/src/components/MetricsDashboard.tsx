@@ -2,7 +2,7 @@ import { useMemo, useState, useEffect, useCallback, useRef } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
-import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint } from '../api';
+import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry } from '../api';
 import { LaneDiagPanel } from './LaneDiagPanel';
 import { WarmStartOriginRow } from './WarmStartOriginRow';
 import { usePoller } from '../hooks/usePoller';
@@ -663,6 +663,25 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             <span>repairs: {data.format_compliance.repair_attempts ?? '—'}</span>
             <span>successes: {data.format_compliance.repair_successes ?? '—'}</span>
           </div>
+          {data.format_compliance_by_type && Object.keys(data.format_compliance_by_type).length > 0 && (
+            <div data-testid="format-compliance-by-type-block" className="mt-2 pt-2 border-t border-neutral-700/50">
+              <div className="text-[10px] text-neutral-500 mb-1 uppercase tracking-wide">By task type</div>
+              <div className="space-y-0.5">
+                {Object.entries(data.format_compliance_by_type).sort(([a], [b]) => a.localeCompare(b)).map(([taskType, entry]: [string, FormatComplianceByTypeEntry]) => (
+                  <div key={taskType} className="flex items-center justify-between gap-3 text-[10px]">
+                    <span className="text-neutral-500">{taskType}</span>
+                    <div className="flex items-center gap-2 text-neutral-400 font-mono">
+                      <span>{entry.format_compliance_rate != null ? `${(entry.format_compliance_rate * 100).toFixed(0)}%` : '—'}</span>
+                      <span className="text-neutral-600">· {entry.tasks_measured ?? '—'} tasks</span>
+                      {(entry.format_error_total ?? 0) > 0 && (
+                        <span className="text-red-400/70">· {entry.format_error_total} err</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
       {data.agent_timeout_rate && (

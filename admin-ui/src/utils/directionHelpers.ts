@@ -3,17 +3,6 @@ import { timeAgo, parseTimestamp } from './time';
 
 export { timeAgo as formatRelativeTime };
 
-export function formatTimeRemaining(isoString: string, cooldownMinutes: number): string {
-  const elapsedMs = Date.now() - parseTimestamp(isoString).getTime();
-  const remainingMs = cooldownMinutes * 60 * 1000 - elapsedMs;
-  if (remainingMs <= 0) return '';
-  const remainingMins = Math.ceil(remainingMs / 60000);
-  if (remainingMins < 60) return `${remainingMins}m left`;
-  const hrs = Math.floor(remainingMins / 60);
-  const mins = remainingMins % 60;
-  return mins > 0 ? `${hrs}h ${mins}m left` : `${hrs}h left`;
-}
-
 export function formatRemainingMinutes(minutes: number): string {
   if (!Number.isFinite(minutes) || minutes <= 0) return '';
   const remainingMins = Math.ceil(minutes);
@@ -21,12 +10,6 @@ export function formatRemainingMinutes(minutes: number): string {
   const hrs = Math.floor(remainingMins / 60);
   const mins = remainingMins % 60;
   return mins > 0 ? `${hrs}h ${mins}m left` : `${hrs}h left`;
-}
-
-export function getCooldownStatus(d: Direction, cooldownMinutes: number): 'ready' | 'cooling' | 'never' {
-  if (!d.last_researched_at) return 'never';
-  const elapsedMs = Date.now() - parseTimestamp(d.last_researched_at).getTime();
-  return elapsedMs < cooldownMinutes * 60 * 1000 ? 'cooling' : 'ready';
 }
 
 /**

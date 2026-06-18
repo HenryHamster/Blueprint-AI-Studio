@@ -19,22 +19,6 @@ export interface ProjectDiagnostics {
   zone_health: { available: number; exhausted: string[]; cooldown_recovery?: Record<string, string> };
 }
 
-export interface HealthOverviewIssue {
-  severity: 'critical' | 'warning' | 'info';
-  title: string;
-  hint: string;
-  task_ids: string[];
-  category: string;
-}
-
-export interface HealthOverview {
-  overall_status: 'healthy' | 'degraded' | 'unhealthy';
-  success_rate: { current: number | null; trend: 'improving' | 'stable' | 'declining'; window_hours: number };
-  actionable_issues: HealthOverviewIssue[];
-  direction_portfolio: { product: number; structural: number; mixed: number; uncategorized: number; total_active: number };
-  queue_depth: { queued: number; active: number; evaluating: number };
-}
-
 export interface FailingTaskTypeEntry {
   task_type: string;
   failure_rate: number;
