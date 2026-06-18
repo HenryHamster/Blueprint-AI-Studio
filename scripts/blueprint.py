@@ -1893,6 +1893,7 @@ def _render_envelope(data: dict) -> None:
     print(f"  max_concurrent_vms:           {data.get('max_concurrent_vms')}")
     print(f"  spend_ceiling_usd:            {data.get('spend_ceiling_usd')}")
     print(f"  spend_window_days:            {data.get('spend_window_days')}")
+    print(f"  spend_warning_fraction:       {data.get('spend_warning_fraction')}")
     print(f"  max_concurrent_compute_jobs:  {data.get('max_concurrent_compute_jobs')}")
     print(f"  active_vm_count:              {data.get('active_vm_count')}")
     recent = data.get("recent_spend_usd")
@@ -3345,6 +3346,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_settings_set.add_argument("--yes", action="store_true",
                                 help="Skip the confirmation prompt (for scripting).")
 
+    # envelope
+    p_envelope = sub.add_parser(
+        "envelope", parents=[common],
+        help="Show or update the per-project resource envelope (VM cap, spend ceiling).",
+        description="Read or patch the resource envelope for a project. "
+                    "Defaults to `show` when no subcommand is given.")
+    envelope_sub = p_envelope.add_subparsers(dest="envelope_cmd")
+    envelope_sub.add_parser("show", parents=[common],
+                            help="Show the current resource envelope.")
+    p_env_set = envelope_sub.add_parser(
+        "set", parents=[common],
+        help="Patch one or more envelope fields (KEY=VALUE ...).")
+    p_env_set.add_argument("assignments", nargs="+", metavar="KEY=VALUE",
+                           help="Fields to update (e.g. max_concurrent_vms=5 "
+                                "spend_ceiling_usd=100.0).")
+    p_env_set.add_argument("--yes", action="store_true",
+                           help="Skip the confirmation prompt (for scripting).")
+
     # analytics
     p_envelope = sub.add_parser(
         "envelope", parents=[common],
@@ -3398,6 +3417,7 @@ _DISPATCH = {
     "logs": cmd_logs,
     "messages": cmd_messages,
     "settings": cmd_settings,
+    "envelope": cmd_envelope,
     "health": cmd_health,
     "analytics": cmd_analytics,
     "envelope": cmd_envelope,

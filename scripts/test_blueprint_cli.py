@@ -345,6 +345,34 @@ def mock_api(monkeypatch):
                      "active_tasks": 0, "rl_hit_count": 1, "disabled_models": {}},
                 ],
             }
+        if "/resource-envelope" in path and method == "PATCH":
+            return {
+                "project_id": "proj-1",
+                "max_concurrent_vms": 8,
+                "max_concurrent_compute_jobs": 3,
+                "spend_ceiling_usd": 200.0,
+                "spend_window_days": 7,
+                "recent_spend_usd": 42.5,
+                "recent_spend_compute_usd": 10.0,
+                "recent_spend_agent_vm_usd": 30.0,
+                "recent_spend_idle_usd": 2.5,
+                "active_vm_count": 2,
+                "is_throttled": False,
+            }
+        if "/resource-envelope" in path:
+            return {
+                "project_id": "proj-1",
+                "max_concurrent_vms": 5,
+                "max_concurrent_compute_jobs": 2,
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 7,
+                "recent_spend_usd": 42.1234,
+                "recent_spend_compute_usd": 10.0,
+                "recent_spend_agent_vm_usd": 30.0,
+                "recent_spend_idle_usd": 2.1234,
+                "active_vm_count": 3,
+                "is_throttled": False,
+            }
         if "/messages" in path and method == "POST":
             return {"id": "msg-abc", "status": "created", "arming": "not_armed"}
         if "/messages" in path:
@@ -2375,6 +2403,56 @@ def test_messages_group(mock_api, monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         blueprint.main(["messages", "send", "blocked send"])
     assert exc.value.code == 1
+
+
+# ── envelope group ────────────────────────────────────────────────────────────
+
+def test_envelope_show(mock_api, monkeypatch, capsys):
+    """envelope show (human + --json) and envelope set (PATCH body, type coercion,
+    read-only refused) via blueprint.main with mocked api."""
+
+    # show human render includes key fields
+    rc = blueprint.main(["envelope", "show"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "RESOURCE ENVELOPE" in out
+    assert "proj-1" in out
+    assert "max_concurrent_vms" in out
+    assert "spend_ceiling_usd" in out
+    assert "is_throttled" in out
+    assert any("/resource-envelope" in p for _, p, _ in mock_api)
+
+    # show --json emits valid JSON with expected fields
+    mock_api.clear()
+    rc = blueprint.main(["--json", "envelope", "show"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["max_concurrent_vms"] == 5
+    assert parsed["spend_ceiling_usd"] == 100.0
+    assert parsed["is_throttled"] is False
+
+    # set with read-only config is refused
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["envelope", "set", "max_concurrent_vms=8", "--yes"])
+    assert exc.value.code == 1
+
+    # set with admin key sends PATCH with type-coerced values
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    mock_api.clear()
+    rc = blueprint.main(["envelope", "set", "max_concurrent_vms=8",
+                         "spend_ceiling_usd=200.0", "--yes"])
+    assert rc == 0
+    patch_calls = [(m, p, b) for m, p, b in mock_api if m == "PATCH"]
+    assert len(patch_calls) == 1
+    _, path, body = patch_calls[0]
+    assert "/resource-envelope" in path
+    assert body["max_concurrent_vms"] == 8          # int, not "8"
+    assert body["spend_ceiling_usd"] == 200.0       # float, not "200.0"
+    out = capsys.readouterr().out
+    assert "RESOURCE ENVELOPE" in out
 
 
 # ── tasks bulk/manual-state extensions ───────────────────────────────────────

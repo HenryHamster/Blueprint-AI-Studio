@@ -140,6 +140,7 @@ async def _project_spend_ceiling_spawn_defer_reason(
             session,
             window_spend_usd=recent_spend,
             ceiling_usd=spend_ceiling,
+            spend_window_days=spend_window_days,
         )
         return (
             f"project spend ceiling reached: ${recent_spend:.2f}/${spend_ceiling:.2f} "
@@ -155,6 +156,7 @@ async def _project_spend_ceiling_spawn_defer_reason(
             window_spend_usd=recent_spend,
             ceiling_usd=spend_ceiling,
             warning_fraction=warning_fraction,
+            spend_window_days=spend_window_days,
         )
     return None
 

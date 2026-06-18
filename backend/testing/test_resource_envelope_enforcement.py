@@ -658,6 +658,95 @@ async def test_at_ceiling_creates_ceiling_alert_not_approaching(db_session, mock
     assert approaching_alerts == []
 
 
+@pytest.mark.asyncio
+async def test_spend_ceiling_alert_contains_window_days(db_session, mocker):
+    """Spend ceiling alert message contains the configured window days, not hardcoded '24h'."""
+    project = make_project(
+        autonomous_enabled=True,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 10.0,
+                "spend_window_days": 7,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Spend at the ceiling
+    mocker.patch(
+        "app.autonomous_research.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}),
+    )
+
+    result = await _project_spend_ceiling_spawn_defer_reason(project, db_session)
+
+    # Alert must be created
+    assert result is not None
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _SPEND_CEILING_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "7-day" in alerts[0].message
+    assert "24h" not in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_approaching_ceiling_alert_contains_window_days(db_session, mocker):
+    """Approaching ceiling alert message contains the configured window days."""
+    project = make_project(
+        autonomous_enabled=True,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 10.0,
+                "spend_window_days": 14,
+                "spend_warning_fraction": 0.8,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Spend at 85% of ceiling — above the 0.8 threshold but below the ceiling
+    mocker.patch(
+        "app.autonomous_research.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 8.5, "compute": 8.5, "agent_vm": 0.0, "idle": 0.0}),
+    )
+
+    result = await _project_spend_ceiling_spawn_defer_reason(project, db_session)
+
+    # Should NOT block spawning
+    assert result is None
+
+    # Approaching-ceiling alert must have been created
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _SPEND_APPROACHING_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "14-day" in alerts[0].message
+
+
 # ---------------------------------------------------------------------------
 # spend_warning_fraction API round-trip
 # ---------------------------------------------------------------------------
@@ -701,3 +790,23 @@ async def test_spend_warning_fraction_patch_round_trip(client: AsyncClient, db_s
     resp4 = await client.get(f"/api/admin/projects/{project.id}/resource-envelope")
     assert resp4.status_code == 200, resp4.text
     assert resp4.json()["spend_warning_fraction"] == pytest.approx(0.8)
+
+
+@pytest.mark.asyncio
+async def test_patch_resource_envelope_rejects_out_of_range_spend_warning_fraction(
+    client: AsyncClient, db_session
+):
+    """PATCH /resource-envelope rejects spend_warning_fraction outside (0, 1] with 422."""
+    project = Project(name="Envelope Warning Reject Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(member)
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/resource-envelope",
+        json={"spend_warning_fraction": 1.5},
+    )
+    assert resp.status_code == 422, resp.text

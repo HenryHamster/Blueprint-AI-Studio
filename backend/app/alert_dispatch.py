@@ -763,8 +763,9 @@ async def _maybe_create_spend_ceiling_alert(
     *,
     window_spend_usd: float,
     ceiling_usd: float,
+    spend_window_days: int,
 ) -> None:
-    """Create a deduplicated WARNING alert when a project's 24h spend ceiling is hit.
+    """Create a deduplicated WARNING alert when a project's spend ceiling is hit.
 
     Deduplicates on a stable title: one undismissed alert per project per trip.
     Caller owns the commit.
@@ -780,12 +781,13 @@ async def _maybe_create_spend_ceiling_alert(
     )
     if existing.scalars().first() is not None:
         return
+    window_label = f"{spend_window_days}-day" if spend_window_days != 1 else "1-day"
     alert = Alert(
         project_id=project_id,
         severity=AlertSeverity.WARNING,
         title=_SPEND_CEILING_ALERT_TITLE,
         message=(
-            f"24h window spend ${window_spend_usd:.4f} has reached the "
+            f"{window_label} window spend ${window_spend_usd:.4f} has reached the "
             f"per-project ceiling ${ceiling_usd:.4f}. New autonomous "
             f"spawning is paused until spend falls below the ceiling."
         ),
@@ -811,6 +813,7 @@ async def _maybe_create_approaching_ceiling_alert(
     window_spend_usd: float,
     ceiling_usd: float,
     warning_fraction: float,
+    spend_window_days: int,
 ) -> None:
     """Create a deduplicated WARNING alert when a project's spend approaches its ceiling.
 
@@ -830,12 +833,13 @@ async def _maybe_create_approaching_ceiling_alert(
     )
     if existing.scalars().first() is not None:
         return
+    window_label = f"{spend_window_days}-day" if spend_window_days != 1 else "1-day"
     alert = Alert(
         project_id=project_id,
         severity=AlertSeverity.WARNING,
         title=_SPEND_APPROACHING_ALERT_TITLE,
         message=(
-            f"Rolling window spend ${window_spend_usd:.4f} has reached "
+            f"Rolling {window_label} window spend ${window_spend_usd:.4f} has reached "
             f"{warning_fraction * 100:.0f}% of the per-project ceiling "
             f"${ceiling_usd:.4f}. Autonomous spawning will pause when spend "
             f"reaches the ceiling."
