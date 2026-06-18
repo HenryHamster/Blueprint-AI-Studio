@@ -1046,6 +1046,73 @@ def to_phase_block(
     return block
 
 
+def _synthesize_narrative(
+    version: ReleaseVersion,
+    *,
+    merged_count: int,
+    aggregate_serving_status: str | None,
+    proven: int,
+    total_merged: int,
+    confidence: float | None,
+    threshold: float | None,
+) -> str:
+    """Synthesize a 2-4 sentence plain-text digest of the version's state.
+
+    Pure function — no I/O, no side effects. Called only by
+    ``build_version_highlights`` so all summary surfaces render identical text.
+    """
+    task_word = "task" if merged_count == 1 else "tasks"
+    total_word = "task" if total_merged == 1 else "tasks"
+
+    if version.status == "promoted":
+        if aggregate_serving_status == "serving_confirmed":
+            intro = "Promoted and actively serving."
+        else:
+            intro = "Promoted."
+        if merged_count == 0:
+            return f"{intro} No tasks were merged into this version."
+        acceptance_part = (
+            f" Acceptance evidence proven for {proven} of {total_merged} merged {total_word}."
+            if total_merged > 0
+            else ""
+        )
+        return f"{intro} Delivered {merged_count} merged {task_word}.{acceptance_part}"
+
+    if version.status == "abandoned":
+        if merged_count == 0:
+            return "Abandoned before promotion with no merged work."
+        acceptance_part = (
+            f" Acceptance evidence was proven for {proven} of {total_merged} merged {total_word}."
+            if total_merged > 0
+            else ""
+        )
+        return f"Abandoned before promotion with {merged_count} merged {task_word}.{acceptance_part}"
+
+    # open
+    if merged_count == 0:
+        return f"Open in the {version.phase} phase with no merged work yet."
+
+    acceptance_part = (
+        f" Acceptance evidence proven for {proven} of {total_merged} merged {total_word}."
+        if total_merged > 0
+        else ""
+    )
+    qual_part = ""
+    if confidence is not None and threshold is not None:
+        conf_pct = round(confidence * 100)
+        thr_pct = round(threshold * 100)
+        direction = "meeting" if confidence >= threshold else "below"
+        qual_part = f" Qualification confidence is {conf_pct}%, {direction} the {thr_pct}% threshold."
+    elif confidence is not None:
+        conf_pct = round(confidence * 100)
+        qual_part = f" Qualification confidence is {conf_pct}%."
+
+    return (
+        f"Open in the {version.phase} phase with {merged_count} merged {task_word}."
+        f"{acceptance_part}{qual_part}"
+    )
+
+
 def build_version_highlights(
     version: ReleaseVersion,
     *,
@@ -1092,6 +1159,16 @@ def build_version_highlights(
     else:
         headline = f"open in {version.phase} with {merged_count} merged"
 
+    narrative = _synthesize_narrative(
+        version,
+        merged_count=merged_count,
+        aggregate_serving_status=aggregate_serving_status,
+        proven=proven,
+        total_merged=total_merged,
+        confidence=confidence,
+        threshold=threshold,
+    )
+
     return {
         "merged_count": merged_count,
         "proven": proven,
@@ -1099,6 +1176,7 @@ def build_version_highlights(
         "qualification_confidence": confidence,
         "qualification_threshold": threshold,
         "headline": headline,
+        "narrative": narrative,
     }
 
 

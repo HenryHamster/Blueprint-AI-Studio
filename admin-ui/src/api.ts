@@ -2063,6 +2063,7 @@ export interface VersionSummaryHighlights {
   total_merged_for_acceptance: number;
   qualification_confidence: number | null;
   qualification_threshold: number | null;
+  narrative?: string | null;
 }
 
 export interface VersionSummaryResponse {

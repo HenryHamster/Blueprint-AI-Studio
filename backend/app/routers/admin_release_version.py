@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field as _Field
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only, selectinload
 from sqlmodel import select
@@ -1692,4 +1693,89 @@ async def get_release_version_summary(
         # Per-task changelog: type, title, and PR number for each merged task,
         # newest-first. Allows operators and the CLI to see what shipped.
         "tasks_merged": tasks_merged,
+    }
+
+
+_RELEASE_VERSION_STATUSES = {"open", "promoted", "abandoned"}
+
+
+@router.get("/projects/{project_id}/release-versions")
+async def list_release_versions(
+    project_id: uuid.UUID,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    status: Optional[str] = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """List all release versions for a project, newest-first, paginated.
+
+    Unlike ``version-lifecycle`` (which surfaces only the open version plus a
+    short recent tail and is cached for dashboard polling), this is an explicit
+    operator query that browses the FULL version history. Each entry is the same
+    rich serialization the lifecycle endpoint's history section emits (merged
+    counts, highlights, serving state).
+
+    Query params:
+    - ``limit`` (1-100, default 20): page size.
+    - ``offset`` (>=0, default 0): rows to skip.
+    - ``status`` (optional ``open`` | ``promoted`` | ``abandoned``): filter.
+
+    Returns ``{"versions": [...], "total": N, "limit": N, "offset": N}`` where
+    ``total`` is the count of matching rows BEFORE pagination. Viewer role or
+    above on the owning project is required. Not cached - this is an explicit
+    operator query, not dashboard polling.
+    """
+    if status is not None and status not in _RELEASE_VERSION_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "status must be one of: " + ", ".join(sorted(_RELEASE_VERSION_STATUSES))
+            ),
+        )
+
+    project_row = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+
+    filters = [ReleaseVersion.project_id == project_id]
+    if status is not None:
+        filters.append(ReleaseVersion.status == status)
+
+    total = (
+        await session.execute(
+            select(func.count()).select_from(ReleaseVersion).where(*filters)
+        )
+    ).scalar_one()
+
+    rows = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
+                .where(*filters)
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    versions = [
+        await _serialize_version_history_entry(
+            version,
+            project_row,
+            session=session,
+            project_id=project_id,
+        )
+        for version in rows
+    ]
+
+    return {
+        "versions": versions,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
     }

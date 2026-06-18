@@ -944,10 +944,22 @@ def _tasks_research(args: argparse.Namespace) -> None:
 def cmd_versions(args: argparse.Namespace) -> None:
     """Dispatch ``versions list`` / ``versions show`` (defaults to list)."""
     pid = get_project_id(getattr(args, "project_id", None))
+
+    # Full-history browsing (``versions list --all`` or ``--limit/--offset``) goes
+    # through the paginated release-versions endpoint rather than the cached
+    # version-lifecycle read. Default ``versions list`` keeps using lifecycle below
+    # so the no-flag UX is unchanged.
+    sub = getattr(args, "versions_cmd", None) or "list"
+    if sub == "list" and (
+        getattr(args, "all_versions", False)
+        or getattr(args, "limit", None) is not None
+    ):
+        _versions_list_paginated(args, pid)
+        return
+
     lifecycle = api("GET", f"/api/admin/projects/{pid}/version-lifecycle")
     cv = lifecycle.get("current_version")
     recent = lifecycle.get("recent_versions") or []
-    sub = getattr(args, "versions_cmd", None) or "list"
 
     if sub == "export-changelog":
         target = getattr(args, "version_number", None)
@@ -1130,6 +1142,69 @@ def _render_version_list(data: dict) -> None:
             print(_version_line(v))
 
 
+def _versions_list_paginated(args: argparse.Namespace, pid: str) -> None:
+    """Browse the full version history via the paginated release-versions endpoint.
+
+    ``--all`` walks every page (fixed internal page size); ``--limit/--offset``
+    fetch a single explicit window. Either way the rendered output shows the
+    pre-pagination ``total`` and the window currently in view.
+    """
+    base = f"/api/admin/projects/{pid}/release-versions"
+    offset = getattr(args, "offset", 0) or 0
+
+    if getattr(args, "all_versions", False):
+        page_size = 100
+        versions: list = []
+        total = 0
+        cursor = offset
+        while True:
+            resp, err = _safe_read(f"{base}?limit={page_size}&offset={cursor}")
+            if err or resp is None:
+                print(err or "no response from release-versions", file=sys.stderr)
+                return
+            total = resp.get("total", 0)
+            batch = resp.get("versions") or []
+            versions.extend(batch)
+            cursor += len(batch)
+            # Stop on a short page or once we've covered the reported total.
+            if not batch or len(batch) < page_size or cursor >= total:
+                break
+        data = {
+            "versions": versions,
+            "total": total,
+            "limit": None,
+            "offset": offset,
+        }
+    else:
+        limit = getattr(args, "limit", None) or 20
+        resp, err = _safe_read(f"{base}?limit={limit}&offset={offset}")
+        if err or resp is None:
+            print(err or "no response from release-versions", file=sys.stderr)
+            return
+        data = {
+            "versions": resp.get("versions") or [],
+            "total": resp.get("total", 0),
+            "limit": resp.get("limit", limit),
+            "offset": resp.get("offset", offset),
+        }
+
+    _emit(args, data, _render_versions_paginated)
+
+
+def _render_versions_paginated(data: dict) -> None:
+    total = data.get("total", 0)
+    versions = data.get("versions") or []
+    print(f"=== RELEASE VERSIONS ({total} total) ===")
+    if not versions:
+        print("  (no versions in this window)")
+        return
+    for v in versions:
+        print(_version_line(v))
+    offset = data.get("offset", 0) or 0
+    end = offset + len(versions) - 1
+    print(f"\n  (showing {offset}-{end} of {total})")
+
+
 def _changelog_to_markdown(tasks_merged: list, heading: str | None = None) -> str:
     """Format a tasks_merged list as a Markdown release-notes block.
 
@@ -1175,8 +1250,11 @@ def _render_version_summary(s: dict) -> None:
         print(f"  goal:         {s['goal'][:200]}")
     highlights = s.get("highlights") or {}
     headline = highlights.get("headline") if isinstance(highlights, dict) else None
+    narrative = highlights.get("narrative") if isinstance(highlights, dict) else None
     if headline:
         print(f"\n  Summary: {headline}")
+    if narrative:
+        print(f"  {narrative}")
     tasks_merged = s.get("tasks_merged") or []
     if tasks_merged:
         print(f"\n  Changelog ({len(tasks_merged)} tasks):")
@@ -2947,7 +3025,18 @@ def build_parser() -> argparse.ArgumentParser:
                                 description="List release versions or show a detailed summary "
                                             "for a specific version.")
     versions_sub = p_versions.add_subparsers(dest="versions_cmd")
-    versions_sub.add_parser("list", parents=[common], help="List current + recent versions.")
+    p_versions_list = versions_sub.add_parser(
+        "list", parents=[common],
+        help="List current + recent versions (or browse full history with --all/--limit).")
+    p_versions_list.add_argument(
+        "--all", action="store_true", dest="all_versions",
+        help="Browse the full version history (paginated) instead of current + recent.")
+    p_versions_list.add_argument(
+        "--limit", type=int, default=None,
+        help="Page size for history browsing (1-100). Implies the full-history view.")
+    p_versions_list.add_argument(
+        "--offset", type=int, default=0,
+        help="Rows to skip for history browsing (use with --limit).")
     p_versions_show = versions_sub.add_parser("show", parents=[common],
                                               help="Show a version summary (current by default).")
     p_versions_show.add_argument("version_number", nargs="?", default=None,

@@ -1048,6 +1048,9 @@ function VersionHighlightsLine({
         {conf && thresh && <span>conf {conf} / thr {thresh}</span>}
         {phase && <span className="text-neutral-500">{phase} · {status}</span>}
       </div>
+      {highlights.narrative && (
+        <p className="text-neutral-400 mt-1 leading-relaxed" data-testid="version-narrative">{highlights.narrative}</p>
+      )}
     </div>
   );
 }

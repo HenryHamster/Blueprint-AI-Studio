@@ -188,6 +188,35 @@ def mock_api(monkeypatch):
                 "promotion_enabled_effective": True,
                 "promotion_enabled_source": "fleet",
             }
+        if "/release-versions?" in path or path.endswith("/release-versions"):
+            # Paginated full-history endpoint. Echo the requested window so the
+            # CLI's offset/limit handling and header/footer can be asserted.
+            from urllib.parse import urlparse, parse_qs
+
+            qs = parse_qs(urlparse(path).query)
+            limit = int(qs.get("limit", ["20"])[0])
+            offset = int(qs.get("offset", ["0"])[0])
+            status_f = qs.get("status", [None])[0]
+            all_rows = [
+                {"id": "uuid-v4", "version_number": 4, "phase": "build",
+                 "status": "open", "merged_count": 2,
+                 "highlights": {"headline": "open in build"}},
+                {"id": "uuid-v3", "version_number": 3, "phase": "stabilize",
+                 "status": "promoted", "promoted_sha": "cafe", "merged_count": 9,
+                 "highlights": {"headline": "promoted v3"}},
+                {"id": "uuid-v2", "version_number": 2, "phase": "build",
+                 "status": "abandoned", "merged_count": 1,
+                 "highlights": {"headline": "abandoned v2"}},
+                {"id": "uuid-v1", "version_number": 1, "phase": "build",
+                 "status": "promoted", "promoted_sha": "f00d", "merged_count": 5,
+                 "highlights": {"headline": "promoted v1"}},
+            ]
+            if status_f:
+                all_rows = [r for r in all_rows if r["status"] == status_f]
+            total = len(all_rows)
+            window = all_rows[offset:offset + limit]
+            return {"versions": window, "total": total,
+                    "limit": limit, "offset": offset}
         if "/release-versions/uuid-v11/summary" in path:
             return {
                 "phase": "stabilize",
@@ -1095,6 +1124,54 @@ def test_versions_list_uses_server_headline_for_past_versions(mock_api, capsys):
     assert "promoted & serving" in out
     # merged count from the row
     assert "merged=10" in out
+
+
+def test_versions_list_default_uses_lifecycle_not_paginated(mock_api, capsys):
+    """Default `versions list` keeps using the cached lifecycle endpoint and
+    never touches the paginated release-versions endpoint."""
+    rc = blueprint.main(["versions", "list"])
+    assert rc == 0
+    paths = [p for _, p, _ in mock_api]
+    assert any("version-lifecycle" in p for p in paths)
+    assert not any("release-versions?" in p for p in paths)
+
+
+def test_versions_list_all_browses_full_history(mock_api, capsys):
+    """`versions list --all` hits the paginated endpoint, shows the total in the
+    header, and renders every version newest-first."""
+    rc = blueprint.main(["versions", "list", "--all"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "=== RELEASE VERSIONS (4 total) ===" in out
+    # All four versions rendered.
+    for n in (1, 2, 3, 4):
+        assert f"v{n}" in out
+    # Window footer covers the whole set.
+    assert "(showing 0-3 of 4)" in out
+    # The paginated endpoint was used; lifecycle was NOT.
+    paths = [p for _, p, _ in mock_api]
+    assert any("release-versions?" in p for p in paths)
+    assert not any("version-lifecycle" in p for p in paths)
+
+
+def test_versions_list_all_json_envelope(mock_api, capsys):
+    """`--json versions list --all` emits the full envelope with total/limit/offset."""
+    rc = blueprint.main(["--json", "versions", "list", "--all"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["total"] == 4
+    assert len(parsed["versions"]) == 4
+    assert [v["version_number"] for v in parsed["versions"]] == [4, 3, 2, 1]
+
+
+def test_versions_list_limit_offset_window(mock_api, capsys):
+    """`versions list --limit N --offset M` requests an explicit window and shows it."""
+    rc = blueprint.main(["versions", "list", "--limit", "2", "--offset", "1"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "(showing 1-2 of 4)" in out
+    # limit/offset are inlined into the request path.
+    assert any("limit=2&offset=1" in p for _, p, _ in mock_api)
 
 
 def test_version_headline_derivation():
