@@ -2786,15 +2786,14 @@ async def _spawn_pipeline_task(
             # First review in the chain — stamp the resolved type_model as the pin.
             reviewer_model_for_chain = type_model
 
+    # Forward viewport screenshots captured by the implementer so both
+    # reviewers and fix agents can visually inspect before/after/diff PNGs.
+    _impl_shots: list = (
+        (orig.context or {}).get("viewport_screenshots", []) if orig is not None else []
+    )
+
     if task_type == "review":
         title = f"Review PR #{pr_number}"
-        # Forward viewport screenshots captured by the implementer so the
-        # independent reviewer can visually inspect before/after/diff PNGs.
-        _impl_shots: list = (
-            (orig.context or {}).get("viewport_screenshots", [])
-            if orig is not None
-            else []
-        )
         payload_data = {
             "type": "review",
             "pr_number": pr_number,
@@ -2831,6 +2830,14 @@ async def _spawn_pipeline_task(
             **({"hotfix": True} if orig_hotfix else {}),
             **({"model": type_model} if type_model else {}),
             **({"effort": type_effort} if type_effort else {}),
+            **(
+                {
+                    "viewport_shot_entries": _impl_shots,
+                    "viewport_source_task_id": resolved_original_id,
+                }
+                if _impl_shots
+                else {}
+            ),
         }
 
     # Build review_history: carry forward from source task, appending current feedback if spawning a fix

@@ -168,6 +168,42 @@ export const VIEWPORT_LIVE_HINT =
 export const VIEWPORT_FAILURE_SCREENSHOT_HINT =
   ' VIEWPORT REGRESSION FAILURES: if `./check` fails on viewport tests, the failure screenshots are automatically uploaded and logged in the output as `[check] viewport screenshot uploaded: <gs_uri> (<component>@<width>px) — local copy: <local_path>`. BEFORE attempting to fix the visual regression, open and read the screenshot at the logged local path (e.g., `/tmp/viewport_failure_<task_id>_<component>_<width>.png`) to see the broken render. The screenshot shows you exactly what is wrong with the layout so you can diagnose the issue instead of fixing blind.';
 
+/**
+ * Build a prompt section pointing an agent at viewport screenshots that were
+ * already downloaded to the local workspace (paths under /tmp/viewport_*). The
+ * paths follow the `<component>-<width>-(before|after|diff).png` naming the
+ * implementer uploads, so we group them back into before/after/diff sets per
+ * component+width key rather than emitting a flat list. Returns '' when no
+ * screenshots were downloaded, so non-visual PRs are unaffected.
+ *
+ * Shared by the review, fix, and panel_review prompt builders so a downstream
+ * agent receives the same screenshot brief regardless of which lane forwarded
+ * the PNGs.
+ */
+export function buildViewportScreenshotSection(downloadedShotPaths: string[]): string {
+  if (downloadedShotPaths.length === 0) return '';
+  const pairs = new Map<string, { before?: string; after?: string; diff?: string }>();
+  for (const p of downloadedShotPaths) {
+    const basename = p.replace(/^.*\//, '').replace(/\.png$/, '');
+    const key = basename.replace(/-(?:before|after|diff)$/, '');
+    if (!pairs.has(key)) pairs.set(key, {});
+    const entry = pairs.get(key);
+    if (!entry) continue;
+    if (basename.endsWith('-before')) entry.before = p;
+    else if (basename.endsWith('-after')) entry.after = p;
+    else if (basename.endsWith('-diff')) entry.diff = p;
+  }
+  const lines = ['## Viewport Screenshots (before/after/diff)'];
+  lines.push('The implementing agent captured these admin-ui viewport screenshots. Use the Read tool to inspect each PNG and check for visual regressions.');
+  for (const [key, entry] of pairs) {
+    lines.push(`\n**${key}**`);
+    if (entry.before) lines.push(`  - before: ${entry.before}`);
+    if (entry.after) lines.push(`  - after:  ${entry.after}`);
+    if (entry.diff) lines.push(`  - diff:   ${entry.diff}`);
+  }
+  return lines.join('\n') + '\n\n';
+}
+
 export const TASK_TYPE_HINTS: Record<string, string> = {
   'qa': 'Focus on writing tests. Run the existing test suite first to understand patterns. Do not modify production code unless fixing a test setup issue.',
   'migrate': 'This is a database migration task. Check existing Alembic migrations in backend/alembic/versions/ for naming conventions. Use `alembic revision --autogenerate` as a starting point only — always review and clean up generated migrations.',

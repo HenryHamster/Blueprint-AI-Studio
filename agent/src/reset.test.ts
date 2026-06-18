@@ -587,6 +587,15 @@ describe('resetForNextRole — integration: full /tmp artifact surface', () => {
       (c) => c[0] === `/tmp/viewport_review_${taskId}`,
     );
     expect(viewportRmCall?.[1]).toEqual(expect.objectContaining({ recursive: true, force: true }));
+
+    // handleFix downloads its screenshots into /tmp/viewport_fix_<task> — it
+    // must be cleaned with the same recursive rm so it does not leak across
+    // reused warm workspaces.
+    expect(rmPaths).toContain(`/tmp/viewport_fix_${taskId}`);
+    const viewportFixRmCall = fsPromisesMocks.rm.mock.calls.find(
+      (c) => c[0] === `/tmp/viewport_fix_${taskId}`,
+    );
+    expect(viewportFixRmCall?.[1]).toEqual(expect.objectContaining({ recursive: true, force: true }));
   });
 
   it('includes "symbols" to prevent ctags file leak on warm VMs between roles', () => {

@@ -51,6 +51,7 @@ import {
   TASK_TYPE_HINTS,
   TASK_TYPES_WITHOUT_HINT,
   VIEWPORT_SNAPSHOT_HINT,
+  buildViewportScreenshotSection,
   buildAnalysisPrompt,
   parseAnalysisPlanFiles,
   parseAnalysisPlanTestFiles,
@@ -4317,6 +4318,37 @@ describe('viewport snapshot pilot — agent prompt wiring', () => {
     expect(end).toBeGreaterThan(start);
     const region = CODE_CHANGE_HELPER_GUIDANCE.slice(start, end);
     expect(region).not.toContain('visual_verification');
+  });
+});
+
+describe('buildViewportScreenshotSection — downloaded PNG wiring', () => {
+  it('returns empty string when no screenshots were downloaded', () => {
+    expect(buildViewportScreenshotSection([])).toBe('');
+  });
+
+  it('lists each downloaded path so the agent can Read the PNGs', () => {
+    const section = buildViewportScreenshotSection([
+      '/tmp/viewport_fix_t1/Dashboard-375-before.png',
+      '/tmp/viewport_fix_t1/Dashboard-375-after.png',
+      '/tmp/viewport_fix_t1/Dashboard-375-diff.png',
+    ]);
+    expect(section).toContain('## Viewport Screenshots');
+    expect(section).toContain('Use the Read tool');
+    expect(section).toContain('/tmp/viewport_fix_t1/Dashboard-375-before.png');
+    expect(section).toContain('/tmp/viewport_fix_t1/Dashboard-375-after.png');
+    expect(section).toContain('/tmp/viewport_fix_t1/Dashboard-375-diff.png');
+  });
+
+  it('groups before/after/diff paths under one key per component+width', () => {
+    const section = buildViewportScreenshotSection([
+      '/tmp/viewport_review_t2/Panel-375-before.png',
+      '/tmp/viewport_review_t2/Panel-375-after.png',
+      '/tmp/viewport_review_t2/Header-768-after.png',
+    ]);
+    // Exactly two grouping headers (Panel-375 and Header-768), not three.
+    expect(section.match(/\*\*[^*]+\*\*/g)).toHaveLength(2);
+    expect(section).toContain('**Panel-375**');
+    expect(section).toContain('**Header-768**');
   });
 });
 

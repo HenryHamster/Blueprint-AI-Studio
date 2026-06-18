@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
@@ -24,6 +25,7 @@ import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   DEFAULT_TOOL_GUIDANCE,
+  buildViewportScreenshotSection,
   configureAgentPermissions,
   computePromptFingerprint,
   formatPlaybook,
@@ -209,6 +211,9 @@ type PanelReviewLensBodyArgs = {
   // Read-only ./fetch guidance block (or '' when project_id is absent). Gated so
   // a prompt never advertises a helper that wasn't written into the workspace.
   fetchGuidance: string;
+  // Prompt section listing viewport screenshots downloaded for this PR (or ''
+  // when none were forwarded), so each lens can Read the rendered PNGs.
+  viewportScreenshotSection: string;
   // When present, this panel_review is acting as an independent challenger for
   // a primary verdict. Absent → standalone advisory workflow (backward compatible).
   challengeContext?: ChallengeContext;
@@ -255,6 +260,7 @@ function buildPanelReviewLensBody(args: PanelReviewLensBodyArgs): string {
     buildConfig,
     fetchGuidance,
     challengeContext,
+    viewportScreenshotSection,
   } = args;
   const outputPath = `/tmp/${panelReviewLensOutputType(lens.id)}_${taskId}.json`;
   const challengeSection = challengeContext
@@ -272,7 +278,7 @@ ${challengeSection}
 ${originalPrompt ? `Original task prompt: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}Files changed in this PR:
 ${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}
 
-Rules for your lens pass:
+${viewportScreenshotSection}Rules for your lens pass:
 - Read the diff and any surrounding files you need with \`git diff origin/${baseBranch}...HEAD\` and targeted file reads.
 - Use severities \`critical\`, \`major\`, or \`minor\`.
 - Only include substantiated issues with a concrete description, scoped to your lens.
@@ -430,6 +436,40 @@ export async function handlePanelReview(
     sendLog(ws, `WARNING: Failed to fetch origin/${baseBranch} for diff comparison: ${String(error)}\n`);
   }
 
+  // Download viewport screenshots forwarded from the review task so panel lenses
+  // have access to the rendered PNGs when evaluating visual-change PRs.
+  const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
+  const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
+  const panelProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
+  const panelProjectIdForShots = strVal(panelProjectMeta?.project_id as string | undefined);
+  const panelOrchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
+  const downloadedShotPaths: string[] = [];
+  if (viewportShotEntries.length > 0 && viewportSourceTaskId && panelProjectIdForShots) {
+    const shotDir = `/tmp/viewport_review_${taskId}`;
+    try { fs.mkdirSync(shotDir, { recursive: true }); } catch { /* ignore */ }
+    for (const entry of viewportShotEntries.slice(0, 8)) {
+      const name = strVal(entry.name);
+      if (!name) continue;
+      const downloadUrl = `${panelOrchestratorUrl}/api/admin/viewport-shots/download-url` +
+        `?project_id=${encodeURIComponent(panelProjectIdForShots)}` +
+        `&task_id=${encodeURIComponent(viewportSourceTaskId)}` +
+        `&name=${encodeURIComponent(name)}`;
+      const dest = `${shotDir}/${name}.png`;
+      try {
+        execFileSync('curl', ['-sfL', '--max-time', '30', '-o', dest, downloadUrl]);
+        downloadedShotPaths.push(dest);
+      } catch {
+        sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`);
+      }
+    }
+    if (downloadedShotPaths.length > 0) {
+      sendLog(ws, `[VIEWPORT] Downloaded ${downloadedShotPaths.length} screenshot(s) for panel review\n`);
+    }
+  }
+  // Prompt section listing the downloaded PNGs so each lens can Read them when
+  // evaluating visual-change PRs (empty string when none were forwarded).
+  const panelViewportScreenshotSection = buildViewportScreenshotSection(downloadedShotPaths);
+
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   // Provision the read-only ./fetch helper (direction|section|playbook) so each
@@ -527,6 +567,7 @@ export async function handlePanelReview(
     buildConfig,
     fetchGuidance: panelFetchGuidance,
     challengeContext,
+    viewportScreenshotSection: panelViewportScreenshotSection,
   }));
   const projectContextSection = projectContext ? `${projectContext}\n\n` : '';
 

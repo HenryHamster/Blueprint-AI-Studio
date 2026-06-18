@@ -22,7 +22,7 @@ import {
   FIX_TASK_FOCUS, getTaskTypeFocusBlock, PARALLEL_REVIEW_GUIDANCE, PARALLEL_FIX_GUIDANCE,
   assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, formatProvenanceWarnings, formatAcceptanceEvidence, type PlaybookEntry,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, formatProvenanceWarnings, formatAcceptanceEvidence, buildViewportScreenshotSection, type PlaybookEntry,
 } from '../prompt.js';
 import {
   formatProjectVision,
@@ -705,31 +705,7 @@ export async function handleReview(
   // Build a section pointing the reviewer at any downloaded viewport screenshots.
   // Group by component/width prefix (strip trailing -before/-after/-diff suffix)
   // so the reviewer sees paired sets rather than a flat list.
-  let viewportScreenshotSection = '';
-  if (downloadedShotPaths.length > 0) {
-    const pairs = new Map<string, { before?: string; after?: string; diff?: string }>();
-    for (const p of downloadedShotPaths) {
-      const base = p.replace(/\/((?:[^/]+-\d+)-(?:before|after|diff))\.png$/, '/$1');
-      const basename = p.replace(/^.*\//, '').replace(/\.png$/, '');
-      const key = basename.replace(/-(?:before|after|diff)$/, '');
-      if (!pairs.has(key)) pairs.set(key, {});
-      const entry = pairs.get(key);
-      if (!entry) continue;
-      if (basename.endsWith('-before')) entry.before = p;
-      else if (basename.endsWith('-after')) entry.after = p;
-      else if (basename.endsWith('-diff')) entry.diff = p;
-      void base;
-    }
-    const lines = ['## Viewport Screenshots (before/after/diff)'];
-    lines.push('The implementing agent captured these admin-ui viewport screenshots. Read them to check for visual regressions.');
-    for (const [key, entry] of pairs) {
-      lines.push(`\n**${key}**`);
-      if (entry.before) lines.push(`  - before: ${entry.before}`);
-      if (entry.after) lines.push(`  - after:  ${entry.after}`);
-      if (entry.diff) lines.push(`  - diff:   ${entry.diff}`);
-    }
-    viewportScreenshotSection = lines.join('\n') + '\n\n';
-  }
+  const viewportScreenshotSection = buildViewportScreenshotSection(downloadedShotPaths);
 
   const reviewPrompt = `${reviewStrategicFraming}${reviewStrategicFraming ? '\n\n' : ''}${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}${fixResponsesSection}${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
 
@@ -908,6 +884,43 @@ export async function handleFix(
 
   git(['config', 'user.email', fixBuildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', fixBuildConfig?.git_user_name || 'Blueprint Agent']);
+
+  // Download viewport screenshots captured by the implementer for visual context.
+  // The payload carries `viewport_shot_entries` (list of {name, storage_uri} dicts)
+  // and `viewport_source_task_id` (the create/fix task that uploaded them).
+  // We fetch each PNG via the admin no-auth 302-redirect endpoint so we never need
+  // a cross-task JWT — this is the same path used by PR body screenshot links.
+  const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
+  const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
+  const fixViewportProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
+  const fixViewportProjectId = strVal(fixViewportProjectMeta?.project_id as string | undefined);
+  const fixViewportOrchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
+  const downloadedFixShotPaths: string[] = [];
+  if (viewportShotEntries.length > 0 && viewportSourceTaskId && fixViewportProjectId) {
+    const shotDir = `/tmp/viewport_fix_${taskId}`;
+    try { fs.mkdirSync(shotDir, { recursive: true }); } catch { /* ignore */ }
+    for (const entry of viewportShotEntries.slice(0, 8)) {
+      const name = strVal(entry.name);
+      if (!name) continue;
+      const downloadUrl = `${fixViewportOrchestratorUrl}/api/admin/viewport-shots/download-url` +
+        `?project_id=${encodeURIComponent(fixViewportProjectId)}` +
+        `&task_id=${encodeURIComponent(viewportSourceTaskId)}` +
+        `&name=${encodeURIComponent(name)}`;
+      const dest = `${shotDir}/${name}.png`;
+      try {
+        execFileSync('curl', ['-sfL', '--max-time', '30', '-o', dest, downloadUrl]);
+        downloadedFixShotPaths.push(dest);
+      } catch {
+        sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`);
+      }
+    }
+    if (downloadedFixShotPaths.length > 0) {
+      sendLog(ws, `[VIEWPORT] Downloaded ${downloadedFixShotPaths.length} screenshot(s) for visual context\n`);
+    }
+  }
+  // Prompt section that points the fix agent at the downloaded PNGs so it can
+  // visually inspect the rendered components (empty when none were downloaded).
+  const fixViewportScreenshotSection = buildViewportScreenshotSection(downloadedFixShotPaths);
 
   // Always rebase onto target branch to resolve merge conflicts
   statusRef.value = `Rebasing onto ${baseBranch}...`;
@@ -1303,6 +1316,13 @@ export async function handleFix(
   );
   if (fixStrategicIntent) {
     enrichedPrompt = `${fixStrategicIntent}\n${enrichedPrompt}`;
+  }
+
+  // Surface the downloaded viewport screenshots to the fix agent so it can
+  // visually inspect the rendered components while addressing the feedback.
+  // Mirrors handleReview's viewportScreenshotSection wiring.
+  if (fixViewportScreenshotSection) {
+    enrichedPrompt = `${enrichedPrompt}\n\n${fixViewportScreenshotSection}`;
   }
 
   // Prepend repo overview so fix agents know the tech stack and layout without

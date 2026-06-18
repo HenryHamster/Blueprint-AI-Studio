@@ -228,13 +228,16 @@ export async function resetForNextRole(opts: ResetOptions): Promise<void> {
         console.error(`[reset] step 2 unlink ${p}: ${String(err)}`);
       }
     }
-    // review-fix.ts downloads implementer screenshots into a per-task
-    // directory that is a directory, not a flat file, so it cannot be
-    // handled by the unlink loop above.
-    try {
-      await fs.promises.rm(`/tmp/viewport_review_${priorTaskId}`, { recursive: true, force: true });
-    } catch (err) {
-      console.error(`[reset] step 2 rm viewport_review dir: ${String(err)}`);
+    // review-fix.ts / panel-review.ts download implementer screenshots into
+    // per-task directories (directories, not flat files), so they cannot be
+    // handled by the unlink loop above. handleReview/panel_review use
+    // /tmp/viewport_review_<task>; handleFix uses /tmp/viewport_fix_<task>.
+    for (const dir of [`/tmp/viewport_review_${priorTaskId}`, `/tmp/viewport_fix_${priorTaskId}`]) {
+      try {
+        await fs.promises.rm(dir, { recursive: true, force: true });
+      } catch (err) {
+        console.error(`[reset] step 2 rm ${dir}: ${String(err)}`);
+      }
     }
   } catch (err) {
     console.error(`[reset] step 2 (/tmp cleanup) failed: ${String(err)}`);
