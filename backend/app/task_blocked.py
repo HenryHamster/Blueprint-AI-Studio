@@ -204,6 +204,7 @@ def build_need(
             need["label"] = label_text[:NEED_LABEL_MAX_LEN]
     return need
 
+
 # Default interval before a blocked task is rechecked by the auto-unblock sweep.
 DEFAULT_BLOCKER_RECHECK_SECONDS = 600
 _UPSTREAM_REASON_MARKERS = (
@@ -322,9 +323,8 @@ def enter_blocked_state(
     teardown / account-slot release.
     """
     now = now or _utcnow()
-    blocker_code = (
-        blocker_kind
-        or _default_blocker_kind(waiting_on=waiting_on, reason=reason, source=source)
+    blocker_code = blocker_kind or _default_blocker_kind(
+        waiting_on=waiting_on, reason=reason, source=source
     )
     recheck_at = (
         now + timedelta(seconds=recheck_in_seconds) if recheck_in_seconds else None
@@ -468,6 +468,13 @@ def clear_blocker_metadata(task: Task) -> None:
     ``_precondition_escalated_key``) so a requeued task never immediately
     re-parks on its next block episode — the escalation was earned by the
     prior run, not the fresh attempt.
+
+    ``_blocked_optimistic_retries`` is included in
+    ``FRESH_ATTEMPT_CONTEXT_STRIP_KEYS`` but is deliberately **preserved**
+    here via ``preserve_blocked_optimistic_retries=True``: the optimistic
+    retry counter accumulates across block episodes within the same task
+    lifetime, so it must survive individual unblock transitions (only a full
+    fresh-attempt resurrection — e.g. a QUEUED re-spawn — resets it).
     """
     task.blocker_kind = None
     task.blocked_reason = None
@@ -490,9 +497,7 @@ def clear_blocker_metadata(task: Task) -> None:
     )
 
 
-def unblock_to_queued(
-    task: Task, *, message: Optional[str] = None
-) -> None:
+def unblock_to_queued(task: Task, *, message: Optional[str] = None) -> None:
     """Out-transition: return a BLOCKED task to QUEUED once its precondition
     resolves.
 
