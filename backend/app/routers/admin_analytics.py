@@ -2120,3 +2120,36 @@ async def get_lane_pilot_preflight(
         "durable_verdict": durable_verdict,
         "pilot_mode": get_lane_pilot_mode(),
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/improvement-lanes/reclaim-orphaned
+# ---------------------------------------------------------------------------
+
+
+@router.post("/improvement-lanes/reclaim-orphaned")
+async def reclaim_orphaned_lane_workspaces(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Reset workspace_state to COLD on lanes whose backing pool VM no longer exists.
+
+    On-demand trigger for the startup recovery sweep
+    (``reclaim_orphaned_lane_workspace_states``).  Useful when an operator
+    observes an improvement lane stuck in workspace_state=WARM_RESERVED or
+    LEASED with a missing VM — running this endpoint remediates the orphan
+    immediately without requiring an orchestrator restart.
+
+    Returns ``reclaimed``: the count of lanes whose workspace state was reset.
+    """
+    from app.improvement_lane_ops import reclaim_orphaned_lane_workspace_states  # noqa: PLC0415
+
+    reclaimed = await reclaim_orphaned_lane_workspace_states(session)
+    await session.commit()
+
+    logger.info(
+        "[LANE-PILOT] operator reclaim-orphaned: reclaimed=%s",
+        reclaimed,
+    )
+
+    return {"reclaimed": reclaimed}

@@ -3653,3 +3653,86 @@ async def test_lane_control_plane_survives_simulated_restart():
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.drop_all)
     await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/improvement-lanes/reclaim-orphaned — endpoint test
+# ---------------------------------------------------------------------------
+
+
+class TestReclaimOrphanedLaneWorkspaces:
+    """Tests for POST /api/admin/improvement-lanes/reclaim-orphaned."""
+
+    @pytest.mark.asyncio
+    async def test_reclaim_orphaned_returns_count(
+        self, client: AsyncClient, db_session: AsyncSession
+    ):
+        """POST reclaim-orphaned returns reclaimed=N for N orphaned lanes and
+        resets their workspace_state to COLD."""
+        from app.models import Project
+
+        project_id = uuid.uuid4()
+        db_session.add(
+            Project(
+                id=project_id,
+                user_id="test-user",
+                name="reclaim-test-project",
+                github_owner="owner",
+                github_repo="repo",
+                status="DEPLOYING",
+            )
+        )
+        await db_session.commit()
+
+        # Lane with WARM_RESERVED state but no backing PoolVm — an orphan.
+        orphan_lane = ImprovementLane(
+            project_id=project_id,
+            direction_id="d-reclaim-test",
+            title="Orphan lane",
+            goal="Test reclaim endpoint",
+            branch_name="lane/reclaim-test",
+            base_branch="main",
+            status=ImprovementLaneStatus.ACTIVE.value,
+            checkpoint_seq=0,
+            checkpoints=[],
+            manifest={},
+            workspace_state="WARM_RESERVED",
+            workspace_vm_instance_id="ghost-vm-reclaim-1",
+            phase_requeues=0,
+        )
+        # Lane already COLD — must not be counted.
+        cold_lane = ImprovementLane(
+            project_id=project_id,
+            direction_id="d-reclaim-test-cold",
+            title="Cold lane",
+            goal="Should not be reclaimed",
+            branch_name="lane/reclaim-test-cold",
+            base_branch="main",
+            status=ImprovementLaneStatus.PARKED.value,
+            checkpoint_seq=0,
+            checkpoints=[],
+            manifest={},
+            workspace_state="COLD",
+            phase_requeues=0,
+        )
+        db_session.add_all([orphan_lane, cold_lane])
+        await db_session.commit()
+
+        resp = await client.post("/api/admin/improvement-lanes/reclaim-orphaned")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["reclaimed"] == 1
+
+        await db_session.refresh(orphan_lane)
+        assert orphan_lane.workspace_state == "COLD"
+        assert orphan_lane.workspace_vm_instance_id is None
+
+    @pytest.mark.asyncio
+    async def test_reclaim_orphaned_no_orphans_returns_zero(
+        self, client: AsyncClient, db_session: AsyncSession
+    ):
+        """Returns reclaimed=0 when no orphaned lanes exist (idempotent)."""
+        resp = await client.post("/api/admin/improvement-lanes/reclaim-orphaned")
+        assert resp.status_code == 200
+        assert resp.json()["reclaimed"] == 0
