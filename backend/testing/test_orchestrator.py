@@ -4538,6 +4538,93 @@ class TestWarmVMSkipProvision:
             assert "2 dependent task" in alerts[0].message
 
     @pytest.mark.asyncio
+    async def test_cascade_cancel_tears_down_provisioned_child_vms(self, orch_warm_db, mocker):
+        """When cascade-cancelling a dependent with provisioned-VM children, all child
+        VMs are deleted alongside the dependent's VM."""
+        from datetime import timezone
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        ensure_vm_deleted_mock = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Cascade VM Teardown", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            prereq = make_task(
+                project_id=project.id,
+                title="root prerequisite",
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create", "prompt": "root"}],
+            )
+            session.add(prereq)
+            await session.commit()
+            await session.refresh(prereq)
+
+            dependent = make_task(
+                project_id=project.id,
+                title="dependent-with-vm",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create", "prompt": "dependent"}],
+                depends_on=[str(prereq.id)],
+                vm_instance_id="dependent-vm-123",
+            )
+            session.add(dependent)
+            await session.commit()
+            await session.refresh(dependent)
+
+            # Non-terminal child with its own provisioned VM
+            child = make_task(
+                project_id=project.id,
+                title="child-with-vm",
+                status=TaskStatus.PROVISIONING,
+                payloads=[{"type": "create", "prompt": "child"}],
+                parent_task_id=dependent.id,
+                vm_instance_id="child-vm-456",
+                vm_provisioned_at=datetime.now(timezone.utc),
+            )
+            session.add(child)
+            await session.commit()
+            dependent_id = dependent.id
+            child_id = child.id
+
+        await self._run_one_cycle(mocker)
+
+        # Verify both dependent and child VMs were deleted
+        vm_delete_calls = ensure_vm_deleted_mock.call_args_list
+        # Find calls with the specific VM IDs
+        dependent_vm_calls = [
+            c for c in vm_delete_calls if c[0][0] == "dependent-vm-123"
+        ]
+        child_vm_calls = [c for c in vm_delete_calls if c[0][0] == "child-vm-456"]
+
+        assert len(dependent_vm_calls) > 0, (
+            f"Expected _ensure_vm_deleted to be called for dependent VM "
+            f"'dependent-vm-123'; calls were: {vm_delete_calls}"
+        )
+        assert len(child_vm_calls) > 0, (
+            f"Expected _ensure_vm_deleted to be called for child VM "
+            f"'child-vm-456'; calls were: {vm_delete_calls}"
+        )
+
+        # Verify both tasks are marked CANCELLED
+        async with orch_warm_db() as verify:
+            dep_task = await verify.get(Task, dependent_id)
+            child_task = await verify.get(Task, child_id)
+            assert dep_task.status == TaskStatus.CANCELLED
+            assert child_task.status == TaskStatus.CANCELLED
+
+    @pytest.mark.asyncio
     async def test_ci_poll_merge_on_promotion_target_withholds_pr_merged(
         self, db_session
     ):

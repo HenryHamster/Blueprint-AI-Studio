@@ -1242,6 +1242,7 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
     from app.alert_dispatch import _maybe_create_failure_alert
 
     vm_id = None
+    child_vm_ids = []
     cancelled_count = 0
     async with AsyncSessionLocal() as cancel_session:
         cancel_task = await cancel_session.get(Task, task_id)
@@ -1290,6 +1291,9 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
                 await release_max_plan_account(child_acct)
                 child.context = {**(child.context or {}), "_slot_released": True}
             cancel_session.add(child)
+            # Track child VM IDs for post-commit deletion
+            if child.vm_instance_id:
+                child_vm_ids.append(child.vm_instance_id)
         await _maybe_create_failure_alert(
             cancel_task,
             cancel_session,
@@ -1303,6 +1307,9 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
         {"task_id": str(task_id), "status": TaskStatus.CANCELLED},
     )
     await _ensure_vm_deleted(vm_id, reason="dependency_cancelled")
+    # Tear down provisioned VMs for any children that have them
+    for child_vm_id in child_vm_ids:
+        await _ensure_vm_deleted(child_vm_id, reason="dependency_cancelled")
     logger.error(f"[ORCHESTRATOR] Cancelled task {task_id} — dependency failed")
     return cancelled_count
 
