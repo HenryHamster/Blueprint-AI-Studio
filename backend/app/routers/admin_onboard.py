@@ -22,7 +22,13 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
 from app.shared_state import limiter
-from app.models import Project, ProjectMember, ProjectStatus, ProjectMessage, MessageType
+from app.models import (
+    Project,
+    ProjectMember,
+    ProjectStatus,
+    ProjectMessage,
+    MessageType,
+)
 from app.auth import get_current_user, require_admin
 from app.ci_resolution import compute_merge_verification_verdict
 from app.schemas import OnboardPayload
@@ -47,6 +53,7 @@ def _derive_task_branch_namespace(github_repo: str) -> str:
     """
     slug = re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
     return slug[:40] if slug else "project"
+
 
 # Backend onboarding must stay aligned with the agent prompt-time greenfield
 # detector: same threshold and same "real source" exclusions live there in
@@ -525,6 +532,21 @@ async def _detect_build_config(
             if _json_defines_test_script(await _fetch_file_text(composer_path)):
                 _add_fallback_directory(path, "composer test")
                 return
+        if "Package.swift" in names:
+            _add_fallback_directory(path, "swift test")
+            return
+        if "build.sbt" in names:
+            _add_fallback_directory(path, "sbt test")
+            return
+        if "WORKSPACE" in names or "WORKSPACE.bazel" in names:
+            _add_fallback_directory(path, "bazel test //...")
+            return
+        if any(n.endswith(".cabal") for n in names):
+            _add_fallback_directory(path, "cabal test all")
+            return
+        if "pubspec.yaml" in names:
+            _add_fallback_directory(path, "flutter test")
+            return
 
         # --- Generic non-manifest fallbacks: Makefile → tox → nox → script. ---
         for makefile_name in ("Makefile", "makefile", "GNUmakefile"):
@@ -944,6 +966,7 @@ async def onboard_project(
         branch_whitelist.append(project.integration_branch)
     if project.promotion_target and project.promotion_target not in branch_whitelist:
         branch_whitelist.append(project.promotion_target)
+
     # Route the one-time onboarding design_doc seed through the canonical
     # lock helper so this file satisfies the design_doc lock invariant without
     # a special-case exemption. There are no concurrent writers at onboard time

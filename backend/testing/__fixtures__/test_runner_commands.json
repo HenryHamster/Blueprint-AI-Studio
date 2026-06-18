@@ -15,5 +15,10 @@
   "dotnet": "dotnet test",
   "php": "vendor/bin/phpunit",
   "composer": "composer test",
+  "swift": "swift test",
+  "scala": "sbt test",
+  "bazel": "bazel test //...",
+  "haskell": "cabal test all",
+  "flutter": "flutter test",
   "script": "bash scripts/test.sh"
 }

@@ -8780,7 +8780,7 @@ class TestAgentTestRunnerParseHelpers:
         """A new divergent family with no table entry is surfaced as an orphan."""
         region = (
             "detectExtraFamilyRunner = (absDir, label) => {\n"
-            "  if (has('build.sbt')) return { cmd: 'sbt', args: ['test'], "
+            "  if (has('hypothetical.lock')) return { cmd: 'hypothetical', args: ['test'], "
             "cwd: absDir, label: l };\n"
             "  return null;\n};"
         )
@@ -8788,7 +8788,7 @@ class TestAgentTestRunnerParseHelpers:
         orphans = _reconstruct_agent_commands(body) - set(
             AGENT_TEST_RUNNER_COMMANDS.values()
         )
-        assert orphans == {"sbt test"}
+        assert orphans == {"hypothetical test"}
 
     def test_extract_classifier_region_raises_on_missing_anchor(self):
         with pytest.raises(ValueError, match="classifyTestExecution"):

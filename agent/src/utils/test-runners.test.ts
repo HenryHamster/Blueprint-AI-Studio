@@ -64,6 +64,11 @@ type RunnerFamily =
   | 'dotnet'
   | 'php'
   | 'composer'
+  | 'swift'
+  | 'scala'
+  | 'bazel'
+  | 'haskell'
+  | 'flutter'
   | 'script'
   | null;
 
@@ -164,6 +169,21 @@ function familyFromRunner(runner: TestRunner): LayoutFixture['family'] {
   }
   if (runner.cmd === 'composer' && runner.args[0] === 'test') {
     return 'composer';
+  }
+  if (runner.cmd === 'swift' && runner.args[0] === 'test') {
+    return 'swift';
+  }
+  if (runner.cmd === 'sbt' && runner.args[0] === 'test') {
+    return 'scala';
+  }
+  if (runner.cmd === 'bazel' && runner.args[0] === 'test') {
+    return 'bazel';
+  }
+  if (runner.cmd === 'cabal' && runner.args[0] === 'test') {
+    return 'haskell';
+  }
+  if (runner.cmd === 'flutter' && runner.args[0] === 'test') {
+    return 'flutter';
   }
   if (runner.cmd === 'bash') {
     return 'script';

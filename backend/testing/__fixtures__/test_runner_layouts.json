@@ -523,5 +523,55 @@
     ],
     "detectable": true,
     "family": "php"
+  },
+  {
+    "name": "package_swift_root",
+    "files": [
+      {
+        "path": "Package.swift"
+      }
+    ],
+    "detectable": true,
+    "family": "swift"
+  },
+  {
+    "name": "build_sbt_root",
+    "files": [
+      {
+        "path": "build.sbt"
+      }
+    ],
+    "detectable": true,
+    "family": "scala"
+  },
+  {
+    "name": "bazel_workspace_root",
+    "files": [
+      {
+        "path": "WORKSPACE"
+      }
+    ],
+    "detectable": true,
+    "family": "bazel"
+  },
+  {
+    "name": "cabal_file_root",
+    "files": [
+      {
+        "path": "app.cabal"
+      }
+    ],
+    "detectable": true,
+    "family": "haskell"
+  },
+  {
+    "name": "pubspec_yaml_root",
+    "files": [
+      {
+        "path": "pubspec.yaml"
+      }
+    ],
+    "detectable": true,
+    "family": "flutter"
   }
 ]
