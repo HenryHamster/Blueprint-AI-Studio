@@ -410,6 +410,56 @@ def mock_api(monkeypatch):
                 ],
                 "total": 2,
             }
+        if "/admin/task-cost-breakdown" in path:
+            return {
+                "project_id": "proj-1",
+                "window": "1h",
+                "window_ms": 3600000,
+                "task_count": 5,
+                "total_estimated_cost_usd": 0.42,
+                "task_type_breakdown": [
+                    {"task_type": "create", "task_count": 3, "estimated_cost_usd": 0.30},
+                    {"task_type": "fix", "task_count": 2, "estimated_cost_usd": 0.12},
+                ],
+                "direction_breakdown": [],
+                "top_tasks": [
+                    {"task_id": "aabbccdd-0000-0000-0000-000000000000",
+                     "task_title": "feat: add widget", "task_type": "create",
+                     "direction_id": None, "completed_at": "2026-06-18T00:00:00",
+                     "estimated_cost_usd": 0.15},
+                ],
+                "truncated": False,
+            }
+        if "/admin/task-duration-stats" in path:
+            return {
+                "stats": {"create": {"p50_seconds": 600, "sample_count": 10}},
+                "scope_duration_stats": {
+                    "small": {"p50_seconds": 400, "p90_seconds": 800, "sample_size": 8},
+                },
+                "phase_duration_stats": {},
+            }
+        if "/admin/direction-auto-pause-stats" in path:
+            return {
+                "window_hours": 24,
+                "auto_paused_count": 2,
+                "auto_recovered_count": 1,
+                "auto_retired_count": 0,
+                "currently_auto_paused": 1,
+                "top_reasons": [{"reason": "stale_tasks", "count": 2}],
+                "trend": "flat",
+                "prev_window_auto_paused_count": 2,
+            }
+        if "/admin/failing-task-types" in path:
+            return {
+                "gated_types": [
+                    {"task_type": "create", "failure_rate": 0.75,
+                     "sample_size": 5, "threshold": 0.7},
+                ],
+                "global_failure_threshold": 0.8,
+                "anomaly_tightened": False,
+                "window_minutes": 15,
+                "generated_at": "2026-06-18T00:00:00",
+            }
         if "/directions/" in path and "/unhold" in path:
             return {"status": "unheld", "direction_id": "d-abc12345", "was_held": True}
         if "/directions/" in path and method == "PATCH":
@@ -2321,3 +2371,27 @@ def test_tasks_reset_iteration_cap_read_only_refused(mock_api, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         blueprint.main(["tasks", "reset-iteration-cap", "task-123", "--yes"])
     assert exc.value.code == 1
+
+
+def test_analytics_cost_json(mock_api, capsys):
+    """analytics cost --json returns valid JSON with cost breakdown fields."""
+    rc = blueprint.main(["--json", "analytics", "cost"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["window"] == "1h"
+    assert parsed["task_count"] == 5
+    assert isinstance(parsed["task_type_breakdown"], list)
+    assert any(r["task_type"] == "create" for r in parsed["task_type_breakdown"])
+    assert any("task-cost-breakdown" in path for _, path, _ in mock_api)
+
+
+def test_analytics_failing_types_json(mock_api, capsys):
+    """analytics failing-types --json returns valid JSON with gated_types."""
+    rc = blueprint.main(["--json", "analytics", "failing-types"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert "gated_types" in parsed
+    assert isinstance(parsed["gated_types"], list)
+    assert parsed["gated_types"][0]["task_type"] == "create"
+    assert parsed["global_failure_threshold"] == 0.8
+    assert any("failing-task-types" in path for _, path, _ in mock_api)

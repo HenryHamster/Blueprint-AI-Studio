@@ -2663,6 +2663,117 @@ def _render_health_activity(data: dict) -> None:
             print(f"                              {err}")
 
 
+# ── analytics ────────────────────────────────────────────────────────────────
+
+def cmd_analytics(args: argparse.Namespace) -> None:
+    """Dispatch analytics subcommands: cost / duration / pause-stats / failing-types."""
+    sub = getattr(args, "analytics_cmd", None) or "cost"
+    pid = get_project_id(getattr(args, "project_id", None))
+
+    if sub == "cost":
+        window = getattr(args, "window", "1h")
+        data, err = _safe_read(f"/api/admin/task-cost-breakdown?project_id={pid}&window={window}")
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return
+        _emit(args, data, _render_analytics_cost)
+
+    elif sub == "duration":
+        data, err = _safe_read(f"/api/admin/task-duration-stats?project_id={pid}")
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return
+        _emit(args, data, _render_analytics_duration)
+
+    elif sub == "pause-stats":
+        hours = getattr(args, "hours", 24)
+        data, err = _safe_read(
+            f"/api/admin/direction-auto-pause-stats?project_id={pid}&window_hours={hours}"
+        )
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return
+        _emit(args, data, _render_analytics_pause_stats)
+
+    elif sub == "failing-types":
+        data, err = _safe_read("/api/admin/failing-task-types")
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return
+        _emit(args, data, _render_analytics_failing_types)
+
+    else:
+        print(
+            f"analytics: unknown subcommand '{sub}'. Run `blueprint analytics --help`.",
+            file=sys.stderr,
+        )
+
+
+def _render_analytics_cost(data: dict) -> None:
+    window = data.get("window", "?")
+    total = data.get("total_estimated_cost_usd", 0.0)
+    task_count = data.get("task_count", 0)
+    print(f"=== TASK COST BREAKDOWN (window={window}, {task_count} tasks) ===")
+    print(f"  Total estimated cost: ${total:.4f}")
+    for row in data.get("task_type_breakdown") or []:
+        tt = row.get("task_type", "?")
+        cost = row.get("estimated_cost_usd", 0.0)
+        n = row.get("task_count", 0)
+        print(f"  {tt:20}  ${cost:.4f}  ({n} tasks)")
+    top = data.get("top_tasks") or []
+    if top:
+        print("  --- top tasks ---")
+        for t in top:
+            print(f"  {t.get('task_id','')[:8]}  ${t.get('estimated_cost_usd',0):.4f}  {(t.get('task_title') or '')[:60]}")
+
+
+def _render_analytics_duration(data: dict) -> None:
+    print("=== TASK DURATION STATS (last 7 days) ===")
+    for tt, s in (data.get("stats") or {}).items():
+        p50 = s.get("p50_seconds", 0)
+        n = s.get("sample_count", 0)
+        print(f"  {tt:20}  p50={int(p50)}s  n={n}")
+    scope = data.get("scope_duration_stats") or {}
+    if scope:
+        print("  --- by scope ---")
+        for sc, s in scope.items():
+            p50 = s.get("p50_seconds", 0)
+            p90 = s.get("p90_seconds", 0)
+            n = s.get("sample_size", 0)
+            print(f"  {sc:10}  p50={int(p50)}s  p90={int(p90)}s  n={n}")
+
+
+def _render_analytics_pause_stats(data: dict) -> None:
+    window = data.get("window_hours", "?")
+    paused = data.get("auto_paused_count", 0)
+    recovered = data.get("auto_recovered_count", 0)
+    retired = data.get("auto_retired_count", 0)
+    current = data.get("currently_auto_paused", 0)
+    trend = data.get("trend", "?")
+    print(f"=== DIRECTION AUTO-PAUSE STATS (window={window}h) ===")
+    print(f"  auto-paused={paused}  recovered={recovered}  retired={retired}")
+    print(f"  currently paused={current}  trend={trend}")
+    for r in data.get("top_reasons") or []:
+        print(f"  reason: {r.get('reason','?')}  ({r.get('count',0)}x)")
+
+
+def _render_analytics_failing_types(data: dict) -> None:
+    gated = data.get("gated_types") or []
+    threshold = data.get("global_failure_threshold", "?")
+    tightened = data.get("anomaly_tightened", False)
+    window = data.get("window_minutes", "?")
+    print(f"=== FAILING TASK TYPES (last {window}min, global_threshold={threshold}"
+          f"{', anomaly-tightened' if tightened else ''}) ===")
+    if not gated:
+        print("  (no types currently gated)")
+        return
+    for g in gated:
+        tt = g.get("task_type", "?")
+        rate = g.get("failure_rate", 0)
+        n = g.get("sample_size", 0)
+        print(f"  {tt:20}  failure_rate={rate:.1%}  n={n}")
+
+
 # ── argument parser ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3067,6 +3178,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_settings_set.add_argument("--yes", action="store_true",
                                 help="Skip the confirmation prompt (for scripting).")
 
+    # analytics
+    p_analytics = sub.add_parser(
+        "analytics", parents=[common],
+        help="Pipeline analytics: cost, duration, pause-stats, failing-types.",
+        description="Analytics subcommands. Defaults to `cost` when no subcommand is given.")
+    analytics_sub = p_analytics.add_subparsers(dest="analytics_cmd")
+    p_analytics_cost = analytics_sub.add_parser("cost", parents=[common],
+                                                help="Task cost breakdown by type and direction.")
+    p_analytics_cost.add_argument("--window", default="1h",
+                                  choices=["15m", "30m", "1h", "2h", "3h", "6h", "12h", "24h", "all"],
+                                  help="Time window (default 1h).")
+    analytics_sub.add_parser("duration", parents=[common],
+                             help="Task duration stats (p50/p90 by type and scope).")
+    p_analytics_pause = analytics_sub.add_parser("pause-stats", parents=[common],
+                                                 help="Direction auto-pause/recovery stats.")
+    p_analytics_pause.add_argument("--hours", type=int, default=24,
+                                   help="Lookback window in hours (default 24).")
+    analytics_sub.add_parser("failing-types", parents=[common],
+                             help="Task types currently gated by high failure rate.")
+
     return parser
 
 
@@ -3086,6 +3217,7 @@ _DISPATCH = {
     "messages": cmd_messages,
     "settings": cmd_settings,
     "health": cmd_health,
+    "analytics": cmd_analytics,
 }
 
 
