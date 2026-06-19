@@ -614,10 +614,12 @@ def record_trial_verdict(
     new_verdict = entry.get("verdict")
     new_reason = entry.get("verdict_reason")
 
+    _authorized_sources = {"strategic_review", "operator"}
+
     if (
         cap_name == LANE_PILOT_CAP_NAME
         and prior_verdict == "KILL"
-        and entry.get("evidence_source") != "strategic_review"
+        and entry.get("evidence_source") not in _authorized_sources
         and new_verdict != "KILL"
     ):
         logger.info(
@@ -630,7 +632,7 @@ def record_trial_verdict(
 
     if (
         new_verdict in _CONTINUE_VERDICTS
-        and entry.get("evidence_source") != "strategic_review"
+        and entry.get("evidence_source") not in _authorized_sources
         and (prior_verdict in _DECIDED_VERDICTS or prior_source == "strategic_review")
         and new_reason not in _SUFFICIENT_DATA_CONTINUE_REASONS
     ):

@@ -380,6 +380,7 @@ vi.mock('../api', () => ({
   fetchLanePilotPreflight: vi.fn(async () => null),
   reclaimOrphanedLaneWorkspaces: vi.fn(async () => ({ reclaimed: 0 })),
   fetchVersionSummary: vi.fn(async () => ({})),
+  declareCapabilityVerdict: vi.fn(async () => {}),
 }));
 
 describe('DashboardHome — viewport regression', () => {

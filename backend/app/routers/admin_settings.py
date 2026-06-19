@@ -137,6 +137,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "module_interfaces_holdback_fraction",
         "related_tests_holdback_fraction",
         "affected_consumers_holdback_fraction",
+        "repo_map_holdback_fraction",
         "productive_direction_cooldown_minutes",
         "direction_refractory_minutes",
         "direction_saturation_refractory_minutes",
@@ -564,6 +565,9 @@ async def get_settings(
         ),
         "affected_consumers_holdback_fraction": float(
             _runtime_config.get("affected_consumers_holdback_fraction", 0.1)
+        ),
+        "repo_map_holdback_fraction": float(
+            _runtime_config.get("repo_map_holdback_fraction", 0.1)
         ),
         "drift_stall_min_claims": int(_runtime_config.get("drift_stall_min_claims", 5)),
         "reserved_slots_for_types": _runtime_config.get(
@@ -1547,6 +1551,7 @@ async def _apply_settings(
         "module_interfaces_holdback_fraction",
         "related_tests_holdback_fraction",
         "affected_consumers_holdback_fraction",
+        "repo_map_holdback_fraction",
     ):
         if float_key in payload:
             try:
@@ -1593,6 +1598,7 @@ async def _apply_settings(
             )
         if val:
             from app.warm_pool import is_warm_pool_enabled as _is_warm_pool_enabled
+
             if not _is_warm_pool_enabled():
                 raise HTTPException(
                     status_code=422,
@@ -1611,6 +1617,7 @@ async def _apply_settings(
             )
         if val:
             from app.warm_pool import is_warm_pool_enabled as _is_warm_pool_enabled2
+
             if not _is_warm_pool_enabled2():
                 raise HTTPException(
                     status_code=422,
@@ -2622,6 +2629,9 @@ async def _apply_settings(
                     ),
                     "affected_consumers_holdback_fraction": _runtime_config.get(
                         "affected_consumers_holdback_fraction", 0.1
+                    ),
+                    "repo_map_holdback_fraction": _runtime_config.get(
+                        "repo_map_holdback_fraction", 0.1
                     ),
                     "agent_prompt_suffixes": _runtime_config.get(
                         "agent_prompt_suffixes", {}

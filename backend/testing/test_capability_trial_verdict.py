@@ -1027,6 +1027,67 @@ class TestRecordTrialVerdict:
         assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.09
         mock_flag.assert_not_called()
 
+    def test_operator_source_bypasses_kill_survival_guard(self):
+        """evidence_source='operator' must override a durable KILL like strategic_review does."""
+        project = _make_project()
+        project.capability_adoption_verdicts = {
+            LANE_PILOT_CAP_NAME: {"verdict": "KILL", "evidence_source": "auto"}
+        }
+        override = {
+            "verdict": "adopt",
+            "evidence_source": "operator",
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, LANE_PILOT_CAP_NAME, override)
+
+        assert (
+            project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME]["verdict"]
+            == "adopt"
+        )
+        mock_flag.assert_called_once()
+
+    def test_operator_source_bypasses_insufficient_data_self_revert_guard(self):
+        """evidence_source='operator' must be able to reopen a decided verdict."""
+        project = _make_project()
+        decided = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 50}
+        project.capability_adoption_verdicts = {"repo_map": decided}
+        operator_reopen = {
+            "verdict": "continue-trial",
+            "evidence_source": "operator",
+            "rationale": "operator re-opening trial",
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", operator_reopen)
+
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["verdict"]
+            == "continue-trial"
+        )
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["evidence_source"]
+            == "operator"
+        )
+        mock_flag.assert_called_once()
+
+    def test_automated_source_still_blocked_by_kill_guard(self):
+        """Automated verdict must still be blocked by KILL-survival when evidence_source is absent."""
+        project = _make_project()
+        project.capability_adoption_verdicts = {
+            LANE_PILOT_CAP_NAME: {"verdict": "KILL", "evidence_source": "auto"}
+        }
+        auto_adopt = {"verdict": "adopt"}
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, LANE_PILOT_CAP_NAME, auto_adopt)
+
+        assert (
+            project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME]["verdict"]
+            == "KILL"
+        )
+        mock_flag.assert_not_called()
+
 
 # ── get_trial_verdicts ────────────────────────────────────────────────────────
 

@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import type { DigestData } from '../types/digest';
+import { declareCapabilityVerdict } from '../api';
 
 function fmtLift(lift: number | null): string { return lift == null ? '—' : lift >= 0 ? `+${lift.toFixed(3)}` : lift.toFixed(3); }
 function fmtDate(ts?: string): string { return ts ? new Date(ts).toLocaleString() : '—'; }
@@ -58,7 +60,87 @@ function laneMetricSummary(v: CapabilityVerdict): string[] {
   return lines;
 }
 
-export function CapabilityTrialsPanel({ digest }: { digest: DigestData | null }) {
+type DeclareVerdict = 'adopt' | 'reject' | 'continue-trial';
+
+function DeclareVerdictForm({ projectId, capName, onDone }: { projectId: string; capName: string; onDone: () => void }) {
+  const [verdict, setVerdict] = useState<DeclareVerdict>('adopt');
+  const [rationale, setRationale] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleSubmit() {
+    setSubmitting(true);
+    setError(null);
+    try {
+      await declareCapabilityVerdict(projectId, capName, verdict, rationale || undefined);
+      onDone();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Request failed');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="mt-1 flex flex-col gap-1 border-t border-neutral-700/50 pt-1">
+      <div className="flex items-center gap-2">
+        <select
+          value={verdict}
+          onChange={e => setVerdict(e.target.value as DeclareVerdict)}
+          className="text-[10px] bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200"
+          disabled={submitting}
+        >
+          <option value="adopt">adopt</option>
+          <option value="reject">reject</option>
+          <option value="continue-trial">continue-trial</option>
+        </select>
+        <input
+          type="text"
+          placeholder="Rationale (optional)"
+          value={rationale}
+          onChange={e => setRationale(e.target.value)}
+          className="text-[10px] bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200 flex-1 min-w-0"
+          disabled={submitting}
+        />
+        {/* eslint-disable-next-line viewport/min-touch-target */}
+        <button
+          onClick={handleSubmit}
+          disabled={submitting}
+          className="text-[10px] px-2 py-0.5 rounded bg-neutral-700 hover:bg-neutral-600 text-neutral-200 disabled:opacity-50 shrink-0"
+        >
+          {submitting ? '…' : 'Declare'}
+        </button>
+        {/* eslint-disable-next-line viewport/min-touch-target */}
+        <button
+          onClick={onDone}
+          disabled={submitting}
+          className="text-[10px] px-1.5 py-0.5 rounded text-neutral-500 hover:text-neutral-300"
+        >
+          ✕
+        </button>
+      </div>
+      {error && <div className="text-[10px] text-red-400">{error}</div>}
+    </div>
+  );
+}
+
+function DeclareButton({ projectId, capName }: { projectId: string; capName: string }) {
+  const [open, setOpen] = useState(false);
+  if (open) {
+    return <DeclareVerdictForm projectId={projectId} capName={capName} onDone={() => setOpen(false)} />;
+  }
+  return (
+    // eslint-disable-next-line viewport/min-touch-target
+    <button
+      onClick={() => setOpen(true)}
+      className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-200 mt-0.5"
+    >
+      Declare verdict
+    </button>
+  );
+}
+
+export function CapabilityTrialsPanel({ digest, projectId }: { digest: DigestData | null; projectId?: string }) {
   if (digest === null) return null;
   const verdicts = Object.entries(digest?.capability_adoption_verdicts ?? {});
   const genericVerdicts = verdicts.filter(([, v]) => !hasLaneMetrics(v));
@@ -132,12 +214,13 @@ export function CapabilityTrialsPanel({ digest }: { digest: DigestData | null })
                 {v.accrual_projection && (
                   <div className="mt-0.5 text-neutral-500">{fmtAccrual(v.accrual_projection)}</div>
                 )}
+                {projectId && <DeclareButton projectId={projectId} capName={name} />}
               </div>
             );
           })}
         </div>
         <table className="hidden sm:table w-full text-xs">
-          <thead><tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50"><th className="text-left px-3 py-2 font-medium">Capability</th><th className="text-right px-3 py-2 font-medium">Verdict</th><th className="text-right px-3 py-2 font-medium">Metric</th><th className="text-right px-3 py-2 font-medium">Samples</th><th className="text-right px-3 py-2 font-medium">Cost / Guardrails</th><th className="text-right px-3 py-2 font-medium">Evaluated</th></tr></thead>
+          <thead><tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50"><th className="text-left px-3 py-2 font-medium">Capability</th><th className="text-right px-3 py-2 font-medium">Verdict</th><th className="text-right px-3 py-2 font-medium">Metric</th><th className="text-right px-3 py-2 font-medium">Samples</th><th className="text-right px-3 py-2 font-medium">Cost / Guardrails</th><th className="text-right px-3 py-2 font-medium">Evaluated</th>{projectId && <th className="text-right px-3 py-2 font-medium">Action</th>}</tr></thead>
           <tbody className="divide-y divide-neutral-800/30">{verdicts.map(([name, v]) => {
             const minN = v.thresholds?.min_n_per_arm ?? 30;
             const isLane = hasLaneMetrics(v);
@@ -158,6 +241,7 @@ export function CapabilityTrialsPanel({ digest }: { digest: DigestData | null })
                 <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{v.n_lane ?? 0} lane / {v.n_control ?? 0} control</> : <>{v.n_with}/{minN}</>}</td>
                 <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{fmtMoney(v.lane_cost_per_merged)} / {fmtMoney(v.control_cost_per_merged)}<div className="text-[10px] text-neutral-500">loss {fmtRate(v.checkpoint_loss_rate)} · gates {v.gate_integrity_violations ?? 0}</div>{v.lane_fix_tasks_sampled != null && <div className="text-[10px] text-neutral-500">warm {fmtRate(v.warm_resume_fraction)} · ckpt {fmtRate(v.checkpoint_fraction)} ({v.lane_fix_tasks_sampled} fix)</div>}{v.engagement_low && <div className="text-[10px] text-amber-400">engagement low</div>}</> : <>{v.n_without}/{minN}</>}</td>
                 <td className="text-right px-3 py-2 text-neutral-300">{fmtDate(v.evaluated_at)}</td>
+                {projectId && <td className="text-right px-3 py-2"><DeclareButton projectId={projectId} capName={name} /></td>}
               </tr>
             );
           })}</tbody>

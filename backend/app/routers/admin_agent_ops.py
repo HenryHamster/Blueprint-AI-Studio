@@ -2956,3 +2956,58 @@ async def admin_get_build_config_commands(
         "directories": result,
         "command_memory": command_memory,
     }
+
+
+class _DeclareCapabilityVerdictRequest(BaseModel):
+    cap_name: str
+    verdict: Literal["adopt", "reject", "continue-trial"]
+    rationale: str | None = None
+
+
+@router.post("/api/admin/projects/{project_id}/capability-trials/declare")
+@limiter.limit("30/minute")
+async def admin_declare_capability_verdict(
+    request: Request,
+    project_id: uuid.UUID,
+    body: _DeclareCapabilityVerdictRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Operator-declared capability trial verdict.
+
+    Stores evidence_source='operator' so the write bypasses the automated
+    self-revert and KILL-survival guards in record_trial_verdict.
+    """
+    project = await _lock_project_or_429(session, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    cap_name = body.cap_name.strip()
+    if not cap_name:
+        raise HTTPException(
+            status_code=400, detail="cap_name must be a non-empty string"
+        )
+
+    entry: dict[str, Any] = {
+        "verdict": body.verdict,
+        "evidence_source": "operator",
+        "evaluated_at": _utcnow().isoformat(),
+    }
+    rationale_text = body.rationale.strip() if isinstance(body.rationale, str) else ""
+    if rationale_text:
+        entry["rationale"] = rationale_text
+
+    record_trial_verdict(project, cap_name, entry)
+    await session.commit()
+
+    logger.info(
+        "[ADMIN] Operator declared capability verdict for %s=%s on project %s",
+        cap_name,
+        body.verdict,
+        project_id,
+    )
+    return {
+        "status": "ok",
+        "cap_name": cap_name,
+        "verdict": body.verdict,
+    }

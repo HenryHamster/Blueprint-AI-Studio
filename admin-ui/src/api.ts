@@ -3599,6 +3599,23 @@ export interface VisualPilotStatus {
   generated_at: string;
 }
 
+export async function declareCapabilityVerdict(
+  projectId: string,
+  capName: string,
+  verdict: 'adopt' | 'reject' | 'continue-trial',
+  rationale?: string,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/admin/projects/${projectId}/capability-trials/declare`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cap_name: capName, verdict, rationale: rationale ?? null }),
+    },
+  );
+  if (!res.ok) throw new Error(`Failed to declare capability verdict: ${res.status}`);
+}
+
 export async function fetchVisualPilotStatus(
   projectId: string,
   signal?: AbortSignal,

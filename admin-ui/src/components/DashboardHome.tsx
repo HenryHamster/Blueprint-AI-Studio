@@ -564,7 +564,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
           <LlmCostBreakdownPanel selectedProjectId={selectedProjectId} />
 
           {/* Section 2g2: Capability Trials */}
-          {!loading && <CapabilityTrialsPanel digest={digest} />}
+          {!loading && <CapabilityTrialsPanel digest={digest} projectId={selectedProjectId ?? undefined} />}
 
           {/* Section 2h: Effort-tier & actual-model efficiency (cost vs landed) */}
           {!loading && <EffortEfficiencyPanel data={digest?.effort_model_efficiency} />}
