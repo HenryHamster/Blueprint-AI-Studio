@@ -4762,9 +4762,7 @@ async def agent_heartbeat(
                     req.format_repair_successes_by_schema or {}
                 ).items()
             },
-            "format_repair_infra_failures": int(
-                req.format_repair_infra_failures or 0
-            ),
+            "format_repair_infra_failures": int(req.format_repair_infra_failures or 0),
             "format_repair_infra_failures_by_schema": {
                 str(schema): int(count)
                 for schema, count in (

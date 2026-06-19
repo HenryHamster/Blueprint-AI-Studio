@@ -7030,3 +7030,96 @@ async def test_self_repair_burn_share_in_llm_cost_attribution_trend(db_session):
         )
     # 4 repair attempts / 20 LLM calls = 0.2
     assert trend[-1][SELF_REPAIR_BURN_SHARE_KEY] == pytest.approx(0.2, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_token_weighted(db_session):
+    """self_repair_burn_share uses token-cost ratio when repair token data is present.
+
+    repair_token_count / total_token_count where repair_token_count =
+    format_repair_input_tokens + format_repair_output_tokens.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with 2000 input + 500 output total tokens; 100 input + 50 output repair tokens.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 10}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 500,
+            "llm_call_count": 10,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 1,
+            "format_repair_attempts": 2,
+            "format_repair_successes": 1,
+            "format_repair_infra_failures": 0,
+            "format_repair_input_tokens": 100,
+            "format_repair_output_tokens": 50,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    attr = snap.get("llm_cost_attribution")
+    assert attr is not None
+    assert SELF_REPAIR_BURN_SHARE_KEY in attr
+    # Token-based: (100 + 50) / (2000 + 500) = 150 / 2500 = 0.06
+    assert attr[SELF_REPAIR_BURN_SHARE_KEY] == pytest.approx(0.06, abs=1e-4)
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_fallback_to_call_count(db_session):
+    """self_repair_burn_share falls back to call-count ratio for pre-token-tracking tasks.
+
+    When format_compliance_summary lacks format_repair_input_tokens, the formula
+    is repair_attempts / total_llm_call_count (the original formula).
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task without repair token fields (pre-dates the feature).
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 11}],
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 1000,
+            "llm_call_count": 20,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 1,
+            "format_repair_attempts": 4,
+            "format_repair_successes": 3,
+            "format_repair_infra_failures": 0,
+            # No format_repair_input_tokens / format_repair_output_tokens
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    attr = snap.get("llm_cost_attribution")
+    assert attr is not None
+    assert SELF_REPAIR_BURN_SHARE_KEY in attr
+    # Fallback: 4 repair attempts / 20 LLM calls = 0.2
+    assert attr[SELF_REPAIR_BURN_SHARE_KEY] == pytest.approx(0.2, abs=1e-6)

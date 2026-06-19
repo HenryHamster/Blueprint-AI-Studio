@@ -2475,9 +2475,13 @@ def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
     split.  Priced rows only in by_model so zero-cost unpriced combos don't
     inflate the block; unpriced_coverage carries the honesty signal.
 
-    Also computes self_repair_burn_share: the fraction of total LLM calls that
-    are self-repair reopen attempts (repair_attempts / total_llm_call_count).
-    None when total_llm_call_count is zero.
+    self_repair_burn_share is computed as a token-cost ratio when repair token
+    data is available (format_repair_input_tokens / format_repair_output_tokens
+    from format_compliance_summary): repair_token_count / total_token_count,
+    which is a cost-correlated fraction assuming consistent per-token pricing
+    across primary and repair calls. Falls back to the call-count ratio
+    (repair_attempts / total_llm_call_count) for tasks that predate repair-token
+    tracking. None when the denominator is zero.
     """
     from app.digest_metrics import _accumulate_format_compliance  # noqa: PLC0415
 
@@ -2501,11 +2505,34 @@ def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
         for r in by_type_rows
         if r["total_cost_usd"] > 0
     ]
-    total_llm_calls = sum(r["llm_call_count"] for r in breakdown["by_provider"])
-    repair_attempts = fc.get("repair_attempts") or 0
-    self_repair_burn_share: float | None = (
-        round(repair_attempts / total_llm_calls, 4) if total_llm_calls > 0 else None
+
+    # Prefer token-cost ratio when repair token data is present; fall back to
+    # call-count ratio for tasks that predate repair-token tracking.
+    # _accumulate_format_compliance always emits repair_input_tokens as int 0
+    # when no task carried token fields, so None-check is insufficient —
+    # distinguish by whether any repair tokens were actually recorded.
+    repair_token_count = (fc.get("repair_input_tokens") or 0) + (
+        fc.get("repair_output_tokens") or 0
     )
+    repair_attempts = fc.get("repair_attempts") or 0
+    if repair_token_count > 0 or repair_attempts == 0:
+        # Token-weighted burn share: repair tokens / total fleet tokens.
+        # Uses combined input+output tokens as the denominator — a cost-correlated
+        # proxy that is accurate for homogeneous-model fleets.
+        total_tokens = (
+            breakdown["totals"]["total_input_tokens"]
+            + breakdown["totals"]["total_output_tokens"]
+        )
+        self_repair_burn_share: float | None = (
+            round(repair_token_count / total_tokens, 4) if total_tokens > 0 else None
+        )
+    else:
+        # Legacy fallback: fraction of LLM calls that are repair reopens.
+        # Applies when repair attempts exist but no token data (pre-token-tracking tasks).
+        total_llm_calls = sum(r["llm_call_count"] for r in breakdown["by_provider"])
+        self_repair_burn_share = (
+            round(repair_attempts / total_llm_calls, 4) if total_llm_calls > 0 else None
+        )
     return {
         "by_model": by_model,
         "by_task_type": by_task_type,

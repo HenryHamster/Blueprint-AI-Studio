@@ -231,6 +231,37 @@ describe('format-compliance telemetry', () => {
       format_repair_output_tokens_by_schema: {},
     });
   });
+
+  it('recordFormatRepairTokens accumulates input and output tokens', () => {
+    recordFormatRepairTokens(500, 200);
+    recordFormatRepairTokens(300, 100);
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_input_tokens).toBe(800);
+    expect(tel.format_repair_output_tokens).toBe(300);
+  });
+
+  it('recordFormatRepairTokens ignores invalid values (NaN, negative, Infinity)', () => {
+    recordFormatRepairTokens(Number.NaN, 100);
+    recordFormatRepairTokens(-50, -20);
+    recordFormatRepairTokens(200, Number.POSITIVE_INFINITY);
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_input_tokens).toBe(200);
+    expect(tel.format_repair_output_tokens).toBe(100);
+  });
+
+  it('getFormatComplianceTelemetry starts with zero repair tokens', () => {
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_input_tokens).toBe(0);
+    expect(tel.format_repair_output_tokens).toBe(0);
+  });
+
+  it('resetFormatComplianceTelemetry clears repair token counters', () => {
+    recordFormatRepairTokens(1000, 500);
+    resetFormatComplianceTelemetry();
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_input_tokens).toBe(0);
+    expect(tel.format_repair_output_tokens).toBe(0);
+  });
 });
 
 describe('format-compliance telemetry — schema dimension', () => {

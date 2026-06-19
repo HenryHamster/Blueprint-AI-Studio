@@ -433,47 +433,17 @@ diagnosis_root_cause in its context, that is your hint about what
 export const SIZE_GUARDRAIL_GUIDANCE = `
 ## Size Guardrails Are Advisory — Bump, Don't Refactor
 
-If a test fails with a message containing \`module_size_limits.json\` or
-\`size guardrail\`, the correct fix is **almost always** to bump the limit
-in that JSON file — NOT to refactor the source. The assertion message
-itself walks you through the bump procedure; follow it literally.
+**Core policy: Bump the limit, do NOT refactor.** If a test fails with \`module_size_limits.json\` or \`size guardrail\`, update the JSON cap — not the source. The assertion message walks you through the procedure.
 
-The fast local gate runs the guardrail too: \`./check\` invokes
-\`python3 backend/testing/check_size_limits.py --sections <touched stacks>\`,
-so a breach now surfaces BEFORE you open a PR — not only in CI.
+**Two guardrail cases:**
+1. Existing cap breach (\`has <N> lines (limit: <M>)\`) — bump the cap.
+2. New uncapped file over 1500 lines — add a cap entry (not a code split).
 
-This covers BOTH size guardrails:
-- a breach of an EXISTING cap — \`has <N> lines (limit: <M>)\` /
-  \`(cap: <M>)\`; and
-- the complementary coverage failure for a NEW oversized file that has
-  no cap at all — \`has <N> lines (threshold: 1500)\` / \`NO cap entry\`
-  (\`test_*_no_uncapped_large_file\`). The fix is to ADD a cap entry, NOT
-  to extract or split the file.
+**Fix procedure:**
+\`python3 backend/testing/check_size_limits.py --fix\`
+This rewrites caps and adds entries using the canonical bump policy (\`max(current+200, current*1.15)\`). Commit both source and regenerated JSON.
 
-Specifically:
-1. Read the failing assertion (or the \`./check\` "size guardrail" failure).
-   It names the file path, current line count, and either the cap it
-   exceeded or the threshold it crossed with no cap entry.
-2. Run the single deterministic fix command from the repo root:
-   \`python3 backend/testing/check_size_limits.py --fix\`
-   This rewrites ONLY the breached caps AND adds a cap entry for any
-   uncapped over-threshold file in
-   \`backend/testing/module_size_limits.json\` using the SAME canonical bump
-   policy the server's size-breach endpoint applies
-   (\`max(current+200, current*1.15)\` rounded up to 50). Do NOT hand-edit
-   the cap to an ad-hoc number, and do NOT refactor — the one command keeps
-   it policy-consistent so the guardrail still catches runaway growth.
-3. Commit both the source change AND the regenerated JSON in the same PR.
-
-**Do NOT** refactor or extract code unless your task explicitly says to.
-Refactoring during a create/fix task is a strategic decision that belongs
-in its own PR; doing it inline causes import cycles, breaks unrelated
-tests, and burns retry attempts.
-
-The only time you should NOT bump is when the diff is genuinely bundling
-unrelated code that should be split — e.g. you accidentally edited
-something outside the task's scope. In that case, shrink the diff to only
-what the task asked for.
+**Why not refactor?** Refactoring during create/fix tasks is out-of-scope, causes import cycles, breaks unrelated tests, and burns retries. Size decisions belong in separate PRs. Exception: if you bundled unrelated code by accident, shrink the diff back to scope.
 `;
 
 // Encourage agents to surface (not absorb) latent debt they discover beyond
@@ -1057,364 +1027,115 @@ const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks 
   headroom (the memory guard auto-exempts single-file runs).
 `;
 
-const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`,
-  commits any pending changes, pushes to the work branch (force-with-lease
-  retry built in), creates a PR (or pushes updates to an existing one for
-  fix tasks) via the orchestrator endpoint. On success writes
-  /tmp/pr_url_<task_id> with the URL. Pass \`--with-tests\` to run
-  \`./check test\` instead of just \`./check\` as the gate. Exits non-zero
-  with a clear message on failure — fix and call again.
-  - **Exit 4 = PR created but conflicts with base.** \`./pr\` polls GitHub
-    for mergeable status post-create; if the result is \`mergeable=false\`
-    + \`mergeable_state=dirty\` (real conflict), exit 4 is returned with
-    explicit resolution steps. You're still in the workspace — rebase
-    onto origin/<base>, resolve the conflicts (typically via Edit or
-    \`git checkout --theirs <file>\` for files outside your task's scope),
-    re-run \`./check\`, then \`./pr open\` again to push the rebase. Cap
-    yourself at ~2 conflict-resolution attempts; if it's not converging
-    call \`./blocked\` and the orchestrator will spawn a fix-task from a
-    fresh VM. Resolving locally is much cheaper than that fallback.
-- \`./done\` — marks the task COMPLETED with the PR URL. Requires
-  \`./pr open\` to have run first. Idempotent (safe to re-run).
-  - \`./done --already-done "<reason>"\` — no-op / already-satisfied exit.
-    Use ONLY when you have VERIFIED that the task's deliverable ALREADY
-    EXISTS on the base branch and producing a diff would be a genuine no-op
-    (or would break an invariant — e.g. a sibling PR already added the
-    migration/model/endpoint you were asked to add, and a duplicate would
-    branch the Alembic revision chain). Marks the task COMPLETED with NO PR
-    and records your reason so operators see why there's no PR. Does NOT
-    require \`./pr open\`. The reason MUST name the concrete artifact you
-    verified and where it lives (≥30 chars), e.g. "0133_poolvm_registry.py +
-    PoolVm model + EXPECTED_SCHEMA_REVISION=0133 already on base via sibling
-    PR #6978; a new migration would break chain-linearity". This is NOT a
-    give-up verb — if you couldn't complete the work use \`./fail\`; if an
-    upstream precondition blocks you use \`./blocked\`. A bare exit with no
-    diff and no \`./done\`/\`./fail\`/\`./blocked\` is treated as INCOMPLETE
-    (it fails) — so if the work is genuinely already done you MUST call
-    \`./done --already-done\` to land it COMPLETED.
-  - \`./done --warn-out-of-scope "<reason>"\` — judgment-call escape hatch.
-    Use when \`./check\` fails but the failures are in **files you edited**
-    and are **pre-existing on the base branch (origin/<BASE>)** AND
-    fixing them is materially out of scope for this PR (e.g., a refactor of an
-    unrelated layout, a sweeping rename, a new dep introduction). Posts a
-    FEEDBACK project message naming the gates/files/reason so strategic
-    can spawn cleanup work. The reason MUST be specific (≥30 chars):
-    which gates failed, which files, why the fix is out of scope.
-    DO try to fix related preexisting issues first ("don't leave
-    preexisting issues" principle). DO NOT use this for issues a single
-    edit could resolve.
-    NOTE: if the failure requires a new bug to be introduced (missing
-    package, infra gap, agent can't even start), use \`./blocked\` instead.
-    \`./blocked\` is for "I cannot start until X is fixed upstream";
-    \`./done --warn-out-of-scope\` is for "I shipped a real change but
-    pre-existing issues in touched files remain — flag for follow-up".
-- \`./fail "<reason>"\` — marks the task FAILED. Use ONLY when the task
-  fundamentally can't be completed: scope is wrong, conflicting
-  requirements, you genuinely don't know how to make the change. Don't
-  use for transient lint/test failures — keep iterating with \`./check\`
-  instead.
-- \`./blocked "<reason>"\` — marks the task BLOCKED_PRECONDITION (an
-  INFRA class — does NOT burn iteration cap). Use when **no code edit
-  on your part can fix the failure**, specifically:
-    1. You made a real code change and \`./check\` still fails *identically*
-       to the previous attempt. The failure isn't moving — another
-       iteration won't help.
-    2. The failure is at the toolchain or system-library layer (e.g.
-       \`error while loading shared libraries: libatk-1.0.so.0\`,
-       \`No module named 'ruff'\`, \`playwright is not installed\`,
-       \`command not found: <tool>\`). No code edit can install a system
-       package on the agent VM.
-    3. A repo-wide gate fails on files your PR did not touch (e.g. a
-       lint baseline of pre-existing errors elsewhere in the tree).
-  This routes to the strategic agent — it can spawn a direction to fix
-  the precondition (update the packer image, scope the gate to
-  changed files, etc.) if it judges that worthwhile.
-  \`./blocked\` is **not** a "give up" verb — it's a "this needs an
-  upstream fix, not a code edit on this PR" verb. \`./fail\` is the
-  give-up verb.
+const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`, commits
+  changes, pushes branch, creates PR. Writes /tmp/pr_url_<task_id> on success.
+  Pass \`--with-tests\` to run \`./check test\` instead. **Exit 4 = conflicts.**
+  Rebase onto origin/<base>, resolve via Edit or \`git checkout --theirs\`,
+  \`./check\`, then \`./pr open\` again. If unresolved after ~2 attempts, \`./blocked\`.
+- \`./done\` — marks COMPLETED with the PR URL. Requires \`./pr open\` first.
+  - \`./done --already-done "<reason>"\` — Deliverable EXISTS on base branch.
+    Reason MUST name concrete artifact (≥30 chars), e.g.,
+    "0133_poolvm_registry.py + PoolVm model + EXPECTED_SCHEMA_REVISION=0133
+    already on base via sibling PR #6978". Does NOT require \`./pr open\`.
+  - \`./done --warn-out-of-scope "<reason>"\` — \`./check\` fails on
+    pre-existing issues in your edited files (not your changes). Reason MUST be
+    specific (≥30 chars): gates, files, why unfixable. Posts FEEDBACK message.
+- \`./fail "<reason>"\` — Task fundamentally can't complete (wrong scope,
+  conflicting requirements, unknown approach). NOT for transient lint/test
+  failures — iterate with \`./check\`.
+- \`./blocked "<reason>"\` — No code edit can fix: (1) \`./check\` fails
+  identically despite changes, (2) toolchain/system error, or (3) repo-wide gate
+  fails on untouched files. Routes to strategic. Does NOT burn iteration cap.
 
 Required exit pattern (every code-change task):
   edit -> ./check -> (if green) ./pr open --title ... --body ... -> ./done
 
-## You MUST end every run with a terminal verb — nothing will resume you
+## You MUST end every run with a terminal verb
 
-Every task run MUST end by invoking **exactly one** terminal verb:
-- \`./done\` — after \`./pr open\` created/updated a PR with your diff.
-- \`./done --already-done "<verified artifact>"\` — when the deliverable
-  ALREADY EXISTS on the base branch and producing a diff would be a genuine
-  no-op (e.g. a sibling PR already shipped the migration/model/endpoint you
-  were asked to add). You MUST verify the concrete artifact and name where it
-  lives (≥30 chars) — see the \`./done --already-done\` documentation above.
-- \`./fail "<reason>"\` — when the work fundamentally could not be completed.
-- \`./blocked "<reason>"\` — when an upstream precondition is missing and no
-  code edit on your part can fix it.
-
-**There is NO external monitor, watcher, or background process that will
-resume this session after you yield.** When you emit a final assistant
-message with no tool call, the Claude SDK turn ends and the run is OVER —
-whatever you intended to do next will never happen. Phrases like "I'll wait
-for the monitor", "I'll wait for the monitor to report completion",
-"waiting for completion", "I'll let the run finish", or ending a turn with
-no tool call are **FORBIDDEN** — they cause the task to be marked
-not-shipped ("Task did not ship"). Never end a turn waiting to be "reported
-back to."
-
-If you determine the deliverable is already present (a sibling PR already
-shipped the change), do NOT wait — verify the concrete artifact on the base
-branch and IMMEDIATELY call \`./done --already-done\` naming that artifact.
-
-ALWAYS call \`./done\`, \`./fail\`, or \`./blocked\` explicitly. The wrapper has only one
-fallback: if you opened a PR via \`./pr open\` but didn't call \`./done\`,
-it posts COMPLETED on your behalf using the PR URL marker. Otherwise it
-posts FAILED with no useful reason — which is bad for the operator and
-bad for downstream investigation. Don't rely on the fallback.
-There is NO "exit with no diff = success" fallback: if the deliverable is
-already present and you produced no diff, you MUST call
-\`./done --already-done "<reason>"\` — a bare no-diff exit is failed as
-incomplete, never silently completed.
-
-DO use \`git status\`, \`git diff\` to inspect your work.
-DON'T directly call \`git commit\`, \`git push\`, or \`gh pr create\` — use
-\`./pr open\` so the lint/build gate fires and the orchestrator records
-the PR atomically.
+ALWAYS call exactly ONE: \`./done\`, \`./done --already-done\`, \`./fail\`, or
+\`./blocked\`. There is NO external monitor that will resume this session —
+run is OVER after you emit a final message with no tool call. Phrases like
+"I'll wait for the monitor" cause the task to be marked not-shipped ("Task
+did not ship"). No "exit with no diff = success" fallback — call
+\`./done --already-done\` if deliverable exists. DO use \`git status\`/\`git diff\`.
+DON'T call \`git commit\`/\`git push\`/\`gh pr create\` — use \`./pr open\`.
 
 ## Required: self-review before \`./done\` (code-change tasks)
 
-For create / fix / refactor / migrate tasks, write a structured self-review
-JSON to \`/tmp/self_review_<task_id>.json\` before calling \`./done\` (your
-task ID is in the ORCHESTRATOR env or the prompt context). \`./done\`
-includes it in the COMPLETED payload as \`self_review_outcome\` —
-downstream consumers use it for retry context, dashboard catch-rate
-metrics, and reviewer-iteration priming.
+For create/fix/refactor/migrate tasks, write a structured self-review JSON to
+\`/tmp/self_review_<task_id>.json\` before \`./done\`. Included in COMPLETED payload
+as \`self_review_outcome\` for retry context and metrics.
 
-Use these canonical category IDs in \`check_results\` (drawn from the
-backend review vocabulary — must match exactly):
-<!-- vocabulary mirrored in backend/testing/test_invariants.py as AGENT_SELF_REVIEW_CATEGORIES frozenset — keep parity with both the frozenset and backend/app/playbook_learning.py (_REVIEW_CATEGORIES) -->
+Use these canonical category IDs in \`check_results\`:
 <!-- SR_CATEGORIES_START -->
-- \`correctness\` — logic bugs, off-by-one errors, edge cases, race conditions
-- \`error-handling\` — unhandled exceptions, missing null checks, async errors
-- \`security\` — injection, XSS, CSRF, exposed secrets, unvalidated inputs
-- \`style-conventions\` — naming, formatting, lint, code style consistency
-- \`type-safety\` — TypeScript errors, missing type annotations, unsafe casts
-- \`documentation\` — missing docstrings, inline comments, undocumented exports
-- \`performance\` — N+1 queries, missing indexes, memory leaks, slow paths
-- \`architecture\` — coupling, abstraction boundaries, pattern violations
-- \`test-coverage\` — missing tests for new behavior, untested edge cases
-- \`scope-drift\` — diff materially exceeds the declared task scope (see thresholds below)
-- \`regression_risk\` — previously-passing test now fails after changes (omit if no baseline available)
-- \`cross-system-contract\` — URL path, DTO field, or shared type referenced on one side has no matching definition on the other (see check below)
+- \`correctness\`
+- \`error-handling\`
+- \`security\`
+- \`style-conventions\`
+- \`type-safety\`
+- \`documentation\`
+- \`performance\`
+- \`architecture\`
+- \`test-coverage\`
+- \`scope-drift\`
+- \`regression_risk\`
+- \`cross-system-contract\`
 <!-- SR_CATEGORIES_END -->
 
-**Scope-drift check (required for code-change tasks):**
-The \`scope-drift\` category has TWO triggers that both feed the SAME \`scope-drift\` entry
-(do not introduce a new category id). If EITHER trigger fires, record \`scope-drift\` with
-\`passed: false\` and an \`issue\` field that names which trigger fired and the specifics.
-Only when BOTH triggers are clean do you record \`passed: true\`.
+**Scope-drift check (required):** TWO triggers → if EITHER fires, \`passed: false\`.
+*Trigger A — diff size:* Run \`git diff --stat HEAD\`; count lines/files.
+small 50/2; medium 200/5; large 800/15 (lines/files).
+*Trigger B — files:* Run \`git diff --name-only HEAD\`; compare against
+\`related_files\`. Allowlisted incidentals: \`package-lock.json\`, \`poetry.lock\`,
+\`Cargo.lock\`, \`go.sum\`, \`yarn.lock\`, \`pnpm-lock.yaml\`, and sibling test files
+(\`.test.ts\`, \`.spec.ts\`, \`test_*.py\`). Off-scope issue format:
+\`"modified files outside declared scope: <file> — declared related_files: [...]"\`.
 
-*Trigger A — diff size exceeds declared-scope threshold.*
-Run \`git diff --stat HEAD\` (or \`git diff --stat <base>..HEAD\` if you know the base) and count
-total changed lines (insertions + deletions) and the number of files touched.
-Compare against the task's declared scope using these thresholds:
+**Regression-risk check (conditional):** If \`/tmp/test_baseline_<TASK_ID>.json\`
+exists, failures not in it are regressions. If absent, omit the baseline check;
+flag risky when ≥80 source lines + 0 test lines, or removed exports.
+Append \`[heuristic-derived]\`.
 
-| Scope  | Max lines | Max files |
-|--------|-----------|-----------|
-| small  | 50        | 2         |
-| medium | 200       | 5         |
-| large  | 800       | 15        |
+**Cross-system-contract check (required when diff touches ≥2 of {admin-ui,
+backend, agent} OR changes HTTP paths/decorators):** Enumerate new/changed URL
+paths, DTO fields, shared types. grep the other side(s) for matching definitions. Record
+\`passed: false\` with \`"major"\` for URL/route mismatches, \`"minor"\` for
+type-name drift. If not cross-system: \`"issue": "diff does not cross system boundaries"\`.
 
-If the diff exceeds the threshold for the declared scope, Trigger A fires. The \`issue\`
-field should explain the overage (e.g. "small task shipped 312 changed lines across 6
-files — threshold is 50 lines / 2 files").
+**Visual-verification (optional; admin-ui/src/components only):** Record a
+TOP-LEVEL \`visual_verification\` object with \`passed\`, \`pairs_inspected\`,
+\`pairs_changed\`, \`note\`, \`caught_visual_issue\`.
 
-*Trigger B — modified files outside the declared \`related_files\` set.*
-Run \`git diff --name-only HEAD\` (or \`git diff --name-only <base>..HEAD\`) to enumerate
-every modified file. Compare that set against the task's declared \`related_files\` (from
-the task prompt / payload). Files in the diff that are NOT in \`related_files\` are
-off-scope UNLESS they fall in the incidental-files allowlist:
+**Regressing-category reasoning (required for Self-Review Blind Spots categories):**
+For every regressing category, add a \`"reasoning"\` field describing what you inspected
+and the evidence supporting the call. Required for BOTH pass and fail outcomes.
+If \`./done\` exits with "Regressing categories need a reasoning field", update SR JSON
+and re-run \`./done\`.
 
-- Lockfiles updated as a side-effect of a manifest change: \`package-lock.json\`,
-  \`poetry.lock\`, \`Cargo.lock\`, \`go.sum\`, \`yarn.lock\`, \`pnpm-lock.yaml\`.
-- Generated outputs that the build emits automatically (e.g. compiled bundles,
-  protobuf-generated code, schema dumps the build regenerates).
-- \`.gitignore\` updates that accompany new generated paths.
-- Sibling test files that mirror a declared source file — e.g. if \`agent/src/foo.ts\` is
-  in \`related_files\`, then \`agent/src/foo.test.ts\` and \`agent/src/foo.spec.ts\` are
-  considered in-scope tests for that file. The same applies to \`test_foo.py\` next to
-  \`foo.py\` and \`__tests__/foo.test.tsx\` next to \`foo.tsx\`.
+**Evidence anchors** are required for high-stakes PASS verdicts (\`correctness\`,
+\`error-handling\`, \`security\`, \`regression_risk\`, \`scope-drift\`). Each PASS
+needs a concrete evidence anchor in \`reasoning\`: a file:line reference
+(\`path/to/file.ts:42\`), a backtick-quoted code snippet (≥10 chars), or a named
+test file. Lower-stakes categories (style-conventions, documentation, performance,
+architecture) do not require an anchor.
+For \`scope-drift\`: Trigger A — cite diff stats vs. threshold (lines/files).
+Trigger B — cite file-set check vs. related_files. PASS without evidence anchor
+on high-stakes = unsubstantiated → downgrade to FAIL.
 
-If any non-allowlisted modified file is outside \`related_files\`, Trigger B fires. The
-\`issue\` field should explicitly enumerate the off-scope files and the declared scope, e.g.
-\`"issue": "modified files outside declared scope: backend/app/foo.py, agent/src/bar.ts — declared related_files: [agent/src/baz.ts]"\`.
-If \`related_files\` is unspecified or empty, Trigger B is informational only — record what
-you observed but do not flip \`passed: false\` solely on missing scope metadata.
+\`fixes_applied: true\` = you caught and fixed issues. File MUST exist for
+code-change tasks (may be degraded \`{"verdict":"unknown"}\`).
 
-If both triggers fire, mention both in the same \`issue\` string. The check does NOT block
-\`./done\` — it is informational and feeds the catch-rate dashboard.
+**\`blind_spots\`:** Specific unverified risks — untested paths, unhandled edge
+cases, uncertain assumptions. NOT: CI running full suite; intentional scope
+decisions. Examples: "did not re-read c.ts after truncation", "concurrent calls
+unsure". Empty if none.
 
-**Regression-risk check (conditional on baseline availability):**
-Before calling \`./done\`, check whether \`/tmp/test_baseline_\${TASK_ID}.json\` exists
-(where TASK_ID is the value from the ORCHESTRATOR env, also printed at the top of
-your session context). If the file exists, it contains a JSON array of test names that
-were already failing BEFORE your changes — these are pre-existing failures, not
-regressions. Compare this list against any test failures surfaced by your most recent
-\`./check test\` or \`./check\` run:
+**Optional:** \`truncated_files_read\` = changed files you re-read (fine if
+subset). Set \`categories: ["incomplete_review"]\` when diff truncated.
 
-- If a test is now failing AND its name does NOT appear in the baseline array, that is a
-  regression introduced by your changes. Record \`regression_risk\` in \`check_results\`
-  with \`passed: false\` and an \`issue\` naming the affected test(s) and your assessment
-  of whether the failure is caused by your changes or is pre-existing/unrelated.
-- If all current failures appear in the baseline (or there are no failures), record
-  \`regression_risk\` with \`passed: true\`.
-- If the baseline file does not exist (fix tasks, non-main branches, auto-remediation),
-  compute a diff-based heuristic instead of omitting:
-  1. Run \`git diff <base>..HEAD --unified=0\`. Classify changed lines by file: test files
-     match \`*.test.ts\`, \`*.spec.*\`, \`test_*.py\`, or paths containing \`__tests__/\`.
-  2. **Signal A — source-to-test ratio**: if ≥80 source lines changed and 0 test lines, flag as risky.
-  3. **Signal B — removed exports**: count removed lines matching
-     \`export (default )?(async )?(function|class|const|let|var|type|interface|enum)\`.
-  Record \`regression_risk\` with \`passed: false\` if any signal fires, \`passed: true\` if none.
-  **Always append \`[heuristic-derived]\`** to the issue text so downstream measurement can
-  distinguish heuristic from baseline-validated results.
-
-Like \`scope-drift\`, this check does NOT block \`./done\` — it is informational and feeds
-the catch-rate dashboard.
-
-**Cross-system-contract check (fires when diff is cross-system):**
-This check is REQUIRED when the diff touches ≥2 of {admin-ui, backend, agent} OR when it adds or
-changes HTTP route paths, FastAPI router decorators (\`@router.get\`, \`@router.post\`, etc.), or
-fetch/axios call sites.
-
-Steps:
-1. Enumerate every new or changed URL path string, DTO field name, and shared TypeScript/Python
-   type name in the diff (look for string literals like \`'/api/...'\`, decorator paths like
-   \`@router.get('/...')\`, and \`fetch('/...')\` / \`axios.get('/...')\` calls).
-2. For each URL path found on one side, grep the *other* side's tree for a matching route
-   definition or call site (e.g., if admin-ui calls \`/api/admin/foo\`, grep backend for \`/foo\`
-   in router files; if backend adds \`@router.post('/bar')\`, grep admin-ui for \`/bar\`).
-3. For each DTO field name or shared type name, grep the other side for its definition or usage.
-4. Record \`passed: false\` with \`severity: "major"\` for URL/route mismatches (these break
-   runtime), or \`severity: "minor"\` for type-name drift where runtime is unaffected.
-   Include the path string and the side that is missing the definition in the \`issue\` field.
-5. If the diff is not cross-system and contains no HTTP path changes, record \`passed: true\`
-   with \`issue: "diff does not cross system boundaries"\`.
-
-This check does NOT block \`./done\` — it is informational and feeds the catch-rate dashboard.
-
-**Visual-verification field (optional; admin-ui/src/components diffs only):**
-When your diff touches \`admin-ui/src/components/\` and you ran
-\`bash scripts/viewport-snapshot.sh\` to inspect before/after PNG pairs, record a
-\`visual_verification\` object as a TOP-LEVEL field of the self-review JSON (NOT a
-\`check_results\` category — its shape differs, and \`check_results\` keys are a fixed
-vocabulary). Shape:
-
-\`\`\`json
-"visual_verification": {
-  "passed": true,
-  "pairs_inspected": 3,
-  "pairs_changed": 1,
-  "note": "<what changed visually; what you checked>",
-  "caught_visual_issue": false
-}
-\`\`\`
-
-- \`pairs_inspected\` / \`pairs_changed\`: counts from the snapshot manifest's
-  changed/new pairs you actually Read.
-- \`caught_visual_issue\`: \`true\` only if visual inspection surfaced a defect the
-  \`./check\` assertion gates did not (this is the pilot's kill-criterion signal).
-- \`passed\`: your overall judgement that the rendered output is correct.
-- Omit the field entirely if the diff does not touch \`admin-ui/src/components/\` or
-  you did not run the snapshot — it is never required and never blocks \`./done\`.
-
-Schema:
-
-\`\`\`json
-{
-  "verdict": "pass" | "fail",
-  "fixes_applied": true | false,
-  "prompt_version": "<string from SELF_REVIEW_PROMPT_VERSION — include verbatim>",
-  "check_results": {
-    "<category>": { "passed": true | false, "issue": "...", "reasoning": "..." }
-  },
-  "blind_spots": ["...", "..."],
-  "visual_verification": { "passed": true, "pairs_inspected": 0, "pairs_changed": 0, "note": "...", "caught_visual_issue": false },
-  "truncated_files_read": ["path/a.ts", "path/b.ts"],
-  "categories": ["incomplete_review"]
-}
-\`\`\`
-
-**Regressing-category reasoning (required for categories in the Self-Review Blind Spots list):**
-If the project context injected a "Self-Review Blind Spots" section naming specific categories
-for this task type, those categories are *regressing* — the dashboard shows increasing miss rates
-for them. For every regressing category in \`check_results\`, add a \`reasoning\` field (~1 sentence)
-describing exactly what you inspected and what evidence supports the pass/fail call. This is
-required for BOTH pass and fail outcomes. Non-regressing categories keep the existing optional
-schema (no \`reasoning\` required). If \`./done\` exits with a "Regressing categories need a
-reasoning field" error, update the SR JSON and re-run \`./done\`.
-
-**Evidence anchors for PASS verdicts on high-stakes categories:**
-When you mark any of these five categories as \`"passed": true\` — \`correctness\`, \`error-handling\`, \`security\`, \`regression_risk\`, or \`scope-drift\` — your \`reasoning\` field MUST include a concrete evidence anchor. Valid anchors depend on the category:
-
-For \`correctness\`, \`error-handling\`, \`security\`, \`regression_risk\`:
-- A file reference with line number: \`path/to/file.ts:42\`
-- A backtick-quoted code snippet ≥10 characters from the diff: \`\`\`const result = validate(...)\`\`\`
-- A named test file: \`testing/test_security.py\` with the assertion that proved the claim
-
-For \`scope-drift\` PASS verdicts specifically:
-- Trigger A evidence (diff size vs. threshold): reference the diff-stat numbers and how they compare to the scope threshold, e.g. \`"diff: 42 lines / 2 files — small scope threshold: 50 lines / 2 files"\`
-- Trigger B evidence (files vs. related_files): reference the file-set check you performed, e.g. \`"checked modified files against related_files: [agent/src/prompt.ts, agent/src/prompt.test.ts]"\`
-
-Example for correctness: \`"reasoning": "Checked \`path/to/foo.ts:89\` — the null guard handles undefined payload fields, verified in test_agent.py:156"\`.
-Example for scope-drift: \`"reasoning": "Trigger A: diff 45 lines / 2 files vs. small threshold 50/2 (within bounds). Trigger B: all modified files in related_files set."\`
-
-PASS without an anchor on these high-stakes categories is unsubstantiated — downgrade to FAIL or \`unknown\` instead. This requirement does not apply to lower-stakes categories (style-conventions, documentation, performance, architecture).
-
-\`fixes_applied: true\` means YOU caught something during self-review and
-fixed it before pushing. A degraded \`{"verdict":"unknown","check_results":{},"blind_spots":["..."]}\`
-envelope is acceptable when you have nothing useful to record, but the
-file MUST exist for code-change tasks.
-
-**\`blind_spots\` semantics:** A blind spot is a *specific, unverified risk inside the diff you wrote* — an untested code path, an unhandled edge case, an assumption that may not hold. It is scoped to your change.
-
-What is NOT a blind spot, by design: after \`./pr open\` CI runs the full backend / docker / viewport / playwright suite and gates the merge. CI running the full suite is a *guarantee*, not a gap — your job is the targeted \`./check\` on the files you touched, and CI closes the loop. So "I did not run the full / complete / docker / integration test suite" is never a blind spot, in any phrasing; neither are intentional scope decisions you made deliberately.
-
-Valid blind_spots are uncertainties CI cannot resolve for you: "did not re-read c.ts after diff truncated", "unsure whether the retry path handles concurrent calls", "no test for the empty-list edge case I added handling for". If you have nothing of that kind, leave the array empty.
-
-**Optional verification-coverage fields (advisory — do NOT block \`./done\`):**
-- \`truncated_files_read\`: list the changed file paths you actually re-opened/re-read during self-review for verification. Only include files you re-inspected — it is fine for this list to be a subset of the diff. Reviewers use it to focus on unverified files.
-- \`categories: ["incomplete_review"]\`: set this marker when the diff was truncated and you could not verify all changed files even after retrying the read. \`categories\` is a top-level array (separate from \`check_results\`) reserved for coverage markers like this.
-
-Example of partial verification (verified two of three changed files, diff was truncated):
-\`\`\`json
-{
-  "verdict": "pass",
-  "fixes_applied": false,
-  "check_results": { "correctness": { "passed": true } },
-  "blind_spots": ["did not re-read c.ts after retry"],
-  "truncated_files_read": ["a.ts", "b.ts"],
-  "categories": ["incomplete_review"]
-}
-\`\`\`
-
-**Fresh-reviewer pass (when enabled):** After your session ends, a second
-read-only Claude session may run and augment the self-review JSON with a
-\`reviewer_findings\` array. Reviewer-flagged categories override passing
-self-attestations in \`check_results\`. Additionally, if \`categories\` contains
-\`"incomplete_review"\`, a recovery fresh-reviewer pass fires automatically even
-when the project has not opted into the fresh-reviewer feature — recovery findings
-carry \`origin: "reviewer_recovery_after_incomplete_sr"\` in their \`check_results\`
-entries and a top-level \`reviewer_recovery_origin\` field on the JSON. The final JSON shape is:
-\`\`\`json
-{
-  "verdict": "pass" | "fail",
-  "fixes_applied": true | false,
-  "check_results": { "<category>": { "passed": true | false, "issue": "..." } },
-  "blind_spots": ["..."],
-  "reviewer_findings": [{ "category": "<id>", "severity": "CRITICAL|HIGH|MEDIUM|LOW", "description": "..." }]
-}
-\`\`\`
-If you see CRITICAL entries in \`reviewer_findings\` when you re-read the file
-before \`./done\`, triage them: fix what's valid, record false positives in
-\`blind_spots\`.
+**Fresh-reviewer pass:** Second session may augment JSON with \`reviewer_findings\`
+array. Reviewer findings override passing attestations. Auto-fires for
+\`"incomplete_review"\`.
 `;
 
 /** Config-driven ./check description for a project that supplied a build_config
