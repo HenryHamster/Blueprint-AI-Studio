@@ -10,7 +10,6 @@ import {
   SrCatchRateHealthBanner,
   type SrMissedTask,
 } from './SrRetrospectiveShared';
-import { SrReviewerDisagreementDrillPanel, type SrReviewerDisagreementTasksResult } from './SrTrendBreakdown';
 import { timeAgo } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import { useUrlFilterState } from '../hooks/useUrlFilterState';
@@ -311,41 +310,6 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
           <RetrospectiveRefreshButton isStale={isStale} loading={loading} onRefresh={handleRefresh} />
         </>
       )}
-    </section>
-  );
-}
-
-const _DRILL_DAY_OPTIONS = [7, 14, 30, 90];
-
-export interface SrDisagreementDrillSectionProps {
-  selectedProjectId: string | null;
-  category: string;
-  taskType: string;
-  onSelectTask: (taskId: string) => void;
-  onClose: () => void;
-  fetchFn: (p: { category: string; task_type: string; days: number; page: number; page_size: number }) => Promise<SrReviewerDisagreementTasksResult>;
-}
-
-export function SrDisagreementDrillSection({
-  selectedProjectId, category, taskType, onSelectTask, onClose, fetchFn,
-}: SrDisagreementDrillSectionProps) {
-  const [days, setDays] = useState(14);
-  if (!selectedProjectId) return null;
-  return (
-    <section aria-label="SR disagreement drill-through" data-testid="sr-disagreement-drill-section">
-      <div className="flex items-center gap-2 mb-2">
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest flex-1">
-          SR Disagreements · {category}{taskType ? ` · ${taskType}` : ''}
-        </h2>
-        <button type="button" onClick={onClose} className="text-neutral-500 hover:text-neutral-300 text-[10px]" aria-label="Close disagreement drill-through">✕</button>
-      </div>
-      <div className="flex flex-wrap items-center gap-1.5 mb-2">
-        {_DRILL_DAY_OPTIONS.map(d => (
-          // eslint-disable-next-line viewport/min-touch-target -- dense filter controls, consistent with adjacent panels
-          <button key={d} type="button" onClick={() => setDays(d)} className={`px-1.5 py-0.5 rounded border text-[10px] ${days === d ? 'border-blue-500 text-blue-300' : 'border-neutral-700 text-neutral-400 hover:border-neutral-500'}`}>{d}d</button>
-        ))}
-      </div>
-      <SrReviewerDisagreementDrillPanel category={category} taskType={taskType} days={days} fetchFn={fetchFn} onSelectTask={onSelectTask} />
     </section>
   );
 }

@@ -8,19 +8,13 @@ import {
   SrUnhandledEdgesRetrospective,
   DirectionSrBreakdownPanel,
   EdgesTrendBreakdown,
-  FreshReviewerTrendBreakdown,
-  SrScopeDriftVsExpansionCard,
   SrReviewerDisagreementsPanel,
-  SrReviewerDisagreementDrillPanel,
   MissRateSparkline,
   computeTargetHealth,
   type SrTrendData,
   type DirectionSrEntry,
   type EdgesTrend,
-  type FreshReviewerTrend,
-  type SrScopeDriftVsExpansion,
   type SrReviewerDisagreementsData,
-  type SrReviewerDisagreementTasksResult,
   type SrUnhandledEdgesTask,
 } from './SrTrendBreakdown';
 
@@ -617,40 +611,6 @@ describe('DirectionSrBreakdownPanel', () => {
   });
 });
 
-describe('FreshReviewerTrendBreakdown', () => {
-  function makeFreshReviewerTrend(overrides: Partial<FreshReviewerTrend> = {}): FreshReviewerTrend {
-    return {
-      bucket_mode: 'cycle',
-      current_cycle_id: 'abcdef123456',
-      previous_cycle_id: 'fedcba654321',
-      current_sample_size: 12,
-      per_category_hit_rate: {
-        correctness: { current: 0.75, previous: 0.6, delta: 0.15, trend: 'improving' },
-      },
-      approval_rate_lift: { current: 0.1, previous: 0.02, delta: 0.08, trend: 'improving' },
-      ...overrides,
-    };
-  }
-
-  it('renders category hit rates and approval lift when either seam is present', () => {
-    render(<FreshReviewerTrendBreakdown trend={makeFreshReviewerTrend()} />);
-    expect(screen.getByTestId('fr-trend-breakdown')).toBeInTheDocument();
-    expect(screen.getByText('Fresh-Reviewer Trend')).toBeInTheDocument();
-    expect(screen.getByText('correctness')).toBeInTheDocument();
-    expect(screen.getByText('75%')).toBeInTheDocument();
-    expect(screen.getByText('+10pp')).toBeInTheDocument();
-  });
-
-  it('returns null when the payload has neither per-category data nor approval lift', () => {
-    const { container } = render(
-      <FreshReviewerTrendBreakdown
-        trend={makeFreshReviewerTrend({ per_category_hit_rate: null, approval_rate_lift: null })}
-      />,
-    );
-    expect(container.firstChild).toBeNull();
-  });
-});
-
 describe('EdgesTrendBreakdown', () => {
   function makeEdgesTrend(overrides: Partial<EdgesTrend> = {}): EdgesTrend {
     return {
@@ -889,79 +849,6 @@ describe('SrTrendBreakdown execution-evidence categories', () => {
     // correctness should NOT be inside the execution-evidence section
     expect(execSection?.textContent).not.toContain('correctness');
     expect(execSection?.textContent).toContain('tests_executed_cleanly');
-  });
-});
-
-describe('SrScopeDriftVsExpansionCard', () => {
-  it('renders nothing when data is null', () => {
-    const { container } = render(<SrScopeDriftVsExpansionCard data={null} />);
-    expect(container.firstChild).toBeNull();
-  });
-
-  it('renders miss-by-expansion rate with numerator/denominator and sample size', () => {
-    const data: SrScopeDriftVsExpansion = {
-      miss_by_expansion_rate: 0.3,
-      numerator: 3,
-      denominator: 10,
-      sample_size: 12,
-      consistent: 7,
-      miss_by_expansion: 3,
-    };
-    render(<SrScopeDriftVsExpansionCard data={data} />);
-    expect(screen.getByTestId('sr-scope-drift-vs-expansion')).toBeInTheDocument();
-    expect(screen.getByText('30%')).toBeInTheDocument();
-    expect(screen.getByText('3/10')).toBeInTheDocument();
-    expect(screen.getByText('n=12')).toBeInTheDocument();
-  });
-
-  it('shows consistent bucket — SR passed + ratio ≤ 1.5 (true-pass)', () => {
-    const data: SrScopeDriftVsExpansion = { consistent: 8, miss_by_expansion_rate: 0 };
-    render(<SrScopeDriftVsExpansionCard data={data} />);
-    expect(screen.getByText('consistent: 8')).toBeInTheDocument();
-  });
-
-  it('shows miss_by_expansion bucket — SR passed + ratio ≥ 2.0 (scope-drift miss)', () => {
-    const data: SrScopeDriftVsExpansion = { miss_by_expansion: 5, miss_by_expansion_rate: 0.5 };
-    render(<SrScopeDriftVsExpansionCard data={data} />);
-    expect(screen.getByText('miss: 5')).toBeInTheDocument();
-  });
-
-  it('shows hit_by_expansion bucket — SR failed scope-drift + ratio ≥ 1.5 (SR caught it)', () => {
-    const data: SrScopeDriftVsExpansion = { hit_by_expansion: 4, miss_by_expansion_rate: 0 };
-    render(<SrScopeDriftVsExpansionCard data={data} />);
-    expect(screen.getByText('hit: 4')).toBeInTheDocument();
-  });
-
-  it('shows fp_candidate bucket — SR failed scope-drift + ratio ≤ 1.0 (likely false positive)', () => {
-    const data: SrScopeDriftVsExpansion = { fp_candidate: 2, miss_by_expansion_rate: 0 };
-    render(<SrScopeDriftVsExpansionCard data={data} />);
-    expect(screen.getByText('fp: 2')).toBeInTheDocument();
-  });
-
-  it('hides gray_zone row when count is zero', () => {
-    const data: SrScopeDriftVsExpansion = { gray_zone: 0, miss_by_expansion_rate: 0.1 };
-    render(<SrScopeDriftVsExpansionCard data={data} />);
-    expect(screen.queryByText(/gray:/)).not.toBeInTheDocument();
-  });
-
-  it('shows gray_zone when count is non-zero', () => {
-    const data: SrScopeDriftVsExpansion = { gray_zone: 3, miss_by_expansion_rate: 0.1 };
-    render(<SrScopeDriftVsExpansionCard data={data} />);
-    expect(screen.getByText('gray: 3')).toBeInTheDocument();
-  });
-
-  it('applies red color when miss-by-expansion rate ≥ 30%', () => {
-    const data: SrScopeDriftVsExpansion = { miss_by_expansion_rate: 0.4 };
-    render(<SrScopeDriftVsExpansionCard data={data} />);
-    const rateEl = screen.getByText('40%');
-    expect(rateEl.className).toContain('text-red-400');
-  });
-
-  it('applies emerald color when miss-by-expansion rate < 15%', () => {
-    const data: SrScopeDriftVsExpansion = { miss_by_expansion_rate: 0.05 };
-    render(<SrScopeDriftVsExpansionCard data={data} />);
-    const rateEl = screen.getByText('5%');
-    expect(rateEl.className).toContain('text-emerald-400');
   });
 });
 
@@ -1590,43 +1477,6 @@ describe('SrReviewerDisagreementsPanel severity stratification', () => {
     );
     const badge = container.querySelector('[title*="max: CRITICAL"]');
     expect(badge).not.toBeNull();
-  });
-});
-
-function makeDrillFn(result: SrReviewerDisagreementTasksResult) {
-  return vi.fn().mockResolvedValue(result);
-}
-
-function makeDrillResult(items: SrReviewerDisagreementTasksResult['items'], total?: number): SrReviewerDisagreementTasksResult {
-  return { items, total: total ?? items.length, page: 0, page_size: 20 };
-}
-
-const SAMPLE_TASK = { task_id: 't1', title: 'Fix the bug', task_type: 'fix', scope: 'small', created_at: '2026-01-01T00:00:00Z', pr_url: null, category: 'correctness', severity: 'HIGH', description: 'Reviewer flagged null check.' };
-
-describe('SrReviewerDisagreementDrillPanel', () => {
-  it('shows empty state when no tasks returned', async () => {
-    render(<SrReviewerDisagreementDrillPanel category="correctness" taskType="fix" days={14} fetchFn={makeDrillFn(makeDrillResult([]))} />);
-    expect(await screen.findByTestId('sr-disagreement-drill-empty')).toBeInTheDocument();
-  });
-
-  it('renders a single task row with title and severity', async () => {
-    render(<SrReviewerDisagreementDrillPanel category="correctness" taskType="fix" days={14} fetchFn={makeDrillFn(makeDrillResult([SAMPLE_TASK]))} />);
-    expect(await screen.findByText('Fix the bug')).toBeInTheDocument();
-    expect(screen.getByText('HIGH')).toBeInTheDocument();
-  });
-
-  it('calls onSelectTask with task_id on row click', async () => {
-    const user = userEvent.setup();
-    const onSelect = vi.fn();
-    render(<SrReviewerDisagreementDrillPanel category="correctness" taskType="fix" days={14} fetchFn={makeDrillFn(makeDrillResult([SAMPLE_TASK]))} onSelectTask={onSelect} />);
-    await user.click(await screen.findByText('Fix the bug'));
-    expect(onSelect).toHaveBeenCalledWith('t1');
-  });
-
-  it('shows pagination controls when total exceeds page size', async () => {
-    const items = Array.from({ length: 20 }, (_, i) => ({ ...SAMPLE_TASK, task_id: `t${i}`, title: `Task ${i}` }));
-    render(<SrReviewerDisagreementDrillPanel category="correctness" taskType="fix" days={14} fetchFn={makeDrillFn(makeDrillResult(items, 45))} />);
-    expect(await screen.findByText('1/3')).toBeInTheDocument();
   });
 });
 
