@@ -137,6 +137,23 @@ describe('MergeVerificationBanner — viewport regression', () => {
     expect(badge?.textContent).toContain('Last hold:');
   });
 
+  test('unverified-state honest-block badge shows total count without overflow at 375px', async () => {
+    const runtime: MergeGateRuntime = {
+      last_degraded_block_at: '2026-04-24T10:00:00Z',
+      last_degraded_block_reason: 'setup_failure',
+      degraded_block_counts: { setup_failure: 4, timeout: 1 },
+    };
+    await expectNoOverflowAt(375, renderVerdict(
+      { state: 'unverified', test_commands: [] },
+      runtime,
+      true,
+    ));
+    const badge = host!.querySelector('[data-testid="honest-block-badge"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toContain('Honest-block policy active');
+    expect(badge?.textContent).toContain('(5 total)');
+  });
+
   test('null verdict renders nothing', async () => {
     await act(async () => {
       host = document.createElement('div');

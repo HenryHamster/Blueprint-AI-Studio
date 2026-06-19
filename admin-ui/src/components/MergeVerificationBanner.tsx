@@ -196,7 +196,7 @@ export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled
           {blockDegradedEnabled ? (
             <div className="mt-2 rounded-md border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5 space-y-0.5" data-testid="honest-block-badge">
               <p className="text-[10px] text-indigo-300 font-medium">
-                Honest-block policy active — degraded fall-opens are held
+                Honest-block policy active — degraded fall-opens are held{degradedBlockTotal > 0 ? ` (${degradedBlockTotal} total)` : ''}
               </p>
               {lastBlockAt ? (
                 <p className="text-[10px] text-neutral-400">
