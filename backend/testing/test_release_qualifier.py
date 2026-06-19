@@ -5005,6 +5005,7 @@ async def test_resolve_candidate_ci_caps_pr_head_sweep(mocker, caplog):
     sweep is capped at _PR_HEAD_SWEEP_MAX to avoid exhausting API quota.
     A warning is logged when truncation occurs."""
     import logging
+
     caplog.set_level(logging.WARNING)
 
     check_runs_call_count = 0
@@ -17429,8 +17430,9 @@ async def test_stabilize_stall_not_fired_for_dry_run_hold(db_session):
 
 @pytest.mark.asyncio
 async def test_stabilize_stall_not_fired_when_calcification_covers_it(db_session):
-    """A version with a hard-blocker not_promoted status is already covered by
-    the calcification alert — stabilize-stall must not double-alert."""
+    """A version with a hard-blocker not_promoted status AND enough qualification
+    attempts is already covered by the calcification alert — stabilize-stall must
+    not double-alert."""
     from datetime import timedelta
 
     _project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -17441,6 +17443,60 @@ async def test_stabilize_stall_not_fired_when_calcification_covers_it(db_session
         "status": "not_promoted",
         "blocker": "ci_not_green",
     }
+    # At or above the calcification threshold the calcification alert covers it,
+    # so the stabilize-stall alert must stay silent.
+    version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_stabilize_stall(db_session, version)
+    assert alerted is False
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_fires_for_low_attempt_hard_blocker_strand(db_session):
+    """A version stuck not_promoted with a hard blocker but below the calcification
+    threshold is invisible to the calcification alert — the stabilize-stall alert
+    must fire as the backstop once the version is old enough."""
+    from datetime import timedelta
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS + 5
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_not_green",
+    }
+    # Below the calcification threshold — calcification alert won't fire.
+    version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS - 1
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_stabilize_stall(db_session, version)
+    assert alerted is True
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_not_fired_for_low_attempt_hard_blocker_young_version(
+    db_session,
+):
+    """A version stuck not_promoted with a hard blocker below the calcification
+    threshold but NOT yet past the age gate must NOT fire the stabilize-stall
+    alert — it is too young."""
+    from datetime import timedelta
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS - 2
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_not_green",
+    }
+    version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS - 1
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
