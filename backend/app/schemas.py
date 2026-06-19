@@ -413,6 +413,12 @@ class HeartbeatRequest(BaseModel):
     format_miss_by_schema: Dict[str, int] | None = None
     format_repair_attempts_by_schema: Dict[str, int] | None = None
     format_repair_successes_by_schema: Dict[str, int] | None = None
+    # Count of reopen/retry runs that crashed (exitCode != 0) — these are infra
+    # failures, not genuine format failures. Excluded from the self_repair_success_rate
+    # denominator so crashed reopens don't silently inflate the failure rate.
+    # Backwards-compatible: older agents omit these; treated as 0 / {}.
+    format_repair_infra_failures: int | None = Field(None, ge=0)
+    format_repair_infra_failures_by_schema: Dict[str, int] | None = None
     # Whether the language-aware repo map was non-empty and injected into the
     # agent prompt for this task. Set once on the first heartbeat after the
     # standard handler registers it; used as the receipt/compliance signal

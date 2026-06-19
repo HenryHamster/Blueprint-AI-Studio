@@ -5598,6 +5598,95 @@ def test_format_compliance_metrics_empty_list():
     assert result["by_type"] == {}
 
 
+def test_self_repair_rate_excludes_reopen_infra_failures():
+    """Crashed reopens (infra failures) are excluded from the denominator.
+
+    attempts=10, successes=6, infra_failures=4 → clean_attempts=6 → rate=1.0
+    """
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 2,
+                "format_repair_attempts": 10,
+                "format_repair_successes": 6,
+                "format_repair_infra_failures": 4,
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["repair_attempts"] == 10
+    assert overall["repair_successes"] == 6
+    assert overall["repair_infra_failures"] == 4
+    # clean denominator = 10 - 4 = 6; rate = 6/6 = 1.0
+    assert overall["self_repair_success_rate"] == 1.0
+
+
+def test_self_repair_rate_infra_failures_equals_attempts_yields_none():
+    """When infra_failures == attempts the clean denominator is 0 → rate is None."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 3,
+                "format_repair_attempts": 5,
+                "format_repair_successes": 0,
+                "format_repair_infra_failures": 5,
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["repair_infra_failures"] == 5
+    assert overall["self_repair_success_rate"] is None
+
+
+def test_self_repair_rate_backward_compat_no_infra_failures():
+    """Tasks without format_repair_infra_failures key behave identically to before.
+
+    The field defaults to 0, so the denominator is unchanged and the legacy rate
+    is preserved exactly.
+    """
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 3,
+                "format_repair_successes": 2,
+                # no format_repair_infra_failures key — older agent
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["repair_infra_failures"] == 0
+    assert overall["self_repair_success_rate"] == round(2 / 3, 3)
+
+
+def test_self_repair_rate_infra_failures_by_schema_aggregated():
+    """Per-schema infra failure counts are aggregated and surfaced in by_schema."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 4,
+                "format_repair_successes": 2,
+                "format_repair_infra_failures": 2,
+                "format_repair_attempts_by_schema": {"ResearchPlan": 4},
+                "format_repair_successes_by_schema": {"ResearchPlan": 2},
+                "format_repair_infra_failures_by_schema": {"ResearchPlan": 2},
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["repair_infra_failures"] == 2
+    # clean_attempts = 4 - 2 = 2; rate = 2/2 = 1.0
+    assert overall["self_repair_success_rate"] == 1.0
+    by_schema = overall["by_schema"]
+    assert "ResearchPlan" in by_schema
+    assert by_schema["ResearchPlan"]["repair_infra_failures"] == 2
+
+
 def _fc_clean(task_type="create"):
     """Task with a clean (well-formed) format_compliance_summary."""
     return _fc_task(

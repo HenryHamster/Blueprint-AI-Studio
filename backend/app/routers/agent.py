@@ -4727,6 +4727,8 @@ async def agent_heartbeat(
         or req.format_miss_by_schema is not None
         or req.format_repair_attempts_by_schema is not None
         or req.format_repair_successes_by_schema is not None
+        or req.format_repair_infra_failures is not None
+        or req.format_repair_infra_failures_by_schema is not None
     ):
         task.format_compliance_summary = {
             "format_miss_by_reason": {
@@ -4750,6 +4752,15 @@ async def agent_heartbeat(
                 str(schema): int(count)
                 for schema, count in (
                     req.format_repair_successes_by_schema or {}
+                ).items()
+            },
+            "format_repair_infra_failures": int(
+                req.format_repair_infra_failures or 0
+            ),
+            "format_repair_infra_failures_by_schema": {
+                str(schema): int(count)
+                for schema, count in (
+                    req.format_repair_infra_failures_by_schema or {}
                 ).items()
             },
             "last_updated_at": _utcnow().isoformat(),

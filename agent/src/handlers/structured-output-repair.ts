@@ -6,6 +6,7 @@ import {
 } from '../json-extract.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
+  recordFormatRepairInfraFailure,
   type FormatMissReason, type SchemaLabel,
 } from '../telemetry.js';
 
@@ -227,8 +228,12 @@ export async function repairStructuredOutput<T = unknown>(
         retryAttempt.missReason = validation.reason;
       }
     }
-    value = retryAttempt.value as T | null;
-    if (value !== null) recordFormatRepairSuccess(schemaLabel);
+    if (retry.exitCode !== 0) {
+      recordFormatRepairInfraFailure(schemaLabel);
+    } else {
+      value = retryAttempt.value as T | null;
+      if (value !== null) recordFormatRepairSuccess(schemaLabel);
+    }
   }
 
   return { value, missReason: firstAttempt.missReason, retry };

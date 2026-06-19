@@ -410,9 +410,11 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
     error_total = 0
     repair_attempts = 0
     repair_successes = 0
+    repair_infra_failures = 0
     miss_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_attempts_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_successes_by_schema: defaultdict[str, int] = defaultdict(int)
+    repair_infra_failures_by_schema: defaultdict[str, int] = defaultdict(int)
     for t in tasks:
         summary = getattr(t, "format_compliance_summary", None)
         if not isinstance(summary, dict):
@@ -421,9 +423,11 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         e = int(summary.get("format_error_total") or 0)
         a = int(summary.get("format_repair_attempts") or 0)
         s = int(summary.get("format_repair_successes") or 0)
+        f = int(summary.get("format_repair_infra_failures") or 0)
         error_total += e
         repair_attempts += a
         repair_successes += s
+        repair_infra_failures += f
         if e == 0:
             well_formed += 1
         for schema, count in (summary.get("format_miss_by_schema") or {}).items():
@@ -436,19 +440,30 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
             summary.get("format_repair_successes_by_schema") or {}
         ).items():
             repair_successes_by_schema[str(schema)] += int(count)
+        for schema, count in (
+            summary.get("format_repair_infra_failures_by_schema") or {}
+        ).items():
+            repair_infra_failures_by_schema[str(schema)] += int(count)
     all_schemas = (
         set(miss_by_schema)
         | set(repair_attempts_by_schema)
         | set(repair_successes_by_schema)
+        | set(repair_infra_failures_by_schema)
     )
     by_schema = {
         schema: {
             "format_miss": miss_by_schema.get(schema, 0),
             "repair_attempts": repair_attempts_by_schema.get(schema, 0),
             "repair_successes": repair_successes_by_schema.get(schema, 0),
+            "repair_infra_failures": repair_infra_failures_by_schema.get(schema, 0),
         }
         for schema in sorted(all_schemas)
     }
+    # Exclude crashed reopens (infra failures) from the denominator so the rate
+    # reflects genuine format repair quality, not infra noise.  For historical
+    # tasks that predate infra-failure reporting, repair_infra_failures == 0 and
+    # the value is identical to the previous formula — backwards-compatible.
+    clean_attempts = repair_attempts - repair_infra_failures
     return {
         "tasks_measured": measured,
         "well_formed_tasks": well_formed,
@@ -460,10 +475,12 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         "format_error_total": error_total,
         "repair_attempts": repair_attempts,
         "repair_successes": repair_successes,
-        # Share of self-repair re-asks that produced a parseable output. None
-        # (not 0) when no repair was ever attempted — an empty denominator.
-        "self_repair_success_rate": round(repair_successes / repair_attempts, 3)
-        if repair_attempts
+        "repair_infra_failures": repair_infra_failures,
+        # Share of self-repair re-asks that produced a parseable output, with
+        # crashed reopens (infra failures) excluded from the denominator.
+        # None (not 0) when the clean denominator is <= 0.
+        "self_repair_success_rate": round(repair_successes / clean_attempts, 3)
+        if clean_attempts > 0
         else None,
         "by_schema": by_schema,
     }

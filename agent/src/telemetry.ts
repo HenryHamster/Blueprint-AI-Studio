@@ -116,9 +116,11 @@ let _formatMissByReason: Record<string, number> = {}; // @per-role
 let _formatErrorTotal = 0; // @per-role
 let _formatRepairAttempts = 0; // @per-role
 let _formatRepairSuccesses = 0; // @per-role
+let _formatRepairInfraFailures = 0; // @per-role
 let _formatMissBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 let _formatRepairAttemptsBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 let _formatRepairSuccessesBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
+let _formatRepairInfraFailuresBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 
 /** Record one unparseable final output, bucketed by the extraction verdict's
  *  reason class and, when provided, by the bounded schema label. Bumps the
@@ -147,6 +149,15 @@ export function recordFormatRepairSuccess(schemaLabel?: SchemaLabel): void {
   }
 }
 
+/** Record that a self-repair reopen run crashed (exitCode !== 0) — an
+ *  infrastructure failure distinct from a clean-but-unparseable reopen. */
+export function recordFormatRepairInfraFailure(schemaLabel?: SchemaLabel): void {
+  _formatRepairInfraFailures += 1;
+  if (schemaLabel !== undefined) {
+    _formatRepairInfraFailuresBySchema[schemaLabel] = (_formatRepairInfraFailuresBySchema[schemaLabel] ?? 0) + 1;
+  }
+}
+
 /** Snapshot the cumulative format-compliance telemetry for heartbeat / status
  *  posts. Returns a plain dict (fresh copies of all per-reason and per-schema maps). */
 export function getFormatComplianceTelemetry(): {
@@ -154,18 +165,22 @@ export function getFormatComplianceTelemetry(): {
   format_error_total: number;
   format_repair_attempts: number;
   format_repair_successes: number;
+  format_repair_infra_failures: number;
   format_miss_by_schema: Partial<Record<SchemaLabel, number>>;
   format_repair_attempts_by_schema: Partial<Record<SchemaLabel, number>>;
   format_repair_successes_by_schema: Partial<Record<SchemaLabel, number>>;
+  format_repair_infra_failures_by_schema: Partial<Record<SchemaLabel, number>>;
 } {
   return {
     format_miss_by_reason: { ..._formatMissByReason },
     format_error_total: _formatErrorTotal,
     format_repair_attempts: _formatRepairAttempts,
     format_repair_successes: _formatRepairSuccesses,
+    format_repair_infra_failures: _formatRepairInfraFailures,
     format_miss_by_schema: { ..._formatMissBySchema },
     format_repair_attempts_by_schema: { ..._formatRepairAttemptsBySchema },
     format_repair_successes_by_schema: { ..._formatRepairSuccessesBySchema },
+    format_repair_infra_failures_by_schema: { ..._formatRepairInfraFailuresBySchema },
   };
 }
 
@@ -175,9 +190,11 @@ export function resetFormatComplianceTelemetry(): void {
   _formatErrorTotal = 0;
   _formatRepairAttempts = 0;
   _formatRepairSuccesses = 0;
+  _formatRepairInfraFailures = 0;
   _formatMissBySchema = {};
   _formatRepairAttemptsBySchema = {};
   _formatRepairSuccessesBySchema = {};
+  _formatRepairInfraFailuresBySchema = {};
 }
 
 /** Estimate token count from character count (4 chars ≈ 1 token).

@@ -273,8 +273,8 @@ Rules:
     // Record the initial unparseable FINAL output straight from the extraction
     // verdict (ground truth), then that a self-repair re-ask is being attempted.
     // Whether it succeeded is recorded after re-extraction below.
-    if (firstAttempt.missReason !== null) recordFormatMiss(firstAttempt.missReason);
-    recordFormatRepairAttempt();
+    if (firstAttempt.missReason !== null) recordFormatMiss(firstAttempt.missReason, 'memo');
+    recordFormatRepairAttempt('memo');
     const retryRun = await attemptStructuredRepair(
       lastResultText || allOutput, MEMO_SCHEMA_HINT,
       'Writing memo (retry)...',
@@ -290,7 +290,7 @@ Rules:
       buildSources(retryRun.lastResultText, retryRun.allOutput),
     );
     memoObj = retryAttempt.value;
-    if (memoObj !== null) recordFormatRepairSuccess();
+    if (memoObj !== null) recordFormatRepairSuccess('memo');
   }
 
   if (memoObj === null) {

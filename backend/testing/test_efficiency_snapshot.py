@@ -3914,6 +3914,42 @@ async def test_format_compliance_backfilled_into_preexisting_baseline(db_session
 
 
 @pytest.mark.asyncio
+async def test_snapshot_surfaces_repair_infra_failures(db_session):
+    """repair_infra_failures is surfaced in the format_compliance snapshot block."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            format_compliance_summary={
+                "format_error_total": 2,
+                "format_repair_attempts": 6,
+                "format_repair_successes": 3,
+                "format_repair_infra_failures": 3,
+            },
+        )
+    )
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    block = snap[FORMAT_COMPLIANCE_KEY]
+    assert block["repair_attempts"] == 6
+    assert block["repair_successes"] == 3
+    # New field surfaced in the snapshot block.
+    assert block["repair_infra_failures"] == 3
+    # Clean denominator = 6 - 3 = 3; rate = 3/3 = 1.0
+    assert block[SELF_REPAIR_SUCCESS_RATE_KEY] == 1.0
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    fc = drift[FORMAT_COMPLIANCE_KEY]
+    assert fc["repair_infra_failures"] == 3
+
+
+@pytest.mark.asyncio
 async def test_efficiency_axes_endpoint_exposes_format_compliance(
     client: AsyncClient, db_session
 ):

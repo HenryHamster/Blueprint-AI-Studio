@@ -422,6 +422,28 @@ export async function runThinkerWithGate(
     problemModelRepair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['intent'],
+      schemaLabel: 'thinker',
+      // Reject schema-template placeholder echoes (BUG_REPORT 8154c2d3 / PR #7435):
+      // a repair session with insufficient context may echo back the schema reminder
+      // text as actual values (e.g. purpose="<from analysis>" or purpose="..." or
+      // empty string). Routing the guard here ensures recordFormatRepairSuccess only
+      // fires when the value is actually accepted, not merely parseable.
+      validateParsedValue: (value) => {
+        const intent = (value as Record<string, unknown>).intent as Record<string, unknown> | undefined;
+        const purpose = typeof intent?.purpose === 'string' ? intent.purpose.trim() : '';
+        // Reject empty-string, '...', or a full XML/schema-tag value like
+        // '<from analysis>'. A legitimate purpose starting with '<' but not
+        // ending with '>' won't match the full-tag regex, so real values are safe.
+        const isSchemaPlaceholder = purpose === '' || purpose === '...' || /^<[^>]+>$/.test(purpose);
+        if (isSchemaPlaceholder) {
+          return {
+            ok: false,
+            reason: 'parsed_object_schema_mismatch',
+            detail: `intent.purpose is a schema-template placeholder: "${purpose}"`,
+          };
+        }
+        return { ok: true };
+      },
       first: {
         exitCode: thinkerResult.exitCode,
         allOutput: thinkerResult.allOutput,
@@ -451,28 +473,11 @@ export async function runThinkerWithGate(
       retryStatus: 'Repairing strategic problem-model JSON...',
     });
     if (problemModelRepair.value !== null) {
-      // Validate the repaired output is not a schema-template echo — the root cause
-      // of BUG_REPORT 8154c2d3 / PR #7435. A repair session with insufficient context
-      // may echo back the schema reminder text as actual values (e.g. purpose="<from
-      // analysis>" or purpose="..." or empty strings). Detect and discard such outputs
-      // rather than persisting garbage that would later get protected as operator intent.
-      const repairIntent = (problemModelRepair.value as Record<string, unknown>).intent as Record<string, unknown> | undefined; // eslint-disable-line @typescript-eslint/no-unnecessary-type-assertion
-      const repairPurpose = typeof repairIntent?.purpose === 'string' ? repairIntent.purpose.trim() : '';
-      // Placeholder detection: reject empty-string purpose, '...', or an entire
-      // XML/schema-tag value like '<from analysis>' (angle-bracket wraps the whole
-      // string).  A legitimate purpose that merely starts with '<' (e.g. "<Your
-      // startup here>") would be caught by startsWith — use the full-tag regex
-      // instead so real purposes aren't silently discarded.
-      const isSchemaPlaceholder = repairPurpose === '' || repairPurpose === '...' || /^<[^>]+>$/.test(repairPurpose);
-      if (isSchemaPlaceholder) {
-        sendLog(ws, `[WARNING] Repair produced blank/schema-template placeholder in intent.purpose ("${repairPurpose}") — discarding repair output to prevent operator-intent clobber\n`);
-      } else {
-        try {
-          fs.writeFileSync(problemModelPath, `${JSON.stringify(problemModelRepair.value, null, 2)}\n`);
-          sendLog(ws, `[INFO] Recovered strategic problem-model JSON via bounded repair and wrote ${problemModelPath}\n`);
-        } catch (e) {
-          sendLog(ws, `[WARNING] Recovered strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
-        }
+      try {
+        fs.writeFileSync(problemModelPath, `${JSON.stringify(problemModelRepair.value, null, 2)}\n`);
+        sendLog(ws, `[INFO] Recovered strategic problem-model JSON via bounded repair and wrote ${problemModelPath}\n`);
+      } catch (e) {
+        sendLog(ws, `[WARNING] Recovered strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
       }
     }
   }

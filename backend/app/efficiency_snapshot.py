@@ -3250,18 +3250,26 @@ async def read_baseline_with_drift(
             ],
         }
 
+    # Suppress drift on self_repair_success_rate when the clean denominator
+    # (attempts minus infra failures) is below SELF_REPAIR_MIN_ATTEMPTS — the
+    # clean count is what the metric actually divides by, so it's the right
+    # threshold.  Falls back to gross repair_attempts for older snapshots that
+    # predate infra-failure reporting (infra_failures absent => 0).
     _current_repair_attempts = latest_format.get("repair_attempts") or 0
+    _current_infra_failures = latest_format.get("repair_infra_failures") or 0
+    _current_clean_attempts = _current_repair_attempts - _current_infra_failures
     format_compliance = {
         FORMAT_COMPLIANCE_RATE_KEY: _format_rate_axis(FORMAT_COMPLIANCE_RATE_KEY),
         SELF_REPAIR_SUCCESS_RATE_KEY: _format_rate_axis(
             SELF_REPAIR_SUCCESS_RATE_KEY,
-            suppress_drift=_current_repair_attempts < SELF_REPAIR_MIN_ATTEMPTS,
+            suppress_drift=_current_clean_attempts < SELF_REPAIR_MIN_ATTEMPTS,
         ),
         "tasks_measured": latest_format.get("tasks_measured"),
         "well_formed_tasks": latest_format.get("well_formed_tasks"),
         "format_error_total": latest_format.get("format_error_total"),
         "repair_attempts": latest_format.get("repair_attempts"),
         "repair_successes": latest_format.get("repair_successes"),
+        "repair_infra_failures": latest_format.get("repair_infra_failures"),
     }
 
     return {

@@ -92,9 +92,11 @@ describe('format-compliance telemetry', () => {
       format_error_total: 0,
       format_repair_attempts: 0,
       format_repair_successes: 0,
+      format_repair_infra_failures: 0,
       format_miss_by_schema: {},
       format_repair_attempts_by_schema: {},
       format_repair_successes_by_schema: {},
+      format_repair_infra_failures_by_schema: {},
     });
   });
 
@@ -122,9 +124,11 @@ describe('format-compliance telemetry', () => {
       format_error_total: 1,
       format_repair_attempts: 1,
       format_repair_successes: 1,
+      format_repair_infra_failures: 0,
       format_miss_by_schema: {},
       format_repair_attempts_by_schema: {},
       format_repair_successes_by_schema: {},
+      format_repair_infra_failures_by_schema: {},
     });
   });
 
@@ -142,9 +146,11 @@ describe('format-compliance telemetry', () => {
       format_error_total: 4,
       format_repair_attempts: 0,
       format_repair_successes: 0,
+      format_repair_infra_failures: 0,
       format_miss_by_schema: {},
       format_repair_attempts_by_schema: {},
       format_repair_successes_by_schema: {},
+      format_repair_infra_failures_by_schema: {},
     });
   });
 
@@ -158,9 +164,11 @@ describe('format-compliance telemetry', () => {
       format_error_total: 1,
       format_repair_attempts: 0,
       format_repair_successes: 0,
+      format_repair_infra_failures: 0,
       format_miss_by_schema: {},
       format_repair_attempts_by_schema: {},
       format_repair_successes_by_schema: {},
+      format_repair_infra_failures_by_schema: {},
     });
   });
 
@@ -174,9 +182,11 @@ describe('format-compliance telemetry', () => {
       format_error_total: 0,
       format_repair_attempts: 0,
       format_repair_successes: 0,
+      format_repair_infra_failures: 0,
       format_miss_by_schema: {},
       format_repair_attempts_by_schema: {},
       format_repair_successes_by_schema: {},
+      format_repair_infra_failures_by_schema: {},
     });
   });
 });
