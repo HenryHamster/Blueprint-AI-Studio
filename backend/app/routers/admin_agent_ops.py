@@ -61,6 +61,7 @@ from app.strategic_completion import (
     _find_matching_direction,
     _normalize_recommended_mode,
     _reset_scaffolding_state_on_outcome_change,
+    _spawn_retirement_memos,
     STRATEGIC_CHALLENGE_CONTEXT_KEY,
     challenge_approves_retirement,
     spawn_budget_status,
@@ -1465,6 +1466,10 @@ async def strategic_operation(
             changed_count=1,
         )
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
+        await _spawn_retirement_memos(
+            session, project, task, [dir_id], {dir_id: rationale}
+        )
+        await session.commit()
         # Advisory (non-blocking): each active direction is one parallel work-lane
         # the fleet fans out across, so retiring below the healthy floor caps max
         # parallelism and leaves VM capacity idle. ``directions`` already reflects

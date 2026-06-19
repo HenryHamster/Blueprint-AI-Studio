@@ -4504,6 +4504,124 @@ async def test_retire_direction_no_warning_when_floor_preserved(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_retire_direction_spawns_and_persists_memo_task(db_session, mocker):
+    """retire_direction via the strategic API creates and persists a retirement memo task.
+
+    Regression guard for the missing session.commit() after _spawn_retirement_memos.
+    Without the commit the memo task is rolled back and never persisted.
+    """
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    direction_id = "d-memo-test"
+    existing = [
+        {
+            "id": direction_id,
+            "text": "A direction to retire with a memo",
+            "status": "active",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+            "success_evidence": "Evidence the gap is closed",
+            "retirement_condition": "Condition met when gap is closed",
+        },
+        {
+            "id": "d-stay-active",
+            "text": "Stays active",
+            "status": "active",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+        },
+        {
+            "id": "d-stay-active-2",
+            "text": "Stays active 2",
+            "status": "active",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+        },
+        {
+            "id": "d-stay-active-3",
+            "text": "Stays active 3",
+            "status": "active",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+        },
+    ]
+    project = Project(
+        name="P-memo-persist",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=existing,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            r = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "retire_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "direction_id": direction_id,
+                        "rationale": "Gap is now closed, evidence confirms success.",
+                    },
+                },
+            )
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "ok"
+
+        # Verify the retirement memo task was committed to the DB
+        result = await db_session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.created_by == "ORCHESTRATOR",
+            )
+        )
+        memo_tasks = result.scalars().all()
+        assert memo_tasks, "Expected a retirement memo task to be persisted after retire_direction"
+        memo = memo_tasks[0]
+        ctx = memo.context or {}
+        assert ctx.get("memo_reasoning_kind") == "direction_retirement"
+        assert ctx.get("memo_source_direction_id") == direction_id
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
 async def test_strategic_api_create_direction_rejects_missing_structured_fields(
     db_session, mocker
 ):
