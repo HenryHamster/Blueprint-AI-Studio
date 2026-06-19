@@ -345,6 +345,31 @@ describe('repairStructuredOutput', () => {
     expect(vi.mocked(recordFormatRepairSuccess).mock.calls[0]).toEqual([undefined]);
   });
 
+  it('parsed_array_invalid_value: preamble says shape did not match (not missing required keys)', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+    const validArrayButBadValues = JSON.stringify([{ summary: 'ok', reasoning: 'ok' }]);
+
+    await repairStructuredOutput({
+      ...baseOpts(makeFirst({ exitCode: 0, lastResultText: validArrayButBadValues })),
+      mode: 'array',
+      requiredKeys: ['summary', 'reasoning'],
+      validateParsedValue: () => ({
+        ok: false,
+        reason: 'parsed_array_invalid_value',
+        detail: 'unrecognized verdict strings: uncertain',
+      }),
+    });
+
+    const sentPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(sentPrompt).toContain('shape did not match');
+    expect(sentPrompt).not.toContain('missing required keys');
+    expect(sentPrompt).toContain(REOPEN_PROMPT);
+    expect(vi.mocked(recordFormatMiss).mock.calls[0][0]).toBe('parsed_array_invalid_value');
+  });
+
   it('malformed_json: preamble tells agent the JSON was incomplete or malformed', async () => {
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,

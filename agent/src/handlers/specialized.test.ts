@@ -904,6 +904,27 @@ describe('handleInvestigate — adversarial grader self-repair', () => {
     expect(call.logs).toContain('agree');
   });
 
+  it('unrecognized verdict re-ask preamble says shape did not match (not missing required keys)', async () => {
+    // When validateParsedValue rejects because verdict VALUES are unrecognized
+    // (keys 'hash' and 'verdict' ARE present), the re-ask prompt must guide the
+    // model to fix the values — not add missing keys that already exist.
+    const UNRECOGNIZED_FIRST = '[{"hash":"abc123","verdict":"uncertain","reason":"not sure"}]';
+    const RECOGNIZED_RETRY = '[{"hash":"abc123","verdict":"pass","reason":"still holds at HEAD"}]';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: UNRECOGNIZED_FIRST });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: RECOGNIZED_RETRY });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, ADVERSARIAL_TASK_WITH_HASHES, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const reaskPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    // The re-ask preamble must NOT claim keys are missing when only values are wrong.
+    expect(reaskPrompt).not.toContain('missing required keys');
+    // The preamble must tell the agent the field values did not match the schema.
+    expect(reaskPrompt).toContain('shape did not match');
+    // The schema restatement from the reopenPrompt must still appear.
+    expect(reaskPrompt).toContain('MUST be exactly "pass" or "fail"');
+  });
+
   it('first attempt unrecognized vocab triggers re-ask; re-ask with recognized verdicts posts repaired array', async () => {
     const UNRECOGNIZED_FIRST = '[{"hash":"abc123","verdict":"agree","reason":"looks good"},{"hash":"def456","verdict":"disagree","reason":"not present"}]';
     const RECOGNIZED_RETRY = '[{"hash":"abc123","verdict":"pass","reason":"still holds at HEAD"},{"hash":"def456","verdict":"fail","reason":"premise no longer present"}]';

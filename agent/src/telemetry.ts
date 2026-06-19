@@ -92,7 +92,8 @@ export function resetLlmTelemetry(): void {
 export type FormatMissReason =
   | JsonExtractionMissReason
   | 'malformed_json'
-  | 'parsed_object_schema_mismatch';
+  | 'parsed_object_schema_mismatch'
+  | 'parsed_array_invalid_value';
 
 /** Bounded vocabulary for the output-schema dimension of format-compliance
  *  telemetry. Keeping this a literal union prevents unbounded telemetry keys

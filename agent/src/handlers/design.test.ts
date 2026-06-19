@@ -465,6 +465,58 @@ describe('handleDesign — bounded self-repair on format miss', () => {
     expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
     expect(lastPostedPayload().status).toBe('FAILED');
   });
+
+  it('includes prior analysis in the repair prompt when a progress file exists', async () => {
+    // First run: clean exit but no document.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'Analysis done but no JSON.', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    // Repair run: valid document.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    // Progress file exists with content.
+    vi.mocked(fs.existsSync).mockImplementation((p: unknown) => {
+      return String(p).includes(`design_progress_${TASK_ID}`) || true;
+    });
+    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+      if (String(p).includes(`design_progress_${TASK_ID}`)) {
+        return 'Explored the reaper module and identified key files.';
+      }
+      return '';
+    });
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design X' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const repairPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairPrompt).toContain('## Pre-Implementation Analysis');
+    expect(repairPrompt).toContain('Explored the reaper module and identified key files.');
+  });
+
+  it('omits prior analysis in the repair prompt when the progress file is absent', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'Analysis done but no JSON.', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    // existsSync returns true for workspace paths (citation grounding) but false for progress file.
+    vi.mocked(fs.existsSync).mockImplementation((p: unknown) => {
+      return !String(p).includes(`design_progress_${TASK_ID}`);
+    });
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design X' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const repairPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairPrompt).not.toContain('## Pre-Implementation Analysis');
+    expect(repairPrompt).toContain('You did not emit the design document JSON');
+  });
 });
 
 // ── Citation-grounding repair: warn the agent and let it fix its citations ────

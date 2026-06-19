@@ -176,7 +176,7 @@ export function aggregateDirectionStats(
 export function buildStrategicCompletionLogs(
   allOutput: string,
   lastResultText: string | null | undefined,
-): { logs: string; warning?: string } {
+): { logs: string; warning?: string; missReason?: import('../json-extract.js').JsonExtractionMissReason } {
   const fallbackLogs = sanitize(lastResultText || allOutput.slice(-50_000));
   const hasDirectionOperations = allOutput.includes('"direction_operations"');
   const hasProblemModel = allOutput.includes('"problem_model"');
@@ -201,6 +201,7 @@ export function buildStrategicCompletionLogs(
     return {
       logs: fallbackLogs,
       warning: `Could not extract strategic JSON: ${describeJsonExtractionResult(stratObj)}`,
+      missReason: stratObj.reason,
     };
   } catch (err: unknown) {
     return {
@@ -1626,6 +1627,7 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
     const repair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['subtasks'],
+      schemaLabel: 'research_plan',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `You did not emit the plan JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required field: subtasks (array). Schema:\n\n{"subtasks":[{"title":"...","prompt":"...","type":"create","scope":"medium","related_files":["path/to/file.ts"],"depends_on_indices":[]}]}\n\nOutput ONLY the JSON object.`,
       ws,

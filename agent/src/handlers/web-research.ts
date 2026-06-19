@@ -307,12 +307,15 @@ ${DEFAULT_TOOL_GUIDANCE}`;
     document = documentFromFile as Record<string, unknown>;
     sendLog(ws, `Read web research document from ${documentPath}\n`);
   }
+  const progress = readWebResearchProgress(taskId);
   if (!document) {
+    const priorAnalysisSection = progress ? `${progress.slice(-8000)}\n\n` : '';
     const repair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['title', 'summary', 'body'],
+      schemaLabel: 'web_research',
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `You did not emit the knowledge document JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required fields: title, summary, body. Schema:\n\n{"title":"Concise document title","summary":"1-3 sentence summary.","body":"Full document in markdown.","source_citations":["https://example.com/source"],"tags":["tag"],"topic":"slug"}\n\nOutput ONLY the JSON object.`,
+      reopenPrompt: `${priorAnalysisSection}You did not emit the knowledge document JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required fields: title, summary, body. Schema:\n\n{"title":"Concise document title","summary":"1-3 sentence summary.","body":"Full document in markdown.","source_citations":["https://example.com/source"],"tags":["tag"],"topic":"slug"}\n\nOutput ONLY the JSON object.`,
       ws,
       statusRef,
       model,
@@ -341,7 +344,6 @@ ${DEFAULT_TOOL_GUIDANCE}`;
   }
 
   const finalStatus = exitCode === 0 ? 'COMPLETED' : 'FAILED';
-  const progress = readWebResearchProgress(taskId);
   try {
     await persistAndPostStatus(taskId, {
       task_id: taskId,
