@@ -153,14 +153,17 @@ async def get_observe_mode_verdict(
     window_hours: int = Query(168, ge=1, le=720),
     max_fire_rate_pct: float = Query(20.0, ge=0.0, le=100.0),
     min_evaluations: int = Query(10, ge=1),
+    daily_cap: int = Query(3, ge=1),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ) -> Dict[str, Any]:
     """Compute a go/no-go verdict for the observe-mode → enforce-mode transition.
 
     Reads the durable fill-decision ledger (EvergreenFillDecisionLog) over the
-    trailing *window_hours* (default 168 h / 7 days) and computes the fire rate:
-    the fraction of observe-mode evaluations that would have triggered a spawn.
+    trailing *window_hours* (default 168 h / 7 days) and computes both the raw
+    fire rate and the cap-adjusted fire rate (capped at *daily_cap* per UTC day).
+    The verdict uses the cap-adjusted rate so consecutive idle ticks on the same
+    day do not inflate the metric toward 100%.
 
     Verdict is one of: ``go``, ``no_go``, or ``insufficient_data``.
     """
@@ -169,6 +172,7 @@ async def get_observe_mode_verdict(
         window_hours=window_hours,
         max_fire_rate_pct=max_fire_rate_pct,
         min_evaluations=min_evaluations,
+        daily_cap=daily_cap,
     )
 
 

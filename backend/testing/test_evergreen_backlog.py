@@ -1363,6 +1363,51 @@ async def test_observe_mode_verdict_ignores_enforce_mode_rows(db_session):
     assert result["observe_evaluations"] == 5
 
 
+async def test_observe_mode_false_alarm_rate_consecutive_tick(db_session):
+    """Cap-adjusted rate prevents idle-fleet false alarms from consecutive ticks.
+
+    Seeds 10 would-have-fired observe_mode rows all within the same UTC day,
+    simulating an idle fleet ticking every 15 minutes.  Without cap adjustment
+    the raw fire rate is 100% (no_go at any threshold).  With daily_cap=3 the
+    cap-adjusted numerator is 3, giving 3/10 = 30% — a go at threshold 50%.
+
+    This is the acceptance evidence for the false-alarm-rate fix: the verdict
+    must use the cap-adjusted metric, not the raw metric.
+    """
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+
+    # 10 would-have-fired rows on the same calendar day — consecutive idle ticks.
+    for _ in range(10):
+        db_session.add(_observe_row(ts=now - timedelta(hours=1), reason="observe_mode"))
+    await db_session.commit()
+
+    result = await compute_observe_mode_verdict(
+        db_session,
+        window_hours=24,
+        max_fire_rate_pct=50.0,
+        min_evaluations=10,
+        daily_cap=3,
+    )
+
+    # Raw metrics are preserved for informational display.
+    assert result["would_have_fired"] == 10
+    assert result["fire_rate_pct"] == 100.0  # would be no_go without fix
+
+    # Cap-adjusted metrics reflect the daily_cap=3 ceiling.
+    assert result["daily_cap"] == 3
+    assert result["cap_adjusted_would_have_fired"] == 3  # min(10, 3)
+    assert result["cap_adjusted_fire_rate_pct"] == 30.0  # 3/10
+
+    # Verdict uses cap-adjusted rate: 30% ≤ 50% threshold → go.
+    assert result["verdict"] == "go", (
+        f"Expected go (cap_adjusted=30% ≤ 50%), got {result['verdict']}: {result}"
+    )
+
+
 async def test_observe_mode_verdict_endpoint(db_session, client):
     """HTTP GET /api/admin/evergreen/observe-mode-verdict returns a verdict dict."""
     from datetime import timedelta
@@ -1387,3 +1432,48 @@ async def test_observe_mode_verdict_endpoint(db_session, client):
     assert body["would_have_fired"] == 3
     assert body["fire_rate_pct"] == 30.0
     assert body["verdict"] == "no_go"  # 30% > default 20% threshold
+
+
+async def test_evergreen_fill_decision_retention_sweep_purges_only_stale_rows(
+    db_session,
+):
+    """Sweep purges only rows older than retention window; fresh rows remain."""
+    from datetime import timedelta
+
+    from app.reaper_sweeps import sweep_evergreen_fill_decision_retention
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    retention_days = 30
+
+    # Create fresh rows (within retention window).
+    for i in range(3):
+        db_session.add(_observe_row(ts=now - timedelta(days=1), reason="observe_mode"))
+
+    # Create stale rows (older than retention window).
+    for i in range(5):
+        db_session.add(_observe_row(ts=now - timedelta(days=45), reason="max_active"))
+
+    await db_session.commit()
+
+    # Verify initial state: 8 rows total.
+    all_rows = (
+        (await db_session.execute(select(EvergreenFillDecisionLog))).scalars().all()
+    )
+    assert len(all_rows) == 8
+
+    # Run the sweep.
+    purged = await sweep_evergreen_fill_decision_retention(
+        db_session, retention_days=retention_days
+    )
+
+    # Verify purged count matches stale rows.
+    assert purged == 5
+
+    # Verify only fresh rows remain.
+    remaining = (
+        (await db_session.execute(select(EvergreenFillDecisionLog))).scalars().all()
+    )
+    assert len(remaining) == 3
+    for row in remaining:
+        assert row.ts >= (now - timedelta(days=retention_days))

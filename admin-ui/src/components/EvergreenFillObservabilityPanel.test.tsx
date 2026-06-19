@@ -24,24 +24,30 @@ const OBSERVABILITY_RESPONSE = {
 
 const VERDICT_RESPONSE_GO = {
   verdict: 'go' as const,
-  verdict_reason: 'Fire rate 8.5% is below threshold 20.0%',
+  verdict_reason: 'Cap-adjusted fire rate 8.5% is within threshold 20.0%',
   window_hours: 168,
   observe_evaluations: 47,
   would_have_fired: 4,
   fire_rate_pct: 8.5,
   max_fire_rate_pct: 20.0,
   min_evaluations: 10,
+  daily_cap: 3,
+  cap_adjusted_would_have_fired: 4,
+  cap_adjusted_fire_rate_pct: 8.5,
 };
 
 const VERDICT_RESPONSE_NO_GO = {
   verdict: 'no_go' as const,
-  verdict_reason: 'Fire rate 25.3% exceeds threshold 20.0%',
+  verdict_reason: 'Cap-adjusted fire rate 25.3% exceeds threshold 20.0%',
   window_hours: 168,
   observe_evaluations: 59,
   would_have_fired: 15,
   fire_rate_pct: 25.3,
   max_fire_rate_pct: 20.0,
   min_evaluations: 10,
+  daily_cap: 3,
+  cap_adjusted_would_have_fired: 15,
+  cap_adjusted_fire_rate_pct: 25.3,
 };
 
 const VERDICT_RESPONSE_INSUFFICIENT = {
@@ -53,6 +59,9 @@ const VERDICT_RESPONSE_INSUFFICIENT = {
   fire_rate_pct: null,
   max_fire_rate_pct: 20.0,
   min_evaluations: 10,
+  daily_cap: 3,
+  cap_adjusted_would_have_fired: 0,
+  cap_adjusted_fire_rate_pct: null,
 };
 
 beforeEach(() => {
@@ -129,14 +138,15 @@ describe('EvergreenFillObservabilityPanel', () => {
 
   it('displays verdict reason', async () => {
     render(<EvergreenFillObservabilityPanel />);
-    await waitFor(() => expect(screen.getByText('Fire rate 8.5% is below threshold 20.0%')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Cap-adjusted fire rate 8.5% is within threshold 20.0%')).toBeInTheDocument());
   });
 
-  it('displays fire rate percentage', async () => {
+  it('displays cap-adjusted and raw fire rate percentages', async () => {
     render(<EvergreenFillObservabilityPanel />);
     await waitFor(() => {
       const container = screen.getByTestId('evergreen-fill-observability-panel');
-      expect(container.textContent).toMatch(/Fire Rate:\s*8\.5%/);
+      expect(container.textContent).toMatch(/Cap-Adjusted Fire Rate:\s*8\.5%/);
+      expect(container.textContent).toMatch(/Raw Fire Rate:\s*8\.5%/);
     });
   });
 

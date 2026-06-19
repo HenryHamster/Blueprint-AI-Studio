@@ -3564,18 +3564,23 @@ export interface ObserveModeVerdictResponse {
   fire_rate_pct: number | null;
   max_fire_rate_pct: number;
   min_evaluations: number;
+  daily_cap: number;
+  cap_adjusted_would_have_fired: number;
+  cap_adjusted_fire_rate_pct: number | null;
 }
 
 export async function fetchObserveModeVerdict(
   windowHours = 168,
   maxFireRatePct = 20.0,
   minEvaluations = 10,
+  dailyCap = 3,
   signal?: AbortSignal,
 ): Promise<ObserveModeVerdictResponse> {
   const params = new URLSearchParams({
     window_hours: String(windowHours),
     max_fire_rate_pct: String(maxFireRatePct),
     min_evaluations: String(minEvaluations),
+    daily_cap: String(dailyCap),
   });
   const res = await apiFetch(`/api/admin/evergreen/observe-mode-verdict?${params}`, undefined, 2, 30000, signal);
   if (!res.ok) throw new Error(`Failed to fetch observe mode verdict: ${res.status}`);

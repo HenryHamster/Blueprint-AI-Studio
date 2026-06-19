@@ -30,7 +30,7 @@ export function EvergreenFillObservabilityPanel() {
   const loadVerdict = useCallback(async (signal?: AbortSignal) => {
     setVerdictError(null);
     try {
-      const result = await fetchObserveModeVerdict(168, 20.0, 10, signal);
+      const result = await fetchObserveModeVerdict(168, 20.0, 10, 3, signal);
       if (signal?.aborted) return;
       setVerdictData(result);
     } catch (e) {
@@ -84,8 +84,11 @@ export function EvergreenFillObservabilityPanel() {
                 </div>
                 <div className="text-xs text-neutral-400 space-y-1">
                   <p><span className="text-neutral-500">Reason:</span> {verdictData.verdict_reason}</p>
+                  {verdictData.cap_adjusted_fire_rate_pct != null && (
+                    <p><span className="text-neutral-500">Cap-Adjusted Fire Rate:</span> {verdictData.cap_adjusted_fire_rate_pct.toFixed(1)}% <span className="text-neutral-600">(daily_cap={verdictData.daily_cap})</span></p>
+                  )}
                   {verdictData.fire_rate_pct != null && (
-                    <p><span className="text-neutral-500">Fire Rate:</span> {verdictData.fire_rate_pct.toFixed(1)}%</p>
+                    <p><span className="text-neutral-500">Raw Fire Rate:</span> {verdictData.fire_rate_pct.toFixed(1)}%</p>
                   )}
                   <p><span className="text-neutral-500">Evaluations:</span> {verdictData.observe_evaluations} (would have fired: {verdictData.would_have_fired})</p>
                   <p><span className="text-neutral-500">Window:</span> {verdictData.window_hours} hours</p>

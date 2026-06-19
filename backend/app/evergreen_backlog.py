@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Deque, Dict, List
@@ -398,6 +398,7 @@ async def compute_observe_mode_verdict(
     window_hours: int = 168,
     max_fire_rate_pct: float = 20.0,
     min_evaluations: int = 10,
+    daily_cap: int = 3,
 ) -> Dict[str, Any]:
     """Compute a go/no-go verdict for the observe-mode → enforce-mode transition.
 
@@ -406,18 +407,26 @@ async def compute_observe_mode_verdict(
     the fraction of observe-mode evaluations that would have triggered a spawn
     (``reason == 'observe_mode'``).
 
-    Verdict rules:
+    Because observe mode never actually spawns, the daily/active caps never
+    engage — so consecutive idle-fleet ticks within a single day all land as
+    ``observe_mode`` noops, inflating the raw fire rate toward 100%.  The
+    *cap-adjusted* fire rate groups would-have-fired rows by UTC calendar day,
+    caps each day's count at *daily_cap*, and uses the capped total as the
+    verdict numerator.  The raw ``fire_rate_pct`` is retained for informational
+    display.
+
+    Verdict rules (applied to the cap-adjusted rate):
 
     * ``insufficient_data`` — fewer than *min_evaluations* observe-mode rows in
       the window; cannot draw a meaningful conclusion yet.
-    * ``go`` — fire rate ≤ *max_fire_rate_pct*; the trigger is conservative
-      enough to enable enforce mode.
-    * ``no_go`` — fire rate > *max_fire_rate_pct*; too many would-be spawns,
-      re-tune before enabling enforce mode.
+    * ``go`` — cap-adjusted fire rate ≤ *max_fire_rate_pct*.
+    * ``no_go`` — cap-adjusted fire rate > *max_fire_rate_pct*.
 
     Returns a dict with keys: ``verdict``, ``verdict_reason``,
     ``observe_evaluations``, ``would_have_fired``, ``fire_rate_pct``,
-    ``window_hours``, ``max_fire_rate_pct``, ``min_evaluations``.
+    ``window_hours``, ``max_fire_rate_pct``, ``min_evaluations``,
+    ``daily_cap``, ``cap_adjusted_would_have_fired``,
+    ``cap_adjusted_fire_rate_pct``.
     """
     cutoff = _now() - timedelta(hours=window_hours)
     rows = (
@@ -435,6 +444,19 @@ async def compute_observe_mode_verdict(
     total = len(rows)
     would_have_fired = sum(1 for r in rows if r.reason == _REASON_OBSERVE_MODE)
 
+    # Group would-have-fired rows by UTC calendar day and cap each day at
+    # daily_cap.  Observe mode never creates tasks, so the real daily cap never
+    # engages — without this adjustment, a fleet idle all day produces
+    # would_have_fired == total (100% raw rate) regardless of actual cadence.
+    daily_fire_counts: Dict[Any, int] = defaultdict(int)
+    for r in rows:
+        if r.reason == _REASON_OBSERVE_MODE:
+            day = r.ts.date() if r.ts else None
+            daily_fire_counts[day] += 1
+    cap_adjusted_would_have_fired = sum(
+        min(count, daily_cap) for count in daily_fire_counts.values()
+    )
+
     if total < min_evaluations:
         verdict = "insufficient_data"
         verdict_reason = (
@@ -442,19 +464,27 @@ async def compute_observe_mode_verdict(
             f"(need ≥{min_evaluations})"
         )
         fire_rate_pct = None
+        cap_adjusted_fire_rate_pct = None
     else:
         fire_rate_pct = round(100.0 * would_have_fired / total, 2)
-        if fire_rate_pct <= max_fire_rate_pct:
+        cap_adjusted_fire_rate_pct = round(
+            100.0 * cap_adjusted_would_have_fired / total, 2
+        )
+        if cap_adjusted_fire_rate_pct <= max_fire_rate_pct:
             verdict = "go"
             verdict_reason = (
-                f"fire rate {fire_rate_pct}% is within threshold {max_fire_rate_pct}% "
-                f"({would_have_fired}/{total} evaluations would have fired)"
+                f"cap-adjusted fire rate {cap_adjusted_fire_rate_pct}% is within "
+                f"threshold {max_fire_rate_pct}% "
+                f"({cap_adjusted_would_have_fired}/{total} cap-adjusted "
+                f"evaluations would have fired; daily_cap={daily_cap})"
             )
         else:
             verdict = "no_go"
             verdict_reason = (
-                f"fire rate {fire_rate_pct}% exceeds threshold {max_fire_rate_pct}% "
-                f"({would_have_fired}/{total} evaluations would have fired)"
+                f"cap-adjusted fire rate {cap_adjusted_fire_rate_pct}% exceeds "
+                f"threshold {max_fire_rate_pct}% "
+                f"({cap_adjusted_would_have_fired}/{total} cap-adjusted "
+                f"evaluations would have fired; daily_cap={daily_cap})"
             )
 
     return {
@@ -466,6 +496,9 @@ async def compute_observe_mode_verdict(
         "window_hours": window_hours,
         "max_fire_rate_pct": max_fire_rate_pct,
         "min_evaluations": min_evaluations,
+        "daily_cap": daily_cap,
+        "cap_adjusted_would_have_fired": cap_adjusted_would_have_fired,
+        "cap_adjusted_fire_rate_pct": cap_adjusted_fire_rate_pct,
     }
 
 
