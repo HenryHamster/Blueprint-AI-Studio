@@ -9,6 +9,7 @@ import {
   setVersionPhase,
   setVersionGoal,
   triggerQualify,
+  type AgentServingShasResponse,
   type QualificationVerdictRecord,
   type CurrentVersion,
   type VersionLifecycleResponse,
@@ -62,9 +63,10 @@ interface VersionLifecyclePanelProps {
   refreshError?: string | null;
   lastSuccessfulRefreshAt?: string | null;
   refreshing?: boolean;
+  agentServingShas?: AgentServingShasResponse | null;
 }
 
-export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole, refreshError, lastSuccessfulRefreshAt, refreshing = false }: VersionLifecyclePanelProps) {
+export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole, refreshError, lastSuccessfulRefreshAt, refreshing = false, agentServingShas }: VersionLifecyclePanelProps) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
@@ -584,7 +586,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   </p>
                 )}
                 <p className="text-[10px] text-neutral-400">{cv.qualification_state.summary}</p>
-                <ArtifactEvidenceList artifacts={cv.serving?.artifacts ?? cv.artifacts} />
+                <ArtifactEvidenceList artifacts={cv.serving?.artifacts ?? cv.artifacts} agentServingShas={agentServingShas} />
               </div>
             )}
             {cv.last_qualification && (
@@ -861,7 +863,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     {!isExpanded && v.highlights && (
                       <VersionHighlightsLine highlights={v.highlights} phase={v.phase} status={v.status} />
                     )}
-                    <ArtifactEvidenceList artifacts={v.artifacts} />
+                    <ArtifactEvidenceList artifacts={v.artifacts} agentServingShas={agentServingShas} />
                     {isExpanded && v.id && <VersionHistorySummary versionId={v.id} />}
                   </div>
                 );

@@ -116,11 +116,7 @@ def register_release_artifact_provider(
         artifact_kind=artifact_kind,
         check=check,
         required=required,
-        **(
-            {"observable": observable}
-            if observable is not None
-            else {}
-        ),
+        **({"observable": observable} if observable is not None else {}),
     )
 
 
@@ -810,6 +806,12 @@ async def _check_agent_image_serving(
     )
     if not base_sha:
         # Diff base unobservable → indeterminate → not-yet-confirmed.
+        logger.info(
+            "agent_image_serving_indeterminate path=base_sha_unobservable"
+            " version_id=%s promoted_sha=%s",
+            version.id,
+            promoted_sha,
+        )
         return None
 
     rebake = await github_refs.agent_image_rebake_expected(
@@ -822,6 +824,12 @@ async def _check_agent_image_serving(
     )
     if rebake is None:
         # API/ref error → indeterminate → not-yet-confirmed.
+        logger.info(
+            "agent_image_serving_indeterminate path=rebake_lookup_indeterminate"
+            " version_id=%s promoted_sha=%s",
+            version.id,
+            promoted_sha,
+        )
         return None
     if rebake is False:
         # No bake-path change → no agent rebake required → confirm immediately so
@@ -840,6 +848,12 @@ async def _check_agent_image_serving(
         project_id=str(version.project_id),
     ):
         return ("serving_confirmed", promoted_sha, now)
+    logger.info(
+        "agent_image_serving_indeterminate path=fleet_not_yet_serving"
+        " version_id=%s promoted_sha=%s",
+        version.id,
+        promoted_sha,
+    )
     return None
 
 
@@ -914,7 +928,9 @@ async def _check_promotion_merge_serving(
     # Used below to time out bounded-defer (indeterminate) paths instead of waiting forever.
     _raw_deadline = artifact.confirmation_deadline or version.deploy_confirm_deadline
     if _raw_deadline is None and version.promoted_at is not None:
-        _raw_deadline = version.promoted_at + timedelta(seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS)
+        _raw_deadline = version.promoted_at + timedelta(
+            seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS
+        )
     _deadline = _to_naive_utc(_raw_deadline)
     _now_naive = _to_naive_utc(now) or now
 

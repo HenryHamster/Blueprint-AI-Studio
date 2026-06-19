@@ -18036,3 +18036,143 @@ class TestAdminDeclareCapabilityVerdict:
         await db_session.refresh(stall_msg)
         assert stall_msg.status == "open"
         assert stall_msg.resolved_at is None
+
+
+class TestProjectConcurrencyCapSettings:
+    """PATCH /api/admin/settings round-trip and validation tests for
+    max_concurrent_tasks_by_project (per-project concurrent-VM cap)."""
+
+    @pytest.mark.asyncio
+    async def test_patch_sets_and_get_returns_cap(self, client: AsyncClient):
+        """PATCH a valid mapping and GET confirms the round-trip."""
+        from app.shared_state import runtime_config as _rc
+
+        original = dict(_rc.get("max_concurrent_tasks_by_project") or {})
+        try:
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"max_concurrent_tasks_by_project": {"proj-1": 3}},
+            )
+            assert resp.status_code == 200, resp.text
+            get_resp = await client.get("/api/admin/settings")
+            assert get_resp.status_code == 200
+            data = get_resp.json()
+            assert "max_concurrent_tasks_by_project" in data
+            assert data["max_concurrent_tasks_by_project"].get("proj-1") == 3
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={"max_concurrent_tasks_by_project": original},
+            )
+
+    @pytest.mark.asyncio
+    async def test_patch_empty_map_clears_all_caps(self, client: AsyncClient):
+        """Patching with an empty dict removes all per-project caps."""
+        from app.shared_state import runtime_config as _rc
+
+        original = dict(_rc.get("max_concurrent_tasks_by_project") or {})
+        try:
+            # First set a cap.
+            await client.patch(
+                "/api/admin/settings",
+                json={"max_concurrent_tasks_by_project": {"proj-a": 5}},
+            )
+            # Now clear it.
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"max_concurrent_tasks_by_project": {}},
+            )
+            assert resp.status_code == 200, resp.text
+            get_resp = await client.get("/api/admin/settings")
+            assert get_resp.json()["max_concurrent_tasks_by_project"] == {}
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={"max_concurrent_tasks_by_project": original},
+            )
+
+    @pytest.mark.asyncio
+    async def test_patch_zero_value_removes_project_cap(self, client: AsyncClient):
+        """A zero cap for a project silently removes it (uncapped behavior)."""
+        from app.shared_state import runtime_config as _rc
+
+        original = dict(_rc.get("max_concurrent_tasks_by_project") or {})
+        try:
+            await client.patch(
+                "/api/admin/settings",
+                json={"max_concurrent_tasks_by_project": {"proj-x": 4}},
+            )
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"max_concurrent_tasks_by_project": {"proj-x": 0}},
+            )
+            assert resp.status_code == 200, resp.text
+            get_resp = await client.get("/api/admin/settings")
+            caps = get_resp.json()["max_concurrent_tasks_by_project"]
+            assert "proj-x" not in caps
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={"max_concurrent_tasks_by_project": original},
+            )
+
+    @pytest.mark.asyncio
+    async def test_patch_non_dict_rejected(self, client: AsyncClient):
+        """A non-mapping value is rejected with 400."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"max_concurrent_tasks_by_project": 5},
+        )
+        assert resp.status_code == 400
+        assert "mapping" in resp.json()["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_patch_non_integer_value_rejected(self, client: AsyncClient):
+        """A non-integer cap value is rejected with 400."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"max_concurrent_tasks_by_project": {"proj-1": "many"}},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_out_of_range_value_rejected(self, client: AsyncClient):
+        """A cap value outside 0..50 is rejected with 400."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"max_concurrent_tasks_by_project": {"proj-1": 51}},
+        )
+        assert resp.status_code == 400
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"max_concurrent_tasks_by_project": {"proj-1": -1}},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_multiple_projects(self, client: AsyncClient):
+        """Multiple project caps can be set in a single PATCH."""
+        from app.shared_state import runtime_config as _rc
+
+        original = dict(_rc.get("max_concurrent_tasks_by_project") or {})
+        try:
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={
+                    "max_concurrent_tasks_by_project": {
+                        "project-a": 2,
+                        "project-b": 10,
+                    }
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            data = (await client.get("/api/admin/settings")).json()
+            caps = data["max_concurrent_tasks_by_project"]
+            assert caps["project-a"] == 2
+            assert caps["project-b"] == 10
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={"max_concurrent_tasks_by_project": original},
+            )
