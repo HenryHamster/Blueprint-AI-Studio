@@ -3,7 +3,7 @@ import type { TaskType } from '../taskCapabilities';
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'BLOCKED' | 'PARKED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type { TaskType };
 
-export type WakeDeliveryState = 'PENDING' | 'FIRED' | 'DELIVERED' | 'EXPIRED' | 'FAILED';
+type WakeDeliveryState = 'PENDING' | 'FIRED' | 'DELIVERED' | 'EXPIRED' | 'FAILED';
 
 export interface TaskWakeRegistration {
   wake_source_kind: string;
@@ -41,7 +41,7 @@ export interface ResearchFinding {
   finding_challenge?: FindingChallenge;
 }
 
-export interface TaskEvaluationSummaryItem {
+interface TaskEvaluationSummaryItem {
   label: string;
   value: string;
 }
@@ -61,7 +61,7 @@ export interface PanelReviewIssue {
   lens?: 'correctness' | 'security' | 'code_quality' | 'test_coverage';
 }
 
-export interface PanelReviewLensVerdict {
+interface PanelReviewLensVerdict {
   verdict: 'APPROVE' | 'REQUEST_CHANGES';
   summary: string;
   issues?: PanelReviewIssue[];

@@ -103,7 +103,7 @@ export interface FailedRollbackInfo {
   gcloud_error?: string | null;
 }
 
-export interface ProviderModeCapabilities {
+interface ProviderModeCapabilities {
   [capability: string]: boolean | number | string | null;
 }
 
