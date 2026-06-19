@@ -547,12 +547,16 @@ async def get_task_cost_breakdown(
         ctx = task.context or {}
         direction_id = ctx.get("direction_id") or payload.get("current_direction_id")
         direction_id_str = str(direction_id).strip() if direction_id else None
+        direction_text_str = (
+            ctx.get("direction_text") or payload.get("direction_text") or ""
+        )
         rows.append(
             {
                 "task_id": str(task.id),
                 "task_title": task.title,
                 "task_type": task_type,
                 "direction_id": direction_id_str,
+                "direction_text": direction_text_str,
                 "completed_at": completed_at,
                 "estimated_cost_usd": cost,
             }
@@ -562,7 +566,7 @@ async def get_task_cost_breakdown(
         lambda: {"task_count": 0, "estimated_cost_usd": 0.0}
     )
     by_direction: Dict[str, Dict[str, Any]] = defaultdict(
-        lambda: {"task_count": 0, "estimated_cost_usd": 0.0}
+        lambda: {"task_count": 0, "estimated_cost_usd": 0.0, "direction_text": ""}
     )
     total_cost = 0.0
 
@@ -576,6 +580,8 @@ async def get_task_cost_breakdown(
         direction_entry = by_direction[direction_key]
         direction_entry["task_count"] += 1
         direction_entry["estimated_cost_usd"] += row["estimated_cost_usd"]
+        if row["direction_text"] and not direction_entry["direction_text"]:
+            direction_entry["direction_text"] = row["direction_text"]
 
     task_type_breakdown = [
         {
@@ -591,6 +597,7 @@ async def get_task_cost_breakdown(
     direction_breakdown = [
         {
             "direction_id": None if direction_id == "unassigned" else direction_id,
+            "direction_text": data["direction_text"] or None,
             "task_count": data["task_count"],
             "estimated_cost_usd": round(data["estimated_cost_usd"], 2),
         }

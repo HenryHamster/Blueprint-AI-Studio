@@ -250,6 +250,7 @@ interface TaskCostBreakdownEntry {
 
 interface DirectionCostBreakdownEntry {
   direction_id: string | null;
+  direction_text: string | null;
   task_count: number;
   estimated_cost_usd: number;
 }
@@ -824,7 +825,7 @@ function TaskCostBreakdownWidget({ projectId, window }: { projectId: string; win
           <div className="space-y-1">
             {data.direction_breakdown.map((row) => (
               <div key={row.direction_id ?? 'unassigned'} className="flex items-center justify-between gap-3 text-xs min-w-0">
-                <span className="text-neutral-300 break-all min-w-0">{row.direction_id ?? 'No direction'}</span>
+                <span className="text-neutral-300 break-all min-w-0">{row.direction_text ?? row.direction_id ?? 'No direction'}</span>
                 <span className="text-neutral-400 font-mono shrink-0">${row.estimated_cost_usd.toFixed(2)} · {row.task_count}</span>
               </div>
             ))}
