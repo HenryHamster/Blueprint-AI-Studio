@@ -440,3 +440,124 @@ class TestAgentBranchInvariants:
             assert not _FORBIDDEN_PAYLOAD_BASE_BRANCH_DEFAULT_RE.search(line), (
                 f"Scanner false-positive on known-good snippet: {snippet!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Static prompt-section byte-budget guard
+# ---------------------------------------------------------------------------
+
+
+def _extract_template_literal_bytes(name: str, src: str) -> int | None:
+    """Return the byte length of a ``const NAME = `...``` template literal body.
+
+    Walks forward from the opening backtick, honouring ``\\`` escape sequences
+    and ``${...}`` expression depth, so nested template expressions and escaped
+    backticks do not prematurely close the outer literal.  Returns ``None`` if
+    the constant declaration is not found.
+    """
+    m = re.search(rf"(?:export\s+)?const\s+{re.escape(name)}\s*=\s*`", src)
+    if not m:
+        return None
+    i = m.end()
+    depth = 0
+    start = i
+    while i < len(src):
+        c = src[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "`" and depth == 0:
+            return i - start
+        if c == "$" and i + 1 < len(src) and src[i + 1] == "{":
+            depth += 1
+            i += 2
+            continue
+        if c == "}" and depth > 0:
+            depth -= 1
+        i += 1
+    return None
+
+
+class TestPromptStaticBudget:
+    """Byte-budget guard for code-change static prompt sections in prompt.ts.
+
+    A compute experiment (2026-06-19, artifact a18629c4-9784-4df2-a18b-4be0f7a2ec11)
+    measured the sections that feed ``code_change_static_tokens`` at 9 723 tokens
+    (34 084 bytes) at a 3.51 chars/token ratio.  This test fires when the combined
+    byte count of those sections exceeds the 12 000-token calibrated ceiling
+    (42 000 bytes), ensuring prompt-size growth is caught before it affects
+    live LLM cost metrics.
+
+    Skipped in CI backend Docker builds where ``agent/src`` is not mounted —
+    the agent TypeScript CI lane already covers prompt.ts at build time; local
+    and ``scripts/test-backend.sh`` runs enforce the guard with the mounted source.
+    """
+
+    # Sections that together form code_change_static_tokens (experiment-verified):
+    #   lifecycle_total = PREAMBLE + BLUEPRINT_CHECK_INTRO + SHARED_LIFECYCLE_REMAINDER
+    #   failure_guidance = READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE
+    #                      + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
+    #                      + EDGES_CONSIDERED_GUIDANCE
+    #   + PLAYBOOK_GUIDANCE
+    # (DEFAULT_TOOL_GUIDANCE is a regular string constant, not a template literal,
+    # and accounts for ~260 tokens / ~913 bytes not checked here.)
+    _CODE_CHANGE_SECTIONS = [
+        "SHARED_LIFECYCLE_PREAMBLE",
+        "BLUEPRINT_CHECK_INTRO",
+        "SHARED_LIFECYCLE_REMAINDER",
+        "READ_THE_FAILURE_MESSAGE",
+        "SIZE_GUARDRAIL_GUIDANCE",
+        "PRIOR_ATTEMPT_DIVERGENCE",
+        "BEYOND_SCOPE_REPORTING",
+        "EDGES_CONSIDERED_GUIDANCE",
+        "PLAYBOOK_GUIDANCE",
+    ]
+
+    # Calibrated ceiling: 12 000 tokens × 3.51 chars/token (ratio from the
+    # 2026-06-19 experiment).  Baseline: 9 723 tokens / 34 084 bytes.
+    _BYTE_CEILING = 42_000
+
+    def test_code_change_static_section_budget(self):
+        """Combined byte count of code-change static sections stays under
+        the 12 000-token calibrated ceiling.
+
+        Skipped when ``agent/src`` is not available in this environment.
+        """
+        if _AGENT_SRC is None:
+            pytest.skip(
+                "agent/src not available in this test environment "
+                "(CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh for enforcement)"
+            )
+        prompt_ts = _AGENT_SRC / "prompt.ts"
+        if not prompt_ts.is_file():
+            pytest.skip(f"prompt.ts not found at {prompt_ts}")
+
+        src = prompt_ts.read_text(encoding="utf-8")
+        section_bytes: dict[str, int] = {}
+        missing: list[str] = []
+
+        for name in self._CODE_CHANGE_SECTIONS:
+            n = _extract_template_literal_bytes(name, src)
+            if n is None:
+                missing.append(name)
+            else:
+                section_bytes[name] = n
+
+        assert not missing, (
+            "Could not locate these prompt.ts template-literal constants — "
+            "update _CODE_CHANGE_SECTIONS if they were renamed:\n" + "\n".join(missing)
+        )
+
+        total = sum(section_bytes.values())
+        breakdown = "\n".join(
+            f"  {k}: {v:,} bytes"
+            for k, v in sorted(section_bytes.items(), key=lambda x: -x[1])
+        )
+        assert total <= self._BYTE_CEILING, (
+            f"Code-change static prompt sections exceeded the 12 000-token "
+            f"byte budget ({total:,} > {self._BYTE_CEILING:,} bytes).\n"
+            f"Baseline (2026-06-19): 34 084 bytes / 9 723 tokens.\n"
+            f"Reduce prompt text or raise the ceiling after operator review.\n"
+            f"Per-section breakdown:\n{breakdown}"
+        )
