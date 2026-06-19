@@ -2791,6 +2791,18 @@ export interface ComputeJob {
   // Augmented by the admin list endpoint from the launching Task.
   task_title: string | null;
   task_type: string | null;
+  // Declared success criterion from the task payload (metric/operator/threshold).
+  success_criterion?: ComputeSuccessCriterion | null;
+  // Evaluated verdict from task.plan_output.compute_result.criterion — present
+  // only on terminal jobs whose task recorded a criterion evaluation.
+  criterion_verdict?: {
+    metric: string;
+    operator: string;
+    threshold: number;
+    value: number | null;
+    met: boolean;
+    measurable: boolean;
+  } | null;
 }
 
 export async function fetchComputeJobs(
