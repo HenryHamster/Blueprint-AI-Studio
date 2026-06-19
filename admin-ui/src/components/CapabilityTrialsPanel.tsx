@@ -38,6 +38,10 @@ function verdictClass(verdict: CapabilityVerdict['verdict']): string {
   return 'text-amber-400';
 }
 
+function isVerdictDecided(verdict: CapabilityVerdict['verdict']): boolean {
+  return verdict === 'adopt' || verdict === 'ADOPT' || verdict === 'reject' || verdict === 'KILL' || verdict === 'no_effect';
+}
+
 function laneMetricSummary(v: CapabilityVerdict): string[] {
   const lines = [
     `Lane samples ${v.n_lane ?? 0}`,
@@ -62,7 +66,7 @@ function laneMetricSummary(v: CapabilityVerdict): string[] {
 
 type DeclareVerdict = 'adopt' | 'reject' | 'continue-trial';
 
-function DeclareVerdictForm({ projectId, capName, onDone }: { projectId: string; capName: string; onDone: () => void }) {
+function DeclareVerdictForm({ projectId, capName, onDone, onSuccess }: { projectId: string; capName: string; onDone: () => void; onSuccess?: () => void }) {
   const [verdict, setVerdict] = useState<DeclareVerdict>('adopt');
   const [rationale, setRationale] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -73,6 +77,9 @@ function DeclareVerdictForm({ projectId, capName, onDone }: { projectId: string;
     setError(null);
     try {
       await declareCapabilityVerdict(projectId, capName, verdict, rationale || undefined);
+      if (onSuccess) {
+        onSuccess();
+      }
       onDone();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Request failed');
@@ -124,10 +131,10 @@ function DeclareVerdictForm({ projectId, capName, onDone }: { projectId: string;
   );
 }
 
-function DeclareButton({ projectId, capName }: { projectId: string; capName: string }) {
+function DeclareButton({ projectId, capName, onSuccess }: { projectId: string; capName: string; onSuccess?: () => void }) {
   const [open, setOpen] = useState(false);
   if (open) {
-    return <DeclareVerdictForm projectId={projectId} capName={capName} onDone={() => setOpen(false)} />;
+    return <DeclareVerdictForm projectId={projectId} capName={capName} onDone={() => setOpen(false)} onSuccess={onSuccess} />;
   }
   return (
     // eslint-disable-next-line viewport/min-touch-target
@@ -140,7 +147,7 @@ function DeclareButton({ projectId, capName }: { projectId: string; capName: str
   );
 }
 
-export function CapabilityTrialsPanel({ digest, projectId }: { digest: DigestData | null; projectId?: string }) {
+export function CapabilityTrialsPanel({ digest, projectId, onRefreshDigest }: { digest: DigestData | null; projectId?: string; onRefreshDigest?: () => void }) {
   if (digest === null) return null;
   const verdicts = Object.entries(digest?.capability_adoption_verdicts ?? {});
   const genericVerdicts = verdicts.filter(([, v]) => !hasLaneMetrics(v));
@@ -214,7 +221,7 @@ export function CapabilityTrialsPanel({ digest, projectId }: { digest: DigestDat
                 {v.accrual_projection && (
                   <div className="mt-0.5 text-neutral-500">{fmtAccrual(v.accrual_projection)}</div>
                 )}
-                {projectId && <DeclareButton projectId={projectId} capName={name} />}
+                {projectId && !isVerdictDecided(v.verdict) && <DeclareButton projectId={projectId} capName={name} onSuccess={onRefreshDigest} />}
               </div>
             );
           })}
@@ -241,7 +248,7 @@ export function CapabilityTrialsPanel({ digest, projectId }: { digest: DigestDat
                 <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{v.n_lane ?? 0} lane / {v.n_control ?? 0} control</> : <>{v.n_with}/{minN}</>}</td>
                 <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{fmtMoney(v.lane_cost_per_merged)} / {fmtMoney(v.control_cost_per_merged)}<div className="text-[10px] text-neutral-500">loss {fmtRate(v.checkpoint_loss_rate)} · gates {v.gate_integrity_violations ?? 0}</div>{v.lane_fix_tasks_sampled != null && <div className="text-[10px] text-neutral-500">warm {fmtRate(v.warm_resume_fraction)} · ckpt {fmtRate(v.checkpoint_fraction)} ({v.lane_fix_tasks_sampled} fix)</div>}{v.engagement_low && <div className="text-[10px] text-amber-400">engagement low</div>}</> : <>{v.n_without}/{minN}</>}</td>
                 <td className="text-right px-3 py-2 text-neutral-300">{fmtDate(v.evaluated_at)}</td>
-                {projectId && <td className="text-right px-3 py-2"><DeclareButton projectId={projectId} capName={name} /></td>}
+                {projectId && <td className="text-right px-3 py-2">{!isVerdictDecided(v.verdict) && <DeclareButton projectId={projectId} capName={name} onSuccess={onRefreshDigest} />}</td>}
               </tr>
             );
           })}</tbody>

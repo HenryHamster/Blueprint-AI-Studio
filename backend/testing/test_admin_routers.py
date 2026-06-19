@@ -17767,3 +17767,272 @@ class TestRecentVersionsHighlights:
         assert result["merged_count"] is None
         assert result["merged_task_count"] is None
         assert result["acceptance_aggregate"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_agent_ops.py — Operator declare capability trial verdict
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestAdminDeclareCapabilityVerdict:
+    """Tests for POST /api/admin/projects/{project_id}/capability-trials/declare."""
+
+    ENDPOINT = "/api/admin/projects/{project_id}/capability-trials/declare"
+
+    def _url(self, project_id):
+        return self.ENDPOINT.format(project_id=project_id)
+
+    @pytest.mark.asyncio
+    async def test_adopt_verdict_adopted(self, client: AsyncClient, db_session):
+        """Adopt verdict is persisted with evidence_source='operator'."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            self._url(project.id),
+            json={"cap_name": "repo_map", "verdict": "adopt", "rationale": None},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["cap_name"] == "repo_map"
+        assert data["verdict"] == "adopt"
+
+        await db_session.refresh(project)
+        stored = (project.capability_adoption_verdicts or {}).get("repo_map", {})
+        assert stored["verdict"] == "adopt"
+        assert stored["evidence_source"] == "operator"
+
+    @pytest.mark.asyncio
+    async def test_admin_declare_capability_verdict_adopt(
+        self, client: AsyncClient, db_session
+    ):
+        """Adopt verdict round-trips correctly: persisted with evidence_source='operator'."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            self._url(project.id),
+            json={"cap_name": "repo_map", "verdict": "adopt"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["verdict"] == "adopt"
+
+        await db_session.refresh(project)
+        entry = (project.capability_adoption_verdicts or {})["repo_map"]
+        assert entry["verdict"] == "adopt"
+        assert entry["evidence_source"] == "operator"
+
+    @pytest.mark.asyncio
+    async def test_reject_verdict_persisted(self, client: AsyncClient, db_session):
+        """Reject verdict is stored with evidence_source='operator'."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            self._url(project.id),
+            json={"cap_name": "related_tests", "verdict": "reject"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["verdict"] == "reject"
+
+        await db_session.refresh(project)
+        entry = (project.capability_adoption_verdicts or {})["related_tests"]
+        assert entry["verdict"] == "reject"
+        assert entry["evidence_source"] == "operator"
+
+    @pytest.mark.asyncio
+    async def test_continue_trial_overwrites_decided_verdict(
+        self, client: AsyncClient, db_session
+    ):
+        """Operator continue-trial can overwrite a prior decided verdict (bypasses self-revert guard)."""
+        project = await _make_project(db_session)
+
+        # Pre-seed a decided verdict
+        project.capability_adoption_verdicts = {
+            "repo_map": {"verdict": "adopt", "evidence_source": "automated"}
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            self._url(project.id),
+            json={"cap_name": "repo_map", "verdict": "continue-trial"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(project)
+        entry = (project.capability_adoption_verdicts or {})["repo_map"]
+        assert entry["verdict"] == "continue-trial"
+        assert entry["evidence_source"] == "operator"
+
+    @pytest.mark.asyncio
+    async def test_rationale_stored(self, client: AsyncClient, db_session):
+        """Non-empty rationale is stored in the persisted entry."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            self._url(project.id),
+            json={
+                "cap_name": "repo_map",
+                "verdict": "reject",
+                "rationale": "Not enough lift observed",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(project)
+        entry = (project.capability_adoption_verdicts or {})["repo_map"]
+        assert entry.get("rationale") == "Not enough lift observed"
+
+    @pytest.mark.asyncio
+    async def test_empty_cap_name_rejected(self, client: AsyncClient, db_session):
+        """Empty cap_name returns 400."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            self._url(project.id),
+            json={"cap_name": "", "verdict": "adopt"},
+        )
+        assert resp.status_code == 400, resp.text
+
+    @pytest.mark.asyncio
+    async def test_unknown_verdict_rejected(self, client: AsyncClient, db_session):
+        """An invalid verdict value returns 422 (Pydantic validation)."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            self._url(project.id),
+            json={"cap_name": "repo_map", "verdict": "bogus"},
+        )
+        assert resp.status_code == 422, resp.text
+
+    @pytest.mark.asyncio
+    async def test_project_not_found(self, client: AsyncClient, db_session):
+        """Unknown project_id returns 404."""
+        missing_id = uuid.uuid4()
+
+        resp = await client.post(
+            self._url(missing_id),
+            json={"cap_name": "repo_map", "verdict": "adopt"},
+        )
+        assert resp.status_code == 404, resp.text
+
+    @pytest.mark.asyncio
+    async def test_non_admin_rejected(self, override_get_session, db_session):
+        """Non-admin user is rejected with 403."""
+        from fastapi import HTTPException
+
+        project = await _make_project(db_session)
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    self._url(project.id),
+                    json={"cap_name": "repo_map", "verdict": "adopt"},
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_adopt_verdict_closes_stall_notice(
+        self, client: AsyncClient, db_session
+    ):
+        """Adopt verdict resolves an open stall notice for the same cap_name."""
+        project = await _make_project(db_session)
+
+        # Seed an open stall notice with the matching dedupe_key
+        stall_msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="[CAPABILITY-TRIAL] repo_map stalled",
+            status="open",
+            context={
+                "event_type": "capability_trial_stalled",
+                "dedupe_key": "capability_trial_stalled_repo_map",
+                "cap_name": "repo_map",
+            },
+        )
+        db_session.add(stall_msg)
+        await db_session.commit()
+
+        resp = await client.post(
+            self._url(project.id),
+            json={"cap_name": "repo_map", "verdict": "adopt"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(stall_msg)
+        assert stall_msg.status == "resolved"
+        assert stall_msg.resolved_at is not None
+
+    @pytest.mark.asyncio
+    async def test_reject_verdict_closes_stall_notice(
+        self, client: AsyncClient, db_session
+    ):
+        """Reject verdict resolves an open stall notice for the same cap_name."""
+        project = await _make_project(db_session)
+
+        stall_msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="[CAPABILITY-TRIAL] repo_map stalled",
+            status="open",
+            context={
+                "event_type": "capability_trial_stalled",
+                "dedupe_key": "capability_trial_stalled_repo_map",
+                "cap_name": "repo_map",
+            },
+        )
+        db_session.add(stall_msg)
+        await db_session.commit()
+
+        resp = await client.post(
+            self._url(project.id),
+            json={"cap_name": "repo_map", "verdict": "reject"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(stall_msg)
+        assert stall_msg.status == "resolved"
+        assert stall_msg.resolved_at is not None
+
+    @pytest.mark.asyncio
+    async def test_continue_trial_leaves_stall_notice_open(
+        self, client: AsyncClient, db_session
+    ):
+        """continue-trial verdict leaves an existing stall notice open."""
+        project = await _make_project(db_session)
+
+        stall_msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="[CAPABILITY-TRIAL] repo_map stalled",
+            status="open",
+            context={
+                "event_type": "capability_trial_stalled",
+                "dedupe_key": "capability_trial_stalled_repo_map",
+                "cap_name": "repo_map",
+            },
+        )
+        db_session.add(stall_msg)
+        await db_session.commit()
+
+        resp = await client.post(
+            self._url(project.id),
+            json={"cap_name": "repo_map", "verdict": "continue-trial"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(stall_msg)
+        assert stall_msg.status == "open"
+        assert stall_msg.resolved_at is None

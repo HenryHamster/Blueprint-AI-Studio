@@ -3003,6 +3003,30 @@ async def admin_declare_capability_verdict(
         entry["rationale"] = rationale_text
 
     record_trial_verdict(project, cap_name, entry)
+
+    # Close any open stall notice for this capability when a decided verdict
+    # (adopt/reject) is declared. continue-trial leaves the notice open because
+    # the trial is still unresolved.
+    if body.verdict in ("adopt", "reject"):
+        dedupe_key = f"capability_trial_stalled_{cap_name}"
+        stall_msgs = (
+            (
+                await session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.status == "open",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for msg in stall_msgs:
+            if (msg.context or {}).get("dedupe_key") == dedupe_key:
+                msg.status = "resolved"
+                msg.resolved_at = _utcnow()
+                session.add(msg)
+
     await session.commit()
 
     logger.info(
