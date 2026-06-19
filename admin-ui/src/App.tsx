@@ -160,6 +160,20 @@ export default function App() {
   const selectedProjectId = s.selectedProjectId;
   const showMessages = s.showMessages;
 
+  const [directions, setDirections] = useState<{ id: string; text: string }[]>([]);
+  useEffect(() => {
+    if (!selectedProjectId) { setDirections([]); return; }
+    const pid = selectedProjectId;
+    apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(pid)}/directions`)
+      .then(res => res.json())
+      .then((data: unknown) => {
+        if (pid !== selectedProjectId) return;
+        const list = Array.isArray(data) ? data : ((data as Record<string, unknown>)?.directions ?? []);
+        setDirections((list as { id: string; text?: string; title?: string }[]).map(d => ({ id: d.id, text: d.text ?? d.title ?? d.id })));
+      })
+      .catch(() => { /* directions are non-critical, silently ignore */ });
+  }, [selectedProjectId]);
+
   // Clear message count when panel opens
   useEffect(() => {
     if (showMessages) {
@@ -965,6 +979,7 @@ export default function App() {
               onBlockedFilterChange={s.setBlockedFilter}
               directionFilter={s.directionFilter}
               onDirectionFilterChange={s.setDirectionFilter}
+              directions={directions}
               onDownloadCsv={handleDownloadTasksCsv}
               inputRef={searchInputRef}
             />
