@@ -708,6 +708,46 @@ describe('pre-implementation analysis note', () => {
     expect(prompt.match(/## Pre-Implementation Analysis/g) ?? []).toHaveLength(1);
     expect(prompt).toContain('Module X imports Y.');
   });
+
+  it('caps oversized pre-implementation analysis context injection on fresh-analysis path', async () => {
+    const { sendLog } = await import('../index.js');
+    vi.clearAllMocks();
+    const underCapSentinel = 'UNDER_CAP_SENTINEL';
+    const overCapSentinel = 'OVER_CAP_SENTINEL';
+    // Build a string that exceeds 32000 chars; place sentinel past the cap
+    const analysisResult = underCapSentinel + 'x'.repeat(32000) + overCapSentinel;
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: '', lastResultText: analysisResult,
+    });
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('## Pre-Implementation Analysis');
+    expect(prompt).toContain('[Analysis truncated at 32000 chars');
+    expect(prompt).not.toContain(overCapSentinel);
+    expect(vi.mocked(sendLog)).toHaveBeenCalledWith(
+      null,
+      expect.stringContaining('WARNING: analysis result'),
+    );
+  });
+
+  it('does not truncate or warn for sub-cap analysis on fresh-analysis path', async () => {
+    const { sendLog } = await import('../index.js');
+    vi.clearAllMocks();
+    const analysisResult = 'Short analysis within cap.';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: '', lastResultText: analysisResult,
+    });
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain(analysisResult);
+    expect(prompt).not.toContain('[Analysis truncated');
+    const warnCalls = vi.mocked(sendLog).mock.calls.filter(
+      ([, msg]) => typeof msg === 'string' && msg.includes('WARNING: analysis result'),
+    );
+    expect(warnCalls).toHaveLength(0);
+  });
 });
 
 describe('handleDocs configuration', () => {
