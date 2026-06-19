@@ -105,11 +105,6 @@ def is_merged_completion(task: Task) -> bool:
     return task.status == TaskStatus.COMPLETED and has_landed_signal(task)
 
 
-def is_unblocked_completion(task: Task) -> bool:
-    """True when a completed task should no longer block rollup convergence."""
-    return task.status == TaskStatus.COMPLETED and has_merge_unblock_signal(task)
-
-
 def _unverified_merge_reason(task: Task) -> str | None:
     """Read ``review_loop["unverified_merge_reason"]`` defensively.
 

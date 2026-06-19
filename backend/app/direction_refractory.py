@@ -105,8 +105,3 @@ def get_direction_refractory_info(
         ),
         "refractory_remaining_minutes": remaining_minutes,
     }
-
-
-def is_direction_refractory(direction: dict[str, Any], *, now: datetime | None = None) -> bool:
-    info = get_direction_refractory_info(direction, now=now)
-    return bool(info["refractory_remaining_minutes"] and info["refractory_remaining_minutes"] > 0)

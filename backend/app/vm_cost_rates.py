@@ -214,11 +214,6 @@ def validate_accelerator_request(
     return spec, None
 
 
-def supported_gpu_machine_types() -> tuple[str, ...]:
-    """Return the explicitly priced single-GPU machine types the platform accepts."""
-    return tuple(sorted(set(GPU_BASE_MACHINE_RATES) | set(GPU_BUNDLED_MACHINE_RATES)))
-
-
 def validate_compute_request(
     accelerator: str | None,
     machine_type: str | None,

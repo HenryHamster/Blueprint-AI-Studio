@@ -24,6 +24,7 @@ from app.direction_metrics import (
     proof_weighted_merged,
 )
 from app.direction_outcomes import verified_merged_count
+
 # Stopword set reused so the spawn-title redundancy check matches the project's
 # established word-overlap semantics (same tokens ignored: articles,
 # conjunctions, and verb prefixes like "feat"/"fix").
@@ -114,10 +115,18 @@ def _strategic_event_completion_summary(
     retired_source = retired_ids or _ctx_list(ctx, "_strategic_retired_ids")
     approved_count = int(ctx.get("_strategic_proposals_approved") or 0)
     rejected_count = int(ctx.get("_strategic_proposals_rejected") or 0)
-    created = [str(v) for v in (created_source or meta.get("created_direction_ids", [])) if v]
-    retired = [str(v) for v in (retired_source or meta.get("retired_direction_ids", [])) if v]
-    staged = [str(v) for v in (staged_ids or _ctx_list(ctx, "_strategic_staged_ids")) if v]
-    updated = [str(v) for v in (updated_ids or _ctx_list(ctx, "_strategic_updated_ids")) if v]
+    created = [
+        str(v) for v in (created_source or meta.get("created_direction_ids", [])) if v
+    ]
+    retired = [
+        str(v) for v in (retired_source or meta.get("retired_direction_ids", [])) if v
+    ]
+    staged = [
+        str(v) for v in (staged_ids or _ctx_list(ctx, "_strategic_staged_ids")) if v
+    ]
+    updated = [
+        str(v) for v in (updated_ids or _ctx_list(ctx, "_strategic_updated_ids")) if v
+    ]
     created_count = int(
         ctx.get("_strategic_dirs_created")
         or getattr(cycle, "directions_created", 0)
@@ -131,14 +140,10 @@ def _strategic_event_completion_summary(
     )
     staged_count = int(ctx.get("_strategic_dirs_staged") or len(staged))
     updated_count = int(
-        ctx.get("_strategic_dirs_updated")
-        or len(updated)
-        or approved_count
+        ctx.get("_strategic_dirs_updated") or len(updated) or approved_count
     )
     tasks_spawned = int(
-        ctx.get("_strategic_tasks_spawned")
-        or getattr(cycle, "tasks_spawned", 0)
-        or 0
+        ctx.get("_strategic_tasks_spawned") or getattr(cycle, "tasks_spawned", 0) or 0
     )
     adoption_declared = int(ctx.get("_strategic_adoption_declared") or 0)
     pm_changed = (
@@ -498,12 +503,13 @@ def _sanitize_challenge_verdict_block(
             "verdict": default_verdict,
             "rationale": default_rationale[:_CHALLENGE_RATIONALE_MAX],
         }
-    verdict = str(raw.get("verdict", "")).strip().lower() or str(
-        raw.get("assessment", "")
-    ).strip().lower()
-    rationale = str(raw.get("rationale", "")).strip() or str(
-        raw.get("reason", "")
-    ).strip()
+    verdict = (
+        str(raw.get("verdict", "")).strip().lower()
+        or str(raw.get("assessment", "")).strip().lower()
+    )
+    rationale = (
+        str(raw.get("rationale", "")).strip() or str(raw.get("reason", "")).strip()
+    )
     return {
         "verdict": (verdict or default_verdict)[:64],
         "rationale": rationale[:_CHALLENGE_RATIONALE_MAX],
@@ -669,7 +675,9 @@ def _sanitize_portfolio_operations(raw: object) -> list[dict]:
             continue
         did = str(entry.get("direction_id", "")).strip()
         txt = str(entry.get("text", "")).strip()
-        fp = portfolio_operation_fingerprint(canon, direction_id=did or None, text=txt or None)
+        fp = portfolio_operation_fingerprint(
+            canon, direction_id=did or None, text=txt or None
+        )
         if fp in seen:
             continue
         seen.add(fp)
@@ -803,10 +811,14 @@ def challenge_approves_retirement(record: object, direction_id: str) -> bool:
 
 def strategic_retirement_challenge_gate_mode() -> str:
     """Return the current retirement challenge rollout mode."""
-    raw = str(
-        _runtime_config.get(STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE_KEY, "observe")
-        or "observe"
-    ).strip().lower()
+    raw = (
+        str(
+            _runtime_config.get(STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE_KEY, "observe")
+            or "observe"
+        )
+        .strip()
+        .lower()
+    )
     if raw not in STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODES:
         return "observe"
     return raw
@@ -910,10 +922,16 @@ def strategic_challenge_summary(record: object) -> dict | None:
     else:
         verdict = "approved"
 
-    gate_mode_raw = str(
-        _runtime_config.get("strategic_challenge_gate_mode", "enforce")
-    ).strip().lower()
-    gate_mode_val = gate_mode_raw if gate_mode_raw in {"observe", "advisory", "enforce"} else "enforce"
+    gate_mode_raw = (
+        str(_runtime_config.get("strategic_challenge_gate_mode", "enforce"))
+        .strip()
+        .lower()
+    )
+    gate_mode_val = (
+        gate_mode_raw
+        if gate_mode_raw in {"observe", "advisory", "enforce"}
+        else "enforce"
+    )
 
     return {
         "mode": mode,
@@ -1478,7 +1496,11 @@ async def _spawn_retirement_memos(
             "memo_source_task_id": str(task.id),
             **({"retirement_rationale": rationale} if rationale else {}),
             **({"success_evidence": success_evidence} if success_evidence else {}),
-            **({"retirement_condition": retirement_condition} if retirement_condition else {}),
+            **(
+                {"retirement_condition": retirement_condition}
+                if retirement_condition
+                else {}
+            ),
         }
         memo_task = Task(
             project_id=project.id,
@@ -1912,9 +1934,7 @@ def _already_built_signature(direction: dict) -> dict | None:
         max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
         for e in window
     )
-    min_no_pr = int(
-        _runtime_config.get("direction_already_built_min_no_pr", 3) or 3
-    )
+    min_no_pr = int(_runtime_config.get("direction_already_built_min_no_pr", 3) or 3)
     dominance = float(
         _runtime_config.get("direction_already_built_dominance", 0.8) or 0.8
     )
@@ -2244,7 +2264,9 @@ def _should_autocomplete_exhausted(
     regardless of how exhaustion was determined.
     """
     is_exhausted = (
-        exhausted if exhausted is not None else _direction_genuinely_exhausted(direction)
+        exhausted
+        if exhausted is not None
+        else _direction_genuinely_exhausted(direction)
     )
     if not is_exhausted:
         return False
@@ -2777,33 +2799,6 @@ def _find_matching_direction(
     return None
 
 
-def _find_recent_rejected_proposal(
-    proposal_text: str, rejected_proposals: list
-) -> dict | None:
-    """Return a recent rejected proposal that overlaps with proposal_text.
-
-    Uses the same tokenization/threshold as `_is_direction_duplicate`, but only
-    scans rejections from the last 30 days so strategic-agent create paths can
-    hard-block recent operator/user rejections while keeping older overlaps
-    advisory-only.
-    """
-    words = set(proposal_text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
-    if len(words) < 2:
-        return None
-    text_lower = proposal_text.lower().strip()
-    cutoff = (_utcnow() - timedelta(days=30)).isoformat()
-    for entry in rejected_proposals:
-        if entry.get("rejected_at", "") < cutoff:
-            continue
-        rejected_text = (entry.get("text") or "").lower().strip()
-        if rejected_text == text_lower:
-            return entry
-        rejected_words = set(rejected_text.split()) - _DIRECTION_DEDUP_STOPWORDS
-        if len(words & rejected_words) >= 4:
-            return entry
-    return None
-
-
 async def _check_direction_starvation(
     project: Any, dirs_created: int, session: AsyncSession
 ) -> None:
@@ -3021,10 +3016,16 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
     # endorsed the same direction_id + status; a stalled verdict is never a
     # suppressor so it never needs (or gets) an approval stamp.
     challenge_record = (task.context or {}).get(STRATEGIC_CHALLENGE_CONTEXT_KEY)
-    gate_mode_raw = str(
-        _runtime_config.get("strategic_challenge_gate_mode", "enforce")
-    ).strip().lower()
-    gate_mode = gate_mode_raw if gate_mode_raw in {"observe", "advisory", "enforce"} else "enforce"
+    gate_mode_raw = (
+        str(_runtime_config.get("strategic_challenge_gate_mode", "enforce"))
+        .strip()
+        .lower()
+    )
+    gate_mode = (
+        gate_mode_raw
+        if gate_mode_raw in {"observe", "advisory", "enforce"}
+        else "enforce"
+    )
     now_iso = _utcnow().isoformat()
     applied = 0
     for d in project.directions or []:
@@ -3040,9 +3041,7 @@ def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
         agg = d.get("history_aggregate") or {}
         cycle_index = len(history) + (agg.get("total_cycles") or 0)
         challenge_approved = status in _EVIDENCE_PROGRESS_SUPPRESSING and (
-            challenge_approves_evidence_progress(
-                challenge_record, d.get("id"), status
-            )
+            challenge_approves_evidence_progress(challenge_record, d.get("id"), status)
         )
         gate_would_block = (
             status in _EVIDENCE_PROGRESS_SUPPRESSING and not challenge_approved
@@ -3085,7 +3084,13 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
     except Exception:
         model_bytes = len(json.dumps(raw_pm, default=str).encode())
         capability_count = len(raw_pm.get("capabilities") or [])
-        gap_count = len([g for g in (raw_pm.get("gaps") or []) if isinstance(g, dict) and g.get("status") == "active"])
+        gap_count = len(
+            [
+                g
+                for g in (raw_pm.get("gaps") or [])
+                if isinstance(g, dict) and g.get("status") == "active"
+            ]
+        )
         model_size_status = "unknown"
 
     packer_meta: dict = {}
@@ -3099,7 +3104,8 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
     trimmed: list = packer_meta.get("trimmed") or []
 
     directions_dropped_count: int = sum(
-        1 for e in dropped
+        1
+        for e in dropped
         if isinstance(e, dict) and "direction" in str(e.get("key", "")).lower()
     )
     problem_model_truncated: bool = any(
@@ -3703,29 +3709,41 @@ async def _handle_strategic_completion(
                 )
                 # Carry proof records and adoption verdicts onto survivor keys
                 # when a capability consolidation occurred in this write.
-                _consolidated = pm_diff.get("capabilities_consolidated") if pm_diff else None
+                _consolidated = (
+                    pm_diff.get("capabilities_consolidated") if pm_diff else None
+                )
                 if _consolidated:
-                    from app.capability_proof import carry_proof_records_for_consolidation
-                    from app.capability_trial_verdict import carry_adoption_verdicts_for_consolidation
+                    from app.capability_proof import (
+                        carry_proof_records_for_consolidation,
+                    )
+                    from app.capability_trial_verdict import (
+                        carry_adoption_verdicts_for_consolidation,
+                    )
 
-                    if not isinstance(getattr(project, "capability_proof_records", None), dict):
+                    if not isinstance(
+                        getattr(project, "capability_proof_records", None), dict
+                    ):
                         project.capability_proof_records = {}
-                    project.capability_proof_records = carry_proof_records_for_consolidation(
-                        _consolidated, project.capability_proof_records
+                    project.capability_proof_records = (
+                        carry_proof_records_for_consolidation(
+                            _consolidated, project.capability_proof_records
+                        )
                     )
                     flag_modified(project, "capability_proof_records")
-                    if not isinstance(getattr(project, "capability_adoption_verdicts", None), dict):
+                    if not isinstance(
+                        getattr(project, "capability_adoption_verdicts", None), dict
+                    ):
                         project.capability_adoption_verdicts = {}
-                    project.capability_adoption_verdicts = carry_adoption_verdicts_for_consolidation(
-                        _consolidated, project.capability_adoption_verdicts
+                    project.capability_adoption_verdicts = (
+                        carry_adoption_verdicts_for_consolidation(
+                            _consolidated, project.capability_adoption_verdicts
+                        )
                     )
                     flag_modified(project, "capability_adoption_verdicts")
                 try:
                     from app import release_version as _rv
 
-                    _new_focus = (new_pm_raw.get("intent") or {}).get(
-                        "current_focus"
-                    )
+                    _new_focus = (new_pm_raw.get("intent") or {}).get("current_focus")
                     await _rv.refresh_open_version_goal_if_auto_derived(
                         session, project.id, _new_focus
                     )
@@ -3757,9 +3775,7 @@ async def _handle_strategic_completion(
             if ru_cycle_id:
                 ru_cycle_row = await strategic_cycle.get(session, ru_cycle_id)
                 if ru_cycle_row is not None:
-                    ru_baseline = strategic_cycle.baseline_running_update(
-                        ru_cycle_row
-                    )
+                    ru_baseline = strategic_cycle.baseline_running_update(ru_cycle_row)
             ru_rejected = apply_reconciled_running_update(
                 project,
                 baseline=ru_baseline,
@@ -4409,9 +4425,7 @@ async def _handle_strategic_completion(
                         why or "challenge rejected this approve_direction",
                     )
                     continue
-                active_count = sum(
-                    1 for d in directions if d.get("status") == "active"
-                )
+                active_count = sum(1 for d in directions if d.get("status") == "active")
                 max_active = _runtime_config.get("max_active_directions", 5)
                 if active_count >= max_active:
                     logger.info(
@@ -4494,9 +4508,7 @@ async def _handle_strategic_completion(
                         "status": "rejected",
                         "rejected_at": _utcnow().isoformat(),
                         "rejected_by": "strategic",
-                        **(
-                            {"rejection_rationale": rationale} if rationale else {}
-                        ),
+                        **({"rejection_rationale": rationale} if rationale else {}),
                     }
                     rejected = [d for d in remaining if d.get("status") == "rejected"]
                     non_rejected = [
@@ -4524,7 +4536,9 @@ async def _handle_strategic_completion(
                         vm_ids_to_delete.append(t.vm_instance_id)
                 directions = remaining
                 _d = directions
-                from app.task_locking import with_directions_locked as _with_directions_locked
+                from app.task_locking import (
+                    with_directions_locked as _with_directions_locked,
+                )
 
                 await _with_directions_locked(session, task.project_id, lambda _: _d)
                 ctx = task.context or {}
@@ -4666,9 +4680,7 @@ async def _handle_strategic_completion(
         if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
             from app.source_ref_validation import compute_message_citation_warning
 
-            warning = await compute_message_citation_warning(
-                session, project, content
-            )
+            warning = await compute_message_citation_warning(session, project, content)
             if warning:
                 _msg_ctx = {**_msg_ctx, "_provenance_warnings": warning}
         new_msg = ProjectMessage(
@@ -4724,10 +4736,15 @@ async def _handle_strategic_completion(
             msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
             # Accept both 'open' and 'linked' so an explicit terminal resolve can
             # always move a linked message to 'resolved' (the operator's escape hatch).
-            if msg and msg.project_id == project.id and msg.status in {
-                "open",
-                _LINKED_STATUS,
-            }:
+            if (
+                msg
+                and msg.project_id == project.id
+                and msg.status
+                in {
+                    "open",
+                    _LINKED_STATUS,
+                }
+            ):
                 if _is_bug_class(msg) and (owned_by_direction or owned_by_task):
                     # Bug-class message with ownership info: record the forward
                     # link and move to 'linked' state. The actual convergence to
@@ -4880,7 +4897,9 @@ async def _handle_strategic_completion(
             status="completed" if fallback_succeeded else "failed",
             created_ids=created_ids_fb,
             retired_ids=retired_ids_fb,
-            problem_model_changed=bool(new_problem_model and isinstance(new_problem_model, dict)),
+            problem_model_changed=bool(
+                new_problem_model and isinstance(new_problem_model, dict)
+            ),
             running_update_changed=isinstance(new_running_update, str),
         ),
     )

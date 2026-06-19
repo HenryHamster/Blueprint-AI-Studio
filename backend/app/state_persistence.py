@@ -10,7 +10,6 @@ import logging
 from collections import deque
 from datetime import datetime
 
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
 import app.shared_state as _shared_state
@@ -131,85 +130,6 @@ def _serialize_pipeline_events_snapshot() -> dict:
         for e in _shared_state.deploy_monitoring["pipeline_events"]
     ]
     return {"events": events_list}
-
-
-async def _persist_anomaly_state(session: AsyncSession | None = None):
-    """Snapshot anomaly detection state to DB so occurrence counts survive restarts.
-
-    If ``session`` is provided, mutates ``DeploymentState`` on that session and
-    leaves the commit to the caller (lets the orchestrator coalesce multiple
-    persist calls into one round-trip — see M-P6). When called without a
-    session, opens its own session and commits, preserving the legacy
-    fire-and-forget contract used by tests.
-    """
-    from app.deploy_health import _get_deploy_state_for_update
-
-    try:
-        snapshot = _serialize_anomaly_snapshot()
-        if session is not None:
-            state = await _get_deploy_state_for_update(session)
-            if state:
-                state.persistent_anomaly_state = snapshot
-                session.add(state)
-            return
-        async with AsyncSessionLocal() as new_session:
-            state = await _get_deploy_state_for_update(new_session)
-            if state:
-                state.persistent_anomaly_state = snapshot
-                new_session.add(state)
-                await new_session.commit()
-    except Exception as e:
-        logger.warning(f"[ANOMALY STATE] Failed to persist: {e}", exc_info=True)
-
-
-async def _persist_direction_streaks(session: AsyncSession | None = None):
-    """Snapshot direction failure streaks to DB so holds survive restarts.
-
-    See :func:`_persist_anomaly_state` for the optional-session contract.
-    """
-    from app.deploy_health import _get_deploy_state_for_update
-
-    try:
-        serializable = _serialize_direction_streaks_snapshot()
-        if session is not None:
-            state = await _get_deploy_state_for_update(session)
-            if state:
-                state.direction_streak_state = serializable
-                session.add(state)
-            return
-        async with AsyncSessionLocal() as new_session:
-            state = await _get_deploy_state_for_update(new_session)
-            if state:
-                state.direction_streak_state = serializable
-                new_session.add(state)
-                await new_session.commit()
-    except Exception as e:
-        logger.warning(f"[DIRECTION STREAKS] Failed to persist: {e}", exc_info=True)
-
-
-async def _persist_pipeline_events(session: AsyncSession | None = None):
-    """Snapshot pipeline events ring buffer to DB so alert windows survive restarts.
-
-    See :func:`_persist_anomaly_state` for the optional-session contract.
-    """
-    from app.deploy_health import _get_deploy_state_for_update
-
-    try:
-        snapshot = _serialize_pipeline_events_snapshot()
-        if session is not None:
-            state = await _get_deploy_state_for_update(session)
-            if state:
-                state.pipeline_events_state = snapshot
-                session.add(state)
-            return
-        async with AsyncSessionLocal() as new_session:
-            state = await _get_deploy_state_for_update(new_session)
-            if state:
-                state.pipeline_events_state = snapshot
-                new_session.add(state)
-                await new_session.commit()
-    except Exception as e:
-        logger.warning(f"[PIPELINE EVENTS] Failed to persist: {e}", exc_info=True)
 
 
 async def _persist_self_healing_state_bundle():

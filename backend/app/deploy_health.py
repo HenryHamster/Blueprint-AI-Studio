@@ -40,7 +40,6 @@ from app.deploy_health_alerts import (  # noqa: F401
 )
 
 logger = logging.getLogger("blueprint")
-_DEPLOY_MONITORING_DEFER_WINDOW = timedelta(minutes=30)
 
 
 def _get_zone_health_summary() -> dict:
@@ -287,81 +286,6 @@ async def _get_deploy_state_for_update(
         .scalars()
         .first()
     )
-
-
-def get_deploy_monitoring_defer_until(
-    deploy_state: DeploymentState | None,
-) -> "datetime | None":
-    """Return the monitoring-window deadline for regression-spawn deferral."""
-    if deploy_state is None or deploy_state.status != DeploymentStatus.MONITORING:
-        return None
-    deployed_at = deploy_state.deployed_at
-    if deployed_at.tzinfo is not None:
-        deployed_at = deployed_at.replace(tzinfo=None)
-    return deployed_at + _DEPLOY_MONITORING_DEFER_WINDOW
-
-
-_DEPLOY_MONITORING_DEFER_TITLE = (
-    "Regression signal deferred: deploy in monitoring window"
-)
-
-
-async def record_deploy_monitoring_deferral(
-    session: AsyncSession,
-    project_id,
-    deploy_state: DeploymentState,
-    signal_name: str,
-) -> "datetime | None":
-    """Persist a project-visible note when regression work is deferred for deploy stabilization.
-
-    Deduped per (project, monitoring window): if an Alert with the same title
-    has already been created since ``deploy_state.deployed_at``, no new alert
-    is added — the dispatcher tick fires every 60s, but operators only need
-    one alert per deploy MONITORING window.
-    """
-    defer_until = get_deploy_monitoring_defer_until(deploy_state)
-    if defer_until is None:
-        return None
-    deployed_at = (
-        deploy_state.deployed_at.replace(tzinfo=None)
-        if deploy_state.deployed_at.tzinfo
-        else deploy_state.deployed_at
-    )
-    existing = (
-        (
-            await session.execute(
-                select(Alert)
-                .where(
-                    Alert.project_id == project_id,
-                    Alert.title == _DEPLOY_MONITORING_DEFER_TITLE,
-                    Alert.created_at >= deployed_at,
-                )
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if existing is not None:
-        return defer_until
-    alert = Alert(
-        project_id=project_id,
-        severity=AlertSeverity.INFO,
-        title=_DEPLOY_MONITORING_DEFER_TITLE,
-        message=(
-            f"{signal_name} would trip but deploy revision="
-            f"{deploy_state.current_revision or 'unknown'} is MONITORING since "
-            f"{deployed_at.isoformat()}; waiting until STABLE or {defer_until.isoformat()} "
-            "before spawning investigate."
-        )[:1000],
-    )
-    session.add(alert)
-    await broadcast_to_project(
-        str(project_id),
-        "alert_created",
-        {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
-    )
-    return defer_until
 
 
 async def _check_monitoring_window():

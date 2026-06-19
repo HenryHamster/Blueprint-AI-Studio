@@ -130,57 +130,6 @@ def _compute_scope_baselines(tasks: list, lookback_days: int) -> dict:
     }
 
 
-def _weekly_merge_rate_deltas(tasks: list) -> List[Dict[str, Any]]:
-    """Bucket tasks by week and compute per-week merge rate + delta vs prior week.
-
-    Shared between medium-scope measurement and strategic payload enrichment
-    (backend/app/strategic_spawning.py::_build_recent_interventions).
-
-    Returns a list of per-week dicts sorted chronologically:
-        {week: ISO Monday date, created: int, merged: int,
-         merge_rate: float|None, merge_rate_delta: float|None}
-    """
-    week_bucket: Dict[str, Dict[str, int]] = defaultdict(
-        lambda: {"created": 0, "merged": 0}
-    )
-    for t in tasks:
-        if not t.created_at:
-            continue
-        task_date = t.created_at.date()
-        week_monday = task_date - timedelta(days=task_date.weekday())
-        week_key = week_monday.isoformat()
-        week_bucket[week_key]["created"] += 1
-        if is_merged_completion(t):
-            week_bucket[week_key]["merged"] += 1
-
-    sorted_weeks = sorted(week_bucket.keys())
-    out: List[Dict[str, Any]] = []
-    for i, week_key in enumerate(sorted_weeks):
-        counts = week_bucket[week_key]
-        created = counts["created"]
-        merged = counts["merged"]
-        merge_rate = round(merged / created, 3) if created > 0 else None
-        if i == 0:
-            delta = None
-        else:
-            prev_rate = out[i - 1]["merge_rate"]
-            delta = (
-                round(merge_rate - prev_rate, 3)
-                if (merge_rate is not None and prev_rate is not None)
-                else None
-            )
-        out.append(
-            {
-                "week": week_key,
-                "created": created,
-                "merged": merged,
-                "merge_rate": merge_rate,
-                "merge_rate_delta": delta,
-            }
-        )
-    return out
-
-
 def _compute_medium_scope_measurement(
     medium_tasks: list,
     project: Optional[Any],
@@ -195,9 +144,7 @@ def _compute_medium_scope_measurement(
     """
     # --- Headline ---
     total_created = len(medium_tasks)
-    total_merged = sum(
-        1 for t in medium_tasks if is_merged_completion(t)
-    )
+    total_merged = sum(1 for t in medium_tasks if is_merged_completion(t))
     medium_scope_conversion_rate = (
         round(total_merged / total_created, 3) if total_created > 0 else None
     )
@@ -253,9 +200,7 @@ def _compute_medium_scope_measurement(
         months and everything is long-terminal."""
         finished = [t for t in tasks_subset if t.status in _TERMINAL_STATUSES]
         created = len(finished)
-        merged = sum(
-            1 for t in finished if is_merged_completion(t)
-        )
+        merged = sum(1 for t in finished if is_merged_completion(t))
         return {
             "merge_rate": round(merged / created, 3) if created > 0 else None,
             "created": created,
@@ -652,8 +597,12 @@ async def get_scope_baselines(
         .where(*filters)
         .options(
             load_only(
-                Task.id, Task.status, Task.context, Task.created_at, Task.project_id,
-                raiseload=True
+                Task.id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+                Task.project_id,
+                raiseload=True,
             )
         )
         .order_by(Task.created_at.desc(), Task.id.desc())
@@ -702,7 +651,8 @@ async def get_medium_scope_measurement(
                 Task.created_at,
                 Task.updated_at,
                 Task.title,
-            raiseload=True,)
+                raiseload=True,
+            )
         )
         .order_by(Task.created_at.desc(), Task.id.desc())
         .limit(_MAX_AGGREGATION_SCAN + 1)

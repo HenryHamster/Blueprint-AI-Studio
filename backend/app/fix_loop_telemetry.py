@@ -88,17 +88,6 @@ def stamp_fix_loop_divergence_computed_at(
     doc["fix_loop_divergence_signal_last_computed_at"] = ts
 
 
-def normalize_fix_loop_error_fingerprint(message: str | None) -> str:
-    """Normalize fix-loop error text into a stable grouping fingerprint.
-
-    Delegates to the existing failure-classification normalizer so UUIDs,
-    numbers, and size tokens cluster identically across telemetry consumers.
-    """
-    from app.failure_classification import _fingerprint_message  # noqa: PLC0415
-
-    return _fingerprint_message(message or "")
-
-
 class FixLoopEventIn(BaseModel):
     """Ingest payload for one fix-loop attempt.
 

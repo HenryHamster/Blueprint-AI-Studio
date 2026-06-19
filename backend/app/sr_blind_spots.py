@@ -191,7 +191,11 @@ async def _scan_blind_spot_counts(
             Task.status == TaskStatus.COMPLETED,
             Task.created_at >= cutoff,
         )
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True))
+        .options(
+            load_only(
+                Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True
+            )
+        )
         .order_by(Task.created_at.desc())
         .limit(_TASK_SCAN_CAP)
     )
@@ -929,29 +933,6 @@ def aggregate_sr_co_failure_pairs(
     return pairs[:top_n]
 
 
-def classify_theme_example_layers(examples: list) -> list:
-    """Return layer tags derived from verbatim blind-spot example texts.
-
-    Runs ``classify_layers`` on each example's ``text`` field individually with
-    no stage constraint (stage=None), so content patterns can surface
-    CI_WORKFLOW, AGENT_VM, AGENT_VERB, and BASELINE_GATE tags beyond the
-    REVIEWER_PASS that the signal-level ``stage='review'`` always contributes.
-
-    The dispatcher includes example texts in the combined ``theme_extras``
-    message (giving classify_layers full context), but calling this function
-    separately lets callers record per-example layer observations in
-    ``symptoms_by_layer`` independently from the signal-level observation.
-    """
-    from app.failure_layer_classifier import classify_layers
-
-    layers: set = set()
-    for ex in examples or []:
-        text = (ex.get("text") or "").strip()
-        if text:
-            layers.update(classify_layers("SR_BLIND_SPOT", text, None))
-    return sorted(layers)
-
-
 _PERSISTENT_BLIND_SPOT_THRESHOLD = 0.25
 _PERSISTENT_BLIND_SPOT_MIN_SAMPLE = 3
 
@@ -1141,7 +1122,11 @@ async def aggregate_sr_reviewer_disagreements(
             Task.status == TaskStatus.COMPLETED,
             Task.created_at >= cutoff,
         )
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True))
+        .options(
+            load_only(
+                Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True
+            )
+        )
         .order_by(Task.created_at.desc())
         .limit(_TASK_SCAN_CAP)
     )
@@ -1186,7 +1171,11 @@ async def aggregate_sr_reviewer_disagreements_envelope(
             Task.status == TaskStatus.COMPLETED,
             Task.created_at >= cutoff,
         )
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True))
+        .options(
+            load_only(
+                Task.id, Task.context, Task.payloads, Task.created_at, raiseload=True
+            )
+        )
         .order_by(Task.created_at.desc())
         .limit(_TASK_SCAN_CAP)
     )

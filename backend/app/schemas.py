@@ -1023,37 +1023,6 @@ class BuildConfig(BaseModel):
         return v
 
 
-class MergeGateRuntime(BaseModel):
-    """Runtime-backed readiness of the no-CI merge gate — what the gate ACTUALLY
-    did the last time it ran a PR to a terminal outcome.
-
-    Distinct from the stored-config ``merge_verification_verdict`` advisory: this
-    is written best-effort by ``ci_resolution.record_no_ci_gate_runtime`` and read
-    back via ``ci_resolution.merge_gate_runtime_block``.  Every field is optional
-    so older clients and projects whose gate has never run remain valid (the API
-    returns ``null`` for the whole block in that case).  ``last_unverified_*`` are
-    populated only when the gate fell open to an UNVERIFIED merge and are
-    preserved across later verified runs.
-    """
-
-    model_config = ConfigDict(extra="ignore")
-
-    last_run_at: str | None = None
-    executed_real_tests: bool = False
-    last_unverified_at: str | None = None
-    last_unverified_reason: str | None = None
-    # Additive history fields (bounded rolling record + per-reason tally +
-    # derived summary). All optional with safe defaults so never-ran and legacy
-    # four-key-only records remain valid and the response shape stays
-    # backward-compatible. ``recent_outcomes`` entries are
-    # ``{"at": iso, "verified": bool, "reason": key | None}``; ``summary``
-    # carries ``window`` / ``verified_runs`` / ``fell_open_runs`` /
-    # ``total_fall_opens`` / ``most_common_reason``.
-    recent_outcomes: List[Dict[str, Any]] | None = None
-    unverified_reason_counts: Dict[str, int] | None = None
-    summary: Dict[str, Any] | None = None
-
-
 class OnboardPayload(BaseModel):
     """Payload for the project onboarding endpoint."""
 
@@ -1077,31 +1046,3 @@ class OnboardPayload(BaseModel):
     # with the given per-project target size, avoiding a separate operator
     # action after creation. preview_only=True suppresses this.
     warm_pool_target_size: int | None = Field(None, ge=1, le=50)
-
-
-# --- Pipeline Efficiency ---
-
-
-class PipelineEfficiencyWindow(BaseModel):
-    """Per-time-window metrics for the pipeline-efficiency endpoint."""
-
-    model_config = ConfigDict(extra="ignore")
-    setup_p50_secs: float | None = None
-    setup_p95_secs: float | None = None
-    setup_sample_n: int = 0
-    warm_reuse_rate: float | None = None
-    warm_reuse_sample_n: int = 0
-    review_iter_median: float | None = None
-    review_iter_p95: float | None = None
-    review_iter_sample_n: int = 0
-    vs_prior_setup_p50_delta: float | None = None
-    vs_prior_warm_reuse_rate_delta: float | None = None
-    vs_prior_review_iter_median_delta: float | None = None
-
-
-class PipelineEfficiencyResponse(BaseModel):
-    """Response schema for GET /api/admin/pipeline-efficiency."""
-
-    computed_at: str
-    window_24h: PipelineEfficiencyWindow
-    window_7d: PipelineEfficiencyWindow

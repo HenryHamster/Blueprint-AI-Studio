@@ -31,7 +31,7 @@ from app.models import (
 )
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user, require_admin
-from app.vm_cost_rates import get_vm_rate_per_second, VM_COST_RATES
+from app.vm_cost_rates import VM_COST_RATES
 from app.shared_state import (
     get_project_integration_branch,
     get_project_promotion_target,
@@ -330,14 +330,6 @@ async def get_direction_auto_pause_stats(
 def _task_completed_at(task: Task) -> datetime:
     """Return the task completion timestamp used for cost windowing."""
     return _derive_completed_at(task)
-
-
-def _task_estimated_cost_usd(task: Task) -> float | None:
-    """Return the VM cost for a task, or None when timing data is incomplete."""
-    if not task.vm_provisioned_at or not task.vm_stopped_at:
-        return None
-    rate = get_vm_rate_per_second(machine_type=task.vm_machine_type, spot=task.vm_spot)
-    return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
 
 
 def _percentile(values: List[float], fraction: float) -> float:
