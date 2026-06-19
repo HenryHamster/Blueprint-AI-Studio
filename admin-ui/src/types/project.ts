@@ -119,13 +119,8 @@ export interface BuildConfig {
   bootstrap_command_memory_updated_at?: string | null;
 }
 
-export interface StagingBranchPrefixesConfig {
-  staging_branch_prefixes: string[];
-  is_default: boolean;
-}
-
 /** A directory path paired with the test command the no-CI merge gate would run there. */
-export interface MergeVerificationTestCommand {
+interface MergeVerificationTestCommand {
   path: string;
   test_cmd: string;
 }
@@ -152,7 +147,7 @@ export interface MergeVerificationVerdict {
 /** One retained entry in the no-CI merge gate's bounded rolling outcome history.
  *  `verified` is true when the gate ran real tests; false when it fell open to an
  *  UNVERIFIED merge (in which case `reason` carries the fall-open reason key). */
-export interface MergeGateOutcome {
+interface MergeGateOutcome {
   at: string;
   verified: boolean;
   reason?: string | null;
@@ -196,14 +191,14 @@ export interface MergeGateRuntime {
   no_test_block_counts?: Record<string, number>;
 }
 
-export interface CapabilityProofSummary {
+interface CapabilityProofSummary {
   proof_count: number;
   latest_proof_kind?: string;
   latest_proved_at?: string;
   latest_commit_sha?: string;
 }
 
-export interface CapabilityAdoptionVerdict {
+interface CapabilityAdoptionVerdict {
   verdict?: 'adopt' | 'reject' | 'continue-trial' | 'ADOPT' | 'KILL' | 'CONTINUE';
   lift?: number | null;
   n_with?: number;
@@ -254,7 +249,7 @@ export interface ProjectResourceEnvelopeResponse extends ResourceEnvelopeConfig 
  * truth instead of a page slice. Additive — absent on legacy payloads, so every
  * read must guard for `undefined`.
  */
-export interface TaskStatusCounts {
+interface TaskStatusCounts {
   queued: number;
   running: number;
   evaluating: number;
@@ -264,7 +259,7 @@ export interface TaskStatusCounts {
   total: number;
 }
 
-export interface RepoOverview {
+interface RepoOverview {
   tech_stack?: string | null;
   directory_layout?: string | null;
   first_steps_summary?: string | null;
@@ -348,7 +343,7 @@ export interface AutoRemediationConfig {
   require_review: boolean;
 }
 
-export interface AutoRemediationRecentTask {
+interface AutoRemediationRecentTask {
   id: string;
   title: string;
   status: string;
