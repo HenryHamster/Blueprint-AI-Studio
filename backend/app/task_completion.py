@@ -2622,16 +2622,31 @@ _ACT_ON_VERDICT_LOG_CHARS = 16000
 
 
 def _build_act_on_verdict_prompt(
-    task: Task, compute_result: dict[str, Any], logs: str
+    task: Task,
+    compute_result: dict[str, Any],
+    logs: str,
+    *,
+    failure_mode: bool = False,
 ) -> str:
-    """Author the fresh reason-and-ship follow-on agent's prompt.
+    """Author the fresh disposition follow-on agent's prompt.
 
-    Embeds the experiment identity, the ORIGINAL hypothesis/goal/criterion from
-    the originating payload, and the FULL faithful results (both arms + real
-    numbers from the captured ``compute_result`` and the raw result record) so a
-    fresh, independent agent can judge whether the result warrants a change. No
-    success rubric and no A-vs-B verdict is hardcoded — that judgment is the
-    agent's job.
+    Two framings, selected by ``failure_mode``:
+
+    * Success (``failure_mode=False``): a reason-and-ship prompt. Embeds the
+      experiment identity, the ORIGINAL hypothesis/goal/criterion, and the FULL
+      faithful results (both arms + real numbers) so a fresh, independent agent
+      can judge whether the result warrants a change. No success rubric and no
+      A-vs-B verdict is hardcoded — that judgment is the agent's job.
+
+    * Failure (``failure_mode=True``): a diagnose-and-fix prompt. The experiment
+      crashed, timed out before measuring, or never delivered the artifact/metric
+      it declared — its traceback is otherwise stranded in a GCS bundle invisible
+      to the strategist. This framing surfaces the captured stderr/traceback tail
+      PROMINENTLY and asks the agent to diagnose root cause, fix it, add a
+      regression guard, and open a PR (or record a reasoned no-op for a transient
+      infra blip or a legitimately expected miss). The COMPUTE_RESULT artifact
+      pointer (when one exists) is still forwarded via the spawned task's context,
+      exactly as on the success path.
     """
     payload = task.first_payload or {}
     experiment = payload.get("experiment") or "(unnamed experiment)"
@@ -2640,12 +2655,23 @@ def _build_act_on_verdict_prompt(
     metric = payload.get("metric")
     success_criterion = payload.get("success_criterion")
 
-    lines = [
-        "You are a fresh, independent engineer acting on a COMPLETED compute "
-        "experiment. Reason over its results and SHIP in this same task.",
-        "",
-        f"Experiment: {experiment}",
-    ]
+    if failure_mode:
+        lines = [
+            "You are a fresh, independent engineer acting on a FAILED compute "
+            "experiment. The experiment did NOT produce a clean, measured result: "
+            "it crashed, timed out before emitting its metric, or never delivered "
+            "the artifact/metric it declared. Diagnose the root cause and FIX it "
+            "in this same task.",
+            "",
+            f"Experiment: {experiment}",
+        ]
+    else:
+        lines = [
+            "You are a fresh, independent engineer acting on a COMPLETED compute "
+            "experiment. Reason over its results and SHIP in this same task.",
+            "",
+            f"Experiment: {experiment}",
+        ]
     if benchmark:
         lines.append(f"Benchmark: {benchmark}")
     lines.append(f"Originating experiment task id: {task.id}")
@@ -2659,6 +2685,38 @@ def _build_act_on_verdict_prompt(
             + json.dumps(success_criterion, indent=2, default=str)
         )
     lines.append("")
+    if failure_mode:
+        # The traceback/stderr tail is the key visibility fix — show it FIRST and
+        # prominently so the diagnosing agent does not have to fetch the GCS bundle.
+        raw = (logs or "").strip()
+        if raw:
+            if len(raw) > _ACT_ON_VERDICT_LOG_CHARS:
+                raw = raw[-_ACT_ON_VERDICT_LOG_CHARS:]
+                raw = "…(truncated; showing tail)…\n" + raw
+            lines.append(
+                "Captured stderr / traceback tail (the experiment's failure "
+                "output — diagnose from this):\n" + raw
+            )
+        else:
+            lines.append(
+                "No stderr/traceback was captured for this failure — the "
+                "experiment may have died before emitting any output."
+            )
+        if compute_result:
+            lines.append(
+                "\nPartial / terminal result record (may be incomplete):\n"
+                + json.dumps(compute_result, indent=2, default=str)
+            )
+        lines.append("")
+        lines.append(
+            "Diagnose the root cause of the failure, then: implement the fix, add "
+            "a regression guard (a test or assertion that would have caught this), "
+            "and open a PR. If the failure is a transient infra blip or a "
+            "legitimately expected miss (not a code defect), conclude instead with "
+            "a recorded no-op that explains why no change is warranted."
+        )
+        return "\n".join(lines)
+
     lines.append(
         "Full experiment results (faithful capture — both A/B arms and the real "
         "numbers):\n" + json.dumps(compute_result, indent=2, default=str)
@@ -2684,8 +2742,10 @@ async def _spawn_act_on_verdict_followon(
     task: Task,
     compute_result: dict[str, Any],
     logs: str,
+    *,
+    failure_mode: bool = False,
 ) -> Task | None:
-    """Spawn ONE write-capable reason-and-ship follow-on for a completed experiment.
+    """Spawn ONE write-capable disposition follow-on for a terminal experiment.
 
     Mirrors the security_audit completion→spawn-create pattern: builds a
     ``type=create`` child (``created_by="ORCHESTRATOR"``, ``QUEUED``,
@@ -2696,6 +2756,10 @@ async def _spawn_act_on_verdict_followon(
     canonical artifact-pointer shape, so the follow-on arrives with a fetchable
     pointer it can resolve via ``GET /api/agent/artifacts/download-url``.
 
+    ``failure_mode`` selects the diagnose-and-fix prompt/title variant used for
+    the FAILURE branches (crash / timed-out-before-measure / undelivered
+    artifact) instead of the success-path reason-and-ship framing.
+
     The ORCHESTRATOR does this spawn; the strategist allowlist
     (``task_capabilities.strategist_spawnable``) is deliberately NOT touched.
 
@@ -2703,6 +2767,12 @@ async def _spawn_act_on_verdict_followon(
     attempt committed it before dying), returns it without spawning a duplicate.
     The caller adds nothing else to the session before its single commit, so the
     child INSERT + parent advance land atomically.
+
+    Concurrency-bounded: when the project already has at least
+    ``max_concurrent_act_on_verdict_followons`` (default 4) non-terminal
+    disposition follow-ons in flight, the spawn is SKIPPED (returns ``None``)
+    without stamping the dedup key, so the next re-dispatch retries once the
+    fleet drains.
     """
     existing_children = (
         (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
@@ -2718,12 +2788,52 @@ async def _spawn_act_on_verdict_followon(
             )
             return ct
 
+    # Concurrency cap: count this project's in-flight disposition follow-ons
+    # (non-terminal type=create children carrying the source key, across ALL
+    # experiments). At/above the cap, skip WITHOUT stamping the dedup key so a
+    # later re-dispatch retries once the fleet drains.
+    try:
+        cap = int(_runtime_config.get("max_concurrent_act_on_verdict_followons", 4))
+    except (TypeError, ValueError):
+        cap = 4
+    if cap > 0:
+        in_flight_rows = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id == task.project_id,
+                        Task.status.in_((TaskStatus.QUEUED, TaskStatus.IN_PROGRESS)),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        in_flight = sum(
+            1
+            for t in in_flight_rows
+            if (t.context or {}).get(_ACT_ON_VERDICT_SOURCE_KEY)
+        )
+        if in_flight >= cap:
+            logger.warning(
+                "[COMPUTE] act_on_verdict follow-on cap reached for project %s "
+                "(%d in-flight >= cap %d); skipping spawn for task %s — will "
+                "retry on re-dispatch",
+                task.project_id,
+                in_flight,
+                cap,
+                task.id,
+            )
+            return None
+
     project = await session.get(Project, task.project_id)
     base_branch = (task.first_payload or {}).get(
         "base_branch"
     ) or get_project_integration_branch(project)
     create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
-    prompt = _build_act_on_verdict_prompt(task, compute_result, logs)
+    prompt = _build_act_on_verdict_prompt(
+        task, compute_result, logs, failure_mode=failure_mode
+    )
 
     context: dict[str, Any] = {_ACT_ON_VERDICT_SOURCE_KEY: str(task.id)}
     # Pillar 5 spawn-forward: when a durable COMPUTE_RESULT artifact exists, stamp
@@ -2740,14 +2850,23 @@ async def _spawn_act_on_verdict_followon(
                 _artifact_pointer(artifact, str(task.id))
             ]
 
+    experiment_label = (task.first_payload or {}).get(
+        "experiment"
+    ) or "compute experiment"
+    if failure_mode:
+        title = f"diagnose-and-fix: {experiment_label}"[:200]
+        description = (
+            "Diagnose a failed compute experiment, fix the root cause, and ship a guard"
+        )
+    else:
+        title = f"act-on-verdict: {experiment_label}"[:200]
+        description = (
+            "Reason over a completed compute experiment's results and ship if warranted"
+        )
     child = Task(
         project_id=task.project_id,
-        title=f"act-on-verdict: {(task.first_payload or {}).get('experiment') or 'compute experiment'}"[
-            :200
-        ],
-        description=(
-            "Reason over a completed compute experiment's results and ship if warranted"
-        ),
+        title=title,
+        description=description,
         parent_task_id=task.id,
         payloads=[
             validate_internal_payload(
@@ -2780,10 +2899,253 @@ async def _spawn_act_on_verdict_followon(
         )
     )
     logger.info(
-        "[COMPUTE] Spawned act_on_verdict reason-and-ship follow-on %s for "
-        "experiment %s",
+        "[COMPUTE] Spawned act_on_verdict %s follow-on %s for experiment %s",
+        "diagnose-and-fix" if failure_mode else "reason-and-ship",
         child.id,
         task.id,
+    )
+    return child
+
+
+# Context key stamped on a sweep aggregate follow-on to distinguish it from
+# single-arm follow-ons (which carry _ACT_ON_VERDICT_SOURCE_KEY instead).
+_ACT_ON_VERDICT_SWEEP_KEY = "act_on_verdict_sweep_id"
+
+# Terminal states — a sweep arm in one of these is done contributing results.
+_TERMINAL_TASK_STATUSES = frozenset(
+    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED]
+)
+
+
+def _build_sweep_aggregate_prompt(
+    tasks: list,
+    sweep_id: str,
+    *,
+    failure_mode: bool = False,
+) -> str:
+    """Build the aggregate follow-on prompt covering all arms of a sweep."""
+    if failure_mode:
+        lines = [
+            "You are a fresh, independent engineer acting on a FAILED compute-experiment "
+            "sweep. One or more arms of the sweep did NOT produce a clean, measured result. "
+            "Diagnose the root causes and FIX them in this same task.",
+            "",
+            f"Sweep id: {sweep_id}",
+            f"Arms ({len(tasks)} total):",
+        ]
+    else:
+        lines = [
+            "You are a fresh, independent engineer acting on a COMPLETED compute-experiment "
+            "sweep. Reason over the aggregate results across all arms and SHIP in this same task.",
+            "",
+            f"Sweep id: {sweep_id}",
+            f"Arms ({len(tasks)} total):",
+        ]
+    for arm in tasks:
+        payload = arm.first_payload or {}
+        experiment = payload.get("experiment") or "(unnamed)"
+        hypothesis = payload.get("hypothesis") or "(no hypothesis)"
+        compute_result = (
+            (arm.plan_output or {}).get("compute_result")
+            if isinstance(arm.plan_output, dict)
+            else None
+        )
+        lines.append(f"\n  Arm task id: {arm.id}")
+        lines.append(f"  Experiment: {experiment}")
+        lines.append(f"  Hypothesis: {hypothesis}")
+        if compute_result:
+            lines.append(
+                "  Result:\n"
+                + "\n".join(
+                    "    " + ln
+                    for ln in json.dumps(
+                        compute_result, indent=2, default=str
+                    ).splitlines()
+                )
+            )
+        else:
+            lines.append(f"  Result: (none — arm status={arm.status})")
+    lines.append("")
+    if failure_mode:
+        lines.append(
+            "Diagnose the root cause(s) of the failure(s), then: implement fixes, "
+            "add regression guards, and open a PR. If a failure is a transient infra "
+            "blip or legitimately expected miss, record a no-op explaining why."
+        )
+    else:
+        lines.append(
+            "Reason about whether these aggregate results warrant a change to the "
+            "codebase. Compare arms where applicable. If warranted, implement the "
+            "change and open a PR. Otherwise, record a no-op explaining why."
+        )
+    return "\n".join(lines)
+
+
+async def _maybe_spawn_sweep_aggregate_followon(
+    session: AsyncSession,
+    task: Task,
+    sweep_id: str,
+    compute_result: dict[str, Any],
+    logs: str,
+    *,
+    failure_mode: bool = False,
+) -> Task | None:
+    """Spawn ONE aggregate disposition follow-on when ALL sweep arms are terminal.
+
+    If any sibling arm is still non-terminal, logs and returns None — a later
+    arm completion will re-evaluate. When all arms are terminal, spawns one
+    aggregate ``type=create`` child whose prompt covers every arm's result.
+
+    Idempotent: guards against double-spawn via ``_ACT_ON_VERDICT_SWEEP_KEY``
+    stamped in the child's context.
+    """
+    # Load all sibling tasks sharing this sweep_id on the same project.
+    sibling_rows = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == task.project_id,
+                    Task.payloads[0]["sweep_id"].as_string() == sweep_id,
+                    Task.payloads[0]["type"].as_string() == "compute_experiment",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if not sibling_rows:
+        # Defensive: treat self-only as a single-arm sweep and proceed.
+        sibling_rows = [task]
+
+    # The current task is being finalized right now (status not yet committed);
+    # exclude it from the non-terminal check so the last arm can trigger the spawn.
+    non_terminal = [
+        t
+        for t in sibling_rows
+        if t.status not in _TERMINAL_TASK_STATUSES and t.id != task.id
+    ]
+    if non_terminal:
+        logger.info(
+            "[COMPUTE] Sweep %s: arm %s terminal but %d sibling(s) still non-terminal; "
+            "deferring aggregate follow-on",
+            sweep_id,
+            task.id,
+            len(non_terminal),
+        )
+        return None
+
+    # All arms are terminal — check whether an aggregate follow-on already exists.
+    for sibling in sibling_rows:
+        existing = (
+            (
+                await session.execute(
+                    select(Task).where(Task.parent_task_id == sibling.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for ct in existing:
+            if (ct.context or {}).get(_ACT_ON_VERDICT_SWEEP_KEY) == sweep_id:
+                logger.info(
+                    "[COMPUTE] Sweep %s: aggregate follow-on %s already exists; "
+                    "skipping duplicate spawn",
+                    sweep_id,
+                    ct.id,
+                )
+                return ct
+
+    # Determine overall failure_mode: True when ANY arm failed non-intentionally.
+    any_failure = any(t.status == TaskStatus.FAILED for t in sibling_rows)
+    effective_failure_mode = failure_mode or any_failure
+
+    project = await session.get(Project, task.project_id)
+    base_branch = (task.first_payload or {}).get(
+        "base_branch"
+    ) or get_project_integration_branch(project)
+    create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
+
+    prompt = _build_sweep_aggregate_prompt(
+        list(sibling_rows), sweep_id, failure_mode=effective_failure_mode
+    )
+
+    # Collect durable artifact pointers from all arms (Pillar 5 spawn-forward).
+    artifact_prereqs: list[dict] = []
+    for sibling in sibling_rows:
+        sibling_result = (
+            (sibling.plan_output or {}).get("compute_result")
+            if isinstance(sibling.plan_output, dict)
+            else None
+        )
+        if sibling_result:
+            artifact_id = sibling_result.get("artifact_id")
+            if artifact_id:
+                try:
+                    artifact = await session.get(Artifact, uuid.UUID(str(artifact_id)))
+                except (ValueError, TypeError):
+                    artifact = None
+                if artifact is not None:
+                    artifact_prereqs.append(
+                        _artifact_pointer(artifact, str(sibling.id))
+                    )
+
+    context: dict[str, Any] = {
+        _ACT_ON_VERDICT_SWEEP_KEY: sweep_id,
+        "sweep_arm_task_ids": [str(t.id) for t in sibling_rows],
+    }
+    if artifact_prereqs:
+        context[ARTIFACT_PREREQUISITES_KEY] = artifact_prereqs
+
+    if effective_failure_mode:
+        title = f"diagnose-and-fix: sweep {sweep_id[:8]}"[:200]
+        description = "Diagnose failed sweep arms, fix root causes, and ship a guard"
+    else:
+        title = f"act-on-verdict: sweep {sweep_id[:8]}"[:200]
+        description = "Reason over a completed compute sweep's aggregate results and ship if warranted"
+
+    child = Task(
+        project_id=task.project_id,
+        title=title,
+        description=description,
+        parent_task_id=task.id,
+        payloads=[
+            validate_internal_payload(
+                {
+                    "type": "create",
+                    "prompt": prompt,
+                    "base_branch": base_branch,
+                    **({"prompt_suffix": create_suffix} if create_suffix else {}),
+                },
+                "task_completion:act_on_verdict_sweep",
+            )
+        ],
+        context=context,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        requires_approval=False,
+        depends_on=[],
+    )
+    session.add(child)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=child.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "ACT_ON_VERDICT_SWEEP",
+                "sweep_id": sweep_id,
+                "arm_task_ids": [str(t.id) for t in sibling_rows],
+            },
+        )
+    )
+    logger.info(
+        "[COMPUTE] Sweep %s: spawned aggregate %s follow-on %s covering %d arm(s)",
+        sweep_id,
+        "diagnose-and-fix" if effective_failure_mode else "reason-and-ship",
+        child.id,
+        len(sibling_rows),
     )
     return child
 
@@ -2823,6 +3185,7 @@ async def _handle_compute_experiment_completion(
         broadcast + knowledge AFTER it commits.
     """
     verdict = evaluate_terminal_output(task, logs)
+    sweep_id = (task.first_payload or {}).get("sweep_id") or None
 
     # Record the declared success-criterion verdict DURABLY on the task so the
     # operator and strategic consumers can read whether the experiment's goal
@@ -2946,6 +3309,19 @@ async def _handle_compute_experiment_completion(
             task.id,
             verdict.reason,
         )
+        # Crash-visibility fix: the gate failed before any compute_result was
+        # extracted, so the experiment's traceback is otherwise stranded in a
+        # GCS bundle. No intentional kill reaches this branch (kills carry an
+        # outcome + cost and pass the gate), so always spawn a tracked
+        # diagnose-and-fix follow-on. The experiment itself stays FAILED.
+        if sweep_id:
+            await _maybe_spawn_sweep_aggregate_followon(
+                session, task, sweep_id, {}, logs, failure_mode=True
+            )
+        else:
+            await _spawn_act_on_verdict_followon(
+                session, task, {}, logs, failure_mode=True
+            )
         await _finalize_compute_experiment(
             session,
             task,
@@ -2990,6 +3366,19 @@ async def _handle_compute_experiment_completion(
                 task.id,
                 miss_reason,
             )
+            # Spawn a diagnose-and-fix follow-on (forwarding the partial
+            # compute_result + any durable artifact pointer) UNLESS the outcome
+            # is an intentional kill — those are honest terminal states, not a
+            # defect to investigate. Experiment stays FAILED.
+            if outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES:
+                if sweep_id:
+                    await _maybe_spawn_sweep_aggregate_followon(
+                        session, task, sweep_id, compute_result, logs, failure_mode=True
+                    )
+                else:
+                    await _spawn_act_on_verdict_followon(
+                        session, task, compute_result, logs, failure_mode=True
+                    )
             await _finalize_compute_experiment(
                 session,
                 task,
@@ -3031,6 +3420,20 @@ async def _handle_compute_experiment_completion(
                 task.id,
                 miss_reason,
             )
+            # Crash-visibility fix: a SUCCESS/FAILURE outcome whose declared metric
+            # never materialized is the classic "ran but crashed before emitting
+            # the number" case. Intentional kills are already excluded by the
+            # guard above, so spawn a tracked diagnose-and-fix follow-on
+            # (forwarding the partial result + artifact pointer). Experiment stays
+            # FAILED.
+            if sweep_id:
+                await _maybe_spawn_sweep_aggregate_followon(
+                    session, task, sweep_id, compute_result, logs, failure_mode=True
+                )
+            else:
+                await _spawn_act_on_verdict_followon(
+                    session, task, compute_result, logs, failure_mode=True
+                )
             await _finalize_compute_experiment(
                 session,
                 task,
@@ -3049,17 +3452,31 @@ async def _handle_compute_experiment_completion(
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
 
-    # Axis B (opt-in): when the originating payload set ``act_on_verdict``, the
-    # ORCHESTRATOR spawns ONE write-capable reason-and-ship follow-on over this
-    # experiment's faithful result and the parent advances to EVALUATING to await
-    # it (mirroring the security_audit completion→spawn-create pattern). Faithful
-    # capture (axis A) below runs in BOTH cases — ``act_on_verdict`` ONLY gates the
-    # immediate follow-on spawn, never the capture. Absent/false: complete clean.
+    # Always-dispose (axis B): EVERY measured, non-prerequisite compute
+    # experiment now spawns ONE write-capable reason-and-ship follow-on over its
+    # faithful result; the parent advances to EVALUATING to await it (mirroring
+    # the security_audit completion→spawn-create pattern). The authoring-time
+    # ``act_on_verdict`` opt-in is retired — disposition is decided here, not at
+    # spawn. The spawn is concurrency-bounded
+    # (``max_concurrent_act_on_verdict_followons``): when the cap is reached no
+    # child spawns and the experiment completes clean, so the dispose is
+    # best-effort, never a hard blocker. Faithful capture (axis A) always runs.
+    #
+    # Intentional kills (budget/deadline/cancel) are EXCLUDED: they are honest,
+    # intended terminal outcomes whose experiment never produced a result to
+    # reason over, so there is nothing to dispose — exactly as the failure
+    # branches above exclude them. They complete clean with full capture.
     final_status = TaskStatus.COMPLETED
-    if bool((task.first_payload or {}).get("act_on_verdict")):
-        child = await _spawn_act_on_verdict_followon(
-            session, task, plan_output.get("compute_result") or {}, logs
-        )
+    result_outcome = (plan_output.get("compute_result") or {}).get("outcome")
+    if result_outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES:
+        if sweep_id:
+            child = await _maybe_spawn_sweep_aggregate_followon(
+                session, task, sweep_id, plan_output.get("compute_result") or {}, logs
+            )
+        else:
+            child = await _spawn_act_on_verdict_followon(
+                session, task, plan_output.get("compute_result") or {}, logs
+            )
         if child is not None:
             final_status = TaskStatus.EVALUATING
             task.latest_status_message = (

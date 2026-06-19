@@ -312,6 +312,14 @@ runtime_config: Dict = {
     # prior remediation is in flight or recently resolved.
     "max_concurrent_auto_remediations": 2,
     "residual_remediation_cooldown_hours": 24,
+    # Cap on a project's concurrent in-flight compute-experiment disposition
+    # follow-ons (the always-dispose reason-and-ship / diagnose-and-fix children
+    # spawned by _spawn_act_on_verdict_followon). When this many non-terminal
+    # type=create disposition children already exist for the project, a new
+    # terminal experiment skips its spawn (and completes/fails clean) rather than
+    # piling on; the dedup key is NOT stamped so a re-dispatch retries once the
+    # fleet drains. 0 disables the cap. Operator-tunable via runtime_config_json.
+    "max_concurrent_act_on_verdict_followons": 4,
     # Future-facing provider tier map used by multi-provider selection. v1 keeps
     # Anthropic as the only dispatch path but persists the structure now so v2
     # can enable provider-aware resolution without another config shape change.
@@ -1578,6 +1586,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "reaper_half_open_probe_limit",
                     "reaper_max_orphans_per_cycle",
                     "usage_headroom_threshold_pct",
+                    "max_concurrent_act_on_verdict_followons",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
