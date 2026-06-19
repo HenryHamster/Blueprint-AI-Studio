@@ -277,6 +277,15 @@ async def _redrive_deferred_unsynced_qualification(
     Returns True only when the re-entry actually STARTED a qualification
     (``status == "spawned"``) — i.e. the deferral cleared — so the sweep can
     count and log it.  A continued deferral or any guard no-op returns False.
+
+    **Rollback on non-spawned result**: when ``run_qualification`` returns any
+    status other than ``"spawned"`` (e.g. ``sha_error``, ``no_credentials``,
+    still-deferred), the session is rolled back rather than committed.  This
+    preserves the pre-existing ``last_qualification`` (including
+    ``first_deferred_at``) so the version stays in ``deferred_unsynced`` and
+    remains eligible for the next sweep.  Without the rollback an error result
+    would overwrite ``last_qualification`` with a non-deferred status, silently
+    removing the version from the re-drive loop.
     """
     # ``run_qualification`` lives in release_qualifier (the core coordinator);
     # import it lazily to avoid the load-time import cycle (release_qualifier
