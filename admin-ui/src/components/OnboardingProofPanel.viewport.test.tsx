@@ -220,4 +220,46 @@ describe('OnboardingProofPanel — viewport regression', () => {
       throw new Error('Stall warning must not render when journey is fully complete');
     }
   });
+
+  test('stall warning includes failed task count when tasks have failed', async () => {
+    await renderWith({
+      ...BASE_PROJECT,
+      onboarding_proof: PROOF_STALLED,
+      task_status_counts: { queued: 0, running: 0, evaluating: 0, blocked: 0, failed: 3, completed: 5, total: 8 },
+    });
+    const text = host!.textContent ?? '';
+    if (!text.includes('Journey stalled')) {
+      throw new Error('Expected stall warning but it was not rendered');
+    }
+    if (!text.includes('3 failed tasks')) {
+      throw new Error('Expected stall warning to include "3 failed tasks" but it was not found');
+    }
+  });
+
+  test('stall warning uses singular "task" for single failed task', async () => {
+    await renderWith({
+      ...BASE_PROJECT,
+      onboarding_proof: PROOF_STALLED,
+      task_status_counts: { queued: 0, running: 0, evaluating: 0, blocked: 0, failed: 1, completed: 5, total: 6 },
+    });
+    const text = host!.textContent ?? '';
+    if (!text.includes('1 failed task')) {
+      throw new Error('Expected stall warning to include "1 failed task" (singular) but it was not found');
+    }
+  });
+
+  test('stall warning omits failed task count when no tasks have failed', async () => {
+    await renderWith({
+      ...BASE_PROJECT,
+      onboarding_proof: PROOF_STALLED,
+      task_status_counts: { queued: 0, running: 0, evaluating: 0, blocked: 0, failed: 0, completed: 5, total: 5 },
+    });
+    const text = host!.textContent ?? '';
+    if (!text.includes('Journey stalled')) {
+      throw new Error('Expected stall warning but it was not rendered');
+    }
+    if (text.includes('failed task')) {
+      throw new Error('Stall warning should not include failed task count when failed=0');
+    }
+  });
 });

@@ -116,6 +116,8 @@ export function OnboardingProofPanel({ project }: Props) {
     stallWarning = staleFrontierWarning(completedMs[completedMs.length - 1], stepDurationsMs);
   }
 
+  const failedTaskCount = project.task_status_counts?.failed ?? 0;
+
   return (
     <div className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950/60 p-3">
       <div className="text-[11px] font-bold text-neutral-300 uppercase tracking-widest mb-2">
@@ -125,6 +127,7 @@ export function OnboardingProofPanel({ project }: Props) {
         <div className="mb-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 px-2.5 py-1.5">
           <span className="text-[11px] font-semibold text-amber-400">
             Journey stalled — pending for {stallWarning.pendingFor}
+            {failedTaskCount > 0 && ` (${failedTaskCount} failed ${failedTaskCount === 1 ? 'task' : 'tasks'})`}
           </span>
         </div>
       )}
