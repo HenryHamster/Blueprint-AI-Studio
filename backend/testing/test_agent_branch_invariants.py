@@ -447,6 +447,29 @@ class TestAgentBranchInvariants:
 # ---------------------------------------------------------------------------
 
 
+def _extract_plain_string_bytes(name: str, src: str) -> int | None:
+    """Return the byte length of a ``const NAME = '...'`` or ``"..."`` string body.
+
+    Walks forward from the opening quote, honouring ``\\`` escape sequences.
+    Returns ``None`` if the constant declaration is not found.
+    """
+    m = re.search(rf"(?:export\s+)?const\s+{re.escape(name)}\s*=\s*(['\"])", src)
+    if not m:
+        return None
+    quote = m.group(1)
+    i = m.end()
+    start = i
+    while i < len(src):
+        c = src[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == quote:
+            return i - start
+        i += 1
+    return None
+
+
 def _extract_template_literal_bytes(name: str, src: str) -> int | None:
     """Return the byte length of a ``const NAME = `...``` template literal body.
 
@@ -499,8 +522,7 @@ class TestPromptStaticBudget:
     #                      + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
     #                      + EDGES_CONSIDERED_GUIDANCE
     #   + PLAYBOOK_GUIDANCE
-    # (DEFAULT_TOOL_GUIDANCE is a regular string constant, not a template literal,
-    # and accounts for ~260 tokens / ~913 bytes not checked here.)
+    #   + DEFAULT_TOOL_GUIDANCE (plain string, ~913 bytes — measured separately below)
     _CODE_CHANGE_SECTIONS = [
         "SHARED_LIFECYCLE_PREAMBLE",
         "BLUEPRINT_CHECK_INTRO",
@@ -513,13 +535,24 @@ class TestPromptStaticBudget:
         "PLAYBOOK_GUIDANCE",
     ]
 
+    # Plain-string constants (single- or double-quoted) that are also part of
+    # the code-change static footprint.  Measured via _extract_plain_string_bytes.
+    _CODE_CHANGE_PLAIN_SECTIONS = [
+        "DEFAULT_TOOL_GUIDANCE",
+    ]
+
     # Calibrated ceiling: 12 000 tokens × 3.51 chars/token (ratio from the
-    # 2026-06-19 experiment).  Baseline: 9 723 tokens / 34 084 bytes.
+    # 2026-06-19 experiment).  Baseline: 9 723 tokens / 34 084 bytes
+    # + ~913 bytes DEFAULT_TOOL_GUIDANCE = ~34 997 bytes total.
     _BYTE_CEILING = 42_000
 
     def test_code_change_static_section_budget(self):
         """Combined byte count of code-change static sections stays under
         the 12 000-token calibrated ceiling.
+
+        Includes both template-literal sections and plain-string constants
+        (e.g. DEFAULT_TOOL_GUIDANCE) so growth in any static prompt section
+        is caught.
 
         Skipped when ``agent/src`` is not available in this environment.
         """
@@ -549,6 +582,20 @@ class TestPromptStaticBudget:
             "update _CODE_CHANGE_SECTIONS if they were renamed:\n" + "\n".join(missing)
         )
 
+        plain_missing: list[str] = []
+        for name in self._CODE_CHANGE_PLAIN_SECTIONS:
+            n = _extract_plain_string_bytes(name, src)
+            if n is None:
+                plain_missing.append(name)
+            else:
+                section_bytes[name] = n
+
+        assert not plain_missing, (
+            "Could not locate these prompt.ts plain-string constants — "
+            "update _CODE_CHANGE_PLAIN_SECTIONS if they were renamed:\n"
+            + "\n".join(plain_missing)
+        )
+
         total = sum(section_bytes.values())
         breakdown = "\n".join(
             f"  {k}: {v:,} bytes"
@@ -557,7 +604,7 @@ class TestPromptStaticBudget:
         assert total <= self._BYTE_CEILING, (
             f"Code-change static prompt sections exceeded the 12 000-token "
             f"byte budget ({total:,} > {self._BYTE_CEILING:,} bytes).\n"
-            f"Baseline (2026-06-19): 34 084 bytes / 9 723 tokens.\n"
+            f"Baseline (2026-06-19): ~34 997 bytes / ~9 983 tokens.\n"
             f"Reduce prompt text or raise the ceiling after operator review.\n"
             f"Per-section breakdown:\n{breakdown}"
         )
