@@ -21,7 +21,6 @@ from app.fix_loop_telemetry import (
     MAX_ATTEMPTS_PER_LOOP,
     apply_fix_loop_events,
     has_terminal_divergence,
-    stamp_fix_loop_divergence_computed_at,
     summarize_fix_loop_history,
 )
 from app.models import Project, ProjectMember, Task, TaskStatus
@@ -870,50 +869,3 @@ async def test_diverged_tasks_endpoint_filter_by_exit_reason(
 def test_fix_loop_divergence_staleness_window_days_is_positive_int():
     assert isinstance(FIX_LOOP_DIVERGENCE_STALENESS_WINDOW_DAYS, int)
     assert FIX_LOOP_DIVERGENCE_STALENESS_WINDOW_DAYS > 0
-
-
-def test_stamp_fix_loop_divergence_computed_at_writes_key():
-    from datetime import datetime
-
-    doc: dict = {}
-    fixed_now = datetime(2026, 5, 7, 12, 0, 0)
-    stamp_fix_loop_divergence_computed_at(doc, now=fixed_now)
-    assert doc["fix_loop_divergence_signal_last_computed_at"] == "2026-05-07T12:00:00"
-
-
-def test_stamp_fix_loop_divergence_computed_at_overwrites_existing():
-    doc: dict = {"fix_loop_divergence_signal_last_computed_at": "2020-01-01T00:00:00"}
-    from datetime import datetime
-
-    stamp_fix_loop_divergence_computed_at(doc, now=datetime(2026, 5, 7, 0, 0, 0))
-    assert doc["fix_loop_divergence_signal_last_computed_at"] == "2026-05-07T00:00:00"
-
-
-def test_stamp_fix_loop_divergence_computed_at_defaults_to_utcnow():
-    from datetime import datetime
-
-    doc: dict = {}
-    before = datetime.utcnow()
-    stamp_fix_loop_divergence_computed_at(doc)
-    after = datetime.utcnow()
-    ts_str = doc.get("fix_loop_divergence_signal_last_computed_at", "")
-    ts = datetime.fromisoformat(ts_str)
-    assert before <= ts <= after
-
-
-def test_stamp_fix_loop_divergence_computed_at_emits_naive_utc_string():
-    """Audit C10: the default-now heartbeat must be a tz-NAIVE ISO string.
-
-    The staleness watchdog parses this string and subtracts a naive _utcnow().
-    A tz-aware writer (datetime.now(timezone.utc)) would emit a '+00:00' suffix
-    that round-trips back to a different (offset) instant after the dispatcher's
-    naive normalisation, mis-dating the freshness check. Assert there is no tz
-    offset in the emitted string and that it round-trips to a naive datetime.
-    """
-    from datetime import datetime
-
-    doc: dict = {}
-    stamp_fix_loop_divergence_computed_at(doc)
-    ts_str = doc["fix_loop_divergence_signal_last_computed_at"]
-    assert "+00:00" not in ts_str and not ts_str.endswith("Z")
-    assert datetime.fromisoformat(ts_str).tzinfo is None

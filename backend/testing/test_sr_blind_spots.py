@@ -11,12 +11,10 @@ from app.sr_blind_spots import (
     DISALLOWED_BLIND_SPOT_PATTERNS,
     aggregate_sr_false_attestation_rates,
     compute_persistent_sr_blind_spot_hint,
-    count_reviewer_disagreements_in_tasks,
     filter_disallowed_blind_spots,
     has_reviewer_confirmed_categories,
     is_disallowed_blind_spot,
     stamp_sr_blind_spot_computed_at,
-    stamp_sr_catch_rate_computed_at,
     triage_sr_blind_spot_theme,
 )
 from testing.factories import make_task
@@ -500,7 +498,11 @@ def test_disagreement_directions_examples_include_pr_url_when_present():
             "_self_review_outcome": {
                 "check_results": {},
                 "reviewer_findings": [
-                    {"category": "correctness", "severity": "HIGH", "description": "Issue"}
+                    {
+                        "category": "correctness",
+                        "severity": "HIGH",
+                        "description": "Issue",
+                    }
                 ],
             },
         },
@@ -872,22 +874,6 @@ def test_persistent_hint_empty_when_window_below_min_sample():
     assert result["hint"] is None
 
 
-def test_persistent_hint_no_double_counting_with_catch_rate():
-    """Running compute_persistent_sr_blind_spot_hint does not alter count_reviewer_disagreements_in_tasks."""
-    now = datetime(2026, 1, 14, 12, 0, 0)
-    pid = uuid.uuid4()
-    tasks = [
-        _make_reviewer_miss_task(pid, created_at=now - timedelta(days=3))
-        for _ in range(3)
-    ] + [_make_clean_task(pid, created_at=now - timedelta(days=3)) for _ in range(2)]
-
-    counts_before = count_reviewer_disagreements_in_tasks(tasks)
-    compute_persistent_sr_blind_spot_hint(tasks, threshold=0.25, min_sample=3, now=now)
-    counts_after = count_reviewer_disagreements_in_tasks(tasks)
-
-    assert counts_before == counts_after
-
-
 def test_persistent_hint_multiple_categories_listed_in_hint():
     """When two categories exceed the threshold, the hint names both."""
     now = datetime(2026, 1, 14, 12, 0, 0)
@@ -1062,110 +1048,18 @@ def test_origin_sub_counters_sum_to_aggregate_miss():
     assert total_sub == bucket["miss"]
 
 
-# ---------------------------------------------------------------------------
-# Unit: stamp_sr_catch_rate_computed_at
-# ---------------------------------------------------------------------------
-
-
-def test_stamp_sr_catch_rate_computed_at_writes_heartbeat():
-    """Heartbeat is written into sr_catch_rate_trends.signal_last_computed_at."""
-    fixed = datetime(2026, 1, 15, 12, 0, 0)
-    doc: dict = {}
-    stamp_sr_catch_rate_computed_at(doc, now=fixed)
-    assert doc["sr_catch_rate_trends"]["signal_last_computed_at"] == fixed.isoformat()
-
-
 def test_stamp_helpers_default_now_emit_naive_utc_strings():
-    """Audit C10: default-now heartbeat stamps must be tz-NAIVE ISO strings.
+    """Audit C10: default-now heartbeat stamp must be tz-NAIVE ISO string.
 
-    The staleness watchdog parses these strings and subtracts a naive _utcnow().
+    The staleness watchdog parses this string and subtracts a naive _utcnow().
     A tz-aware writer (datetime.now(timezone.utc)) would emit a '+00:00' suffix
-    that the dispatcher then strips, mis-dating the freshness window. Assert both
-    sr_blind_spots stamp helpers default to naive UTC (no tz offset) so they stay
-    consistent with the watchdog and with task_results timestamps.
+    that the dispatcher then strips, mis-dating the freshness window.
     """
     blind_doc: dict = {}
     stamp_sr_blind_spot_computed_at(blind_doc)
     blind_ts = blind_doc["sr_blind_spot_signal_last_computed_at"]
     assert "+00:00" not in blind_ts and not blind_ts.endswith("Z")
     assert datetime.fromisoformat(blind_ts).tzinfo is None
-
-    catch_doc: dict = {}
-    stamp_sr_catch_rate_computed_at(catch_doc)
-    catch_ts = catch_doc["sr_catch_rate_trends"]["signal_last_computed_at"]
-    assert "+00:00" not in catch_ts and not catch_ts.endswith("Z")
-    assert datetime.fromisoformat(catch_ts).tzinfo is None
-
-
-def test_stamp_sr_catch_rate_computed_at_preserves_existing_keys():
-    """Existing keys in sr_catch_rate_trends are not clobbered."""
-    fixed = datetime(2026, 1, 15, 12, 0, 0)
-    doc: dict = {"sr_catch_rate_trends": {"computed_at": "old", "some_key": 42}}
-    stamp_sr_catch_rate_computed_at(doc, now=fixed)
-    assert doc["sr_catch_rate_trends"]["some_key"] == 42
-    assert doc["sr_catch_rate_trends"]["signal_last_computed_at"] == fixed.isoformat()
-
-
-def test_stamp_sr_catch_rate_computed_at_initialises_missing_trends():
-    """Works when sr_catch_rate_trends key is absent from doc."""
-    fixed = datetime(2026, 3, 1, 8, 30, 0)
-    doc: dict = {"other_key": "value"}
-    stamp_sr_catch_rate_computed_at(doc, now=fixed)
-    assert "sr_catch_rate_trends" in doc
-    assert doc["sr_catch_rate_trends"]["signal_last_computed_at"] == fixed.isoformat()
-    assert doc["other_key"] == "value"
-
-
-def test_stamp_sr_catch_rate_computed_at_data_sufficient_true():
-    """data_sufficient=True stamps both data_sufficient and last_sufficient_computed_at."""
-    fixed = datetime(2026, 4, 1, 10, 0, 0)
-    doc: dict = {}
-    stamp_sr_catch_rate_computed_at(doc, now=fixed, data_sufficient=True)
-    trends = doc["sr_catch_rate_trends"]
-    assert trends["signal_last_computed_at"] == fixed.isoformat()
-    assert trends["data_sufficient"] is True
-    assert trends["last_sufficient_computed_at"] == fixed.isoformat()
-
-
-def test_stamp_sr_catch_rate_computed_at_data_sufficient_false():
-    """data_sufficient=False stamps data_sufficient but does NOT stamp last_sufficient_computed_at."""
-    fixed = datetime(2026, 4, 1, 10, 0, 0)
-    doc: dict = {}
-    stamp_sr_catch_rate_computed_at(doc, now=fixed, data_sufficient=False)
-    trends = doc["sr_catch_rate_trends"]
-    assert trends["signal_last_computed_at"] == fixed.isoformat()
-    assert trends["data_sufficient"] is False
-    assert "last_sufficient_computed_at" not in trends
-
-
-def test_stamp_sr_catch_rate_computed_at_data_sufficient_false_preserves_existing():
-    """data_sufficient=False preserves an existing last_sufficient_computed_at (frozen trend detection)."""
-    fixed_old = datetime(2026, 3, 1, 0, 0, 0)
-    fixed_new = datetime(2026, 4, 1, 10, 0, 0)
-    doc: dict = {
-        "sr_catch_rate_trends": {
-            "signal_last_computed_at": fixed_old.isoformat(),
-            "last_sufficient_computed_at": fixed_old.isoformat(),
-            "data_sufficient": True,
-        }
-    }
-    stamp_sr_catch_rate_computed_at(doc, now=fixed_new, data_sufficient=False)
-    trends = doc["sr_catch_rate_trends"]
-    assert trends["signal_last_computed_at"] == fixed_new.isoformat()
-    assert trends["data_sufficient"] is False
-    # last_sufficient_computed_at must stay at the old value — not overwritten
-    assert trends["last_sufficient_computed_at"] == fixed_old.isoformat()
-
-
-def test_stamp_sr_catch_rate_computed_at_no_data_sufficient_omits_fields():
-    """Default call (no data_sufficient) does not write data_sufficient or last_sufficient_computed_at."""
-    fixed = datetime(2026, 4, 1, 10, 0, 0)
-    doc: dict = {}
-    stamp_sr_catch_rate_computed_at(doc, now=fixed)
-    trends = doc["sr_catch_rate_trends"]
-    assert trends["signal_last_computed_at"] == fixed.isoformat()
-    assert "data_sufficient" not in trends
-    assert "last_sufficient_computed_at" not in trends
 
 
 def test_has_reviewer_confirmed_categories_all_iterations_only():

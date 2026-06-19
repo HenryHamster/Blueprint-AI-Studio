@@ -81,18 +81,6 @@ def fleet_provisioning_is_spot() -> bool:
     return VM_PROVISIONING_MODEL == "SPOT"
 
 
-def get_fleet_vm_rate_per_second() -> float:
-    """Per-second VM rate for the fleet default machine type + provisioning model.
-
-    Used by warm-pool idle-cost accounting: an idle pool member bills GCE
-    wall-clock at the fleet's configured machine type and spot/on-demand mode,
-    not at any task-specific rate (it carries no task).
-    """
-    from app.compute import MACHINE_TYPE
-
-    return get_vm_rate_per_second(MACHINE_TYPE, spot=fleet_provisioning_is_spot())
-
-
 def idle_cost_usd(
     idle_seconds: float,
     *,

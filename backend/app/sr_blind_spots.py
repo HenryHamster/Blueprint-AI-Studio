@@ -129,38 +129,6 @@ def stamp_sr_blind_spot_computed_at(
     doc["sr_blind_spot_signal_last_computed_at"] = ts
 
 
-def stamp_sr_catch_rate_computed_at(
-    doc: dict,
-    now: datetime | None = None,
-    *,
-    data_sufficient: bool | None = None,
-) -> None:
-    """Write the current UTC timestamp into *doc* under the sr_catch_rate_trends
-    heartbeat key consumed by the pipeline staleness watchdog.
-
-    Mirrors stamp_sr_blind_spot_computed_at — call on every invocation of
-    compute_sr_catch_rate_trends, success or no-result alike, so the watchdog
-    can distinguish idle/low-data from genuinely broken.  Pass *now* in tests
-    to fix the clock.
-
-    When *data_sufficient* is provided it is written into the trends dict so
-    callers can distinguish 'job ran but had no data' (False) from 'trend
-    refreshed with real data' (True).  When True, ``last_sufficient_computed_at``
-    is also stamped so the staleness watchdog and UI can tell when the displayed
-    trend is actually current (a frozen trend continues advancing
-    ``signal_last_computed_at`` but ``last_sufficient_computed_at`` stays at the
-    last real computation).
-    """
-    ts = (now or _utcnow()).isoformat()  # Audit C10: naive-UTC stamp (see above)
-    trends = dict(doc.get("sr_catch_rate_trends") or {})
-    trends["signal_last_computed_at"] = ts
-    if data_sufficient is not None:
-        trends["data_sufficient"] = data_sufficient
-        if data_sufficient:
-            trends["last_sufficient_computed_at"] = ts
-    doc["sr_catch_rate_trends"] = trends
-
-
 def is_skipped_sr_outcome(sro: Dict[str, Any] | None) -> bool:
     """A self-review outcome is a 'skip' when the agent emitted the
     bash ./done fallback envelope: verdict=='unknown' with empty
@@ -244,30 +212,6 @@ async def _scan_blind_spot_counts(
         d["layer_distribution"] = dict(d["layer_distribution"])
 
     return theme_data
-
-
-async def compute_sr_blind_spot_themes(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    days: int = 14,
-    now: datetime | None = None,
-) -> None:
-    """Background variant of blind-spot aggregation that stamps the design-doc
-    staleness key consumed by the pipeline-regression dispatcher's
-    telemetry-staleness watchdog.
-
-    Call on task completion alongside compute_sr_catch_rate_trends so the
-    dispatcher can detect when this job stops running and spawn an
-    investigation automatically.
-    """
-    from app.shared_state import with_design_doc_locked
-
-    await with_design_doc_locked(
-        session,
-        project_id,
-        lambda doc: stamp_sr_blind_spot_computed_at(doc, now=now),
-    )
 
 
 async def aggregate_sr_blind_spot_themes(
@@ -394,167 +338,6 @@ _EXECUTION_EVIDENCE_CATEGORIES = (
 
 # Mirror playbook_learning._MIN_SR_SAMPLE — update both if the threshold changes.
 _SR_MIN_SAMPLE = 5
-
-
-def has_test_loop_signal(task) -> bool:
-    """Return True when the task's test fix-loop ran non-trivially.
-
-    'Non-trivial' means ≥2 test attempts, or a single attempt whose
-    exit_reason is not 'passed' (divergence, max-attempts, etc.).
-    """
-    history = getattr(task, "fix_loop_history", None) or {}
-    test_attempts = history.get("test") or []
-    if len(test_attempts) >= 2:
-        return True
-    if test_attempts:
-        last = test_attempts[-1]
-        if isinstance(last, dict):
-            reason = last.get("exit_reason")
-            if reason and reason != "passed":
-                return True
-    return False
-
-
-def aggregate_sr_regression_risk_test_signal(
-    tasks,
-    *,
-    min_sample: int = _SR_MIN_SAMPLE,
-) -> Dict[str, Any] | None:
-    """Synchronous aggregation of regression_risk vs test-signal for a task list.
-
-    Classifies each qualifying code-change task (non-skip SR outcome with
-    ``check_results.regression_risk.passed`` present) into one of four buckets:
-
-    - ``sr_passed_no_signal``   — true-pass: SR ok, test loop quiet
-    - ``sr_passed_with_signal`` — miss-by-test-signal: SR ok, test loop ran
-    - ``sr_failed_with_signal`` — hit-by-test-signal: SR flagged, test loop ran
-    - ``sr_failed_no_signal``   — false-flag: SR flagged, test loop quiet
-
-    Returns ``None`` when fewer than *min_sample* tasks qualify.
-    """
-    qualifying = []
-    for t in tasks:
-        if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
-            continue
-        ctx = t.context or {}
-        sro = ctx.get("_self_review_outcome")
-        if not sro or is_skipped_sr_outcome(sro):
-            continue
-        rr = (sro.get("check_results") or {}).get("regression_risk")
-        if not isinstance(rr, dict) or "passed" not in rr:
-            continue
-        qualifying.append(t)
-
-    if len(qualifying) < min_sample:
-        return None
-
-    stats: Dict[str, int] = {
-        "sr_passed_no_signal": 0,
-        "sr_passed_with_signal": 0,
-        "sr_failed_with_signal": 0,
-        "sr_failed_no_signal": 0,
-    }
-    for t in qualifying:
-        sro = (t.context or {}).get("_self_review_outcome") or {}
-        rr = (sro.get("check_results") or {}).get("regression_risk") or {}
-        sr_passed = bool(rr.get("passed"))
-        signal = has_test_loop_signal(t)
-        if sr_passed and signal:
-            stats["sr_passed_with_signal"] += 1
-        elif sr_passed:
-            stats["sr_passed_no_signal"] += 1
-        elif signal:
-            stats["sr_failed_with_signal"] += 1
-        else:
-            stats["sr_failed_no_signal"] += 1
-
-    numer = stats["sr_passed_with_signal"]
-    denom = stats["sr_passed_no_signal"] + stats["sr_passed_with_signal"]
-    rate = round(numer / denom, 3) if denom > 0 else None
-    return {
-        **stats,
-        "miss_by_test_signal_rate": rate,
-        "numerator": numer,
-        "denominator": denom,
-        "sample_size": len(qualifying),
-    }
-
-
-def aggregate_sr_scope_drift_vs_expansion(
-    tasks,
-    *,
-    min_sample: int = _SR_MIN_SAMPLE,
-) -> Dict[str, Any] | None:
-    """Cross-validate SR scope-drift verdict against the objective expansion_ratio signal.
-
-    Qualifying tasks: code-change type, non-skip SR outcome with a
-    ``check_results["scope-drift"]`` entry, and a pre-computed
-    ``expansion_ratio`` in task.context (set by the agent status router when
-    changed_files and related_files are both present on PR submission).
-
-    Four buckets:
-
-    - ``consistent``        — SR passed + ratio ≤ 1.5 (true-pass, not a miss)
-    - ``miss_by_expansion`` — SR passed + ratio ≥ 2.0 (SR missed scope drift)
-    - ``hit_by_expansion``  — SR failed scope-drift + ratio ≥ 1.5 (SR caught it)
-    - ``fp_candidate``      — SR failed scope-drift + ratio ≤ 1.0 (likely false positive)
-    - ``gray_zone``         — SR passed + 1.5 < ratio < 2.0 (ambiguous; not counted in rate)
-
-    Returns ``None`` when fewer than *min_sample* tasks qualify.
-    """
-    qualifying = []
-    for t in tasks:
-        if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
-            continue
-        ctx = t.context or {}
-        sro = ctx.get("_self_review_outcome")
-        if not sro or is_skipped_sr_outcome(sro):
-            continue
-        sd = (sro.get("check_results") or {}).get("scope-drift")
-        if not isinstance(sd, dict) or "passed" not in sd:
-            continue
-        if ctx.get("expansion_ratio") is None:
-            continue
-        qualifying.append(t)
-
-    if len(qualifying) < min_sample:
-        return None
-
-    stats: Dict[str, int] = {
-        "consistent": 0,
-        "miss_by_expansion": 0,
-        "hit_by_expansion": 0,
-        "fp_candidate": 0,
-        "gray_zone": 0,
-    }
-    for t in qualifying:
-        sro = (t.context or {}).get("_self_review_outcome") or {}
-        sd = (sro.get("check_results") or {}).get("scope-drift") or {}
-        sr_passed = bool(sd.get("passed"))
-        ratio = max(float((t.context or {}).get("expansion_ratio") or 1.0), 1.0)
-        if sr_passed:
-            if ratio <= 1.5:
-                stats["consistent"] += 1
-            elif ratio >= 2.0:
-                stats["miss_by_expansion"] += 1
-            else:
-                stats["gray_zone"] += 1
-        else:
-            if ratio >= 1.5:
-                stats["hit_by_expansion"] += 1
-            elif ratio <= 1.0:
-                stats["fp_candidate"] += 1
-
-    numer = stats["miss_by_expansion"]
-    denom = stats["consistent"] + stats["miss_by_expansion"]
-    rate = round(numer / denom, 3) if denom > 0 else None
-    return {
-        **stats,
-        "miss_by_expansion_rate": rate,
-        "numerator": numer,
-        "denominator": denom,
-        "sample_size": len(qualifying),
-    }
 
 
 # Canonical set of every NON-author origin the agent stamps on a fresh-reviewer
@@ -1026,23 +809,6 @@ def compute_persistent_sr_blind_spot_hint(
         " flagged issues the self-review pass missed."
     )
     return {"categories": persistent, "hint": hint}
-
-
-def count_reviewer_disagreements_in_tasks(tasks) -> Dict[tuple, int]:
-    """Single source of truth for the (category, task_type) -> count tally.
-
-    The caller is responsible for filtering tasks by status and by created_at
-    cutoff (each call site has slightly different fetch semantics — DB vs.
-    pre-fetched playbook list — but the disagreement-counting rule itself
-    must not drift between them).
-
-    A *disagreement* is counted for every reviewer_finding category that
-    self-review either omitted or marked ``passed: true``. Skipped/fallback
-    self-review envelopes are excluded so the bash ./done fallback does not
-    inflate counts.
-    """
-    counts = _count_reviewer_disagreement_directions(tasks)
-    return {key: bucket["miss"] for key, bucket in counts.items() if bucket["miss"] > 0}
 
 
 def _format_reviewer_disagreement_entry(
