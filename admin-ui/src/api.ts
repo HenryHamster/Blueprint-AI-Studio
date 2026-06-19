@@ -3555,6 +3555,32 @@ export async function fetchStructuralHealthObservability(
   return res.json();
 }
 
+export interface ObserveModeVerdictResponse {
+  verdict: 'go' | 'no_go' | 'insufficient_data';
+  window_hours: number;
+  observe_evaluations: number;
+  would_have_fired: number;
+  fire_rate_pct: number | null;
+  max_fire_rate_pct: number;
+  min_evaluations: number;
+}
+
+export async function fetchObserveModeVerdict(
+  windowHours = 168,
+  maxFireRatePct = 20.0,
+  minEvaluations = 10,
+  signal?: AbortSignal,
+): Promise<ObserveModeVerdictResponse> {
+  const params = new URLSearchParams({
+    window_hours: String(windowHours),
+    max_fire_rate_pct: String(maxFireRatePct),
+    min_evaluations: String(minEvaluations),
+  });
+  const res = await apiFetch(`/api/admin/evergreen/observe-mode-verdict?${params}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch observe mode verdict: ${res.status}`);
+  return res.json();
+}
+
 export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSettings>): Promise<void> {
   const res = await apiFetch('/api/admin/settings', {
     method: 'PATCH',

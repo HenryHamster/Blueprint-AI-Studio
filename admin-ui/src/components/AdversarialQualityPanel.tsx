@@ -17,7 +17,7 @@ function DistributionBar({ confirmed, revised, rejected }: { confirmed: number; 
 function GateHealthBadge({ failOpen, total }: { failOpen: number; total: number }) {
   const rate = total + failOpen > 0 ? failOpen / (total + failOpen) : 0;
   if (rate >= 0.3) return <span data-testid="health-badge" className="text-red-400 font-mono text-[10px]">DEGRADED</span>;
-  if (rate >= 0.1) return <span data-testid="health-badge" className="text-amber-400 font-mono text-[10px]">PARTIAL</span>;
+  if (rate >= 0.05) return <span data-testid="health-badge" className="text-amber-400 font-mono text-[10px]">PARTIAL</span>;
   return <span data-testid="health-badge" className="text-emerald-400 font-mono text-[10px]">HEALTHY</span>;
 }
 

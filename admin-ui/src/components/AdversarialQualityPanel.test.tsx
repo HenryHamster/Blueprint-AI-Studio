@@ -69,6 +69,20 @@ describe('AdversarialQualityPanel', () => {
     expect(el.querySelector('[data-testid="health-badge"]')?.textContent).toBe('HEALTHY');
   });
 
+  test('shows PARTIAL badge when fail-open rate is between 5% and 30%', async () => {
+    // 1 fail-open out of 19 normal = 1/20 = 5% — exactly at the new 5% PARTIAL threshold
+    axesPayload = {
+      ...BASE_AXES,
+      panel_review_effectiveness: makeEffectiveness({
+        challenged_escalated: 1,
+        total_challenged: 19,
+      }),
+    };
+    const el = render(<AdversarialQualityPanel projectId="proj-1" />);
+    await act(async () => {});
+    expect(el.querySelector('[data-testid="health-badge"]')?.textContent).toBe('PARTIAL');
+  });
+
   test('shows DEGRADED badge when fail-open rate >= 30%', async () => {
     axesPayload = {
       ...BASE_AXES,
