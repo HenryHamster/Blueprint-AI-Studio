@@ -10,14 +10,11 @@ import {
 } from '@dnd-kit/core';
 import type { DragEndEvent, DragStartEvent } from '@dnd-kit/core';
 import { arrayMove, SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
-import { TASK_TYPE_STYLES } from './TaskCard';
 import type { Task, TaskStatus } from './TaskCard';
 import { sortTasks, type TaskSortBy } from '../utils/taskCsv';
-import type { Project } from './ProjectDashboard';
 import {
   KanbanColumn as KanbanColumnComponent,
   SortableCard,
-  TaskItem,
   ColumnSelectCheckbox,
   ColumnArchiveButton,
 } from './KanbanColumn';
@@ -43,7 +40,6 @@ export interface KanbanColumn {
 
 const STORAGE_KEY = 'kanban_card_order';
 const ARCHIVABLE_COLUMNS: TaskStatus[] = ['COMPLETED', 'CANCELLED', 'FAILED'];
-const EMPTY_PROJECTS: Project[] = [];
 const SORT_LABELS: Record<SortBy, string> = {
   newest: 'Newest first',
   oldest: 'Oldest first',
@@ -130,8 +126,6 @@ export function KanbanBoard({
   searchQuery,
   onDirectionClick,
 }: KanbanBoardProps) {
-  const groupBy = 'status' as 'status' | 'type' | 'project';
-  const projects: Project[] = EMPTY_PROJECTS;
   const [columnOrder, setColumnOrder] = useState<Record<string, string[]>>(loadColumnOrder);
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [collapsedColumns, setCollapsedColumns] = useState<Set<string>>(loadCollapsedColumns);
@@ -345,14 +339,6 @@ export function KanbanBoard({
     columnRefs.current[targetColIndex]?.[targetCardIndex]?.focus();
   }, []);
 
-  const projectMap = useMemo(() => {
-    const map: Record<string, string> = {};
-    for (const p of projects) {
-      map[p.id] = p.name;
-    }
-    return map;
-  }, [projects]);
-
   const blockingMap = useMemo(() => {
     const map: Record<string, number> = {};
     for (const task of tasks) {
@@ -364,35 +350,6 @@ export function KanbanBoard({
     }
     return map;
   }, [tasks]);
-
-  const taskProps = useMemo(() => ({ selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick }), [selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick]);
-
-  const mobileGroupedSorted = useMemo(() => {
-    if (groupBy !== 'type') return {} as Record<string, Array<[string, Task[]]>>;
-    const result: Record<string, Array<[string, Task[]]>> = {};
-    for (const col of columns) {
-      const colTasks = tasksByColumn[col.id] ?? [];
-      const groups = new Map<string, Task[]>();
-      for (const task of colTasks) {
-        const type = task.task_type || 'create';
-        const list = groups.get(type) ?? [];
-        list.push(task);
-        groups.set(type, list);
-      }
-      result[col.id] = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-    }
-    return result;
-  }, [groupBy, columns, tasksByColumn]);
-
-  const mobileTaskFlatIndex = useMemo(() => {
-    if (groupBy !== 'type') return {} as Record<string, Map<string, number>>;
-    const result: Record<string, Map<string, number>> = {};
-    for (const col of columns) {
-      const colTasks = tasksByColumn[col.id] ?? [];
-      result[col.id] = new Map(colTasks.map((t, i) => [t.id, i]));
-    }
-    return result;
-  }, [groupBy, columns, tasksByColumn]);
 
   const taskIdsByColumn = useMemo(() => {
     const result: Record<string, string[]> = {};
@@ -447,101 +404,7 @@ export function KanbanBoard({
             ? (taskId: string) => onShiftSelect(taskId, taskIds)
             : undefined;
 
-          let mobileContent: React.ReactNode;
-          if (groupBy === 'type') {
-            const sorted = mobileGroupedSorted[col.id] ?? [];
-            const taskFlatIndex = mobileTaskFlatIndex[col.id] ?? new Map<string, number>();
-            mobileContent = sorted.length === 0 && !loading ? (
-              <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">No tasks</div>
-            ) : (
-              <>
-                {sorted.map(([type, typeTasks]) => {
-                  const style = TASK_TYPE_STYLES[type];
-                  const label = style?.label ?? type.toUpperCase();
-                  return (
-                    <div key={type} className="mb-3">
-                      <div className={`sticky top-0 z-[5] flex items-center gap-1.5 px-2 py-1 mb-2 rounded text-[10px] font-bold uppercase tracking-wider border ${style ? `${style.bg} ${style.text}` : 'bg-neutral-800/50 border-neutral-700/50 text-neutral-400'}`}>
-                        <span>{label}</span>
-                        <span className="opacity-60">({typeTasks.length})</span>
-                      </div>
-                      <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
-                        {typeTasks.map(task => {
-                          const flatIdx = taskFlatIndex.get(task.id) ?? 0;
-                          return (
-                            <TaskItem
-                              key={task.id}
-                              task={task}
-                              {...taskProps}
-                              onShiftClick={shiftClickHandler}
-                              blockingCount={blockingMap[task.id]}
-                              isTracked={trackedTaskIds?.has(task.id)}
-                              colIdx={colIdx}
-                              cardIdx={flatIdx}
-                              cardRef={makeCardRef(colIdx, flatIdx)}
-                              onNavigate={handleNavigate}
-                            />
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })}
-              </>
-            );
-          } else if (groupBy === 'project') {
-            const groups = new Map<string, Task[]>();
-            for (const task of columnTasks) {
-              const key = task.project_id ?? '__none__';
-              const list = groups.get(key) ?? [];
-              list.push(task);
-              groups.set(key, list);
-            }
-            const sorted = [...groups.entries()].sort((a, b) => {
-              if (a[0] === '__none__') return 1;
-              if (b[0] === '__none__') return -1;
-              const nameA = projectMap[a[0]] ?? a[0];
-              const nameB = projectMap[b[0]] ?? b[0];
-              return nameA.localeCompare(nameB);
-            });
-            const taskFlatIndex = new Map(columnTasks.map((t, i) => [t.id, i]));
-            mobileContent = sorted.length === 0 && !loading ? (
-              <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">No tasks</div>
-            ) : (
-              <>
-                {sorted.map(([projectId, projectTasks]) => {
-                  const name = projectId === '__none__' ? 'No Project' : (projectMap[projectId] ?? projectId);
-                  return (
-                    <div key={projectId} className="mb-3">
-                      <div className="sticky top-0 z-[5] flex items-center gap-1.5 px-2 py-1 mb-2 rounded text-[10px] font-bold uppercase tracking-wider bg-neutral-800/50 border border-neutral-700/50 text-neutral-400">
-                        <span className="truncate max-w-[200px]" title={name}>{name}</span>
-                        <span className="opacity-60 shrink-0">({projectTasks.length})</span>
-                      </div>
-                      <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
-                        {projectTasks.map(task => {
-                          const flatIdx = taskFlatIndex.get(task.id) ?? 0;
-                          return (
-                            <TaskItem
-                              key={task.id}
-                              task={task}
-                              {...taskProps}
-                              onShiftClick={shiftClickHandler}
-                              blockingCount={blockingMap[task.id]}
-                              isTracked={trackedTaskIds?.has(task.id)}
-                              colIdx={colIdx}
-                              cardIdx={flatIdx}
-                              cardRef={makeCardRef(colIdx, flatIdx)}
-                              onNavigate={handleNavigate}
-                            />
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })}
-              </>
-            );
-          } else {
-            mobileContent = (
+          const mobileContent = (
               <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
                 <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
                   {columnTasks.map((task, cardIdx) => (
@@ -584,7 +447,6 @@ export function KanbanBoard({
                 )}
               </div>
             );
-          }
 
           return (
             <div key={col.id} className="flex-1 overflow-y-auto p-3 custom-scrollbar">
@@ -644,8 +506,6 @@ export function KanbanBoard({
               compact={compact}
               selectionMode={selectionMode}
               selectedTaskIds={selectedTaskIds}
-              groupBy={groupBy}
-              projectMap={projectMap}
               blockingMap={blockingMap}
               trackedTaskIds={trackedTaskIds}
               maxRetries={maxRetries}

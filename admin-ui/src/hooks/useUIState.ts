@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useReducer, useCallback } from 'react';
+import { useState, useRef, useReducer, useCallback } from 'react';
 
 export function useUIState() {
   // Panel visibility
@@ -36,23 +36,9 @@ export function useUIState() {
   const [showSettings, setShowSettings] = useState(false);
   const [showDirections, setShowDirections] = useState(false);
   const [showMetrics, setShowMetrics] = useState(false);
-  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
   const [showUserManagement, setShowUserManagement] = useState(false);
 
   const settingsRef = useRef<HTMLDivElement>(null);
-  const shortcutHelpRef = useRef<HTMLDivElement>(null);
-
-  // Close shortcut help on outside click
-  useEffect(() => {
-    if (!showShortcutHelp) return;
-    const handleClick = (e: MouseEvent) => {
-      if (shortcutHelpRef.current && !shortcutHelpRef.current.contains(e.target as Node)) {
-        setShowShortcutHelp(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [showShortcutHelp]);
 
   // Selection mode
   const [selectionMode, setSelectionMode] = useState(false);
@@ -132,9 +118,8 @@ export function useUIState() {
     showSettings, setShowSettings,
     showDirections, setShowDirections,
     showMetrics, setShowMetrics,
-    showShortcutHelp, setShowShortcutHelp,
     showUserManagement, setShowUserManagement,
-    settingsRef, shortcutHelpRef,
+    settingsRef,
     selectionMode, setSelectionMode, selectedTaskIds, setSelectedTaskIds,
     toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
     confirmDialog, setConfirmDialog,

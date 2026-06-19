@@ -6,7 +6,7 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { TaskCard, TASK_TYPE_STYLES, FAILURE_CLASS_CONFIG } from './TaskCard';
+import { TaskCard, FAILURE_CLASS_CONFIG } from './TaskCard';
 import type { Task, TaskStatus } from './TaskCard';
 import type { KanbanColumn as KanbanColumnConfig, SortBy } from './KanbanBoard';
 import { getFailureClassBreakdown } from '../utils/failureClass';
@@ -371,8 +371,6 @@ export interface KanbanColumnProps {
   compact?: boolean;
   selectionMode: boolean;
   selectedTaskIds: Set<string>;
-  groupBy: 'status' | 'type' | 'project';
-  projectMap: Record<string, string>;
   blockingMap: Record<string, number>;
   trackedTaskIds?: Set<string>;
   maxRetries: number;
@@ -413,8 +411,6 @@ export function KanbanColumn({
   compact,
   selectionMode,
   selectedTaskIds,
-  groupBy,
-  projectMap,
   blockingMap,
   trackedTaskIds,
   maxRetries,
@@ -450,168 +446,49 @@ export function KanbanColumn({
   }, [onShiftSelect, taskIds]);
   const effectiveShiftClickHandler = onShiftSelect ? shiftClickHandler : undefined;
 
-  const taskProps = useMemo(() => ({ selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick }), [selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick]);
-
-  let content: React.ReactNode;
-
-  if (groupBy === 'type') {
-    const groups = new Map<string, Task[]>();
-    for (const task of columnTasks) {
-      const type = task.task_type || 'create';
-      const list = groups.get(type) ?? [];
-      list.push(task);
-      groups.set(type, list);
-    }
-    const sorted = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-    const taskFlatIndex = new Map(columnTasks.map((t, i) => [t.id, i]));
-    content = sorted.length === 0 && !loading ? (
-      <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">No tasks</div>
-    ) : (
-      <>
-        {sorted.map(([type, typeTasks]) => {
-          const style = TASK_TYPE_STYLES[type];
-          const label = style?.label ?? type.toUpperCase();
-          return (
-            <div key={type} className="mb-3">
-              <div className="space-y-0.5">
-                <div className={`sticky top-0 z-[5] flex items-center gap-1.5 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider border ${style ? `${style.bg} ${style.text}` : 'bg-neutral-800/50 border-neutral-700/50 text-neutral-400'}`}>
-                  <span>{label}</span>
-                  <span className="opacity-60">({typeTasks.length})</span>
-                </div>
-                {col.id === 'FAILED' && typeTasks.length > 0 && (
-                  <div className="px-2">
-                    <FailureClassBreakdown tasks={typeTasks} />
-                  </div>
-                )}
-              </div>
-              <div className={compact ? 'space-y-1.5 mt-2' : 'space-y-2 mt-2'}>
-                {typeTasks.map(task => {
-                  const flatIdx = taskFlatIndex.get(task.id) ?? 0;
-                  return (
-                    <TaskItem
-                      key={task.id}
-                      task={task}
-                      {...taskProps}
-                      onShiftClick={effectiveShiftClickHandler}
-                      blockingCount={blockingMap[task.id]}
-                      isTracked={trackedTaskIds?.has(task.id)}
-                      colIdx={colIdx}
-                      cardIdx={flatIdx}
-                      cardRef={getCardRef(flatIdx)}
-                      onNavigate={handleNavigate}
-                    />
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
-      </>
-    );
-  } else if (groupBy === 'project') {
-    const groups = new Map<string, Task[]>();
-    for (const task of columnTasks) {
-      const key = task.project_id ?? '__none__';
-      const list = groups.get(key) ?? [];
-      list.push(task);
-      groups.set(key, list);
-    }
-    const sorted = [...groups.entries()].sort((a, b) => {
-      if (a[0] === '__none__') return 1;
-      if (b[0] === '__none__') return -1;
-      const nameA = projectMap[a[0]] ?? a[0];
-      const nameB = projectMap[b[0]] ?? b[0];
-      return nameA.localeCompare(nameB);
-    });
-    const taskFlatIndex = new Map(columnTasks.map((t, i) => [t.id, i]));
-    content = sorted.length === 0 && !loading ? (
-      <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">No tasks</div>
-    ) : (
-      <>
-        {sorted.map(([projectId, projectTasks]) => {
-          const name = projectId === '__none__' ? 'No Project' : (projectMap[projectId] ?? projectId);
-          return (
-            <div key={projectId} className="mb-3">
-              <div className="space-y-0.5">
-                <div className="sticky top-0 z-[5] flex items-center gap-1.5 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider bg-neutral-800/50 border border-neutral-700/50 text-neutral-400">
-                  <span className="truncate max-w-[200px]" title={name}>{name}</span>
-                  <span className="opacity-60 shrink-0">({projectTasks.length})</span>
-                </div>
-                {col.id === 'FAILED' && projectTasks.length > 0 && (
-                  <div className="px-2">
-                    <FailureClassBreakdown tasks={projectTasks} />
-                  </div>
-                )}
-              </div>
-              <div className={compact ? 'space-y-1.5 mt-2' : 'space-y-2 mt-2'}>
-                {projectTasks.map(task => {
-                  const flatIdx = taskFlatIndex.get(task.id) ?? 0;
-                  return (
-                    <TaskItem
-                      key={task.id}
-                      task={task}
-                      {...taskProps}
-                      onShiftClick={effectiveShiftClickHandler}
-                      blockingCount={blockingMap[task.id]}
-                      isTracked={trackedTaskIds?.has(task.id)}
-                      colIdx={colIdx}
-                      cardIdx={flatIdx}
-                      cardRef={getCardRef(flatIdx)}
-                      onNavigate={handleNavigate}
-                    />
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
-      </>
-    );
-  } else {
-    content = (
-      <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
-        <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
-          {columnTasks.map((task, cardIdx) => (
-            <SortableCard
-              key={task.id}
-              task={task}
-              maxRetries={maxRetries}
-              actionLoadingMap={actionLoadingMap}
-              selectionMode={selectionMode}
-              selectedTaskIds={selectedTaskIds}
-              onToggleTaskSelection={onToggleTaskSelection}
-              onShiftClick={effectiveShiftClickHandler}
-              onCtrlClick={onCtrlClick}
-              compact={compact}
-              blockingCount={blockingMap[task.id]}
-              colIdx={colIdx}
-              cardIdx={cardIdx}
-              cardRef={getCardRef(cardIdx)}
-              onNavigate={handleNavigate}
-              onApprove={onApprove}
-              onRequestChanges={onRequestChanges}
-              onCancel={onCancel}
-              onRetry={onRetry}
-              onEditPrompt={onEditPrompt}
-              onDismiss={onDismiss}
-              onArchive={onArchive}
-              onViewLogs={onViewLogs}
-              onTrack={onTrack}
-              isTracked={trackedTaskIds?.has(task.id)}
-              onDuplicate={onDuplicate}
-              searchQuery={searchQuery}
-              onDirectionClick={onDirectionClick}
-            />
-          ))}
-        </SortableContext>
-        {columnTasks.length === 0 && !loading && (
-          <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
-            No tasks
-          </div>
-        )}
-      </div>
-    );
-  }
+  const content = (
+    <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
+      <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
+        {columnTasks.map((task, cardIdx) => (
+          <SortableCard
+            key={task.id}
+            task={task}
+            maxRetries={maxRetries}
+            actionLoadingMap={actionLoadingMap}
+            selectionMode={selectionMode}
+            selectedTaskIds={selectedTaskIds}
+            onToggleTaskSelection={onToggleTaskSelection}
+            onShiftClick={effectiveShiftClickHandler}
+            onCtrlClick={onCtrlClick}
+            compact={compact}
+            blockingCount={blockingMap[task.id]}
+            colIdx={colIdx}
+            cardIdx={cardIdx}
+            cardRef={getCardRef(cardIdx)}
+            onNavigate={handleNavigate}
+            onApprove={onApprove}
+            onRequestChanges={onRequestChanges}
+            onCancel={onCancel}
+            onRetry={onRetry}
+            onEditPrompt={onEditPrompt}
+            onDismiss={onDismiss}
+            onArchive={onArchive}
+            onViewLogs={onViewLogs}
+            onTrack={onTrack}
+            isTracked={trackedTaskIds?.has(task.id)}
+            onDuplicate={onDuplicate}
+            searchQuery={searchQuery}
+            onDirectionClick={onDirectionClick}
+          />
+        ))}
+      </SortableContext>
+      {columnTasks.length === 0 && !loading && (
+        <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
+          No tasks
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <React.Fragment>

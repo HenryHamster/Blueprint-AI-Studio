@@ -601,9 +601,6 @@ export default function App() {
         onSignOut={() => signOut(auth)}
         userEmail={s.user.email || ''}
         wsRef={s.wsRef}
-        showShortcutHelp={s.showShortcutHelp}
-        onToggleShortcutHelp={() => s.setShowShortcutHelp(prev => !prev)}
-        shortcutHelpRef={s.shortcutHelpRef}
         showSettings={s.showSettings}
         onToggleSettings={s.handleToggleSettings}
         settingsRef={s.settingsRef}
