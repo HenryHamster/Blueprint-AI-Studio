@@ -46,7 +46,7 @@ function FailureClassBreakdown({ tasks }: { tasks: Task[] }) {
   );
 }
 
-export interface SortableCardProps {
+interface SortableCardProps {
   task: Task;
   maxRetries: number;
   actionLoadingMap: Record<string, string>;
@@ -279,7 +279,7 @@ export function ColumnArchiveButton({
   );
 }
 
-export interface KanbanColumnProps {
+interface KanbanColumnProps {
   col: KanbanColumnConfig;
   colIdx: number;
   columnTasks: Task[];
