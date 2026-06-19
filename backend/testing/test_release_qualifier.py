@@ -13295,6 +13295,49 @@ async def test_sweep_leaves_not_promoted_when_head_unchanged(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_redrive_requalifies_zero_gating_ready_version(db_session, mocker):
+    """A stabilize-phase version with not_promoted verdict, a non-audit blocker,
+    ZERO carried high/medium audit findings, and automain advanced to a new SHA
+    is re-driven into run_qualification by the sweep; a fresh qualification spawns.
+
+    Acceptance proof: version transitions from not_promoted to pending and an
+    audit task is created — matching the declared task acceptance evidence. This
+    test verifies the fix for the gating_total==0 short-circuit: a version whose
+    only blocker was non-audit (e.g. ci_not_green) and that is now ready should
+    be re-driven, not skipped."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Stale not_promoted verdict with non-audit blocker, zero gating findings.
+    old_sha = "oldsha0" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "ci_not_green",
+        "audit_findings": [],  # Zero gating findings
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # automain has advanced to a NEW SHA (different from old_sha).
+    new_sha = "automn0" * 5 + "00000"
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    # Synced — LTS gate passes.
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+    await db_session.refresh(version)
+    # Stale verdict overwritten — qualification started.
+    assert version.last_qualification["status"] == "pending"
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_sweep_skips_already_finalized_version(db_session):
     """A version whose last_qualification is not 'pending' is skipped — the
     sweep only acts on stuck pending records."""
@@ -16963,21 +17006,26 @@ async def test_calcification_not_fired_below_attempt_threshold(db_session):
 
 
 @pytest.mark.asyncio
-async def test_sweep_triggers_calcification_check(db_session):
+async def test_sweep_triggers_calcification_check(db_session, mocker):
     """The sweep runs the calcification check after finalizing stuck versions —
     a version that already has enough hard-blocker failures gets an alert."""
     from app.models import Alert as _Alert
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    # No pending qualification — the sweep won't try to finalize this version.
-    # But it should still check for calcification.
+    # automain HEAD matches the candidate SHA — run_qualification returns
+    # cached_verdict (no-op), preserving the not_promoted status so the
+    # calcification check can fire.
+    same_sha = "automn0" * 5 + "00000"
     version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS
     version.last_qualification = {
         "status": "not_promoted",
         "blocker": "ci_not_green",
+        "candidate_sha": same_sha,
     }
     db_session.add(version)
     await db_session.commit()
+
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=same_sha))
 
     await rq.sweep_stuck_qualifications(
         db_session, session_factory=_shared_session_factory(db_session)

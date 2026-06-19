@@ -285,9 +285,7 @@ async def _redrive_deferred_unsynced_qualification(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as redrive_session:
-        version = await redrive_session.get(
-            release_version.ReleaseVersion, version_id
-        )
+        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
         if version is None:
             return False
         qual = version.last_qualification
@@ -349,9 +347,7 @@ async def _redrive_not_promoted_qualification(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as redrive_session:
-        version = await redrive_session.get(
-            release_version.ReleaseVersion, version_id
-        )
+        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
         if version is None:
             return False
         qual = version.last_qualification
@@ -361,18 +357,22 @@ async def _redrive_not_promoted_qualification(
             or version.phase != "stabilize"
         ):
             return False
-        # Guard: only re-drive when there are gating findings AND all are resolved.
-        # A version with zero gating findings (e.g. blocked by ci_not_green or
-        # other non-audit blockers) has nothing to re-drive via the finding-
-        # resolution path — skip it so the lifecycle stall checks (calcification)
-        # see the original not_promoted state unchanged.
+        # Readiness guard: all gating audit findings must be ledger-resolved.
+        # compute_requalification_readiness returns requalification_ready=True in two
+        # cases: (1) zero carried high/medium audit findings (e.g. version blocked by
+        # non-audit blocker like ci_not_green that has since cleared), or (2) all
+        # gating findings ledger-resolved.  In both cases the version is eligible for
+        # re-qualification against the current automain HEAD.
         readiness = await compute_requalification_readiness(
             redrive_session, version.project_id
         )
         if not readiness.get("requalification_ready"):
             return False
-        if readiness.get("gating_total", 0) == 0:
-            return False
+        # The real backstop against redundant re-runs is run_qualification's cached-
+        # verdict guard: under its FOR UPDATE lock, it re-resolves the candidate SHA.
+        # If automain has NOT advanced (same SHA), run_qualification returns cached_
+        # verdict (no-op).  If automain HAS advanced, the cached-verdict miss spawns a
+        # fresh qualification.
         result = await release_qualifier.run_qualification(
             redrive_session, version.project_id, version
         )
