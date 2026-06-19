@@ -1067,6 +1067,10 @@ class OnboardPayload(BaseModel):
     # subset (only the ``context`` / ``constraints`` keys are applied; other
     # keys are ignored by the seeding path). None/omitted is a no-op.
     initial_steering: Dict[str, Any] | None = None
+    # When set, enables the warm VM pool for this project at onboarding time
+    # with the given per-project target size, avoiding a separate operator
+    # action after creation. preview_only=True suppresses this.
+    warm_pool_target_size: int | None = Field(None, ge=1, le=50)
 
 
 # --- Pipeline Efficiency ---
