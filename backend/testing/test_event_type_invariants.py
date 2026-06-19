@@ -28,24 +28,32 @@ def test_extract_event_types_from_source():
     3. Failing with a clear message if any event_type is missing
     """
     snapshot_path = Path(__file__).parent / "event_type_snapshot.json"
-    source_path = Path(__file__).parent.parent / "app" / "notification_dispatch.py"
+    app_dir = Path(__file__).parent.parent / "app"
+
+    # Source files that emit event_type literals included in the snapshot
+    source_paths = [
+        app_dir / "notification_dispatch.py",
+        app_dir / "capability_trial_verdict.py",
+    ]
 
     assert snapshot_path.exists(), "event_type_snapshot.json not found"
-    assert source_path.exists(), "notification_dispatch.py not found"
+    for sp in source_paths:
+        assert sp.exists(), f"{sp.name} not found"
 
     # Load the snapshot
     with open(snapshot_path) as f:
         snapshot = json.load(f)
     snapshot_events = {et["name"] for et in snapshot["event_types"]}
 
-    # Extract event_type="..." from source using regex
-    with open(source_path) as f:
-        source_code = f.read()
-
+    # Extract event_type="..." from all source files using regex
     # Find all event_type="..." patterns (both function args and dict keys)
     # Matches: event_type="value" and "event_type": "value"
     pattern = r'(?:event_type|"event_type")\s*[:=]\s*["\']([^"\']+)["\']'
-    source_events = set(re.findall(pattern, source_code))
+    source_events: set[str] = set()
+    for source_path in source_paths:
+        with open(source_path) as f:
+            source_code = f.read()
+        source_events.update(re.findall(pattern, source_code))
 
     # Validate no drift
     missing_in_snapshot = source_events - snapshot_events
