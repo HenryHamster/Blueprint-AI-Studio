@@ -171,6 +171,7 @@ export function CapabilityTrialsPanel({ digest, projectId, onRefreshDigest }: { 
                   <span className="font-medium text-neutral-200 break-words">{name}</span>
                   <div className="shrink-0 text-right">
                     <span className={`font-medium ${verdictClass(v.verdict)}`}>{v.verdict}</span>
+                    {v.is_stalled && <span className="ml-1 inline-block px-1 py-0.5 rounded text-[9px] font-medium bg-amber-900/40 text-amber-400 border border-amber-700/40">Stalled</span>}
                     {v.verdict_reason && <div className="text-neutral-500">{v.verdict_reason}</div>}
                   </div>
                 </div>
@@ -240,6 +241,7 @@ export function CapabilityTrialsPanel({ digest, projectId, onRefreshDigest }: { 
                 </td>
                 <td className="text-right px-3 py-2">
                   <span className={`font-medium ${verdictClass(v.verdict)}`}>{v.verdict}</span>
+                  {v.is_stalled && <span className="ml-1 inline-block px-1 py-0.5 rounded text-[9px] font-medium bg-amber-900/40 text-amber-400 border border-amber-700/40">Stalled</span>}
                   {v.verdict_reason && <div className="text-[10px] text-neutral-500">{v.verdict_reason}</div>}
                   {v.immediate_alert && <div className="text-[10px] text-red-300">Immediate alert</div>}
                   {v.arm_composition && <div className="text-[10px] text-neutral-500">{v.arm_composition.with_assigned ?? 0}+{v.arm_composition.with_receipt ?? 0}w / {v.arm_composition.without_assigned ?? 0}+{v.arm_composition.without_receipt ?? 0}wo{(v.arm_composition.without_contaminated ?? 0) > 0 ? <span className="text-amber-400 ml-1">· {v.arm_composition.without_contaminated} contaminated</span> : null}</div>}

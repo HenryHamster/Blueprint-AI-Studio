@@ -1942,12 +1942,15 @@ async def _compute_digest(
                 "alternative_projections": _alternative_projections,
             }
 
-        # Escalate permanently stalled trials to a durable deduplicated operator notice.
-        _stalled_trials = [
-            (_cap, _entry)
-            for _cap, _entry in _augmented_verdicts.items()
-            if isinstance(_entry, dict) and is_trial_stalled(_entry)
-        ]
+        # Stamp is_stalled on every augmented verdict entry and collect stalled ones.
+        _stalled_trials: list[tuple[str, dict[str, Any]]] = []
+        for _cap, _entry in _augmented_verdicts.items():
+            if not isinstance(_entry, dict):
+                continue
+            _stalled = is_trial_stalled(_entry)
+            _entry["is_stalled"] = _stalled
+            if _stalled:
+                _stalled_trials.append((_cap, _entry))
         if _stalled_trials:
             try:
                 await persist_stalled_trial_notices_in_transaction(

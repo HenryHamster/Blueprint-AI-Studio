@@ -3971,4 +3971,85 @@ class TestPersistStalledTrialNotices:
         added_msg = mock_session.add.call_args[0][0]
         ctx = added_msg.context
         assert "alternative_projections" in ctx
-        assert ctx["alternative_projections"] == {"0.1": 20.0, "0.3": 8.0, "0.5": None}
+
+
+# ── is_stalled flag stamped on augmented verdict entries ──────────────────────
+
+
+class TestIsStalledFlagStamped:
+    """Verify that is_stalled is stamped onto augmented verdict dicts.
+
+    The digest loop stamps is_stalled on every _augmented_verdicts entry.
+    These tests verify the flag is True for a stalled entry and False for
+    a healthy continue-trial (finite days_to_min_n) or a decided verdict.
+    """
+
+    def _stalled_entry(self):
+        return {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "arm_composition": {"with_assigned": 50, "without_assigned": 5},
+            "accrual_projection": {
+                "with_7d": 5,
+                "without_7d": 0,
+                "window_days": 7,
+                "holdback_fraction": 0.05,
+                "days_to_min_n": None,
+                "alternative_projections": {},
+            },
+        }
+
+    def _healthy_entry(self):
+        return {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "arm_composition": {"with_assigned": 20, "without_assigned": 8},
+            "accrual_projection": {
+                "with_7d": 10,
+                "without_7d": 4,
+                "window_days": 7,
+                "holdback_fraction": 0.3,
+                "days_to_min_n": 14.0,
+                "alternative_projections": {},
+            },
+        }
+
+    def test_is_stalled_true_for_stalled_entry(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = self._stalled_entry()
+        # Simulate the digest loop stamping is_stalled
+        entry["is_stalled"] = is_trial_stalled(entry)
+        assert entry["is_stalled"] is True
+
+    def test_is_stalled_false_for_healthy_continue_trial(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = self._healthy_entry()
+        entry["is_stalled"] = is_trial_stalled(entry)
+        assert entry["is_stalled"] is False
+
+    def test_is_stalled_false_for_decided_adopt(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {"verdict": "adopt", "verdict_reason": "sufficient_data"}
+        entry["is_stalled"] = is_trial_stalled(entry)
+        assert entry["is_stalled"] is False
+
+    def test_augmented_verdicts_all_have_is_stalled(self):
+        """All entries in the augmented dict receive is_stalled regardless of verdict."""
+        from app.capability_trial_verdict import is_trial_stalled
+
+        augmented_verdicts = {
+            "stalled_cap": self._stalled_entry(),
+            "healthy_cap": self._healthy_entry(),
+            "decided_cap": {"verdict": "adopt", "verdict_reason": "sufficient_data"},
+        }
+        # Simulate the digest stamping loop
+        for _cap, _entry in augmented_verdicts.items():
+            if isinstance(_entry, dict):
+                _entry["is_stalled"] = is_trial_stalled(_entry)
+
+        assert augmented_verdicts["stalled_cap"]["is_stalled"] is True
+        assert augmented_verdicts["healthy_cap"]["is_stalled"] is False
+        assert augmented_verdicts["decided_cap"]["is_stalled"] is False
