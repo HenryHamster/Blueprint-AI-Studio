@@ -136,7 +136,6 @@ from app.routers.admin_release_version import (  # noqa: E402, F401
     set_version_phase,
 )
 
-_SIGNAL_STALENESS_TITLE_PREFIX = "Signal staleness: "
 
 # Pipeline-observability endpoints relocated to app.routers.admin_pipeline_observability
 # (cluster 1/4 — keep admin_digest focused on the catch-up digest). Re-exported here so
