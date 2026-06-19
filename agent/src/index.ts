@@ -249,12 +249,6 @@ export function readAgentSourceSha(): string | null {
 /** Get the current agent token (may have been refreshed since startup). */
 export function getAgentToken(): string { return AGENT_TOKEN; }
 
-/** Get the current API headers (Content-Type + X-Agent-Token). Always reads
- *  the live AGENT_TOKEN, so callers don't need to guard against rotation. */
-export function getAgentHeaders(): Record<string, string> {
-  return { 'Content-Type': 'application/json', 'X-Agent-Token': AGENT_TOKEN };
-}
-
 /** Test-only: override the live agent token used by main()/api calls. */
 export function _setAgentTokenForTesting(value: string): void {
   AGENT_TOKEN = value;
@@ -2202,14 +2196,6 @@ export function clearLogBuffer(): void {
   logBuffer.splice(0);
 }
 
-export function flushLogBuffer(ws: WebSocket) {
-  while (logBuffer.length > 0) {
-    const entry = logBuffer[0];
-    try { ws.send(JSON.stringify({ type: 'log', content: entry.content })); } catch { break; }
-    logBuffer.shift();
-  }
-}
-
 // Replay the log buffer at a rate ≤15 msgs/s to stay safely under the
 // backend's 20 msg/s close-threshold (routers/projects.py).
 export async function replayLogBufferRateLimited(ws: WebSocket): Promise<void> {
@@ -2517,27 +2503,6 @@ export function execFileAsync(
       reject(e);
     });
   });
-}
-
-/** Commit with captured stderr. Returns true if a commit was created,
- *  false if there was nothing to commit (pre-commit hook may have reverted
- *  changes, or the working tree was already clean). Throws with full
- *  stdout+stderr for any other failure — the default execFileSync error
- *  only echoes the command, which hides the real cause. */
-export function gitCommit(message: string, cwd = WORKSPACE): boolean {
-  try {
-    execFileSync('git', ['-C', cwd, 'commit', '-m', message], { encoding: 'utf-8' });
-    return true;
-  } catch (e: unknown) {
-    const err = e as { stderr?: string | Buffer; stdout?: string | Buffer; message?: string };
-    const stderr = (err.stderr ? err.stderr.toString() : '').trim();
-    const stdout = (err.stdout ? err.stdout.toString() : '').trim();
-    const combined = [stdout, stderr].filter(Boolean).join('\n');
-    if (/nothing to commit|nothing added to commit|no changes added to commit/i.test(combined)) {
-      return false;
-    }
-    throw new Error(`git commit failed: ${combined || err.message || 'unknown error'}`);
-  }
 }
 
 /** Async git that doesn't block the event loop — use for long operations (push, clone)

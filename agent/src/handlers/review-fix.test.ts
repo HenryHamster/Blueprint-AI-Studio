@@ -37,7 +37,6 @@ vi.mock('../index.js', () => ({
   validateBranchName: vi.fn((b: string) => b),
   git: vi.fn().mockReturnValue(''),
   gitAsync: vi.fn().mockResolvedValue(''),
-  gitCommit: vi.fn().mockReturnValue(true),
   setupWorkspace: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
   extractPytestSelectorsFromOutput: vi.fn((output: string) => {

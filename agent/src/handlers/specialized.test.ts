@@ -29,7 +29,6 @@ vi.mock('../index.js', async (importOriginal) => {
     validateBranchName: vi.fn((b: string, _label: string) => b),
     git: vi.fn().mockReturnValue(''),
     gitAsync: vi.fn().mockResolvedValue(''),
-    gitCommit: vi.fn().mockReturnValue(true),
     setupWorkspace: vi.fn(),
     runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
     cloneWithRetry: vi.fn().mockResolvedValue(undefined),

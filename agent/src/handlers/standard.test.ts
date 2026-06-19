@@ -28,7 +28,6 @@ vi.mock('../index.js', async (importOriginal) => {
     readHandlerOutput: vi.fn(),
     validateBranchName: vi.fn((b: string, _label: string) => b),
     git: vi.fn().mockReturnValue(''),
-    gitCommit: vi.fn().mockReturnValue(true),
     setupWorkspace: vi.fn().mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' }),
     runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
     sendHeartbeatSync: vi.fn(),

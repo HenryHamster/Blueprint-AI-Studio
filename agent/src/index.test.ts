@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiGet, apiRequest, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import {
   __resetTaskCapabilityContractForTesting,
@@ -3080,46 +3080,6 @@ describe('recordToolUse', () => {
   });
 });
 
-// ── flushLogBuffer ───────────────────────────────────────────────────────────
-describe('flushLogBuffer', () => {
-  beforeEach(() => {
-    // Drain any entries from prior tests by flushing into a no-op sink.
-    const sink = { send: vi.fn() } as unknown as WebSocket;
-    flushLogBuffer(sink);
-  });
-
-  it('sends all buffered entries and empties the buffer on success', () => {
-    appendToLogBuffer('one');
-    appendToLogBuffer('two');
-    const ws = { send: vi.fn() } as unknown as WebSocket;
-    flushLogBuffer(ws);
-    expect((ws.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(2);
-    expect(snapshotLogBuffer().length).toBe(0);
-  });
-
-  it('retains the failing entry in the buffer when ws.send throws', () => {
-    appendToLogBuffer('will-fail');
-    appendToLogBuffer('never-attempted');
-    const ws = { send: vi.fn(() => { throw new Error('socket closed'); }) } as unknown as WebSocket;
-    flushLogBuffer(ws);
-    const remaining = snapshotLogBuffer();
-    expect(remaining.length).toBe(2);
-    expect(remaining[0].content).toBe('will-fail');
-    expect(remaining[1].content).toBe('never-attempted');
-  });
-
-  it('keeps only the unsent entries when send fails mid-flush', () => {
-    appendToLogBuffer('a');
-    appendToLogBuffer('b');
-    appendToLogBuffer('c');
-    let call = 0;
-    const ws = { send: vi.fn(() => { call += 1; if (call === 2) throw new Error('fail'); }) } as unknown as WebSocket;
-    flushLogBuffer(ws);
-    const remaining = snapshotLogBuffer();
-    expect(remaining.map(e => e.content)).toEqual(['b', 'c']);
-  });
-});
-
 // ── replayLogBufferRateLimited ────────────────────────────────────────────────
 describe('replayLogBufferRateLimited', () => {
   beforeEach(() => {
@@ -3358,7 +3318,7 @@ describe('park directives and warm continuation', () => {
   const originalTaskId = process.env.TASK_ID;
   const originalVmInstanceId = process.env.VM_INSTANCE_ID;
   const originalAgentToken = process.env.AGENT_SECRET_TOKEN;
-  const originalLiveAgentToken = getAgentHeaders()['X-Agent-Token'];
+  const originalLiveAgentToken = getAgentToken();
 
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -4063,7 +4023,7 @@ describe('bootstrapPoolMode', () => {
       timeoutMs: 250,
     }));
     expect(process.env.TASK_ID).toBe('pool-task-1');
-    expect(getAgentHeaders()['X-Agent-Token']).toBe('pool-jwt-1');
+    expect(getAgentToken()).toBe('pool-jwt-1');
     expect(process.env.BLUEPRINT_WARM_HANDOFF).toBeUndefined();
   });
 
@@ -4577,7 +4537,7 @@ describe('main pool-mode startup ordering', () => {
       prior_pr_number: null,
     });
     expect(process.env.TASK_ID).toBe('pool-task-main-1');
-    expect(getAgentHeaders()['X-Agent-Token']).toBe(makeTaskToken('pool-task-main-1'));
+    expect(getAgentToken()).toBe(makeTaskToken('pool-task-main-1'));
     expect(process.env.BLUEPRINT_WARM_HANDOFF).toBeUndefined();
     expect(vi.mocked(fs.unlinkSync).mock.calls).toEqual(expect.arrayContaining([
       ['/tmp/task_stale-persisted_result.json'],
@@ -4986,29 +4946,6 @@ describe('pollForNextRole auth-revoked', () => {
       expect(line).not.toContain('ghp_secretToken1234');
       expect(line).toContain('x-access-token:***@');
     }
-  });
-});
-
-// ── getAgentHeaders — Issue 3 ───────────────────────────────────────────────
-describe('getAgentHeaders', () => {
-  it('returns headers with Content-Type and X-Agent-Token reflecting the live AGENT_TOKEN', () => {
-    const headers = getAgentHeaders();
-    expect(headers['Content-Type']).toBe('application/json');
-    // The exact AGENT_TOKEN value depends on how the test harness was started
-    // (process.env.AGENT_SECRET_TOKEN). The contract is just that the field
-    // is present with a string value — token rotation is exercised by the
-    // production tryRefreshToken path which reads back the same module-level
-    // AGENT_TOKEN variable that getAgentHeaders reads.
-    expect(typeof headers['X-Agent-Token']).toBe('string');
-    expect(Object.keys(headers).sort()).toEqual(['Content-Type', 'X-Agent-Token']);
-  });
-
-  it('returns a fresh object each call (no shared mutable reference)', () => {
-    // Callers shouldn't be able to mutate one returned headers object and
-    // affect a subsequent call's headers. Object identity must differ.
-    const h1 = getAgentHeaders();
-    const h2 = getAgentHeaders();
-    expect(h1).not.toBe(h2);
   });
 });
 
