@@ -5599,6 +5599,40 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_review_second_opinion_sample_rate_round_trip(
+        self, client: AsyncClient
+    ):
+        """review_second_opinion_sample_rate accepts floats in [0.0, 1.0],
+        rejects out-of-range values and non-numbers, and round-trips on GET."""
+        for rate in (0.0, 0.5, 1.0):
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"review_second_opinion_sample_rate": rate},
+            )
+            assert resp.status_code == 200, f"PATCH {rate} failed: {resp.text}"
+            get_resp = await client.get("/api/admin/settings")
+            assert get_resp.json()["review_second_opinion_sample_rate"] == rate
+
+        for bad_val in (-0.1, 1.1):
+            bad = await client.patch(
+                "/api/admin/settings",
+                json={"review_second_opinion_sample_rate": bad_val},
+            )
+            assert bad.status_code == 400, f"Expected 400 for {bad_val}"
+
+        bad_str = await client.patch(
+            "/api/admin/settings",
+            json={"review_second_opinion_sample_rate": "half"},
+        )
+        assert bad_str.status_code == 400
+
+        bad_unknown = await client.patch(
+            "/api/admin/settings",
+            json={"review_second_opinion_sample_rate_typo": 0.5},
+        )
+        assert bad_unknown.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_patch_warm_pool_project_allowlist_round_trip(
         self, client: AsyncClient
     ):
