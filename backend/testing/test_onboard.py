@@ -3649,3 +3649,150 @@ class TestOnboardRepoBootstrapSpawn:
         assert len(bootstrap_tasks) == 0, (
             "repo_is_empty project must not spawn a repo_bootstrap task"
         )
+
+
+class TestOnboardWarmPool:
+    """Tests for warm_pool_target_size opt-in at onboarding time."""
+
+    def _common_patches(self):
+        return (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_onboard_with_warm_pool_target_size_calls_enable(
+        self, client: AsyncClient, db_session
+    ):
+        """Passing warm_pool_target_size enables the pool and seeds the project."""
+        apply_calls = []
+        seed_calls = []
+
+        async def _fake_apply(payload, session, config):
+            apply_calls.append(payload)
+
+        async def _fake_seed(session, project_id, user_id):
+            seed_calls.append({"project_id": str(project_id), "user_id": user_id})
+            return {
+                "project_id": str(project_id),
+                "seeded": 3,
+                "recycled": 0,
+                "drained": 0,
+            }
+
+        fake_lock = MagicMock()
+        fake_lock.__aenter__ = AsyncMock(return_value=None)
+        fake_lock.__aexit__ = AsyncMock(return_value=False)
+
+        p1, p2, p3 = self._common_patches()
+        with (
+            p1,
+            p2,
+            p3,
+            patch("app.routers.admin_settings._apply_settings", _fake_apply),
+            patch("app.routers.admin_warm_pool._seed_project_pool", _fake_seed),
+            patch("app.warm_pool.warm_pool_project_scope", return_value=set()),
+            patch("app.warm_pool.warm_pool_project_target_map", return_value={}),
+            patch("app.shared_state.runtime_config", MagicMock()),
+            patch("app.shared_state.runtime_config_lock", fake_lock),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "stsbot2",
+                    "warm_pool_target_size": 3,
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "project_id" in data
+
+        # _apply_settings was called with correct warm-pool keys
+        assert len(apply_calls) == 1
+        applied = apply_calls[0]
+        assert applied["warm_pool_enabled"] is True
+        assert applied["warm_pool_target_size_by_project"][data["project_id"]] == 3
+
+        # _seed_project_pool was called for the new project
+        assert len(seed_calls) == 1
+        assert seed_calls[0]["project_id"] == data["project_id"]
+
+        # Response carries warm_pool summary
+        assert data["warm_pool"]["enabled"] is True
+        assert data["warm_pool"]["target_size"] == 3
+        assert data["warm_pool"]["seeded"] == 3
+
+    @pytest.mark.asyncio
+    async def test_onboard_without_warm_pool_target_size_skips_pool(
+        self, client: AsyncClient, db_session
+    ):
+        """Omitting warm_pool_target_size leaves warm-pool state untouched."""
+        seed_calls = []
+
+        async def _fake_seed(session, project_id, user_id):
+            seed_calls.append(project_id)
+            return {}
+
+        p1, p2, p3 = self._common_patches()
+        with (
+            p1,
+            p2,
+            p3,
+            patch("app.routers.admin_warm_pool._seed_project_pool", _fake_seed),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "no-pool"},
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "warm_pool" not in data
+        assert len(seed_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_onboard_preview_only_skips_warm_pool(
+        self, client: AsyncClient, db_session
+    ):
+        """preview_only=True with warm_pool_target_size does NOT call the enable path."""
+        apply_calls = []
+
+        async def _fake_apply(payload, session, config):
+            apply_calls.append(payload)
+
+        p1, p2, p3 = self._common_patches()
+        with (
+            p1,
+            p2,
+            p3,
+            patch("app.routers.admin_settings._apply_settings", _fake_apply),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "preview-pool",
+                    "warm_pool_target_size": 2,
+                    "preview_only": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "warm_pool" not in data
+        assert len(apply_calls) == 0

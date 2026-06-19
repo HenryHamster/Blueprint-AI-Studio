@@ -151,6 +151,8 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "release_auto_merge_stalled",
         "strategic_steering_deferred",
         "strategic_steering_acted",
+        "capability_trial_stalled",
+        "capability_verdict_decided",
     }
 )
 

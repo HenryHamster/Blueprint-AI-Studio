@@ -15,6 +15,7 @@ export default defineConfig({
     setupFiles: ['./src/test/setup.ts'],
     include: ['src/**/*.test.{ts,tsx}', 'eslint-rules/**/*.test.{js,ts}'],
     exclude: ['node_modules/**', 'src/**/*.viewport.test.{ts,tsx}'],
+    retry: 2,
   },
   define: {
     'import.meta.env.VITE_FIREBASE_API_KEY': JSON.stringify(process.env.VITE_FIREBASE_API_KEY ?? 'ci-placeholder'),

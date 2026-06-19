@@ -1518,8 +1518,15 @@ export interface PanelReviewEffectiveness {
   challenged_revised: number;
   challenged_rejected: number;
   total_challenged: number;
-  overturn_rate: number;
+  overturn_rate: number | null;
   cost_per_challenge_usd?: number | null;
+  challenged_escalated?: number;
+}
+
+export interface ChallengerSampleRateRecommendation {
+  status: 'no_data' | 'insufficient_data' | 'gate_earning' | 'reduce';
+  recommended_sample_rate: number | null;
+  rationale: string;
 }
 
 export interface VmCostAttributionEntry {
@@ -1568,6 +1575,9 @@ export interface EfficiencyAxesResponse {
   // total gate invocations from the latest snapshot. Null when no gate
   // invocations exist in the window. Optional for older backends.
   panel_review_effectiveness?: PanelReviewEffectiveness | null;
+  // Data-driven recommended sample_rate for the challenger gate, computed from
+  // the latest snapshot's overturn_rate. Optional for older backends.
+  panel_review_recommended_sample_rate?: ChallengerSampleRateRecommendation | null;
   // VM cost attribution: per-task-type breakdown of infrastructure spend from
   // the latest snapshot, showing which task types (review, create, side-car, etc.)
   // dominate VM spend. Optional for older backends.
@@ -3427,6 +3437,8 @@ export interface EvergreenFillDecisionRecord {
   reason: string;
   trigger: string | null;
   project_id: string | null;
+  /** ISO timestamp; present when backed by the durable log (not in-memory fallback). */
+  ts?: string;
 }
 
 export interface EvergreenFillObservabilityResponse {
@@ -3543,6 +3555,38 @@ export async function fetchStructuralHealthObservability(
   return res.json();
 }
 
+export interface ObserveModeVerdictResponse {
+  verdict: 'go' | 'no_go' | 'insufficient_data';
+  verdict_reason: string;
+  window_hours: number;
+  observe_evaluations: number;
+  would_have_fired: number;
+  fire_rate_pct: number | null;
+  max_fire_rate_pct: number;
+  min_evaluations: number;
+  daily_cap: number;
+  cap_adjusted_would_have_fired: number;
+  cap_adjusted_fire_rate_pct: number | null;
+}
+
+export async function fetchObserveModeVerdict(
+  windowHours = 168,
+  maxFireRatePct = 20.0,
+  minEvaluations = 10,
+  dailyCap = 3,
+  signal?: AbortSignal,
+): Promise<ObserveModeVerdictResponse> {
+  const params = new URLSearchParams({
+    window_hours: String(windowHours),
+    max_fire_rate_pct: String(maxFireRatePct),
+    min_evaluations: String(minEvaluations),
+    daily_cap: String(dailyCap),
+  });
+  const res = await apiFetch(`/api/admin/evergreen/observe-mode-verdict?${params}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch observe mode verdict: ${res.status}`);
+  return res.json();
+}
+
 export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSettings>): Promise<void> {
   const res = await apiFetch('/api/admin/settings', {
     method: 'PATCH',
@@ -3587,6 +3631,23 @@ export interface VisualPilotStatus {
     early_pause_infra_rate: number;
   };
   generated_at: string;
+}
+
+export async function declareCapabilityVerdict(
+  projectId: string,
+  capName: string,
+  verdict: 'adopt' | 'reject' | 'continue-trial',
+  rationale?: string,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/admin/projects/${projectId}/capability-trials/declare`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cap_name: capName, verdict, rationale: rationale ?? null }),
+    },
+  );
+  if (!res.ok) throw new Error(`Failed to declare capability verdict: ${res.status}`);
 }
 
 export async function fetchVisualPilotStatus(

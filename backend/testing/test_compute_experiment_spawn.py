@@ -277,6 +277,41 @@ async def test_sync_whitelist_applies_persisted_threshold():
             rcs.runtime_config["compute_experiment_spend_threshold_usd"] = prev
 
 
+def test_act_on_verdict_followon_cap_default_present():
+    from app.runtime_config_state import runtime_config
+
+    val = runtime_config.get("max_concurrent_act_on_verdict_followons")
+    assert isinstance(val, int)
+    assert val == 4  # sane positive default
+
+
+@pytest.mark.asyncio
+async def test_sync_whitelist_applies_act_on_verdict_followon_cap():
+    from types import SimpleNamespace
+
+    from app import runtime_config_state as rcs
+    from app.models import DeploymentStatus
+
+    prev = rcs.runtime_config.get("max_concurrent_act_on_verdict_followons")
+    try:
+        state = SimpleNamespace(
+            status=DeploymentStatus.STABLE,
+            runtime_max_concurrent_vms=None,
+            runtime_max_retries=None,
+            runtime_max_autonomous_tasks_per_hour=None,
+            runtime_max_global_autonomous_tasks_per_hour=None,
+            runtime_autonomous_research_interval_minutes=None,
+            runtime_autonomous_direction_cooldown_minutes=None,
+            runtime_config_json={"max_concurrent_act_on_verdict_followons": 9},
+        )
+        changed = await rcs.sync_runtime_config_from_state(state)
+        assert "max_concurrent_act_on_verdict_followons" in changed
+        assert rcs.runtime_config["max_concurrent_act_on_verdict_followons"] == 9
+    finally:
+        if prev is not None:
+            rcs.runtime_config["max_concurrent_act_on_verdict_followons"] = prev
+
+
 # --- act_on_verdict reason-and-ship follow-on (axis B) --------------------
 #
 # These DB-backed tests pin the ORCHESTRATOR completion->spawn-create behaviour
@@ -354,9 +389,10 @@ async def _succeeded_job(db_session, task, *, result_reference: str | None = Non
 async def test_act_on_verdict_spawns_write_capable_followon(
     db_session, _quiet_compute_io
 ):
-    """act_on_verdict=true → exactly one type=create child, created_by=ORCHESTRATOR,
-    carrying the hypothesis + both arms in its prompt and (since a durable
-    gs:// artifact exists) an artifact_prerequisites pointer in its context."""
+    """Always-dispose: a successful experiment spawns exactly one type=create
+    child, created_by=ORCHESTRATOR, carrying the hypothesis + both arms in its
+    prompt and (since a durable gs:// artifact exists) an artifact_prerequisites
+    pointer in its context. No authoring-time opt-in is required."""
     task = await _make_compute_task(
         db_session,
         {
@@ -365,7 +401,6 @@ async def test_act_on_verdict_spawns_write_capable_followon(
             "experiment": "mcts-rollout-depth",
             "hypothesis": "deeper rollouts beat the shallow baseline",
             "metric": "win_rate",
-            "act_on_verdict": True,
             "acceptance_evidence": {
                 "kind": "downstream_artifact",
                 "artifact_id": "experiment-result-bundle",
@@ -431,11 +466,13 @@ async def test_act_on_verdict_spawns_write_capable_followon(
 
 
 @pytest.mark.asyncio
-async def test_act_on_verdict_absent_spawns_no_followon_but_captures(
+async def test_success_always_spawns_followon_without_opt_in(
     db_session, _quiet_compute_io
 ):
-    """act_on_verdict absent/false → NO child spawned, parent COMPLETED, and the
-    faithful capture (axis A) is still recorded on plan_output."""
+    """Always-dispose (opt-in retired): a successful experiment with NO
+    act_on_verdict flag now ALWAYS spawns exactly one disposition follow-on, and
+    the parent advances to EVALUATING to await it. Faithful capture (axis A) is
+    still recorded on plan_output."""
     task = await _make_compute_task(
         db_session,
         {
@@ -449,7 +486,8 @@ async def test_act_on_verdict_absent_spawns_no_followon_but_captures(
     await _handle_compute_experiment_completion(task, _result_with_arms(), db_session)
 
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED
+    # Parent advances to EVALUATING to await the always-spawned follow-on.
+    assert task.status == TaskStatus.EVALUATING
     # Axis A capture still happens.
     assert task.plan_output["compute_result"]["outcome"] == "SUCCESS"
     assert task.plan_output["compute_result"]["final_cost_usd"] == pytest.approx(0.42)
@@ -459,14 +497,19 @@ async def test_act_on_verdict_absent_spawns_no_followon_but_captures(
         .scalars()
         .all()
     )
-    assert children == []
+    assert len(children) == 1
+    child = children[0]
+    assert child.first_payload["type"] == "create"
+    assert child.created_by == "ORCHESTRATOR"
+    assert child.status == TaskStatus.QUEUED
+    # Success framing: reason-and-ship, not diagnose-and-fix.
+    assert child.title.startswith("act-on-verdict:")
 
 
 @pytest.mark.asyncio
-async def test_act_on_verdict_spawn_is_idempotent_on_replay(
-    db_session, _quiet_compute_io
-):
-    """A second completion dispatch must not spawn a duplicate follow-on."""
+async def test_dedup_guard_blocks_double_spawn_on_replay(db_session, _quiet_compute_io):
+    """A second completion dispatch must not spawn a duplicate follow-on — the
+    ``_ACT_ON_VERDICT_SOURCE_KEY`` replay guard holds under always-dispose."""
     task = await _make_compute_task(
         db_session,
         {
@@ -474,7 +517,6 @@ async def test_act_on_verdict_spawn_is_idempotent_on_replay(
             "base_branch": "main",
             "experiment": "mcts-rollout-depth",
             "hypothesis": "deeper rollouts beat the shallow baseline",
-            "act_on_verdict": True,
         },
     )
 
@@ -489,9 +531,501 @@ async def test_act_on_verdict_spawn_is_idempotent_on_replay(
     assert len(children) == 1
 
 
+@pytest.mark.asyncio
+async def test_failure_path_spawns_diagnose_followon(db_session, _quiet_compute_io):
+    """A compute experiment that fails the artifact-delivery gate (its output is an
+    unparseable crash traceback with no outcome/cost) spawns a tracked QUEUED
+    diagnose-and-fix child; the child prompt names 'diagnose' and the originating
+    experiment id; the experiment itself stays FAILED."""
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "mcts-rollout-depth",
+            "hypothesis": "deeper rollouts beat the shallow baseline",
+        },
+    )
+
+    crash_logs = (
+        "Traceback (most recent call last):\n"
+        '  File "experiment.py", line 12, in <module>\n'
+        "    run()\n"
+        "RuntimeError: CUDA out of memory\n"
+    )
+    await _handle_compute_experiment_completion(task, crash_logs, db_session)
+
+    await db_session.refresh(task)
+    # The experiment is a tombstone-free FAILED — it is NOT flipped to EVALUATING.
+    assert task.status == TaskStatus.FAILED
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child.first_payload["type"] == "create"
+    assert child.created_by == "ORCHESTRATOR"
+    assert child.status == TaskStatus.QUEUED
+    assert child.requires_approval is False
+    assert child.title.startswith("diagnose-and-fix:")
+
+    prompt = child.first_payload["prompt"]
+    assert "diagnose" in prompt.lower()
+    assert str(task.id) in prompt
+
+    # SPAWNED history records the orchestrator origin.
+    history = (
+        (
+            await db_session.execute(
+                select(TaskHistory).where(TaskHistory.task_id == child.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any(
+        h.action == "SPAWNED" and h.details.get("spawned_by") == "ACT_ON_VERDICT"
+        for h in history
+    )
+
+
+@pytest.mark.asyncio
+async def test_failure_followon_prompt_contains_traceback(
+    db_session, _quiet_compute_io
+):
+    """The captured stderr/traceback tail is embedded prominently in the failure
+    follow-on's prompt — the key crash-visibility fix."""
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "mcts-rollout-depth",
+        },
+    )
+
+    crash_logs = (
+        "Traceback (most recent call last):\n"
+        '  File "train.py", line 5, in <module>\n'
+        "ValueError: unique-traceback-marker-abc123\n"
+    )
+    await _handle_compute_experiment_completion(task, crash_logs, db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    prompt = children[0].first_payload["prompt"]
+    assert "unique-traceback-marker-abc123" in prompt
+    assert "Traceback" in prompt
+
+
+@pytest.mark.asyncio
+async def test_compute_unmeasured_criterion_spawns_followon(
+    db_session, _quiet_compute_io
+):
+    """Crash-visibility gap: outcome=SUCCESS but the declared kind=metric criterion
+    produced no numeric value → compute_unmeasured_criterion fires AND a tracked
+    diagnose-and-fix follow-on is spawned; the experiment stays FAILED."""
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "mcts-rollout-depth",
+            "success_criterion": {
+                "kind": "metric",
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+            },
+        },
+    )
+
+    # outcome=SUCCESS, both arms present, but no top-level 'accuracy' value.
+    await _handle_compute_experiment_completion(task, _result_with_arms(), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.context["failure_category"] == "compute_unmeasured_criterion"
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert children[0].title.startswith("diagnose-and-fix:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kill_outcome", ["TIMED_OUT", "SPEND_CAP_EXCEEDED"])
+async def test_intentional_kill_spawns_no_followon(
+    db_session, _quiet_compute_io, kill_outcome
+):
+    """An intentional kill (budget/deadline) is an honest terminal outcome with no
+    result to dispose — it spawns NO follow-on and completes clean."""
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "mcts-rollout-depth",
+        },
+    )
+
+    await _handle_compute_experiment_completion(
+        task, _result_with_arms(outcome=kill_outcome), db_session
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.plan_output["compute_result"]["outcome"] == kill_outcome
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert children == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cap_suppresses_excess_spawn(db_session, _quiet_compute_io):
+    """When max_concurrent_act_on_verdict_followons=1 and one follow-on is already
+    QUEUED for the project, a second experiment's completion spawns no child (the
+    dedup key is NOT stamped, so a later re-dispatch can retry)."""
+    from app.runtime_config_state import runtime_config
+
+    project = Project(name="CapTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    async def _exp(experiment: str) -> Task:
+        t = Task(
+            project_id=project.id,
+            title=f"compute_experiment: {experiment}",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "base_branch": "main",
+                    "experiment": experiment,
+                }
+            ],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(t)
+        await db_session.commit()
+        await db_session.refresh(t)
+        return t
+
+    prev = runtime_config.get("max_concurrent_act_on_verdict_followons")
+    runtime_config["max_concurrent_act_on_verdict_followons"] = 1
+    try:
+        first = await _exp("first")
+        await _handle_compute_experiment_completion(
+            first, _result_with_arms(), db_session
+        )
+        # First experiment spawns one QUEUED follow-on (now 1 in-flight).
+        first_children = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.parent_task_id == first.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(first_children) == 1
+        assert first_children[0].status == TaskStatus.QUEUED
+
+        # Second experiment: cap reached → no spawn → completes clean.
+        second = await _exp("second")
+        await _handle_compute_experiment_completion(
+            second, _result_with_arms(), db_session
+        )
+        await db_session.refresh(second)
+        assert second.status == TaskStatus.COMPLETED
+
+        second_children = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.parent_task_id == second.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert second_children == []
+    finally:
+        if prev is not None:
+            runtime_config["max_concurrent_act_on_verdict_followons"] = prev
+        else:
+            runtime_config.pop("max_concurrent_act_on_verdict_followons", None)
+
+
 def test_strategist_allowlist_excludes_create_unchanged():
     """The act_on_verdict spawn does NOT widen the strategist allowlist: the
     strategist still cannot spawn create (the ORCHESTRATOR does the spawn)."""
     assert "create" not in STRATEGIST_SPAWNABLE_TASK_TYPES
     assert "refactor" not in STRATEGIST_SPAWNABLE_TASK_TYPES
     assert "fix" not in STRATEGIST_SPAWNABLE_TASK_TYPES
+
+
+# ---------------------------------------------------------------------------
+# Sweep-aware disposition (O(1) follow-ons for N-arm experiments)
+# ---------------------------------------------------------------------------
+
+
+async def _make_sweep_arm(
+    db_session,
+    project,
+    sweep_id: str,
+    experiment: str,
+    *,
+    status=TaskStatus.IN_PROGRESS,
+) -> Task:
+    """Create a compute_experiment task as one arm of a sweep."""
+    task = Task(
+        project_id=project.id,
+        title=f"compute_experiment: {experiment}",
+        status=status,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "experiment": experiment,
+                "hypothesis": f"hypothesis for {experiment}",
+                "sweep_id": sweep_id,
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_sweep_arm_suppresses_per_arm_disposition_while_siblings_pending(
+    db_session, _quiet_compute_io
+):
+    """First sweep arm completes while a sibling is still IN_PROGRESS — no
+    aggregate follow-on should spawn yet."""
+    project = Project(name="SweepTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sweep_id = "sweep-" + uuid.uuid4().hex[:8]
+    arm1 = await _make_sweep_arm(db_session, project, sweep_id, "arm-1")
+    # arm2 is still IN_PROGRESS (not yet terminal)
+    _arm2 = await _make_sweep_arm(
+        db_session, project, sweep_id, "arm-2", status=TaskStatus.IN_PROGRESS
+    )
+
+    await _handle_compute_experiment_completion(arm1, _result_with_arms(), db_session)
+
+    await db_session.refresh(arm1)
+    # arm1 completes (no per-arm follow-on since it's part of a sweep with pending siblings)
+    assert arm1.status == TaskStatus.COMPLETED
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == arm1.id)))
+        .scalars()
+        .all()
+    )
+    assert children == [], "no aggregate follow-on while a sibling is still pending"
+
+
+@pytest.mark.asyncio
+async def test_sweep_last_arm_spawns_aggregate_followon(db_session, _quiet_compute_io):
+    """When the last arm completes and all siblings are terminal, exactly ONE
+    aggregate follow-on is spawned; its prompt covers all arms' results."""
+    project = Project(name="SweepAgg", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sweep_id = "sweep-" + uuid.uuid4().hex[:8]
+    arm1 = await _make_sweep_arm(db_session, project, sweep_id, "arm-1")
+    arm2 = await _make_sweep_arm(db_session, project, sweep_id, "arm-2")
+
+    # Complete arm1 first (arm2 still IN_PROGRESS → deferred)
+    await _handle_compute_experiment_completion(arm1, _result_with_arms(), db_session)
+    await db_session.refresh(arm1)
+
+    # No follow-on yet — arm2 still pending
+    arm1_children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == arm1.id)))
+        .scalars()
+        .all()
+    )
+    assert arm1_children == []
+
+    # Complete arm2 — now all arms are terminal → aggregate spawns
+    await _handle_compute_experiment_completion(arm2, _result_with_arms(), db_session)
+    await db_session.refresh(arm2)
+    assert arm2.status == TaskStatus.EVALUATING
+
+    agg_children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == arm2.id)))
+        .scalars()
+        .all()
+    )
+    assert len(agg_children) == 1
+    agg = agg_children[0]
+    assert agg.first_payload["type"] == "create"
+    assert agg.created_by == "ORCHESTRATOR"
+    assert agg.status == TaskStatus.QUEUED
+
+    prompt = agg.first_payload["prompt"]
+    # Prompt must reference the sweep and both arms
+    assert sweep_id in prompt
+    assert "arm-1" in prompt
+    assert "arm-2" in prompt
+
+    # Sweep key in context identifies it as an aggregate
+    from app.task_completion import _ACT_ON_VERDICT_SWEEP_KEY
+
+    assert (agg.context or {}).get(_ACT_ON_VERDICT_SWEEP_KEY) == sweep_id
+
+    # SPAWNED history row records the sweep origin
+    from sqlalchemy import select as sa_select
+
+    history = (
+        (
+            await db_session.execute(
+                sa_select(TaskHistory).where(TaskHistory.task_id == agg.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any(
+        h.action == "SPAWNED" and h.details.get("spawned_by") == "ACT_ON_VERDICT_SWEEP"
+        for h in history
+    )
+
+
+@pytest.mark.asyncio
+async def test_sweep_aggregate_spawn_is_idempotent(db_session, _quiet_compute_io):
+    """Two arms completing 'simultaneously' (double-dispatch of the last arm)
+    must spawn only ONE aggregate follow-on."""
+    project = Project(name="SweepDedup", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sweep_id = "sweep-" + uuid.uuid4().hex[:8]
+    arm1 = await _make_sweep_arm(db_session, project, sweep_id, "arm-1")
+    arm2 = await _make_sweep_arm(db_session, project, sweep_id, "arm-2")
+
+    # arm1 completes first (deferred — arm2 pending)
+    await _handle_compute_experiment_completion(arm1, _result_with_arms(), db_session)
+
+    # arm2 completes (aggregate spawns)
+    await _handle_compute_experiment_completion(arm2, _result_with_arms(), db_session)
+    # arm2 completion dispatched again (replay)
+    await _handle_compute_experiment_completion(arm2, _result_with_arms(), db_session)
+
+    # Across both arms, there should be exactly one aggregate child
+    all_children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id.in_([arm1.id, arm2.id]))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(all_children) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_sweep_experiment_unaffected(db_session, _quiet_compute_io):
+    """A compute experiment with no sweep_id still gets a per-experiment
+    follow-on (Phase 1+2 behavior is preserved)."""
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "standalone-experiment",
+            "hypothesis": "a standalone hypothesis",
+        },
+    )
+
+    await _handle_compute_experiment_completion(task, _result_with_arms(), db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    assert children[0].first_payload["type"] == "create"
+    assert children[0].title.startswith("act-on-verdict:")
+
+
+@pytest.mark.asyncio
+async def test_sweep_aggregate_includes_failed_arm_results(
+    db_session, _quiet_compute_io
+):
+    """One arm FAILED (crash), others COMPLETED; aggregate still fires and
+    prompt covers all arms including the failed one."""
+    project = Project(name="SweepFail", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sweep_id = "sweep-" + uuid.uuid4().hex[:8]
+    arm_success = await _make_sweep_arm(db_session, project, sweep_id, "arm-success")
+    arm_crash = await _make_sweep_arm(db_session, project, sweep_id, "arm-crash")
+
+    # arm_success completes cleanly first
+    await _handle_compute_experiment_completion(
+        arm_success, _result_with_arms(), db_session
+    )
+
+    # arm_crash receives a crash traceback — fails the artifact-delivery gate
+    crash_logs = (
+        "Traceback (most recent call last):\n"
+        '  File "train.py", line 5, in <module>\n'
+        "RuntimeError: sweep-crash-marker-xyz\n"
+    )
+    await _handle_compute_experiment_completion(arm_crash, crash_logs, db_session)
+
+    await db_session.refresh(arm_crash)
+    # The crash arm itself is FAILED
+    assert arm_crash.status == TaskStatus.FAILED
+
+    # The aggregate follow-on was spawned on the crash arm (last to be processed)
+    agg_children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == arm_crash.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(agg_children) == 1
+    agg = agg_children[0]
+    prompt = agg.first_payload["prompt"]
+    # Prompt covers both arms
+    assert "arm-success" in prompt
+    assert "arm-crash" in prompt
+    # Failure framing because one arm failed
+    assert "diagnose" in prompt.lower()

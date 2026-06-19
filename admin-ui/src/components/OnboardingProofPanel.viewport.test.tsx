@@ -28,6 +28,7 @@ const PROOF_ALL_DONE = {
   first_merge_gate_executed_tests: true,
   first_merge_gate_unverified_reason: null,
   first_pr_merged_at: '2026-06-01T09:50:00Z',
+  first_autonomous_improvement_at: '2026-06-01T10:00:00Z',
 };
 
 const PROOF_PENDING = {
@@ -39,6 +40,7 @@ const PROOF_PENDING = {
   first_merge_gate_executed_tests: null,
   first_merge_gate_unverified_reason: null,
   first_pr_merged_at: null,
+  first_autonomous_improvement_at: null,
 };
 
 describe('OnboardingProofPanel — viewport regression', () => {
@@ -116,6 +118,56 @@ describe('OnboardingProofPanel — viewport regression', () => {
     // Panel must not render any content for self-repo
     if (host.firstChild !== null) {
       throw new Error('OnboardingProofPanel rendered content for is_self_repo=true');
+    }
+  });
+
+  test('renders first_autonomous_improvement_at milestone at 1024px without overflow', async () => {
+    await expectNoOverflowAt(1024, () =>
+      renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_ALL_DONE }),
+    );
+  });
+
+  test('renders elapsed duration badges for completed milestones at 375px without overflow', async () => {
+    await expectNoOverflowAt(375, () =>
+      renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_ALL_DONE }),
+    );
+    // Verify duration badges are present in the rendered output
+    const durationBadges = host!.querySelectorAll('span');
+    const texts = Array.from(durationBadges).map((s) => s.textContent ?? '');
+    const hasDurationBadge = texts.some((t) => t.startsWith('+'));
+    if (!hasDurationBadge) {
+      throw new Error('Expected elapsed duration badges (+Xm/+Xh) but none found');
+    }
+  });
+
+  test('renders DORA headline summary at 1024px without overflow', async () => {
+    await expectNoOverflowAt(1024, () =>
+      renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_ALL_DONE }),
+    );
+    const text = host!.textContent ?? '';
+    if (!text.includes('Time to first improvement')) {
+      throw new Error('Expected DORA headline "Time to first improvement" not found');
+    }
+    if (!text.includes('Time to first merge')) {
+      throw new Error('Expected DORA headline "Time to first merge" not found');
+    }
+  });
+
+  test('duration badges absent when only repo_added_at is set (PROOF_PENDING)', async () => {
+    await renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_PENDING });
+    const spans = host!.querySelectorAll('span');
+    const texts = Array.from(spans).map((s) => s.textContent ?? '');
+    const hasDurationBadge = texts.some((t) => t.startsWith('+'));
+    if (hasDurationBadge) {
+      throw new Error('Duration badges should not appear when milestones are not yet completed');
+    }
+  });
+
+  test('DORA headline absent when PROOF_PENDING (no improvements yet)', async () => {
+    await renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_PENDING });
+    const text = host!.textContent ?? '';
+    if (text.includes('Time to first improvement') || text.includes('Time to first merge')) {
+      throw new Error('DORA headline should not render when milestones are pending');
     }
   });
 

@@ -1054,7 +1054,7 @@ ${strategicChallengeSection}
       // path, with a clean exit, re-ask ONCE for the JSON only and re-extract.
       // Mirrors handleMemo / the audit handlers (see structured-repair.ts).
       if (completionLogs.warning && exitCode === 0) {
-        recordFormatMiss('no_matching_candidate');
+        recordFormatMiss(completionLogs.missReason ?? 'no_matching_candidate');
         recordFormatRepairAttempt();
         const retryRun = await attemptStructuredRepair(
           lastResultText || allOutput, STRATEGIC_COMPLETION_SCHEMA_HINT,

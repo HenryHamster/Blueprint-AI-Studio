@@ -325,12 +325,15 @@ ${designFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
     document = documentFromFile as Record<string, unknown>;
     sendLog(ws, `Read design document from ${documentPath}\n`);
   }
+  const progress = readDesignProgress(taskId);
   if (!document) {
+    const priorAnalysisSection = progress ? `${progress.slice(-8000)}\n\n` : '';
     const repair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['title', 'summary', 'body'],
+      schemaLabel: 'design',
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `You did not emit the design document JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required fields: title, summary, body. Schema:\n\n{"title":"Concise design title","summary":"1-3 sentence summary.","body":"Full design in markdown.","source_citations":["file:backend/app/example.py"],"tags":["tag"],"topic":"slug"}\n\nOutput ONLY the JSON object.`,
+      reopenPrompt: `${priorAnalysisSection}You did not emit the design document JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required fields: title, summary, body. Schema:\n\n{"title":"Concise design title","summary":"1-3 sentence summary.","body":"Full design in markdown.","source_citations":["file:backend/app/example.py"],"tags":["tag"],"topic":"slug"}\n\nOutput ONLY the JSON object.`,
       ws,
       statusRef,
       model,
@@ -365,7 +368,6 @@ ${designFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   }
 
   const finalStatus = exitCode === 0 ? 'COMPLETED' : 'FAILED';
-  const progress = readDesignProgress(taskId);
   try {
     await persistAndPostStatus(taskId, {
       task_id: taskId,

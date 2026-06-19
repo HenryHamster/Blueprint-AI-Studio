@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Deque, Dict, List
@@ -36,8 +36,14 @@ from sqlalchemy import func as safunc
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
-from app.models import EvergreenBacklogItem, Task, TaskStatus, _utcnow
-from app.time_utils import _utcnow as _now  # noqa: F401  (re-export parity)
+from app.models import (
+    EvergreenBacklogItem,
+    EvergreenFillDecisionLog,
+    Task,
+    TaskStatus,
+    _utcnow,
+)
+from app.time_utils import _utcnow as _now
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +227,16 @@ class _FillObservability:
         default_factory=lambda: deque(maxlen=_RECENT_DECISIONS_MAX)
     )
 
-    def record(self, decision: FillDecision, *, project_id: str | None = None) -> None:
+    def record(
+        self,
+        decision: FillDecision,
+        *,
+        project_id: str | None = None,
+        signal: FleetSignal | None = None,
+        item_id: str | None = None,
+        finding_key: str | None = None,
+        ts: datetime | None = None,
+    ) -> None:
         self.reason_counts[decision.reason] = (
             self.reason_counts.get(decision.reason, 0) + 1
         )
@@ -231,14 +246,29 @@ class _FillObservability:
             )
         if decision.should_create:
             self.created_count += 1
-        self.recent.append(
-            {
-                "action": decision.action,
-                "reason": decision.reason,
-                "trigger": decision.trigger,
-                "project_id": project_id,
-            }
-        )
+        entry: Dict[str, Any] = {
+            "action": decision.action,
+            "reason": decision.reason,
+            "trigger": decision.trigger,
+            "project_id": project_id,
+            "item_id": item_id,
+            "finding_key": finding_key,
+            "ts": ts,
+        }
+        if signal is not None:
+            entry.update(
+                {
+                    "mode": signal.mode,
+                    "util_now": signal.util_now,
+                    "util_threshold": signal.util_threshold,
+                    "dispatchable_queue_depth": signal.dispatchable_queue_depth,
+                    "vm_slots_available": signal.vm_slots_available,
+                    "active_evergreen_probes": signal.active_evergreen_probes,
+                    "daily_spawn_count": signal.daily_spawn_count,
+                    "has_candidate": signal.has_candidate,
+                }
+            )
+        self.recent.append(entry)
 
     def snapshot(self) -> Dict[str, Any]:
         return {
@@ -253,8 +283,23 @@ class _FillObservability:
 _OBSERVABILITY = _FillObservability()
 
 
-def record_decision(decision: FillDecision, *, project_id: str | None = None) -> None:
-    _OBSERVABILITY.record(decision, project_id=project_id)
+def record_decision(
+    decision: FillDecision,
+    *,
+    project_id: str | None = None,
+    signal: FleetSignal | None = None,
+    item_id: str | None = None,
+    finding_key: str | None = None,
+    ts: datetime | None = None,
+) -> None:
+    _OBSERVABILITY.record(
+        decision,
+        project_id=project_id,
+        signal=signal,
+        item_id=item_id,
+        finding_key=finding_key,
+        ts=ts,
+    )
 
 
 def get_fill_observability() -> Dict[str, Any]:
@@ -265,6 +310,196 @@ def _reset_observability_for_tests() -> None:
     """Test helper — clear the process-local counters."""
     global _OBSERVABILITY
     _OBSERVABILITY = _FillObservability()
+
+
+async def _persist_fill_decision(
+    session, decision: FillDecision, *, project_id: str | None = None
+) -> None:
+    """Write one EvergreenFillDecisionLog row for durable observability.
+
+    Called from check_evergreen_fill() after record_decision() — the caller
+    commits the session so this row lands in the same transaction as any probe
+    spawn, or in the next periodic commit if no spawn occurred.
+    """
+    row = EvergreenFillDecisionLog(
+        id=uuid.uuid4(),
+        project_id=uuid.UUID(project_id) if project_id else None,
+        action=decision.action,
+        reason=decision.reason,
+        trigger=decision.trigger,
+    )
+    session.add(row)
+
+
+async def get_fill_observability_from_db(
+    session, *, window_hours: int = 24
+) -> Dict[str, Any]:
+    """Aggregate fill decisions from the durable log over a trailing window.
+
+    Returns the same four-key shape as :func:`get_fill_observability` so the
+    existing endpoint and panel keep working unchanged.  Records are ordered
+    most-recent-first; the ``recent`` list is capped at
+    :data:`_RECENT_DECISIONS_MAX` entries.
+    """
+    cutoff = _now() - timedelta(hours=window_hours)
+    rows = (
+        (
+            await session.execute(
+                select(EvergreenFillDecisionLog)
+                .where(EvergreenFillDecisionLog.ts >= cutoff)
+                .order_by(EvergreenFillDecisionLog.ts.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    reason_counts: Dict[str, int] = {}
+    trigger_counts: Dict[str, int] = {}
+    created_count = 0
+    recent: list = []
+
+    for row in rows:
+        reason_counts[row.reason] = reason_counts.get(row.reason, 0) + 1
+        if row.trigger:
+            trigger_counts[row.trigger] = trigger_counts.get(row.trigger, 0) + 1
+        if row.action == DECISION_CREATE:
+            created_count += 1
+        if len(recent) < _RECENT_DECISIONS_MAX:
+            recent.append(
+                {
+                    "action": row.action,
+                    "reason": row.reason,
+                    "trigger": row.trigger,
+                    "project_id": str(row.project_id) if row.project_id else None,
+                    "ts": row.ts.isoformat() if row.ts else None,
+                }
+            )
+
+    return {
+        "created_count": created_count,
+        "reason_counts": reason_counts,
+        "trigger_counts": trigger_counts,
+        "recent": recent,
+    }
+
+
+#: Observe-mode noop reason — rows with this reason represent would-have-fired
+#: decisions that observe mode suppressed.
+_REASON_OBSERVE_MODE = "observe_mode"
+
+#: Mode string for observe-mode rows.
+_MODE_OBSERVE = "observe"
+
+
+async def compute_observe_mode_verdict(
+    session,
+    *,
+    window_hours: int = 168,
+    max_fire_rate_pct: float = 20.0,
+    min_evaluations: int = 10,
+    daily_cap: int = 3,
+) -> Dict[str, Any]:
+    """Compute a go/no-go verdict for the observe-mode → enforce-mode transition.
+
+    Reads ``EvergreenFillDecisionLog`` rows in ``observe`` mode within the
+    trailing *window_hours* (default 7 days) and computes the **fire rate**:
+    the fraction of observe-mode evaluations that would have triggered a spawn
+    (``reason == 'observe_mode'``).
+
+    Because observe mode never actually spawns, the daily/active caps never
+    engage — so consecutive idle-fleet ticks within a single day all land as
+    ``observe_mode`` noops, inflating the raw fire rate toward 100%.  The
+    *cap-adjusted* fire rate groups would-have-fired rows by UTC calendar day,
+    caps each day's count at *daily_cap*, and uses the capped total as the
+    verdict numerator.  The raw ``fire_rate_pct`` is retained for informational
+    display.
+
+    Verdict rules (applied to the cap-adjusted rate):
+
+    * ``insufficient_data`` — fewer than *min_evaluations* observe-mode rows in
+      the window; cannot draw a meaningful conclusion yet.
+    * ``go`` — cap-adjusted fire rate ≤ *max_fire_rate_pct*.
+    * ``no_go`` — cap-adjusted fire rate > *max_fire_rate_pct*.
+
+    Returns a dict with keys: ``verdict``, ``verdict_reason``,
+    ``observe_evaluations``, ``would_have_fired``, ``fire_rate_pct``,
+    ``window_hours``, ``max_fire_rate_pct``, ``min_evaluations``,
+    ``daily_cap``, ``cap_adjusted_would_have_fired``,
+    ``cap_adjusted_fire_rate_pct``.
+    """
+    cutoff = _now() - timedelta(hours=window_hours)
+    rows = (
+        (
+            await session.execute(
+                select(EvergreenFillDecisionLog)
+                .where(EvergreenFillDecisionLog.mode == _MODE_OBSERVE)
+                .where(EvergreenFillDecisionLog.ts >= cutoff)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    total = len(rows)
+    would_have_fired = sum(1 for r in rows if r.reason == _REASON_OBSERVE_MODE)
+
+    # Group would-have-fired rows by UTC calendar day and cap each day at
+    # daily_cap.  Observe mode never creates tasks, so the real daily cap never
+    # engages — without this adjustment, a fleet idle all day produces
+    # would_have_fired == total (100% raw rate) regardless of actual cadence.
+    daily_fire_counts: Dict[Any, int] = defaultdict(int)
+    for r in rows:
+        if r.reason == _REASON_OBSERVE_MODE:
+            day = r.ts.date() if r.ts else None
+            daily_fire_counts[day] += 1
+    cap_adjusted_would_have_fired = sum(
+        min(count, daily_cap) for count in daily_fire_counts.values()
+    )
+
+    if total < min_evaluations:
+        verdict = "insufficient_data"
+        verdict_reason = (
+            f"only {total} observe-mode evaluation(s) in the last {window_hours}h "
+            f"(need ≥{min_evaluations})"
+        )
+        fire_rate_pct = None
+        cap_adjusted_fire_rate_pct = None
+    else:
+        fire_rate_pct = round(100.0 * would_have_fired / total, 2)
+        cap_adjusted_fire_rate_pct = round(
+            100.0 * cap_adjusted_would_have_fired / total, 2
+        )
+        if cap_adjusted_fire_rate_pct <= max_fire_rate_pct:
+            verdict = "go"
+            verdict_reason = (
+                f"cap-adjusted fire rate {cap_adjusted_fire_rate_pct}% is within "
+                f"threshold {max_fire_rate_pct}% "
+                f"({cap_adjusted_would_have_fired}/{total} cap-adjusted "
+                f"evaluations would have fired; daily_cap={daily_cap})"
+            )
+        else:
+            verdict = "no_go"
+            verdict_reason = (
+                f"cap-adjusted fire rate {cap_adjusted_fire_rate_pct}% exceeds "
+                f"threshold {max_fire_rate_pct}% "
+                f"({cap_adjusted_would_have_fired}/{total} cap-adjusted "
+                f"evaluations would have fired; daily_cap={daily_cap})"
+            )
+
+    return {
+        "verdict": verdict,
+        "verdict_reason": verdict_reason,
+        "observe_evaluations": total,
+        "would_have_fired": would_have_fired,
+        "fire_rate_pct": fire_rate_pct,
+        "window_hours": window_hours,
+        "max_fire_rate_pct": max_fire_rate_pct,
+        "min_evaluations": min_evaluations,
+        "daily_cap": daily_cap,
+        "cap_adjusted_would_have_fired": cap_adjusted_would_have_fired,
+        "cap_adjusted_fire_rate_pct": cap_adjusted_fire_rate_pct,
+    }
 
 
 # --- Enrollment / dedup ------------------------------------------------------
@@ -839,7 +1074,36 @@ async def check_evergreen_fill() -> None:
                     duplicate_lineage=duplicate_lineage,
                 )
                 decision = decide_evergreen_fill(signal)
-                record_decision(decision, project_id=str(project.id))
+                candidate_item_id = str(candidate.id) if candidate is not None else None
+                candidate_finding_key = (
+                    candidate.finding_key if candidate is not None else None
+                )
+                record_decision(
+                    decision,
+                    project_id=str(project.id),
+                    signal=signal,
+                    item_id=candidate_item_id,
+                    finding_key=candidate_finding_key,
+                    ts=now,
+                )
+                log_row = EvergreenFillDecisionLog(
+                    ts=now,
+                    project_id=project.id,
+                    action=decision.action,
+                    reason=decision.reason,
+                    trigger=decision.trigger,
+                    mode=signal.mode,
+                    util_now=signal.util_now,
+                    util_threshold=signal.util_threshold,
+                    dispatchable_queue_depth=signal.dispatchable_queue_depth,
+                    vm_slots_available=signal.vm_slots_available,
+                    active_evergreen_probes=signal.active_evergreen_probes,
+                    daily_spawn_count=signal.daily_spawn_count,
+                    has_candidate=signal.has_candidate,
+                    item_id=candidate.id if candidate is not None else None,
+                    finding_key=candidate_finding_key,
+                )
+                session.add(log_row)
 
                 if not decision.should_create or candidate is None:
                     continue
@@ -861,6 +1125,8 @@ async def check_evergreen_fill() -> None:
                         decision.trigger,
                         project.id,
                     )
+            # Commit any decision-log rows for projects where no probe was spawned.
+            await session.commit()
     except Exception as exc:  # pragma: no cover - defensive, never crash the loop
         logger.error("[EVERGREEN] check_evergreen_fill error: %s", exc, exc_info=True)
 

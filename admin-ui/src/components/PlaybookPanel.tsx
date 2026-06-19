@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { BookOpen, ChevronDown, ChevronUp, ThumbsUp, ThumbsDown, Archive, AlertTriangle } from 'lucide-react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { BookOpen, ChevronDown, ChevronUp, ThumbsUp, ThumbsDown, Archive, AlertTriangle, Search } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../api';
 
 interface PlaybookEntry {
@@ -46,6 +46,8 @@ export function PlaybookPanel({ selectedProjectId }: PlaybookPanelProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
+  const [typeFilter, setTypeFilter] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!selectedProjectId) return;
@@ -98,6 +100,21 @@ export function PlaybookPanel({ selectedProjectId }: PlaybookPanelProps) {
     }
   };
 
+  const allTypes = useMemo(() => {
+    const set = new Set<string>();
+    entries.forEach(e => e.applicable_types.forEach(t => set.add(t)));
+    return Array.from(set).sort();
+  }, [entries]);
+
+  const filteredEntries = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return entries.filter(e => {
+      if (typeFilter && !e.applicable_types.includes(typeFilter)) return false;
+      if (q && !e.key.toLowerCase().includes(q) && !e.content.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [entries, search, typeFilter]);
+
   if (!selectedProjectId) return null;
 
   const staleCount = entries.filter(e => e.stale).length;
@@ -128,6 +145,29 @@ export function PlaybookPanel({ selectedProjectId }: PlaybookPanelProps) {
 
       {!collapsed && (
         <div className="border-t border-neutral-800/60">
+          {entries.length > 0 && (
+            <div className="px-4 py-2 flex items-center gap-2 flex-wrap border-b border-neutral-800/40">
+              <div className="relative flex-1 min-w-[160px]">
+                <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-neutral-500 pointer-events-none" />
+                <input
+                  type="text"
+                  placeholder="Search key or content…"
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  className="w-full pl-6 pr-2 py-1 text-xs bg-neutral-900 border border-neutral-700/60 rounded text-neutral-200 placeholder:text-neutral-600 focus:outline-none focus:border-violet-600/60"
+                />
+              </div>
+              {allTypes.map(t => (
+                <button
+                  key={t}
+                  onClick={() => setTypeFilter(typeFilter === t ? null : t)}
+                  className={`text-xs px-2 min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded border transition-colors ${typeFilter === t ? 'bg-violet-900/60 border-violet-600/60 text-violet-300' : 'border-neutral-700/60 text-neutral-500 hover:text-neutral-300 hover:border-neutral-600'}`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          )}
           {loading && entries.length === 0 && (
             <div className="px-4 py-6 text-center text-sm text-neutral-500">Loading…</div>
           )}
@@ -137,9 +177,12 @@ export function PlaybookPanel({ selectedProjectId }: PlaybookPanelProps) {
           {!loading && entries.length === 0 && !error && (
             <div className="px-4 py-6 text-center text-sm text-neutral-500">No playbook entries yet.</div>
           )}
-          {entries.length > 0 && (
+          {entries.length > 0 && filteredEntries.length === 0 && (
+            <div className="px-4 py-6 text-center text-sm text-neutral-500">No entries match your filter.</div>
+          )}
+          {filteredEntries.length > 0 && (
             <div className="divide-y divide-neutral-800/40">
-              {entries.map(entry => {
+              {filteredEntries.map(entry => {
                 const isIneffective = entry.reference_count >= 10 && entry.confirmed_count === 0;
                 const isPending = pendingKey === entry.key;
                 return (

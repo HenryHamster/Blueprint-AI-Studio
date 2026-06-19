@@ -6608,3 +6608,169 @@ def test_panel_review_effectiveness_cost_per_challenge_usd():
     assert result["cost_per_challenge_usd"] == expected_per_challenge, (
         f"expected cost_per_challenge_usd={expected_per_challenge}, got {result['cost_per_challenge_usd']}"
     )
+
+
+def test_panel_review_effectiveness_escalated_fail_open():
+    """Escalated fail-open records (unchallenged + escalated=True) are counted in
+    challenged_escalated and excluded from total_challenged.
+
+    Setup:
+      - 2 challenged_confirmed (normal gate invocations)
+      - 1 challenged_rejected  (normal gate invocation)
+      - 2 unchallenged + escalated=True (challenger failed — fail-open)
+      - 1 unchallenged without escalated (gate not invoked — must be ignored)
+
+    Expected:
+      total_challenged = 3 (only the three successful gate invocations)
+      challenged_escalated = 2 (the two fail-open records)
+      overturn_rate = 1/3
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _task(recon):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    tasks = [
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_rejected"}),
+        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "unchallenged"}),  # gate not invoked — must be ignored
+    ]
+
+    result = compute_panel_review_effectiveness(tasks)
+    assert result is not None, "must return a result when escalated records exist"
+    assert result["total_challenged"] == 3, (
+        f"escalated records must be excluded from total_challenged, got {result['total_challenged']}"
+    )
+    assert result["challenged_escalated"] == 2, (
+        f"expected challenged_escalated=2, got {result['challenged_escalated']}"
+    )
+    assert result["overturn_rate"] == round(1 / 3, 4), (
+        f"overturn_rate must be computed from total_challenged only, got {result['overturn_rate']}"
+    )
+
+
+def test_panel_review_effectiveness_fail_open_rate():
+    """fail_open_rate = escalated / (total_challenged + escalated).
+
+    Setup:
+      - 3 challenged_confirmed (successful gate invocations)
+      - 2 unchallenged + escalated=True (challenger failed — fail-open)
+
+    Expected:
+      total_challenged = 3
+      challenged_escalated = 2
+      fail_open_rate = 2 / (3 + 2) = 0.4
+      Zero-invocations case (no tasks) returns None for fail_open_rate.
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _task(recon):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    tasks = [
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "unchallenged", "escalated": True}),
+    ]
+
+    result = compute_panel_review_effectiveness(tasks)
+    assert result is not None
+    assert result["total_challenged"] == 3
+    assert result["challenged_escalated"] == 2
+    expected_rate = round(2 / 5, 4)
+    assert result["fail_open_rate"] == expected_rate, (
+        f"expected fail_open_rate={expected_rate}, got {result['fail_open_rate']}"
+    )
+
+    # Zero-invocations: no tasks with gate records returns None
+    assert compute_panel_review_effectiveness([]) is None
+
+
+# ---------------------------------------------------------------------------
+# compute_recommended_challenger_sample_rate
+# ---------------------------------------------------------------------------
+
+
+def test_recommended_sample_rate_no_data():
+    """Returns no_data status when panel_review_effectiveness is None."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    result = compute_recommended_challenger_sample_rate(None)
+    assert result["status"] == "no_data"
+    assert result["recommended_sample_rate"] is None
+    assert "rationale" in result
+
+
+def test_recommended_sample_rate_insufficient_data():
+    """Returns insufficient_data when total_challenged < MIN_SAMPLE_SIZE (30)."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    eff = {"total_challenged": 15, "overturn_rate": 0.05}
+    result = compute_recommended_challenger_sample_rate(eff)
+    assert result["status"] == "insufficient_data"
+    assert result["recommended_sample_rate"] is None
+    assert "15" in result["rationale"]
+
+
+def test_recommended_sample_rate_gate_earning():
+    """Returns gate_earning with rate=1.0 when overturn_rate >= 10%."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    eff = {"total_challenged": 50, "overturn_rate": 0.15}
+    result = compute_recommended_challenger_sample_rate(eff)
+    assert result["status"] == "gate_earning"
+    assert result["recommended_sample_rate"] == 1.0
+
+
+def test_recommended_sample_rate_reduce():
+    """Returns reduce status with rate < 1.0 when overturn_rate < 10%."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    # 4% overturn rate → recommended = max(0.10, 0.04/0.10) = max(0.10, 0.40) = 0.40
+    eff = {"total_challenged": 100, "overturn_rate": 0.04}
+    result = compute_recommended_challenger_sample_rate(eff)
+    assert result["status"] == "reduce"
+    assert result["recommended_sample_rate"] == 0.40
+
+
+def test_recommended_sample_rate_reduce_floor():
+    """Very low overturn_rate is clamped to 0.10 floor."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    eff = {"total_challenged": 100, "overturn_rate": 0.005}
+    result = compute_recommended_challenger_sample_rate(eff)
+    assert result["status"] == "reduce"
+    assert result["recommended_sample_rate"] == 0.10
+
+
+def test_recommended_sample_rate_at_threshold_boundary():
+    """Exactly at 10% overturn_rate is gate_earning."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    eff = {"total_challenged": 50, "overturn_rate": 0.10}
+    result = compute_recommended_challenger_sample_rate(eff)
+    assert result["status"] == "gate_earning"
+    assert result["recommended_sample_rate"] == 1.0

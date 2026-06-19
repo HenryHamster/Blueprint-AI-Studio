@@ -1454,6 +1454,7 @@ class TestTaskCostBreakdown:
         assert body["direction_breakdown"] == [
             {
                 "direction_id": "dir-a",
+                "direction_text": None,
                 "task_count": 2,
                 "estimated_cost_usd": pytest.approx(
                     round(5400 * admin_analytics.ON_DEMAND_RATE, 2)
@@ -1461,6 +1462,7 @@ class TestTaskCostBreakdown:
             },
             {
                 "direction_id": None,
+                "direction_text": None,
                 "task_count": 1,
                 "estimated_cost_usd": pytest.approx(
                     round(600 * admin_analytics.ON_DEMAND_RATE, 2)
@@ -1477,6 +1479,61 @@ class TestTaskCostBreakdown:
         assert body["top_tasks"][1]["estimated_cost_usd"] == pytest.approx(
             round(1800 * admin_analytics.ON_DEMAND_RATE, 2)
         )
+
+    @pytest.mark.asyncio
+    async def test_direction_text_surfaced_in_breakdown(
+        self, client: AsyncClient, db_session
+    ):
+        """direction_text from context is returned in direction_breakdown; first-non-empty
+        wins when two tasks share a direction but only one carries direction_text."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+
+        def _task(title: str, direction_id: str, vm_seconds: int, direction_text: str | None = None) -> None:
+            completed_at = now - timedelta(minutes=10)
+            started_at = completed_at - timedelta(seconds=vm_seconds)
+            ctx: dict = {"direction_id": direction_id}
+            if direction_text is not None:
+                ctx["direction_text"] = direction_text
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    title=title,
+                    status=TaskStatus.COMPLETED,
+                    created_by="ORCHESTRATOR",
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    context=ctx,
+                    started_at=started_at,
+                    created_at=started_at,
+                    status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                    vm_provisioned_at=started_at,
+                    vm_stopped_at=completed_at,
+                    vm_spot=False,
+                )
+            )
+
+        # Two tasks in the same direction: the task without text has a later created_at
+        # (vm_seconds=300 → less time before completed_at → later created_at), so it is
+        # returned first in the DESC-ordered query result. The first-non-empty aggregation
+        # (admin_analytics.py:583-584) skips it and picks up the text from the second row.
+        _task("Task without text", direction_id="dir-x", vm_seconds=300, direction_text=None)
+        _task("Task with text", direction_id="dir-x", vm_seconds=600, direction_text="Fix the login flow")
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/task-cost-breakdown?project_id={project.id}&window=1h"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert len(body["direction_breakdown"]) == 1
+        entry = body["direction_breakdown"][0]
+        assert entry["direction_id"] == "dir-x"
+        assert entry["direction_text"] == "Fix the login flow"
+        assert entry["task_count"] == 2
 
     @pytest.mark.asyncio
     async def test_banked_retry_cost_added_to_current_vm_interval(

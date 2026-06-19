@@ -38,8 +38,10 @@ export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled
   const summaryLine = formatMergeGateSummary(runtime?.summary);
   const lastBlockAt = runtime?.last_degraded_block_at ? parseTimestamp(runtime.last_degraded_block_at) : null;
   const lastBlockReason = runtime?.last_degraded_block_reason ? humanizeUnverifiedReason(runtime.last_degraded_block_reason) : null;
+  const degradedBlockTotal = runtime?.degraded_block_counts ? Object.values(runtime.degraded_block_counts).reduce((sum, count) => sum + count, 0) : 0;
   const lastNoTestBlockAt = runtime?.last_no_test_block_at ? parseTimestamp(runtime.last_no_test_block_at) : null;
   const lastNoTestBlockReason = runtime?.last_no_test_block_reason ? humanizeUnverifiedReason(runtime.last_no_test_block_reason) : null;
+  const noTestBlockTotal = runtime?.no_test_block_counts ? Object.values(runtime.no_test_block_counts).reduce((sum, count) => sum + count, 0) : 0;
   const mismatch = verdict.state === 'tests_gated' && Boolean(unverifiedAt && (!verifiedAt || unverifiedAt.getTime() > verifiedAt.getTime()));
   const runtimeState = runtime
     ? (mismatch
@@ -141,7 +143,7 @@ export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled
             {blockDegradedEnabled ? (
               <div className="mt-2 rounded-md border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5 space-y-0.5" data-testid="honest-block-badge">
                 <p className="text-[10px] text-indigo-300 font-medium">
-                  Honest-block policy active — degraded fall-opens are held
+                  Honest-block policy active — degraded fall-opens are held{degradedBlockTotal > 0 ? ` (${degradedBlockTotal} total)` : ''}
                 </p>
                 {lastBlockAt ? (
                   <p className="text-[10px] text-neutral-400">
@@ -194,7 +196,7 @@ export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled
           {blockDegradedEnabled ? (
             <div className="mt-2 rounded-md border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5 space-y-0.5" data-testid="honest-block-badge">
               <p className="text-[10px] text-indigo-300 font-medium">
-                Honest-block policy active — degraded fall-opens are held
+                Honest-block policy active — degraded fall-opens are held{degradedBlockTotal > 0 ? ` (${degradedBlockTotal} total)` : ''}
               </p>
               {lastBlockAt ? (
                 <p className="text-[10px] text-neutral-400">
@@ -206,7 +208,7 @@ export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled
           {blockNoTestEnabled ? (
             <div className="mt-2 rounded-md border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5 space-y-0.5" data-testid="no-test-block-badge">
               <p className="text-[10px] text-indigo-300 font-medium">
-                No-test hold policy active — unverified merges are held
+                No-test hold policy active — unverified merges are held{noTestBlockTotal > 0 ? ` (${noTestBlockTotal} total)` : ''}
               </p>
               {lastNoTestBlockAt ? (
                 <p className="text-[10px] text-neutral-400">

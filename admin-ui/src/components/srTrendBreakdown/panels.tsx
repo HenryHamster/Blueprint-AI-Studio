@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import {
   ExampleList,
   deltaColorClass,
@@ -9,15 +9,11 @@ import {
 import type {
   DirectionSrEntry,
   EdgesTrend,
-  FreshReviewerTrend,
   SrCoFailurePair,
   SrDisagreementExample,
   SrMissExample,
   SrReviewerDisagreement,
   SrReviewerDisagreementsData,
-  SrReviewerDisagreementTask,
-  SrReviewerDisagreementTasksResult,
-  SrScopeDriftVsExpansion,
   SrTrendData,
 } from './types';
 
@@ -25,60 +21,6 @@ function frTrendColor(trend: string | null | undefined): string {
   if (trend === 'improving') return 'text-emerald-400';
   if (trend === 'regressing') return 'text-red-400';
   return 'text-neutral-500';
-}
-
-export function FreshReviewerTrendBreakdown({ trend }: { trend: FreshReviewerTrend | null | undefined }) {
-  if (!trend) return null;
-  const cats = trend.per_category_hit_rate;
-  const lift = trend.approval_rate_lift;
-  const hasCats = !!cats && Object.keys(cats).length > 0;
-  if (!hasCats && lift == null) return null;
-  const cycleLabel =
-    trend.bucket_mode === 'cycle' && trend.current_cycle_id
-      ? `cycle ${trend.current_cycle_id.slice(-6)} vs ${trend.previous_cycle_id ? trend.previous_cycle_id.slice(-6) : '–'}`
-      : null;
-  return (
-    <div data-testid="fr-trend-breakdown" className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]">
-      <div className="flex items-baseline gap-2 mb-1">
-        <p className="text-[9px] text-neutral-500 uppercase tracking-wide">Fresh-Reviewer Trend</p>
-        {cycleLabel && <span className="text-[9px] text-neutral-600 font-mono">{cycleLabel}</span>}
-        {trend.current_sample_size != null && (
-          <span className="text-[9px] text-neutral-600 font-mono ml-auto">n={trend.current_sample_size}</span>
-        )}
-      </div>
-      {cats && Object.keys(cats).length > 0 && (
-        <div className="flex flex-col gap-0.5 mb-1">
-          <p className="text-[9px] text-neutral-600">Hit rate by category</p>
-          {Object.entries(cats).map(([cat, metric]) => (
-            <div key={cat} className="flex items-center gap-2 text-[10px] min-w-0">
-              <span className="text-neutral-300 flex-1 truncate">{cat}</span>
-              <span className={`font-mono tabular-nums ${frTrendColor(metric.trend)}`}>
-                {metric.current != null ? `${Math.round(metric.current * 100)}%` : '–'}
-              </span>
-              {metric.delta != null && (
-                <span className={`font-mono tabular-nums text-xs ${deltaColorClass(metric.delta)}`}>
-                  {formatDelta(metric.delta)}
-                </span>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-      {lift != null && (
-        <div className="flex items-center gap-2 text-[10px] pt-1 border-t border-neutral-800/60">
-          <span className="text-neutral-400 flex-1">Approval rate lift</span>
-          <span className={`font-mono tabular-nums ${frTrendColor(lift.trend)}`}>
-            {lift.current != null ? `${lift.current >= 0 ? '+' : ''}${Math.round(lift.current * 100)}pp` : '–'}
-          </span>
-          {lift.delta != null && (
-            <span className={`font-mono tabular-nums text-xs ${deltaColorClass(lift.delta)}`}>
-              {formatDelta(lift.delta)}
-            </span>
-          )}
-        </div>
-      )}
-    </div>
-  );
 }
 
 export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | undefined }) {
@@ -428,113 +370,6 @@ export function SrReviewerDisagreementsPanel({
           </div>
         );
       })()}
-    </div>
-  );
-}
-
-const _DRILL_PAGE_SIZE = 20;
-
-export function SrReviewerDisagreementDrillPanel({
-  category, taskType, days, fetchFn, onSelectTask,
-}: {
-  category: string;
-  taskType: string;
-  days: number;
-  fetchFn: (p: { category: string; task_type: string; days: number; page: number; page_size: number }) => Promise<SrReviewerDisagreementTasksResult>;
-  onSelectTask?: (taskId: string) => void;
-}) {
-  const [items, setItems] = useState<SrReviewerDisagreementTask[]>([]);
-  const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(false);
-  const [page, setPage] = useState(1);
-  useEffect(() => {
-    let alive = true;
-    async function load() {
-      setLoading(true);
-      try {
-        const r = await fetchFn({ category, task_type: taskType, days, page: page - 1, page_size: _DRILL_PAGE_SIZE });
-        if (alive) { setItems(r.items); setTotal(r.total); }
-      } finally {
-        if (alive) setLoading(false);
-      }
-    }
-    load();
-    return () => { alive = false; };
-  }, [fetchFn, category, taskType, days, page]);
-  const totalPages = Math.ceil(total / _DRILL_PAGE_SIZE);
-  if (loading && !items.length) return <div className="text-xs text-neutral-500 p-2">Loading…</div>;
-  if (!items.length) return <div data-testid="sr-disagreement-drill-empty" className="text-xs text-neutral-500 p-2">No tasks found.</div>;
-  return (
-    <div data-testid="sr-disagreement-drill-panel">
-      {items.map(t => (
-        // eslint-disable-next-line viewport/min-touch-target
-        <div key={t.task_id} className="py-1 border-b border-neutral-800 text-xs cursor-pointer hover:bg-neutral-800/30" onClick={() => onSelectTask?.(t.task_id)}>
-          <div className="font-medium text-neutral-200 truncate">{t.title}</div>
-          <div className="text-neutral-500 flex gap-2 flex-wrap">
-            <span>{t.task_type}</span>
-            {t.scope && <span>{t.scope}</span>}
-            <span>{t.severity}</span>
-            <span className="ml-auto">{new Date(t.created_at).toLocaleDateString()}</span>
-            {t.pr_url && <a href={t.pr_url} onClick={e => e.stopPropagation()} className="text-blue-400 hover:underline" target="_blank" rel="noreferrer">PR</a>}
-          </div>
-          {t.description && <div className="text-neutral-600 truncate">{t.description}</div>}
-        </div>
-      ))}
-      {totalPages > 1 && (
-        <div className="flex gap-2 mt-1 text-xs text-neutral-500">
-          <button disabled={page <= 1} onClick={() => setPage(p => p - 1)} className="disabled:opacity-40">prev</button>
-          <span>{page}/{totalPages}</span>
-          <button disabled={page >= totalPages} onClick={() => setPage(p => p + 1)} className="disabled:opacity-40">next</button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-export function SrScopeDriftVsExpansionCard({ data }: { data: SrScopeDriftVsExpansion | null | undefined }) {
-  if (!data) return null;
-  const rate = data.miss_by_expansion_rate;
-  const rateColor = rate == null
-    ? 'text-neutral-500'
-    : rate >= 0.3
-      ? 'text-red-400'
-      : rate >= 0.15
-        ? 'text-amber-400'
-        : 'text-emerald-400';
-  return (
-    <div data-testid="sr-scope-drift-vs-expansion" className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]">
-      <div className="flex items-baseline gap-2 mb-1">
-        <p className="text-[9px] text-neutral-500 uppercase tracking-wide">SR Scope-Drift vs Expansion</p>
-        {data.sample_size != null && (
-          <span className="text-[9px] text-neutral-600 font-mono ml-auto">n={data.sample_size}</span>
-        )}
-      </div>
-      <div className="flex items-center gap-2 text-[10px] mb-0.5">
-        <span className="text-neutral-400 flex-1">miss-by-expansion rate</span>
-        <span className={`font-mono font-bold tabular-nums ${rateColor}`}>
-          {rate != null ? `${Math.round(rate * 100)}%` : '–'}
-        </span>
-        {data.numerator != null && data.denominator != null && (
-          <span className="text-neutral-600 font-mono text-[9px]">{data.numerator}/{data.denominator}</span>
-        )}
-      </div>
-      <div className="flex flex-wrap gap-x-3 gap-y-0 text-[9px] text-neutral-500">
-        {data.consistent != null && (
-          <span title="SR passed + ratio ≤ 1.5 (true-pass)">consistent: {data.consistent}</span>
-        )}
-        {data.miss_by_expansion != null && (
-          <span title="SR passed + ratio ≥ 2.0 (scope-drift miss)" className="text-red-400/70">miss: {data.miss_by_expansion}</span>
-        )}
-        {data.hit_by_expansion != null && (
-          <span title="SR failed scope-drift + ratio ≥ 1.5 (SR caught it)" className="text-emerald-400/70">hit: {data.hit_by_expansion}</span>
-        )}
-        {data.fp_candidate != null && (
-          <span title="SR failed scope-drift + ratio ≤ 1.0 (likely false positive)">fp: {data.fp_candidate}</span>
-        )}
-        {(data.gray_zone ?? 0) > 0 && (
-          <span title="SR passed + 1.5 < ratio < 2.0 (ambiguous)">gray: {data.gray_zone}</span>
-        )}
-      </div>
     </div>
   );
 }

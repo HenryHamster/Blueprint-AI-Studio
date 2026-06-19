@@ -9580,3 +9580,88 @@ def test_authorized_test_deletions_require_documentation():
         "  str(f) == entry.path_suffix or str(f).endswith('/' + entry.path_suffix)\n"
         "Failures:\n" + "\n".join(unanchored)
     )
+
+
+def test_authorized_test_deletions_lifecycle_bounded():
+    """Entries in AUTHORIZED_TEST_DELETIONS must remain active only while their
+    co-deleted subject code is actually deleted from the working tree.
+
+    When a co-deleted file is restored (re-added to the repo), its entry becomes
+    "spent" and must be removed from the allowlist. Otherwise entries accumulate
+    indefinitely as permanent gate-bypass holes, allowing test deletions that were
+    never meant to be authorized.
+
+    The lifecycle-bounded filter _get_lifecycle_bounded_authorized_deletions()
+    enforces this: only entries whose subject code is still deleted remain active.
+    """
+    from app.release_scoring import (
+        AUTHORIZED_TEST_DELETIONS,
+        _get_lifecycle_bounded_authorized_deletions,
+    )
+    from pathlib import Path
+
+    # Anchor to the repo root (backend/testing/test_invariants.py -> repo root is 3 levels up).
+    _repo_root = Path(__file__).parent.parent.parent
+
+    def _subject_file_exists(file_part: str) -> list[str]:
+        """Return list of repo-relative paths where file_part is found (recursive search)."""
+        matches = []
+        for base_dir in ("admin-ui", "backend", "agent"):
+            for p in (_repo_root / base_dir).rglob(file_part):
+                matches.append(str(p.relative_to(_repo_root)))
+        # Also check full relative path from repo root
+        direct = _repo_root / file_part
+        if direct.exists() and str(direct.relative_to(_repo_root)) not in matches:
+            matches.append(str(direct.relative_to(_repo_root)))
+        return matches
+
+    active = _get_lifecycle_bounded_authorized_deletions()
+
+    # Verify that the filtered list contains only entries whose subject files
+    # are actually deleted (no longer exist in the working tree).
+    spent_entries = []
+    for entry in AUTHORIZED_TEST_DELETIONS:
+        if entry not in active:
+            # This entry was filtered out — check that its subject file exists.
+            # If it exists, the entry is correctly identified as spent.
+            subject_str = entry.co_deleted_subject.strip()
+            file_part = subject_str.split()[0] if subject_str else ""
+            if not file_part:
+                spent_entries.append(f"  {entry.path_suffix!r}: malformed co_deleted_subject (no file part)")
+                continue
+
+            # Try to find the file anywhere under the repo root (recursive).
+            found_paths = _subject_file_exists(file_part)
+
+            if not found_paths:
+                # Subject file does not exist but entry was filtered — this is an
+                # inconsistency. The entry should be active since the code is deleted.
+                spent_entries.append(
+                    f"  {entry.path_suffix!r}: subject file '{file_part}' is deleted "
+                    "but entry was filtered out (should be active)"
+                )
+
+    assert not spent_entries, (
+        "AUTHORIZED_TEST_DELETIONS lifecycle check failed. Entries are filtered as "
+        "'spent' only when their co-deleted subject files have been restored (re-added "
+        "to the repo). If the subject is still deleted, the entry must remain active.\n"
+        "Issues:\n" + "\n".join(spent_entries)
+    )
+
+    # Verify that active entries correspond to entries where the subject code
+    # is actually deleted (proving the entry is valid and currently-needed).
+    for entry in active:
+        subject_str = entry.co_deleted_subject.strip()
+        file_part = subject_str.split()[0] if subject_str else ""
+        if not file_part:
+            continue
+
+        # The subject file must NOT exist (must be deleted) for an entry to be active.
+        # Search recursively from the repo root so nested paths are found.
+        found_paths = _subject_file_exists(file_part)
+
+        assert not found_paths, (
+            f"AUTHORIZED_TEST_DELETIONS entry {entry.path_suffix!r} is active but its "
+            f"co-deleted subject '{file_part}' exists at {found_paths}. The entry is "
+            "'spent' (the code came back) and must be removed from AUTHORIZED_TEST_DELETIONS."
+        )

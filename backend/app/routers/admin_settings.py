@@ -137,6 +137,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "module_interfaces_holdback_fraction",
         "related_tests_holdback_fraction",
         "affected_consumers_holdback_fraction",
+        "repo_map_holdback_fraction",
         "productive_direction_cooldown_minutes",
         "direction_refractory_minutes",
         "direction_saturation_refractory_minutes",
@@ -156,6 +157,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "residual_remediation_cooldown_hours",
         "rollup_merge_queue_enabled",
         "review_second_opinion_gate_enabled",
+        "review_second_opinion_sample_rate",
         "smoketest_enabled",
         "spend_approval_timeout_hours",
         "strategic_retirement_challenge_gate_mode",
@@ -477,6 +479,9 @@ async def get_settings(
         "review_second_opinion_gate_enabled": bool(
             _runtime_config.get("review_second_opinion_gate_enabled", True)
         ),
+        "review_second_opinion_sample_rate": float(
+            _runtime_config.get("review_second_opinion_sample_rate", 1.0)
+        ),
         "strategic_retirement_challenge_gate_mode": str(
             _runtime_config.get("strategic_retirement_challenge_gate_mode", "observe")
             or "observe"
@@ -564,6 +569,9 @@ async def get_settings(
         ),
         "affected_consumers_holdback_fraction": float(
             _runtime_config.get("affected_consumers_holdback_fraction", 0.1)
+        ),
+        "repo_map_holdback_fraction": float(
+            _runtime_config.get("repo_map_holdback_fraction", 0.1)
         ),
         "drift_stall_min_claims": int(_runtime_config.get("drift_stall_min_claims", 5)),
         "reserved_slots_for_types": _runtime_config.get(
@@ -1169,6 +1177,20 @@ async def _apply_settings(
                 detail="review_second_opinion_gate_enabled must be a boolean",
             )
         _runtime_config["review_second_opinion_gate_enabled"] = val
+    if "review_second_opinion_sample_rate" in payload:
+        try:
+            fval = float(payload["review_second_opinion_sample_rate"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="review_second_opinion_sample_rate must be a number",
+            )
+        if not (0.0 <= fval <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="review_second_opinion_sample_rate must be between 0.0 and 1.0",
+            )
+        _runtime_config["review_second_opinion_sample_rate"] = round(fval, 4)
     if "strategic_retirement_challenge_gate_mode" in payload:
         val = (
             str(payload["strategic_retirement_challenge_gate_mode"] or "")
@@ -1547,6 +1569,7 @@ async def _apply_settings(
         "module_interfaces_holdback_fraction",
         "related_tests_holdback_fraction",
         "affected_consumers_holdback_fraction",
+        "repo_map_holdback_fraction",
     ):
         if float_key in payload:
             try:
@@ -1593,6 +1616,7 @@ async def _apply_settings(
             )
         if val:
             from app.warm_pool import is_warm_pool_enabled as _is_warm_pool_enabled
+
             if not _is_warm_pool_enabled():
                 raise HTTPException(
                     status_code=422,
@@ -1611,6 +1635,7 @@ async def _apply_settings(
             )
         if val:
             from app.warm_pool import is_warm_pool_enabled as _is_warm_pool_enabled2
+
             if not _is_warm_pool_enabled2():
                 raise HTTPException(
                     status_code=422,
@@ -2623,6 +2648,9 @@ async def _apply_settings(
                     "affected_consumers_holdback_fraction": _runtime_config.get(
                         "affected_consumers_holdback_fraction", 0.1
                     ),
+                    "repo_map_holdback_fraction": _runtime_config.get(
+                        "repo_map_holdback_fraction", 0.1
+                    ),
                     "agent_prompt_suffixes": _runtime_config.get(
                         "agent_prompt_suffixes", {}
                     ),
@@ -2727,6 +2755,9 @@ async def _apply_settings(
                     # True default).
                     "review_second_opinion_gate_enabled": bool(
                         _runtime_config.get("review_second_opinion_gate_enabled", True)
+                    ),
+                    "review_second_opinion_sample_rate": float(
+                        _runtime_config.get("review_second_opinion_sample_rate", 1.0)
                     ),
                     "strategic_retirement_challenge_gate_mode": str(
                         _runtime_config.get(

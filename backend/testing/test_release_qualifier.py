@@ -5005,6 +5005,7 @@ async def test_resolve_candidate_ci_caps_pr_head_sweep(mocker, caplog):
     sweep is capped at _PR_HEAD_SWEEP_MAX to avoid exhausting API quota.
     A warning is logged when truncation occurs."""
     import logging
+
     caplog.set_level(logging.WARNING)
 
     check_runs_call_count = 0
@@ -13143,6 +13144,52 @@ async def test_sweep_leaves_deferred_unsynced_when_still_behind(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_redrive_deferred_unsynced_preserves_state_on_transient_sha_error(
+    db_session, mocker
+):
+    """A transient GitHub error during deferred_unsynced re-drive must NOT
+    overwrite last_qualification with the error state.
+
+    Acceptance proof: after the sweep, version.last_qualification["status"] is
+    still "deferred_unsynced" (not "sha_error") and no audit task was created —
+    the version remains eligible for the next sweep's re-drive loop.
+    """
+    from datetime import datetime, timedelta
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    first_deferred = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+    version.last_qualification = {
+        "status": "deferred_unsynced",
+        "candidate_sha": "stale00" * 5 + "00000",
+        "first_deferred_at": first_deferred,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # Simulate a transient GitHub error: get_branch_sha raises, causing
+    # run_qualification to return sha_error without clearing the deferral.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        side_effect=RuntimeError("transient GitHub 503"),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # The sweep does not count a failed re-drive as a finalization.
+    assert count == 0
+    await db_session.refresh(version)
+    # Critical: the deferred_unsynced state must be preserved, not overwritten
+    # with sha_error — otherwise the version falls out of the re-drive loop.
+    assert version.last_qualification["status"] == "deferred_unsynced"
+    assert version.last_qualification["first_deferred_at"] == first_deferred
+    # No audit task should have been spawned.
+    assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
 async def test_redrive_requalifies_resolved_blocker_stale_verdict(db_session, mocker):
     """A stabilize version at a conclusive not_promoted verdict with all gating
     findings ledger-resolved and automain HEAD advanced past the candidate SHA
@@ -13291,6 +13338,49 @@ async def test_sweep_leaves_not_promoted_when_head_unchanged(db_session, mocker)
     # Still not_promoted — cached_verdict guard fired.
     assert version.last_qualification["status"] == "not_promoted"
     assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_redrive_requalifies_zero_gating_ready_version(db_session, mocker):
+    """A stabilize-phase version with not_promoted verdict, a non-audit blocker,
+    ZERO carried high/medium audit findings, and automain advanced to a new SHA
+    is re-driven into run_qualification by the sweep; a fresh qualification spawns.
+
+    Acceptance proof: version transitions from not_promoted to pending and an
+    audit task is created — matching the declared task acceptance evidence. This
+    test verifies the fix for the gating_total==0 short-circuit: a version whose
+    only blocker was non-audit (e.g. ci_not_green) and that is now ready should
+    be re-driven, not skipped."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Stale not_promoted verdict with non-audit blocker, zero gating findings.
+    old_sha = "oldsha0" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "ci_not_green",
+        "audit_findings": [],  # Zero gating findings
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # automain has advanced to a NEW SHA (different from old_sha).
+    new_sha = "automn0" * 5 + "00000"
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    # Synced — LTS gate passes.
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+    await db_session.refresh(version)
+    # Stale verdict overwritten — qualification started.
+    assert version.last_qualification["status"] == "pending"
+    assert len(await _audit_tasks(db_session, project.id)) == 1
 
 
 @pytest.mark.asyncio
@@ -16962,21 +17052,26 @@ async def test_calcification_not_fired_below_attempt_threshold(db_session):
 
 
 @pytest.mark.asyncio
-async def test_sweep_triggers_calcification_check(db_session):
+async def test_sweep_triggers_calcification_check(db_session, mocker):
     """The sweep runs the calcification check after finalizing stuck versions —
     a version that already has enough hard-blocker failures gets an alert."""
     from app.models import Alert as _Alert
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    # No pending qualification — the sweep won't try to finalize this version.
-    # But it should still check for calcification.
+    # automain HEAD matches the candidate SHA — run_qualification returns
+    # cached_verdict (no-op), preserving the not_promoted status so the
+    # calcification check can fire.
+    same_sha = "automn0" * 5 + "00000"
     version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS
     version.last_qualification = {
         "status": "not_promoted",
         "blocker": "ci_not_green",
+        "candidate_sha": same_sha,
     }
     db_session.add(version)
     await db_session.commit()
+
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=same_sha))
 
     await rq.sweep_stuck_qualifications(
         db_session, session_factory=_shared_session_factory(db_session)
@@ -17429,8 +17524,9 @@ async def test_stabilize_stall_not_fired_for_dry_run_hold(db_session):
 
 @pytest.mark.asyncio
 async def test_stabilize_stall_not_fired_when_calcification_covers_it(db_session):
-    """A version with a hard-blocker not_promoted status is already covered by
-    the calcification alert — stabilize-stall must not double-alert."""
+    """A version with a hard-blocker not_promoted status AND enough qualification
+    attempts is already covered by the calcification alert — stabilize-stall must
+    not double-alert."""
     from datetime import timedelta
 
     _project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -17441,6 +17537,60 @@ async def test_stabilize_stall_not_fired_when_calcification_covers_it(db_session
         "status": "not_promoted",
         "blocker": "ci_not_green",
     }
+    # At or above the calcification threshold the calcification alert covers it,
+    # so the stabilize-stall alert must stay silent.
+    version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_stabilize_stall(db_session, version)
+    assert alerted is False
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_fires_for_low_attempt_hard_blocker_strand(db_session):
+    """A version stuck not_promoted with a hard blocker but below the calcification
+    threshold is invisible to the calcification alert — the stabilize-stall alert
+    must fire as the backstop once the version is old enough."""
+    from datetime import timedelta
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS + 5
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_not_green",
+    }
+    # Below the calcification threshold — calcification alert won't fire.
+    version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS - 1
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_stabilize_stall(db_session, version)
+    assert alerted is True
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_not_fired_for_low_attempt_hard_blocker_young_version(
+    db_session,
+):
+    """A version stuck not_promoted with a hard blocker below the calcification
+    threshold but NOT yet past the age gate must NOT fire the stabilize-stall
+    alert — it is too young."""
+    from datetime import timedelta
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.phase_changed_at = rq._utcnow() - timedelta(
+        days=rq._STABILIZE_STALL_AGE_DAYS - 2
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_not_green",
+    }
+    version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS - 1
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)

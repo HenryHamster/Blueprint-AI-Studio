@@ -60,6 +60,54 @@ AUTHORIZED_TEST_DELETIONS: tuple[AuthorizedTestDeletion, ...] = (
     ),
 )
 
+def _get_lifecycle_bounded_authorized_deletions() -> tuple[AuthorizedTestDeletion, ...]:
+    """Return only the currently-active AUTHORIZED_TEST_DELETIONS entries.
+
+    Entries are considered active only when their co-deleted subject code is
+    actually deleted from the working tree. If a subject file has been restored
+    (re-added to the repo), the entry is considered "spent" and must be removed
+    from the allowlist — otherwise it becomes a permanent gate-bypass hole.
+
+    This ensures that each entry has a finite lifecycle: it is active only while
+    the code it authorized for deletion remains deleted, and must be removed if
+    that code is ever restored or the circumstances change.
+    """
+    from pathlib import Path
+
+    # Anchor to the repo root (backend/app/release_scoring.py -> repo root is 3 levels up).
+    _repo_root = Path(__file__).parent.parent.parent
+
+    active: list[AuthorizedTestDeletion] = []
+    for entry in AUTHORIZED_TEST_DELETIONS:
+        # Parse the co_deleted_subject to find file paths mentioned.
+        # Expected format: "filename.ext (functionName)" or "filename.ext"
+        subject_str = entry.co_deleted_subject.strip()
+        # Extract the first token which is typically the filename.
+        file_part = subject_str.split()[0] if subject_str else ""
+
+        # Check if the subject file exists in the working tree. If it does,
+        # the entry is "spent" (the code came back) and should not be active.
+        if file_part:
+            # Search recursively in common top-level directories from the repo root
+            # so files nested in subdirectories (e.g. admin-ui/src/utils/foo.ts) are found.
+            found = any(
+                any((_repo_root / base_dir).rglob(file_part))
+                for base_dir in ("admin-ui", "backend", "agent")
+            )
+            if not found:
+                # Also check if file_part is a full relative path from repo root.
+                found = (_repo_root / file_part).exists()
+
+            # If none of the expected paths exist, the entry is active (code is deleted).
+            if not found:
+                active.append(entry)
+        else:
+            # Malformed entry, keep it for now (the documentation test will catch it)
+            active.append(entry)
+
+    return tuple(active)
+
+
 # Hardcoded fallback used when promotion_policy.yaml is missing, unreadable, or
 # malformed.  MUST match the documented defaults in promotion_policy.yaml so a
 # parse failure degrades to the intended rubric rather than a silent surprise.
@@ -470,12 +518,15 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
         # Exclude authorized dead-code deletions (anchored path-suffix match:
         # requires a '/' before the suffix so that e.g. "evilFoo.test.ts"
         # does not accidentally authorize "Foo.test.ts").
+        # Use only the lifecycle-bounded (currently-active) authorized deletions
+        # to prevent spent entries from becoming permanent gate-bypass holes.
+        active_deletions = _get_lifecycle_bounded_authorized_deletions()
         unauthorized = [
             f
             for f in deleted
             if not any(
                 str(f) == entry.path_suffix or str(f).endswith("/" + entry.path_suffix)
-                for entry in AUTHORIZED_TEST_DELETIONS
+                for entry in active_deletions
             )
         ]
         if unauthorized:

@@ -740,6 +740,7 @@ Rules:
     const repaired = await repairStructuredOutput<unknown[]>({
       mode: 'array',
       requiredKeys: ['severity'],
+      schemaLabel: 'specialized_findings',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior performance analysis response did not end with a parseable JSON findings array.
 Return ONLY the JSON array for /tmp/perf_report_${taskId}.json. Each finding object must include at least "severity" plus area, title, description, fix_prompt, and related_files. Use [] if there are no findings. No markdown, prose, or code fences.`,
@@ -878,7 +879,7 @@ The "verdict" value MUST be exactly "pass" or "fail" — no other values are acc
         if (unrecognized.length > 0) {
           return {
             ok: false,
-            reason: 'parsed_array_missing_key',
+            reason: 'parsed_array_invalid_value',
             detail: `unrecognized verdict strings: ${unrecognized.join(', ')}`,
           };
         }
@@ -992,6 +993,7 @@ IMPORTANT:
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['root_cause', 'recommended_fix'],
+      schemaLabel: 'specialized_result',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior investigation response did not end with a parseable JSON diagnosis object.
 Return ONLY the JSON object for /tmp/investigation_report_${taskId}.json with top-level "summary", "root_cause", "affected_files", "recommended_fix", "severity", and "confidence". Include verdict fields when relevant. No markdown, prose, or code fences.`,

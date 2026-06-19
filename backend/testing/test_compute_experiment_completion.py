@@ -78,6 +78,20 @@ def _quiet_compute_io(mocker):
     mocker.patch(
         "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
     )
+    # Hold the always-dispose follow-on spawn constant so these tests stay focused
+    # on the completion GATE + faithful capture + knowledge persistence contract.
+    # Under always-dispose every terminal experiment now routes through
+    # _spawn_act_on_verdict_followon (success → reason-and-ship → parent EVALUATING;
+    # failure → diagnose-and-fix; intentional kills → skipped). That orthogonal
+    # disposition behaviour — child shape, prompt framing, EVALUATING transition,
+    # kill exclusion, concurrency cap — is owned and asserted by
+    # testing/test_compute_experiment_spawn.py. Mocking it here (return None) keeps
+    # the success path COMPLETED and the failure paths FAILED so each test below
+    # asserts exactly the gate/capture/knowledge behaviour it was written for.
+    mocker.patch(
+        "app.task_completion._spawn_act_on_verdict_followon",
+        new=AsyncMock(return_value=None),
+    )
 
 
 # ── Registry: the declaration is honest ─────────────────────────────────────

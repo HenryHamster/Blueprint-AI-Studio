@@ -22,13 +22,17 @@ from app.evergreen_backlog import (
     FleetSignal,
     apply_research_outcome,
     backlog_summary,
+    compute_observe_mode_verdict,
     count_active_probes,
     decide_evergreen_fill,
     enroll_backlog_item,
+    record_decision,
     select_candidate,
     spawn_evergreen_probe,
+    _reset_observability_for_tests,
+    get_fill_observability,
 )
-from app.models import EvergreenBacklogItem, Project, Task
+from app.models import EvergreenBacklogItem, EvergreenFillDecisionLog, Project, Task
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +190,102 @@ def test_every_decision_reason_is_closed_vocabulary():
             assert d.reason in TRIGGER_REASONS
         else:
             assert d.reason in NOOP_REASONS
+
+
+# --------------------------------------------------------------------------- #
+# Observe-mode cap-precedes-observe ordering — false-alarm rate purity.
+#
+# In observe mode, cap/dedup guards fire BEFORE the observe_mode noop.  So
+# when a cap fires, the returned reason is the cap reason (not 'observe_mode').
+# These tests verify that ordering, which is what makes the fire-rate metric
+# correct: only genuine would-have-fired decisions land in the denominator.
+# --------------------------------------------------------------------------- #
+
+
+def test_observe_mode_active_cap_precedes_observe_noop():
+    """active_cap_reached fires before observe_mode in observe mode."""
+    decision = decide_evergreen_fill(
+        _would_create_signal(mode="observe", active_evergreen_probes=1, max_active=1)
+    )
+    assert decision.action == DECISION_NOOP
+    assert decision.reason == "active_cap_reached"
+    assert decision.reason != "observe_mode"
+
+
+def test_observe_mode_daily_cap_precedes_observe_noop():
+    """daily_cap_reached fires before observe_mode in observe mode."""
+    decision = decide_evergreen_fill(
+        _would_create_signal(mode="observe", daily_spawn_count=3, daily_cap=3)
+    )
+    assert decision.action == DECISION_NOOP
+    assert decision.reason == "daily_cap_reached"
+    assert decision.reason != "observe_mode"
+
+
+def test_observe_mode_no_candidate_precedes_observe_noop():
+    """no_candidate fires before observe_mode in observe mode."""
+    decision = decide_evergreen_fill(
+        _would_create_signal(mode="observe", has_candidate=False)
+    )
+    assert decision.action == DECISION_NOOP
+    assert decision.reason == "no_candidate"
+    assert decision.reason != "observe_mode"
+
+
+def test_observe_mode_direction_conflict_precedes_observe_noop():
+    """direction_conflict fires before observe_mode in observe mode."""
+    decision = decide_evergreen_fill(
+        _would_create_signal(mode="observe", candidate_conflict=True)
+    )
+    assert decision.action == DECISION_NOOP
+    assert decision.reason == "direction_conflict"
+    assert decision.reason != "observe_mode"
+
+
+def test_observe_mode_duplicate_lineage_precedes_observe_noop():
+    """duplicate_lineage fires before observe_mode in observe mode."""
+    decision = decide_evergreen_fill(
+        _would_create_signal(mode="observe", duplicate_lineage=True)
+    )
+    assert decision.action == DECISION_NOOP
+    assert decision.reason == "duplicate_lineage"
+    assert decision.reason != "observe_mode"
+
+
+async def test_observe_mode_active_cap_rows_excluded_from_would_have_fired(db_session):
+    """Cap-reason rows in observe mode are NOT counted as would_have_fired.
+
+    Seeds a mix of observe-mode rows: some with reason='active_cap_reached'
+    (cap fired before observe check) and some with reason='observe_mode'
+    (genuine would-have-fired).  Confirms that compute_observe_mode_verdict
+    counts only the 'observe_mode' rows in would_have_fired, so cap rows do
+    not inflate the false-alarm rate.
+    """
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+
+    # 5 rows where a cap fired — these must NOT inflate would_have_fired.
+    for _ in range(5):
+        db_session.add(
+            _observe_row(ts=now - timedelta(hours=1), reason="active_cap_reached")
+        )
+    # 5 rows where observe_mode suppressed a genuine would-have-fired spawn.
+    for _ in range(5):
+        db_session.add(_observe_row(ts=now - timedelta(hours=1), reason="observe_mode"))
+    await db_session.commit()
+
+    result = await compute_observe_mode_verdict(
+        db_session, window_hours=24, max_fire_rate_pct=60.0, min_evaluations=10
+    )
+    assert result["observe_evaluations"] == 10
+    # Only the 5 genuine would-have-fired rows count.
+    assert result["would_have_fired"] == 5
+    # Fire rate is 50%, not 100% (which would be the case if cap rows were counted).
+    assert result["fire_rate_pct"] == 50.0
+    assert result["verdict"] == "go"  # 50% ≤ 60% threshold
 
 
 # --------------------------------------------------------------------------- #
@@ -526,6 +626,78 @@ async def test_admin_enroll_list_and_observability_endpoints(client, db_session)
 
 
 # --------------------------------------------------------------------------- #
+# Durable fill-decision log — windowed observability (acceptance evidence).
+# --------------------------------------------------------------------------- #
+
+
+async def test_fill_decisions_endpoint_windowing(db_session, client):
+    """Endpoint returns only in-window rows; out-of-window rows are excluded.
+
+    Seeds in-window and out-of-window EvergreenFillDecisionLog rows directly,
+    clears the in-memory ring (simulating a process restart), then asserts
+    the fill-observability endpoint returns only the in-window row.
+    """
+    from datetime import timedelta
+
+    from app.evergreen_backlog import _reset_observability_for_tests
+    from app.models import EvergreenFillDecisionLog
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+
+    _common = {
+        "mode": "enforce",
+        "util_threshold": 0.5,
+        "dispatchable_queue_depth": 0,
+        "active_evergreen_probes": 0,
+        "daily_spawn_count": 0,
+        "has_candidate": True,
+    }
+
+    # In-window: 2 hours ago — should appear in a 24-hour window.
+    in_window = EvergreenFillDecisionLog(
+        action="create",
+        reason="low_utilization",
+        trigger="low_utilization",
+        ts=now - timedelta(hours=2),
+        **_common,
+    )
+    # Out-of-window: 30 hours ago — excluded from 24-hour window.
+    out_of_window = EvergreenFillDecisionLog(
+        action="noop",
+        reason="mode_off",
+        trigger=None,
+        ts=now - timedelta(hours=30),
+        **_common,
+    )
+    db_session.add(in_window)
+    db_session.add(out_of_window)
+    await db_session.commit()
+
+    # Simulate process restart by clearing the in-memory ring.
+    _reset_observability_for_tests()
+
+    resp = await client.get("/api/admin/evergreen/fill-observability?window_hours=24")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Only the in-window create should appear.
+    assert body["created_count"] == 1
+    assert body["reason_counts"].get("low_utilization") == 1
+    assert "mode_off" not in body["reason_counts"]
+    assert body["trigger_counts"].get("low_utilization") == 1
+
+    # Recent list contains only the in-window row with correct fields.
+    assert len(body["recent"]) == 1
+    rec = body["recent"][0]
+    assert rec["action"] == "create"
+    assert rec["reason"] == "low_utilization"
+    assert rec["trigger"] == "low_utilization"
+    # ts field present when backed by durable log.
+    assert "ts" in rec and rec["ts"] is not None
+
+
+# --------------------------------------------------------------------------- #
 # Deferred-memo enrollment integration (flag-gated).
 # --------------------------------------------------------------------------- #
 
@@ -835,3 +1007,473 @@ async def test_global_hourly_cap_holds_across_multi_project_tick(db_session, moc
         f"Expected exactly 1 probe (cap={cap}, pre-existing={cap - 1}), "
         f"got {len(all_probes)}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Durable EvergreenFillDecisionLog ledger — acceptance evidence.
+# test_fill_decisions_persist_and_window                                       #
+# --------------------------------------------------------------------------- #
+
+
+async def test_fill_decisions_persist_and_window(db_session, mocker):
+    """Decision-log rows are durably written and the in-memory ring carries context.
+
+    Acceptance contract (two parts):
+    (a) One EvergreenFillDecisionLog row per project per tick is written to the
+        DB with signal fields populated (util_now, mode, dispatchable_queue_depth,
+        has_candidate, util_threshold, active_evergreen_probes, daily_spawn_count).
+    (b) The augmented in-memory ring entry for the same decision exposes those
+        same signal context fields (util_now, mode, has_candidate etc.).
+    """
+    import contextlib
+    import uuid as _uuid
+    from unittest.mock import AsyncMock, patch
+
+    import app.shared_state as _ss
+    from app.evergreen_backlog import check_evergreen_fill
+
+    _reset_observability_for_tests()
+
+    # Two autonomous projects, each with one enrolled backlog candidate.
+    projects = []
+    items = []
+    for i in range(2):
+        proj = Project(
+            name=f"log-test-{i}-{_uuid.uuid4().hex[:6]}",
+            user_id="test-user-log",
+            autonomous_enabled=True,
+        )
+        db_session.add(proj)
+        await db_session.flush()
+        item = await enroll_backlog_item(
+            db_session,
+            project_id=proj.id,
+            finding_key=f"log-gap-{i}",
+            title=f"Log test gap {i}",
+        )
+        projects.append(proj)
+        items.append(item)
+
+    @contextlib.asynccontextmanager
+    async def _session_cm():
+        yield db_session
+
+    _ss.last_evergreen_check = None
+
+    runtime_overrides = {
+        "evergreen_fill_mode": "observe",  # observe mode: no task created, log written
+        "evergreen_fill_interval_minutes": 0,
+        "evergreen_fill_util_threshold": 0.9,  # util_now (0.1) < threshold → triggers
+        "evergreen_fill_min_free_slots": 1,
+        "evergreen_fill_max_active": 5,
+        "evergreen_fill_daily_cap": 10,
+        "max_global_autonomous_tasks_per_hour": 50,
+    }
+
+    import app.shared_state as _real_ss
+    from app.shared_state import runtime_config as _real_rc
+
+    orig_values = {k: _real_rc.get(k) for k in runtime_overrides}
+    for k, v in runtime_overrides.items():
+        _real_rc[k] = v
+    _real_ss.last_evergreen_check = None
+
+    try:
+        with (
+            patch("app.database.AsyncSessionLocal", _session_cm),
+            patch(
+                "app.fleet_utilization.get_fleet_utilization_snapshot",
+                new=AsyncMock(return_value={"util_now": 0.1, "vm_slots_available": 8}),
+            ),
+            patch(
+                "app.branch_resolution.get_project_integration_branch",
+                return_value="automain",
+            ),
+            patch(
+                "app.evergreen_backlog._evergreen_spend_ceiling_reason",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.evergreen_backlog._evergreen_circuit_open",
+                return_value=False,
+            ),
+            patch(
+                "app.evergreen_backlog._directions_parked_or_proof_waiting",
+                return_value=False,
+            ),
+            patch(
+                "app.evergreen_backlog.has_direction_conflict",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "app.evergreen_backlog.has_duplicate_lineage",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            await check_evergreen_fill()
+    finally:
+        for k, orig_v in orig_values.items():
+            if orig_v is None:
+                _real_rc.pop(k, None)
+            else:
+                _real_rc[k] = orig_v
+
+    # (a) — one EvergreenFillDecisionLog row per project, with signal fields.
+    for proj, item in zip(projects, items):
+        rows = (
+            (
+                await db_session.execute(
+                    select(EvergreenFillDecisionLog).where(
+                        EvergreenFillDecisionLog.project_id == proj.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1, (
+            f"Expected 1 decision log row for project {proj.id}, got {len(rows)}"
+        )
+        row = rows[0]
+        assert row.mode == "observe"
+        assert row.action == DECISION_NOOP
+        assert row.reason == "observe_mode"
+        assert row.trigger == "low_utilization"
+        assert abs((row.util_now or 0) - 0.1) < 1e-6
+        assert abs(row.util_threshold - 0.9) < 1e-6
+        assert row.dispatchable_queue_depth == 0
+        assert row.vm_slots_available == 8
+        assert row.has_candidate is True
+        assert row.active_evergreen_probes == 0
+        assert row.daily_spawn_count == 0
+        assert row.item_id == item.id
+        assert row.finding_key == item.finding_key
+        assert row.ts is not None
+
+    # (b) — the in-memory ring entries expose the same context fields.
+    obs = get_fill_observability()
+    recent = obs["recent"]
+    # Two projects → two entries in the ring.
+    assert len(recent) >= 2, f"Expected ≥2 ring entries, got {len(recent)}: {recent}"
+    for entry in recent[-2:]:
+        assert entry.get("mode") == "observe"
+        assert abs((entry.get("util_now") or 0) - 0.1) < 1e-6
+        assert entry.get("has_candidate") is True
+        assert entry.get("dispatchable_queue_depth") == 0
+        assert entry.get("item_id") is not None
+        assert entry.get("finding_key") is not None
+
+
+def test_record_decision_augmented_ring_fields():
+    """record_decision with a FleetSignal populates all signal fields in the ring."""
+    _reset_observability_for_tests()
+
+    signal = FleetSignal(
+        mode="observe",
+        util_now=0.25,
+        util_threshold=0.5,
+        dispatchable_queue_depth=0,
+        vm_slots_available=4,
+        min_free_slots=2,
+        active_evergreen_probes=0,
+        max_active=1,
+        daily_spawn_count=1,
+        daily_cap=3,
+        has_candidate=True,
+    )
+    from app.evergreen_backlog import FillDecision, DECISION_NOOP
+
+    decision = FillDecision(
+        action=DECISION_NOOP, reason="observe_mode", trigger="low_utilization"
+    )
+    from datetime import datetime
+
+    ts = datetime(2026, 1, 1, 12, 0, 0)
+    record_decision(
+        decision,
+        project_id="proj-abc",
+        signal=signal,
+        item_id="item-xyz",
+        finding_key="gap-test",
+        ts=ts,
+    )
+
+    obs = get_fill_observability()
+    assert len(obs["recent"]) == 1
+    entry = obs["recent"][0]
+
+    assert entry["action"] == DECISION_NOOP
+    assert entry["reason"] == "observe_mode"
+    assert entry["trigger"] == "low_utilization"
+    assert entry["project_id"] == "proj-abc"
+    assert entry["mode"] == "observe"
+    assert abs((entry["util_now"] or 0) - 0.25) < 1e-6
+    assert abs(entry["util_threshold"] - 0.5) < 1e-6
+    assert entry["dispatchable_queue_depth"] == 0
+    assert entry["vm_slots_available"] == 4
+    assert entry["active_evergreen_probes"] == 0
+    assert entry["daily_spawn_count"] == 1
+    assert entry["has_candidate"] is True
+    assert entry["item_id"] == "item-xyz"
+    assert entry["finding_key"] == "gap-test"
+    assert entry["ts"] == ts
+
+
+# --------------------------------------------------------------------------- #
+# Observe-mode false-alarm validation verdict (acceptance evidence).
+# test_observe_mode_false_alarm_verdict                                        #
+# --------------------------------------------------------------------------- #
+
+
+def _observe_row(**kwargs):
+    """Minimal EvergreenFillDecisionLog row for observe-mode verdict tests."""
+    from app.time_utils import _utcnow
+
+    defaults = {
+        "mode": "observe",
+        "action": DECISION_NOOP,
+        "reason": "observe_mode",
+        "trigger": "low_utilization",
+        "ts": _utcnow(),
+        "util_threshold": 0.5,
+        "dispatchable_queue_depth": 0,
+        "active_evergreen_probes": 0,
+        "daily_spawn_count": 0,
+        "has_candidate": True,
+    }
+    defaults.update(kwargs)
+    return EvergreenFillDecisionLog(**defaults)
+
+
+async def test_observe_mode_false_alarm_verdict(db_session):
+    """Acceptance evidence: synthetic windows yield correct verdict at/around the threshold.
+
+    Seeds three synthetic observation windows and checks the verdict transitions:
+    - exactly at threshold (20%) → go
+    - above threshold (80%) → no_go
+    - empty window → insufficient_data
+    """
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    threshold = 20.0
+
+    # Window A: 2/10 would-have-fired → 20% — exactly at threshold → go.
+    for i in range(10):
+        db_session.add(
+            _observe_row(
+                ts=now - timedelta(hours=1),
+                reason="observe_mode" if i < 2 else "max_active",
+            )
+        )
+
+    await db_session.commit()
+
+    result = await compute_observe_mode_verdict(
+        db_session, window_hours=24, max_fire_rate_pct=threshold, min_evaluations=10
+    )
+    assert result["verdict"] == "go", f"Expected go, got: {result}"
+    assert result["observe_evaluations"] == 10
+    assert result["would_have_fired"] == 2
+    assert result["fire_rate_pct"] == 20.0
+
+
+async def test_observe_mode_verdict_insufficient_data_when_no_rows(db_session):
+    """Empty window yields insufficient_data verdict."""
+    result = await compute_observe_mode_verdict(
+        db_session, window_hours=24, max_fire_rate_pct=20.0, min_evaluations=10
+    )
+    assert result["verdict"] == "insufficient_data"
+    assert result["observe_evaluations"] == 0
+    assert result["fire_rate_pct"] is None
+
+
+async def test_observe_mode_verdict_go_when_fire_rate_below_threshold(db_session):
+    """2/10 would-have-fired at threshold 25% → go."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    for i in range(10):
+        db_session.add(
+            _observe_row(
+                ts=now - timedelta(hours=1),
+                reason="observe_mode" if i < 2 else "max_active",
+            )
+        )
+    await db_session.commit()
+
+    result = await compute_observe_mode_verdict(
+        db_session, window_hours=24, max_fire_rate_pct=25.0, min_evaluations=10
+    )
+    assert result["verdict"] == "go"
+    assert result["fire_rate_pct"] == 20.0
+
+
+async def test_observe_mode_verdict_no_go_when_fire_rate_exceeds_threshold(db_session):
+    """8/10 would-have-fired at threshold 25% → no_go."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    for i in range(10):
+        db_session.add(
+            _observe_row(
+                ts=now - timedelta(hours=1),
+                reason="observe_mode" if i < 8 else "max_active",
+            )
+        )
+    await db_session.commit()
+
+    result = await compute_observe_mode_verdict(
+        db_session, window_hours=24, max_fire_rate_pct=25.0, min_evaluations=10
+    )
+    assert result["verdict"] == "no_go"
+    assert result["fire_rate_pct"] == 80.0
+
+
+async def test_observe_mode_verdict_ignores_enforce_mode_rows(db_session):
+    """Only mode='observe' rows count; enforce-mode rows are excluded."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    # 5 observe rows, 0 would-have-fired.
+    for _ in range(5):
+        db_session.add(_observe_row(ts=now - timedelta(hours=1), reason="max_active"))
+    # 20 enforce rows with observe_mode reason — must NOT count.
+    for _ in range(20):
+        db_session.add(
+            _observe_row(
+                ts=now - timedelta(hours=1), mode="enforce", reason="observe_mode"
+            )
+        )
+    await db_session.commit()
+
+    result = await compute_observe_mode_verdict(
+        db_session, window_hours=24, max_fire_rate_pct=25.0, min_evaluations=10
+    )
+    # Only 5 observe rows — below min_evaluations=10.
+    assert result["verdict"] == "insufficient_data"
+    assert result["observe_evaluations"] == 5
+
+
+async def test_observe_mode_false_alarm_rate_consecutive_tick(db_session):
+    """Cap-adjusted rate prevents idle-fleet false alarms from consecutive ticks.
+
+    Seeds 10 would-have-fired observe_mode rows all within the same UTC day,
+    simulating an idle fleet ticking every 15 minutes.  Without cap adjustment
+    the raw fire rate is 100% (no_go at any threshold).  With daily_cap=3 the
+    cap-adjusted numerator is 3, giving 3/10 = 30% — a go at threshold 50%.
+
+    This is the acceptance evidence for the false-alarm-rate fix: the verdict
+    must use the cap-adjusted metric, not the raw metric.
+    """
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+
+    # 10 would-have-fired rows on the same calendar day — consecutive idle ticks.
+    for _ in range(10):
+        db_session.add(_observe_row(ts=now - timedelta(hours=1), reason="observe_mode"))
+    await db_session.commit()
+
+    result = await compute_observe_mode_verdict(
+        db_session,
+        window_hours=24,
+        max_fire_rate_pct=50.0,
+        min_evaluations=10,
+        daily_cap=3,
+    )
+
+    # Raw metrics are preserved for informational display.
+    assert result["would_have_fired"] == 10
+    assert result["fire_rate_pct"] == 100.0  # would be no_go without fix
+
+    # Cap-adjusted metrics reflect the daily_cap=3 ceiling.
+    assert result["daily_cap"] == 3
+    assert result["cap_adjusted_would_have_fired"] == 3  # min(10, 3)
+    assert result["cap_adjusted_fire_rate_pct"] == 30.0  # 3/10
+
+    # Verdict uses cap-adjusted rate: 30% ≤ 50% threshold → go.
+    assert result["verdict"] == "go", (
+        f"Expected go (cap_adjusted=30% ≤ 50%), got {result['verdict']}: {result}"
+    )
+
+
+async def test_observe_mode_verdict_endpoint(db_session, client):
+    """HTTP GET /api/admin/evergreen/observe-mode-verdict returns a verdict dict."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    for i in range(10):
+        db_session.add(
+            _observe_row(
+                ts=now - timedelta(hours=1),
+                reason="observe_mode" if i < 3 else "max_active",
+            )
+        )
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/evergreen/observe-mode-verdict?window_hours=24")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verdict"] in {"go", "no_go", "insufficient_data"}
+    assert body["observe_evaluations"] == 10
+    assert body["would_have_fired"] == 3
+    assert body["fire_rate_pct"] == 30.0
+    assert body["verdict"] == "no_go"  # 30% > default 20% threshold
+
+
+async def test_evergreen_fill_decision_retention_sweep_purges_only_stale_rows(
+    db_session,
+):
+    """Sweep purges only rows older than retention window; fresh rows remain."""
+    from datetime import timedelta
+
+    from app.reaper_sweeps import sweep_evergreen_fill_decision_retention
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    retention_days = 30
+
+    # Create fresh rows (within retention window).
+    for i in range(3):
+        db_session.add(_observe_row(ts=now - timedelta(days=1), reason="observe_mode"))
+
+    # Create stale rows (older than retention window).
+    for i in range(5):
+        db_session.add(_observe_row(ts=now - timedelta(days=45), reason="max_active"))
+
+    await db_session.commit()
+
+    # Verify initial state: 8 rows total.
+    all_rows = (
+        (await db_session.execute(select(EvergreenFillDecisionLog))).scalars().all()
+    )
+    assert len(all_rows) == 8
+
+    # Run the sweep.
+    purged = await sweep_evergreen_fill_decision_retention(
+        db_session, retention_days=retention_days
+    )
+
+    # Verify purged count matches stale rows.
+    assert purged == 5
+
+    # Verify only fresh rows remain.
+    remaining = (
+        (await db_session.execute(select(EvergreenFillDecisionLog))).scalars().all()
+    )
+    assert len(remaining) == 3
+    for row in remaining:
+        assert row.ts >= (now - timedelta(days=retention_days))

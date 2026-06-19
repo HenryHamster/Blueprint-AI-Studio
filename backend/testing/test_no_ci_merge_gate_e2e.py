@@ -1794,6 +1794,96 @@ def test_orchestrator_consults_no_test_block_helper():
     )
 
 
+@pytest.mark.asyncio
+async def test_block_no_test_unverified_merge_mirrors_orchestrator_decision_tree(
+    db_session, mocker
+):
+    """Opt-in no-test honest-block policy: with the flag ON and
+    ``no_detectable_test_command`` the PR is HELD (no merge, block recorded);
+    with the flag OFF the SAME reason still merges UNVERIFIED exactly as today.
+    A DEGRADED reason is never caught by the no-test policy (it belongs to the
+    separate ``block_degraded_unverified_merge`` branch).
+
+    Mirrors the orchestrator's inline decision tree end-to-end using the real
+    helpers ``should_block_no_test_unverified_merge`` and
+    ``record_no_ci_gate_no_test_block`` so a future refactor cannot silently
+    regress the no-test-block path back to auto-merging UNVERIFIED.
+    """
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    ci_result = build_no_ci_gate_ci_result("undetected", "")
+    assert ci_result["conclusion"] == "success"
+    no_test_reason = "no_detectable_test_command"
+
+    # ── Half 1: policy ON + no-test reason ⇒ BLOCK (no merge) ────────────────
+    on_project = await _make_no_ci_project(db_session, with_test_cmd=False)
+    bc = dict(on_project.build_config or {})
+    bc["block_no_test_unverified_merge"] = True
+    from sqlalchemy.orm.attributes import flag_modified
+
+    on_project.build_config = bc
+    flag_modified(on_project, "build_config")
+    db_session.add(on_project)
+    await db_session.commit()
+    await db_session.refresh(on_project)
+
+    on_parent = _make_parent_task(db_session, on_project)
+    await db_session.commit()
+    await db_session.refresh(on_parent)
+    on_parent = await _set_unverified_reason(db_session, on_parent, no_test_reason)
+
+    assert should_block_no_test_unverified_merge(on_project, no_test_reason) is True, (
+        "policy ON + no_detectable_test_command must block"
+    )
+
+    # Mirror the orchestrator's block branch: record the honest block and do NOT
+    # invoke the merge primitive (the PR is held open).
+    record_no_ci_gate_no_test_block(
+        db_session, on_project, unverified_reason=no_test_reason, when=_RUNTIME_WHEN
+    )
+    await db_session.commit()
+    merge_mock.assert_not_called()
+
+    on_project = await db_session.get(Project, on_project.id)
+    runtime = merge_gate_runtime_block(on_project)
+    assert runtime is not None
+    assert runtime["last_no_test_block_reason"] == no_test_reason
+    assert runtime["last_no_test_block_at"] is not None
+    assert runtime["no_test_block_counts"][no_test_reason] == 1
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_reason"] == no_test_reason
+
+    # ── Half 2: policy OFF (default) + SAME reason ⇒ merge UNVERIFIED ─────────
+    off_project = await _make_no_ci_project(db_session, with_test_cmd=False)
+    off_parent = _make_parent_task(db_session, off_project)
+    await db_session.commit()
+    await db_session.refresh(off_parent)
+    off_parent = await _set_unverified_reason(db_session, off_parent, no_test_reason)
+
+    assert (
+        should_block_no_test_unverified_merge(off_project, no_test_reason) is False
+    ), "policy OFF must never block — today's behavior is preserved"
+
+    # Mirror the orchestrator's merge branch: handle_ci_completion merges
+    # UNVERIFIED and raises exactly one operator alert, exactly as today.
+    acted = await handle_ci_completion(
+        off_parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()
+    alerts = await _unverified_merge_alerts(db_session, off_project.id)
+    assert len(alerts) == 1, "policy-OFF no-test fall-open merges unverified as today"
+
+    # ── Half 3: policy ON + DEGRADED reason ⇒ not caught by no-test policy ───
+    degraded_reason = "verify_setup_failed"
+    assert (
+        should_block_no_test_unverified_merge(on_project, degraded_reason) is False
+    ), "a DEGRADED reason must never be caught by no-test policy"
+
+
 # ---------------------------------------------------------------------------
 # 5. A repo detected via a NON-MANIFEST entrypoint runs its suite and blocks
 #    the merge on failure (detection layer → gate layer, composed).
@@ -3478,9 +3568,9 @@ async def test_no_ci_verify_tests_spawn_deferral_cap_escalates_to_operator_revie
                 f"{_spawn_deferrals} consecutive cycles — escalating for operator review",
             )
 
-    assert ci_loop["verify_tests_spawn_deferrals"] == _VERIFY_TESTS_SPAWN_DEFERRAL_CAP, (
-        f"counter must reach cap ({_VERIFY_TESTS_SPAWN_DEFERRAL_CAP})"
-    )
+    assert (
+        ci_loop["verify_tests_spawn_deferrals"] == _VERIFY_TESTS_SPAWN_DEFERRAL_CAP
+    ), f"counter must reach cap ({_VERIFY_TESTS_SPAWN_DEFERRAL_CAP})"
     assert parent.status == TaskStatus.FAILED, (
         "task must be FAILED after spawn-deferral cap is exhausted"
     )

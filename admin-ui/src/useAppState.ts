@@ -41,7 +41,7 @@ export function useAppState() {
   // ── Composed hooks ──────────────────────────────────────────────────────
   const { user, authLoading, userRole, accessDenied, error, setError } = useAuth();
   const { toasts, addToast, dismissToast } = useToasts();
-  const { viewMode, setViewMode, compactMode, setCompactMode, groupBy, setGroupBy, columnPrefs, setColumnPrefs, defaultTaskType, setDefaultTaskType } = useViewPreferences();
+  const { viewMode, setViewMode, compactMode, setCompactMode, columnPrefs, setColumnPrefs, defaultTaskType, setDefaultTaskType } = useViewPreferences();
   const { metricsHistory, cumulativeCost, cumulativeVmHours, metricsWindow, setMetricsWindow, addMetricsPoint } = useMetrics();
   const {
     showArchive, setShowArchive, archiveTasks, archiveLoading,
@@ -92,9 +92,8 @@ export function useAppState() {
     showSettings, setShowSettings,
     showDirections, setShowDirections,
     showMetrics, setShowMetrics,
-    showShortcutHelp, setShowShortcutHelp,
     showUserManagement, setShowUserManagement,
-    settingsRef, shortcutHelpRef,
+    settingsRef,
     selectionMode, setSelectionMode, selectedTaskIds, setSelectedTaskIds,
     toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
     confirmDialog, setConfirmDialog,
@@ -152,7 +151,7 @@ export function useAppState() {
     () => resolveTaskCapabilities(taskCapabilityContract).filterIds,
     [taskCapabilityContract],
   );
-  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter } = useSearchFilters(taskTypeFilterValues);
+  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter, directionFilter, setDirectionFilter } = useSearchFilters(taskTypeFilterValues);
 
   // useTaskModal runs after useSettings so it can consume the published
   // task-capability contract for its launchable-type guard.
@@ -216,7 +215,7 @@ export function useAppState() {
     fetchArchiveTasks,
     selectedTaskIds, setSelectedTaskIds, setSelectionMode, setConfirmDialog,
     fetchTasksRef, prevTasksRef,
-    selectedProjectId,
+    selectedProjectId, directionFilter,
   });
 
   // ── Project-scoped config domain ─────────────────────────────────────────
@@ -401,7 +400,6 @@ export function useAppState() {
         if (showDirections) { setShowDirections(false); return; }
         if (showMetrics) { setShowMetrics(false); return; }
         if (showSettings) { setShowSettings(false); return; }
-        if (showShortcutHelp) { setShowShortcutHelp(false); return; }
         return;
       }
 
@@ -471,12 +469,9 @@ export function useAppState() {
         case 'm':
           setShowMetrics(prev => !prev);
           break;
-        case '?':
-          setShowShortcutHelp(prev => !prev);
-          break;
         case 'a':
         case 'A':
-          if (!showNewTaskModal && !logTask && !showResearchBrowser && !showDirections && !showSettings && !showShortcutHelp) {
+          if (!showNewTaskModal && !logTask && !showResearchBrowser && !showDirections && !showSettings) {
             setShowArchive(!showArchive);
           }
           break;
@@ -485,7 +480,7 @@ export function useAppState() {
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive, selectionMode, selectedTaskIds, tasks]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, showDirections, showMetrics, showSettings, showArchive, selectionMode, selectedTaskIds, tasks]);
 
   // ── Cross-domain glue handlers ────────────────────────────────────────────
 
@@ -573,11 +568,10 @@ export function useAppState() {
     // View
     viewMode, setViewMode,
     compactMode, setCompactMode,
-    groupBy, setGroupBy,
     // Column preferences
     columnPrefs, setColumnPrefs,
     // Search/filter
-    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter,
+    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter, directionFilter, setDirectionFilter,
     // Projects
     projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous, fetchProjects,
     // Log viewer
@@ -675,7 +669,6 @@ export function useAppState() {
     // Misc
     lastVisitTimestamp,
     lastRefresh, wsRef,
-    showShortcutHelp, setShowShortcutHelp, shortcutHelpRef,
     // Status bar
     apiHealthy, wsConnected, lastFetchTime,
     // Task tracking

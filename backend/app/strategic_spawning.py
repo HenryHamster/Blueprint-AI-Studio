@@ -5990,6 +5990,19 @@ async def _spawn_strategic_review(
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
             "is_self_repo": bool(project.is_self_repo),
+            # Machine-checkable g-generality retirement signal: set when a
+            # create/fix/refactor task has merged on this external project for
+            # the first time.  Absent (no key) for self-repo and projects with
+            # no merged improvements yet.
+            **(
+                {"first_autonomous_improvement_at": _first_improvement_at}
+                if (
+                    _first_improvement_at := (project.build_config or {}).get(
+                        "first_autonomous_improvement_at"
+                    )
+                )
+                else {}
+            ),
             "enable_self_improvement": project.enable_self_improvement,
             # Trim-proof authoritative direction counts + operator ceiling. Both
             # are ``critical`` so the agent's direction views always anchor on the

@@ -69,6 +69,11 @@ runtime_config: Dict = {
     # the panel_review task type (it stays available as a user-launchable
     # advisory workflow); reconciliation records then read ``unchallenged``.
     "review_second_opinion_gate_enabled": True,
+    # Fraction of high-stakes trunk-targeting APPROVEs that spawn a panel_review
+    # challenger (0.0 = none, 1.0 = all). Default 1.0 preserves existing behavior.
+    # Uses deterministic task-ID-based sampling so operators can safely dial down
+    # challenger frequency without randomness between restarts.
+    "review_second_opinion_sample_rate": 1.0,
     # Rollout mode for binding agent-authored direction retirement to the
     # strategic judgment challenge's per-direction second opinion.
     #   observe  — compute/record verdict, never block
@@ -307,6 +312,14 @@ runtime_config: Dict = {
     # prior remediation is in flight or recently resolved.
     "max_concurrent_auto_remediations": 2,
     "residual_remediation_cooldown_hours": 24,
+    # Cap on a project's concurrent in-flight compute-experiment disposition
+    # follow-ons (the always-dispose reason-and-ship / diagnose-and-fix children
+    # spawned by _spawn_act_on_verdict_followon). When this many non-terminal
+    # type=create disposition children already exist for the project, a new
+    # terminal experiment skips its spawn (and completes/fails clean) rather than
+    # piling on; the dedup key is NOT stamped so a re-dispatch retries once the
+    # fleet drains. 0 disables the cap. Operator-tunable via runtime_config_json.
+    "max_concurrent_act_on_verdict_followons": 4,
     # Future-facing provider tier map used by multi-provider selection. v1 keeps
     # Anthropic as the only dispatch path but persists the structure now so v2
     # can enable provider-aware resolution without another config shape change.
@@ -1320,6 +1333,18 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "review_second_opinion_gate_enabled",
                         bool(config_json["review_second_opinion_gate_enabled"]),
                     )
+                if "review_second_opinion_sample_rate" in config_json:
+                    try:
+                        _rate = max(
+                            0.0,
+                            min(
+                                1.0,
+                                float(config_json["review_second_opinion_sample_rate"]),
+                            ),
+                        )
+                        _set("review_second_opinion_sample_rate", _rate)
+                    except (TypeError, ValueError):
+                        pass
                 if "strategic_retirement_challenge_gate_mode" in config_json:
                     raw_mode = (
                         str(
@@ -1561,6 +1586,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "reaper_half_open_probe_limit",
                     "reaper_max_orphans_per_cycle",
                     "usage_headroom_threshold_pct",
+                    "max_concurrent_act_on_verdict_followons",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))

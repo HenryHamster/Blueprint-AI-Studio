@@ -277,6 +277,15 @@ async def _redrive_deferred_unsynced_qualification(
     Returns True only when the re-entry actually STARTED a qualification
     (``status == "spawned"``) — i.e. the deferral cleared — so the sweep can
     count and log it.  A continued deferral or any guard no-op returns False.
+
+    **Rollback on non-spawned result**: when ``run_qualification`` returns any
+    status other than ``"spawned"`` (e.g. ``sha_error``, ``no_credentials``,
+    still-deferred), the session is rolled back rather than committed.  This
+    preserves the pre-existing ``last_qualification`` (including
+    ``first_deferred_at``) so the version stays in ``deferred_unsynced`` and
+    remains eligible for the next sweep.  Without the rollback an error result
+    would overwrite ``last_qualification`` with a non-deferred status, silently
+    removing the version from the re-drive loop.
     """
     # ``run_qualification`` lives in release_qualifier (the core coordinator);
     # import it lazily to avoid the load-time import cycle (release_qualifier
@@ -285,9 +294,7 @@ async def _redrive_deferred_unsynced_qualification(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as redrive_session:
-        version = await redrive_session.get(
-            release_version.ReleaseVersion, version_id
-        )
+        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
         if version is None:
             return False
         qual = version.last_qualification
@@ -300,8 +307,15 @@ async def _redrive_deferred_unsynced_qualification(
         result = await release_qualifier.run_qualification(
             redrive_session, version.project_id, version
         )
-        await redrive_session.commit()
-        return bool(result) and result.get("status") == "spawned"
+        if result and result.get("status") == "spawned":
+            await redrive_session.commit()
+            return True
+        # run_qualification returned a non-spawned status (sha_error, no_credentials,
+        # still deferred, etc.) — rollback so last_qualification is not overwritten
+        # with an error state that would drop this version from the re-drive loop
+        # (only deferred_unsynced versions are picked up by the next sweep).
+        await redrive_session.rollback()
+        return False
 
 
 async def _redrive_not_promoted_qualification(
@@ -328,6 +342,9 @@ async def _redrive_not_promoted_qualification(
       1. Calls ``compute_requalification_readiness`` to verify ALL gating
          high/medium audit findings are ledger-resolved (``resolved`` or ``stale``).
          If not, returns False immediately — the blockers have NOT cleared.
+         Versions with zero gating findings (e.g. blocked by ``ci_not_green``)
+         pass this check: the hard blockers may be resolved by a code fix, and
+         HEAD advancement is the signal that warrants a fresh qualification.
       2. Re-invokes ``run_qualification``, which under its own ``FOR UPDATE`` lock
          re-resolves the candidate SHA.  If ``automain`` has NOT advanced (same
          SHA), ``run_qualification`` returns ``cached_verdict`` and this returns
@@ -349,9 +366,7 @@ async def _redrive_not_promoted_qualification(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as redrive_session:
-        version = await redrive_session.get(
-            release_version.ReleaseVersion, version_id
-        )
+        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
         if version is None:
             return False
         qual = version.last_qualification
@@ -361,18 +376,22 @@ async def _redrive_not_promoted_qualification(
             or version.phase != "stabilize"
         ):
             return False
-        # Guard: only re-drive when there are gating findings AND all are resolved.
-        # A version with zero gating findings (e.g. blocked by ci_not_green or
-        # other non-audit blockers) has nothing to re-drive via the finding-
-        # resolution path — skip it so the lifecycle stall checks (calcification)
-        # see the original not_promoted state unchanged.
+        # Readiness guard: all gating audit findings must be ledger-resolved.
+        # compute_requalification_readiness returns requalification_ready=True in two
+        # cases: (1) zero carried high/medium audit findings (e.g. version blocked by
+        # non-audit blocker like ci_not_green that has since cleared), or (2) all
+        # gating findings ledger-resolved.  In both cases the version is eligible for
+        # re-qualification against the current automain HEAD.
         readiness = await compute_requalification_readiness(
             redrive_session, version.project_id
         )
         if not readiness.get("requalification_ready"):
             return False
-        if readiness.get("gating_total", 0) == 0:
-            return False
+        # The real backstop against redundant re-runs is run_qualification's cached-
+        # verdict guard: under its FOR UPDATE lock, it re-resolves the candidate SHA.
+        # If automain has NOT advanced (same SHA), run_qualification returns cached_
+        # verdict (no-op).  If automain HAS advanced, the cached-verdict miss spawns a
+        # fresh qualification.
         result = await release_qualifier.run_qualification(
             redrive_session, version.project_id, version
         )

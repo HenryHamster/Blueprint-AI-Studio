@@ -135,6 +135,51 @@ def stamp_first_pr_merged(project: Any) -> None:
         )
 
 
+# Task types that represent autonomous code improvements delivered to a repo.
+# Matches the "code-change" SR-metrics filter — the first time one of these
+# merges on an external project, the g-generality retirement condition is met.
+_AUTONOMOUS_IMPROVEMENT_TASK_TYPES: frozenset[str] = frozenset(
+    ("create", "fix", "refactor")
+)
+
+
+def stamp_first_autonomous_improvement(task: Any, project: Any) -> None:
+    """Stamp the first autonomous-improvement timestamp on a non-self-repo project.
+
+    Called at every integration-branch merge via ``apply_merged_landed_signal``.
+    Guards: skips self-repo projects and tasks whose type is not one of
+    {create, fix, refactor}.  Idempotent — a second call on the same project
+    is a no-op.  No session parameter: the caller's SQLAlchemy session already
+    tracks ``project`` (mirrors ``stamp_first_pr_merged``).
+    """
+    try:
+        if project is None:
+            return
+        if getattr(project, "is_self_repo", False):
+            return
+        task_type = (getattr(task, "first_payload", None) or {}).get("type")
+        if task_type not in _AUTONOMOUS_IMPROVEMENT_TASK_TYPES:
+            return
+        bc: dict = dict(getattr(project, "build_config", None) or {})
+        if bc.get("first_autonomous_improvement_at") is not None:
+            return  # already stamped — idempotent
+        from app.time_utils import _utcnow
+
+        bc["first_autonomous_improvement_at"] = _utcnow().isoformat()
+        project.build_config = bc
+        try:
+            from sqlalchemy.orm.attributes import flag_modified
+
+            flag_modified(project, "build_config")
+        except Exception:  # noqa: BLE001, S110
+            pass
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[ONBOARDING_PROOF] failed to stamp first autonomous improvement",
+            exc_info=True,
+        )
+
+
 def build_onboarding_proof_block(project: Any) -> dict[str, Any] | None:
     """Assemble the full onboarding milestone timeline for the project API.
 
@@ -167,4 +212,5 @@ def build_onboarding_proof_block(project: Any) -> dict[str, Any] | None:
             "first_merge_gate_unverified_reason"
         ),
         "first_pr_merged_at": bc.get("first_pr_merged_at"),
+        "first_autonomous_improvement_at": bc.get("first_autonomous_improvement_at"),
     }

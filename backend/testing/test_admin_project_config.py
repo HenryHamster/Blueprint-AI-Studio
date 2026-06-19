@@ -1459,6 +1459,98 @@ async def test_patch_block_degraded_unverified_merge_rejects_non_bool(
 
 
 # ---------------------------------------------------------------------------
+# block_no_test_unverified_merge config tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_block_no_test_unverified_merge_defaults_false(
+    client: AsyncClient, project_owner
+):
+    """GET returns {block_no_test_unverified_merge: false, is_default: true} when unset."""
+    project = project_owner
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/block-no-test-unverified-merge"
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["project_id"] == str(project.id)
+    assert data["block_no_test_unverified_merge"] is False
+    assert data["is_default"] is True
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_block_no_test_unverified_merge_round_trip(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH true → is_default=false; PATCH false → is_default=true (reverts to default)."""
+    project = project_owner
+
+    # Enable the policy.
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/block-no-test-unverified-merge",
+        json={"block_no_test_unverified_merge": True},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["block_no_test_unverified_merge"] is True
+    assert data["is_default"] is False
+
+    get_resp = await client.get(
+        f"/api/admin/projects/{project.id}/block-no-test-unverified-merge"
+    )
+    assert get_resp.status_code == 200
+    assert get_resp.json()["block_no_test_unverified_merge"] is True
+    assert get_resp.json()["is_default"] is False
+
+    # Disable the policy — should revert to default (key removed from build_config).
+    resp2 = await client.patch(
+        f"/api/admin/projects/{project.id}/block-no-test-unverified-merge",
+        json={"block_no_test_unverified_merge": False},
+    )
+    assert resp2.status_code == 200, resp2.text
+    data2 = resp2.json()
+    assert data2["block_no_test_unverified_merge"] is False
+    assert data2["is_default"] is True
+
+    await db_session.refresh(project)
+    assert "block_no_test_unverified_merge" not in (project.build_config or {})
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_block_no_test_unverified_merge_requires_owner_role(
+    client: AsyncClient, project_member
+):
+    """A non-owner member cannot PATCH the block-no-test-unverified-merge policy."""
+    project = project_member
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/block-no-test-unverified-merge",
+        json={"block_no_test_unverified_merge": True},
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_block_no_test_unverified_merge_rejects_non_bool(
+    client: AsyncClient, project_owner
+):
+    """PATCH rejects a non-boolean value for block_no_test_unverified_merge with 422."""
+    project = project_owner
+    for bad_val in ["yes", 1, None]:
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/block-no-test-unverified-merge",
+            json={"block_no_test_unverified_merge": bad_val},
+        )
+        assert resp.status_code == 422, (
+            f"Expected 422 for value {bad_val!r}, got {resp.status_code}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Resource-envelope config tests
 # ---------------------------------------------------------------------------
 

@@ -1045,4 +1045,53 @@ async def onboard_project(
     response["project_id"] = str(project.id)
     response["build_config"] = project.build_config or build_config or {}
     response["merge_verification_verdict"] = compute_merge_verification_verdict(project)
+
+    # Enable the warm pool for this project inline when the caller requests it.
+    # Runs after the final commit so project.id is durable. A failure here never
+    # aborts the onboard — the caller gets a warning key instead.
+    if not payload.preview_only and payload.warm_pool_target_size is not None:
+        try:
+            from app.routers.admin_settings import _apply_settings
+            from app.shared_state import runtime_config, runtime_config_lock
+            from app.warm_pool import (
+                warm_pool_project_scope,
+                warm_pool_project_target_map,
+            )
+            from app.routers.admin_warm_pool import _seed_project_pool
+
+            async with runtime_config_lock:
+                scope = warm_pool_project_scope()
+                scope.add(str(project.id))
+                new_target_map = dict(warm_pool_project_target_map())
+                new_target_map[str(project.id)] = payload.warm_pool_target_size
+                await _apply_settings(
+                    {
+                        "warm_pool_enabled": True,
+                        "warm_pool_project_allowlist": sorted(scope),
+                        "warm_pool_target_size_by_project": new_target_map,
+                    },
+                    session,
+                    runtime_config,
+                )
+
+            logger.info(
+                "[ONBOARD] Enabled warm pool project=%s target=%d by onboard",
+                project.id,
+                payload.warm_pool_target_size,
+            )
+            seed_summary = await _seed_project_pool(
+                session, project.id, current_user["user_id"]
+            )
+            response["warm_pool"] = {
+                **seed_summary,
+                "enabled": True,
+                "target_size": payload.warm_pool_target_size,
+            }
+        except Exception:
+            logger.exception(
+                "[ONBOARD] Failed to enable warm pool for project %s — continuing",
+                project.id,
+            )
+            response["warm_pool"] = {"enabled": False, "error": "setup_failed"}
+
     return response

@@ -1027,6 +1027,67 @@ class TestRecordTrialVerdict:
         assert project.capability_adoption_verdicts["repo_map"]["lift"] == 0.09
         mock_flag.assert_not_called()
 
+    def test_operator_source_bypasses_kill_survival_guard(self):
+        """evidence_source='operator' must override a durable KILL like strategic_review does."""
+        project = _make_project()
+        project.capability_adoption_verdicts = {
+            LANE_PILOT_CAP_NAME: {"verdict": "KILL", "evidence_source": "auto"}
+        }
+        override = {
+            "verdict": "adopt",
+            "evidence_source": "operator",
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, LANE_PILOT_CAP_NAME, override)
+
+        assert (
+            project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME]["verdict"]
+            == "adopt"
+        )
+        mock_flag.assert_called_once()
+
+    def test_operator_source_bypasses_insufficient_data_self_revert_guard(self):
+        """evidence_source='operator' must be able to reopen a decided verdict."""
+        project = _make_project()
+        decided = {"verdict": "adopt", "lift": 0.09, "n_with": 50, "n_without": 50}
+        project.capability_adoption_verdicts = {"repo_map": decided}
+        operator_reopen = {
+            "verdict": "continue-trial",
+            "evidence_source": "operator",
+            "rationale": "operator re-opening trial",
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, "repo_map", operator_reopen)
+
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["verdict"]
+            == "continue-trial"
+        )
+        assert (
+            project.capability_adoption_verdicts["repo_map"]["evidence_source"]
+            == "operator"
+        )
+        mock_flag.assert_called_once()
+
+    def test_automated_source_still_blocked_by_kill_guard(self):
+        """Automated verdict must still be blocked by KILL-survival when evidence_source is absent."""
+        project = _make_project()
+        project.capability_adoption_verdicts = {
+            LANE_PILOT_CAP_NAME: {"verdict": "KILL", "evidence_source": "auto"}
+        }
+        auto_adopt = {"verdict": "adopt"}
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            record_trial_verdict(project, LANE_PILOT_CAP_NAME, auto_adopt)
+
+        assert (
+            project.capability_adoption_verdicts[LANE_PILOT_CAP_NAME]["verdict"]
+            == "KILL"
+        )
+        mock_flag.assert_not_called()
+
 
 # ── get_trial_verdicts ────────────────────────────────────────────────────────
 
@@ -3602,3 +3663,393 @@ def test_non_adopt_verdicts_do_not_record_capability_proof():
         assert project.capability_proof_records == {}, (
             f"Unexpected proof recorded for verdict={non_adopt!r}"
         )
+
+
+# ── is_trial_stalled ──────────────────────────────────────────────────────────
+
+
+class TestIsTrialStalled:
+    """Unit tests for is_trial_stalled predicate."""
+
+    def _stalled_entry(self, **overrides):
+        base = {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "arm_composition": {
+                "with_assigned": 50,
+                "without_assigned": 3,  # holdback has participants — trial is stalled, not cold
+            },
+            "accrual_projection": {
+                "with_7d": 5,
+                "without_7d": 0,
+                "window_days": 7,
+                "holdback_fraction": 0.05,
+                "days_to_min_n": None,
+                "alternative_projections": {"0.1": 20.0, "0.3": None},
+            },
+        }
+        base.update(overrides)
+        return base
+
+    def test_stalled_continue_trial_insufficient_data_none_days(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        assert is_trial_stalled(self._stalled_entry()) is True
+
+    def test_decided_adopt_not_stalled(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {"verdict": "adopt", "verdict_reason": "sufficient_data"}
+        assert is_trial_stalled(entry) is False
+
+    def test_decided_reject_not_stalled(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {"verdict": "reject", "verdict_reason": "sufficient_data"}
+        assert is_trial_stalled(entry) is False
+
+    def test_decided_no_effect_not_stalled(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {"verdict": "no_effect", "verdict_reason": "futility_bound_reached"}
+        assert is_trial_stalled(entry) is False
+
+    def test_decided_kill_not_stalled(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {
+            "verdict": "KILL",
+            "verdict_reason": "gate_integrity_violations_exceeded",
+        }
+        assert is_trial_stalled(entry) is False
+
+    def test_healthy_continue_trial_finite_days_not_stalled(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = self._stalled_entry()
+        entry["accrual_projection"]["days_to_min_n"] = 14.0
+        assert is_trial_stalled(entry) is False
+
+    def test_ambiguous_lift_continue_trial_not_stalled(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {
+            "verdict": "continue-trial",
+            "verdict_reason": "ambiguous_lift",
+            "accrual_projection": {"days_to_min_n": None},
+        }
+        assert is_trial_stalled(entry) is False
+
+    def test_treatment_not_engaging_not_stalled(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {
+            "verdict": "continue-trial",
+            "verdict_reason": "treatment_not_engaging",
+            "immediate_alert": True,
+            "accrual_projection": {"days_to_min_n": None},
+        }
+        assert is_trial_stalled(entry) is False
+
+    def test_holdback_contaminated_not_stalled(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {
+            "verdict": "continue-trial",
+            "verdict_reason": "holdback_contaminated",
+            "immediate_alert": True,
+            "accrual_projection": {"days_to_min_n": None},
+        }
+        assert is_trial_stalled(entry) is False
+
+    def test_no_accrual_projection_not_stalled(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {"verdict": "continue-trial", "verdict_reason": "insufficient_data"}
+        assert is_trial_stalled(entry) is False
+
+    def test_days_to_min_n_zero_not_stalled(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = self._stalled_entry()
+        entry["accrual_projection"]["days_to_min_n"] = 0.0
+        assert is_trial_stalled(entry) is False
+
+    def test_cold_start_no_holdback_participants_not_stalled(self):
+        """A trial with zero holdback assignments hasn't started yet — not a stall."""
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = self._stalled_entry()
+        entry["arm_composition"] = {"with_assigned": 0, "without_assigned": 0}
+        assert is_trial_stalled(entry) is False
+
+    def test_cold_start_missing_arm_composition_not_stalled(self):
+        """A trial with no arm_composition at all is treated as cold start — not stalled."""
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "accrual_projection": {"days_to_min_n": None},
+        }
+        assert is_trial_stalled(entry) is False
+
+    def test_non_dict_entry_not_stalled(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        assert is_trial_stalled(None) is False  # type: ignore[arg-type]
+        assert is_trial_stalled("continue-trial") is False  # type: ignore[arg-type]
+
+
+# ── persist_stalled_trial_notices_in_transaction ──────────────────────────────
+
+
+class TestPersistStalledTrialNotices:
+    """Tests for raise_stalled_trial_notice and persist_stalled_trial_notices_in_transaction."""
+
+    def _build_mock_db(self, open_messages: list | None = None):
+        """Return (mock_session, mock_cm) with configurable open ProjectMessages."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_session = MagicMock()
+        mock_session.commit = AsyncMock()
+        mock_session.rollback = AsyncMock()
+        mock_session.add = MagicMock()
+
+        scalars_mock = MagicMock()
+        scalars_mock.all.return_value = open_messages or []
+        execute_result = MagicMock()
+        execute_result.scalars.return_value = scalars_mock
+        mock_session.execute = AsyncMock(return_value=execute_result)
+
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_cm.return_value = mock_cm
+
+        return mock_session, mock_cm
+
+    def _stalled_entry(self):
+        return {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "thresholds": {"min_n_per_arm": 30},
+            "arm_composition": {"without_assigned": 3, "with_assigned": 25},
+            "accrual_projection": {
+                "with_7d": 10,
+                "without_7d": 0,
+                "window_days": 7,
+                "holdback_fraction": 0.05,
+                "days_to_min_n": None,
+                "alternative_projections": {"0.1": 20.0, "0.3": 8.0, "0.5": None},
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_stalled_trial_raises_exactly_one_notice(self):
+        """A stalled continue-trial (insufficient_data, days_to_min_n=None) emits one notice."""
+        import uuid
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.capability_trial_verdict import (
+            persist_stalled_trial_notices_in_transaction,
+        )
+
+        project_id = uuid.uuid4()
+        mock_session, mock_cm = self._build_mock_db()
+        mock_factory = MagicMock(return_value=mock_cm)
+
+        with (
+            patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory),
+            patch("app.database.resolve_async_engine", return_value=MagicMock()),
+            patch(
+                "app.capability_trial_verdict.raise_stalled_trial_notice",
+                new_callable=AsyncMock,
+            ) as mock_notice,
+        ):
+            await persist_stalled_trial_notices_in_transaction(
+                MagicMock(),
+                project_id,
+                stalled=[("repo_map", self._stalled_entry())],
+            )
+
+        mock_notice.assert_called_once()
+        call_args = mock_notice.call_args[0]
+        assert call_args[2] == "repo_map"  # cap_name
+        assert call_args[3] == self._stalled_entry()  # entry
+
+    @pytest.mark.asyncio
+    async def test_dedup_second_evaluation_silent(self):
+        """Second call for the same stalled cap with an existing open notice is silent."""
+        import uuid
+        from unittest.mock import MagicMock
+
+        from app.capability_trial_verdict import raise_stalled_trial_notice
+
+        project_id = uuid.uuid4()
+
+        # Simulate an existing open ProjectMessage with the dedupe_key.
+        existing_msg = MagicMock()
+        existing_msg.context = {"dedupe_key": "capability_trial_stalled_repo_map"}
+        mock_session, _ = self._build_mock_db(open_messages=[existing_msg])
+
+        await raise_stalled_trial_notice(
+            mock_session, project_id, "repo_map", self._stalled_entry()
+        )
+
+        # No add should have been called — dedupe blocks the write.
+        mock_session.add.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_first_evaluation_creates_notice(self):
+        """No existing open notice → raise_stalled_trial_notice writes a ProjectMessage."""
+        import uuid
+
+        from app.capability_trial_verdict import raise_stalled_trial_notice
+
+        project_id = uuid.uuid4()
+        mock_session, _ = self._build_mock_db(open_messages=[])
+
+        await raise_stalled_trial_notice(
+            mock_session, project_id, "repo_map", self._stalled_entry()
+        )
+
+        mock_session.add.assert_called_once()
+        added_msg = mock_session.add.call_args[0][0]
+        ctx = added_msg.context
+        assert ctx["event_type"] == "capability_trial_stalled"
+        assert ctx["dedupe_key"] == "capability_trial_stalled_repo_map"
+        assert ctx["cap_name"] == "repo_map"
+        assert ctx["alternative_projections"] == {"0.1": 20.0, "0.3": 8.0, "0.5": None}
+        assert ctx["with_7d"] == 10
+        assert ctx["without_7d"] == 0
+        assert ctx["holdback_fraction"] == 0.05
+
+    @pytest.mark.asyncio
+    async def test_decided_verdicts_do_not_raise_stall_notice(self):
+        """is_trial_stalled returns False for decided verdicts — no notice emitted."""
+        from app.capability_trial_verdict import is_trial_stalled
+
+        for verdict in ("adopt", "reject", "no_effect", "ADOPT", "KILL"):
+            entry = {
+                "verdict": verdict,
+                "verdict_reason": "sufficient_data",
+                "accrual_projection": {"days_to_min_n": None},
+            }
+            assert is_trial_stalled(entry) is False, (
+                f"Expected not stalled for verdict={verdict!r}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_healthy_continue_trial_not_stalled(self):
+        """A continue-trial with finite days_to_min_n is NOT stalled."""
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "accrual_projection": {"days_to_min_n": 12.5},
+        }
+        assert is_trial_stalled(entry) is False
+
+    @pytest.mark.asyncio
+    async def test_notice_context_carries_alternative_projections(self):
+        """The notice context must include alternative_projections map."""
+        import uuid
+
+        from app.capability_trial_verdict import raise_stalled_trial_notice
+
+        project_id = uuid.uuid4()
+        mock_session, _ = self._build_mock_db(open_messages=[])
+
+        entry = self._stalled_entry()
+        await raise_stalled_trial_notice(
+            mock_session, project_id, "module_interfaces", entry
+        )
+
+        mock_session.add.assert_called_once()
+        added_msg = mock_session.add.call_args[0][0]
+        ctx = added_msg.context
+        assert "alternative_projections" in ctx
+
+
+# ── is_stalled flag stamped on augmented verdict entries ──────────────────────
+
+
+class TestIsStalledFlagStamped:
+    """Verify that is_stalled is stamped onto augmented verdict dicts.
+
+    The digest loop stamps is_stalled on every _augmented_verdicts entry.
+    These tests verify the flag is True for a stalled entry and False for
+    a healthy continue-trial (finite days_to_min_n) or a decided verdict.
+    """
+
+    def _stalled_entry(self):
+        return {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "arm_composition": {"with_assigned": 50, "without_assigned": 5},
+            "accrual_projection": {
+                "with_7d": 5,
+                "without_7d": 0,
+                "window_days": 7,
+                "holdback_fraction": 0.05,
+                "days_to_min_n": None,
+                "alternative_projections": {},
+            },
+        }
+
+    def _healthy_entry(self):
+        return {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "arm_composition": {"with_assigned": 20, "without_assigned": 8},
+            "accrual_projection": {
+                "with_7d": 10,
+                "without_7d": 4,
+                "window_days": 7,
+                "holdback_fraction": 0.3,
+                "days_to_min_n": 14.0,
+                "alternative_projections": {},
+            },
+        }
+
+    def test_is_stalled_true_for_stalled_entry(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = self._stalled_entry()
+        # Simulate the digest loop stamping is_stalled
+        entry["is_stalled"] = is_trial_stalled(entry)
+        assert entry["is_stalled"] is True
+
+    def test_is_stalled_false_for_healthy_continue_trial(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = self._healthy_entry()
+        entry["is_stalled"] = is_trial_stalled(entry)
+        assert entry["is_stalled"] is False
+
+    def test_is_stalled_false_for_decided_adopt(self):
+        from app.capability_trial_verdict import is_trial_stalled
+
+        entry = {"verdict": "adopt", "verdict_reason": "sufficient_data"}
+        entry["is_stalled"] = is_trial_stalled(entry)
+        assert entry["is_stalled"] is False
+
+    def test_augmented_verdicts_all_have_is_stalled(self):
+        """All entries in the augmented dict receive is_stalled regardless of verdict."""
+        from app.capability_trial_verdict import is_trial_stalled
+
+        augmented_verdicts = {
+            "stalled_cap": self._stalled_entry(),
+            "healthy_cap": self._healthy_entry(),
+            "decided_cap": {"verdict": "adopt", "verdict_reason": "sufficient_data"},
+        }
+        # Simulate the digest stamping loop
+        for _cap, _entry in augmented_verdicts.items():
+            if isinstance(_entry, dict):
+                _entry["is_stalled"] = is_trial_stalled(_entry)
+
+        assert augmented_verdicts["stalled_cap"]["is_stalled"] is True
+        assert augmented_verdicts["healthy_cap"]["is_stalled"] is False
+        assert augmented_verdicts["decided_cap"]["is_stalled"] is False

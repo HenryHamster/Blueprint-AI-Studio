@@ -292,7 +292,13 @@ async def _check_version_stabilize_stall(
     if qual_status == "dry_run":
         return False
     if qual_status == "not_promoted" and qual.get("blocker"):
-        return False
+        # Only suppress the stall alert when the calcification checker already
+        # covers this version (i.e. it has accumulated enough hard-blocker
+        # attempts for _check_version_calcification to fire).  Below that
+        # threshold the calcification alert is silent, so the age/count gate
+        # below serves as the backstop to keep the version operator-visible.
+        if (version.qualification_attempts or 0) >= _MIN_CALCIFICATION_ATTEMPTS:
+            return False
 
     ref_time = version.phase_changed_at or version.opened_at
     if ref_time is None:
@@ -393,17 +399,16 @@ async def _alert_promotion_deploy_failed(
     if version.deploy_confirm_alerted_at is not None:
         return False
 
-    reason = aggregate_deploy_failure_reason or version.deploy_failure_reason or "unknown"
+    reason = (
+        aggregate_deploy_failure_reason or version.deploy_failure_reason or "unknown"
+    )
     _reason_text = {
         "no_new_revision": (
-            "no new healthy production revision booted within the confirmation "
-            "window"
+            "no new healthy production revision booted within the confirmation window"
         ),
         "rolled_back": "the deploy was ROLLED BACK after the promotion",
         "halted": "the deploy was HALTED after the promotion",
-        "sha_mismatch": (
-            "the live serving SHA does not match the promoted SHA"
-        ),
+        "sha_mismatch": ("the live serving SHA does not match the promoted SHA"),
     }.get(reason, reason)
     _artifact_gap = summarize_required_artifact_gap(artifact_evidence)
     _artifact_text = f" Aggregate evidence: {_artifact_gap}." if _artifact_gap else ""
@@ -497,8 +502,7 @@ async def _resolve_promotion_deploy_failed_alert(
         alert.dismissed_at = now
         session.add(alert)
     logger.info(
-        "[RELEASE_QUALIFIER] resolved %d open deploy-failed alert(s) for "
-        "recovered v%d",
+        "[RELEASE_QUALIFIER] resolved %d open deploy-failed alert(s) for recovered v%d",
         len(open_alerts),
         version.version_number,
     )

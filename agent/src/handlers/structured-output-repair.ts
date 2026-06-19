@@ -110,6 +110,9 @@ function buildMissAwarePrompt(
     case 'parsed_object_schema_mismatch':
       preamble = 'Your previous response parsed as JSON, but the top-level object shape did not match the required schema — fix the object shape and include all required keys.';
       break;
+    case 'parsed_array_invalid_value':
+      preamble = 'Your previous response parsed as JSON, but the array elements\' field values did not match the required schema — the shape did not match what was expected. Fix the field values to conform to the required format.';
+      break;
     default:
       return callerPrompt;
   }

@@ -5101,6 +5101,10 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
     monkeypatch.setattr(
         compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
     )
+    monkeypatch.setattr(
+        "app.task_completion._spawn_act_on_verdict_followon",
+        AsyncMock(return_value=None),
+    )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
         expire_on_commit=False,
@@ -5234,6 +5238,10 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
 
     monkeypatch.setattr(
         compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    monkeypatch.setattr(
+        "app.task_completion._spawn_act_on_verdict_followon",
+        AsyncMock(return_value=None),
     )
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
@@ -5389,6 +5397,10 @@ async def test_compute_wake_delivery_commit_is_durable_and_single(
     await db_session.commit()
 
     # Deliver via the sweep (single per-registration commit owns the advance).
+    monkeypatch.setattr(
+        "app.task_completion._spawn_act_on_verdict_followon",
+        AsyncMock(return_value=None),
+    )
     delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
     assert delivered == 1
 
@@ -5605,6 +5617,10 @@ async def test_wake_post_commit_side_effects_are_recoverable(db_session, monkeyp
     monkeypatch.setattr(
         "app.knowledge_completion.persist_compute_experiment_knowledge",
         flaky_persist,
+    )
+    monkeypatch.setattr(
+        "app.task_completion._spawn_act_on_verdict_followon",
+        AsyncMock(return_value=None),
     )
 
     delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
@@ -7196,6 +7212,10 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
     monkeypatch.setattr(
         compute_jobs, "get_compute_backend", lambda _name: _AlwaysSucceedsBackend()
     )
+    monkeypatch.setattr(
+        "app.task_completion._spawn_act_on_verdict_followon",
+        AsyncMock(return_value=None),
+    )
 
     Session = _sessionmaker(
         bind=db_session.bind,
@@ -7489,6 +7509,10 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
 
     monkeypatch.setattr(
         compute_jobs, "get_compute_backend", lambda _name: _BlockingLaunchBackend()
+    )
+    monkeypatch.setattr(
+        "app.task_completion._spawn_act_on_verdict_followon",
+        AsyncMock(return_value=None),
     )
 
     monitor_task = asyncio.create_task(

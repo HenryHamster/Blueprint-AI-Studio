@@ -21440,6 +21440,10 @@ async def test_agent_status_compute_terminal_before_park_callback_finalizes_once
     from app.time_utils import _utcnow
 
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch(
+        "app.task_completion._spawn_act_on_verdict_followon",
+        AsyncMock(return_value=None),
+    )
 
     project = Project(
         name="Compute Terminal Before Park Endpoint", user_id="test-user-park-1"

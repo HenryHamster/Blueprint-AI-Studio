@@ -56,6 +56,7 @@ vi.mock('child_process', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
+import fs from 'fs';
 import { handleWebResearch, groundWebCitations } from './web-research.js';
 import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '../index.js';
 import { configureAgentPermissions, writePlaybookHelper, writeMessagesHelper } from '../prompt.js';
@@ -471,6 +472,56 @@ describe('handleWebResearch — bounded self-repair on format miss', () => {
     expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
     expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
     expect(lastPostedPayload().status).toBe('FAILED');
+  });
+
+  it('includes prior analysis in the repair prompt when a progress file exists', async () => {
+    // First run: clean exit but no document.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'Research done but no JSON.', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    // Repair run: valid document.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    // Progress file exists with content.
+    vi.mocked(fs.existsSync).mockImplementation((p: unknown) => {
+      return String(p).includes(`web_research_progress_${TASK_ID}`) || false;
+    });
+    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+      if (String(p).includes(`web_research_progress_${TASK_ID}`)) {
+        return 'Searched WebAssembly spec and found key performance data.';
+      }
+      return '';
+    });
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research X' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const repairPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairPrompt).toContain('## Pre-Implementation Analysis');
+    expect(repairPrompt).toContain('Searched WebAssembly spec and found key performance data.');
+  });
+
+  it('omits prior analysis in the repair prompt when the progress file is absent', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'Research done but no JSON.', lastResultText: '',
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
+    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    // existsSync returns false for the progress file (absent).
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+
+    await handleWebResearch(
+      TASK_ID, { prompt: 'Research X' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const repairPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairPrompt).not.toContain('## Pre-Implementation Analysis');
+    expect(repairPrompt).toContain('You did not emit the knowledge document JSON');
   });
 });
 

@@ -154,6 +154,17 @@ describe('useSearchFilters', () => {
     expect(FAILURE_CLASSES.length).toBeGreaterThan(0);
   });
 
+  it('returns empty string for directionFilter by default', () => {
+    const { result } = renderHook(() => useSearchFilters());
+    expect(result.current.directionFilter).toBe('');
+  });
+
+  it('persists and restores directionFilter', () => {
+    localStorage.setItem(k('directionId'), JSON.stringify('d-abc123'));
+    const { result } = renderHook(() => useSearchFilters());
+    expect(result.current.directionFilter).toBe('d-abc123');
+  });
+
   it('uses the resolved contract-driven task types for defaults', () => {
     const { result } = renderHook(() => useSearchFilters(['create', 'release_audit']));
     expect(result.current.taskTypeFilter).toEqual(['create', 'release_audit']);

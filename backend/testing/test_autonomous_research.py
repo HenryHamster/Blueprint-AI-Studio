@@ -16562,3 +16562,148 @@ async def test_strategic_spawn_deduplication_respects_EVALUATING_status(
     assert not design_doc_mock.called, (
         "strategic spawn must be skipped when an EVALUATING strategic task is active"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Non-self project routing and onboarding proof
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_idle_research_selects_eligible_non_self_project(db_session, mocker):
+    """A non-self-repo project with autonomous_enabled=True is selected by the
+    idle research loop and spawns a research task.  When the spawned task's
+    token is later resolved, the returned (owner, repo) pair is the project's
+    own external github_owner/github_repo — not the Blueprint self-repo
+    identity.
+
+    Acceptance evidence: non-self project PR dispatch resolves to the
+    project's own owner/repo (not the self repo).
+    """
+    from app.github_token_resolver import get_github_token_for_task, _github_token_cache
+
+    direction = _active_direction_with_cooldown_elapsed(
+        "d-non-self-route", "External repo improvement"
+    )
+    project = Project(
+        name="Non-Self External Repo",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_strategic_failures": 3},
+        build_config={"bootstrap_completed_at": "2026-01-01T00:00:00"},
+        github_owner="external-owner",
+        github_repo="external-repo",
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Spawn a research task (simulates what _check_idle_research would do).
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    spawned_task = result.scalars().first()
+    assert spawned_task is not None, (
+        "A research task must be spawned for an eligible non-self-repo project"
+    )
+
+    # Verify that token resolution for the spawned task returns the project's
+    # own external owner/repo — not a Blueprint self-repo identity.
+    _github_token_cache.pop(str(project.id), None)
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="ext-app-token"),
+    )
+
+    token, owner, repo = await get_github_token_for_task(spawned_task.id, db_session)
+
+    assert token == "ext-app-token"
+    assert owner == "external-owner", (
+        f"owner must be the project's external github_owner, got {owner!r}"
+    )
+    assert repo == "external-repo", (
+        f"repo must be the project's external github_repo, got {repo!r}"
+    )
+
+
+def test_build_onboarding_proof_block_returns_none_for_none_project():
+    """build_onboarding_proof_block returns None when project is None."""
+    from app.onboarding_proof import build_onboarding_proof_block
+
+    assert build_onboarding_proof_block(None) is None
+
+
+def test_build_onboarding_proof_block_unstamped_non_self_project():
+    """An unstamped non-self-repo project returns a block with all nine keys
+    present; milestone keys are null except repo_added_at."""
+    from datetime import datetime, timezone
+
+    from app.onboarding_proof import build_onboarding_proof_block
+
+    class _StubProject:
+        created_at = datetime(2026, 1, 15, tzinfo=timezone.utc)
+        build_config = {}
+        is_self_repo = False
+
+    block = build_onboarding_proof_block(_StubProject())
+
+    assert block is not None
+    expected_keys = {
+        "repo_added_at",
+        "bootstrap_completed_at",
+        "first_task_spawned_at",
+        "first_pr_opened_at",
+        "first_merge_gate_verdict_at",
+        "first_merge_gate_executed_tests",
+        "first_merge_gate_unverified_reason",
+        "first_pr_merged_at",
+        "first_autonomous_improvement_at",
+    }
+    assert set(block.keys()) == expected_keys, (
+        f"unexpected keys: {set(block.keys()) ^ expected_keys}"
+    )
+    assert block["repo_added_at"] == "2026-01-15T00:00:00+00:00"
+    # All milestone fields are null before any work lands.
+    for key in expected_keys - {"repo_added_at"}:
+        assert block[key] is None, f"expected {key!r} to be null, got {block[key]!r}"
+
+
+def test_build_onboarding_proof_block_fully_stamped_non_self_project():
+    """A fully-stamped non-self-repo project returns all nine keys non-null,
+    including first_autonomous_improvement_at."""
+    from datetime import datetime, timezone
+
+    from app.onboarding_proof import build_onboarding_proof_block
+
+    class _StubProject:
+        created_at = datetime(2026, 1, 15, tzinfo=timezone.utc)
+        build_config = {
+            "bootstrap_completed_at": "2026-01-16T00:00:00",
+            "first_task_spawned_at": "2026-01-17T00:00:00",
+            "first_pr_opened_at": "2026-01-18T00:00:00",
+            "first_merge_gate_verdict_at": "2026-01-19T00:00:00",
+            "first_merge_gate_executed_tests": True,
+            "first_merge_gate_unverified_reason": None,
+            "first_pr_merged_at": "2026-01-20T00:00:00",
+            "first_autonomous_improvement_at": "2026-01-20T01:00:00",
+        }
+        is_self_repo = False
+
+    block = build_onboarding_proof_block(_StubProject())
+
+    assert block is not None
+    assert block["repo_added_at"] == "2026-01-15T00:00:00+00:00"
+    assert block["bootstrap_completed_at"] == "2026-01-16T00:00:00"
+    assert block["first_task_spawned_at"] == "2026-01-17T00:00:00"
+    assert block["first_pr_opened_at"] == "2026-01-18T00:00:00"
+    assert block["first_merge_gate_verdict_at"] == "2026-01-19T00:00:00"
+    assert block["first_merge_gate_executed_tests"] is True
+    assert block["first_pr_merged_at"] == "2026-01-20T00:00:00"
+    assert block["first_autonomous_improvement_at"] == "2026-01-20T01:00:00"

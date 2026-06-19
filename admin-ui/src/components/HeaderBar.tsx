@@ -39,9 +39,6 @@ export interface HeaderBarProps {
   onSignOut: () => void;
   userEmail: string;
   wsRef: RefObject<WebSocket | null>;
-  showShortcutHelp: boolean;
-  onToggleShortcutHelp: () => void;
-  shortcutHelpRef: RefObject<HTMLDivElement | null>;
   // SettingsDropdown props
   showSettings: boolean;
   onToggleSettings: () => void;

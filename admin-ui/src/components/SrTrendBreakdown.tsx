@@ -73,10 +73,7 @@ export {
 export {
   DirectionSrBreakdownPanel,
   EdgesTrendBreakdown,
-  FreshReviewerTrendBreakdown,
   SrReviewerDisagreementsPanel,
-  SrReviewerDisagreementDrillPanel,
-  SrScopeDriftVsExpansionCard,
 } from './srTrendBreakdown/panels';
 export { SrMissedRetrospective, SrUnhandledEdgesRetrospective } from './srTrendBreakdown/retrospectives';
 

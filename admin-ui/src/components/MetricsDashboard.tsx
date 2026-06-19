@@ -2,7 +2,7 @@ import { useMemo, useState, useEffect, useCallback, useRef } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
-import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry } from '../api';
+import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry, type ChallengerSampleRateRecommendation } from '../api';
 import { LaneDiagPanel } from './LaneDiagPanel';
 import { WarmStartOriginRow } from './WarmStartOriginRow';
 import { usePoller } from '../hooks/usePoller';
@@ -250,6 +250,7 @@ interface TaskCostBreakdownEntry {
 
 interface DirectionCostBreakdownEntry {
   direction_id: string | null;
+  direction_text: string | null;
   task_count: number;
   estimated_cost_usd: number;
 }
@@ -497,6 +498,20 @@ function NestedAxisLine({ label, axis, unit, favorableDirection, percent = false
   );
 }
 
+function ChallengerSampleRateRow({ rec }: { rec: ChallengerSampleRateRecommendation }) {
+  const statusColor = rec.status === 'reduce' ? 'text-amber-400' : rec.status === 'gate_earning' ? 'text-emerald-400' : 'text-neutral-500';
+  const rateLabel = rec.recommended_sample_rate != null ? rec.recommended_sample_rate.toFixed(2) : '—';
+  return (
+    <div data-testid="challenger-sample-rate-recommendation" className="mt-1.5 text-[10px] border-t border-neutral-700/50 pt-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-neutral-400">recommended sample_rate</span>
+        <span className={`font-mono font-semibold ${statusColor}`}>{rateLabel}</span>
+      </div>
+      <p className={`mt-0.5 ${statusColor} leading-tight`}>{rec.rationale}</p>
+    </div>
+  );
+}
+
 function EfficiencyWidget({ projectId }: { projectId: string }) {
   const [data, setData] = useState<EfficiencyAxesLocal | null>(null);
   const [loading, setLoading] = useState(true);
@@ -613,6 +628,9 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
               <span>cost/challenge: ${data.panel_review_effectiveness.cost_per_challenge_usd.toFixed(4)}</span>
             )}
           </div>
+          {data.panel_review_recommended_sample_rate && (
+            <ChallengerSampleRateRow rec={data.panel_review_recommended_sample_rate} />
+          )}
         </div>
       )}
       {data.vm_cost_attribution && data.vm_cost_attribution.by_task_type.length > 0 && (
@@ -807,7 +825,7 @@ function TaskCostBreakdownWidget({ projectId, window }: { projectId: string; win
           <div className="space-y-1">
             {data.direction_breakdown.map((row) => (
               <div key={row.direction_id ?? 'unassigned'} className="flex items-center justify-between gap-3 text-xs min-w-0">
-                <span className="text-neutral-300 break-all min-w-0">{row.direction_id ?? 'No direction'}</span>
+                <span className="text-neutral-300 break-all min-w-0">{row.direction_text ?? row.direction_id ?? 'No direction'}</span>
                 <span className="text-neutral-400 font-mono shrink-0">${row.estimated_cost_usd.toFixed(2)} · {row.task_count}</span>
               </div>
             ))}

@@ -256,6 +256,7 @@ class SourceKind(str, Enum):
     COMPUTE_EXPERIMENT = "compute_experiment"
     RESEARCH_AUDIT = "research_audit"
     REPO_DOMAIN = "repo_domain"
+    DIRECTION_RETIREMENT = "direction_retirement"
     UNKNOWN = "unknown"
 
 
@@ -4712,5 +4713,74 @@ class EvergreenBacklogItem(SQLModel, table=True):
             "ix_evergreenbacklogitem_project_status",
             "project_id",
             "status",
+        ),
+    )
+
+
+class EvergreenFillDecisionLog(SQLModel, table=True):
+    """Durable per-project, per-tick fill-decision ledger for evergreen observe-mode.
+
+    One row is written for every project evaluated on each check_evergreen_fill
+    tick, regardless of mode (off/observe/enforce) or decision (create/noop).
+    The full FleetSignal context is persisted so observe-mode behavior can be
+    reviewed across deploys for false-alarm analysis (direction d-15685fb3).
+
+    project_id and item_id use ON DELETE SET NULL so the ledger row outlives
+    the project/item rows for long-term audit purposes.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    ts: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False, index=True),
+    )
+
+    project_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    action: str = Field(sa_column=Column(String(16), nullable=False))
+    reason: str = Field(sa_column=Column(String(64), nullable=False))
+    trigger: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    mode: str = Field(sa_column=Column(String(16), nullable=False))
+
+    # Fleet utilization snapshot at decision time.
+    util_now: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
+    util_threshold: float = Field(sa_column=Column(Float, nullable=False))
+    dispatchable_queue_depth: int = Field(sa_column=Column(Integer, nullable=False))
+    vm_slots_available: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    active_evergreen_probes: int = Field(sa_column=Column(Integer, nullable=False))
+    daily_spawn_count: int = Field(sa_column=Column(Integer, nullable=False))
+    has_candidate: bool = Field(sa_column=Column(Boolean, nullable=False))
+
+    # Candidate identity at decision time (nullable when no candidate selected).
+    item_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("evergreenbacklogitem.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
+    finding_key: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+
+    __table_args__ = (
+        # Windowed-read hot path: per-project time-range scans.
+        Index(
+            "ix_evergreenfilldecisionlog_project_ts",
+            "project_id",
+            "ts",
         ),
     )

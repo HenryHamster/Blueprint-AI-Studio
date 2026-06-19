@@ -56,7 +56,7 @@ import { MergeGateFleetHealthCard } from './MergeGateFleetHealthCard';
 import { ParkWakeHealthCard } from './ParkWakeHealthCard';
 import { DependencyHealthCard } from './DependencyHealthCard';
 import { ImprovementLanesPanel } from './ImprovementLanesPanel';
-import { VersionSummaryPanel } from './VersionSummaryPanel';
+import { AdversarialQualityPanel } from './AdversarialQualityPanel';
 import type { Task } from '../types/task';
 import type { Project } from '../types/project';
 import { type DigestData as DigestDataBase, type FailureGroup } from '../types/digest';
@@ -319,19 +319,14 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
         />
       )}
 
-      {/* Version Summary */}
-      {versionLifecycle?.current_version?.tasks_merged !== undefined && (
-        <VersionSummaryPanel
-          tasksMerged={versionLifecycle.current_version.tasks_merged}
-          heading="What merged"
-        />
-      )}
-
       {/* Pipeline Efficiency */}
       <PipelineEfficiencyPanel projectId={selectedProjectId} />
 
       {/* Warm-reuse vs cost-per-merged-PR trend (baseline reference line) */}
       <WarmReuseVsCostTrend projectId={selectedProjectId} />
+
+      {/* Challenge Gate Health — adversarial quality panel */}
+      <AdversarialQualityPanel projectId={selectedProjectId} />
 
       {/* System Status */}
       <SystemStatusCard digest={digest} loading={loading} />
@@ -569,7 +564,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
           <LlmCostBreakdownPanel selectedProjectId={selectedProjectId} />
 
           {/* Section 2g2: Capability Trials */}
-          {!loading && <CapabilityTrialsPanel digest={digest} />}
+          {!loading && <CapabilityTrialsPanel digest={digest} projectId={selectedProjectId ?? undefined} onRefreshDigest={refetchDigest} />}
 
           {/* Section 2h: Effort-tier & actual-model efficiency (cost vs landed) */}
           {!loading && <EffortEfficiencyPanel data={digest?.effort_model_efficiency} />}

@@ -772,13 +772,14 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     # links a COMPUTE_RESULT artifact whose storage URI is durable-class (gs://,
     # s3://, az://, file:). Absent/False preserves existing fail-soft behavior.
     require_durable_artifact: bool | None = None
-    # Opt-in "act now" axis (axis B). When True, a SUCCESSFUL completion makes the
-    # ORCHESTRATOR spawn ONE write-capable reason-and-ship follow-on task that
-    # reasons over the faithful result AND ships in the same task (and forwards any
-    # durable COMPUTE_RESULT artifact to it). Absent/False (default) preserves
-    # axis-A behavior exactly: the experiment still gets full faithful capture but
-    # spawns no follow-on. This flag ONLY gates the immediate follow-on spawn.
-    act_on_verdict: bool | None = None
+    # Optional sweep identifier. When set, this experiment is one arm of a
+    # multi-arm sweep sharing the same sweep_id within a project. Completion
+    # suppresses the per-arm disposition follow-on and instead fires ONE aggregate
+    # follow-on when every sibling arm reaches a terminal state.
+    sweep_id: str | None = None
+    # NOTE: the legacy ``act_on_verdict`` opt-in (axis B) was retired — disposition
+    # is now decided at completion (always-dispose), not by an authoring-time flag.
+    # ``extra='allow'`` keeps any legacy payload still carrying the key valid.
 
 
 class WebResearchPayload(BasePayload):

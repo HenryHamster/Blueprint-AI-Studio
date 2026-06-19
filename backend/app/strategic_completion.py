@@ -29,11 +29,13 @@ from app.direction_outcomes import verified_merged_count
 # conjunctions, and verb prefixes like "feat"/"fix").
 from app.finding_deduplication import _STOPWORDS as _SPAWN_STOPWORDS
 from app.models import (
+    KnowledgeDocument,
     MessageType,
     Project,
     ProjectMessage,
     RECOMMENDED_MODE_META_KEY,
     RECOMMENDED_MODE_SOURCE_STRATEGIC,
+    SourceKind,
     Task,
     TaskStatus,
 )
@@ -1490,6 +1492,10 @@ async def _spawn_retirement_memos(
             priority=TASK_PRIORITY_MAP.get("low", 0),
         )
         session.add(memo_task)
+        # Flush so memo_task.id is visible in the DB before KnowledgeDocument
+        # rows reference it via source_task_id (no ORM relationship to order the
+        # flush automatically, unlike Artifact which has a back_populates).
+        await session.flush()
         # Synthesize the memo artifact at spawn time when source_finding is
         # available — works for both rationale-present and rationale-absent paths.
         # The source_finding snapshot carries all decision context so synthesis
@@ -1530,6 +1536,20 @@ async def _spawn_retirement_memos(
                     "tags": tags,
                 }
                 _apply_synthesized_memo(memo_task, synth_memo, session)
+                session.add(
+                    KnowledgeDocument(
+                        project_id=project.id,
+                        source_task_id=memo_task.id,
+                        source_kind=SourceKind.DIRECTION_RETIREMENT.value,
+                        title=memo_task.title,
+                        summary=synth_memo["summary"],
+                        body=synth_memo["reasoning"],
+                        topic="direction-retirement",
+                        direction_id=did,
+                        tags=synth_memo["tags"],
+                        source_citations=synth_memo["citations"],
+                    )
+                )
                 synthesized = True
             elif _snapshot_has_substantive_context(snapshot):
                 parts = []
@@ -1565,6 +1585,20 @@ async def _spawn_retirement_memos(
                     "tags": tags,
                 }
                 _apply_synthesized_memo(memo_task, synth_memo, session)
+                session.add(
+                    KnowledgeDocument(
+                        project_id=project.id,
+                        source_task_id=memo_task.id,
+                        source_kind=SourceKind.DIRECTION_RETIREMENT.value,
+                        title=memo_task.title,
+                        summary=synth_memo["summary"],
+                        body=synth_memo["reasoning"],
+                        topic="direction-retirement",
+                        direction_id=did,
+                        tags=synth_memo["tags"],
+                        source_citations=synth_memo["citations"],
+                    )
+                )
                 synthesized = True
             else:
                 # No rationale and no substantive snapshot context. Synthesize a
@@ -1576,6 +1610,20 @@ async def _spawn_retirement_memos(
                     "tags": ["direction-retirement"],
                 }
                 _apply_synthesized_memo(memo_task, minimal_memo, session)
+                session.add(
+                    KnowledgeDocument(
+                        project_id=project.id,
+                        source_task_id=memo_task.id,
+                        source_kind=SourceKind.DIRECTION_RETIREMENT.value,
+                        title=memo_task.title,
+                        summary=minimal_memo["summary"],
+                        body=minimal_memo["reasoning"],
+                        topic="direction-retirement",
+                        direction_id=did,
+                        tags=minimal_memo["tags"],
+                        source_citations=minimal_memo["citations"],
+                    )
+                )
                 synthesized = True
         except Exception:
             memo_task.status = TaskStatus.FAILED

@@ -203,6 +203,18 @@
       "classification": "high_signal",
       "message_type": "NOTE",
       "source_fn": "post_strategic_steering_acted_message"
+    },
+    {
+      "name": "capability_trial_stalled",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "raise_stalled_trial_notice"
+    },
+    {
+      "name": "capability_verdict_decided",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "raise_capability_verdict_notice"
     }
   ]
 }

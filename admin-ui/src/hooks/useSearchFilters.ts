@@ -92,6 +92,10 @@ export function useSearchFilters(taskTypeValues: readonly string[] = FILTER_TASK
     'filter:failureClass', [],
     parsed => sanitizeStringArray(parsed, FAILURE_CLASSES, []),
   );
+  const [directionFilter, setDirectionFilter] = usePersistedState<string>(
+    'filter:directionId', '',
+    parsed => (typeof parsed === 'string' ? parsed : ''),
+  );
   const previousValidTaskTypesRef = useRef<string[]>(defaultTaskTypeFilter);
 
   useEffect(() => {
@@ -106,5 +110,5 @@ export function useSearchFilters(taskTypeValues: readonly string[] = FILTER_TASK
     });
   }, [defaultTaskTypeFilter, setTaskTypeFilter, validTaskTypes]);
 
-  return { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter };
+  return { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter, directionFilter, setDirectionFilter };
 }
