@@ -2486,8 +2486,11 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
       * ``challenged_revised``    — same verdict direction, surviving issue set changed.
       * ``challenged_rejected``   — panel overturns the verdict direction (the ROI signal).
 
-    The ``unchallenged`` state (gate off or primary was not an APPROVE) is excluded
-    because it does not represent a gate invocation.
+    The plain ``unchallenged`` state (gate off or primary was not an APPROVE) is
+    excluded because it does not represent a gate invocation.  However, records
+    where ``unchallenged`` is combined with ``escalated=True`` capture a distinct
+    failure class — the challenger task itself failed or returned an unparseable
+    verdict — and are counted separately as ``challenged_escalated`` (fail-opens).
 
     Returns ``None`` when no gate invocations exist in the window.
 
@@ -2498,6 +2501,10 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
 
     ``cost_per_challenge_usd`` = total LLM cost of panel_review tasks / total_challenged.
     Provides the spend-per-invocation needed to compute gate ROI alongside overturn_rate.
+
+    ``challenged_escalated`` — count of invocations where the challenger failed
+    (unparseable/crashed) and the primary verdict was adopted as a fail-open.  These
+    are excluded from ``total_challenged`` because no independent verdict was reached.
     """
     from app.task_completion import (  # noqa: PLC0415
         REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
@@ -2506,6 +2513,7 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
     confirmed = 0
     revised = 0
     rejected = 0
+    escalated = 0
     for t in tasks:
         recon = (t.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
         if not isinstance(recon, dict):
@@ -2517,9 +2525,11 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
             revised += 1
         elif state == "challenged_rejected":
             rejected += 1
+        elif state == "unchallenged" and recon.get("escalated"):
+            escalated += 1
 
     total = confirmed + revised + rejected
-    if total == 0:
+    if total == 0 and escalated == 0:
         return None
 
     # Sum LLM cost across panel_review challenger tasks in the window.
@@ -2535,8 +2545,9 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
         "challenged_revised": revised,
         "challenged_rejected": rejected,
         "total_challenged": total,
-        "overturn_rate": round(rejected / total, 4),
+        "overturn_rate": round(rejected / total, 4) if total > 0 else None,
         "cost_per_challenge_usd": cost_per_challenge,
+        "challenged_escalated": escalated,
     }
 
 

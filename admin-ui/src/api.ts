@@ -1518,8 +1518,9 @@ export interface PanelReviewEffectiveness {
   challenged_revised: number;
   challenged_rejected: number;
   total_challenged: number;
-  overturn_rate: number;
+  overturn_rate: number | null;
   cost_per_challenge_usd?: number | null;
+  challenged_escalated?: number;
 }
 
 export interface ChallengerSampleRateRecommendation {

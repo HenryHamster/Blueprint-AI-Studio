@@ -6610,6 +6610,57 @@ def test_panel_review_effectiveness_cost_per_challenge_usd():
     )
 
 
+def test_panel_review_effectiveness_escalated_fail_open():
+    """Escalated fail-open records (unchallenged + escalated=True) are counted in
+    challenged_escalated and excluded from total_challenged.
+
+    Setup:
+      - 2 challenged_confirmed (normal gate invocations)
+      - 1 challenged_rejected  (normal gate invocation)
+      - 2 unchallenged + escalated=True (challenger failed — fail-open)
+      - 1 unchallenged without escalated (gate not invoked — must be ignored)
+
+    Expected:
+      total_challenged = 3 (only the three successful gate invocations)
+      challenged_escalated = 2 (the two fail-open records)
+      overturn_rate = 1/3
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _task(recon):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    tasks = [
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_rejected"}),
+        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "unchallenged"}),  # gate not invoked — must be ignored
+    ]
+
+    result = compute_panel_review_effectiveness(tasks)
+    assert result is not None, "must return a result when escalated records exist"
+    assert result["total_challenged"] == 3, (
+        f"escalated records must be excluded from total_challenged, got {result['total_challenged']}"
+    )
+    assert result["challenged_escalated"] == 2, (
+        f"expected challenged_escalated=2, got {result['challenged_escalated']}"
+    )
+    assert result["overturn_rate"] == round(1 / 3, 4), (
+        f"overturn_rate must be computed from total_challenged only, got {result['overturn_rate']}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # compute_recommended_challenger_sample_rate
 # ---------------------------------------------------------------------------
