@@ -46,7 +46,9 @@ from app.capability_trial_verdict import (
     evaluate_lane_pilot_verdict,
     evaluate_trial_verdict,
     get_trial_definitions,
+    is_ambiguous_lift_escalation_needed,
     is_trial_stalled,
+    persist_ambiguous_lift_escalations_in_transaction,
     persist_stalled_trial_notices_in_transaction,
     persist_trial_verdicts_in_transaction,
 )
@@ -1960,6 +1962,26 @@ async def _compute_digest(
             except Exception:
                 logger.warning(
                     "[CAPABILITY_TRIAL] failed to persist stalled-trial notices",
+                    exc_info=True,
+                )
+
+        # Escalate ambiguous_lift trials that have been inconclusive past the dwell threshold.
+        _escalated_trials: list[tuple[str, dict[str, Any]]] = []
+        for _cap, _entry in _augmented_verdicts.items():
+            if not isinstance(_entry, dict):
+                continue
+            if is_ambiguous_lift_escalation_needed(_entry):
+                _escalated_trials.append((_cap, _entry))
+        if _escalated_trials:
+            try:
+                await persist_ambiguous_lift_escalations_in_transaction(
+                    session,
+                    project_id,
+                    escalated=_escalated_trials,
+                )
+            except Exception:
+                logger.warning(
+                    "[CAPABILITY_TRIAL] failed to persist ambiguous-lift escalation notices",
                     exc_info=True,
                 )
 

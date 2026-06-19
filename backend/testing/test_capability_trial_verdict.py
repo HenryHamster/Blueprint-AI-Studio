@@ -4053,3 +4053,302 @@ class TestIsStalledFlagStamped:
         assert augmented_verdicts["stalled_cap"]["is_stalled"] is True
         assert augmented_verdicts["healthy_cap"]["is_stalled"] is False
         assert augmented_verdicts["decided_cap"]["is_stalled"] is False
+
+
+# ── is_ambiguous_lift_escalation_needed ──────────────────────────────────────
+
+
+class TestIsAmbiguousLiftEscalationNeeded:
+    """Unit tests for is_ambiguous_lift_escalation_needed predicate."""
+
+    def _ambiguous_entry(self, since_iso: str, **overrides) -> dict:
+        base = {
+            "verdict": "continue-trial",
+            "verdict_reason": "ambiguous_lift",
+            "ambiguous_lift_since": since_iso,
+            "lift": 0.02,
+            "n_with": 50,
+            "n_without": 50,
+        }
+        base.update(overrides)
+        return base
+
+    def test_above_threshold_returns_true(self):
+        from app.capability_trial_verdict import is_ambiguous_lift_escalation_needed
+
+        # 15 days dwell > 14-day threshold
+        since = "2026-06-01T00:00:00+00:00"
+        now = "2026-06-16T00:00:00+00:00"
+        assert (
+            is_ambiguous_lift_escalation_needed(
+                self._ambiguous_entry(since), threshold_days=14, now_iso=now
+            )
+            is True
+        )
+
+    def test_below_threshold_returns_false(self):
+        from app.capability_trial_verdict import is_ambiguous_lift_escalation_needed
+
+        # 5 days dwell < 14-day threshold
+        since = "2026-06-10T00:00:00+00:00"
+        now = "2026-06-15T00:00:00+00:00"
+        assert (
+            is_ambiguous_lift_escalation_needed(
+                self._ambiguous_entry(since), threshold_days=14, now_iso=now
+            )
+            is False
+        )
+
+    def test_exactly_at_threshold_returns_true(self):
+        from app.capability_trial_verdict import is_ambiguous_lift_escalation_needed
+
+        since = "2026-06-01T00:00:00+00:00"
+        now = "2026-06-15T00:00:00+00:00"
+        assert (
+            is_ambiguous_lift_escalation_needed(
+                self._ambiguous_entry(since), threshold_days=14, now_iso=now
+            )
+            is True
+        )
+
+    def test_non_ambiguous_lift_verdict_reason_returns_false(self):
+        from app.capability_trial_verdict import is_ambiguous_lift_escalation_needed
+
+        entry = {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "ambiguous_lift_since": "2026-01-01T00:00:00+00:00",
+        }
+        now = "2026-06-15T00:00:00+00:00"
+        assert is_ambiguous_lift_escalation_needed(entry, now_iso=now) is False
+
+    def test_decided_verdict_returns_false(self):
+        from app.capability_trial_verdict import is_ambiguous_lift_escalation_needed
+
+        for verdict in ("adopt", "reject", "no_effect", "ADOPT", "KILL"):
+            entry = {
+                "verdict": verdict,
+                "verdict_reason": "ambiguous_lift",
+                "ambiguous_lift_since": "2026-01-01T00:00:00+00:00",
+            }
+            now = "2026-06-15T00:00:00+00:00"
+            assert is_ambiguous_lift_escalation_needed(entry, now_iso=now) is False
+
+    def test_missing_since_returns_false(self):
+        from app.capability_trial_verdict import is_ambiguous_lift_escalation_needed
+
+        entry = {"verdict": "continue-trial", "verdict_reason": "ambiguous_lift"}
+        now = "2026-06-15T00:00:00+00:00"
+        assert is_ambiguous_lift_escalation_needed(entry, now_iso=now) is False
+
+    def test_non_dict_returns_false(self):
+        from app.capability_trial_verdict import is_ambiguous_lift_escalation_needed
+
+        assert (
+            is_ambiguous_lift_escalation_needed(
+                None, now_iso="2026-06-15T00:00:00+00:00"
+            )
+            is False
+        )  # type: ignore[arg-type]
+        assert (
+            is_ambiguous_lift_escalation_needed(
+                "continue-trial", now_iso="2026-06-15T00:00:00+00:00"
+            )
+            is False
+        )  # type: ignore[arg-type]
+
+    def test_unparseable_since_returns_false(self):
+        from app.capability_trial_verdict import is_ambiguous_lift_escalation_needed
+
+        entry = {
+            "verdict": "continue-trial",
+            "verdict_reason": "ambiguous_lift",
+            "ambiguous_lift_since": "not-a-date",
+        }
+        now = "2026-06-15T00:00:00+00:00"
+        assert is_ambiguous_lift_escalation_needed(entry, now_iso=now) is False
+
+
+# ── record_trial_verdict: ambiguous_lift_since carry-forward ─────────────────
+
+
+class TestRecordTrialVerdictAmbiguousLiftSince:
+    """Tests for ambiguous_lift_since stamping in record_trial_verdict."""
+
+    def test_stamps_since_on_first_ambiguous_lift(self):
+        """First ambiguous_lift verdict stamps ambiguous_lift_since from evaluated_at."""
+        project = _make_project()
+        incoming = {
+            "verdict": "continue-trial",
+            "verdict_reason": "ambiguous_lift",
+            "lift": 0.02,
+            "n_with": 50,
+            "n_without": 50,
+            "evaluated_at": "2026-06-01T00:00:00+00:00",
+        }
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", incoming)
+
+        stored = project.capability_adoption_verdicts["repo_map"]
+        assert stored["ambiguous_lift_since"] == "2026-06-01T00:00:00+00:00"
+
+    def test_preserves_since_on_subsequent_ambiguous_lift(self):
+        """Subsequent ambiguous_lift verdicts carry forward the original since timestamp."""
+        project = _make_project()
+        prior = {
+            "verdict": "continue-trial",
+            "verdict_reason": "ambiguous_lift",
+            "lift": 0.02,
+            "ambiguous_lift_since": "2026-06-01T00:00:00+00:00",
+        }
+        project.capability_adoption_verdicts = {"repo_map": prior}
+
+        incoming = {
+            "verdict": "continue-trial",
+            "verdict_reason": "ambiguous_lift",
+            "lift": 0.01,
+            "n_with": 60,
+            "n_without": 60,
+            "evaluated_at": "2026-06-15T00:00:00+00:00",
+        }
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", incoming)
+
+        stored = project.capability_adoption_verdicts["repo_map"]
+        # Original since timestamp must be preserved, not overwritten with evaluated_at
+        assert stored["ambiguous_lift_since"] == "2026-06-01T00:00:00+00:00"
+
+    def test_non_ambiguous_lift_does_not_stamp_since(self):
+        """insufficient_data continue-trial must not receive ambiguous_lift_since."""
+        project = _make_project()
+        incoming = {
+            "verdict": "continue-trial",
+            "verdict_reason": "insufficient_data",
+            "lift": None,
+            "n_with": 5,
+            "n_without": 5,
+            "evaluated_at": "2026-06-01T00:00:00+00:00",
+        }
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", incoming)
+
+        stored = project.capability_adoption_verdicts["repo_map"]
+        assert "ambiguous_lift_since" not in stored
+
+
+# ── raise_ambiguous_lift_escalation_notice ───────────────────────────────────
+
+
+class TestRaiseAmbiguousLiftEscalationNotice:
+    """Tests for raise_ambiguous_lift_escalation_notice and persist_ambiguous_lift_escalations_in_transaction."""
+
+    def _build_mock_db(self, open_messages=None):
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_session = MagicMock()
+        mock_session.commit = AsyncMock()
+        mock_session.rollback = AsyncMock()
+        mock_session.add = MagicMock()
+
+        scalars_mock = MagicMock()
+        scalars_mock.all.return_value = open_messages or []
+        execute_result = MagicMock()
+        execute_result.scalars.return_value = scalars_mock
+        mock_session.execute = AsyncMock(return_value=execute_result)
+
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_cm.return_value = mock_cm
+        return mock_session, mock_cm
+
+    def _escalated_entry(self):
+        return {
+            "verdict": "continue-trial",
+            "verdict_reason": "ambiguous_lift",
+            "ambiguous_lift_since": "2026-06-01T00:00:00+00:00",
+            "lift": 0.02,
+            "n_with": 50,
+            "n_without": 50,
+            "thresholds": {"min_n_per_arm": 30},
+        }
+
+    @pytest.mark.asyncio
+    async def test_first_evaluation_creates_notice(self):
+        """No existing open notice → creates a ProjectMessage with correct event_type."""
+        import uuid
+
+        from app.capability_trial_verdict import raise_ambiguous_lift_escalation_notice
+
+        project_id = uuid.uuid4()
+        mock_session, _ = self._build_mock_db(open_messages=[])
+
+        await raise_ambiguous_lift_escalation_notice(
+            mock_session, project_id, "repo_map", self._escalated_entry()
+        )
+
+        mock_session.add.assert_called_once()
+        added_msg = mock_session.add.call_args[0][0]
+        ctx = added_msg.context
+        assert ctx["event_type"] == "capability_trial_ambiguous_lift_escalation"
+        assert (
+            ctx["dedupe_key"] == "capability_trial_ambiguous_lift_escalation_repo_map"
+        )
+        assert ctx["cap_name"] == "repo_map"
+        assert ctx["ambiguous_lift_since"] == "2026-06-01T00:00:00+00:00"
+        assert ctx["lift"] == 0.02
+
+    @pytest.mark.asyncio
+    async def test_dedup_second_evaluation_silent(self):
+        """Second call with existing open notice must not add another message."""
+        import uuid
+        from unittest.mock import MagicMock
+
+        from app.capability_trial_verdict import raise_ambiguous_lift_escalation_notice
+
+        project_id = uuid.uuid4()
+        existing_msg = MagicMock()
+        existing_msg.context = {
+            "dedupe_key": "capability_trial_ambiguous_lift_escalation_repo_map"
+        }
+        mock_session, _ = self._build_mock_db(open_messages=[existing_msg])
+
+        await raise_ambiguous_lift_escalation_notice(
+            mock_session, project_id, "repo_map", self._escalated_entry()
+        )
+
+        mock_session.add.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_persist_ambiguous_lift_escalations_basic(self):
+        """persist_ambiguous_lift_escalations_in_transaction calls the notice function and commits."""
+        import uuid
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.capability_trial_verdict import (
+            persist_ambiguous_lift_escalations_in_transaction,
+        )
+
+        project_id = uuid.uuid4()
+        mock_session, mock_cm = self._build_mock_db()
+        mock_factory = MagicMock(return_value=mock_cm)
+
+        with (
+            patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory),
+            patch("app.database.resolve_async_engine", return_value=MagicMock()),
+            patch(
+                "app.capability_trial_verdict.raise_ambiguous_lift_escalation_notice",
+                new_callable=AsyncMock,
+            ) as mock_notice,
+        ):
+            await persist_ambiguous_lift_escalations_in_transaction(
+                MagicMock(),
+                project_id,
+                escalated=[("repo_map", self._escalated_entry())],
+            )
+
+        mock_notice.assert_called_once()
+        call_args = mock_notice.call_args[0]
+        assert call_args[2] == "repo_map"
+        assert call_args[3] == self._escalated_entry()
+        mock_session.commit.assert_called_once()

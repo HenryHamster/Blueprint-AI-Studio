@@ -17,6 +17,7 @@ transition. The old entry is replaced, not appended.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, TypedDict
 
 from sqlalchemy.orm.attributes import flag_modified
@@ -645,6 +646,18 @@ def record_trial_verdict(
         )
         return
 
+    # Carry forward ambiguous_lift_since so dwell-time escalation can fire.
+    if new_verdict in _CONTINUE_VERDICTS and new_reason == "ambiguous_lift":
+        prior_since = (prior or {}).get("ambiguous_lift_since")
+        if prior_since and (prior or {}).get("verdict_reason") == "ambiguous_lift":
+            entry = dict(entry)
+            entry["ambiguous_lift_since"] = prior_since
+        elif "ambiguous_lift_since" not in entry:
+            entry = dict(entry)
+            entry["ambiguous_lift_since"] = (
+                entry.get("evaluated_at") or datetime.now(timezone.utc).isoformat()
+            )
+
     project.capability_adoption_verdicts[cap_name] = entry
     flag_modified(project, "capability_adoption_verdicts")
 
@@ -1084,6 +1097,146 @@ async def persist_stalled_trial_notices_in_transaction(
         try:
             for cap_name, entry in stalled:
                 await raise_stalled_trial_notice(session, project_id, cap_name, entry)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+# ── Ambiguous-lift dwell-time escalation ─────────────────────────────────────
+
+_AMBIGUOUS_LIFT_ESCALATION_THRESHOLD_DAYS = 14
+
+
+def is_ambiguous_lift_escalation_needed(
+    entry: dict[str, Any],
+    *,
+    threshold_days: int = _AMBIGUOUS_LIFT_ESCALATION_THRESHOLD_DAYS,
+    now_iso: str | None = None,
+) -> bool:
+    """Return True when an ambiguous_lift trial has dwelled past the threshold.
+
+    Returns False when:
+    - entry is not a dict
+    - verdict/verdict_reason are not ambiguous_lift
+    - ``ambiguous_lift_since`` is absent or unparseable
+    - dwell time is below ``threshold_days``
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("verdict") != "continue-trial":
+        return False
+    if entry.get("verdict_reason") != "ambiguous_lift":
+        return False
+    since_str = entry.get("ambiguous_lift_since")
+    if not since_str:
+        return False
+    try:
+        since_dt = datetime.fromisoformat(since_str.replace("Z", "+00:00"))
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+        if now_iso is not None:
+            now_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=timezone.utc)
+        else:
+            now_dt = datetime.now(timezone.utc)
+        dwell_days = (now_dt - since_dt).total_seconds() / 86400
+        return dwell_days >= threshold_days
+    except (ValueError, TypeError):
+        return False
+
+
+async def raise_ambiguous_lift_escalation_notice(
+    session: Any,
+    project_id: Any,
+    cap_name: str,
+    entry: dict[str, Any],
+) -> None:
+    """Record a durable operator notice when an ambiguous_lift trial exceeds the dwell threshold.
+
+    Deduplicated on ``cap_name`` so repeated digest re-evaluations of the same
+    long-dwelling trial emit exactly ONE open notice per capability.
+    """
+    from sqlalchemy import select
+
+    from app.models import MessageType, ProjectMessage
+
+    dedupe_key = f"capability_trial_ambiguous_lift_escalation_{cap_name}"
+    existing = (
+        (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.status == "open",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing):
+        return
+
+    since_str = entry.get("ambiguous_lift_since")
+    lift = entry.get("lift")
+    n_with = entry.get("n_with")
+    n_without = entry.get("n_without")
+    thresholds = entry.get("thresholds") or {}
+    min_n = thresholds.get("min_n_per_arm")
+
+    content = (
+        f"[CAPABILITY-TRIAL] {cap_name} ambiguous_lift escalation: trial has been inconclusive "
+        f"since {since_str} (lift={lift} n_with={n_with} n_without={n_without} min_n={min_n}) "
+        f"— operator review required: consider expanding trial, adjusting thresholds, or closing"
+    )
+    session.add(
+        ProjectMessage(
+            project_id=project_id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content=content,
+            context={
+                "event_type": "capability_trial_ambiguous_lift_escalation",
+                "dedupe_key": dedupe_key,
+                "cap_name": cap_name,
+                "ambiguous_lift_since": since_str,
+                "lift": lift,
+                "n_with": n_with,
+                "n_without": n_without,
+                "min_n": min_n,
+            },
+        )
+    )
+
+
+async def persist_ambiguous_lift_escalations_in_transaction(
+    source_session: Any,
+    project_id: Any,
+    *,
+    escalated: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Durably persist ambiguous-lift escalation notices for long-dwelling trials.
+
+    Opens its OWN committing AsyncSession (mirroring ``persist_stalled_trial_notices_in_transaction``)
+    so notices survive regardless of whether the outer digest request session commits.
+    On any exception it rolls back and re-raises.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.database import resolve_async_engine
+
+    factory = async_sessionmaker(
+        resolve_async_engine(source_session),
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with factory() as session:
+        try:
+            for cap_name, entry in escalated:
+                await raise_ambiguous_lift_escalation_notice(
+                    session, project_id, cap_name, entry
+                )
             await session.commit()
         except Exception:
             await session.rollback()

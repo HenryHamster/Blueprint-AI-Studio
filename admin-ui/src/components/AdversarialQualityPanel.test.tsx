@@ -69,13 +69,13 @@ describe('AdversarialQualityPanel', () => {
     expect(el.querySelector('[data-testid="health-badge"]')?.textContent).toBe('HEALTHY');
   });
 
-  test('shows PARTIAL badge when fail-open rate is between 5% and 30%', async () => {
-    // 1 fail-open out of 19 normal = 1/20 = 5% — exactly at the new 5% PARTIAL threshold
+  test('shows PARTIAL badge when fail-open rate is between 1% and 5%', async () => {
+    // 1 fail-open out of 49 normal = 1/50 = 2% — between 1% PARTIAL and 5% DEGRADED thresholds
     axesPayload = {
       ...BASE_AXES,
       panel_review_effectiveness: makeEffectiveness({
         challenged_escalated: 1,
-        total_challenged: 19,
+        total_challenged: 49,
       }),
     };
     const el = render(<AdversarialQualityPanel projectId="proj-1" />);
@@ -83,12 +83,13 @@ describe('AdversarialQualityPanel', () => {
     expect(el.querySelector('[data-testid="health-badge"]')?.textContent).toBe('PARTIAL');
   });
 
-  test('shows DEGRADED badge when fail-open rate >= 30%', async () => {
+  test('shows DEGRADED badge when fail-open rate >= 5%', async () => {
+    // 1 fail-open out of 19 normal = 1/20 = 5% — at the operator-action threshold
     axesPayload = {
       ...BASE_AXES,
       panel_review_effectiveness: makeEffectiveness({
-        challenged_escalated: 6,
-        total_challenged: 10,
+        challenged_escalated: 1,
+        total_challenged: 19,
       }),
     };
     const el = render(<AdversarialQualityPanel projectId="proj-1" />);

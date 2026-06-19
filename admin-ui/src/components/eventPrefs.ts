@@ -57,6 +57,7 @@ export const HIGH_SIGNAL_NOTE_BADGE_LABELS: Readonly<Record<string, string>> = {
   direction_staged_activated: 'Direction Activated',
   capability_trial_stalled: 'Trial Stalled',
   capability_verdict_decided: 'Verdict Decided',
+  capability_trial_ambiguous_lift_escalation: 'Ambiguous Lift',
 };
 
 export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
@@ -65,6 +66,7 @@ export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'release_stabilize_stalled', 'release_ci_unresolved_stall', 'release_auto_merge_stalled',
   'promotion_readiness_reached', 'strategic_steering_deferred', 'strategic_steering_acted',
   'direction_staged_activated', 'capability_trial_stalled', 'capability_verdict_decided',
+  'capability_trial_ambiguous_lift_escalation',
   ...ESCALATION_EVENT_TYPES,
 ]);
 
