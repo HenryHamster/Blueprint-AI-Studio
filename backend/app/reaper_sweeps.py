@@ -554,6 +554,27 @@ async def sweep_routine_message_retention(session, *, retention_days: int = 7) -
     return purged
 
 
+async def sweep_evergreen_fill_decision_retention(
+    session, *, retention_days: int = 30
+) -> int:
+    """Purge EvergreenFillDecisionLog rows older than retention_days (default 30).
+
+    Returns the number of rows deleted.
+    """
+    from app.models import EvergreenFillDecisionLog
+    from sqlalchemy import delete
+
+    cutoff = _utcnow() - timedelta(days=retention_days)
+    res = await session.execute(
+        delete(EvergreenFillDecisionLog).where(EvergreenFillDecisionLog.ts < cutoff)
+    )
+    count = res.rowcount
+    if count:
+        await session.commit()
+        logger.info(f"[REAPER] Purged {count} stale evergreen fill decision log row(s)")
+    return count
+
+
 # ── Step 12: BLOCKED-task auto-unblock / escalation sweep ──────────────────
 # (constants and sweep helpers live in app.blocked_task_unblock_sweeps)
 

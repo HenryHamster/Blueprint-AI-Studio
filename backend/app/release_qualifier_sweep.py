@@ -333,6 +333,9 @@ async def _redrive_not_promoted_qualification(
       1. Calls ``compute_requalification_readiness`` to verify ALL gating
          high/medium audit findings are ledger-resolved (``resolved`` or ``stale``).
          If not, returns False immediately — the blockers have NOT cleared.
+         Versions with zero gating findings (e.g. blocked by ``ci_not_green``)
+         pass this check: the hard blockers may be resolved by a code fix, and
+         HEAD advancement is the signal that warrants a fresh qualification.
       2. Re-invokes ``run_qualification``, which under its own ``FOR UPDATE`` lock
          re-resolves the candidate SHA.  If ``automain`` has NOT advanced (same
          SHA), ``run_qualification`` returns ``cached_verdict`` and this returns

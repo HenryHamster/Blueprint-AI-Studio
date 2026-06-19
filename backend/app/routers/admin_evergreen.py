@@ -27,8 +27,10 @@ from app.database import get_session
 from app.evergreen_backlog import (
     BACKLOG_STATUSES,
     backlog_summary,
+    compute_observe_mode_verdict,
     enroll_backlog_item,
     get_fill_observability,
+    get_fill_observability_from_db,
     list_backlog_items,
 )
 
@@ -129,10 +131,45 @@ async def get_backlog_summary(
 
 @router.get("/fill-observability")
 async def get_observability(
+    window_hours: int = Query(24, ge=1, le=168),
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ) -> Dict[str, Any]:
-    """Bounded in-memory fill-decision counters + recent decisions."""
-    return get_fill_observability()
+    """Fill-decision counters and recent decisions from the durable log.
+
+    Aggregates EvergreenFillDecisionLog rows within the trailing window
+    (default 24 h, max 168 h / 7 days).  Falls back to the process-local
+    in-memory snapshot when the table has no rows in the window so fresh
+    deploys still show something meaningful.
+    """
+    result = await get_fill_observability_from_db(session, window_hours=window_hours)
+    if not result["recent"] and result["created_count"] == 0:
+        return get_fill_observability()
+    return result
+
+
+@router.get("/observe-mode-verdict")
+async def get_observe_mode_verdict(
+    window_hours: int = Query(168, ge=1, le=720),
+    max_fire_rate_pct: float = Query(20.0, ge=0.0, le=100.0),
+    min_evaluations: int = Query(10, ge=1),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Compute a go/no-go verdict for the observe-mode → enforce-mode transition.
+
+    Reads the durable fill-decision ledger (EvergreenFillDecisionLog) over the
+    trailing *window_hours* (default 168 h / 7 days) and computes the fire rate:
+    the fraction of observe-mode evaluations that would have triggered a spawn.
+
+    Verdict is one of: ``go``, ``no_go``, or ``insufficient_data``.
+    """
+    return await compute_observe_mode_verdict(
+        session,
+        window_hours=window_hours,
+        max_fire_rate_pct=max_fire_rate_pct,
+        min_evaluations=min_evaluations,
+    )
 
 
 @router.get("/structural-health-observability")

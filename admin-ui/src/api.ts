@@ -3437,6 +3437,8 @@ export interface EvergreenFillDecisionRecord {
   reason: string;
   trigger: string | null;
   project_id: string | null;
+  /** ISO timestamp; present when backed by the durable log (not in-memory fallback). */
+  ts?: string;
 }
 
 export interface EvergreenFillObservabilityResponse {
