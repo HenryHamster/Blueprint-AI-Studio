@@ -961,11 +961,14 @@ async def _link_clustered_bug_messages(
     if _bug_message_cluster_signature(anchor_msg) is None:
         return 0
 
+    # Limit to 500 candidates to bound O(N) comparisons on large projects.
     result = await session.execute(
-        select(ProjectMessage).where(
+        select(ProjectMessage)
+        .where(
             ProjectMessage.project_id == project.id,
             ProjectMessage.status == "open",
         )
+        .limit(500)
     )
     linked = 0
     for candidate in result.scalars().all():

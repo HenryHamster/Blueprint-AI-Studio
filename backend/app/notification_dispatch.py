@@ -1049,16 +1049,22 @@ async def open_system_bug_or_blocker_exists(
     try:
         eligible_types = tuple(MessageType(v) for v in BUG_CLASS_TYPES)
         result = await session.execute(
-            select(ProjectMessage).where(
+            select(ProjectMessage)
+            .where(
                 ProjectMessage.project_id == project_id,
                 ProjectMessage.status == "open",
                 ProjectMessage.message_type.in_(eligible_types),
                 ProjectMessage.from_type.in_(tuple(_DEDUPED_SYSTEM_FROM_TYPES)),
+                # Push dedupe_key match to the database to avoid a full-table scan
+                # in Python; NULL contexts produce NULL from the path accessor and
+                # never match, so this is safe with nullable context columns.
+                ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
             )
+            .limit(500)
         )
-        for msg in result.scalars().all():
-            if (msg.context or {}).get("dedupe_key") == dedupe_key:
-                return msg
+        msg = result.scalars().first()
+        if msg is not None:
+            return msg
     except Exception as exc:  # fail-open: never block a legitimately new message
         logger.warning(
             "[DEDUPE] open_system_bug_or_blocker_exists lookup failed for %s: %s",
