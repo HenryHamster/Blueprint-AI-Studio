@@ -3557,6 +3557,7 @@ export async function fetchStructuralHealthObservability(
 
 export interface ObserveModeVerdictResponse {
   verdict: 'go' | 'no_go' | 'insufficient_data';
+  verdict_reason: string;
   window_hours: number;
   observe_evaluations: number;
   would_have_fired: number;

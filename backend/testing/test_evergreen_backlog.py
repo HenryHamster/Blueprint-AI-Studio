@@ -193,6 +193,102 @@ def test_every_decision_reason_is_closed_vocabulary():
 
 
 # --------------------------------------------------------------------------- #
+# Observe-mode cap-precedes-observe ordering — false-alarm rate purity.
+#
+# In observe mode, cap/dedup guards fire BEFORE the observe_mode noop.  So
+# when a cap fires, the returned reason is the cap reason (not 'observe_mode').
+# These tests verify that ordering, which is what makes the fire-rate metric
+# correct: only genuine would-have-fired decisions land in the denominator.
+# --------------------------------------------------------------------------- #
+
+
+def test_observe_mode_active_cap_precedes_observe_noop():
+    """active_cap_reached fires before observe_mode in observe mode."""
+    decision = decide_evergreen_fill(
+        _would_create_signal(mode="observe", active_evergreen_probes=1, max_active=1)
+    )
+    assert decision.action == DECISION_NOOP
+    assert decision.reason == "active_cap_reached"
+    assert decision.reason != "observe_mode"
+
+
+def test_observe_mode_daily_cap_precedes_observe_noop():
+    """daily_cap_reached fires before observe_mode in observe mode."""
+    decision = decide_evergreen_fill(
+        _would_create_signal(mode="observe", daily_spawn_count=3, daily_cap=3)
+    )
+    assert decision.action == DECISION_NOOP
+    assert decision.reason == "daily_cap_reached"
+    assert decision.reason != "observe_mode"
+
+
+def test_observe_mode_no_candidate_precedes_observe_noop():
+    """no_candidate fires before observe_mode in observe mode."""
+    decision = decide_evergreen_fill(
+        _would_create_signal(mode="observe", has_candidate=False)
+    )
+    assert decision.action == DECISION_NOOP
+    assert decision.reason == "no_candidate"
+    assert decision.reason != "observe_mode"
+
+
+def test_observe_mode_direction_conflict_precedes_observe_noop():
+    """direction_conflict fires before observe_mode in observe mode."""
+    decision = decide_evergreen_fill(
+        _would_create_signal(mode="observe", candidate_conflict=True)
+    )
+    assert decision.action == DECISION_NOOP
+    assert decision.reason == "direction_conflict"
+    assert decision.reason != "observe_mode"
+
+
+def test_observe_mode_duplicate_lineage_precedes_observe_noop():
+    """duplicate_lineage fires before observe_mode in observe mode."""
+    decision = decide_evergreen_fill(
+        _would_create_signal(mode="observe", duplicate_lineage=True)
+    )
+    assert decision.action == DECISION_NOOP
+    assert decision.reason == "duplicate_lineage"
+    assert decision.reason != "observe_mode"
+
+
+async def test_observe_mode_active_cap_rows_excluded_from_would_have_fired(db_session):
+    """Cap-reason rows in observe mode are NOT counted as would_have_fired.
+
+    Seeds a mix of observe-mode rows: some with reason='active_cap_reached'
+    (cap fired before observe check) and some with reason='observe_mode'
+    (genuine would-have-fired).  Confirms that compute_observe_mode_verdict
+    counts only the 'observe_mode' rows in would_have_fired, so cap rows do
+    not inflate the false-alarm rate.
+    """
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+
+    # 5 rows where a cap fired — these must NOT inflate would_have_fired.
+    for _ in range(5):
+        db_session.add(
+            _observe_row(ts=now - timedelta(hours=1), reason="active_cap_reached")
+        )
+    # 5 rows where observe_mode suppressed a genuine would-have-fired spawn.
+    for _ in range(5):
+        db_session.add(_observe_row(ts=now - timedelta(hours=1), reason="observe_mode"))
+    await db_session.commit()
+
+    result = await compute_observe_mode_verdict(
+        db_session, window_hours=24, max_fire_rate_pct=60.0, min_evaluations=10
+    )
+    assert result["observe_evaluations"] == 10
+    # Only the 5 genuine would-have-fired rows count.
+    assert result["would_have_fired"] == 5
+    # Fire rate is 50%, not 100% (which would be the case if cap rows were counted).
+    assert result["fire_rate_pct"] == 50.0
+    assert result["verdict"] == "go"  # 50% ≤ 60% threshold
+
+
+# --------------------------------------------------------------------------- #
 # DB-backed: enrollment / dedup / selection.
 # --------------------------------------------------------------------------- #
 

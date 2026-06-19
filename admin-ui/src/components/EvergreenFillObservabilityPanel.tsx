@@ -2,13 +2,17 @@ import { useCallback, useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import {
   fetchEvergreenFillObservability,
+  fetchObserveModeVerdict,
   type EvergreenFillObservabilityResponse,
+  type ObserveModeVerdictResponse,
 } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 export function EvergreenFillObservabilityPanel() {
   const [data, setData] = useState<EvergreenFillObservabilityResponse | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [verdictData, setVerdictData] = useState<ObserveModeVerdictResponse | null>(null);
+  const [verdictError, setVerdictError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
 
   const load = useCallback(async (signal?: AbortSignal) => {
@@ -23,7 +27,20 @@ export function EvergreenFillObservabilityPanel() {
     }
   }, []);
 
+  const loadVerdict = useCallback(async (signal?: AbortSignal) => {
+    setVerdictError(null);
+    try {
+      const result = await fetchObserveModeVerdict(168, 20.0, 10, signal);
+      if (signal?.aborted) return;
+      setVerdictData(result);
+    } catch (e) {
+      if (signal?.aborted) return;
+      setVerdictError(e instanceof Error ? e.message : 'Failed to load');
+    }
+  }, []);
+
   usePoller(load, { intervalMs: DEFAULT_POLL_MS, enabled: true });
+  usePoller(loadVerdict, { intervalMs: DEFAULT_POLL_MS, enabled: true });
 
   const reasonEntries = Object.entries(data?.reason_counts ?? {}).sort((a, b) => b[1] - a[1]);
   const triggerEntries = Object.entries(data?.trigger_counts ?? {}).sort((a, b) => b[1] - a[1]);
@@ -48,6 +65,39 @@ export function EvergreenFillObservabilityPanel() {
 
       {!collapsed && (
         <div className="px-4 py-3 space-y-4">
+          {verdictData != null && (
+            <div className="bg-neutral-900 rounded-lg px-3 py-3 border border-neutral-800">
+              <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-3">Observe Mode Verdict</p>
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <div
+                    className={`inline-block px-2 py-1 rounded text-xs font-medium ${
+                      verdictData.verdict === 'go'
+                        ? 'bg-green-900/40 text-green-300'
+                        : verdictData.verdict === 'no_go'
+                          ? 'bg-red-900/40 text-red-300'
+                          : 'bg-neutral-700/40 text-neutral-300'
+                    }`}
+                  >
+                    {verdictData.verdict === 'go' ? '✓ GO' : verdictData.verdict === 'no_go' ? '✗ NO-GO' : '◯ INSUFFICIENT DATA'}
+                  </div>
+                </div>
+                <div className="text-xs text-neutral-400 space-y-1">
+                  <p><span className="text-neutral-500">Reason:</span> {verdictData.verdict_reason}</p>
+                  {verdictData.fire_rate_pct != null && (
+                    <p><span className="text-neutral-500">Fire Rate:</span> {verdictData.fire_rate_pct.toFixed(1)}%</p>
+                  )}
+                  <p><span className="text-neutral-500">Evaluations:</span> {verdictData.observe_evaluations} (would have fired: {verdictData.would_have_fired})</p>
+                  <p><span className="text-neutral-500">Window:</span> {verdictData.window_hours} hours</p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {verdictError && (
+            <p className="text-xs text-red-400">Verdict load error: {verdictError}</p>
+          )}
+
           {fetchError && (
             <p className="text-xs text-red-400">{fetchError}</p>
           )}

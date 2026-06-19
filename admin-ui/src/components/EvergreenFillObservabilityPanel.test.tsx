@@ -5,9 +5,11 @@ import { EvergreenFillObservabilityPanel } from './EvergreenFillObservabilityPan
 import { __pollerInternals } from '../hooks/usePoller';
 
 const mockFetchEvergreenFillObservability = vi.fn();
+const mockFetchObserveModeVerdict = vi.fn();
 
 vi.mock('../api', () => ({
   fetchEvergreenFillObservability: (...args: unknown[]) => mockFetchEvergreenFillObservability(...args),
+  fetchObserveModeVerdict: (...args: unknown[]) => mockFetchObserveModeVerdict(...args),
 }));
 
 const OBSERVABILITY_RESPONSE = {
@@ -20,8 +22,42 @@ const OBSERVABILITY_RESPONSE = {
   ],
 };
 
+const VERDICT_RESPONSE_GO = {
+  verdict: 'go' as const,
+  verdict_reason: 'Fire rate 8.5% is below threshold 20.0%',
+  window_hours: 168,
+  observe_evaluations: 47,
+  would_have_fired: 4,
+  fire_rate_pct: 8.5,
+  max_fire_rate_pct: 20.0,
+  min_evaluations: 10,
+};
+
+const VERDICT_RESPONSE_NO_GO = {
+  verdict: 'no_go' as const,
+  verdict_reason: 'Fire rate 25.3% exceeds threshold 20.0%',
+  window_hours: 168,
+  observe_evaluations: 59,
+  would_have_fired: 15,
+  fire_rate_pct: 25.3,
+  max_fire_rate_pct: 20.0,
+  min_evaluations: 10,
+};
+
+const VERDICT_RESPONSE_INSUFFICIENT = {
+  verdict: 'insufficient_data' as const,
+  verdict_reason: 'Only 5 evaluations recorded, need at least 10',
+  window_hours: 168,
+  observe_evaluations: 5,
+  would_have_fired: 0,
+  fire_rate_pct: null,
+  max_fire_rate_pct: 20.0,
+  min_evaluations: 10,
+};
+
 beforeEach(() => {
   mockFetchEvergreenFillObservability.mockResolvedValue(OBSERVABILITY_RESPONSE);
+  mockFetchObserveModeVerdict.mockResolvedValue(VERDICT_RESPONSE_GO);
 });
 
 afterEach(() => {
@@ -83,5 +119,65 @@ describe('EvergreenFillObservabilityPanel', () => {
     });
     render(<EvergreenFillObservabilityPanel />);
     await waitFor(() => expect(screen.getByText('No fill decisions recorded yet.')).toBeInTheDocument());
+  });
+
+  it('renders verdict badge with go state', async () => {
+    render(<EvergreenFillObservabilityPanel />);
+    await waitFor(() => expect(screen.getByText('✓ GO')).toBeInTheDocument());
+    expect(screen.getByText('Observe Mode Verdict')).toBeInTheDocument();
+  });
+
+  it('displays verdict reason', async () => {
+    render(<EvergreenFillObservabilityPanel />);
+    await waitFor(() => expect(screen.getByText('Fire rate 8.5% is below threshold 20.0%')).toBeInTheDocument());
+  });
+
+  it('displays fire rate percentage', async () => {
+    render(<EvergreenFillObservabilityPanel />);
+    await waitFor(() => {
+      const container = screen.getByTestId('evergreen-fill-observability-panel');
+      expect(container.textContent).toMatch(/Fire Rate:\s*8\.5%/);
+    });
+  });
+
+  it('displays evaluation counts', async () => {
+    render(<EvergreenFillObservabilityPanel />);
+    await waitFor(() => {
+      expect(screen.getByText(/Evaluations:/)).toBeInTheDocument();
+      expect(screen.getByText(/would have fired: 4/)).toBeInTheDocument();
+    });
+  });
+
+  it('renders no_go verdict badge', async () => {
+    mockFetchObserveModeVerdict.mockResolvedValue(VERDICT_RESPONSE_NO_GO);
+    render(<EvergreenFillObservabilityPanel />);
+    await waitFor(() => expect(screen.getByText('✗ NO-GO')).toBeInTheDocument());
+  });
+
+  it('renders insufficient_data verdict badge', async () => {
+    mockFetchObserveModeVerdict.mockResolvedValue(VERDICT_RESPONSE_INSUFFICIENT);
+    render(<EvergreenFillObservabilityPanel />);
+    await waitFor(() => expect(screen.getByText('◯ INSUFFICIENT DATA')).toBeInTheDocument());
+    expect(screen.getByText('Only 5 evaluations recorded, need at least 10')).toBeInTheDocument();
+  });
+
+  it('shows null fire_rate as empty', async () => {
+    mockFetchObserveModeVerdict.mockResolvedValue(VERDICT_RESPONSE_INSUFFICIENT);
+    render(<EvergreenFillObservabilityPanel />);
+    await waitFor(() => expect(screen.getByText('◯ INSUFFICIENT DATA')).toBeInTheDocument());
+    expect(screen.queryByText(/Fire Rate/)).not.toBeInTheDocument();
+  });
+
+  it('shows verdict error message on fetch failure', async () => {
+    mockFetchObserveModeVerdict.mockRejectedValue(new Error('Verdict fetch failed'));
+    render(<EvergreenFillObservabilityPanel />);
+    await waitFor(() => expect(screen.getByText(/Verdict load error.*Verdict fetch failed/)).toBeInTheDocument());
+  });
+
+  it('collapses verdict section with rest of panel', async () => {
+    render(<EvergreenFillObservabilityPanel />);
+    await waitFor(() => expect(screen.getByText('Observe Mode Verdict')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('evergreen-fill-observability-panel').querySelector('button')!);
+    expect(screen.queryByText('Observe Mode Verdict')).not.toBeInTheDocument();
   });
 });
