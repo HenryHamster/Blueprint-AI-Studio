@@ -6,7 +6,7 @@
 // for that mapping — TaskCard, ResearchBrowser, and TaskDetailDrawerMeta all
 // consume it so the styling stays in lockstep.
 
-export type VerdictTone = 'positive' | 'blocking' | 'neutral' | 'info';
+type VerdictTone = 'positive' | 'blocking' | 'neutral' | 'info';
 
 // Reuse the EXACT class strings already used by TaskDetailDrawerMeta's
 // EvaluationSummarySection so the styling is byte-for-byte consistent.
@@ -47,7 +47,7 @@ function titleCase(token: string): string {
     .join(' ');
 }
 
-export function verdictTone(verdict: string): VerdictTone {
+function verdictTone(verdict: string): VerdictTone {
   const token = (verdict ?? '').trim().toLowerCase();
   if (POSITIVE_VERDICTS.has(token)) return 'positive';
   if (BLOCKING_VERDICTS.has(token)) return 'blocking';
@@ -64,9 +64,4 @@ export function formatVerdict(verdict: string): { label: string; tone: VerdictTo
   const token = raw.toLowerCase();
   const label = VERDICT_LABELS[token] ?? (raw ? titleCase(raw) : '');
   return { label, tone: verdictTone(raw) };
-}
-
-// Convenience: badge class straight from a verdict token.
-export function verdictBadgeClass(verdict: string): string {
-  return verdictToneBadgeClass(verdictTone(verdict));
 }
