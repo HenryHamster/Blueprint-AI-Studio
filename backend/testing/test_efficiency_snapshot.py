@@ -6661,6 +6661,54 @@ def test_panel_review_effectiveness_escalated_fail_open():
     )
 
 
+def test_panel_review_effectiveness_fail_open_rate():
+    """fail_open_rate = escalated / (total_challenged + escalated).
+
+    Setup:
+      - 3 challenged_confirmed (successful gate invocations)
+      - 2 unchallenged + escalated=True (challenger failed — fail-open)
+
+    Expected:
+      total_challenged = 3
+      challenged_escalated = 2
+      fail_open_rate = 2 / (3 + 2) = 0.4
+      Zero-invocations case (no tasks) returns None for fail_open_rate.
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _task(recon):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    tasks = [
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "unchallenged", "escalated": True}),
+    ]
+
+    result = compute_panel_review_effectiveness(tasks)
+    assert result is not None
+    assert result["total_challenged"] == 3
+    assert result["challenged_escalated"] == 2
+    expected_rate = round(2 / 5, 4)
+    assert result["fail_open_rate"] == expected_rate, (
+        f"expected fail_open_rate={expected_rate}, got {result['fail_open_rate']}"
+    )
+
+    # Zero-invocations: no tasks with gate records returns None
+    assert compute_panel_review_effectiveness([]) is None
+
+
 # ---------------------------------------------------------------------------
 # compute_recommended_challenger_sample_rate
 # ---------------------------------------------------------------------------

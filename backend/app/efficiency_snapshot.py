@@ -2540,6 +2540,7 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
     )
     cost_per_challenge = round(panel_review_llm_cost / total, 4) if total > 0 else None
 
+    total_plus_escalated = total + escalated
     return {
         "challenged_confirmed": confirmed,
         "challenged_revised": revised,
@@ -2548,6 +2549,9 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
         "overturn_rate": round(rejected / total, 4) if total > 0 else None,
         "cost_per_challenge_usd": cost_per_challenge,
         "challenged_escalated": escalated,
+        "fail_open_rate": round(escalated / total_plus_escalated, 4)
+        if total_plus_escalated > 0
+        else None,
     }
 
 
