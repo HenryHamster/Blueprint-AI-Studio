@@ -4707,11 +4707,15 @@ async def agent_heartbeat(
         req.llm_call_count is not None
         or req.total_input_tokens is not None
         or req.total_output_tokens is not None
+        or req.viewport_screenshot_forwarded_count is not None
     ):
         task.api_call_summary = {
             "llm_call_count": int(req.llm_call_count or 0),
             "total_input_tokens": int(req.total_input_tokens or 0),
             "total_output_tokens": int(req.total_output_tokens or 0),
+            "viewport_screenshot_forwarded_count": int(
+                req.viewport_screenshot_forwarded_count or 0
+            ),
             "last_updated_at": _utcnow().isoformat(),
         }
 
@@ -4729,6 +4733,10 @@ async def agent_heartbeat(
         or req.format_repair_successes_by_schema is not None
         or req.format_repair_infra_failures is not None
         or req.format_repair_infra_failures_by_schema is not None
+        or req.format_repair_input_tokens is not None
+        or req.format_repair_output_tokens is not None
+        or req.format_repair_input_tokens_by_schema is not None
+        or req.format_repair_output_tokens_by_schema is not None
     ):
         task.format_compliance_summary = {
             "format_miss_by_reason": {
@@ -4761,6 +4769,20 @@ async def agent_heartbeat(
                 str(schema): int(count)
                 for schema, count in (
                     req.format_repair_infra_failures_by_schema or {}
+                ).items()
+            },
+            "format_repair_input_tokens": int(req.format_repair_input_tokens or 0),
+            "format_repair_output_tokens": int(req.format_repair_output_tokens or 0),
+            "format_repair_input_tokens_by_schema": {
+                str(schema): int(count)
+                for schema, count in (
+                    req.format_repair_input_tokens_by_schema or {}
+                ).items()
+            },
+            "format_repair_output_tokens_by_schema": {
+                str(schema): int(count)
+                for schema, count in (
+                    req.format_repair_output_tokens_by_schema or {}
                 ).items()
             },
             "last_updated_at": _utcnow().isoformat(),

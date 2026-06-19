@@ -419,6 +419,16 @@ class HeartbeatRequest(BaseModel):
     # Backwards-compatible: older agents omit these; treated as 0 / {}.
     format_repair_infra_failures: int | None = Field(None, ge=0)
     format_repair_infra_failures_by_schema: Dict[str, int] | None = None
+    # Token cost of repair re-ask runs. Cumulative input/output tokens consumed
+    # across all reopen calls within this task. Backwards-compatible: older
+    # agents omit these fields; treated as 0 / {}.
+    format_repair_input_tokens: int | None = Field(None, ge=0)
+    format_repair_output_tokens: int | None = Field(None, ge=0)
+    format_repair_input_tokens_by_schema: Dict[str, int] | None = None
+    format_repair_output_tokens_by_schema: Dict[str, int] | None = None
+    # Count of viewport screenshots forwarded into agent prompts this task.
+    # Backwards-compatible: older agents omit this field; treated as 0.
+    viewport_screenshot_forwarded_count: int | None = Field(None, ge=0)
     # Whether the language-aware repo map was non-empty and injected into the
     # agent prompt for this task. Set once on the first heartbeat after the
     # standard handler registers it; used as the receipt/compliance signal

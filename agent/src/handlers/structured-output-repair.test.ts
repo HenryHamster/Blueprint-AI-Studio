@@ -22,6 +22,11 @@ vi.mock('../telemetry.js', async (importOriginal) => {
     recordFormatRepairAttempt: vi.fn(),
     recordFormatRepairSuccess: vi.fn(),
     recordFormatRepairInfraFailure: vi.fn(),
+    recordFormatRepairTokens: vi.fn(),
+    getLlmTelemetry: vi.fn().mockReturnValue({
+      llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
+    }),
   };
 });
 
@@ -30,7 +35,7 @@ import { repairStructuredOutput, type RunResult } from './structured-output-repa
 import { runClaudeCode } from '../index.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
-  recordFormatRepairInfraFailure,
+  recordFormatRepairInfraFailure, recordFormatRepairTokens, getLlmTelemetry,
 } from '../telemetry.js';
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -468,5 +473,28 @@ describe('repairStructuredOutput', () => {
     expect(recordFormatRepairInfraFailure).toHaveBeenCalledTimes(1);
     expect(vi.mocked(recordFormatRepairInfraFailure).mock.calls[0]).toEqual([undefined]);
     expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
+  });
+
+  it('records repair token delta via recordFormatRepairTokens with schemaLabel when the reopen run consumes tokens', async () => {
+    // Simulate getLlmTelemetry returning different snapshots before and after the reopen run.
+    vi.mocked(getLlmTelemetry)
+      .mockReturnValueOnce({ llm_call_count: 3, total_input_tokens: 500, total_output_tokens: 200, viewport_screenshot_forwarded_count: 0 })
+      .mockReturnValueOnce({ llm_call_count: 4, total_input_tokens: 900, total_output_tokens: 450, viewport_screenshot_forwarded_count: 0 });
+
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    await repairStructuredOutput({
+      ...baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json first try', lastResultText: '' })),
+      schemaLabel: 'thinker',
+    });
+
+    // getLlmTelemetry must be called before and after the reopen run.
+    expect(getLlmTelemetry).toHaveBeenCalledTimes(2);
+    // recordFormatRepairTokens must receive the delta (input: 400, output: 250) and schemaLabel.
+    expect(recordFormatRepairTokens).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairTokens).mock.calls[0]).toEqual([400, 250, 'thinker']);
   });
 });

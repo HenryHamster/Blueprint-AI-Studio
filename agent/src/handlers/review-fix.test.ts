@@ -1135,10 +1135,14 @@ describe('handleReview — verdict file parsing', () => {
       format_repair_attempts: 1,
       format_repair_successes: 1,
       format_repair_infra_failures: 0,
+      format_repair_input_tokens: 0,
+      format_repair_output_tokens: 0,
       format_miss_by_schema: { review_verdict: 1 },
       format_repair_attempts_by_schema: { review_verdict: 1 },
       format_repair_successes_by_schema: { review_verdict: 1 },
       format_repair_infra_failures_by_schema: {},
+      format_repair_input_tokens_by_schema: {},
+      format_repair_output_tokens_by_schema: {},
     });
   });
 
@@ -1186,10 +1190,14 @@ describe('handleReview — verdict file parsing', () => {
       format_repair_attempts: 1,
       format_repair_successes: 1,
       format_repair_infra_failures: 0,
+      format_repair_input_tokens: 0,
+      format_repair_output_tokens: 0,
       format_miss_by_schema: { review_verdict: 1 },
       format_repair_attempts_by_schema: { review_verdict: 1 },
       format_repair_successes_by_schema: { review_verdict: 1 },
       format_repair_infra_failures_by_schema: {},
+      format_repair_input_tokens_by_schema: {},
+      format_repair_output_tokens_by_schema: {},
     });
   });
 

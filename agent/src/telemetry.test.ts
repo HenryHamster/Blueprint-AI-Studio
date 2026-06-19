@@ -6,11 +6,13 @@ import {
   getCurrentPromptFingerprint,
   recordLlmCallStart,
   recordLlmTokens,
+  recordViewportScreenshotDownload,
   getLlmTelemetry,
   resetLlmTelemetry,
   recordFormatMiss,
   recordFormatRepairAttempt,
   recordFormatRepairSuccess,
+  recordFormatRepairTokens,
   getFormatComplianceTelemetry,
   resetFormatComplianceTelemetry,
   estimateTokensFromChars,
@@ -62,26 +64,46 @@ describe('setCurrentPromptFingerprint / getCurrentPromptFingerprint', () => {
 
 describe('LLM telemetry', () => {
   it('starts at zero', () => {
-    expect(getLlmTelemetry()).toEqual({ llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0 });
+    expect(getLlmTelemetry()).toEqual({ llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0, viewport_screenshot_forwarded_count: 0 });
   });
   it('accumulates call counts and token totals', () => {
     recordLlmCallStart();
     recordLlmTokens(100, 50);
     recordLlmCallStart();
     recordLlmTokens(200, 75);
-    expect(getLlmTelemetry()).toEqual({ llm_call_count: 2, total_input_tokens: 300, total_output_tokens: 125 });
+    expect(getLlmTelemetry()).toEqual({ llm_call_count: 2, total_input_tokens: 300, total_output_tokens: 125, viewport_screenshot_forwarded_count: 0 });
   });
   it('ignores invalid token values (NaN, negative, Infinity)', () => {
     recordLlmTokens(Number.NaN, 50);   // NaN input ignored, 50 output added
     recordLlmTokens(-5, -10);           // negatives ignored
     recordLlmTokens(100, Number.POSITIVE_INFINITY); // 100 input added, Infinity output ignored
-    expect(getLlmTelemetry()).toEqual({ llm_call_count: 0, total_input_tokens: 100, total_output_tokens: 50 });
+    expect(getLlmTelemetry()).toEqual({ llm_call_count: 0, total_input_tokens: 100, total_output_tokens: 50, viewport_screenshot_forwarded_count: 0 });
   });
   it('resets all counters', () => {
     recordLlmCallStart();
     recordLlmTokens(500, 250);
     resetLlmTelemetry();
-    expect(getLlmTelemetry()).toEqual({ llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0 });
+    expect(getLlmTelemetry()).toEqual({ llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0, viewport_screenshot_forwarded_count: 0 });
+  });
+});
+
+describe('viewport screenshot telemetry', () => {
+  it('starts at zero', () => {
+    expect(getLlmTelemetry().viewport_screenshot_forwarded_count).toBe(0);
+  });
+  it('accumulates across multiple download calls', () => {
+    recordViewportScreenshotDownload(3);
+    recordViewportScreenshotDownload(2);
+    expect(getLlmTelemetry().viewport_screenshot_forwarded_count).toBe(5);
+  });
+  it('ignores zero-count calls', () => {
+    recordViewportScreenshotDownload(0);
+    expect(getLlmTelemetry().viewport_screenshot_forwarded_count).toBe(0);
+  });
+  it('resets with resetLlmTelemetry', () => {
+    recordViewportScreenshotDownload(4);
+    resetLlmTelemetry();
+    expect(getLlmTelemetry().viewport_screenshot_forwarded_count).toBe(0);
   });
 });
 
@@ -93,10 +115,14 @@ describe('format-compliance telemetry', () => {
       format_repair_attempts: 0,
       format_repair_successes: 0,
       format_repair_infra_failures: 0,
+      format_repair_input_tokens: 0,
+      format_repair_output_tokens: 0,
       format_miss_by_schema: {},
       format_repair_attempts_by_schema: {},
       format_repair_successes_by_schema: {},
       format_repair_infra_failures_by_schema: {},
+      format_repair_input_tokens_by_schema: {},
+      format_repair_output_tokens_by_schema: {},
     });
   });
 
@@ -125,10 +151,14 @@ describe('format-compliance telemetry', () => {
       format_repair_attempts: 1,
       format_repair_successes: 1,
       format_repair_infra_failures: 0,
+      format_repair_input_tokens: 0,
+      format_repair_output_tokens: 0,
       format_miss_by_schema: {},
       format_repair_attempts_by_schema: {},
       format_repair_successes_by_schema: {},
       format_repair_infra_failures_by_schema: {},
+      format_repair_input_tokens_by_schema: {},
+      format_repair_output_tokens_by_schema: {},
     });
   });
 
@@ -147,10 +177,14 @@ describe('format-compliance telemetry', () => {
       format_repair_attempts: 0,
       format_repair_successes: 0,
       format_repair_infra_failures: 0,
+      format_repair_input_tokens: 0,
+      format_repair_output_tokens: 0,
       format_miss_by_schema: {},
       format_repair_attempts_by_schema: {},
       format_repair_successes_by_schema: {},
       format_repair_infra_failures_by_schema: {},
+      format_repair_input_tokens_by_schema: {},
+      format_repair_output_tokens_by_schema: {},
     });
   });
 
@@ -165,10 +199,14 @@ describe('format-compliance telemetry', () => {
       format_repair_attempts: 0,
       format_repair_successes: 0,
       format_repair_infra_failures: 0,
+      format_repair_input_tokens: 0,
+      format_repair_output_tokens: 0,
       format_miss_by_schema: {},
       format_repair_attempts_by_schema: {},
       format_repair_successes_by_schema: {},
       format_repair_infra_failures_by_schema: {},
+      format_repair_input_tokens_by_schema: {},
+      format_repair_output_tokens_by_schema: {},
     });
   });
 
@@ -183,10 +221,14 @@ describe('format-compliance telemetry', () => {
       format_repair_attempts: 0,
       format_repair_successes: 0,
       format_repair_infra_failures: 0,
+      format_repair_input_tokens: 0,
+      format_repair_output_tokens: 0,
       format_miss_by_schema: {},
       format_repair_attempts_by_schema: {},
       format_repair_successes_by_schema: {},
       format_repair_infra_failures_by_schema: {},
+      format_repair_input_tokens_by_schema: {},
+      format_repair_output_tokens_by_schema: {},
     });
   });
 });
@@ -248,6 +290,77 @@ describe('format-compliance telemetry — schema dimension', () => {
     (snap.format_miss_by_schema as Record<string, number>)['web_research'] = 999;
 
     expect(getFormatComplianceTelemetry().format_miss_by_schema).toEqual({ web_research: 1 });
+  });
+});
+
+describe('format-compliance telemetry — repair token counters', () => {
+  it('starts at zero for repair token fields', () => {
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_input_tokens).toBe(0);
+    expect(tel.format_repair_output_tokens).toBe(0);
+    expect(tel.format_repair_input_tokens_by_schema).toEqual({});
+    expect(tel.format_repair_output_tokens_by_schema).toEqual({});
+  });
+
+  it('accumulates repair token deltas', () => {
+    recordFormatRepairTokens(1000, 500);
+    recordFormatRepairTokens(2000, 800);
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_input_tokens).toBe(3000);
+    expect(tel.format_repair_output_tokens).toBe(1300);
+  });
+
+  it('floors non-integer token deltas', () => {
+    recordFormatRepairTokens(100.9, 50.7);
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_input_tokens).toBe(100);
+    expect(tel.format_repair_output_tokens).toBe(50);
+  });
+
+  it('ignores non-positive and non-finite deltas', () => {
+    recordFormatRepairTokens(0, 0);
+    recordFormatRepairTokens(-10, -5);
+    recordFormatRepairTokens(Number.NaN, Number.POSITIVE_INFINITY);
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_input_tokens).toBe(0);
+    expect(tel.format_repair_output_tokens).toBe(0);
+  });
+
+  it('buckets repair tokens by schema when schemaLabel is provided', () => {
+    recordFormatRepairTokens(1000, 400, 'memo');
+    recordFormatRepairTokens(500, 200, 'design');
+    recordFormatRepairTokens(300, 100, 'memo');
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_input_tokens).toBe(1800);
+    expect(tel.format_repair_output_tokens).toBe(700);
+    expect(tel.format_repair_input_tokens_by_schema).toEqual({ memo: 1300, design: 500 });
+    expect(tel.format_repair_output_tokens_by_schema).toEqual({ memo: 500, design: 200 });
+  });
+
+  it('calls without schemaLabel do not create per-schema entries', () => {
+    recordFormatRepairTokens(500, 250);
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_input_tokens).toBe(500);
+    expect(tel.format_repair_output_tokens).toBe(250);
+    expect(tel.format_repair_input_tokens_by_schema).toEqual({});
+    expect(tel.format_repair_output_tokens_by_schema).toEqual({});
+  });
+
+  it('reset clears repair token counters and per-schema maps', () => {
+    recordFormatRepairTokens(1000, 500, 'audit');
+    resetFormatComplianceTelemetry();
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_input_tokens).toBe(0);
+    expect(tel.format_repair_output_tokens).toBe(0);
+    expect(tel.format_repair_input_tokens_by_schema).toEqual({});
+    expect(tel.format_repair_output_tokens_by_schema).toEqual({});
+  });
+
+  it('token snapshot is a copy — mutating it does not affect internal state', () => {
+    recordFormatRepairTokens(600, 300, 'thinker');
+    const snap = getFormatComplianceTelemetry();
+    (snap.format_repair_input_tokens_by_schema as Record<string, number>)['thinker'] = 999;
+    expect(getFormatComplianceTelemetry().format_repair_input_tokens_by_schema).toEqual({ thinker: 600 });
   });
 });
 

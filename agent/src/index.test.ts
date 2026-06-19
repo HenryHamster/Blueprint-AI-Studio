@@ -876,6 +876,7 @@ describe('resetPerRoleModuleState (warm-VM isolation)', () => {
       llm_call_count: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
     });
     expect(_getWarmStartForTesting()).toBe(true);
   });
@@ -6535,6 +6536,7 @@ describe('LLM telemetry counters', () => {
       llm_call_count: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
     });
   });
 
@@ -6547,6 +6549,7 @@ describe('LLM telemetry counters', () => {
       llm_call_count: 2,
       total_input_tokens: 300,
       total_output_tokens: 125,
+      viewport_screenshot_forwarded_count: 0,
     });
   });
 
@@ -6558,6 +6561,7 @@ describe('LLM telemetry counters', () => {
       llm_call_count: 0,
       total_input_tokens: 100,
       total_output_tokens: 50,
+      viewport_screenshot_forwarded_count: 0,
     });
   });
 
@@ -6569,6 +6573,7 @@ describe('LLM telemetry counters', () => {
       llm_call_count: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
     });
   });
 });

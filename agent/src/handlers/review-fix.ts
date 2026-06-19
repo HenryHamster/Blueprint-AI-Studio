@@ -64,6 +64,7 @@ export { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajector
 import { detectMigrationConflict, buildMigrationConflictGuidance, extractReservedMigrationRevision } from './review-fix-migration.js';
 import { resolveMigrationLayout } from './specialized.js';
 import { downloadViewportShots } from '../utils/viewport-shot-download.js';
+import { recordViewportScreenshotDownload } from '../telemetry.js';
 export { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
 export type { MigrationConflict } from './review-fix-migration.js';
 
@@ -513,6 +514,7 @@ export async function handleReview(
     });
     if (downloadedShotPaths.length > 0) {
       sendLog(ws, `[VIEWPORT] Downloaded ${downloadedShotPaths.length} screenshot(s) for visual review\n`);
+      recordViewportScreenshotDownload(downloadedShotPaths.length);
     }
   }
 
@@ -899,6 +901,7 @@ export async function handleFix(
     });
     if (downloadedFixShotPaths.length > 0) {
       sendLog(ws, `[VIEWPORT] Downloaded ${downloadedFixShotPaths.length} screenshot(s) for visual context\n`);
+      recordViewportScreenshotDownload(downloadedFixShotPaths.length);
     }
   }
   // Prompt section that points the fix agent at the downloaded PNGs so it can

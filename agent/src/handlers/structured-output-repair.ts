@@ -6,7 +6,7 @@ import {
 } from '../json-extract.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
-  recordFormatRepairInfraFailure,
+  recordFormatRepairInfraFailure, recordFormatRepairTokens, getLlmTelemetry,
   type FormatMissReason, type SchemaLabel,
 } from '../telemetry.js';
 
@@ -207,8 +207,15 @@ export async function repairStructuredOutput<T = unknown>(
     if (retryStatus) statusRef.value = retryStatus;
 
     const missAwarePrompt = buildMissAwarePrompt(firstAttempt.missReason, requiredKeys, reopenPrompt);
+    const tokensBefore = getLlmTelemetry();
     const retryRun = await runClaudeCode(
       missAwarePrompt, ws, statusRef, model, effort, disallowedTools,
+    );
+    const tokensAfter = getLlmTelemetry();
+    recordFormatRepairTokens(
+      tokensAfter.total_input_tokens - tokensBefore.total_input_tokens,
+      tokensAfter.total_output_tokens - tokensBefore.total_output_tokens,
+      schemaLabel,
     );
     retry = {
       exitCode: retryRun.exitCode,
