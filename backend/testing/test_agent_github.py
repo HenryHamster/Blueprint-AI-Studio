@@ -3,10 +3,11 @@
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 from httpx import AsyncClient
 
 from app.main import app
-from app.models import Project, Task
+from app.models import Project, Task, UserIntegration
 from app.routers.agent import verify_agent_token
 
 
@@ -80,3 +81,186 @@ async def test_agent_github_check_runs_uses_shared_verify_agent_token(
         }
     finally:
         app.dependency_overrides.pop(verify_agent_token, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# get_github_token_for_task — non-self project token resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_github_token_app_level_success_non_self_project(db_session, mocker):
+    """App-level installation discovery resolves a token and returns the
+    project's own github_owner/github_repo for a non-self-repo project."""
+    from app.github_token_resolver import get_github_token_for_task, _github_token_cache
+
+    project = Project(
+        name="External Repo Token Test",
+        user_id="test-user-ext",
+        github_owner="external-owner",
+        github_repo="external-repo",
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _github_token_cache.pop(str(project.id), None)
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="app-install-token"),
+    )
+
+    token, owner, repo = await get_github_token_for_task(task.id, db_session)
+
+    assert token == "app-install-token"
+    assert owner == "external-owner"
+    assert repo == "external-repo"
+
+
+@pytest.mark.asyncio
+async def test_get_github_token_falls_back_to_pat_when_app_fails(db_session, mocker):
+    """When App-level discovery raises, get_github_token_for_task falls back to
+    the PAT stored in the user integration record."""
+    from app.github_token_resolver import get_github_token_for_task, _github_token_cache
+
+    project = Project(
+        name="PAT Fallback Project",
+        user_id="test-user-pat",
+        github_owner="pat-owner",
+        github_repo="pat-repo",
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    integration = UserIntegration(
+        user_id="test-user-pat",
+        github_pat="secret-ref/pat-token",
+    )
+    db_session.add(integration)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _github_token_cache.pop(str(project.id), None)
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(side_effect=Exception("App discovery unavailable")),
+    )
+    mocker.patch(
+        "app.github_token_resolver.get_user_secret",
+        new=AsyncMock(return_value="plain-pat-token"),
+    )
+
+    token, owner, repo = await get_github_token_for_task(task.id, db_session)
+
+    assert token == "plain-pat-token"
+    assert owner == "pat-owner"
+    assert repo == "pat-repo"
+
+
+@pytest.mark.asyncio
+async def test_get_github_token_falls_back_to_installation_id_when_app_fails(
+    db_session, mocker
+):
+    """When App-level discovery fails and no PAT is set, the stored
+    installation_id path is used via generate_installation_access_token."""
+    from app.github_token_resolver import get_github_token_for_task, _github_token_cache
+
+    project = Project(
+        name="Installation ID Fallback Project",
+        user_id="test-user-instid",
+        github_owner="instid-owner",
+        github_repo="instid-repo",
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    integration = UserIntegration(
+        user_id="test-user-instid",
+        github_installation_id="inst-456",
+    )
+    db_session.add(integration)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "refactor"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _github_token_cache.pop(str(project.id), None)
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(side_effect=Exception("App discovery unavailable")),
+    )
+    mocker.patch(
+        "app.github_token_resolver.generate_installation_access_token",
+        new=AsyncMock(return_value="instid-access-token"),
+    )
+
+    token, owner, repo = await get_github_token_for_task(task.id, db_session)
+
+    assert token == "instid-access-token"
+    assert owner == "instid-owner"
+    assert repo == "instid-repo"
+
+
+@pytest.mark.asyncio
+async def test_get_github_token_raises_400_when_all_fallbacks_exhausted(
+    db_session, mocker
+):
+    """HTTPException(400) is raised when App-level discovery, installation_id,
+    and PAT fallbacks all fail or are absent."""
+    from app.github_token_resolver import get_github_token_for_task, _github_token_cache
+
+    project = Project(
+        name="No Token Project",
+        user_id="test-user-notoken",
+        github_owner="notoken-owner",
+        github_repo="notoken-repo",
+        is_self_repo=False,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No UserIntegration row at all — neither PAT nor installation_id available.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _github_token_cache.pop(str(project.id), None)
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(side_effect=Exception("App discovery unavailable")),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_github_token_for_task(task.id, db_session)
+
+    assert exc_info.value.status_code == 400

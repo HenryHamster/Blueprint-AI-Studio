@@ -127,6 +127,50 @@ describe('OnboardingProofPanel — viewport regression', () => {
     );
   });
 
+  test('renders elapsed duration badges for completed milestones at 375px without overflow', async () => {
+    await expectNoOverflowAt(375, () =>
+      renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_ALL_DONE }),
+    );
+    // Verify duration badges are present in the rendered output
+    const durationBadges = host!.querySelectorAll('span');
+    const texts = Array.from(durationBadges).map((s) => s.textContent ?? '');
+    const hasDurationBadge = texts.some((t) => t.startsWith('+'));
+    if (!hasDurationBadge) {
+      throw new Error('Expected elapsed duration badges (+Xm/+Xh) but none found');
+    }
+  });
+
+  test('renders DORA headline summary at 1024px without overflow', async () => {
+    await expectNoOverflowAt(1024, () =>
+      renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_ALL_DONE }),
+    );
+    const text = host!.textContent ?? '';
+    if (!text.includes('Time to first improvement')) {
+      throw new Error('Expected DORA headline "Time to first improvement" not found');
+    }
+    if (!text.includes('Time to first merge')) {
+      throw new Error('Expected DORA headline "Time to first merge" not found');
+    }
+  });
+
+  test('duration badges absent when only repo_added_at is set (PROOF_PENDING)', async () => {
+    await renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_PENDING });
+    const spans = host!.querySelectorAll('span');
+    const texts = Array.from(spans).map((s) => s.textContent ?? '');
+    const hasDurationBadge = texts.some((t) => t.startsWith('+'));
+    if (hasDurationBadge) {
+      throw new Error('Duration badges should not appear when milestones are not yet completed');
+    }
+  });
+
+  test('DORA headline absent when PROOF_PENDING (no improvements yet)', async () => {
+    await renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_PENDING });
+    const text = host!.textContent ?? '';
+    if (text.includes('Time to first improvement') || text.includes('Time to first merge')) {
+      throw new Error('DORA headline should not render when milestones are pending');
+    }
+  });
+
   test('returns null when onboarding_proof is absent', async () => {
     host = document.createElement('div');
     document.body.appendChild(host);
