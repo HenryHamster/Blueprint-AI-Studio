@@ -288,6 +288,7 @@ export interface OnboardingProof {
   first_merge_gate_executed_tests?: boolean | null;
   first_merge_gate_unverified_reason?: string | null;
   first_pr_merged_at?: string | null;
+  first_autonomous_improvement_at?: string | null;
 }
 
 export interface Project {

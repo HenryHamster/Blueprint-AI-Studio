@@ -63,6 +63,10 @@ export function OnboardingProofPanel({ project }: Props) {
       label: 'First PR merged',
       timestamp: proof.first_pr_merged_at,
     },
+    {
+      label: 'First autonomous improvement',
+      timestamp: proof.first_autonomous_improvement_at,
+    },
   ];
 
   const repoSlug = `${project.github_owner}/${project.github_repo}`;

@@ -28,6 +28,7 @@ const PROOF_ALL_DONE = {
   first_merge_gate_executed_tests: true,
   first_merge_gate_unverified_reason: null,
   first_pr_merged_at: '2026-06-01T09:50:00Z',
+  first_autonomous_improvement_at: '2026-06-01T10:00:00Z',
 };
 
 const PROOF_PENDING = {
@@ -39,6 +40,7 @@ const PROOF_PENDING = {
   first_merge_gate_executed_tests: null,
   first_merge_gate_unverified_reason: null,
   first_pr_merged_at: null,
+  first_autonomous_improvement_at: null,
 };
 
 describe('OnboardingProofPanel — viewport regression', () => {
@@ -117,6 +119,12 @@ describe('OnboardingProofPanel — viewport regression', () => {
     if (host.firstChild !== null) {
       throw new Error('OnboardingProofPanel rendered content for is_self_repo=true');
     }
+  });
+
+  test('renders first_autonomous_improvement_at milestone at 1024px without overflow', async () => {
+    await expectNoOverflowAt(1024, () =>
+      renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_ALL_DONE }),
+    );
   });
 
   test('returns null when onboarding_proof is absent', async () => {
