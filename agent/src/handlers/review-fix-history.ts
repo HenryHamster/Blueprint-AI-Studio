@@ -3,7 +3,7 @@
 
 import type { ReviewHistoryEntry } from './review-fix-issue-dedup.js';
 
-export type DriftInEntry = {
+type DriftInEntry = {
   file: string;
   first_appeared_iteration?: number;
   flag_count?: number;

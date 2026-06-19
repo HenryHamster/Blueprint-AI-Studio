@@ -7,7 +7,7 @@
 // PR branched, the PR's revision id and down_revision are stale and must be
 // renumbered even if git produced no conflict markers. Pure-function form so
 // it can be unit-tested without touching the filesystem.
-export const ALEMBIC_VERSIONS_DIR = 'backend/alembic/versions/';
+const ALEMBIC_VERSIONS_DIR = 'backend/alembic/versions/';
 export type MigrationConflict = {
   detected: boolean;
   prMigrations: string[];
@@ -40,7 +40,7 @@ export function detectMigrationConflict(
 // A provisional Alembic revision reserved up-front by the orchestrator so
 // migration-producing tasks can be authored in parallel and linearized at merge
 // time, rather than serializing the whole pipeline behind one running migration.
-export type ReservedMigrationRevision = {
+type ReservedMigrationRevision = {
   provisionalRevision: string;
   provisionalDownRevision: string;
 };

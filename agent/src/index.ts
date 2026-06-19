@@ -44,8 +44,7 @@ import {
   staleResultBackoffMs, shouldAbandonStaleResult, markStaleResultFailure,
 } from './utils/stale-result.js';
 import {
-  type DiffLines,
-  jaccardSimilarity, detectLoopDivergence,
+  detectLoopDivergence,
 } from './utils/diff-detection.js';
 import {
   type BuildConfig, type TestRunner,
@@ -2750,9 +2749,7 @@ export {
 };
 
 // ── Divergence detection helpers ─────────────────────────────────────────────
-export type { DivergenceReason } from './utils/diff-detection.js';
-export type { DiffLines };
-export { jaccardSimilarity, detectLoopDivergence };
+export { detectLoopDivergence };
 
 
 // ── Test runner detection (shared by testFixLoop and captureTestBaseline) ───
