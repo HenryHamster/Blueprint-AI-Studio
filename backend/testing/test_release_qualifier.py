@@ -13144,6 +13144,52 @@ async def test_sweep_leaves_deferred_unsynced_when_still_behind(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_redrive_deferred_unsynced_preserves_state_on_transient_sha_error(
+    db_session, mocker
+):
+    """A transient GitHub error during deferred_unsynced re-drive must NOT
+    overwrite last_qualification with the error state.
+
+    Acceptance proof: after the sweep, version.last_qualification["status"] is
+    still "deferred_unsynced" (not "sha_error") and no audit task was created —
+    the version remains eligible for the next sweep's re-drive loop.
+    """
+    from datetime import datetime, timedelta
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    first_deferred = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+    version.last_qualification = {
+        "status": "deferred_unsynced",
+        "candidate_sha": "stale00" * 5 + "00000",
+        "first_deferred_at": first_deferred,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # Simulate a transient GitHub error: get_branch_sha raises, causing
+    # run_qualification to return sha_error without clearing the deferral.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        side_effect=RuntimeError("transient GitHub 503"),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # The sweep does not count a failed re-drive as a finalization.
+    assert count == 0
+    await db_session.refresh(version)
+    # Critical: the deferred_unsynced state must be preserved, not overwritten
+    # with sha_error — otherwise the version falls out of the re-drive loop.
+    assert version.last_qualification["status"] == "deferred_unsynced"
+    assert version.last_qualification["first_deferred_at"] == first_deferred
+    # No audit task should have been spawned.
+    assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
 async def test_redrive_requalifies_resolved_blocker_stale_verdict(db_session, mocker):
     """A stabilize version at a conclusive not_promoted verdict with all gating
     findings ledger-resolved and automain HEAD advanced past the candidate SHA

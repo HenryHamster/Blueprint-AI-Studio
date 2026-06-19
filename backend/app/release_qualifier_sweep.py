@@ -298,8 +298,15 @@ async def _redrive_deferred_unsynced_qualification(
         result = await release_qualifier.run_qualification(
             redrive_session, version.project_id, version
         )
-        await redrive_session.commit()
-        return bool(result) and result.get("status") == "spawned"
+        if result and result.get("status") == "spawned":
+            await redrive_session.commit()
+            return True
+        # run_qualification returned a non-spawned status (sha_error, no_credentials,
+        # still deferred, etc.) — rollback so last_qualification is not overwritten
+        # with an error state that would drop this version from the re-drive loop
+        # (only deferred_unsynced versions are picked up by the next sweep).
+        await redrive_session.rollback()
+        return False
 
 
 async def _redrive_not_promoted_qualification(
