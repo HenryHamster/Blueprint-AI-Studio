@@ -90,8 +90,7 @@ def has_landed_signal(task: Task) -> bool:
     if landed is False:
         return False
     return (
-        ctx.get(LANDED_SIGNAL_KEY) is True
-        and NON_MERGE_UNBLOCK_REASON_KEY not in ctx
+        ctx.get(LANDED_SIGNAL_KEY) is True and NON_MERGE_UNBLOCK_REASON_KEY not in ctx
     )
 
 
@@ -398,6 +397,20 @@ def apply_merged_landed_signal(
         except Exception:  # noqa: BLE001 — observability stamp must never undo a real merge
             logger.warning(
                 "[LANDED] onboarding first-pr-merged stamp failed for task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
+        # Onboarding-proof: record the first autonomous code improvement
+        # (create/fix/refactor) that landed on an external (non-self-repo)
+        # project. Makes the g-generality direction retirement condition
+        # machine-checkable. Same pattern: best-effort, idempotent.
+        try:
+            from app.onboarding_proof import stamp_first_autonomous_improvement
+
+            stamp_first_autonomous_improvement(task, project)
+        except Exception:  # noqa: BLE001 — stamp must never undo a real merge
+            logger.warning(
+                "[LANDED] first-autonomous-improvement stamp failed for task %s",
                 getattr(task, "id", None),
                 exc_info=True,
             )

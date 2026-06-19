@@ -102,3 +102,124 @@ async def test_first_pr_merged_not_stamped_for_non_integration_landing(db_sessio
 
     assert landed is False
     assert (project.build_config or {}).get("first_pr_merged_at") is None
+
+
+# ---------------------------------------------------------------------------
+# stamp_first_autonomous_improvement tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_autonomous_improvement_stamped_for_create_task(db_session):
+    """A create task merging on a non-self-repo project stamps the milestone."""
+    project = Project(name="external project", user_id="test-user", is_self_repo=False)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="create task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    integration = get_project_integration_branch(project)
+    landed = apply_merged_landed_signal(
+        task, project, base_branch=integration, hotfix_lane=False
+    )
+
+    assert landed is True
+    assert (project.build_config or {}).get(
+        "first_autonomous_improvement_at"
+    ) is not None
+
+
+@pytest.mark.asyncio
+async def test_first_autonomous_improvement_not_stamped_for_self_repo(db_session):
+    """Self-repo projects never get the external-improvement milestone."""
+    project = Project(name="self repo", user_id="test-user", is_self_repo=True)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="create task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    integration = get_project_integration_branch(project)
+    apply_merged_landed_signal(
+        task, project, base_branch=integration, hotfix_lane=False
+    )
+
+    assert (project.build_config or {}).get("first_autonomous_improvement_at") is None
+
+
+@pytest.mark.asyncio
+async def test_first_autonomous_improvement_not_stamped_for_migrate_task(db_session):
+    """A migrate task (not in the code-change set) does not stamp the milestone."""
+    project = Project(name="external migrate", user_id="test-user", is_self_repo=False)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="migrate task",
+        payloads=[{"type": "migrate"}],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    integration = get_project_integration_branch(project)
+    apply_merged_landed_signal(
+        task, project, base_branch=integration, hotfix_lane=False
+    )
+
+    assert (project.build_config or {}).get("first_autonomous_improvement_at") is None
+
+
+@pytest.mark.asyncio
+async def test_first_autonomous_improvement_stamp_is_idempotent(db_session):
+    """A second landing never overwrites the first autonomous-improvement timestamp."""
+    project = Project(
+        name="external idempotent", user_id="test-user", is_self_repo=False
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="fix task",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    integration = get_project_integration_branch(project)
+    apply_merged_landed_signal(
+        task, project, base_branch=integration, hotfix_lane=False
+    )
+    first_value = (project.build_config or {}).get("first_autonomous_improvement_at")
+    assert first_value is not None
+
+    apply_merged_landed_signal(
+        task, project, base_branch=integration, hotfix_lane=False
+    )
+    assert (project.build_config or {}).get(
+        "first_autonomous_improvement_at"
+    ) == first_value
