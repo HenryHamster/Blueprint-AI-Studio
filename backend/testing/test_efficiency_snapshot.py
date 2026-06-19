@@ -25,6 +25,7 @@ from app.efficiency_snapshot import (
     LLM_TOKEN_PRICING,
     METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
+    SELF_REPAIR_BURN_SHARE_KEY,
     SELF_REPAIR_MIN_ATTEMPTS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
     _compute_checkpoint_loss_rate,
@@ -4256,6 +4257,60 @@ def test_llm_cost_breakdown_by_task_type_merge_credited_once():
     assert fix_row["total_cost_usd"] == expected_cost
 
 
+def test_compute_llm_cost_by_task_type():
+    """mean_input_tokens_per_call = total_input_tokens / llm_call_count; None when
+    call count is zero; computed correctly under a real merge-test verdict."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # Merged task: 2000 input tokens over 8 calls -> mean = 250
+    merged_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 800,
+            "llm_call_count": 8,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    # Task with no llm_call_count -> mean should be None
+    no_calls_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "review"}],
+        api_call_summary={
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "llm_call_count": 0,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([merged_task, no_calls_task])
+    by_type = {r["task_type"]: r for r in rows}
+
+    create_row = by_type["create"]
+    assert create_row["llm_call_count"] == 8
+    assert create_row["total_input_tokens"] == 2000
+    assert create_row["mean_input_tokens_per_call"] == 250  # 2000 / 8
+
+    review_row = by_type["review"]
+    assert review_row["llm_call_count"] == 0
+    assert review_row["mean_input_tokens_per_call"] is None
+
+    # Verify merged task is counted correctly
+    assert create_row["merged_count"] == 1
+    assert create_row["verified_merged_count"] == 1
+
+
 @pytest.mark.asyncio
 async def test_llm_cost_breakdown_endpoint_includes_by_task_type(
     client: AsyncClient, db_session
@@ -6810,3 +6865,122 @@ def test_recommended_sample_rate_at_threshold_boundary():
     result = compute_recommended_challenger_sample_rate(eff)
     assert result["status"] == "gate_earning"
     assert result["recommended_sample_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_in_snapshot(db_session):
+    """write_snapshot includes self_repair_burn_share in llm_cost_attribution.
+
+    self_repair_burn_share = repair_attempts / total_llm_call_count.
+    Tasks with format_compliance_summary carrying repair_attempts contribute
+    to the numerator; api_call_summary.llm_call_count contributes to the denominator.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with 10 LLM calls and 2 repair attempts.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 1}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 1000,
+            "llm_call_count": 10,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 2,
+            "format_repair_attempts": 2,
+            "format_repair_successes": 1,
+            "format_repair_infra_failures": 0,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    attr = snap.get("llm_cost_attribution")
+    assert attr is not None, "llm_cost_attribution must be present"
+    assert SELF_REPAIR_BURN_SHARE_KEY in attr, "self_repair_burn_share must be present"
+    # 2 repair attempts / 10 total LLM calls = 0.2
+    assert attr[SELF_REPAIR_BURN_SHARE_KEY] == pytest.approx(0.2, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_none_when_no_llm_calls(db_session):
+    """self_repair_burn_share is None when total_llm_call_count is zero."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with no api_call_summary (no LLM calls recorded).
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 2}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    attr = snap.get("llm_cost_attribution")
+    assert attr is not None
+    assert attr[SELF_REPAIR_BURN_SHARE_KEY] is None
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_in_llm_cost_attribution_trend(db_session):
+    """read_baseline_with_drift includes self_repair_burn_share in each trend entry."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 3}],
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 1500,
+            "llm_call_count": 20,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 1,
+            "format_repair_attempts": 4,
+            "format_repair_successes": 3,
+            "format_repair_infra_failures": 0,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    trend = drift.get("llm_cost_attribution_trend")
+    assert isinstance(trend, list)
+    assert len(trend) >= 1
+    for entry in trend:
+        assert SELF_REPAIR_BURN_SHARE_KEY in entry, (
+            "each trend entry must carry self_repair_burn_share"
+        )
+    # 4 repair attempts / 20 LLM calls = 0.2
+    assert trend[-1][SELF_REPAIR_BURN_SHARE_KEY] == pytest.approx(0.2, abs=1e-6)

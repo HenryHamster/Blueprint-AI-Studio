@@ -99,6 +99,7 @@ AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
 FORMAT_COMPLIANCE_KEY = "format_compliance"
 FORMAT_COMPLIANCE_RATE_KEY = "format_compliance_rate"
 SELF_REPAIR_SUCCESS_RATE_KEY = "self_repair_success_rate"
+SELF_REPAIR_BURN_SHARE_KEY = "self_repair_burn_share"
 # Minimum repair_attempts in the current snapshot window before self_repair_success_rate
 # drift is meaningful. Below this threshold the ratio is too noisy (rare-event denominator)
 # and drift_pct is suppressed to None to avoid phantom regression signals.
@@ -170,7 +171,7 @@ NESTED_METRIC_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)",
     },
     "llm_cost_attribution": {
-        "ground_truth": "Task.llm_*_tokens_banked + api_call_summary tokens priced via LLM_TOKEN_PRICING",
+        "ground_truth": "Task.llm_*_tokens_banked + api_call_summary tokens priced via LLM_TOKEN_PRICING; self_repair_burn_share from Task.format_compliance_summary.format_repair_attempts",
         "consumer": "read_baseline_with_drift -> llm_cost_attribution (strategic_spawning digest payload)",
     },
     "panel_review_effectiveness": {
@@ -278,7 +279,10 @@ _SNAPSHOT_HISTORY_MAX = 365
 # v8: per-driver LLM cost attribution block (by_model, by_task_type, rework_share,
 #     total_llm_usd) folded into the daily snapshot for retroactive decomposition
 #     of llm_cost_per_merged_pr drift.
-METRIC_DEF_VERSION = "v8"
+# v9: self_repair_burn_share added to llm_cost_attribution — fraction of total LLM
+#     calls that are self-repair reopen attempts, quantifying repair overhead as a
+#     cost driver alongside rework_share.
+METRIC_DEF_VERSION = "v9"
 
 
 async def _load_recent_tasks(
@@ -1793,6 +1797,11 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
                 b["cost_usd"], b["verified_merged_count"]
             ),
             "share_of_total_cost": _share(b["cost_usd"]),
+            "mean_input_tokens_per_call": (
+                round(b["input_tokens"] / b["llm_call_count"])
+                if b["llm_call_count"] > 0
+                else None
+            ),
         }
         for task_type, b in sorted(
             buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
@@ -2448,10 +2457,17 @@ def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
     per-(provider,model) cost, per-task-type cost, and the first-pass/rework
     split.  Priced rows only in by_model so zero-cost unpriced combos don't
     inflate the block; unpriced_coverage carries the honesty signal.
+
+    Also computes self_repair_burn_share: the fraction of total LLM calls that
+    are self-repair reopen attempts (repair_attempts / total_llm_call_count).
+    None when total_llm_call_count is zero.
     """
+    from app.digest_metrics import _accumulate_format_compliance  # noqa: PLC0415
+
     breakdown = compute_llm_cost_breakdown(tasks)
     by_type_rows = compute_llm_cost_by_task_type(tasks)
     rework = compute_pr_rework_chain_breakdown(tasks)
+    fc = _accumulate_format_compliance(tasks)
 
     total_usd = round(breakdown["totals"]["total_cost_usd"], 6)
     by_model = [
@@ -2468,12 +2484,18 @@ def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
         for r in by_type_rows
         if r["total_cost_usd"] > 0
     ]
+    total_llm_calls = sum(r["llm_call_count"] for r in breakdown["by_provider"])
+    repair_attempts = fc.get("repair_attempts") or 0
+    self_repair_burn_share: float | None = (
+        round(repair_attempts / total_llm_calls, 4) if total_llm_calls > 0 else None
+    )
     return {
         "by_model": by_model,
         "by_task_type": by_task_type,
         "rework_share": rework.get("rework_share_of_total_llm_cost"),
         "total_llm_usd": total_usd,
         "unpriced_coverage": breakdown["totals"].get("unpriced_coverage_fraction"),
+        SELF_REPAIR_BURN_SHARE_KEY: self_repair_burn_share,
     }
 
 
@@ -3064,6 +3086,9 @@ async def read_baseline_with_drift(
             ),
             "total_llm_usd": (snap.get("llm_cost_attribution") or {}).get(
                 "total_llm_usd"
+            ),
+            SELF_REPAIR_BURN_SHARE_KEY: (snap.get("llm_cost_attribution") or {}).get(
+                SELF_REPAIR_BURN_SHARE_KEY
             ),
         }
         for snap in snapshots
