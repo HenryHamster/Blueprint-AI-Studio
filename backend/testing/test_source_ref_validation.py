@@ -2,7 +2,6 @@
 
 Covers the generalized helpers extracted so design-doc system verification and
 playbook stale-ref flagging share one partition path:
-- ``partition_missing`` — pure sync partitioner over an arbitrary predicate.
 - ``classify_existing_paths`` — async git-HEAD-backed classifier.
 """
 
@@ -15,7 +14,6 @@ from app.source_ref_validation import (
     classify_existing_paths,
     classify_paths_tristate,
     detect_absent_symbols,
-    partition_missing,
     summarize_ungrounded_claims,
     validate_source_refs,
 )
@@ -30,42 +28,6 @@ def _patch_snapshot(mocker, paths=None, truncated=False):
 
 async def _branch_exists(path):
     return await _file_exists_in_repo_branch(path, **_BRANCH_KW)
-
-
-# ── partition_missing (pure) ──────────────────────────────────────────────────
-
-
-def test_partition_missing_all_present():
-    present, missing = partition_missing(
-        ["a.py", "b.py"], lambda p: True
-    )
-    assert present == ["a.py", "b.py"]
-    assert missing == []
-
-
-def test_partition_missing_all_absent():
-    present, missing = partition_missing(
-        ["a.py", "b.py"], lambda p: False
-    )
-    assert present == []
-    assert missing == ["a.py", "b.py"]
-
-
-def test_partition_missing_mixed_preserves_order():
-    existing = {"a.py", "c.py"}
-    present, missing = partition_missing(
-        ["a.py", "b.py", "c.py", "d.py"], lambda p: p in existing
-    )
-    assert present == ["a.py", "c.py"]
-    assert missing == ["b.py", "d.py"]
-
-
-def test_partition_missing_non_string_treated_as_missing():
-    present, missing = partition_missing(
-        ["a.py", None, 42], lambda p: True
-    )
-    assert present == ["a.py"]
-    assert missing == [None, 42]
 
 
 # ── classify_existing_paths (async, git-backed via _file_exists_at_head) ──────
