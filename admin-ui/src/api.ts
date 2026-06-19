@@ -478,12 +478,6 @@ export async function fetchTaskSerialConsole(taskId: string): Promise<import('./
   return res.json();
 }
 
-export async function fetchAutonomyDebug(projectId: string): Promise<unknown> {
-  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/autonomy-debug`);
-  if (!res.ok) throw new Error(`Failed to fetch autonomy debug: ${res.status}`);
-  return res.json();
-}
-
 export interface RetirementCritique {
   direction_id: string | null;
   what_it_addressed: string;
@@ -1047,39 +1041,6 @@ export async function fetchSrCatchRateHealth(projectId: string): Promise<SrCatch
   return res.json();
 }
 
-export interface SrRecentMiss {
-  task_id: string;
-  title: string;
-  scope: string | null;
-  task_type: string | null;
-  created_at?: string | null;
-  missed_categories: string[];
-  caught_categories: string[];
-  pr_url: string | null;
-  sr_check_results?: Record<string, { passed: boolean; issue?: string | null; origin?: string | null }>;
-  reviewer_findings?: Array<{ category: string; severity?: string | null; description: string }>;
-}
-
-export interface SrRecentMissesResponse {
-  misses: SrRecentMiss[];
-  total: number;
-}
-
-export async function fetchSrRecentMisses(
-  projectId: string,
-  params?: { limit?: number; category?: string; days?: number },
-): Promise<SrRecentMissesResponse> {
-  const searchParams = new URLSearchParams();
-  if (params?.limit !== undefined) searchParams.set('limit', String(params.limit));
-  if (params?.category) searchParams.set('category', params.category);
-  if (params?.days !== undefined) searchParams.set('days', String(params.days));
-  const query = searchParams.toString();
-  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/sr-recent-misses${query ? `?${query}` : ''}`;
-  const res = await apiFetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch SR recent misses: ${res.status}`);
-  return res.json();
-}
-
 export interface SrUnhandledEdge {
   case: string;
   handled: boolean;
@@ -1202,36 +1163,6 @@ export async function fetchEvictedFindings(
   return res.json();
 }
 
-export interface SrAlertDrilldownRow {
-  task_id: string;
-  title: string;
-  missed_categories: string[];
-  sr_verdict: string | null;
-  pr_url?: string | null;
-}
-
-export interface SrAlertDrilldownResponse {
-  items: SrAlertDrilldownRow[];
-  total: number;
-  alert_type: string;
-  categories: string[];
-}
-
-export async function fetchSrAlertDrilldown(
-  projectId: string,
-  categories: string[],
-  alertType: 'trends' | 'floor' = 'trends',
-  pageSize = 50,
-): Promise<SrAlertDrilldownResponse> {
-  const params = new URLSearchParams({ alert_type: alertType, page_size: String(pageSize) });
-  categories.forEach(c => params.append('categories', c));
-  const res = await apiFetch(
-    `/api/admin/projects/${encodeURIComponent(projectId)}/sr-alert-drilldown?${params}`,
-  );
-  if (!res.ok) throw new Error(`Failed to fetch SR alert drilldown: ${res.status}`);
-  return res.json();
-}
-
 export interface SrCategoryTrend {
   current_hit_rate?: number | null;
   previous_hit_rate?: number | null;
@@ -1334,21 +1265,6 @@ export interface PromptFingerprintAnalyticsResponse {
   project_first_attempt_success_rate: number | null;
   project_sr_skip_rate: number | null;
   fingerprints: PromptFingerprintEntry[];
-}
-
-export async function fetchPromptFingerprintAnalytics(
-  projectId: string,
-  params?: { days?: number; min_sample_size?: number; top_n?: number },
-): Promise<PromptFingerprintAnalyticsResponse> {
-  const searchParams = new URLSearchParams();
-  if (params?.days !== undefined) searchParams.set('days', String(params.days));
-  if (params?.min_sample_size !== undefined) searchParams.set('min_sample_size', String(params.min_sample_size));
-  if (params?.top_n !== undefined) searchParams.set('top_n', String(params.top_n));
-  const query = searchParams.toString();
-  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/prompt-fingerprint-analytics${query ? `?${query}` : ''}`;
-  const res = await apiFetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch prompt fingerprint analytics: ${res.status}`);
-  return res.json();
 }
 
 export async function onboardProject(
@@ -2478,38 +2394,6 @@ export interface ChallengeSummary {
   reason: string;
 }
 
-export interface ProjectFinding {
-  task_id: string;
-  direction_id: string | null;
-  completed_at: string | null;
-  finding_index: number;
-  finding_title: string;
-  finding_description: string;
-  actionability_grade: 'HIGH' | 'MEDIUM' | 'LOW';
-  claims: string[];
-  sources: Array<{ ref: string; type?: string | null; excerpt?: string | null }>;
-  challenge_summary?: ChallengeSummary | null;
-}
-
-export interface ProjectFindingsResponse {
-  findings: ProjectFinding[];
-  count: number;
-}
-
-export async function fetchProjectFindings(
-  projectId: string,
-  params?: { directionId?: string; limit?: number; days?: number },
-): Promise<ProjectFindingsResponse> {
-  const searchParams = new URLSearchParams();
-  if (params?.directionId) searchParams.set('direction_id', params.directionId);
-  if (params?.limit !== undefined) searchParams.set('limit', String(params.limit));
-  if (params?.days !== undefined) searchParams.set('days', String(params.days));
-  const query = searchParams.toString();
-  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/findings${query ? `?${query}` : ''}`);
-  if (!res.ok) throw new Error(`Failed to fetch project findings: ${res.status}`);
-  return res.json();
-}
-
 export interface StagingBranchPrefixesResponse {
   project_id: string;
   staging_branch_prefixes: string[];
@@ -3415,18 +3299,6 @@ export async function fetchLaneBaselines(
     signal,
   );
   if (!res.ok) throw new Error(`Failed to fetch lane baselines: ${res.status}`);
-  return res.json();
-}
-
-export async function fetchLaneDiag(
-  projectId?: string,
-  signal?: AbortSignal,
-): Promise<LaneDiagResponse> {
-  const params = new URLSearchParams();
-  if (projectId) params.set('project_id', projectId);
-  const query = params.toString() ? `?${params.toString()}` : '';
-  const res = await apiFetch(`/api/admin/lane-diag${query}`, undefined, 2, 30000, signal);
-  if (!res.ok) throw new Error(`Failed to fetch lane diagnostics: ${res.status}`);
   return res.json();
 }
 

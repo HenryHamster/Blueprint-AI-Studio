@@ -130,13 +130,6 @@ export function deployWindowStatus(deadline: string | number): { overdue: boolea
   };
 }
 
-/** "10m 30s" since signal first crossed threshold to case opening. */
-export function formatTimeToDetect(firstSeenAt: string | null, signalFirstCrossedAt?: string | null): string {
-  if (!firstSeenAt || !signalFirstCrossedAt) return 'unknown';
-  const seconds = (parseTimestamp(firstSeenAt).getTime() - parseTimestamp(signalFirstCrossedAt).getTime()) / 1000;
-  return formatDurationSec(Math.max(0, seconds));
-}
-
 /**
  * Detect whether an onboarding journey frontier has stalled.
  *

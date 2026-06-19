@@ -26,8 +26,7 @@ export interface SrMissedTask {
   reviewer_findings?: SrReviewerFinding[];
 }
 
-// eslint-disable-next-line react-refresh/only-export-components -- shared non-component constants for retrospective panels
-export const RETROSPECTIVE_DAY_OPTIONS = [7, 14, 30, 90] as const;
+const RETROSPECTIVE_DAY_OPTIONS = [7, 14, 30, 90] as const;
 
 export { SR_CANONICAL_CATEGORIES } from './srTrendBreakdown/types';
 export { SrCatchRateFreshnessPill } from './srTrendBreakdown/primitives';
