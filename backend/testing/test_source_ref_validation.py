@@ -18,7 +18,12 @@ from app.source_ref_validation import (
     validate_source_refs,
 )
 
-_BRANCH_KW = {"token": "ghs_test", "owner": "acme", "repo": "widget", "branch": "automain"}
+_BRANCH_KW = {
+    "token": "ghs_test",
+    "owner": "acme",
+    "repo": "widget",
+    "branch": "automain",
+}
 _SNAPSHOT_PATH = "app.github_repo_snapshot._get_snapshot"
 
 
@@ -172,21 +177,21 @@ async def test_classify_paths_tristate_glob_not_in_missing_bucket_without_snapsh
 @pytest.mark.asyncio
 async def test_summarize_ungrounded_claims_all_grounded(mocker):
     """A claim with symbols that ARE defined returns None (no ungrounded refs)."""
+
     async def _symbol_defined(path, symbol):
         return True
 
     mocker.patch(
         "app.source_ref_validation._symbol_defined_at_head", side_effect=_symbol_defined
     )
-    result = await summarize_ungrounded_claims(
-        ["backend/app/x.py:my_func stores Y"]
-    )
+    result = await summarize_ungrounded_claims(["backend/app/x.py:my_func stores Y"])
     assert result is None
 
 
 @pytest.mark.asyncio
 async def test_summarize_ungrounded_claims_single_absent_symbol(mocker):
     """A claim with a symbol NOT defined is flagged and counted."""
+
     async def _symbol_defined(path, symbol):
         return False
 
@@ -222,6 +227,7 @@ async def test_summarize_ungrounded_claims_multiple_refs_in_one_claim(mocker):
 @pytest.mark.asyncio
 async def test_summarize_ungrounded_claims_deduplicates_refs_across_claims(mocker):
     """Same ungrounded ref in multiple claims is deduplicated in ungrounded_refs."""
+
     async def _symbol_defined(path, symbol):
         return symbol != "bug_func"
 
@@ -242,6 +248,7 @@ async def test_summarize_ungrounded_claims_deduplicates_refs_across_claims(mocke
 @pytest.mark.asyncio
 async def test_summarize_ungrounded_claims_mixed_grounded_ungrounded(mocker):
     """Mix of grounded and ungrounded claims counts only ungrounded ones."""
+
     async def _symbol_defined(path, symbol):
         return symbol in {"good_func", "another_good"}
 
@@ -263,6 +270,7 @@ async def test_summarize_ungrounded_claims_mixed_grounded_ungrounded(mocker):
 @pytest.mark.asyncio
 async def test_summarize_ungrounded_claims_indeterminate_git_not_flagged(mocker):
     """When git is unavailable (None result), refs are NOT flagged (fail-open)."""
+
     async def _symbol_defined(path, symbol):
         return None
 
@@ -289,15 +297,14 @@ async def test_summarize_ungrounded_claims_no_refs_returns_none(mocker):
 async def test_summarize_ungrounded_claims_line_number_not_symbol(mocker):
     """Line-number refs like file.py:42 are not treated as symbols."""
     mocker.patch("app.source_ref_validation._symbol_defined_at_head")
-    result = await summarize_ungrounded_claims(
-        ["See backend/app/x.py:42 for details"]
-    )
+    result = await summarize_ungrounded_claims(["See backend/app/x.py:42 for details"])
     assert result is None
 
 
 @pytest.mark.asyncio
 async def test_summarize_ungrounded_claims_with_sources_excerpt(mocker):
     """Sources with file-type and excerpt/quote are checked but don't count claims."""
+
     async def _symbol_defined(path, symbol):
         return symbol != "bad_symbol"
 
@@ -322,6 +329,7 @@ async def test_summarize_ungrounded_claims_with_sources_excerpt(mocker):
 @pytest.mark.asyncio
 async def test_summarize_ungrounded_claims_non_file_sources_ignored(mocker):
     """Non-file sources (PR, message) don't count as claims even if ungrounded."""
+
     async def _symbol_defined(path, symbol):
         return True
 
@@ -452,9 +460,7 @@ async def test_reconcile_presence_local_indeterminate_unchanged(mocker, tmp_path
     async def _head(path, repo_root=None):
         return None
 
-    mocker.patch(
-        "app.source_ref_validation._path_exists_at_head", side_effect=_head
-    )
+    mocker.patch("app.source_ref_validation._path_exists_at_head", side_effect=_head)
     value = {"status": "mature", "modules": ["backend/app/gone.py"]}
     result = await reconcile_design_doc_presence(
         value, "systems/auth", repo_root=str(tmp_path)
@@ -510,64 +516,13 @@ async def test_reconcile_presence_backward_compat_two_arg_downgrades(mocker, tmp
     async def _head(path, repo_root=None):
         return False
 
-    mocker.patch(
-        "app.source_ref_validation._path_exists_at_head", side_effect=_head
-    )
+    mocker.patch("app.source_ref_validation._path_exists_at_head", side_effect=_head)
     value = {"status": "mature", "modules": ["backend/app/gone.py"]}
     result = await reconcile_design_doc_presence(
         value, "systems/auth", repo_root=str(tmp_path)
     )
     assert result["status"] == "missing"
     assert "presence_warning" in result
-
-
-# ── reconcile_design_doc (doc-level walker) ───────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_reconcile_design_doc_walks_keys_and_skips_others(mocker):
-    """reconcile_design_doc downgrades all-absent systems/capabilities and leaves
-    non-system/capability keys (and partial hits) untouched."""
-    from app.source_ref_validation import reconcile_design_doc
-
-    async def _in_branch(path, **kwargs):
-        return path == "backend/app/real.py"
-
-    mocker.patch(
-        "app.source_ref_validation._file_exists_in_repo_branch", side_effect=_in_branch
-    )
-    doc = {
-        "systems/gone": {"status": "mature", "modules": ["backend/app/gone.py"]},
-        "capabilities/kept": {
-            "status": "working",
-            "notes": "backend/app/real.py exists",
-        },
-        "playbook/tip": {"status": "mature", "modules": ["backend/app/gone.py"]},
-        "summary": "free text, not a record",
-    }
-    result = await reconcile_design_doc(
-        doc,
-        token="ghs_tok",
-        owner="acme",
-        repo="widget",
-        branch="automain",
-    )
-    assert result["systems/gone"]["status"] == "missing"
-    assert result["capabilities/kept"]["status"] == "working"
-    # Non system/capability keys are passed through verbatim.
-    assert result["playbook/tip"]["status"] == "mature"
-    assert "presence_warning" not in result["playbook/tip"]
-    assert result["summary"] == "free text, not a record"
-    # Input is not mutated.
-    assert doc["systems/gone"]["status"] == "mature"
-
-
-@pytest.mark.asyncio
-async def test_reconcile_design_doc_non_dict_passthrough():
-    from app.source_ref_validation import reconcile_design_doc
-
-    assert await reconcile_design_doc(None) is None
-    assert await reconcile_design_doc(["x"]) == ["x"]
 
 
 # ── resolve_branch_verification_context ───────────────────────────────────────
@@ -825,9 +780,7 @@ async def test_validate_source_refs_local_fallback_absent_flags_invalid(mocker):
     async def _exists(path, *, cwd=None):
         return False
 
-    mocker.patch(
-        "app.source_ref_validation._file_exists_at_head", side_effect=_exists
-    )
+    mocker.patch("app.source_ref_validation._file_exists_at_head", side_effect=_exists)
     repo = mocker.patch(
         "app.source_ref_validation._file_content_in_repo_branch",
         side_effect=AssertionError("repo-branch path should not be used"),
@@ -847,9 +800,7 @@ async def test_validate_source_refs_local_indeterminate_never_invalid(mocker):
     async def _exists(path, *, cwd=None):
         return None
 
-    mocker.patch(
-        "app.source_ref_validation._file_exists_at_head", side_effect=_exists
-    )
+    mocker.patch("app.source_ref_validation._file_exists_at_head", side_effect=_exists)
     result = await validate_source_refs(
         [{"type": "file", "ref": "backend/app/x.py:999"}]
     )
@@ -1002,7 +953,13 @@ async def test_symbol_defined_in_repo_branch_api_error_indeterminate(mocker):
 
 # ── summarize_bug_report_citations (free-text bug-report grounding) ────────────
 
-_CITE_CREDS = {"token": "t", "owner": "o", "repo": "r", "branch": "main", "project_id": "p"}
+_CITE_CREDS = {
+    "token": "t",
+    "owner": "o",
+    "repo": "r",
+    "branch": "main",
+    "project_id": "p",
+}
 
 
 @pytest.mark.asyncio
@@ -1199,9 +1156,9 @@ async def test_bug_report_citations_partial_file_grounding_is_present(mocker):
     mocker.patch(
         "app.source_ref_validation._file_content_in_repo_branch",
         new=AsyncMock(
-            side_effect=lambda path, **kw: (True, 500)
-            if "alive" in path
-            else (False, None)
+            side_effect=lambda path, **kw: (
+                (True, 500) if "alive" in path else (False, None)
+            )
         ),
     )
     signal = await summarize_bug_report_citations(

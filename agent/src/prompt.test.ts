@@ -4267,8 +4267,8 @@ describe('cross-cutting guidance-block fingerprints — structural invariants fo
 // create/fix/docs/deps focus blocks were added. If this test fails, bump the
 // version in prompt.ts and reset this assertion to the new value.
 describe('SELF_REVIEW_PROMPT_VERSION — regime version lock', () => {
-  it('is "7" (current pinned version)', () => {
-    expect(SELF_REVIEW_PROMPT_VERSION).toBe('7');
+  it('is "8" (current pinned version)', () => {
+    expect(SELF_REVIEW_PROMPT_VERSION).toBe('8');
   });
 
   it('is a non-empty string (used as prompt_version field in self-review JSON)', () => {
@@ -4354,27 +4354,30 @@ describe('buildViewportScreenshotSection — downloaded PNG wiring', () => {
 
 // ── assembleFailureGuidanceBlocks — structural invariants ─────────────────────
 // code-change handlers (standard.ts, review-fix.ts, specialized.ts) delegate to
-// assembleFailureGuidanceBlocks() for the four cross-cutting failure-guidance
+// assembleFailureGuidanceBlocks() for the five cross-cutting failure-guidance
 // blocks. Pins block inclusion and canonical order so a dropped block or
 // reordering is caught at change-time.
 describe('assembleFailureGuidanceBlocks — structural invariants', () => {
-  it('includes all 4 required failure-guidance blocks', () => {
+  it('includes all 5 required failure-guidance blocks', () => {
     const blocks = assembleFailureGuidanceBlocks();
     expect(blocks).toContain('Read The Failure Message Literally');    // READ_THE_FAILURE_MESSAGE
     expect(blocks).toContain('Size Guardrails Are Advisory');          // SIZE_GUARDRAIL_GUIDANCE
     expect(blocks).toContain("If You're Retrying");                    // PRIOR_ATTEMPT_DIVERGENCE
     expect(blocks).toContain('When You Find Bigger Problems Than Your Task'); // BEYOND_SCOPE_REPORTING
+    expect(blocks).toContain('Edges-Considered Field in Self-Review'); // EDGES_CONSIDERED_GUIDANCE
   });
 
-  it('assembles blocks in canonical order (READ > SIZE > PRIOR > BEYOND)', () => {
+  it('assembles blocks in canonical order (READ > SIZE > PRIOR > BEYOND > EDGES)', () => {
     const blocks = assembleFailureGuidanceBlocks();
     const rfmIdx = blocks.indexOf('Read The Failure Message Literally');
     const sgIdx  = blocks.indexOf('Size Guardrails Are Advisory');
     const padIdx = blocks.indexOf("If You're Retrying");
     const bsrIdx = blocks.indexOf('When You Find Bigger Problems Than Your Task');
+    const ecIdx  = blocks.indexOf('Edges-Considered Field in Self-Review');
     expect(rfmIdx).toBeLessThan(sgIdx);
     expect(sgIdx).toBeLessThan(padIdx);
     expect(padIdx).toBeLessThan(bsrIdx);
+    expect(bsrIdx).toBeLessThan(ecIdx);
   });
 });
 

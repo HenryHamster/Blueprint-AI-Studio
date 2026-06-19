@@ -553,7 +553,7 @@ Guidelines:
 // Centralized so block order, inclusion, and future additions only need
 // to change in one place.
 export function assembleFailureGuidanceBlocks(): string {
-  return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING;
+  return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING + EDGES_CONSIDERED_GUIDANCE;
 }
 
 // Compute a stable 12-hex-char fingerprint of the static prompt guidance for
@@ -1000,7 +1000,7 @@ export function formatPlaybook(
 // across the agent → backend (schemas.SelfReviewOutcome) → frontend
 // (SrTrendData.prompt_version) chain is consistent and string-safe
 // for frontend operations like `.slice(...)`.
-export const SELF_REVIEW_PROMPT_VERSION = "7";
+export const SELF_REVIEW_PROMPT_VERSION = "8";
 
 // Human-readable examples of disallowed blind_spot entries — mirrored in
 // backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES for contract-test parity.

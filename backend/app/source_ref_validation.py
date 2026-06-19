@@ -275,7 +275,6 @@ async def _file_has_line_count(path: str, min_line: int) -> bool:
         return False
 
 
-
 async def _classify_each_path(
     paths: list,
     *,
@@ -458,9 +457,7 @@ async def resolve_head_commit(
         try:
             from app.github_refs import get_branch_sha
 
-            return await get_branch_sha(
-                str(token), str(owner), str(repo), str(branch)
-            )
+            return await get_branch_sha(str(token), str(owner), str(repo), str(branch))
         except Exception:  # noqa: BLE001 — grounding/advisory path must degrade, never raise
             logger.debug(
                 "[SOURCE_REF_VALIDATION] head-commit GitHub resolution failed",
@@ -515,9 +512,7 @@ async def cited_paths_changed_since(
     """
     if not sha:
         return None
-    norm = {
-        _parse_ref(p)[0] for p in paths if isinstance(p, str) and p
-    }
+    norm = {_parse_ref(p)[0] for p in paths if isinstance(p, str) and p}
     norm.discard("")
     if not norm:
         return None
@@ -626,7 +621,12 @@ async def _symbol_defined_at_head(
     None  → indeterminate (git unavailable / timeout / non-repo / error). Callers
             treat None as grounded so a git outage never flags refs.
     """
-    if not path or not symbol or not isinstance(path, str) or not isinstance(symbol, str):
+    if (
+        not path
+        or not symbol
+        or not isinstance(path, str)
+        or not isinstance(symbol, str)
+    ):
         return None
     use_repo_branch = all([token, owner, repo, branch])
     if use_repo_branch:
@@ -664,7 +664,9 @@ async def _symbol_defined_at_head(
         logger.warning(f"[SOURCE_REF_VALIDATION] git show failed for {path}: {e}")
         return None
     if proc.returncode == 0:
-        return bool(_symbol_definition_regex(symbol).search(stdout.decode(errors="replace")))
+        return bool(
+            _symbol_definition_regex(symbol).search(stdout.decode(errors="replace"))
+        )
     err = stderr.decode(errors="replace").lower()
     if "does not exist" in err or "exists on disk, but not in" in err:
         # git ran fine; the path is genuinely absent at HEAD → unambiguously absent.
@@ -847,53 +849,17 @@ async def reconcile_design_doc_presence(
         f"claimed {status} but all referenced module file(s) are absent on the "
         f"integration branch — treat as missing"
     )
-    downgraded: dict[str, Any] = {**value, "status": "missing", "presence_warning": warning}
+    downgraded: dict[str, Any] = {
+        **value,
+        "status": "missing",
+        "presence_warning": warning,
+    }
     raw_text = value.get(text_field)
     existing = raw_text.strip() if isinstance(raw_text, str) else ""
     downgraded[text_field] = (
         f"{existing} " if existing else ""
     ) + f"[reconciled: {warning}]"
     return downgraded
-
-
-async def reconcile_design_doc(
-    doc: Any,
-    *,
-    repo_root: str = _REPO_ROOT,
-    token: str | None = None,
-    owner: str | None = None,
-    repo: str | None = None,
-    branch: str | None = None,
-    project_id: str | None = None,
-) -> Any:
-    """Reconcile every ``systems/*`` and ``capabilities/*`` entry in *doc*.
-
-    Walks the design-doc mapping and applies
-    :func:`reconcile_design_doc_presence` to each system/capability key,
-    forwarding the GitHub verification context so present-but-absent entries
-    are downgraded against the project's real integration branch when
-    credentials are available (and the local-git fallback otherwise). Non
-    system/capability keys are passed through untouched. Operates on a shallow
-    copy: the input mapping is never mutated.
-    """
-    if not isinstance(doc, dict):
-        return doc
-    out: dict[str, Any] = dict(doc)
-    for entry_key, entry_value in doc.items():
-        if not isinstance(entry_key, str):
-            continue
-        if entry_key.startswith("systems/") or entry_key.startswith("capabilities/"):
-            out[entry_key] = await reconcile_design_doc_presence(
-                entry_value,
-                entry_key,
-                repo_root,
-                token=token,
-                owner=owner,
-                repo=repo,
-                branch=branch,
-                project_id=project_id,
-            )
-    return out
 
 
 async def ground_design_doc_value(
@@ -1001,8 +967,7 @@ async def ground_design_doc(
 ) -> Any:
     """Symbol-aware reconcile of every ``systems/*``/``capabilities/*`` entry.
 
-    The symbol-aware sibling of the file-only :func:`reconcile_design_doc`
-    walker: applies the combined file- AND symbol-level
+    The symbol-aware replacement for the file-only walker: applies the combined file- AND symbol-level
     :func:`ground_design_doc_value` to each system/capability key, forwarding the
     GitHub verification context so present-but-absent entries — whether their
     backing file is gone OR their cited symbol was deleted from a still-present
@@ -1030,11 +995,13 @@ async def ground_design_doc(
     return out
 
 
-async def resolve_branch_verification_context(session: Any, project: Any) -> Dict[str, str]:
+async def resolve_branch_verification_context(
+    session: Any, project: Any
+) -> Dict[str, str]:
     """Resolve the GitHub-backed verification context for design-doc grounding.
 
     Returns the keyword arguments shared by :func:`classify_existing_paths`,
-    :func:`reconcile_design_doc`, and the capability backing-path verifiers:
+    :func:`ground_design_doc`, and the capability backing-path verifiers:
     always ``branch`` + ``project_id``, plus ``token``/``owner``/``repo`` when
     the project's GitHub credentials resolve. Degrades gracefully — on any
     credential-resolution failure (or a project without an authorized repo) the
@@ -1100,15 +1067,18 @@ async def detect_absent_symbols(
                 pairs.append(pair)
     absent: List[str] = []
     for path, symbol in pairs:
-        if await _symbol_defined_at_head(
-            path,
-            symbol,
-            token=token,
-            owner=owner,
-            repo=repo,
-            branch=branch,
-            project_id=project_id,
-        ) is False:
+        if (
+            await _symbol_defined_at_head(
+                path,
+                symbol,
+                token=token,
+                owner=owner,
+                repo=repo,
+                branch=branch,
+                project_id=project_id,
+            )
+            is False
+        ):
             absent.append(f"{path}:{symbol}")
     return absent
 
