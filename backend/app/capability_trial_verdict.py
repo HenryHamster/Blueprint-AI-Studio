@@ -951,6 +951,143 @@ def carry_adoption_verdicts_for_consolidation(
     return result
 
 
+def is_trial_stalled(entry: dict[str, Any]) -> bool:
+    """Return True when a verdict entry represents a permanently stalled trial.
+
+    A trial is stalled when it is still in ``continue-trial``/``insufficient_data`` and
+    its accrual projection shows that the holdback arm can NEVER reach ``min_n_per_arm``
+    at the current accrual rate (``days_to_min_n is None``).
+
+    Returns False for:
+    - decided verdicts (adopt/reject/no_effect/ADOPT/KILL)
+    - healthy continue-trials with a finite ``days_to_min_n``
+    - sufficient-data continue-trials (``ambiguous_lift``, ``receipt_only_trial``)
+    - ``treatment_not_engaging`` / ``holdback_contaminated`` which raise their own
+      ``immediate_alert`` and must not double-notify
+    - entries with no ``accrual_projection`` (not yet projected)
+    - trials that have never received holdback-arm assignments (not yet started)
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("verdict") != "continue-trial":
+        return False
+    if entry.get("verdict_reason") != "insufficient_data":
+        return False
+    accrual = entry.get("accrual_projection")
+    if not isinstance(accrual, dict):
+        return False
+    if accrual.get("days_to_min_n") is not None:
+        return False
+    # A trial whose holdback arm has never received any assignments hasn't started
+    # yet — zero accrual rate on zero participants is not a stall, it's a cold start.
+    arm_comp = entry.get("arm_composition") or {}
+    return bool(int(arm_comp.get("without_assigned") or 0))
+
+
+async def raise_stalled_trial_notice(
+    session: Any,
+    project_id: Any,
+    cap_name: str,
+    entry: dict[str, Any],
+) -> None:
+    """Record a durable operator notice when a capability trial is permanently stalled.
+
+    Deduplicated on ``cap_name`` so repeated digest re-evaluations of the same stalled
+    trial emit exactly ONE open notice per capability.  The notice carries the actionable
+    data the digest already computed: which arm is stalled, its assigned count vs
+    ``min_n``, the recent accrual rates, the current ``holdback_fraction``, and the
+    ``alternative_projections`` map of concrete options the operator can act on.
+    """
+    from sqlalchemy import select
+
+    from app.models import MessageType, ProjectMessage
+
+    dedupe_key = f"capability_trial_stalled_{cap_name}"
+    existing = (
+        (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.status == "open",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing):
+        return
+
+    accrual = entry.get("accrual_projection") or {}
+    with_7d = accrual.get("with_7d")
+    without_7d = accrual.get("without_7d")
+    window_days = accrual.get("window_days")
+    holdback_fraction = accrual.get("holdback_fraction")
+    alternative_projections = accrual.get("alternative_projections") or {}
+    arm_comp = entry.get("arm_composition") or {}
+    thresholds = entry.get("thresholds") or {}
+    min_n = thresholds.get("min_n_per_arm")
+    without_assigned = arm_comp.get("without_assigned")
+
+    content = (
+        f"[CAPABILITY-TRIAL] {cap_name} stalled: holdback arm cannot reach min_n at current accrual "
+        f"(holdback_fraction={holdback_fraction} without_assigned={without_assigned} min_n={min_n} "
+        f"with_7d={with_7d} without_7d={without_7d} window_days={window_days}) "
+        f"— raise holdback_fraction or extend trial window"
+    )
+    session.add(
+        ProjectMessage(
+            project_id=project_id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content=content,
+            context={
+                "event_type": "capability_trial_stalled",
+                "dedupe_key": dedupe_key,
+                "cap_name": cap_name,
+                "with_7d": with_7d,
+                "without_7d": without_7d,
+                "window_days": window_days,
+                "holdback_fraction": holdback_fraction,
+                "without_assigned": without_assigned,
+                "min_n": min_n,
+                "alternative_projections": alternative_projections,
+            },
+        )
+    )
+
+
+async def persist_stalled_trial_notices_in_transaction(
+    source_session: Any,
+    project_id: Any,
+    *,
+    stalled: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Durably persist stall notices for permanently stalled capability trials.
+
+    Opens its OWN committing AsyncSession (mirroring ``persist_trial_verdicts_in_transaction``)
+    so notices survive regardless of whether the outer digest request session commits.
+    On any exception it rolls back and re-raises.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.database import resolve_async_engine
+
+    factory = async_sessionmaker(
+        resolve_async_engine(source_session),
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with factory() as session:
+        try:
+            for cap_name, entry in stalled:
+                await raise_stalled_trial_notice(session, project_id, cap_name, entry)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
 def get_effective_holdback_fraction(
     verdicts: Any,
     cap_name: str,

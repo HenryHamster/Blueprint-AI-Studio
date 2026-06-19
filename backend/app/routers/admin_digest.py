@@ -46,6 +46,8 @@ from app.capability_trial_verdict import (
     evaluate_lane_pilot_verdict,
     evaluate_trial_verdict,
     get_trial_definitions,
+    is_trial_stalled,
+    persist_stalled_trial_notices_in_transaction,
     persist_trial_verdicts_in_transaction,
 )
 from app.digest_metrics import (
@@ -1939,6 +1941,25 @@ async def _compute_digest(
                 "days_to_min_n": _days_to_min_n,
                 "alternative_projections": _alternative_projections,
             }
+
+        # Escalate permanently stalled trials to a durable deduplicated operator notice.
+        _stalled_trials = [
+            (_cap, _entry)
+            for _cap, _entry in _augmented_verdicts.items()
+            if isinstance(_entry, dict) and is_trial_stalled(_entry)
+        ]
+        if _stalled_trials:
+            try:
+                await persist_stalled_trial_notices_in_transaction(
+                    session,
+                    project_id,
+                    stalled=_stalled_trials,
+                )
+            except Exception:
+                logger.warning(
+                    "[CAPABILITY_TRIAL] failed to persist stalled-trial notices",
+                    exc_info=True,
+                )
 
     _first_review_approval_rate = _compute_first_review_approval_breakdowns(
         completed_tasks + failed_tasks
