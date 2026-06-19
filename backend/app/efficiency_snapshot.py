@@ -18,9 +18,12 @@ each axis as ``current_value`` / ``baseline_value`` / ``drift_pct``.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import statistics
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, Mapping
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -96,6 +99,12 @@ AXIS_LLM_COST_PER_MERGED_PR = "llm_cost_per_merged_pr"
 AXIS_LANE_COST_PER_MERGED_PR = "lane_cost_per_merged_pr"
 AXIS_LANE_WARM_RESUME_RATE = "lane_warm_resume_rate"
 AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
+AXIS_PROMPT_STATIC_BYTES = "prompt_static_bytes"
+
+# Guard threshold for prompt_static_bytes: alert when static prompt size exceeds
+# this many source characters. Set well above the current measured value (~31k chars)
+# to catch significant growth while avoiding false positives on minor edits.
+PROMPT_STATIC_BYTES_THRESHOLD = 55_000
 FORMAT_COMPLIANCE_KEY = "format_compliance"
 FORMAT_COMPLIANCE_RATE_KEY = "format_compliance_rate"
 SELF_REPAIR_SUCCESS_RATE_KEY = "self_repair_success_rate"
@@ -115,6 +124,7 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_LANE_COST_PER_MERGED_PR,
     AXIS_LANE_WARM_RESUME_RATE,
     AXIS_CHECKPOINT_LOSS_RATE,
+    AXIS_PROMPT_STATIC_BYTES,
 )
 
 # ---------------------------------------------------------------------------
@@ -158,6 +168,10 @@ AXIS_CONSUMERS: dict[str, dict] = {
     },
     AXIS_CHECKPOINT_LOSS_RATE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_PROMPT_STATIC_BYTES: {
+        "pending": "drift alerting — leading indicator for static prompt budget growth "
+        "before mean_input_tokens_per_call rises in production"
     },
 }
 
@@ -282,7 +296,10 @@ _SNAPSHOT_HISTORY_MAX = 365
 # v9: self_repair_burn_share added to llm_cost_attribution — fraction of total LLM
 #     calls that are self-repair reopen attempts, quantifying repair overhead as a
 #     cost driver alongside rework_share.
-METRIC_DEF_VERSION = "v9"
+# v10: prompt_static_bytes axis added — source character count of the dominant static
+#      prompt sections (SHARED_LIFECYCLE_REMAINDER + assembleFailureGuidanceBlocks
+#      constants in agent/src/prompt.ts) as a leading indicator for token budget growth.
+METRIC_DEF_VERSION = "v10"
 
 
 async def _load_recent_tasks(
@@ -2629,6 +2646,91 @@ def compute_recommended_challenger_sample_rate(
     }
 
 
+def _find_agent_src() -> str | None:
+    """Locate the agent/src directory for prompt.ts static-size introspection.
+
+    Search order mirrors test_agent_branch_invariants._resolve_agent_src_root:
+      1. AGENT_SRC_ROOT env override.
+      2. /agent/src — Docker volume-mount path used by scripts/test-backend.sh.
+      3. Host filesystem relative to this file (backend/app -> repo root -> agent/src).
+
+    Returns the first existing directory path, or None.
+    """
+    candidates: list[Path] = []
+    env_override = os.environ.get("AGENT_SRC_ROOT")
+    if env_override:
+        candidates.append(Path(env_override))
+    candidates.append(Path("/agent/src"))
+    candidates.append(Path(__file__).resolve().parents[2] / "agent" / "src")
+    for c in candidates:
+        if c.is_dir():
+            return str(c)
+    return None
+
+
+def _extract_ts_template_literal_length(src: str, const_name: str) -> int | None:
+    """Find a TypeScript `const NAME = backtick...backtick` and return its source char count.
+
+    Scans from the opening backtick to the matching unescaped closing backtick,
+    advancing by 2 on any backslash escape sequence so that escaped backticks and
+    escaped backslashes inside the literal do not prematurely terminate the scan.
+    Returns None if the constant is not found or the literal is unterminated.
+    """
+    pattern = re.compile(r"\bconst\s+" + re.escape(const_name) + r"\s*=\s*`")
+    m = pattern.search(src)
+    if not m:
+        return None
+    pos = m.end()
+    start = pos
+    n = len(src)
+    while pos < n:
+        ch = src[pos]
+        if ch == "\\":
+            pos += 2
+        elif ch == "`":
+            return pos - start
+        else:
+            pos += 1
+    return None
+
+
+_PROMPT_STATIC_CONST_NAMES: tuple[str, ...] = (
+    "SHARED_LIFECYCLE_REMAINDER",
+    "READ_THE_FAILURE_MESSAGE",
+    "SIZE_GUARDRAIL_GUIDANCE",
+    "PRIOR_ATTEMPT_DIVERGENCE",
+    "BEYOND_SCOPE_REPORTING",
+    "EDGES_CONSIDERED_GUIDANCE",
+)
+
+
+def _compute_prompt_static_bytes() -> int | None:
+    """Sum the source character lengths of the major static code-change prompt sections.
+
+    Reads agent/src/prompt.ts and measures SHARED_LIFECYCLE_REMAINDER plus the five
+    blocks concatenated by assembleFailureGuidanceBlocks(). Returns None when prompt.ts
+    is unavailable (production backend containers that do not mount agent/src).
+    """
+    agent_src = _find_agent_src()
+    if agent_src is None:
+        return None
+    prompt_ts = os.path.join(agent_src, "prompt.ts")
+    if not os.path.exists(prompt_ts):
+        return None
+    try:
+        with open(prompt_ts, encoding="utf-8") as fh:
+            src = fh.read()
+    except OSError:
+        return None
+    total = 0
+    for name in _PROMPT_STATIC_CONST_NAMES:
+        length = _extract_ts_template_literal_length(src, name)
+        if length is None:
+            return None
+        total += length
+    return total
+
+
 async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
@@ -2678,6 +2780,7 @@ async def compute_current_axes(
         AXIS_LANE_COST_PER_MERGED_PR: _compute_lane_cost_per_merged_pr(lanes),
         AXIS_LANE_WARM_RESUME_RATE: _compute_lane_warm_resume_rate(lanes),
         AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),
+        AXIS_PROMPT_STATIC_BYTES: _compute_prompt_static_bytes(),
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
         "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],

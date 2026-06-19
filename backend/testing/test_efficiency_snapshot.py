@@ -17,6 +17,7 @@ from app.efficiency_snapshot import (
     AXIS_LLM_COST_PER_MERGED_PR,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
+    AXIS_PROMPT_STATIC_BYTES,
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
     DESIGN_DOC_KEY,
@@ -25,6 +26,7 @@ from app.efficiency_snapshot import (
     LLM_TOKEN_PRICING,
     METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
+    PROMPT_STATIC_BYTES_THRESHOLD,
     SELF_REPAIR_BURN_SHARE_KEY,
     SELF_REPAIR_MIN_ATTEMPTS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
@@ -33,6 +35,7 @@ from app.efficiency_snapshot import (
     _compute_lane_cost_per_merged_pr,
     _compute_lane_warm_resume_rate,
     _compute_llm_cost_pricing_coverage,
+    _compute_prompt_static_bytes,
     _last_run_due,
     _task_llm_attempts,
     compute_current_axes,
@@ -499,7 +502,14 @@ async def test_compute_current_axes_empty_returns_none(db_session):
     # Scalar axes are None when no tasks exist. Structural metadata keys
     # (vm_cold_start_breakdown, llm_cost_pricing_coverage) are exempt —
     # they return None / empty-dict rather than a scalar None.
-    assert all(axes[k] is None for k in ALL_AXES)
+    # AXIS_PROMPT_STATIC_BYTES is also exempt: it is environment-derived
+    # (parses agent/src/prompt.ts) and returns a positive int regardless
+    # of whether any tasks exist.
+    task_data_axes = [k for k in ALL_AXES if k != AXIS_PROMPT_STATIC_BYTES]
+    assert all(axes[k] is None for k in task_data_axes)
+    assert axes[AXIS_PROMPT_STATIC_BYTES] is None or isinstance(
+        axes[AXIS_PROMPT_STATIC_BYTES], int
+    )
 
 
 @pytest.mark.asyncio
@@ -4082,6 +4092,42 @@ def test_nested_snapshot_metrics_have_ground_truth_and_named_consumer():
 def test_axis_llm_cost_constant_value():
     """AXIS_LLM_COST_PER_MERGED_PR resolves to the expected string key."""
     assert AXIS_LLM_COST_PER_MERGED_PR == "llm_cost_per_merged_pr"
+
+
+def test_code_change_prompt_static_bytes():
+    """AXIS_PROMPT_STATIC_BYTES is registered in ALL_AXES and AXIS_CONSUMERS, and
+    _compute_prompt_static_bytes() returns a positive integer within the guard
+    threshold when agent/src/prompt.ts is available.
+
+    This is the acceptance test for the prompt_static_bytes gauge (d-22af1f55):
+    it exercises the production parsing logic against the live prompt.ts source,
+    so a PR that grows the static prompt budget past PROMPT_STATIC_BYTES_THRESHOLD
+    will fail here before reaching production.
+    """
+    assert AXIS_PROMPT_STATIC_BYTES in ALL_AXES, (
+        f"{AXIS_PROMPT_STATIC_BYTES!r} must be in ALL_AXES"
+    )
+    assert AXIS_PROMPT_STATIC_BYTES in AXIS_CONSUMERS, (
+        f"{AXIS_PROMPT_STATIC_BYTES!r} must have an entry in AXIS_CONSUMERS"
+    )
+    assert AXIS_CONSUMERS[AXIS_PROMPT_STATIC_BYTES].get("pending") or AXIS_CONSUMERS[
+        AXIS_PROMPT_STATIC_BYTES
+    ].get("consumer"), (
+        "AXIS_CONSUMERS entry for prompt_static_bytes must have a 'pending' or 'consumer' key"
+    )
+
+    result = _compute_prompt_static_bytes()
+    if result is None:
+        pytest.skip("agent/src/prompt.ts not available in this environment")
+
+    assert isinstance(result, int), f"Expected int, got {type(result)!r}"
+    assert result > 0, f"prompt_static_bytes must be positive, got {result}"
+    assert result <= PROMPT_STATIC_BYTES_THRESHOLD, (
+        f"prompt_static_bytes={result} exceeds PROMPT_STATIC_BYTES_THRESHOLD="
+        f"{PROMPT_STATIC_BYTES_THRESHOLD}. A recent change grew the static prompt "
+        "budget past the guard. Either revert the growth or raise the threshold "
+        "with justification in efficiency_snapshot.py."
+    )
 
 
 # ---------------------------------------------------------------------------
