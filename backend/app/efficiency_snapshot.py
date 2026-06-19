@@ -2540,6 +2540,58 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
     }
 
 
+_PANEL_MIN_SAMPLE = 30
+_PANEL_EARNING_THRESHOLD = 0.10  # 10% overturn rate = gate earns its cost
+
+
+def compute_recommended_challenger_sample_rate(
+    panel_review_effectiveness: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Data-driven recommended sample_rate for the panel_review challenger gate.
+
+    Thresholds:
+    - no_data: no gate invocations in the window → no recommendation.
+    - insufficient_data: fewer than 30 challenges → sample too small.
+    - gate_earning: overturn_rate >= 10% → gate justifies full cost; keep 1.0.
+    - reduce: overturn_rate < 10% → recommended = clamp(rate/0.10, 0.10, 1.0).
+    """
+    if panel_review_effectiveness is None:
+        return {
+            "status": "no_data",
+            "recommended_sample_rate": None,
+            "rationale": "No gate invocations in the snapshot window.",
+        }
+    total = panel_review_effectiveness.get("total_challenged", 0)
+    if total < _PANEL_MIN_SAMPLE:
+        return {
+            "status": "insufficient_data",
+            "recommended_sample_rate": None,
+            "rationale": f"Only {total} challenges — need {_PANEL_MIN_SAMPLE} for a reliable estimate.",
+        }
+    overturn_rate = panel_review_effectiveness.get("overturn_rate", 0.0)
+    if overturn_rate >= _PANEL_EARNING_THRESHOLD:
+        return {
+            "status": "gate_earning",
+            "recommended_sample_rate": 1.0,
+            "rationale": (
+                f"overturn_rate={overturn_rate:.1%} ≥ {_PANEL_EARNING_THRESHOLD:.0%} threshold"
+                " — gate earns its cost; keep sample_rate=1.0."
+            ),
+        }
+    recommended = max(
+        0.10, min(1.0, round(overturn_rate / _PANEL_EARNING_THRESHOLD, 2))
+    )
+    savings_pct = round((1.0 - recommended) * 100)
+    return {
+        "status": "reduce",
+        "recommended_sample_rate": recommended,
+        "rationale": (
+            f"overturn_rate={overturn_rate:.1%} < {_PANEL_EARNING_THRESHOLD:.0%} threshold"
+            f" — recommend sample_rate={recommended} to save ~{savings_pct}% of challenger runs."
+        ),
+    }
+
+
 async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
@@ -2656,7 +2708,16 @@ async def compute_current_axes(
         # signal: near-zero = gate is expensive with marginal catch; high =
         # gate earns its Opus-tier cost. Reads context.review_second_opinion
         # which the task_lifecycle path stamps on every challenged review task.
-        "panel_review_effectiveness": compute_panel_review_effectiveness(tasks),
+        "panel_review_effectiveness": (
+            _peff := compute_panel_review_effectiveness(tasks)
+        ),
+        # Data-driven recommended sample_rate for the challenger gate, derived from
+        # the live overturn_rate in the same window. Status is one of: no_data,
+        # insufficient_data, gate_earning, or reduce (with a rationale string and
+        # recommended_sample_rate float or None).
+        "panel_review_recommended_sample_rate": compute_recommended_challenger_sample_rate(
+            _peff
+        ),
     }
 
 
@@ -3282,6 +3343,12 @@ async def read_baseline_with_drift(
         # outcome (confirmed/revised/rejected), and total gate invocations. Null
         # when no gate invocations exist in the window.
         "panel_review_effectiveness": latest.get("panel_review_effectiveness"),
+        # Recommended sample_rate for the challenger gate, computed on-the-fly from
+        # the latest snapshot's panel_review_effectiveness so operators always see a
+        # fresh recommendation without waiting for the next daily snapshot write.
+        "panel_review_recommended_sample_rate": compute_recommended_challenger_sample_rate(
+            latest.get("panel_review_effectiveness")
+        ),
         # VM cost attribution: per-task-type breakdown of VM spend, mirroring the
         # structure of llm_cost_attribution but for infrastructure costs. Allows
         # operators to see which task types (review, create, side-car, etc.)

@@ -8889,6 +8889,162 @@ async def test_second_opinion_gate_off_restores_synchronous_merge(tl_db, mocker)
 
 
 @pytest.mark.asyncio
+async def test_second_opinion_sample_rate_zero_never_spawns(tl_db, mocker):
+    """sample_rate=0.0 → no challenger spawned for any task; proceeds synchronously
+    with context state 'sampled_out'."""
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_sample_rate": 0.0},
+    )
+    (
+        session,
+        factory,
+        project,
+        _original,
+        review_task,
+        merge_mock,
+        _captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7784)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is None, "rate=0.0 must never spawn a challenger"
+    assert merge_mock.called, "rate=0.0 must merge synchronously"
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec is not None, "sampled_out record must be written"
+    assert rec["state"] == "sampled_out", f"expected sampled_out, got {rec['state']!r}"
+    assert rec["sample_rate"] == 0.0
+    assert rec["reconciled_verdict"] == "APPROVE"
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_sample_rate_one_always_spawns(tl_db, mocker):
+    """sample_rate=1.0 (default) → challenger always spawned for high-stakes APPROVE."""
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_sample_rate": 1.0},
+    )
+    (
+        session,
+        factory,
+        project,
+        _original,
+        review_task,
+        merge_mock,
+        _captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7786)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None, "rate=1.0 must always spawn a challenger"
+    assert not merge_mock.called, "must not merge while challenge is pending"
+
+
+@pytest.mark.asyncio
+async def test_second_opinion_sample_rate_deterministic(tl_db, mocker):
+    """Sampling is deterministic: a task whose UUID slot falls above the configured
+    rate is skipped; one that falls below is challenged."""
+    import uuid
+
+    # Find a UUID whose slot is above 0.3 (sampled out)
+    above_uuid = None
+    for _ in range(10_000):
+        candidate = uuid.uuid4()
+        if candidate.int % 1_000_000 / 1_000_000.0 >= 0.3:
+            above_uuid = candidate
+            break
+    assert above_uuid is not None
+
+    # Find a UUID whose slot is below 0.3 (spawns challenger)
+    below_uuid = None
+    for _ in range(10_000):
+        candidate = uuid.uuid4()
+        if candidate.int % 1_000_000 / 1_000_000.0 < 0.3:
+            below_uuid = candidate
+            break
+    assert below_uuid is not None
+
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"review_second_opinion_sample_rate": 0.3},
+    )
+
+    # --- task with slot >= 0.3: no challenger ---
+    (
+        session,
+        factory,
+        project,
+        _original,
+        review_task_above,
+        merge_mock_above,
+        _captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7787)
+    # Override the task's UUID so the slot computation is deterministic.
+    review_task_above.id = above_uuid
+    session.add(review_task_above)
+    await session.commit()
+    await session.refresh(review_task_above)
+
+    payload_above = AgentStatusPayload(
+        task_id=review_task_above.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(
+        review_task_above.id, payload_above, _session_factory=factory
+    )
+    await session.refresh(review_task_above)
+    challenger_above = await _find_challenger(session, project.id, review_task_above.id)
+    assert challenger_above is None, "slot >= rate must not spawn challenger"
+    rec_above = (review_task_above.context or {}).get("review_second_opinion")
+    assert rec_above is not None and rec_above["state"] == "sampled_out"
+
+    # --- task with slot < 0.3: challenger spawned ---
+    (
+        session2,
+        factory2,
+        project2,
+        _original2,
+        review_task_below,
+        merge_mock_below,
+        _captured_spawn2,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7788)
+    review_task_below.id = below_uuid
+    session2.add(review_task_below)
+    await session2.commit()
+    await session2.refresh(review_task_below)
+
+    payload_below = AgentStatusPayload(
+        task_id=review_task_below.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(
+        review_task_below.id, payload_below, _session_factory=factory2
+    )
+    await session2.refresh(review_task_below)
+    challenger_below = await _find_challenger(
+        session2, project2.id, review_task_below.id
+    )
+    assert challenger_below is not None, "slot < rate must spawn challenger"
+    assert not merge_mock_below.called, "must not merge while challenge is pending"
+
+
+@pytest.mark.asyncio
 async def test_second_opinion_single_shot_no_double_spawn(tl_db, mocker):
     """Single-shot guard: a second finalize while a challenge is in flight does
     not spawn a second challenger, and the challenger never recurses."""

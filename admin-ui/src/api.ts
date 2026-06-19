@@ -1522,6 +1522,12 @@ export interface PanelReviewEffectiveness {
   cost_per_challenge_usd?: number | null;
 }
 
+export interface ChallengerSampleRateRecommendation {
+  status: 'no_data' | 'insufficient_data' | 'gate_earning' | 'reduce';
+  recommended_sample_rate: number | null;
+  rationale: string;
+}
+
 export interface VmCostAttributionEntry {
   task_type: string;
   task_count: number;
@@ -1568,6 +1574,9 @@ export interface EfficiencyAxesResponse {
   // total gate invocations from the latest snapshot. Null when no gate
   // invocations exist in the window. Optional for older backends.
   panel_review_effectiveness?: PanelReviewEffectiveness | null;
+  // Data-driven recommended sample_rate for the challenger gate, computed from
+  // the latest snapshot's overturn_rate. Optional for older backends.
+  panel_review_recommended_sample_rate?: ChallengerSampleRateRecommendation | null;
   // VM cost attribution: per-task-type breakdown of infrastructure spend from
   // the latest snapshot, showing which task types (review, create, side-car, etc.)
   // dominate VM spend. Optional for older backends.

@@ -6608,3 +6608,70 @@ def test_panel_review_effectiveness_cost_per_challenge_usd():
     assert result["cost_per_challenge_usd"] == expected_per_challenge, (
         f"expected cost_per_challenge_usd={expected_per_challenge}, got {result['cost_per_challenge_usd']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# compute_recommended_challenger_sample_rate
+# ---------------------------------------------------------------------------
+
+
+def test_recommended_sample_rate_no_data():
+    """Returns no_data status when panel_review_effectiveness is None."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    result = compute_recommended_challenger_sample_rate(None)
+    assert result["status"] == "no_data"
+    assert result["recommended_sample_rate"] is None
+    assert "rationale" in result
+
+
+def test_recommended_sample_rate_insufficient_data():
+    """Returns insufficient_data when total_challenged < MIN_SAMPLE_SIZE (30)."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    eff = {"total_challenged": 15, "overturn_rate": 0.05}
+    result = compute_recommended_challenger_sample_rate(eff)
+    assert result["status"] == "insufficient_data"
+    assert result["recommended_sample_rate"] is None
+    assert "15" in result["rationale"]
+
+
+def test_recommended_sample_rate_gate_earning():
+    """Returns gate_earning with rate=1.0 when overturn_rate >= 10%."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    eff = {"total_challenged": 50, "overturn_rate": 0.15}
+    result = compute_recommended_challenger_sample_rate(eff)
+    assert result["status"] == "gate_earning"
+    assert result["recommended_sample_rate"] == 1.0
+
+
+def test_recommended_sample_rate_reduce():
+    """Returns reduce status with rate < 1.0 when overturn_rate < 10%."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    # 4% overturn rate → recommended = max(0.10, 0.04/0.10) = max(0.10, 0.40) = 0.40
+    eff = {"total_challenged": 100, "overturn_rate": 0.04}
+    result = compute_recommended_challenger_sample_rate(eff)
+    assert result["status"] == "reduce"
+    assert result["recommended_sample_rate"] == 0.40
+
+
+def test_recommended_sample_rate_reduce_floor():
+    """Very low overturn_rate is clamped to 0.10 floor."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    eff = {"total_challenged": 100, "overturn_rate": 0.005}
+    result = compute_recommended_challenger_sample_rate(eff)
+    assert result["status"] == "reduce"
+    assert result["recommended_sample_rate"] == 0.10
+
+
+def test_recommended_sample_rate_at_threshold_boundary():
+    """Exactly at 10% overturn_rate is gate_earning."""
+    from app.efficiency_snapshot import compute_recommended_challenger_sample_rate
+
+    eff = {"total_challenged": 50, "overturn_rate": 0.10}
+    result = compute_recommended_challenger_sample_rate(eff)
+    assert result["status"] == "gate_earning"
+    assert result["recommended_sample_rate"] == 1.0

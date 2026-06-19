@@ -69,6 +69,11 @@ runtime_config: Dict = {
     # the panel_review task type (it stays available as a user-launchable
     # advisory workflow); reconciliation records then read ``unchallenged``.
     "review_second_opinion_gate_enabled": True,
+    # Fraction of high-stakes trunk-targeting APPROVEs that spawn a panel_review
+    # challenger (0.0 = none, 1.0 = all). Default 1.0 preserves existing behavior.
+    # Uses deterministic task-ID-based sampling so operators can safely dial down
+    # challenger frequency without randomness between restarts.
+    "review_second_opinion_sample_rate": 1.0,
     # Rollout mode for binding agent-authored direction retirement to the
     # strategic judgment challenge's per-direction second opinion.
     #   observe  — compute/record verdict, never block
@@ -1320,6 +1325,18 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "review_second_opinion_gate_enabled",
                         bool(config_json["review_second_opinion_gate_enabled"]),
                     )
+                if "review_second_opinion_sample_rate" in config_json:
+                    try:
+                        _rate = max(
+                            0.0,
+                            min(
+                                1.0,
+                                float(config_json["review_second_opinion_sample_rate"]),
+                            ),
+                        )
+                        _set("review_second_opinion_sample_rate", _rate)
+                    except (TypeError, ValueError):
+                        pass
                 if "strategic_retirement_challenge_gate_mode" in config_json:
                     raw_mode = (
                         str(

@@ -3095,34 +3095,63 @@ async def _process_post_commit(
                             _shared_state.get_project_promotion_target(_review_project),
                         ),
                     ):
-                        _challenger = await spawn_review_second_opinion(
-                            task,
-                            session,
-                            verdict=verdict,
-                            issues=issues,
-                            feedback=feedback,
-                            pr_number=pr_number,
-                            branch=branch,
-                            base_branch=base_branch,
-                            original_task_id=original_task_id,
-                            original_prompt=original_prompt,
-                            investigated_files=investigated_files,
-                        )
-                        if _challenger is not None:
-                            logger.info(
-                                "[REVIEW PIPELINE] PR #%s: parked review %s "
-                                "awaiting second-opinion challenge %s "
-                                "(primary verdict=%s) — not acting yet",
-                                pr_number,
-                                task.id,
-                                _challenger.id,
-                                verdict,
+                        _sample_rate = float(
+                            _runtime_config.get(
+                                "review_second_opinion_sample_rate", 1.0
                             )
-                            return {"status": "accepted"}
-                        # spawn refused: a challenge is already in flight. Stay
-                        # parked rather than act on the unreconciled verdict.
-                        if (task.context or {}).get("awaiting_review_second_opinion"):
-                            return {"status": "accepted"}
+                        )
+                        _task_slot = task.id.int % 1_000_000 / 1_000_000.0
+                        if _task_slot >= _sample_rate:
+                            logger.info(
+                                "[REVIEW PIPELINE] PR #%s: challenger sampled out "
+                                "(slot=%.6f >= rate=%.4f) — proceeding synchronously",
+                                pr_number,
+                                _task_slot,
+                                _sample_rate,
+                            )
+                            task.context = {
+                                **(task.context or {}),
+                                REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {
+                                    "state": "sampled_out",
+                                    "sample_rate": _sample_rate,
+                                    "primary_verdict": verdict,
+                                    "reconciled_verdict": verdict,
+                                    "surviving_issues": issues,
+                                    "review_task_id": str(task.id),
+                                },
+                            }
+                            session.add(task)
+                        else:
+                            _challenger = await spawn_review_second_opinion(
+                                task,
+                                session,
+                                verdict=verdict,
+                                issues=issues,
+                                feedback=feedback,
+                                pr_number=pr_number,
+                                branch=branch,
+                                base_branch=base_branch,
+                                original_task_id=original_task_id,
+                                original_prompt=original_prompt,
+                                investigated_files=investigated_files,
+                            )
+                            if _challenger is not None:
+                                logger.info(
+                                    "[REVIEW PIPELINE] PR #%s: parked review %s "
+                                    "awaiting second-opinion challenge %s "
+                                    "(primary verdict=%s) — not acting yet",
+                                    pr_number,
+                                    task.id,
+                                    _challenger.id,
+                                    verdict,
+                                )
+                                return {"status": "accepted"}
+                            # spawn refused: a challenge is already in flight. Stay
+                            # parked rather than act on the unreconciled verdict.
+                            if (task.context or {}).get(
+                                "awaiting_review_second_opinion"
+                            ):
+                                return {"status": "accepted"}
                     else:
                         # Gate on but verdict not high-stakes — proceed
                         # synchronously and record the unchallenged outcome.
