@@ -13587,6 +13587,126 @@ async def test_spawn_retirement_memo_empty_snapshot_completes_inline_no_vm(db_se
     )
 
 
+@pytest.mark.asyncio
+async def test_spawn_retirement_memos_creates_knowledge_document(db_session):
+    """_spawn_retirement_memos persists a KnowledgeDocument row for each retired direction.
+
+    Verifies: source_kind=="direction_retirement", direction_id matches, topic is
+    "direction-retirement", body is non-empty, and project_id matches.
+    Covers all three synthesis branches: rationale-present, snapshot-substantive,
+    and minimal-fallback.
+    """
+    from app.models import KnowledgeDocument, SourceKind, TaskStatus
+    from sqlmodel import select
+
+    direction_id_with_rationale = str(uuid.uuid4())
+    direction_id_snapshot_only = str(uuid.uuid4())
+    direction_id_minimal = str(uuid.uuid4())
+
+    project = Project(
+        name="KnowledgeDocRetirementTest",
+        user_id="u-knowdoc-retirement",
+        directions=[
+            {
+                "id": direction_id_with_rationale,
+                "text": "Build the metrics pipeline end-to-end",
+                "status": "retired",
+                "priority": "medium",
+                "notes": [],
+                "context": {
+                    "success_evidence": "CI passes on main for 7 days",
+                    "retirement_condition": "All acceptance criteria verified",
+                },
+                "research_history": [
+                    {"cycles": 1, "prs_merged": 2, "tasks_completed": 3, "tasks_failed": 0},
+                ],
+            },
+            {
+                "id": direction_id_snapshot_only,
+                "text": "Ship the observability dashboard",
+                "status": "retired",
+                "priority": "medium",
+                "notes": [],
+                "context": {
+                    "success_evidence": "Dashboard live in production",
+                },
+            },
+            {
+                "id": direction_id_minimal,
+                # no text, no context — triggers minimal fallback
+                "status": "retired",
+                "priority": "low",
+                "notes": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    spawned = await _spawn_retirement_memos(
+        db_session,
+        project,
+        parent_task,
+        retired_ids=[direction_id_with_rationale, direction_id_snapshot_only, direction_id_minimal],
+        rationales={direction_id_with_rationale: "Pipeline complete and all criteria met."},
+    )
+    assert spawned == 3
+
+    await db_session.commit()
+
+    docs = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.project_id == project.id,
+                    KnowledgeDocument.source_kind == SourceKind.DIRECTION_RETIREMENT.value,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(docs) == 3, f"expected 3 KnowledgeDocument rows, got {len(docs)}"
+
+    docs_by_direction = {d.direction_id: d for d in docs}
+
+    # Branch 1: rationale-present
+    doc = docs_by_direction.get(direction_id_with_rationale)
+    assert doc is not None, "KnowledgeDocument missing for rationale-present direction"
+    assert doc.source_kind == SourceKind.DIRECTION_RETIREMENT.value
+    assert doc.topic == "direction-retirement"
+    assert doc.body, "body must be non-empty"
+    assert "Pipeline complete" in doc.body
+    assert doc.project_id == project.id
+
+    # Branch 2: snapshot-substantive (no rationale but has context)
+    doc2 = docs_by_direction.get(direction_id_snapshot_only)
+    assert doc2 is not None, "KnowledgeDocument missing for snapshot-substantive direction"
+    assert doc2.source_kind == SourceKind.DIRECTION_RETIREMENT.value
+    assert doc2.topic == "direction-retirement"
+    assert doc2.body, "body must be non-empty"
+
+    # Branch 3: minimal fallback
+    doc3 = docs_by_direction.get(direction_id_minimal)
+    assert doc3 is not None, "KnowledgeDocument missing for minimal-fallback direction"
+    assert doc3.source_kind == SourceKind.DIRECTION_RETIREMENT.value
+    assert doc3.topic == "direction-retirement"
+    assert doc3.body, "body must be non-empty"
+    assert f"direction:{direction_id_minimal}" in doc3.source_citations
+
+
 # ===========================================================================
 # refresh_open_version_goal_if_auto_derived via _handle_strategic_completion
 # ===========================================================================

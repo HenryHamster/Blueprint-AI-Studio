@@ -256,6 +256,7 @@ class SourceKind(str, Enum):
     COMPUTE_EXPERIMENT = "compute_experiment"
     RESEARCH_AUDIT = "research_audit"
     REPO_DOMAIN = "repo_domain"
+    DIRECTION_RETIREMENT = "direction_retirement"
     UNKNOWN = "unknown"
 
 
