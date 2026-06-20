@@ -4148,6 +4148,45 @@ def test_code_change_prompt_static_bytes():
     )
 
 
+def test_playbook_guidance_trigger_bullets_condensed():
+    """PLAYBOOK_GUIDANCE must use at most 5 trigger-condition bullets.
+
+    PR #11033 condensed the 10 original bullets to 5 by merging overlapping
+    categories (error-fixes + linting rules; workarounds + wrong-approaches;
+    build-commands + env-setup; test-setup + test-patterns; module-deps +
+    architecture). This test guards against re-expansion.
+    """
+    import os
+
+    prompt_ts = os.path.join(
+        os.path.dirname(__file__), "..", "..", "agent", "src", "prompt.ts"
+    )
+    prompt_ts = os.path.normpath(prompt_ts)
+    if not os.path.exists(prompt_ts):
+        pytest.skip("agent/src/prompt.ts not available in this environment")
+
+    with open(prompt_ts, encoding="utf-8") as fh:
+        src = fh.read()
+
+    # Extract the PLAYBOOK_GUIDANCE template literal body
+    marker = "**When to save (trigger conditions):**"
+    start = src.find(marker)
+    assert start != -1, (
+        "PLAYBOOK_GUIDANCE trigger conditions section not found in prompt.ts"
+    )
+    end_marker = "\n\n**What NOT to save:**"
+    end = src.find(end_marker, start)
+    assert end != -1, "'What NOT to save' section not found after trigger conditions"
+
+    trigger_section = src[start:end]
+    bullet_count = trigger_section.count("\n- ")
+    assert bullet_count <= 5, (
+        f"PLAYBOOK_GUIDANCE has {bullet_count} trigger bullets (max 5). "
+        "Consolidate overlapping categories rather than expanding the list. "
+        "See PR #11033 for the canonical 5-bullet grouping."
+    )
+
+
 # ---------------------------------------------------------------------------
 # compute_llm_cost_by_task_type tests
 # ---------------------------------------------------------------------------
