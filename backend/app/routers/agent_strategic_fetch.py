@@ -371,6 +371,46 @@ async def agent_fetch_vm_cost(
     }
 
 
+@router.get("/projects/{project_id}/efficiency-snapshot")
+@limiter.limit("60/minute")
+async def agent_fetch_efficiency_snapshot(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return the current efficiency snapshot for the project: cost_per_merged_pr,
+    vm_reuse_rate, llm_cost_per_merged_pr, format_compliance, and window metadata.
+    Reuses the same compute path as the operator dashboard so numbers are consistent.
+    Read-only; cross-project access returns 404."""
+    from app.efficiency_snapshot import (  # noqa: PLC0415
+        AXIS_COST_PER_MERGED_PR,
+        AXIS_LLM_COST_PER_MERGED_PR,
+        AXIS_VM_REUSE_RATE,
+        FORMAT_COMPLIANCE_KEY,
+        _AXIS_WINDOW_DAYS,
+        _compute_cost_per_merged_pr,
+        _compute_llm_cost_per_merged_pr,
+        _compute_vm_reuse_rate,
+        _load_recent_tasks,
+    )
+    from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
+
+    await _resolve_agent_project(project_id, token, session)
+    tasks = await _load_recent_tasks(session, project_id)
+    format_compliance = compute_format_compliance_metrics(tasks)
+    return {
+        "status": "success",
+        "data": {
+            AXIS_COST_PER_MERGED_PR: _compute_cost_per_merged_pr(tasks),
+            AXIS_VM_REUSE_RATE: _compute_vm_reuse_rate(tasks),
+            AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
+            FORMAT_COMPLIANCE_KEY: format_compliance,
+            "window_days": _AXIS_WINDOW_DAYS,
+        },
+    }
+
+
 @router.get("/projects/{project_id}/gaps/{gap_id}")
 @limiter.limit("60/minute")
 async def agent_fetch_gap(

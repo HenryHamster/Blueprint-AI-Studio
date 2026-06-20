@@ -25103,6 +25103,7 @@ async def test_finalize_carries_blind_merge_grade_forward(db_session, mocker):
     assert carried.get("coverage_verdict") == "partial"
     assert carried.get("biggest_gap") == "Auth module changes not covered by merged PRs"
 
+
 # ===========================================================================
 # Blind merge-grade hard-block hook (armable-dark)
 # ===========================================================================
@@ -25359,3 +25360,101 @@ class TestBlindMergeGradeBlock:
             f"covers verdict must not trigger merge_grade_misses blocker; "
             f"got blocker={result.get('blocker')!r}"
         )
+
+
+@pytest.mark.asyncio
+async def test_release_audit_payload_includes_version_goal(db_session, mocker):
+    """run_qualification threads version.goal into the release_audit payload.
+
+    When a version has a non-empty goal, the spawned release_audit task's
+    first_payload must contain a 'version_goal' key equal to that goal string.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.goal = "STABILIZE — reduce pipeline friction"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    candidate = "abcdef12" * 5
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    audit_tasks = [
+        t for t in tasks if (t.first_payload or {}).get("type") == "release_audit"
+    ]
+    assert len(audit_tasks) == 1, (
+        f"expected 1 release_audit task, got {len(audit_tasks)}"
+    )
+    audit_task = audit_tasks[0]
+    assert (
+        audit_task.first_payload["version_goal"]
+        == "STABILIZE — reduce pipeline friction"
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_audit_payload_omits_version_goal_when_none(db_session, mocker):
+    """run_qualification omits version_goal from the release_audit payload when version.goal is None."""
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    assert version.goal is None
+
+    candidate = "deadbeef" * 5
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    audit_tasks = [
+        t for t in tasks if (t.first_payload or {}).get("type") == "release_audit"
+    ]
+    assert len(audit_tasks) == 1, (
+        f"expected 1 release_audit task, got {len(audit_tasks)}"
+    )
+    audit_task = audit_tasks[0]
+    assert "version_goal" not in audit_task.first_payload

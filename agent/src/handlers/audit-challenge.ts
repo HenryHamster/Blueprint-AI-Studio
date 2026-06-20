@@ -384,6 +384,13 @@ export async function handleReleaseAuditChallenge(
   const primaryFindings = parsePrimaryFindings(payload);
   const primaryFindingsSection = formatPrimaryFindingsSection(primaryFindings);
 
+  const versionGoal = typeof payload.version_goal === 'string' && payload.version_goal.length > 0
+    ? payload.version_goal
+    : null;
+  const versionGoalSection = versionGoal
+    ? `\n## Version Goal\n\n${versionGoal}\n\nThis is the strategic objective the version aimed to deliver. As optional metadata (does NOT affect the \`verdicts\` structure), you may add a \`goal_alignment_comment\` string field to your JSON output (1-2 sentences): note whether you agree or disagree with the primary audit's \`goal_alignment\` assessment, or flag a discrepancy you observed in the diff. Omit it if the primary audit did not include \`goal_alignment\` or you have no meaningful observation.\n\n`
+    : '';
+
   const challengePrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}You are a release-audit CHALLENGER — an independent, adversarial second opinion. A primary release-audit agent already reviewed the diff range \`${diffRange}\` and produced findings. Your job is NOT to repeat that audit, but to skeptically RE-JUDGE its higher-severity findings against the real code. \`${candidateSha}\` is the PINNED release candidate commit; it has already been fetched into this clone on \`${baseBranch}\`, so the diff range resolves.
 
 ## Your task
@@ -394,7 +401,7 @@ export async function handleReleaseAuditChallenge(
    - \`confirmed\` — you independently reproduced the issue against the real code; it is a genuine problem.
    - \`refuted_false_positive\` — you investigated and the issue does NOT hold (e.g. a hardcoded constant reaching a sink is not injection; a per-request DB check is not a replay gap; an exception-guarded comparison is not a TypeError).
    - \`uncertain\` — you could not confidently confirm or refute it from the available code.
-
+${versionGoalSection}
 3. **Emit results.** Write your verdicts as a JSON object to \`/tmp/release_audit_challenge_${taskId}.json\` with EXACTLY this structure:
 
 \`\`\`json

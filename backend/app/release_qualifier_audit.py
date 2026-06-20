@@ -198,6 +198,7 @@ async def _spawn_release_audit_task(
     base_branch: str,
     diff_range: str,
     candidate_sha: str,
+    version_goal: str | None = None,
 ) -> Task:
     """Create + queue a ``release_audit`` task for the qualifier."""
     payload: dict[str, Any] = {
@@ -208,6 +209,8 @@ async def _spawn_release_audit_task(
         # reads this from the payload and checks out this SHA.
         "candidate_sha": candidate_sha,
     }
+    if version_goal:
+        payload["version_goal"] = version_goal
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
         "release_audit"
     )
@@ -268,6 +271,7 @@ async def _spawn_release_audit_challenge_task(
     candidate_sha: str,
     primary_audit_task_id: str | None = None,
     primary_findings: list[dict[str, str]] | None = None,
+    version_goal: str | None = None,
 ) -> Task:
     """Create + queue a challenge task for the release-audit flow.
 
@@ -282,6 +286,8 @@ async def _spawn_release_audit_challenge_task(
         "diff_range": diff_range,
         "candidate_sha": candidate_sha,
     }
+    if version_goal:
+        payload["version_goal"] = version_goal
     if primary_audit_task_id is not None:
         payload["primary_audit_task_id"] = primary_audit_task_id
         payload["primary_audit_report"] = None
@@ -519,8 +525,7 @@ async def get_latest_release_audit_challenge(
                 select(Task)
                 .where(
                     Task.project_id == project_id,
-                    Task.payloads[0]["type"].as_string()
-                    == "release_audit_challenge",
+                    Task.payloads[0]["type"].as_string() == "release_audit_challenge",
                     Task.context["candidate_sha"].as_string() == candidate_sha,
                 )
                 .order_by(Task.created_at.desc())
@@ -561,7 +566,9 @@ async def _audit_report_for_task(
         session, task.id, ArtifactType.RELEASE_AUDIT_REPORT
     )
     ctx = task.context or {}
-    status_val = task.status.value if hasattr(task.status, "value") else str(task.status)
+    status_val = (
+        task.status.value if hasattr(task.status, "value") else str(task.status)
+    )
     return {
         "audit_task_id": str(task.id),
         "task_status": status_val,
@@ -898,9 +905,7 @@ async def _handle_independent_blocker(
         f0 = independent_blocker_findings[0]
         sev = str(f0.get("severity") or "high").upper()
         summary = str(f0.get("summary") or "").strip()
-        blocker_detail = (
-            f" ({sev}: {summary[:120]})" if summary else f" ({sev})"
-        )
+        blocker_detail = f" ({sev}: {summary[:120]})" if summary else f" ({sev})"
     rq = _release_qualifier_module()
     await rq._notify_operator(
         session,

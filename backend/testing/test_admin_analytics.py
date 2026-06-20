@@ -3746,3 +3746,107 @@ class TestLanePilotPreflight:
             f"/api/admin/improvement-lanes/preflight?project_id={uuid.uuid4()}"
         )
         assert resp.status_code == 404
+
+
+class TestSpendBurnRate:
+    @pytest.mark.asyncio
+    async def test_returns_daily_and_monthly_spend(
+        self, client: AsyncClient, db_session
+    ):
+        """Completed tasks in window contribute to daily rate and monthly forecast."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        # Two tasks completing 1 day apart (within 7d window), each 1h of VM time.
+        for days_ago in (1, 3):
+            completed_at = now - timedelta(days=days_ago)
+            started_at = completed_at - timedelta(hours=1)
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    title=f"task-{days_ago}d",
+                    status=TaskStatus.COMPLETED,
+                    created_by="ORCHESTRATOR",
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    started_at=started_at,
+                    created_at=started_at,
+                    status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                    vm_provisioned_at=started_at,
+                    vm_stopped_at=completed_at,
+                    vm_spot=False,
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/spend-burn-rate?project_id={project.id}&window_days=7"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["project_id"] == str(project.id)
+        assert body["window_days"] == 7
+        assert body["task_count"] == 2
+        # Two 1-hour tasks at on-demand rate
+        expected_total = round(2 * 3600 * admin_analytics.ON_DEMAND_RATE, 2)
+        assert body["window_cost_usd"] == pytest.approx(expected_total, abs=0.01)
+        assert body["daily_spend_usd"] == pytest.approx(expected_total / 7, abs=0.01)
+        assert body["monthly_forecast_usd"] == pytest.approx(
+            (expected_total / 7) * 30, abs=0.01
+        )
+
+    @pytest.mark.asyncio
+    async def test_excludes_tasks_outside_window(
+        self, client: AsyncClient, db_session
+    ):
+        """Tasks older than window_days do not contribute to burn rate."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        # One task inside the window, one outside
+        for days_ago, title in [(1, "in-window"), (10, "out-of-window")]:
+            completed_at = now - timedelta(days=days_ago)
+            started_at = completed_at - timedelta(hours=1)
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    title=title,
+                    status=TaskStatus.COMPLETED,
+                    created_by="ORCHESTRATOR",
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    started_at=started_at,
+                    created_at=started_at,
+                    status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                    vm_provisioned_at=started_at,
+                    vm_stopped_at=completed_at,
+                    vm_spot=False,
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/spend-burn-rate?project_id={project.id}&window_days=7"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_no_tasks_returns_zero_rates(self, client: AsyncClient, db_session):
+        """Empty project returns zero daily and monthly rates."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/spend-burn-rate?project_id={project.id}&window_days=7"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_count"] == 0
+        assert body["window_cost_usd"] == 0.0
+        assert body["daily_spend_usd"] == 0.0
+        assert body["monthly_forecast_usd"] == 0.0

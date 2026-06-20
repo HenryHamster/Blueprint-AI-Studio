@@ -619,6 +619,13 @@ export async function handleReleaseAudit(
   const retryContext = buildRetryContext(task);
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
+  const versionGoal = typeof payload.version_goal === 'string' && payload.version_goal.length > 0
+    ? payload.version_goal
+    : null;
+  const versionGoalSection = versionGoal
+    ? `\n## Version Goal\n\n${versionGoal}\n\nIn addition to the standard quality checks below, assess whether this diff plausibly delivers the version's strategic goal stated above. Add a \`goal_alignment\` object to your JSON output with:\n- \`covered\` (boolean): true if the diff plausibly delivers the goal, false otherwise.\n- \`rationale\` (string, 1-3 sentences): explain whether the merged changes advance the goal or fall short, citing specific files or patterns from the diff.\n\nThis is an ADDITIONAL field alongside the required \`audit_score\`, \`test_erosion\`, and \`findings\` fields — it does not replace them.\n\n`
+    : '';
+
   const releaseAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}You are a release audit agent. You have been cloned onto \`${baseBranch}\` — the last known-good LTS branch — and your job is to review the incoming diff range \`${diffRange}\` against \`${baseBranch}\`'s standards. \`${candidateSha}\` is the PINNED release candidate commit (a snapshot of the integration branch); it has already been fetched into this clone, so the diff range resolves.
 
 IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge the incoming changes by \`${baseBranch}\`'s standards, NOT by the new code's standards. This asymmetry is the entire point of the audit.
@@ -638,7 +645,7 @@ IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge th
    - Architecture drift (patterns inconsistent with the existing codebase conventions)
    - Test coverage gaps for new behavior
    - Documentation / comment accuracy
-
+${versionGoalSection}
 4. **Score and emit results.** Write your findings as a JSON object to \`/tmp/release_audit_report_${taskId}.json\` with EXACTLY this structure:
 
 \`\`\`json

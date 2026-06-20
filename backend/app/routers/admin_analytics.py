@@ -632,6 +632,77 @@ async def get_task_cost_breakdown(
     }
 
 
+@router.get("/spend-burn-rate")
+async def get_spend_burn_rate(
+    project_id: uuid.UUID | None = Query(None),
+    window_days: int = Query(7, ge=1, le=30),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return daily spend burn rate and monthly cost forecast.
+
+    Queries completed tasks over ``window_days`` to compute a rolling daily
+    average and a 30-day projection so operators can track spend trajectory.
+    """
+    cutoff = _utcnow() - timedelta(days=window_days)
+    filters = [
+        Task.status.in_(
+            [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+        ),
+        Task.created_at >= cutoff,
+    ]
+    if project_id is not None:
+        filters.append(Task.project_id == project_id)
+
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.created_at,
+                        Task.status_log,
+                        Task.context,
+                        Task.vm_provisioned_at,
+                        Task.vm_stopped_at,
+                        Task.vm_spot,
+                        Task.vm_runtime_cost_banked_db,
+                        raiseload=True,
+                    )
+                )
+                .where(*filters)
+                .order_by(Task.created_at.desc())
+                .limit(20000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    total_cost = 0.0
+    task_count = 0
+    for task in tasks:
+        cost = get_task_total_vm_cost_usd_or_none(task)
+        if cost is None:
+            continue
+        total_cost += cost
+        task_count += 1
+
+    daily_spend_usd = total_cost / window_days if window_days > 0 else 0.0
+    monthly_forecast_usd = daily_spend_usd * 30
+
+    return {
+        "project_id": str(project_id) if project_id else None,
+        "window_days": window_days,
+        "window_cost_usd": round(total_cost, 2),
+        "task_count": task_count,
+        "daily_spend_usd": round(daily_spend_usd, 2),
+        "monthly_forecast_usd": round(monthly_forecast_usd, 2),
+    }
+
+
 @router.get("/lane-diag")
 async def get_lane_diag(
     project_id: uuid.UUID | None = Query(None),

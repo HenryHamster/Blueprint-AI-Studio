@@ -310,7 +310,11 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
                 f"runtime_config promotion_weights sum to {weight_sum:.4f}, expected ~1.0"
             )
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
-        for _k in ("theme_warn_threshold", "theme_block_threshold", "merge_grade_block_threshold"):
+        for _k in (
+            "theme_warn_threshold",
+            "theme_block_threshold",
+            "merge_grade_block_threshold",
+        ):
             _v = _runtime_config.get(_k)
             if _v is not None:
                 with contextlib.suppress(TypeError, ValueError):
@@ -373,7 +377,11 @@ def _resolve_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
             )
 
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
-        for _k in ("theme_warn_threshold", "theme_block_threshold", "merge_grade_block_threshold"):
+        for _k in (
+            "theme_warn_threshold",
+            "theme_block_threshold",
+            "merge_grade_block_threshold",
+        ):
             if _k in parsed:
                 with contextlib.suppress(TypeError, ValueError):
                     result[_k] = float(parsed[_k])
@@ -1467,6 +1475,7 @@ async def run_qualification(
             base_branch=promotion_target,
             diff_range=diff_range,
             candidate_sha=candidate_sha,
+            version_goal=version.goal,
         )
         audit_task_id = str(audit_task.id)
         if smoketest_enabled:
@@ -2258,6 +2267,7 @@ async def _finalize_qualification(
                         base_branch=new_base_branch,
                         diff_range=new_diff_range,
                         candidate_sha=candidate_sha,
+                        version_goal=version.goal,
                     )
                     new_count = rl_respawn_count + 1
                     updated_qual = {
@@ -2312,6 +2322,7 @@ async def _finalize_qualification(
                         base_branch=new_base_branch,
                         diff_range=new_diff_range,
                         candidate_sha=candidate_sha,
+                        version_goal=version.goal,
                     )
                     new_count = infra_respawn_count + 1
                     updated_qual = append_infra_failure_child_event(
@@ -2539,6 +2550,7 @@ async def _finalize_qualification(
                 candidate_sha=candidate_sha,
                 primary_audit_task_id=audit_task_id,
                 primary_findings=primary_findings,
+                version_goal=version.goal,
             )
         except PayloadTooLargeError as _spawn_exc:
             logger.warning(
@@ -2664,6 +2676,7 @@ async def _finalize_qualification(
                                         candidate_sha=candidate_sha,
                                         primary_audit_task_id=audit_task_id,
                                         primary_findings=_chal_primary_findings,
+                                        version_goal=version.goal,
                                     )
                                 )
                             except PayloadTooLargeError as _chal_exc:
@@ -2805,6 +2818,7 @@ async def _finalize_qualification(
                     candidate_sha=candidate_sha,
                     primary_audit_task_id=audit_task_id,
                     primary_findings=primary_findings,
+                    version_goal=version.goal,
                 )
             except PayloadTooLargeError as _early_exc:
                 logger.warning(
@@ -2915,6 +2929,7 @@ async def _finalize_qualification(
                         candidate_sha=candidate_sha,
                         primary_audit_task_id=audit_task_id,
                         primary_findings=primary_findings,
+                        version_goal=version.goal,
                     )
                 except PayloadTooLargeError as _spawn_exc:
                     logger.warning(

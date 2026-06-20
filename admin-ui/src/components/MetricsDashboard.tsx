@@ -276,6 +276,15 @@ interface TaskCostBreakdownResponse {
   top_tasks: TopCostTask[];
 }
 
+interface SpendBurnRateResponse {
+  project_id: string | null;
+  window_days: number;
+  window_cost_usd: number;
+  task_count: number;
+  daily_spend_usd: number;
+  monthly_forecast_usd: number;
+}
+
 interface DigestLatencyStats {
   latency_percentiles: {
     p50_seconds: number | null;
@@ -773,6 +782,55 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
   );
 }
 
+function SpendBurnRateWidget({ projectId }: { projectId?: string }) {
+  const [data, setData] = useState<SpendBurnRateResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    setLoading(true);
+    setError(null);
+    setData(null);
+
+    (async () => {
+      try {
+        const params = new URLSearchParams({ window_days: '7' });
+        if (projectId) params.set('project_id', projectId);
+        const result = await apiFetch(`/api/admin/spend-burn-rate?${params}`);
+        if (!result.ok) throw new Error(`Failed to fetch spend burn rate: ${result.status}`);
+        if (mounted) setData(await result.json());
+      } catch (err) {
+        if (mounted) setError(err instanceof Error ? err.message : 'Unknown error');
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    })();
+
+    return () => { mounted = false; };
+  }, [projectId]);
+
+  if (loading) return <div className="flex items-center justify-center h-16 text-neutral-500 text-xs">Loading burn rate…</div>;
+  if (error) return <div className="flex items-center justify-center h-16 text-red-400 text-xs">{error}</div>;
+  if (!data) return null;
+
+  return (
+    <div data-testid="spend-burn-rate-widget" className="flex flex-wrap gap-6 items-end">
+      <div>
+        <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Daily spend (7d avg)</div>
+        <div className="text-2xl font-mono text-neutral-100">${data.daily_spend_usd.toFixed(2)}<span className="text-sm text-neutral-400">/day</span></div>
+      </div>
+      <div>
+        <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Monthly forecast</div>
+        <div className="text-2xl font-mono text-emerald-400">${data.monthly_forecast_usd.toFixed(2)}<span className="text-sm text-neutral-400">/mo</span></div>
+      </div>
+      <div className="text-[10px] text-neutral-500 font-mono ml-auto self-end">
+        {data.task_count} tasks · ${data.window_cost_usd.toFixed(2)} over {data.window_days}d
+      </div>
+    </div>
+  );
+}
+
 function TaskCostBreakdownWidget({ projectId, window }: { projectId: string; window: MetricsWindow }) {
   const [data, setData] = useState<TaskCostBreakdownResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1066,6 +1124,12 @@ export default function MetricsDashboard({
         <div className={cardClass}>
           <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">Failure Rate</div>
           <FailureRateChart points={metricsHistory} windowMs={windowMs} />
+        </div>
+
+        {/* Spend burn rate widget — full width */}
+        <div className={`${cardClass} sm:col-span-2`}>
+          <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-3">Spend Burn Rate</div>
+          <SpendBurnRateWidget projectId={projectId} />
         </div>
 
         {/* Cost breakdown widget — full width */}

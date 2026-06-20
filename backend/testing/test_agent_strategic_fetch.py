@@ -2178,3 +2178,50 @@ async def test_agent_fetch_vm_cost_rejects_cross_project(
         headers={"x-agent-token": token},
     )
     assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot(client: AsyncClient, db_session):
+    """Agent endpoint returns cost_per_merged_pr and vm_reuse_rate in data."""
+    project, task = await _make_project_task(db_session, vm="agent-vm-eff")
+    token = create_agent_token(str(task.id), "agent-vm-eff")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+    assert "cost_per_merged_pr" in data
+    assert "vm_reuse_rate" in data
+    assert "llm_cost_per_merged_pr" in data
+    assert "format_compliance" in data
+    assert data["window_days"] == 7
+
+
+@pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch efficiency-snapshot for project B (404)."""
+    project_a = Project(name="Eff A", user_id="test-user-effa")
+    project_b = Project(name="Eff B", user_id="test-user-effb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(
+        project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-effa"
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-effa")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
