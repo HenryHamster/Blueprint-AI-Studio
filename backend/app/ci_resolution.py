@@ -98,6 +98,19 @@ def proceed_on_no_checks(project, branch: str | None) -> bool:
     (``requires_ci_checks=False``). CI-gated repos keep polling — for them a
     missing check means 'not registered yet', never 'will never run'.
 
+    ``ci_required_branches`` override (``build_config``, default ``["main"]`` —
+    the promotion target): a repo that CONFIRMED it has CI (``has_ci=True``) but
+    relaxed ``requires_ci_checks`` — to skip per-PR CI on its integration branch
+    (e.g. ``automain``, whose PRs then legitimately carry zero checks) — STILL
+    keeps its required branches strictly CI-gated. This keeps the
+    integration->``main`` promotion gate airtight: a no_checks on the promotion
+    PR (the empty-checks window between PR-open and GitHub registering check-runs)
+    must never merge on absence of signal. The override is deliberately scoped to
+    ``has_ci is True`` so it ONLY constrains a CI-capable repo that opted out —
+    an external no-CI repo (``has_ci`` False or None/undetermined) is untouched
+    and proceeds on its real base as before, never wedged into polling for checks
+    that will never come.
+
     ``has_ci=False`` is authoritative over a stale ``requires_ci_checks=True``:
     a repo with zero workflows cannot produce check-runs on any PR, so polling
     is guaranteed to strand the parent in EVALUATING forever.
@@ -106,8 +119,16 @@ def proceed_on_no_checks(project, branch: str | None) -> bool:
         return False
     if project.is_staging_branch(branch):
         return True
-    if (getattr(project, "build_config", None) or {}).get("has_ci") is False:
+    build_config = getattr(project, "build_config", None) or {}
+    if build_config.get("has_ci") is False:
         return True
+    # CI-capable repo that relaxed requires_ci_checks: its required branches stay
+    # strict so the promotion gate cannot merge on absence of signal. Scoped to
+    # has_ci is True so no-CI / undetermined repos keep their existing behavior.
+    if build_config.get("has_ci") is True and branch is not None:
+        required_branches = build_config.get("ci_required_branches", ["main"])
+        if branch in required_branches:
+            return False
     return not requires_ci_checks(project)
 
 
