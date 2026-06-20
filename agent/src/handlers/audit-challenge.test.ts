@@ -567,6 +567,9 @@ describe('handleReleaseAuditChallenge — pinned candidate + diff-range pre-flig
 
     // First run + exactly one bounded self-repair reopen.
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const reopenPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(reopenPrompt).toContain('Output ONLY the JSON object now');
+    expect(reopenPrompt).not.toContain('/tmp/');
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');

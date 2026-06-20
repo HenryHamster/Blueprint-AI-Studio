@@ -6695,7 +6695,7 @@ async def test_read_baseline_by_schema_passthrough(db_session):
             "repair_output_tokens": 400,
             "self_repair_success_rate": 0.667,
         },
-        "audit": {
+        "security_audit": {
             "format_miss": 1,
             "repair_attempts": 1,
             "repair_successes": 1,
@@ -6740,7 +6740,7 @@ async def test_read_baseline_by_schema_passthrough(db_session):
         "by_schema contents must match the persisted snapshot value"
     )
     assert fc["by_schema"]["thinker"]["format_miss"] == 3
-    assert fc["by_schema"]["audit"]["self_repair_success_rate"] == 1.0
+    assert fc["by_schema"]["security_audit"]["self_repair_success_rate"] == 1.0
 
 
 # ---------------------------------------------------------------------------

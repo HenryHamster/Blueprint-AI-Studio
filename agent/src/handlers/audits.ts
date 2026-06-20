@@ -183,10 +183,10 @@ Rules:
     const repaired = await repairStructuredOutput<unknown[]>({
       mode: 'array',
       requiredKeys: ['severity'],
-      schemaLabel: 'audit',
+      schemaLabel: 'security_audit',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior security audit response did not end with a parseable JSON findings array.
-Return ONLY the JSON array for /tmp/security_findings_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE}. Each finding object must include at least "severity" plus title, description, file_path, line_number, and fix_prompt. Use [] if there are no findings. No markdown, prose, or code fences.`,
+Output ONLY the JSON array now — each finding must include at least "severity" plus title, description, file_path, line_number, and fix_prompt. Use [] if there are no findings. No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,
@@ -342,10 +342,10 @@ Rules:
     const objRepair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['findings', 'system_id'],
-      schemaLabel: 'audit',
+      schemaLabel: 'self_audit',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior self-audit response did not end with a parseable JSON object.
-Return ONLY the JSON object for /tmp/self_audit_findings_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with top-level "findings": [...] and each finding carrying "system_id", score, components, top_issues, recommended_mode, and evidence. No markdown, prose, or code fences.`,
+Output ONLY the JSON object now — with top-level "findings": [...] and each finding carrying "system_id", score, components, top_issues, recommended_mode, and evidence. No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,
@@ -691,10 +691,10 @@ Rules:
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['audit_score', 'findings'],
-      schemaLabel: 'audit',
+      schemaLabel: 'release_audit',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior release audit response did not end with a parseable JSON report object.
-Return ONLY the JSON object for /tmp/release_audit_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with top-level "audit_score", "test_erosion", and "findings". Each finding must include "severity", "summary", "file", and "verification_note". No markdown, prose, or code fences.`,
+Output ONLY the JSON object now — with top-level "audit_score", "test_erosion", and "findings". Each finding must include "severity", "summary", "file", and "verification_note". No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,

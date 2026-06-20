@@ -111,7 +111,9 @@ export type FormatMissReason =
  *  from leaking in via task-prompt text. */
 export type SchemaLabel =
   | 'memo'
-  | 'audit'
+  | 'security_audit'
+  | 'self_audit'
+  | 'release_audit'
   | 'audit_challenge'
   | 'research_spawn_adversarial_challenge'
   | 'design'

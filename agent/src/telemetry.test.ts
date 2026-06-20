@@ -279,9 +279,9 @@ describe('format-compliance telemetry — repair miss by schema', () => {
   it('recordFormatRepairMiss with schemaLabel fills format_repair_miss_by_schema', () => {
     recordFormatRepairMiss('no_json_start', 'thinker');
     recordFormatRepairMiss('malformed_json', 'thinker');
-    recordFormatRepairMiss('unbalanced_json', 'audit');
+    recordFormatRepairMiss('unbalanced_json', 'security_audit');
     const tel = getFormatComplianceTelemetry();
-    expect(tel.format_repair_miss_by_schema).toEqual({ thinker: 2, audit: 1 });
+    expect(tel.format_repair_miss_by_schema).toEqual({ thinker: 2, security_audit: 1 });
     expect(tel.format_repair_miss_by_reason).toEqual({ no_json_start: 1, malformed_json: 1, unbalanced_json: 1 });
   });
 
@@ -346,9 +346,9 @@ describe('format-compliance telemetry — schema dimension', () => {
   });
 
   it('reset clears per-schema maps', () => {
-    recordFormatMiss('unbalanced_json', 'audit');
-    recordFormatRepairAttempt('audit');
-    recordFormatRepairSuccess('audit');
+    recordFormatMiss('unbalanced_json', 'security_audit');
+    recordFormatRepairAttempt('security_audit');
+    recordFormatRepairSuccess('security_audit');
     resetFormatComplianceTelemetry();
 
     const tel = getFormatComplianceTelemetry();
@@ -449,7 +449,7 @@ describe('format-compliance telemetry — repair token counters', () => {
   });
 
   it('reset clears repair token counters and per-schema maps', () => {
-    recordFormatRepairTokens(1000, 500, 'audit');
+    recordFormatRepairTokens(1000, 500, 'security_audit');
     resetFormatComplianceTelemetry();
     const tel = getFormatComplianceTelemetry();
     expect(tel.format_repair_input_tokens).toBe(0);

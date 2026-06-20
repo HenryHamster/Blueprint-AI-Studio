@@ -743,7 +743,7 @@ Rules:
       schemaLabel: 'specialized_findings',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior performance analysis response did not end with a parseable JSON findings array.
-Return ONLY the JSON array for /tmp/perf_report_${taskId}.json. Each finding object must include at least "severity" plus area, title, description, fix_prompt, and related_files. Use [] if there are no findings. No markdown, prose, or code fences.`,
+Output ONLY the JSON array now — each finding must include at least "severity" plus area, title, description, fix_prompt, and related_files. Use [] if there are no findings. No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,
@@ -977,6 +977,7 @@ recommended_fix guidance:
 
 IMPORTANT:
 - Write ONLY the JSON object to /tmp/investigation_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} — no markdown, no code fences, no extra text.
+- Also output the same JSON object as the final output in your logs.
 - Do NOT modify any files in the repository.
 - Base every claim on code you have actually read.`;
 
@@ -995,8 +996,8 @@ IMPORTANT:
       requiredKeys: ['root_cause', 'recommended_fix'],
       schemaLabel: 'specialized_result',
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `Your prior investigation response did not end with a parseable JSON diagnosis object.
-Return ONLY the JSON object for /tmp/investigation_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with top-level "summary", "root_cause", "affected_files", "recommended_fix", "severity", and "confidence". Include verdict fields when relevant. No markdown, prose, or code fences.`,
+      reopenPrompt: `${(lastResultText || allOutput || '').slice(-8000) ? `${(lastResultText || allOutput || '').slice(-8000)}\n\n` : ''}Your prior investigation response did not end with a parseable JSON diagnosis object.
+Output ONLY the JSON object now — with top-level "summary", "root_cause", "affected_files", "recommended_fix", "severity", and "confidence". Include verdict fields when relevant. No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,
