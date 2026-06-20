@@ -2512,7 +2512,11 @@ def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
         if r.get("priced") and r["total_cost_usd"] > 0
     ]
     by_task_type = [
-        {"task_type": r["task_type"], "cost_usd": r["total_cost_usd"]}
+        {
+            "task_type": r["task_type"],
+            "cost_usd": r["total_cost_usd"],
+            "mean_input_tokens_per_call": r.get("mean_input_tokens_per_call"),
+        }
         for r in by_type_rows
         if r["total_cost_usd"] > 0
     ]

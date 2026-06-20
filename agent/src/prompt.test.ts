@@ -4577,7 +4577,9 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — evidence anchors', () => {
   });
 
   it('specifies scope-drift anchor formats (diff stats and file list)', () => {
-    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/Trigger A.*diff.*stats|Trigger B.*related_files/);
+    // Trigger A (diff stat) is on the same line as the reference; Trigger B and
+    // related_files may be on adjacent lines, so use dotAll for the B branch.
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/Trigger A.*diff.*stat|Trigger B[\s\S]*?related_files/);
   });
 
   it('mentions that this requirement applies to high-stakes categories', () => {

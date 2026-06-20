@@ -4414,6 +4414,38 @@ def test_compute_llm_cost_by_task_type():
     assert create_row["verified_merged_count"] == 1
 
 
+def test_compact_llm_cost_attribution():
+    """mean_input_tokens_per_call is stored in each by_task_type row of the
+    compact attribution block under a real merge-test verdict."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 600,
+            "llm_call_count": 6,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    from app.efficiency_snapshot import _compact_llm_cost_attribution
+
+    result = _compact_llm_cost_attribution([task])
+    by_type = {r["task_type"]: r for r in result["by_task_type"]}
+
+    assert "create" in by_type
+    create_row = by_type["create"]
+    assert create_row["mean_input_tokens_per_call"] == 500  # 3000 / 6
+    assert create_row["cost_usd"] > 0
+
+
 @pytest.mark.asyncio
 async def test_llm_cost_breakdown_endpoint_includes_by_task_type(
     client: AsyncClient, db_session
