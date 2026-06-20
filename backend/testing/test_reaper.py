@@ -1870,6 +1870,44 @@ async def test_heartbeat_timeout_api_error_logs_classified_as_external_api(
 
 
 @pytest.mark.asyncio
+async def test_cloud_run_task_reap_skips_vm_deletion(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Reaped Cloud Run task must not enqueue a GCE VM deletion.
+
+    Cloud Run tasks carry a synthetic vm_instance_id (not a real GCE instance
+    name). Calling _ensure_vm_deleted on them fires a GCE API call against a
+    non-existent resource. The guard added to reaper.py must prevent that.
+    """
+    ensure_deleted = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_machine_type="cloud-run-1vcpu-2gib",
+        vm_instance_id="cloud-run-job-test-123",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    # Task must have been reaped (heartbeat expired).
+    assert t.status in (TaskStatus.FAILED, TaskStatus.QUEUED), (
+        f"Expected task to be reaped, got status={t.status}"
+    )
+    # The synthetic Cloud Run vm_id must NOT have triggered a GCE deletion call.
+    ensure_deleted.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_external_api_retry_delay_escalates_with_attempt_count(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):

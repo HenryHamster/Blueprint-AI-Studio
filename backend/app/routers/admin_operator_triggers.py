@@ -113,7 +113,7 @@ def _record_failure_result(task: Task, failure_class: str) -> None:
         logger.exception(f"[ADMIN] Failed to record failure result for task {task.id}")
 
 
-class SelfAuditRequest(BaseModel):
+class _SelfAuditRequest(BaseModel):
     """Optional body for POST /projects/{project_id}/self-audit.
 
     Both fields are optional — when omitted, the agent picks up to ``max_systems``
@@ -127,7 +127,7 @@ class SelfAuditRequest(BaseModel):
 @router.post("/projects/{project_id}/self-audit")
 async def trigger_self_audit(
     project_id: uuid.UUID,
-    body: SelfAuditRequest | None = None,
+    body: _SelfAuditRequest | None = None,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -949,7 +949,7 @@ async def cancel_strategic_refresh_endpoint(
     return {"cleared": cleared}
 
 
-class RecordFindingResolutionBody(BaseModel):
+class _RecordFindingResolutionBody(BaseModel):
     """Body for POST /projects/{project_id}/finding-resolution."""
 
     finding_key: str = Field(..., min_length=1, max_length=64)
@@ -964,7 +964,7 @@ class RecordFindingResolutionBody(BaseModel):
 @router.post("/projects/{project_id}/finding-resolution")
 async def record_finding_resolution(
     project_id: uuid.UUID,
-    body: RecordFindingResolutionBody,
+    body: _RecordFindingResolutionBody,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):

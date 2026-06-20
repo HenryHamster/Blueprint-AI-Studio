@@ -54,6 +54,7 @@ from app.compute import (
     any_zone_available,
     soonest_zone_recovery,
 )
+from app.compute_cloud_run import is_cloud_run_task
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import (
     record_pipeline_event,
@@ -889,7 +890,9 @@ async def reaper_service():
                                 # idempotent, so re-collecting on a later cycle (if the
                                 # orphan re-qualifies before its row is cleaned up) is
                                 # harmless.
-                                if task.vm_instance_id:
+                                if task.vm_instance_id and not is_cloud_run_task(
+                                    task.vm_machine_type
+                                ):
                                     _reaper_old_vms[str(task.id)] = task.vm_instance_id
                                 _orphan_reap_crash_streaks.pop(str(task_id), None)
                                 continue
@@ -1005,7 +1008,9 @@ async def reaper_service():
                         )
 
                         # Capture old VM ID before any overwrite — deletion happens after commit
-                        if fresh_task.vm_instance_id:
+                        if fresh_task.vm_instance_id and not is_cloud_run_task(
+                            fresh_task.vm_machine_type
+                        ):
                             _reaper_old_vms[str(task.id)] = fresh_task.vm_instance_id
 
                         # Read-only inputs to the I/O block + branch decisions below.

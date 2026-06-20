@@ -104,7 +104,7 @@ router = APIRouter(
 # ---------------------------------------------------------------------------
 
 
-class StuckTaskInfo(TypedDict):
+class _StuckTaskInfo(TypedDict):
     task_id: str
     title: str
     status: TaskStatus
@@ -116,7 +116,7 @@ class StuckTaskInfo(TypedDict):
     remediation_hint: str
 
 
-class CircuitBreakerInfo(TypedDict):
+class _CircuitBreakerInfo(TypedDict):
     state: str
     failure_count: int
     infra_failure_count: int
@@ -126,7 +126,7 @@ class CircuitBreakerInfo(TypedDict):
     opened_at: Optional[str]
 
 
-class ProjectSummary(TypedDict):
+class _ProjectSummary(TypedDict):
     project_id: str
     stuck_count: int
     queued_count: int
@@ -135,7 +135,7 @@ class ProjectSummary(TypedDict):
     needs_manual_intervention_count: int
 
 
-class DirectionRemediationInfo(TypedDict):
+class _DirectionRemediationInfo(TypedDict):
     direction_id: str
     direction_text: str
     status: str
@@ -156,7 +156,7 @@ class DirectionRemediationInfo(TypedDict):
 
 def _build_direction_remediation_state(
     project: Project,
-) -> List[DirectionRemediationInfo]:
+) -> List[_DirectionRemediationInfo]:
     """Surface per-direction diagnosis/remediation state for operators.
 
     Returns entries for directions that have notable state: active remediation
@@ -164,7 +164,7 @@ def _build_direction_remediation_state(
     manual-intervention flag. Directions with no such state are omitted so the
     operator view stays focused on what actually needs attention.
     """
-    entries: List[DirectionRemediationInfo] = []
+    entries: List[_DirectionRemediationInfo] = []
     for d in project.directions or []:
         attempts = int(d.get("remediation_attempts", 0) or 0)
         monitor_started = d.get("remediation_monitor_started_at")
@@ -300,11 +300,11 @@ async def _build_stuck_tasks(
     tasks: List[Task],
     now: datetime,
     session: AsyncSession,
-) -> List[StuckTaskInfo]:
+) -> List[_StuckTaskInfo]:
     """Detect stuck tasks and build the diagnostics list."""
     from app.compute import get_zone_health  # noqa: PLC0415
 
-    stuck: List[StuckTaskInfo] = []
+    stuck: List[_StuckTaskInfo] = []
     # Align with reaper's pre-claim threshold (6 min) so diagnostics don't flag a
     # PROVISIONING task before the reaper would act on it. IN_PROGRESS heartbeat
     # threshold is computed per-task via reaper._heartbeat_stale_cutoff to match
@@ -482,7 +482,7 @@ async def _build_stuck_tasks(
     return stuck
 
 
-def _format_circuit_breaker(cb: dict) -> CircuitBreakerInfo:
+def _format_circuit_breaker(cb: dict) -> _CircuitBreakerInfo:
     opened_at = cb.get("opened_at")
     cooldown_remaining = None
     if opened_at and cb.get("state") == "OPEN":
@@ -1486,15 +1486,15 @@ async def get_global_diagnostics(
         .options(load_only(Project.id, Project.directions, raiseload=True))
         .limit(500)
     )
-    remediation_by_project: Dict[str, List[DirectionRemediationInfo]] = {}
+    remediation_by_project: Dict[str, List[_DirectionRemediationInfo]] = {}
     for proj in projects_result.scalars().all():
         entries = _build_direction_remediation_state(proj)
         if entries:
             remediation_by_project[str(proj.id)] = entries
 
-    all_stuck: List[StuckTaskInfo] = []
-    project_summaries: List[ProjectSummary] = []
-    all_remediation: List[DirectionRemediationInfo] = []
+    all_stuck: List[_StuckTaskInfo] = []
+    project_summaries: List[_ProjectSummary] = []
+    all_remediation: List[_DirectionRemediationInfo] = []
 
     project_ids = set(by_project.keys()) | set(remediation_by_project.keys())
     for pid in project_ids:
