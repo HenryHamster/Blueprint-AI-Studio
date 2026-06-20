@@ -1986,3 +1986,105 @@ async def test_resolve_message_ref_tail_tradeoff_old_message_not_found(
         headers={"x-agent-token": token},
     )
     assert res.status_code == 404, res.text
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_vm_cost_by_task_type(client: AsyncClient, db_session):
+    """Agent ./fetch vm-cost returns by-task-type VM cost/count/merge-yield rows
+    plus window metadata. Tasks of different types are bucketed; merged tasks
+    contribute to merged_count."""
+    from app.models import TaskStatus
+    from datetime import datetime, timezone
+
+    project = Project(name="VmCost Test", user_id="test-user-vmcost")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task that holds the agent token
+    token_task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-vmcost",
+    )
+    db_session.add(token_task)
+
+    # A completed create task (no merge signal)
+    create_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        updated_at=datetime.now(timezone.utc),
+        vm_provisioned_at=datetime.now(timezone.utc),
+        vm_stopped_at=datetime.now(timezone.utc),
+    )
+    db_session.add(create_task)
+
+    # A completed fix task with a merge signal
+    fix_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        updated_at=datetime.now(timezone.utc),
+        vm_provisioned_at=datetime.now(timezone.utc),
+        vm_stopped_at=datetime.now(timezone.utc),
+        context={"pr_merged": True},
+    )
+    db_session.add(fix_task)
+
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-vmcost")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/vm-cost",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+    assert "by_task_type" in data
+    assert "window_days" in data
+    assert data["window_days"] == 7
+    # Each row has the expected fields
+    rows = data["by_task_type"]
+    assert isinstance(rows, list)
+    task_types = {r["task_type"] for r in rows}
+    # The two non-token tasks have types "create" and "fix"
+    assert "create" in task_types or "fix" in task_types
+    for row in rows:
+        assert "task_count" in row
+        assert "merged_count" in row
+        assert "total_cost_usd" in row
+        assert "share_of_total_cost" in row
+        assert "cost_per_merge" in row
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_vm_cost_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch vm-cost for project B (404)."""
+    project_a = Project(name="VmCost A", user_id="test-user-vmca")
+    project_b = Project(name="VmCost B", user_id="test-user-vmcb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(
+        project_id=project_a.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-vmca",
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-vmca")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/vm-cost",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
