@@ -24,7 +24,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app import release_version
 from app.database import AsyncSessionLocal
-from app.models import Alert, AlertSeverity, ReleaseDeployArtifact
+from app.models import Alert, AlertSeverity, AuditFindingResolution, ReleaseDeployArtifact
 from app.release_artifacts import required_release_artifact_kinds
 from app.release_promotion import _notify_operator
 from app.release_reconciliation import (
@@ -405,6 +405,168 @@ async def _redrive_not_promoted_qualification(
         return False
 
 
+async def _auto_stale_not_promoted_findings(
+    version_id,
+    *,
+    session_factory=None,
+) -> int:
+    """Write 'stale' ledger rows for unresolved gating findings when automain advances.
+
+    The ``_redrive_not_promoted_qualification`` gate requires every gating
+    audit finding (critical/high/medium) to have a ledger row in state
+    ``resolved`` or ``stale`` before it will re-enter the qualifier.  No
+    automated write path populates those rows: the only existing write path is
+    the admin endpoint where an operator manually resolves each finding.  So
+    once automain advances past the ``not_promoted`` candidate SHA, the version
+    strands indefinitely — the re-drive gate blocks even though the findings
+    are effectively stale (they were audited against an old HEAD).
+
+    This function is the missing automated write path.  For each sweep it
+    checks a stabilize-phase ``not_promoted`` version and, when automain HEAD
+    has advanced past the ``candidate_sha``, writes a ``stale`` row for every
+    gating finding that has NO existing ledger entry.  Existing entries are
+    left untouched (idempotent; preserves operator ``resolved`` records).
+
+    Short-circuits when:
+      - The version's carried findings list was truncated (conservative — a
+        partial list could miss a finding that should stay unresolved).
+      - GitHub credential resolution fails (no credentials configured).
+      - ``get_branch_sha`` raises (transient network error; next sweep retries).
+      - automain HEAD equals ``candidate_sha`` (no advance — nothing to stale).
+
+    Returns the count of new ``stale`` rows written (0 on no-op).
+
+    Called by ``sweep_stuck_qualifications`` BEFORE the
+    ``_redrive_not_promoted_qualification`` loop so the ledger is populated
+    when ``compute_requalification_readiness`` is consulted in that same cycle.
+    """
+    from app import github, release_qualifier
+    from app.release_readiness import (
+        _REQUALIFICATION_GATING_SEVERITIES,
+        _latest_carried_audit_findings,
+        apply_finding_resolution,
+    )
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        version = await session.get(release_version.ReleaseVersion, version_id)
+        if version is None:
+            return 0
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "not_promoted"
+            or version.phase != "stabilize"
+        ):
+            return 0
+
+        # Short-circuit on truncated findings — partial list could misrepresent
+        # which findings need staleing.
+        if qual.get("audit_findings_truncated"):
+            return 0
+
+        # Load the project for GitHub credential resolution.
+        project = await session.get(release_version.Project, version.project_id)
+        if project is None:
+            return 0
+
+        # Resolve GitHub credentials.
+        resolved = await release_qualifier._resolve_github_with_session(
+            session, project
+        )
+        if resolved is None:
+            return 0
+        token, owner, repo = resolved
+
+        # Determine the integration branch (automain).
+        integration_branch, _promotion_target = release_qualifier._lts_branch_names(
+            project
+        )
+
+        # Fetch current integration-branch HEAD.
+        try:
+            head_sha = await github.get_branch_sha(
+                token, owner, repo, integration_branch
+            )
+        except Exception:
+            logger.warning(
+                "[RELEASE_QUALIFIER] auto_stale: failed to resolve %s HEAD "
+                "for version %s — will retry on next sweep",
+                integration_branch,
+                version_id,
+            )
+            return 0
+
+        candidate_sha = qual.get("candidate_sha") or ""
+        if not head_sha or head_sha == candidate_sha:
+            # HEAD has not advanced — stale rows would be premature.
+            return 0
+
+        # Load the latest carried gating findings via the same resolution path
+        # that compute_requalification_readiness uses.
+        findings, truncated = await _latest_carried_audit_findings(session, version)
+        if truncated:
+            return 0
+
+        gating_findings = [
+            f
+            for f in findings
+            if isinstance(f, dict)
+            and str(f.get("severity") or "").lower()
+            in _REQUALIFICATION_GATING_SEVERITIES
+            and f.get("key")
+        ]
+        if not gating_findings:
+            return 0
+
+        # Load existing ledger keys for this version (idempotency — skip any
+        # finding that already has a row so operator 'resolved' entries are
+        # never overwritten).
+        existing_keys = {
+            row.finding_key
+            for row in (
+                await session.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == version.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        }
+
+        written = 0
+        for f in gating_findings:
+            key = f["key"]
+            if key in existing_keys:
+                continue
+            await apply_finding_resolution(
+                session,
+                version.project_id,
+                version.id,
+                key,
+                "stale",
+                severity=str(f.get("severity") or "").lower() or None,
+                note=(
+                    "auto-staled: automain advanced past not_promoted candidate SHA"
+                ),
+            )
+            written += 1
+
+        if written:
+            await session.commit()
+            logger.info(
+                "[RELEASE_QUALIFIER] auto_stale: wrote %d stale ledger row(s) "
+                "for version %s (automain %s advanced past candidate %s)",
+                written,
+                version_id,
+                head_sha[:12],
+                candidate_sha[:12],
+            )
+
+        return written
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -579,6 +741,35 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove deferred_unsynced version %s "
                 "(now synced — qualification spawned)",
+                version_id,
+            )
+
+    # Auto-stale not_promoted gating findings when automain has advanced.
+    # ``_redrive_not_promoted_qualification`` requires every gating finding to
+    # have a ledger row in state ``resolved`` or ``stale``, but no automated
+    # path writes those rows — only the operator admin endpoint does.  So once
+    # automain advances past the not_promoted candidate SHA the version strands
+    # indefinitely.  This loop writes ``stale`` rows for all unresolved gating
+    # findings when HEAD has advanced, populating the ledger so the re-drive
+    # loop below can fire in the SAME sweep cycle.  Runs BEFORE the re-drive
+    # loop; skips truncated finding lists and existing ledger entries.
+    for version_id in version_ids:
+        try:
+            staled = await _auto_stale_not_promoted_findings(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: auto_stale failed for version %s",
+                version_id,
+            )
+            continue
+        if staled:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep auto-staled %d finding(s) for "
+                "version %s (automain advanced past candidate SHA)",
+                staled,
                 version_id,
             )
 

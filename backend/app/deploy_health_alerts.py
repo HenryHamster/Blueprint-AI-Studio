@@ -78,23 +78,24 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
         "Will auto-resume when healthy."
     )
     project_ids = (await session.execute(select(Project.id))).scalars().all()
-    for project_id in project_ids:
-        existing = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.task_id.is_(None),
-                        Alert.severity == AlertSeverity.WARNING,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title == title,
-                    )
+    # Batch-check for existing pause alerts across all projects in one query
+    already_alerted_pids = set(
+        (
+            await session.execute(
+                select(Alert.project_id).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == title,
                 )
             )
-            .scalars()
-            .first()
         )
-        if existing is not None:
+        .scalars()
+        .all()
+    )
+    for project_id in project_ids:
+        if project_id in already_alerted_pids:
             continue
         alert = Alert(
             project_id=project_id,
@@ -159,24 +160,25 @@ async def _create_forced_resume_alerts(
         )
     now = _utcnow()
     project_ids = (await session.execute(select(Project.id))).scalars().all()
-    for project_id in project_ids:
-        existing_warnings = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.severity == AlertSeverity.WARNING,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title == pause_title,
-                    )
+    # Batch-dismiss existing pause-warning alerts across all projects in one query
+    all_existing_warnings = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == pause_title,
                 )
             )
-            .scalars()
-            .all()
         )
-        for warning in existing_warnings:
-            warning.dismissed_at = now
-            session.add(warning)
+        .scalars()
+        .all()
+    )
+    for warning in all_existing_warnings:
+        warning.dismissed_at = now
+        session.add(warning)
+    for project_id in project_ids:
         alert = Alert(
             project_id=project_id,
             severity=AlertSeverity.ERROR,
@@ -227,24 +229,25 @@ async def _create_auto_resume_alerts(
         severity = AlertSeverity.INFO
     now = _utcnow()
     project_ids = (await session.execute(select(Project.id))).scalars().all()
-    for project_id in project_ids:
-        existing_warnings = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.severity == AlertSeverity.WARNING,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title == pause_title,
-                    )
+    # Batch-dismiss existing pause-warning alerts across all projects in one query
+    all_existing_warnings = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == pause_title,
                 )
             )
-            .scalars()
-            .all()
         )
-        for warning in existing_warnings:
-            warning.dismissed_at = now
-            session.add(warning)
+        .scalars()
+        .all()
+    )
+    for warning in all_existing_warnings:
+        warning.dismissed_at = now
+        session.add(warning)
+    for project_id in project_ids:
         alert = Alert(
             project_id=project_id,
             severity=severity,

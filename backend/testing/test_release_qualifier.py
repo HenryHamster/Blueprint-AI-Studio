@@ -13251,12 +13251,14 @@ async def test_redrive_requalifies_resolved_blocker_stale_verdict(db_session, mo
 @pytest.mark.asyncio
 async def test_sweep_leaves_not_promoted_when_findings_unresolved(db_session, mocker):
     """A not_promoted version whose gating audit findings are NOT yet
-    ledger-resolved is left untouched by the sweep — blockers have not cleared."""
+    ledger-resolved is left untouched when HEAD has NOT advanced — the
+    auto-stale gate short-circuits (same SHA) so the re-drive never fires."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    old_sha = "oldsha0" * 5 + "0000000"
+    # candidate SHA matches automain HEAD — no advance.
+    same_sha = "automn0" * 5 + "00000"
     version.last_qualification = {
         "status": "not_promoted",
-        "candidate_sha": old_sha,
+        "candidate_sha": same_sha,
         "blocker": "below_threshold",
         "audit_findings": [
             {
@@ -13269,8 +13271,8 @@ async def test_sweep_leaves_not_promoted_when_findings_unresolved(db_session, mo
     db_session.add(version)
     await db_session.commit()
 
-    # No ledger rows — finding is unresolved.
-    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    # No ledger rows — finding is unresolved; HEAD unchanged (same SHA).
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=same_sha))
     mocker.patch(
         "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
     )
@@ -13341,6 +13343,217 @@ async def test_sweep_leaves_not_promoted_when_head_unchanged(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_auto_stale_writes_stale_rows_when_head_advanced(db_session, mocker):
+    """When automain has advanced past the not_promoted candidate SHA and a
+    gating finding has no ledger row, the sweep auto-stales it and the version
+    stays not_promoted (the re-drive fires in the same cycle and spawns a fresh
+    qualification, advancing the version to pending)."""
+    from app.models import AuditFindingResolution
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "oldsha0" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {"key": "FINDING_AUTO_STALE", "severity": "high", "summary": "stale now"},
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # automain HEAD has advanced past the candidate SHA.
+    new_sha = "automn0" * 5 + "00000"
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # Auto-stale writes a ledger row; re-drive fires in the same cycle → count=1.
+    assert count == 1
+
+    # Stale ledger row was written for the finding.
+    ledger_rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(ledger_rows) == 1
+    assert ledger_rows[0].finding_key == "FINDING_AUTO_STALE"
+    assert ledger_rows[0].state == "stale"
+
+    # Re-drive fired and started a fresh qualification.
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_stale_skips_when_head_unchanged(db_session, mocker):
+    """When automain HEAD equals the not_promoted candidate SHA, the auto-stale
+    gate short-circuits and no ledger rows are written."""
+    from app.models import AuditFindingResolution
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    same_sha = "automn0" * 5 + "00000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": same_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {"key": "FINDING_NO_ADVANCE", "severity": "high", "summary": "unresolved"},
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # HEAD matches candidate SHA — no advance.
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=same_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 0
+    ledger_rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert ledger_rows == []
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+
+
+@pytest.mark.asyncio
+async def test_auto_stale_skips_truncated_findings(db_session, mocker):
+    """When audit_findings_truncated is True the auto-stale gate short-circuits
+    — a partial finding list cannot safely be auto-staled."""
+    from app.models import AuditFindingResolution
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "oldsha0" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+        "audit_findings_truncated": True,
+        "audit_findings": [
+            {"key": "FINDING_TRUNC", "severity": "high", "summary": "truncated list"},
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    new_sha = "automn0" * 5 + "00000"
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 0
+    ledger_rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert ledger_rows == []
+
+
+@pytest.mark.asyncio
+async def test_auto_stale_idempotent_skips_existing_ledger_rows(db_session, mocker):
+    """Auto-stale skips finding keys that already have a ledger row, preserving
+    operator 'resolved' entries and avoiding redundant stale writes."""
+    from app.models import AuditFindingResolution
+    from app.release_readiness import apply_finding_resolution
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "oldsha0" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {
+                "key": "FINDING_RESOLVED",
+                "severity": "high",
+                "summary": "already resolved by operator",
+            },
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # Operator has already resolved this finding.
+    await apply_finding_resolution(
+        db_session, project.id, version.id, "FINDING_RESOLVED", "resolved"
+    )
+    await db_session.commit()
+
+    new_sha = "automn0" * 5 + "00000"
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # Re-drive fires (finding already resolved) → version moves to pending.
+    assert count == 1
+
+    # Existing 'resolved' row was NOT overwritten by auto-stale.
+    ledger_rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(ledger_rows) == 1
+    assert ledger_rows[0].state == "resolved"
+
+
+@pytest.mark.asyncio
 async def test_redrive_requalifies_zero_gating_ready_version(db_session, mocker):
     """A stabilize-phase version with not_promoted verdict, a non-audit blocker,
     ZERO carried high/medium audit findings, and automain advanced to a new SHA
@@ -13381,6 +13594,178 @@ async def test_redrive_requalifies_zero_gating_ready_version(db_session, mocker)
     # Stale verdict overwritten — qualification started.
     assert version.last_qualification["status"] == "pending"
     assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_full_requalification_flow_not_promoted_to_promoted(db_session, mocker):
+    """E2E: not_promoted with unresolved gating finding → automain advances →
+    sweep auto-stales finding + re-drives → fresh qualification spawns → audit
+    completes clean → challenge spawned + completed → finalize promotes →
+    version status 'promoted' and next version opened.
+
+    This is the integration gate for the full autonomous requalification
+    pipeline introduced by the auto-stale sweep feature.  No step is individually
+    mocked out — the production sequence runs end-to-end through
+    _auto_stale_not_promoted_findings → _redrive_not_promoted_qualification →
+    run_qualification → _finalize_qualification → promote.
+    """
+    from app import shared_state
+    from app.models import AuditFindingResolution
+
+    # Enable promotion so _finalize_qualification reaches promote() rather than
+    # returning a dry_run result.
+    shared_state.runtime_config["promotion_enabled"] = True
+    # smoketest_enabled defaults False — keep it simple (single audit child).
+
+    # --- Phase 1: seed a stabilize-phase version stuck in not_promoted --------
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "oldsha0" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {
+                "key": "STALE_HIGH_FINDING",
+                "severity": "high",
+                "summary": "High finding that blocks requalification until staled",
+            }
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # automain HEAD has advanced past the not_promoted candidate SHA.
+    new_sha = "newautom" * 5
+    merge_sha = "merged00" * 5
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=new_sha, main=merge_sha),
+    )
+
+    # --- Phase 2: sweep auto-stales the finding and re-drives qualification ---
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # Exactly one action: auto-stale wrote a stale row, re-drive spawned a new
+    # qualification (count=1).
+    assert count == 1
+
+    # Stale ledger row written for the gating finding.
+    ledger_rows = (
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(ledger_rows) == 1
+    assert ledger_rows[0].finding_key == "STALE_HIGH_FINDING"
+    assert ledger_rows[0].state == "stale"
+
+    # Re-drive advanced the version to pending with a fresh audit child.
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == new_sha
+
+    audit_task_id = uuid.UUID(version.last_qualification["audit_task_id"])
+    audit_task = await db_session.get(Task, audit_task_id)
+    assert audit_task is not None
+
+    # --- Phase 3: simulate audit completing with a clean result ---------------
+    audit_task.status = TaskStatus.COMPLETED
+    db_session.add(audit_task)
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(
+                {
+                    "audit_score": 1.0,
+                    "findings": [],
+                    "test_erosion": {
+                        "deleted_test_files": [],
+                        "assertion_delta": 0,
+                        "test_count_delta": 0,
+                    },
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    # --- Phase 4: first finalize — spawns initial binding challenge -----------
+    # _finalize_qualification sees audit_challenge_spawn_pending=True (set by
+    # run_qualification) and no existing challenge task, so it spawns the initial
+    # binding challenge with 0 primary findings (clean audit).
+    result1 = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result1["status"] == "audit_challenge_respawned"
+    assert version.last_qualification["status"] == "pending"
+
+    # Retrieve the spawned challenge task and mark it COMPLETED with no verdicts
+    # (clean audit had no findings for the challenger to evaluate).
+    challenge_task_id = uuid.UUID(version.last_qualification["challenge_task_id"])
+    challenge_task = await db_session.get(Task, challenge_task_id)
+    assert challenge_task is not None
+    candidate_sha = version.last_qualification["candidate_sha"]
+    challenge_task.status = TaskStatus.COMPLETED
+    db_session.add(challenge_task)
+    db_session.add(
+        Artifact(
+            task_id=challenge_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_CHALLENGE,
+            logs=json.dumps(
+                {
+                    "challenged_candidate_sha": candidate_sha,
+                    "verdicts": [],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    # --- Phase 5: set up GitHub mocks for promote() ---------------------------
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(
+            return_value={"number": 1, "html_url": "http://github.test/pr/1"}
+        ),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+
+    # --- Phase 6: second finalize — clean audit + resolved challenge → promote
+    # With binding_expected_count=0 (no deductible findings) the challenge proof
+    # state is 'not_required', all sub-score gates pass → promote() is called.
+    result2 = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result2["status"] == "promoted"
+
+    # Version is fully promoted.
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.last_qualification["status"] == "promoted"
+
+    # A fresh v2 was opened in the build phase.
+    next_version = await rv.current_open_version(db_session, project.id)
+    assert next_version is not None
+    assert next_version.version_number == 2
+    assert next_version.phase == "build"
 
 
 @pytest.mark.asyncio
