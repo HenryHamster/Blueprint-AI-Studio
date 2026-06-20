@@ -74,6 +74,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app import github, release_version, theme_delivery
+from app.blind_merge_grade import (
+    BLIND_MERGE_GRADE_KEY,
+    blind_merge_grade_disabled,
+    blind_merge_grade_satisfied,
+    compute_blind_merge_grade,
+    persist_blind_merge_grade,
+)
 from app.database import AsyncSessionLocal, resolve_async_engine
 from app.failure_classification import (
     AGENT_TIMEOUT,
@@ -1337,6 +1344,70 @@ async def run_qualification(
             "candidate_sha": candidate_sha,
         }
 
+    # Guard 4 (under the lock): the BLIND MERGE-GRADE gate (direction
+    # d-c0fe439f).  Before committing to qualify, an UNINVESTED grade of the
+    # merged diffs against the version goal — blind to the strategist's
+    # running_update — must exist for THIS candidate SHA.  This is the
+    # load-bearing "do the merged diffs actually satisfy the version goal?"
+    # question the rest of the qualifier never asks.  It is a synchronous,
+    # backend-only direct-LLM call (no spawned agent), and it FAILS CLOSED:
+    # if a grade cannot be produced the version stays in stabilize, no audit
+    # task is spawned, and the request is re-attemptable next cycle.  The
+    # operator escape hatch (DISABLE_BLIND_MERGE_GRADE=1) skips the gate so a
+    # broken model account can never permanently wedge promotions.
+    blind_grade: dict[str, Any] | None = None
+    if blind_merge_grade_disabled():
+        blind_grade = {
+            "status": "skipped",
+            "reason": "DISABLE_BLIND_MERGE_GRADE set",
+            "candidate_sha": candidate_sha,
+            "graded_at": _utcnow().isoformat(),
+        }
+    elif blind_merge_grade_satisfied(version, candidate_sha):
+        # A usable grade for this exact SHA is already persisted — reuse it
+        # (e.g. a prior cycle computed it and its children have since
+        # terminated, or a prior spawn was retried).  No re-roll of the LLM.
+        blind_grade = (version.last_qualification or {}).get(BLIND_MERGE_GRADE_KEY)
+    else:
+        blind_grade = await compute_blind_merge_grade(
+            session, project, version, candidate_sha
+        )
+        if blind_grade is None:
+            # FAIL CLOSED.  Leave phase == "stabilize", spawn nothing, and
+            # record an explicit non-conclusive block so the next cycle
+            # re-attempts.  This status is NOT "pending" (so the in-flight
+            # guard won't treat it as a live run) and NOT a conclusive verdict
+            # (so the cached-verdict guard won't freeze it).
+            version.last_qualification = {
+                "status": "blocked_no_merge_grade",
+                "candidate_sha": candidate_sha,
+                "ci_green": ci_green,
+                "ci_state": ci_state,
+                "reason": (
+                    "blind merge-grade of the merged diffs vs the version goal "
+                    "could not be computed (LLM unavailable/unparseable); "
+                    "deferring qualification until a grade is produced"
+                ),
+                "blocked_at": _utcnow().isoformat(),
+            }
+            flag_modified(version, "last_qualification")
+            session.add(version)
+            logger.info(
+                "[RELEASE_QUALIFIER] run_qualification: version v%d blocked — "
+                "no blind merge-grade for candidate %s (fail closed, retryable)",
+                version.version_number,
+                candidate_sha[:8],
+            )
+            return {
+                "status": "blocked_no_merge_grade",
+                "candidate_sha": candidate_sha,
+            }
+        # Durably persist the freshly-computed grade BEFORE spawning, so a
+        # crash between here and the pending stamp does not lose it (the
+        # pending stamp below re-includes it via the local var).
+        persist_blind_merge_grade(version, blind_grade)
+        session.add(version)
+
     # Carry forward the infra-failure streak so _finalize_qualification can
     # detect a persistently broken qualifier pipeline.  The streak is the count
     # of consecutive infrastructure failures (FAILED/CANCELLED required child
@@ -1456,6 +1527,10 @@ async def run_qualification(
         "previous_infra_failure_signature": prior_infra_failure_signature,
         "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
         "infra_attempt_history": infra_attempt_history,
+        # Surface the blind merge-grade (biggest_gap + coverage_verdict) on the
+        # pending record so it is visible, and so blind_merge_grade_satisfied()
+        # short-circuits a re-run for this SHA instead of re-rolling the LLM.
+        BLIND_MERGE_GRADE_KEY: blind_grade,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic

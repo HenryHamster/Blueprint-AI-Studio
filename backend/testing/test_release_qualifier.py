@@ -5253,6 +5253,28 @@ def _qualifier_ci_resolves_green(mocker):
         new=AsyncMock(return_value=("ok", None)),
     )
 
+    # Default the blind merge-grade gate to a usable computed grade for the
+    # candidate SHA so the overwhelming majority of run_qualification tests
+    # (which assume the candidate reaches the spawn path) proceed without a real
+    # LLM call. The grade echoes the candidate_sha so blind_merge_grade_satisfied
+    # short-circuits a re-run for the same SHA. Tests that exercise the gate
+    # itself (the fail-closed block, the positive persistence path, the escape
+    # hatch) re-patch this in their own body; the later patch wins.
+    async def _default_blind_merge_grade(_session, _project, _version, candidate_sha):
+        return {
+            "candidate_sha": candidate_sha,
+            "coverage_verdict": "partial",
+            "biggest_gap": "default test gap (autouse fixture)",
+            "model": "test-model",
+            "pr_count": 0,
+            "graded_at": "2026-01-01T00:00:00+00:00",
+        }
+
+    mocker.patch(
+        "app.release_qualifier.compute_blind_merge_grade",
+        new=AsyncMock(side_effect=_default_blind_merge_grade),
+    )
+
 
 # ===========================================================================
 # run_qualification — phase 1: guards + snapshot + spawn
@@ -5625,6 +5647,151 @@ async def test_run_qualification_wrong_phase_is_noop(db_session, mocker):
         .all()
     )
     assert len(tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_blocked_without_blind_merge_grade(db_session, mocker):
+    """The blind merge-grade gate (d-c0fe439f) CANNOT be skipped.
+
+    A stabilize-phase version with NO persisted blind merge-grade, with the
+    grader patched to be unavailable (returns None), must cause run_qualification
+    to FAIL CLOSED: it returns blocked_no_merge_grade, spawns NO audit task,
+    leaves version.phase == "stabilize", and blind_merge_grade_satisfied stays
+    False. This pins that an uninvested goal-coverage grade is REQUIRED before
+    the stabilize->qualify transition."""
+    from app import blind_merge_grade as bmg
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "dead" * 10  # 40-char placeholder SHA
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    # Grader unavailable -> None. Re-patches the autouse default; later wins.
+    grade_mock = mocker.patch(
+        "app.release_qualifier.compute_blind_merge_grade",
+        new=AsyncMock(return_value=None),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "blocked_no_merge_grade"
+    assert result["candidate_sha"] == candidate
+    grade_mock.assert_awaited_once()
+
+    await db_session.refresh(version)
+    # The transition is refused: phase stays stabilize, the gate is unsatisfied.
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "blocked_no_merge_grade"
+    assert version.last_qualification["candidate_sha"] == candidate
+    assert bmg.blind_merge_grade_satisfied(version, candidate) is False
+
+    # NO audit / smoketest children were spawned.
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_persists_blind_merge_grade_and_spawns(
+    db_session, mocker
+):
+    """Positive path: with a computable grade, run_qualification persists it on
+    last_qualification['blind_merge_grade'] (keyed to the candidate SHA, with a
+    non-empty biggest_gap and coverage_verdict) and proceeds to the normal
+    audit-spawn path."""
+    from app import blind_merge_grade as bmg
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "beef" * 10
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+
+    async def _grade(_session, _project, _version, candidate_sha):
+        return {
+            "candidate_sha": candidate_sha,
+            "coverage_verdict": "misses",
+            "biggest_gap": "the cost-reduction VM substrate change was never merged",
+            "model": "test-model",
+            "pr_count": 3,
+            "graded_at": "2026-01-01T00:00:00+00:00",
+        }
+
+    mocker.patch(
+        "app.release_qualifier.compute_blind_merge_grade",
+        new=AsyncMock(side_effect=_grade),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["candidate_sha"] == candidate
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    grade = version.last_qualification["blind_merge_grade"]
+    assert grade["candidate_sha"] == candidate
+    assert grade["coverage_verdict"] == "misses"
+    assert grade["biggest_gap"]  # non-empty single biggest gap
+    # The persisted grade satisfies the gate for this exact SHA.
+    assert bmg.blind_merge_grade_satisfied(version, candidate) is True
+    # A different SHA is NOT satisfied — a new candidate must be graded afresh.
+    assert bmg.blind_merge_grade_satisfied(version, "f00d" * 10) is False
+
+    # The normal audit child was spawned.
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    types = sorted((t.first_payload or {}).get("type") for t in tasks)
+    assert "release_audit" in types
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_blind_merge_grade_escape_hatch(
+    db_session, mocker, monkeypatch
+):
+    """Escape hatch: with DISABLE_BLIND_MERGE_GRADE=1 the gate is skipped — the
+    grader is NEVER invoked and run_qualification proceeds to spawn even though
+    the grader (if called) would return None."""
+    monkeypatch.setenv("DISABLE_BLIND_MERGE_GRADE", "1")
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "0ff1ce00" * 5
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    # If the gate were not skipped this None would block; assert it is not called.
+    grade_mock = mocker.patch(
+        "app.release_qualifier.compute_blind_merge_grade",
+        new=AsyncMock(return_value=None),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    grade_mock.assert_not_called()
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["blind_merge_grade"]["status"] == "skipped"
 
 
 @pytest.mark.asyncio
