@@ -424,9 +424,10 @@ describe('repairStructuredOutput', () => {
 
   // ── infra-failure classification (reopen exitCode !== 0) ─────────────────────
 
-  it('records infra failure not success when reopen exitCode is nonzero', async () => {
-    // Reopen run crashes (exitCode 1) but happens to emit parseable partial output.
-    // Must record infra failure, NOT repair success, and return null value.
+  it('adopts valid output and records both infra failure and repair success when reopen exitCode is nonzero', async () => {
+    // Reopen run exits non-zero (e.g. filesystem warning) but emits parseable
+    // output. The recovered value MUST be returned and repair success recorded —
+    // a non-zero exit does not invalidate valid structured output.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 1, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
       codexTurnCompleted: false, stderrTail: 'process crashed',
@@ -441,6 +442,24 @@ describe('repairStructuredOutput', () => {
     expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
     expect(recordFormatRepairInfraFailure).toHaveBeenCalledTimes(1);
     expect(vi.mocked(recordFormatRepairInfraFailure).mock.calls[0]).toEqual(['design']);
+    // Value was valid — success is recorded even though exit was non-zero.
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
+    expect(res.value).toEqual({ summary: 'A concise summary.', reasoning: 'Detailed reasoning here.' });
+    expect(res.retry?.exitCode).toBe(1);
+  });
+
+  it('records only infra failure (not success) when reopen exitCode is nonzero and output is unparseable', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 1, allOutput: '', lastResultText: '',
+      codexTurnCompleted: false, stderrTail: 'oom',
+    });
+
+    const res = await repairStructuredOutput({
+      ...baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json here', lastResultText: '' })),
+      schemaLabel: 'design',
+    });
+
+    expect(recordFormatRepairInfraFailure).toHaveBeenCalledTimes(1);
     expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
     expect(res.value).toBeNull();
     expect(res.retry?.exitCode).toBe(1);

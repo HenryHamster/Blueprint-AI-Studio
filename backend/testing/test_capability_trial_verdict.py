@@ -4352,3 +4352,43 @@ class TestRaiseAmbiguousLiftEscalationNotice:
         assert call_args[2] == "repo_map"
         assert call_args[3] == self._escalated_entry()
         mock_session.commit.assert_called_once()
+
+
+# ── Bounded ProjectMessage query invariants ───────────────────────────────────
+
+
+class TestBoundedProjectMessageQueries:
+    """Verify that dedupe scans in raise_*_notice functions are bounded with .limit()."""
+
+    def test_raise_capability_verdict_notice_query_is_bounded(self):
+        """raise_capability_verdict_notice must apply .limit() to ProjectMessage dedupe scan."""
+        import inspect
+
+        from app.capability_trial_verdict import raise_capability_verdict_notice
+
+        source = inspect.getsource(raise_capability_verdict_notice)
+        assert ".limit(" in source, (
+            "raise_capability_verdict_notice must bound ProjectMessage query with .limit()"
+        )
+
+    def test_raise_stalled_trial_notice_query_is_bounded(self):
+        """raise_stalled_trial_notice must apply .limit() to ProjectMessage dedupe scan."""
+        import inspect
+
+        from app.capability_trial_verdict import raise_stalled_trial_notice
+
+        source = inspect.getsource(raise_stalled_trial_notice)
+        assert ".limit(" in source, (
+            "raise_stalled_trial_notice must bound ProjectMessage query with .limit()"
+        )
+
+    def test_raise_ambiguous_lift_escalation_notice_query_is_bounded(self):
+        """raise_ambiguous_lift_escalation_notice must apply .limit() to ProjectMessage dedupe scan."""
+        import inspect
+
+        from app.capability_trial_verdict import raise_ambiguous_lift_escalation_notice
+
+        source = inspect.getsource(raise_ambiguous_lift_escalation_notice)
+        assert ".limit(" in source, (
+            "raise_ambiguous_lift_escalation_notice must bound ProjectMessage query with .limit()"
+        )

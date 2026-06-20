@@ -30,7 +30,9 @@ from app.efficiency_snapshot import (
     SELF_REPAIR_BURN_SHARE_KEY,
     SELF_REPAIR_MIN_ATTEMPTS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
+    _PROMPT_STATIC_CONST_NAMES,
     _compute_checkpoint_loss_rate,
+    _extract_ts_template_literal_length,
     _compute_cold_start_breakdown_p50,
     _compute_lane_cost_per_merged_pr,
     _compute_lane_warm_resume_rate,
@@ -7123,3 +7125,173 @@ async def test_self_repair_burn_share_fallback_to_call_count(db_session):
     assert SELF_REPAIR_BURN_SHARE_KEY in attr
     # Fallback: 4 repair attempts / 20 LLM calls = 0.2
     assert attr[SELF_REPAIR_BURN_SHARE_KEY] == pytest.approx(0.2, abs=1e-6)
+
+
+# ── _extract_ts_template_literal_length tests ────────────────────────────────
+
+
+def test_extract_ts_template_literal_length_basic():
+    """Returns correct char count for a simple template literal."""
+    src = "const HELLO = `hello world`;"
+    result = _extract_ts_template_literal_length(src, "HELLO")
+    assert result == len("hello world")
+
+
+def test_extract_ts_template_literal_length_multiline():
+    """Counts newlines and all chars within the literal."""
+    body = "line one\nline two\nline three"
+    src = f"const MULTI = `{body}`;"
+    result = _extract_ts_template_literal_length(src, "MULTI")
+    assert result == len(body)
+
+
+def test_extract_ts_template_literal_length_escaped_backtick():
+    """Escaped backticks inside the literal do not terminate the scan early."""
+    body = r"prefix \` suffix"
+    src = f"const ESCAPED = `{body}`;"
+    result = _extract_ts_template_literal_length(src, "ESCAPED")
+    assert result == len(body)
+
+
+def test_extract_ts_template_literal_length_missing_const_returns_none():
+    """Returns None when the named constant is not present in the source."""
+    src = "const OTHER = `some content`;"
+    result = _extract_ts_template_literal_length(src, "MISSING_NAME")
+    assert result is None
+
+
+def test_extract_ts_template_literal_length_unterminated_returns_none():
+    """Returns None when the template literal has no closing backtick."""
+    src = "const OPEN = `no closing backtick"
+    result = _extract_ts_template_literal_length(src, "OPEN")
+    assert result is None
+
+
+# ── _compute_prompt_static_bytes tests ───────────────────────────────────────
+
+
+def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
+    """When all _PROMPT_STATIC_CONST_NAMES are found in prompt.ts the result
+    is a positive integer equal to the sum of their body lengths."""
+    from unittest.mock import mock_open, patch
+
+    # Build a synthetic prompt.ts that defines every required constant.
+    bodies = {name: f"body of {name} " * 5 for name in _PROMPT_STATIC_CONST_NAMES}
+    synthetic_src = "\n".join(
+        f"const {name} = `{body}`;" for name, body in bodies.items()
+    )
+    expected_total = sum(len(b) for b in bodies.values())
+
+    import app.efficiency_snapshot as es_mod
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", return_value=True),
+        patch("builtins.open", mock_open(read_data=synthetic_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result == expected_total
+    assert result > 0
+
+
+def test_compute_prompt_static_bytes_missing_constant_returns_none():
+    """Returns None when any one of _PROMPT_STATIC_CONST_NAMES is absent."""
+    from unittest.mock import mock_open, patch
+
+    # Omit the last constant from the synthetic source.
+    present_names = _PROMPT_STATIC_CONST_NAMES[:-1]
+    synthetic_src = "\n".join(
+        f"const {name} = `body of {name}`;" for name in present_names
+    )
+
+    import app.efficiency_snapshot as es_mod
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", return_value=True),
+        patch("builtins.open", mock_open(read_data=synthetic_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result is None
+
+
+def test_compute_prompt_static_bytes_no_agent_src_returns_none():
+    """Returns None when _find_agent_src cannot locate the agent/src directory."""
+    from unittest.mock import patch
+
+    import app.efficiency_snapshot as es_mod
+
+    with patch.object(es_mod, "_find_agent_src", return_value=None):
+        result = _compute_prompt_static_bytes()
+
+    assert result is None
+
+
+# ── self_repair_burn_share suppression test ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_zero_clean_attempts_suppresses_drift(db_session):
+    """When all repair attempts are infra failures, clean_attempts=0 falls below
+    SELF_REPAIR_MIN_ATTEMPTS so drift_pct on self_repair_success_rate is None."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed a baseline snapshot first.
+    task_first = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 20}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 10,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 2,
+            "format_repair_attempts": 2,
+            "format_repair_successes": 1,
+            "format_repair_infra_failures": 0,
+        },
+    )
+    db_session.add(task_first)
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    # Now add a second task where ALL repair attempts are infra failures
+    # → clean_attempts = 0 < SELF_REPAIR_MIN_ATTEMPTS → drift_pct suppressed.
+    task_second = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 21}],
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 200,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 3,
+            "format_repair_attempts": 3,
+            "format_repair_successes": 0,
+            "format_repair_infra_failures": 3,  # all infra failures → clean=0
+        },
+    )
+    db_session.add(task_second)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    sr_axis = drift.get("format_compliance", {}).get(SELF_REPAIR_SUCCESS_RATE_KEY, {})
+    # clean_attempts = repair_attempts - infra_failures = 3 - 3 = 0 < SELF_REPAIR_MIN_ATTEMPTS
+    # → drift suppressed
+    assert sr_axis.get("drift_pct") is None

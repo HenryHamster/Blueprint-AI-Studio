@@ -236,11 +236,12 @@ export async function repairStructuredOutput<T = unknown>(
       }
     }
     if (retry.exitCode !== 0) {
+      // A non-zero exit (e.g. a filesystem warning) does not invalidate
+      // structured output produced during the run — adopt it when parseable.
       recordFormatRepairInfraFailure(schemaLabel);
-    } else {
-      value = retryAttempt.value as T | null;
-      if (value !== null) recordFormatRepairSuccess(schemaLabel);
     }
+    value = retryAttempt.value as T | null;
+    if (value !== null) recordFormatRepairSuccess(schemaLabel);
   }
 
   return { value, missReason: firstAttempt.missReason, retry };

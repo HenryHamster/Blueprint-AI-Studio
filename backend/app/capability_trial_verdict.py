@@ -706,10 +706,12 @@ async def raise_capability_verdict_notice(
     existing = (
         (
             await session.execute(
-                select(ProjectMessage).where(
+                select(ProjectMessage)
+                .where(
                     ProjectMessage.project_id == project_id,
                     ProjectMessage.status == "open",
                 )
+                .limit(200)
             )
         )
         .scalars()
@@ -1021,10 +1023,12 @@ async def raise_stalled_trial_notice(
     existing = (
         (
             await session.execute(
-                select(ProjectMessage).where(
+                select(ProjectMessage)
+                .where(
                     ProjectMessage.project_id == project_id,
                     ProjectMessage.status == "open",
                 )
+                .limit(200)
             )
         )
         .scalars()
@@ -1166,10 +1170,12 @@ async def raise_ambiguous_lift_escalation_notice(
     existing = (
         (
             await session.execute(
-                select(ProjectMessage).where(
+                select(ProjectMessage)
+                .where(
                     ProjectMessage.project_id == project_id,
                     ProjectMessage.status == "open",
                 )
+                .limit(200)
             )
         )
         .scalars()
