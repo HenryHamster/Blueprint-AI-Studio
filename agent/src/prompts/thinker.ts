@@ -2,7 +2,7 @@ import fs from 'fs';
 import { createHash } from 'crypto';
 import type WebSocket from 'ws';
 import { sendLog, runClaudeCode, persistAndPostStatus } from '../index.js';
-import { PLAYBOOK_GUIDANCE, DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
+import { PLAYBOOK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 import { extractJsonObjectDetailed } from '../json-extract.js';
 import { repairStructuredOutput } from '../handlers/structured-output-repair.js';
 import type { RepairStructuredOutputResult } from '../handlers/structured-output-repair.js';
@@ -308,13 +308,13 @@ Each direction in the "Direction outcomes" section above lists its cumulative co
 **Weight evidence by verification basis.** A direction may carry a \`recent_findings_verification_basis\` distribution (counts of \`code_verified\` / \`path_verified\` / \`pattern_inferred\` / \`deduced\` findings). This records HOW each finding's claim was established, not whether it is implementable. Weight your \`evidence_progress\` read accordingly: a direction whose recent findings are predominantly \`code_verified\`/\`path_verified\` warrants higher confidence that its claimed progress is real than one whose findings are predominantly \`pattern_inferred\`/\`deduced\`. This is purely a WEIGHTING signal, NOT a gate — inferred findings remain valid and are often correct; a heavily-inferred direction is not stalled merely for being inferred.
 
 ## 4. Running update document (for the user)
-Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
+Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` ${READ_ONLY_BASH_WRITE_NOTE} (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
 
 ## 5. Self-reflection (optional)
 Only if something this cycle was hard in a way worth remembering. Fields: what_was_hard, missing_context, proposed_self_improvement. Empty is fine. Don't fill with platitudes.
 
 ## 6. Problem model (update — non-destructive merge)
-Write your problem_model update as JSON to \`/tmp/problem_model_${p.taskId}.json\` (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). The backend MERGES the agent-owned collections (\`capabilities\`, \`gaps\`, \`friction\`, \`pending_user_confirmation\`) rather than replacing them: entries upsert by stable key (\`capabilities\` by name; the rest by id), **entries you omit are preserved**, and per-gap \`history\`/\`past_moves\` union. So you do NOT need to reconstruct every gap/capability from memory — emit the ones you're changing plus enough to stay coherent. If a section was trimmed or dropped from your payload (see "Context not shipped" above), write just the parts you're changing and trust the rest is retained, or \`./fetch problem-model\` first to read the full current state.
+Write your problem_model update as JSON to \`/tmp/problem_model_${p.taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). The backend MERGES the agent-owned collections (\`capabilities\`, \`gaps\`, \`friction\`, \`pending_user_confirmation\`) rather than replacing them: entries upsert by stable key (\`capabilities\` by name; the rest by id), **entries you omit are preserved**, and per-gap \`history\`/\`past_moves\` union. So you do NOT need to reconstruct every gap/capability from memory — emit the ones you're changing plus enough to stay coherent. If a section was trimmed or dropped from your payload (see "Context not shipped" above), write just the parts you're changing and trust the rest is retained, or \`./fetch problem-model\` first to read the full current state.
 
 Normally your **whole** problem_model is shipped inline this cycle — full gaps, capabilities, and friction — so you edit it directly. Only in the exceptional case where the full model cannot fit the byte budget does it arrive floored/skeletonized (recoverable siblings yield first, so this is rare). **If** that happened — look for the \`_agent_view_floor_applied\` marker, which means gap \`description\`/\`evidence\` were stripped and capabilities/friction were reduced to \`name\`+\`status\` — **echo that marker back verbatim** in your update file. The backend uses it to know which fields you never actually saw, so editing and resubmitting a skeleton entry (e.g. bumping a gap's \`priority\` or a capability's \`status\`) won't blank the durable \`description\`, \`notes\`, \`source\`, etc. you couldn't see. Without the marker echoed, a blank field is treated as a deliberate clear. When the marker is absent (the normal case), the model you see is complete — edit freely.
 
@@ -343,7 +343,7 @@ Source = {type (user_message|friction_promotion|agent_observation|self_reflectio
 
 When describing changes in prose, be precise: "opening gap g-strategic-mem (from user_message msg-42)", "retiring direction d-auth-middleware (gap g-auth closed by merged PR #82)".
 
-Before finishing, write /tmp/research_progress_${p.taskId}.md — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
+Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
 
 ${PLAYBOOK_GUIDANCE}
 

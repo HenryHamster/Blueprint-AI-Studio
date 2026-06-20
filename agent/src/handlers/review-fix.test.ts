@@ -132,7 +132,7 @@ import { computeReviewPromptFingerprint } from '../prompts/review-prompt.js';
 import { runCodeChangeTask } from './code-change.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { shouldFanOutReview, shouldFanOutFix } from '../constants.js';
-import { computePromptFingerprint, buildScopedLintOneliner } from '../prompt.js';
+import { computePromptFingerprint, buildScopedLintOneliner, READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { getFormatComplianceTelemetry, resetFormatComplianceTelemetry } from '../telemetry.js';
 
@@ -2801,6 +2801,10 @@ describe('handleReview structural prompt invariants', () => {
 
   it('handleReview prompt contains verdict JSON file path pattern', async () => {
     expect(await captureReviewPrompt()).toContain('/tmp/review_verdict_');
+  });
+
+  it('handleReview prompt contains READ_ONLY_BASH_WRITE_NOTE next to /tmp verdict path', async () => {
+    expect(await captureReviewPrompt()).toContain(READ_ONLY_BASH_WRITE_NOTE);
   });
 
   it('handleReview prompt contains Correctness & Logic checklist section', async () => {

@@ -1373,6 +1373,17 @@ export interface EfficiencyDriftAxis {
   history?: EfficiencyHistoryPoint[];
 }
 
+export interface FormatComplianceBySchemaEntry {
+  format_miss: number;
+  repair_attempts: number;
+  repair_successes: number;
+  repair_infra_failures: number;
+  repair_miss: number;
+  repair_input_tokens: number;
+  repair_output_tokens: number;
+  self_repair_success_rate: number | null;
+}
+
 export interface FormatComplianceResponse {
   format_compliance_rate: EfficiencyDriftAxis;
   self_repair_success_rate: EfficiencyDriftAxis;
@@ -1381,6 +1392,7 @@ export interface FormatComplianceResponse {
   format_error_total: number | null;
   repair_attempts: number | null;
   repair_successes: number | null;
+  by_schema?: Record<string, FormatComplianceBySchemaEntry> | null;
 }
 
 export interface FormatComplianceByTypeEntry {

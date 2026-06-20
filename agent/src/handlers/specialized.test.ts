@@ -143,7 +143,7 @@ import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
-import { PARALLEL_AUDIT_GUIDANCE } from '../prompt.js';
+import { PARALLEL_AUDIT_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
@@ -2333,5 +2333,53 @@ describe('resolveBaseBranch cascade — analysis handlers honor project_metadata
     const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
     expect(opts.branch).toBe('feature/x');
     expect(opts.baseBranch).toBe('feature/x');
+  });
+});
+
+// ── READ_ONLY_BASH_WRITE_NOTE — prompt inclusion guards ──────────────────────
+// Each read-only specialized handler must instruct the agent to use Bash to
+// write its /tmp output file because Write/Edit tools are disabled. These tests
+// assert the shared note appears in the main prompt, preventing silent
+// regression when prompts are refactored.
+describe('read-only specialized handlers — Bash write note present in prompt', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  it('handleSmoketest prompt contains READ_ONLY_BASH_WRITE_NOTE', async () => {
+    await handleSmoketest(TASK_ID, { ...BASE_PAYLOAD, suites: {} }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
+  });
+
+  it('handleDebug prompt contains READ_ONLY_BASH_WRITE_NOTE', async () => {
+    const debugPayload = { ...BASE_PAYLOAD, prompt: 'investigate the crash', error_logs: 'error: crash' };
+    await handleDebug(TASK_ID, debugPayload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
+  });
+
+  it('handlePerf prompt contains READ_ONLY_BASH_WRITE_NOTE', async () => {
+    await handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
+  });
+
+  it('handleInvestigate prompt contains READ_ONLY_BASH_WRITE_NOTE', async () => {
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
+  });
+
+  it('handleRepoBootstrap prompt contains READ_ONLY_BASH_WRITE_NOTE', async () => {
+    vi.mocked(readHandlerOutput)
+      .mockReturnValueOnce({ tech_stack: 'node', directory_layout: 'src/', first_steps_summary: 'npm install', entry_points: '', test_layout: '', key_conventions: '', environment_requirements: '', source_revision: 'abc' })
+      .mockReturnValueOnce({ status: 'success', detail: '', updated_paths: [] })
+      .mockReturnValueOnce({ purpose: 'test app', key_concepts: {}, critical_user_flows: [], architectural_gotchas: [], source: 'README.md' });
+    await handleRepoBootstrap(TASK_ID, { ...BASE_PAYLOAD, repo_url: 'https://github.com/example/repo' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
   });
 });

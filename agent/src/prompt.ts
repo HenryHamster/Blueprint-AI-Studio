@@ -296,6 +296,15 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
 
 export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. Use ./symbols <name> to find where a function or class is defined (returns file path, line, and kind). If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
 
+// Shared parenthetical for every read-only handler that instructs the agent to
+// write a /tmp output file. The Write/Edit tools are stripped for read-only
+// tasks (configureAgentPermissions returns them in the disallowed list), so the
+// agent must use Bash (e.g. `cat << 'EOF' > /tmp/...` or `echo '...' > /tmp/...`)
+// to create the file. Without this note the agent reaches for the disabled Write
+// tool, the call silently no-ops, no output file lands, and the unparseable
+// final message is booked as a format miss and wasted repair reopen.
+export const READ_ONLY_BASH_WRITE_NOTE = '(use Bash to write the file — the Write/Edit tools are disabled for this read-only task)';
+
 // Adaptive parallel-subagent guidance for rollup PRs touching multiple
 // modules. Only inject when shouldFanOutReview() AND the per-project
 // enable_parallel_review flag both allow it — the fingerprint moves when

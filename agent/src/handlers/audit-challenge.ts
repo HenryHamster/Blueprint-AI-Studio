@@ -7,7 +7,7 @@ import {
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import {
-  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
+  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   computePromptFingerprint, type PlaybookEntry,
@@ -408,7 +408,7 @@ Field semantics:
 Rules:
 - Only judge findings the primary scoring would weigh — severity ${CHALLENGE_SEVERITIES_REQUIRING_VERDICT.join('/')}. Low/info findings do NOT need a verdict; omit them.
 - Read the actual code before each verdict — do NOT speculate.
-- IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_challenge_${taskId}.json\` — no markdown, no code fences, no extra text.
+- IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_challenge_${taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} — no markdown, no code fences, no extra text.
 - Also output the same JSON object as the final output in your logs.
 - Do NOT modify any files in the repository.${designDocAdvertisement(task)}`;
 
@@ -431,9 +431,9 @@ Rules:
     logs = sanitize(JSON.stringify(normalizeChallengeOutput(handlerOutput, candidateSha, primaryFindings)));
   } else {
     const reopenPrompt = primaryFindings.length > 0
-      ? `${primaryFindingsSection}Your prior release audit challenge response did not end with a parseable JSON verdict object.\nReturn ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`
+      ? `${primaryFindingsSection}Your prior release audit challenge response did not end with a parseable JSON verdict object.\nReturn ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`
       : `Your prior release audit challenge response did not end with a parseable JSON verdict object.
-Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`;
+Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`;
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['challenged_candidate_sha', 'verdicts'],

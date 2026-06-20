@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import type { BuildConfig } from '../index.js';
 import {
-  PARALLEL_REVIEW_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
+  PARALLEL_REVIEW_GUIDANCE, DEFAULT_TOOL_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE,
   buildScopedLintOneliner, detectLinterKind,
 } from '../prompt.js';
 
@@ -225,7 +225,7 @@ For each issue in the \`issues\` array:
 - \`line\`: line number in the file (optional — omit if not applicable)
 - Issues without \`file\`/\`line\` are still valid and will be included in the review body summary
 
-IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
+IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 }
 
 export function buildRollupReviewGuidance(

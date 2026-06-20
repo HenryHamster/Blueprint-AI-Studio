@@ -28,6 +28,7 @@ vi.mock('../index.js', () => ({
 import fs from 'fs';
 import { runClaudeCode, persistAndPostStatus } from '../index.js';
 import { buildThinkerPrompt, runThinkerWithGate, type ThinkerPromptParams } from './thinker.js';
+import { READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 import { buildThinkerPrompt as buildThinkerPromptFromResearchPlan } from '../handlers/research-plan.js';
 import { buildMemoCitationsSection } from '../handlers/research-plan.js';
 import { renderStrategicPromptSuffix } from '../handlers/strategic.js';
@@ -439,6 +440,14 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('/tmp/problem_model_abc-456.json');
     expect(prompt).toContain('/tmp/running_update_abc-456.md');
     expect(prompt).toContain('/tmp/research_progress_abc-456.md');
+  });
+
+  it('includes READ_ONLY_BASH_WRITE_NOTE next to each /tmp output path', () => {
+    const prompt = buildThinkerPrompt({ ...base, taskId: 'abc-789' });
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
+    // Note should appear multiple times (once per output file path)
+    const count = prompt.split(READ_ONLY_BASH_WRITE_NOTE).length - 1;
+    expect(count).toBeGreaterThanOrEqual(3);
   });
 
   it('includes PLAYBOOK_GUIDANCE (structural invariant: strategic_review class)', () => {

@@ -10,7 +10,7 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { describeJsonExtractionResult, extractJsonArrayDetailed } from '../json-extract.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
-  PARALLEL_AUDIT_GUIDANCE,
+  PARALLEL_AUDIT_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
 } from '../prompt.js';
@@ -163,7 +163,7 @@ Rules:
 - Each finding must have a concrete, actionable fix_prompt
 - Limit to 20 findings maximum, prioritized by severity
 - For findings without a specific line number, use 0
-- IMPORTANT: Write your findings JSON array to /tmp/security_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
+- IMPORTANT: Write your findings JSON array to /tmp/security_findings_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 - Also output the same JSON array as the final output in your logs.${designDocAdvertisement(task)}`;
 
   const secBuildConfig = resolveBuildConfig(task);
@@ -186,7 +186,7 @@ Rules:
       schemaLabel: 'audit',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior security audit response did not end with a parseable JSON findings array.
-Return ONLY the JSON array for /tmp/security_findings_${taskId}.json. Each finding object must include at least "severity" plus title, description, file_path, line_number, and fix_prompt. Use [] if there are no findings. No markdown, prose, or code fences.`,
+Return ONLY the JSON array for /tmp/security_findings_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE}. Each finding object must include at least "severity" plus title, description, file_path, line_number, and fix_prompt. Use [] if there are no findings. No markdown, prose, or code fences.`,
       ws,
       statusRef,
       model,
@@ -318,7 +318,7 @@ Rules:
 - recommended_mode MUST be one of: audit, fundamentals, ship, pause
 - Limit findings to ${maxSystems} systems unless focus_systems was provided (then use all focus_systems)
 - Each finding must cite at least one evidence file from the actual repo
-- IMPORTANT: Write the JSON object to /tmp/self_audit_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
+- IMPORTANT: Write the JSON object to /tmp/self_audit_findings_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
 - Also output the same JSON object as the final output in your logs.${designDocAdvertisement(task)}`;
 
   const buildConfig = resolveBuildConfig(task);
@@ -345,7 +345,7 @@ Rules:
       schemaLabel: 'audit',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior self-audit response did not end with a parseable JSON object.
-Return ONLY the JSON object for /tmp/self_audit_findings_${taskId}.json with top-level "findings": [...] and each finding carrying "system_id", score, components, top_issues, recommended_mode, and evidence. No markdown, prose, or code fences.`,
+Return ONLY the JSON object for /tmp/self_audit_findings_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with top-level "findings": [...] and each finding carrying "system_id", score, components, top_issues, recommended_mode, and evidence. No markdown, prose, or code fences.`,
       ws,
       statusRef,
       model,
@@ -652,7 +652,7 @@ Rules:
 - IMPORTANT — substantiation required: Before recording any finding at severity high, medium, or critical, read the relevant unchanged files in the full repository (not just the diff) to check for existing mitigations (guards, exception handlers, per-request checks, hardcoded constants at the call site). Record what you read and why the issue is real in \`verification_note\`. A hardcoded constant reaching a sink is NOT injection. A per-request DB check is NOT a replay gap. A comparison that is exception-guarded is NOT a TypeError. Only record the finding if you can substantiate it after reading the whole-repo context.
 - Authorized Alembic revision-identity divergences are owned by a separate deterministic gate, NOT the audit. If the diff renumbers or reuses an Alembic revision id that is an authorized, reconciled divergence (e.g. the \`0143\` back-merge: the old \`0143\` migration replaced by a new \`0143\` plus a renumbered \`0144\`), do NOT raise a finding for the revision-identity/renumber itself — the qualifier's migration-identity gate evaluates it and deploy-time reconciliation handles it. You SHOULD still flag genuinely broken migration BODIES (bad DDL, missing/incorrect downgrade, destructive re-apply, data-loss risk) on those same files.
 - If \`git diff ${diffRange}\` produces no output (empty diff), set \`audit_score: 1.0\`, \`findings: []\`, and note it in a single low-severity finding.
-- IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_report_${taskId}.json\` — no markdown, no code fences, no extra text.
+- IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_report_${taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} — no markdown, no code fences, no extra text.
 - Also output the same JSON object as the final output in your logs.
 - Do NOT modify any files in the repository.${designDocAdvertisement(task)}`;
 
@@ -694,7 +694,7 @@ Rules:
       schemaLabel: 'audit',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior release audit response did not end with a parseable JSON report object.
-Return ONLY the JSON object for /tmp/release_audit_report_${taskId}.json with top-level "audit_score", "test_erosion", and "findings". Each finding must include "severity", "summary", "file", and "verification_note". No markdown, prose, or code fences.`,
+Return ONLY the JSON object for /tmp/release_audit_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with top-level "audit_score", "test_erosion", and "findings". Each finding must include "severity", "summary", "file", and "verification_note". No markdown, prose, or code fences.`,
       ws,
       statusRef,
       model,

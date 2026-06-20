@@ -82,6 +82,7 @@ import {
   SIZE_GUARDRAIL_GUIDANCE,
   PRIOR_ATTEMPT_DIVERGENCE,
   BEYOND_SCOPE_REPORTING,
+  READ_ONLY_BASH_WRITE_NOTE,
   SELF_REVIEW_PROMPT_VERSION,
   assembleFailureGuidanceBlocks,
   type FixAttempt,
@@ -4259,6 +4260,20 @@ describe('cross-cutting guidance-block fingerprints — structural invariants fo
 
   it('BEYOND_SCOPE_REPORTING contains section header fingerprint', () => {
     expect(BEYOND_SCOPE_REPORTING).toContain('When You Find Bigger Problems Than Your Task');
+  });
+
+  it('READ_ONLY_BASH_WRITE_NOTE is a non-empty string', () => {
+    expect(typeof READ_ONLY_BASH_WRITE_NOTE).toBe('string');
+    expect(READ_ONLY_BASH_WRITE_NOTE.length).toBeGreaterThan(0);
+  });
+
+  it('READ_ONLY_BASH_WRITE_NOTE names Bash as the write mechanism', () => {
+    expect(READ_ONLY_BASH_WRITE_NOTE).toContain('Bash');
+  });
+
+  it('READ_ONLY_BASH_WRITE_NOTE states that Write/Edit tools are disabled', () => {
+    expect(READ_ONLY_BASH_WRITE_NOTE).toContain('Write');
+    expect(READ_ONLY_BASH_WRITE_NOTE).toContain('disabled');
   });
 });
 

@@ -6644,6 +6644,73 @@ async def test_self_repair_drift_suppressed_below_min_attempts(db_session):
     )
 
 
+@pytest.mark.asyncio
+async def test_read_baseline_by_schema_passthrough(db_session):
+    """read_baseline_with_drift forwards by_schema from the persisted snapshot.
+
+    When a snapshot's format_compliance block contains a by_schema dict,
+    read_baseline_with_drift must include it in the returned format_compliance
+    block so operators can see per-schema format-miss rankings.
+    """
+    by_schema_fixture = {
+        "thinker": {
+            "format_miss": 3,
+            "repair_attempts": 3,
+            "repair_successes": 2,
+            "repair_infra_failures": 0,
+            "repair_miss": 1,
+            "repair_input_tokens": 1200,
+            "repair_output_tokens": 400,
+            "self_repair_success_rate": 0.667,
+        },
+        "audit": {
+            "format_miss": 1,
+            "repair_attempts": 1,
+            "repair_successes": 1,
+            "repair_infra_failures": 0,
+            "repair_miss": 0,
+            "repair_input_tokens": 300,
+            "repair_output_tokens": 100,
+            "self_repair_success_rate": 1.0,
+        },
+    }
+    baseline_fc = {
+        FORMAT_COMPLIANCE_KEY: {
+            "format_compliance_rate": 0.85,
+            SELF_REPAIR_SUCCESS_RATE_KEY: 0.75,
+            "repair_attempts": 4,
+            "repair_successes": 3,
+            "tasks_measured": 10,
+            "well_formed_tasks": 8,
+            "format_error_total": 4,
+            "by_schema": by_schema_fixture,
+        }
+    }
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {"captured_at": "2026-01-01T00:00:00", **baseline_fc},
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00", **baseline_fc}],
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    fc = drift[FORMAT_COMPLIANCE_KEY]
+
+    assert "by_schema" in fc, (
+        "by_schema must be forwarded in the format_compliance block"
+    )
+    assert fc["by_schema"] == by_schema_fixture, (
+        "by_schema contents must match the persisted snapshot value"
+    )
+    assert fc["by_schema"]["thinker"]["format_miss"] == 3
+    assert fc["by_schema"]["audit"]["self_repair_success_rate"] == 1.0
+
+
 # ---------------------------------------------------------------------------
 # Panel review effectiveness tests
 # ---------------------------------------------------------------------------

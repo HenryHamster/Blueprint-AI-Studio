@@ -112,6 +112,7 @@ import {
 import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
+import { READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-abc123';
@@ -952,5 +953,48 @@ describe('handleReleaseAudit — JSON schema field name contract', () => {
     const match = prompt.match(/```json\s*([\s\S]*?)```/);
     const block = match ? match[1] : prompt;
     expect(block).not.toContain('"level"');
+  });
+});
+
+// ── READ_ONLY_BASH_WRITE_NOTE — prompt inclusion guards ──────────────────────
+// Each read-only audit handler must instruct the agent to use Bash to write its
+// /tmp output file because Write/Edit tools are disabled. These tests assert the
+// shared note appears in the main prompt for each handler, preventing silent
+// regression when prompts are refactored.
+describe('read-only audit handlers — Bash write note present in prompt', () => {
+  const CANDIDATE_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(git).mockReturnValue('');
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  it('handleSecurityAudit prompt contains READ_ONLY_BASH_WRITE_NOTE', async () => {
+    await handleSecurityAudit(TASK_ID, { base_branch: 'main' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
+  });
+
+  it('handleSelfAudit prompt contains READ_ONLY_BASH_WRITE_NOTE', async () => {
+    await handleSelfAudit(TASK_ID, { base_branch: 'main' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
+  });
+
+  it('handleReleaseAudit prompt contains READ_ONLY_BASH_WRITE_NOTE', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 1,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      findings: [],
+    });
+    await handleReleaseAudit(
+      TASK_ID, { base_branch: 'main', candidate_sha: CANDIDATE_SHA },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
   });
 });

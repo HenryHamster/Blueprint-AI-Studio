@@ -2,7 +2,7 @@ import { useMemo, useState, useEffect, useCallback, useRef } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
-import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry, type ChallengerSampleRateRecommendation } from '../api';
+import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry, type FormatComplianceBySchemaEntry, type ChallengerSampleRateRecommendation } from '../api';
 import { LaneDiagPanel } from './LaneDiagPanel';
 import { WarmStartOriginRow } from './WarmStartOriginRow';
 import { usePoller } from '../hooks/usePoller';
@@ -715,6 +715,27 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
                       <span className="text-neutral-600">· {entry.tasks_measured ?? '—'} tasks</span>
                       {(entry.format_error_total ?? 0) > 0 && (
                         <span className="text-red-400/70">· {entry.format_error_total} err</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {data.format_compliance?.by_schema && Object.keys(data.format_compliance.by_schema).length > 0 && (
+            <div data-testid="format-compliance-by-schema-block" className="mt-2 pt-2 border-t border-neutral-700/50">
+              <div className="text-[10px] text-neutral-500 mb-1 uppercase tracking-wide">By schema</div>
+              <div className="space-y-0.5">
+                {Object.entries(data.format_compliance.by_schema).sort(([, a]: [string, FormatComplianceBySchemaEntry], [, b]: [string, FormatComplianceBySchemaEntry]) => (b.format_miss ?? 0) - (a.format_miss ?? 0)).map(([schema, entry]: [string, FormatComplianceBySchemaEntry]) => (
+                  <div key={schema} className="flex items-center justify-between gap-3 text-[10px]">
+                    <span className="text-neutral-500">{schema}</span>
+                    <div className="flex items-center gap-2 text-neutral-400 font-mono">
+                      {entry.format_miss > 0 && (
+                        <span className="text-red-400/70">{entry.format_miss} miss</span>
+                      )}
+                      <span className="text-neutral-600">· {entry.repair_attempts} repair</span>
+                      {entry.self_repair_success_rate != null && (
+                        <span>{(entry.self_repair_success_rate * 100).toFixed(0)}% ok</span>
                       )}
                     </div>
                   </div>
