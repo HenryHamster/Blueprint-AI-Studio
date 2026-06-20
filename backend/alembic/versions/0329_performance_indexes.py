@@ -7,15 +7,15 @@ without full table scans:
 - ix_projectmessage_created_at on projectmessage(created_at)
 - ix_projectmessage_project_created_at on projectmessage(project_id, created_at)
 
-Revision ID: 0309
-Revises: 0308
+Revision ID: 0329
+Revises: 0309
 """
 
 from alembic import op
 
 
-revision = "0309"
-down_revision = "0308"
+revision = "0329"
+down_revision = "0309"
 branch_labels = None
 depends_on = None
 

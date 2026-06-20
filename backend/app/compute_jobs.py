@@ -1091,6 +1091,16 @@ async def _process_single_compute_job(
             return
         provisioning_timeout_seconds = _provisioning_timeout_seconds(job, now=now)
         if provisioning_timeout_seconds == 0.0:
+            # Guard: if the VM has heartbeated (first heartbeat already transitions
+            # the job to RUNNING via the endpoint, but check reserved which is a
+            # freshly-locked row in case the endpoint and the monitor race).
+            if reserved.last_heartbeat_at is not None:
+                logger.info(
+                    "[COMPUTE_JOB] provisioning deadline passed but VM %s heartbeated"
+                    " — skipping termination; next poll will handle via running path",
+                    reserved.external_compute_id,
+                )
+                return
             started_at = _utcnow()
             terminate_diagnostic = None
             try:
@@ -1154,6 +1164,35 @@ async def _process_single_compute_job(
             logger.warning(
                 "[COMPUTE_JOB] launch provisioning timed out for job=%s", job.id
             )
+            # Guard: re-read the job to check if the VM heartbeated during the
+            # wait.  A heartbeat means the VM booted successfully despite the
+            # slow GCP LRO; the endpoint already transitioned it to RUNNING.
+            # Skipping termination here lets the next monitor tick handle it
+            # via the normal running/polling path.
+            async with session_factory() as _hb_session:
+                _fresh = await _hb_session.get(ComputeJob, reserved.id)
+            if _fresh is not None and _fresh.last_heartbeat_at is not None:
+                logger.info(
+                    "[COMPUTE_JOB] launch LRO timed out but VM %s heartbeated"
+                    " — skipping termination; next poll will handle via running path",
+                    reserved.external_compute_id,
+                )
+                # The heartbeat endpoint transitions STARTING→RUNNING atomically.
+                # Under a tight race the monitor may still see STARTING here;
+                # finish the transition so the job doesn't stay stuck.
+                if _fresh.status == ComputeJobStatus.STARTING:
+                    _now = _utcnow()
+                    async with session_factory() as _tr_session:
+                        _tr_job = await _lock_compute_job(_tr_session, reserved.id)
+                        if (
+                            _tr_job is not None
+                            and _tr_job.status == ComputeJobStatus.STARTING
+                        ):
+                            _tr_job.status = ComputeJobStatus.RUNNING
+                            _tr_job.started_at = _tr_job.started_at or _now
+                            _tr_job.updated_at = _now
+                            await _tr_session.commit()
+                return
             terminate_diagnostic = None
             try:
                 terminated = await backend.terminate(reserved, reason="provisioning")
