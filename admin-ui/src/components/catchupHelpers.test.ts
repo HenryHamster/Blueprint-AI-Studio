@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
+  getCatchUpViewedKey,
   getLastCatchUpViewed,
   formatDuration,
   windowToHours,
@@ -7,6 +8,27 @@ import {
   EXTERNAL_API_SUBTYPE_LABELS,
   RATE_LIMIT_KIND_LABELS,
 } from './catchupHelpers';
+
+describe('getCatchUpViewedKey', () => {
+  it('returns the base key when no email is provided', () => {
+    expect(getCatchUpViewedKey()).toBe('blueprint-admin:lastCatchUpViewed');
+    expect(getCatchUpViewedKey(undefined)).toBe('blueprint-admin:lastCatchUpViewed');
+  });
+
+  it('returns the base key when email is null', () => {
+    expect(getCatchUpViewedKey(null)).toBe('blueprint-admin:lastCatchUpViewed');
+  });
+
+  it('returns a per-operator scoped key when email is provided', () => {
+    expect(getCatchUpViewedKey('alice@example.com')).toBe('blueprint-admin:lastCatchUpViewed:alice@example.com');
+  });
+
+  it('scoped key differs from base key', () => {
+    const base = getCatchUpViewedKey();
+    const scoped = getCatchUpViewedKey('bob@example.com');
+    expect(scoped).not.toBe(base);
+  });
+});
 
 describe('getLastCatchUpViewed', () => {
   let store: Record<string, string>;

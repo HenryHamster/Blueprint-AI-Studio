@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   FILTER_TASK_TYPE_IDS,
   matchesTaskTypeFilter,
+  TASK_CAPABILITIES,
   USER_LAUNCHABLE_TASK_TYPE_IDS,
   getTaskTypeLabel,
   resolveTaskCapabilities,
@@ -30,6 +31,11 @@ describe('task capability registry', () => {
 
   it('does not invent labels for unknown future task types', () => {
     expect(getTaskTypeLabel('future_capability')).toBe('future_capability');
+  });
+
+  it('has no duplicate ids in TASK_CAPABILITIES', () => {
+    const ids = TASK_CAPABILITIES.map(c => c.id);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });
 
