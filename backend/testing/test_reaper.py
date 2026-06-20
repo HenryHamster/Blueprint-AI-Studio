@@ -64,6 +64,7 @@ from app.reaper import (
     _ORPHAN_PRIORITY_PROVISION,
     _ORPHAN_PRIORITY_DEFAULT,
     _normalize_reaper_retry_failure_class,
+    _build_active_scan_stmt,
 )
 from app.retry_prompt import _build_retry_prompt_suffix
 from app.shared_state import runtime_config as _runtime_config
@@ -14865,3 +14866,26 @@ async def test_orphan_external_io_gather_result_bundle(mocker):
     # No provision failure — serial capture skipped
     assert snapshot.io_serial_log is None
     assert snapshot.io_prov_zone is None
+
+
+def test_reaper_active_scan_projection_invariant():
+    """The active-scan stmt must exclude plan_output and retain the columns
+    required by event listeners and _heartbeat_stale_cutoff."""
+    from sqlalchemy.dialects import postgresql
+
+    stmt = _build_active_scan_stmt()
+    sql_text = str(stmt.compile(dialect=postgresql.dialect()))
+
+    # plan_output must NOT appear in the projected columns
+    assert "plan_output" not in sql_text, (
+        "Active-scan projection must exclude plan_output JSONB. "
+        "Re-adding it re-introduces the over-fetch this guard protects against."
+    )
+
+    # These columns are required by Task event listeners (_heartbeat_stale_cutoff
+    # / status assignment); removing any triggers MissingGreenlet under async sessions.
+    for required in ("status_log", "context", "payloads"):
+        assert required in sql_text, (
+            f"Active-scan projection must include '{required}' — "
+            "removing it will trigger MissingGreenlet under async sessions."
+        )

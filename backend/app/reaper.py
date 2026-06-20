@@ -224,6 +224,46 @@ _TRANSIENT_5XX_PATTERNS = frozenset(
 _BATCH = 5000
 
 
+def _build_active_scan_stmt():
+    """Return the column-projected SELECT for the reaper's 60s active-task scan.
+
+    Excludes ``plan_output`` (heavy JSONB, never read on the reap path).
+    Retains ``status_log``/``context``/``payloads`` because the Task event
+    listeners and ``_heartbeat_stale_cutoff`` require them (MissingGreenlet
+    under async sessions if absent).  ``raiseload=True`` catches future
+    accidental full-row loads during development.
+    """
+    return (
+        select(Task)
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.last_heartbeat,
+                Task.last_tool_use_at,
+                Task.started_at,
+                Task.created_at,
+                Task.vm_instance_id,
+                Task.vm_provisioned_at,
+                Task.project_id,
+                Task.parent_task_id,
+                Task.latest_status_message,
+                Task.attempt_count,
+                Task.context,
+                Task.payloads,
+                Task.status_log,
+                Task.retry_after_until,
+                Task.previous_error_fingerprint,
+                Task.requeue_in_flight,
+                Task.description,
+                raiseload=True,
+            )
+        )
+        .where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+        .limit(_BATCH)
+    )
+
+
 from app.retry_prompt import _copy_analysis_artifacts_to_previous  # noqa: E402, F401, RUF100
 
 
@@ -369,39 +409,7 @@ async def reaper_service():
                 # latest_status_message, vm_instance_id, last_heartbeat, started_at,
                 # context, payloads, attempt_count downstream.
                 # Audit R3-W2 (H7): cap per-tick fetch at _BATCH rows.
-                stmt = (
-                    select(Task)
-                    .options(
-                        load_only(
-                            Task.id,
-                            Task.status,
-                            Task.last_heartbeat,
-                            Task.last_tool_use_at,
-                            Task.started_at,
-                            Task.created_at,
-                            Task.vm_instance_id,
-                            Task.vm_provisioned_at,
-                            Task.project_id,
-                            Task.parent_task_id,
-                            Task.latest_status_message,
-                            Task.attempt_count,
-                            Task.context,
-                            Task.payloads,
-                            Task.status_log,
-                            Task.retry_after_until,
-                            Task.previous_error_fingerprint,
-                            Task.requeue_in_flight,
-                            Task.description,
-                            raiseload=True,
-                        )
-                    )
-                    .where(
-                        Task.status.in_(
-                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                        )
-                    )
-                    .limit(_BATCH)
-                )
+                stmt = _build_active_scan_stmt()
                 active_tasks = (await session.execute(stmt)).scalars().all()
                 if len(active_tasks) >= _BATCH:
                     logger.warning(
