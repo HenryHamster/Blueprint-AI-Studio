@@ -203,6 +203,60 @@ async def _handle_approval_gate_timeout(
                 )
                 return True
         hours = round(approval_elapsed / 3600, 1)
+
+        # If the PR is still clean/mergeable and not yet preserved, leave it
+        # open for hand-merge instead of silently abandoning it. Guard with
+        # the preserve flag so re-entering sweeps are idempotent (no repeat
+        # alerts). Broken/conflicted/non-rollup PRs fall through to FAILED.
+        if not ctx.get("approval_timeout_preserved_for_handmerge"):
+            _pr_num = ctx.get("rollup_pr_number") or (task.first_payload or {}).get(
+                "pr_number"
+            )
+            if _pr_num:
+                _is_preservable = False
+                try:
+                    from app.review_loop_convergence import _pr_is_preservable_on_cap
+
+                    _is_preservable = await _pr_is_preservable_on_cap(
+                        task, int(_pr_num), session
+                    )
+                except Exception:
+                    logger.debug(
+                        f"[EVAL TIMEOUT] Preservability check failed for "
+                        f"{str(task.id)[:8]} PR #{_pr_num}",
+                        exc_info=True,
+                    )
+                if _is_preservable:
+                    logger.info(
+                        f"[EVAL TIMEOUT] Task {str(task.id)[:8]} approval-gate "
+                        f"timeout after {hours}h — PR #{_pr_num} is clean/mergeable, "
+                        f"PRESERVING for hand-merge instead of abandoning"
+                    )
+                    task.context = {
+                        **ctx,
+                        "approval_timeout_preserved_for_handmerge": True,
+                        "failure_detail": "approval_timeout_preserved_for_handmerge",
+                    }
+                    flag_modified(task, "context")
+                    session.add(task)
+                    await session.commit()
+                    await maybe_create_failure_alert(
+                        task,
+                        session,
+                        f"Approval-gate timeout after {hours}h — PR #{_pr_num} "
+                        f"left open for hand-merge (mergeable work, not abandoned)",
+                    )
+                    await services.broadcast_to_project(
+                        str(task.project_id),
+                        "task_updated",
+                        {"task_id": str(task.id), "status": task.status},
+                    )
+                    return True
+
+        # Idempotent re-entry: already preserved on a prior sweep.
+        if ctx.get("approval_timeout_preserved_for_handmerge"):
+            return True
+
         logger.error(
             f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has been "
             f"requires_approval for {hours}h without resolution — "

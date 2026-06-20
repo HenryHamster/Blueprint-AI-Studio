@@ -1812,6 +1812,97 @@ async def test_approved_cap_exhaustion_records_distinct_outcome(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_approved_rollup_cap_preserved_not_closed(db_session, mocker):
+    """RC-1: when the review-fix cap is reached on an already-APPROVED ROLLUP
+    PR that is clean and non-empty, the PR must be LEFT OPEN for hand-merge
+    rather than auto-closed. APPROVED_CAP_PR_CLOSED labeling is kept (approval
+    changes the label, not whether the PR is destroyed)."""
+    from app.failure_classification import APPROVED_CAP_PR_CLOSED
+
+    close_mock = _mock_preservable_pr(mocker, changed_files=4, mergeable_state="clean")
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec_task = mocker.patch("app.routers.agent_status.record_task_result")
+    rec_dir = mocker.patch("app.shared_state.record_direction_result")
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+
+    from app.review_pipeline import _handle_cap_exhaustion
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "direction_id": "dir-approved-rollup-cap",
+            "_is_rollup_review": True,
+            "rollup_pr_number": 407,
+            "review_loop": {"review_approved": True, "pr_number": 407},
+        },
+    )
+    db_session.add(orig)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 407,
+                "original_task_id": str(orig.id),
+            }
+        ],
+        context={"review_loop": {"review_approved": True, "pr_number": 407}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(orig)
+    await db_session.refresh(source_task)
+
+    await _handle_cap_exhaustion(
+        source_task,
+        str(orig.id),
+        407,
+        16,
+        db_session,
+        scope="per-chain",
+    )
+
+    await db_session.refresh(orig)
+    # Approved + preservable rollup: PR must be LEFT OPEN.
+    close_mock.assert_not_called()
+    assert orig.requires_approval is True, "Preserved PR must be flagged for operator"
+    assert (orig.context or {}).get(
+        "failure_detail"
+    ) == "cap_exhausted_after_approve", (
+        "Approved labeling must be preserved even on the preserve path"
+    )
+    assert (orig.context or {}).get("failure_category") == APPROVED_CAP_PR_CLOSED, (
+        "Must record APPROVED_CAP_PR_CLOSED, not CODE_ERROR"
+    )
+    assert (orig.context or {}).get("pr_preserved_for_handmerge") is True
+    assert (orig.context or {}).get("pr_rejected") is not True, (
+        "Approved PR must never set pr_rejected"
+    )
+    alert_mock.assert_awaited()
+    rec_task.assert_called_once_with(
+        success=False,
+        failure_class=APPROVED_CAP_PR_CLOSED,
+        task_id=str(orig.id),
+        task_type="create",
+    )
+    rec_dir.assert_called_once_with(
+        "dir-approved-rollup-cap",
+        success=False,
+        failure_class=APPROVED_CAP_PR_CLOSED,
+        project_id=str(project.id),
+    )
+
+
+@pytest.mark.asyncio
 async def test_cap_exhaustion_with_outstanding_changes_requested_stays_failed(
     db_session, mocker
 ):

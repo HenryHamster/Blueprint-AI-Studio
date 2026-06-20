@@ -1814,6 +1814,110 @@ async def test_evaluating_approval_gate_within_window_not_failed(eval_db, mocker
     assert parent.status == TaskStatus.EVALUATING
 
 
+# ── RC-2: approval-gate timeout preserves mergeable rollup PRs ───────────────
+
+
+@pytest.mark.asyncio
+async def test_approval_gate_timeout_preserves_mergeable_rollup_pr(eval_db, mocker):
+    """RC-2: when the approval-gate timeout fires on an EVALUATING parent whose
+    rollup PR is still clean/mergeable, the task must NOT be marked FAILED.
+    Instead it is left EVALUATING with approval_timeout_preserved_for_handmerge=True
+    and a hand-merge alert is fired — the PR stays open for the operator."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "open",
+            "changed_files": 3,
+            "mergeable_state": "clean",
+        },
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="Rollup Preserve", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": _naive_utc_ago(hours=5).isoformat(),
+            "rollup_pr_number": 474,
+            "_is_rollup_review": True,
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Mergeable rollup PR must NOT be FAILed by approval-gate timeout, "
+        f"got {parent.status}: {parent.latest_status_message!r}"
+    )
+    assert (parent.context or {}).get(
+        "approval_timeout_preserved_for_handmerge"
+    ) is True
+    assert (parent.context or {}).get(
+        "failure_detail"
+    ) == "approval_timeout_preserved_for_handmerge"
+    alert_mock.assert_awaited()
+    rec.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_approval_gate_timeout_fails_non_rollup_task(eval_db, mocker):
+    """RC-2 GUARDRAIL: approval-gate timeout on a non-rollup task (no rollup PR
+    to preserve) keeps today's FAILED path unchanged."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="Non-Rollup Timeout", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "non-rollup approval-gated parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={"_approval_set_at": _naive_utc_ago(hours=5).isoformat()},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Non-rollup approval-gate timeout must still FAIL, got {parent.status}"
+    )
+    rec.assert_called_once()
+    assert rec.call_args.kwargs.get("success") is False
+
+
 # ── Spend/budget approval holds: clean non-failure decline ────────────────────
 
 

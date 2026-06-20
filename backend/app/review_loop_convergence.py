@@ -507,6 +507,106 @@ async def _handle_cap_exhaustion(
     ):
         from sqlalchemy.orm.attributes import flag_modified
 
+        # APPROVED + PRESERVABLE: an approved rollup/back-merge PR is the
+        # strongest candidate for preservation — close+CANCEL destroys
+        # salvageable, signed-off work. Leave it open for hand-merge and
+        # keep the APPROVED_CAP_PR_CLOSED labeling (approval changes the
+        # label, never whether the PR is destroyed). Non-preservable approved
+        # PRs (empty, conflicted, non-rollup) keep the close+CANCEL path.
+        if await _pr_is_preservable_on_cap(orig, pr_number, session):
+            _preserve_kind = (
+                "back-merge resolver" if _is_backmerge_resolver(orig) else "rollup"
+            )
+            logger.info(
+                f"[PIPELINE] Cap reached for PR #{pr_number} on an APPROVED, "
+                f"non-empty, conflict-free {_preserve_kind} — PRESERVING: leaving "
+                f"PR open + flagging orig {resolved_original_id[:8]} "
+                f"requires_approval for hand-merge "
+                f"(APPROVED_CAP_PR_CLOSED, no CODE_ERROR, no PR close)"
+            )
+            orig.status = TaskStatus.FAILED
+            orig.requires_approval = True
+            orig.latest_status_message = (
+                f"Review-fix cap reached ({iterations} iterations, {cap_label}) "
+                f"after approval — PR #{pr_number} LEFT OPEN with mergeable work; "
+                f"manual hand-merge required (approved cap, not auto-closed)"
+            )
+            persist_failure_category(orig, APPROVED_CAP_PR_CLOSED)
+            ctx = dict(orig.context or {})
+            ctx["failure_detail"] = "cap_exhausted_after_approve"
+            ctx["review_cap_iterations"] = iterations
+            ctx["pr_preserved_for_handmerge"] = True
+            # NB: deliberately NOT setting pr_rejected — this was an approved PR.
+            orig.context = ctx
+            flag_modified(orig, "context")
+            session.add(orig)
+            try:
+                await session.commit()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[PIPELINE] Cap-exhaustion(after-approve/preserve): failed to "
+                    f"commit orig {resolved_original_id[:8]}: {e}",
+                    exc_info=True,
+                )
+                return
+            record_task_result(
+                success=False,
+                failure_class=APPROVED_CAP_PR_CLOSED,
+                task_id=str(orig.id),
+                task_type=(orig.first_payload or {}).get("type", ""),
+            )
+            _direction_id = str((orig.context or {}).get("direction_id") or "")
+            if _direction_id:
+                record_direction_result(
+                    _direction_id,
+                    success=False,
+                    failure_class=APPROVED_CAP_PR_CLOSED,
+                    project_id=str(orig.project_id) if orig.project_id else "",
+                )
+            try:
+                from app.task_completion import _record_remediation_if_terminal
+
+                await _record_remediation_if_terminal(orig, TaskStatus.FAILED, session)
+                await session.commit()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[PIPELINE] Cap-exhaustion(after-approve/preserve): remediation "
+                    f"record failed for PR #{pr_number}: {e}"
+                )
+            try:
+                gh_token, owner, repo = await get_github_token_for_task(
+                    orig.id, session
+                )
+                await create_pr_comment(
+                    gh_token,
+                    owner,
+                    repo,
+                    pr_number,
+                    f"Review-fix cap reached ({iterations} iterations, {cap_label}) "
+                    f"after approval. This PR has mergeable work and was LEFT OPEN "
+                    f"for manual hand-merge rather than auto-closed. "
+                    f"Operator review required.",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[PIPELINE] Cap-exhaustion(after-approve/preserve): comment "
+                    f"failed on PR #{pr_number}: {e}"
+                )
+            try:
+                await _maybe_create_failure_alert(
+                    orig,
+                    session,
+                    f"PR #{pr_number} hit review-fix cap ({iterations} iterations, "
+                    f"{cap_label}) after approval — left open with approved mergeable "
+                    f"work, hand-merge required",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[PIPELINE] Cap-exhaustion(after-approve/preserve): alert "
+                    f"failed for PR #{pr_number}: {e}"
+                )
+            return
+
         logger.info(
             f"[PIPELINE] Cap reached for PR #{pr_number} AFTER approval — landing "
             f"orig {resolved_original_id[:8]} CANCELLED (cap_exhausted_after_approve), "
