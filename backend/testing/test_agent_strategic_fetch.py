@@ -1959,14 +1959,13 @@ async def test_audit_finding_resolution_rejects_stale_task_version(
 async def test_resolve_message_ref_python_side_filter_within_recent_window(
     client: AsyncClient, db_session
 ):
-    """resolve_message_ref fetches the 500 most-recent project messages
-    (ORDER BY created_at DESC LIMIT 500) and filters in Python via
-    str.startswith(prefix).
+    """resolve_message_ref fetches all project message IDs (no recency cap),
+    matches the prefix in Python, then loads the full row for any hit.
 
     Strategy: create a target message and several non-target messages all with
     the same 8-char hex prefix; the target is distinguishable by a longer
-    (24-char) prefix.  All messages are within the 500-row recency window, so
-    the target is found and the unique prefix resolves unambiguously.
+    (24-char) prefix.  The target is found and the unique prefix resolves
+    unambiguously regardless of creation order.
     """
     import uuid as _uuid
 
@@ -2018,18 +2017,14 @@ async def test_resolve_message_ref_python_side_filter_within_recent_window(
 
 
 @pytest.mark.asyncio
-async def test_resolve_message_ref_tail_tradeoff_old_message_not_found(
+async def test_resolve_message_ref_old_message_beyond_500_found(
     client: AsyncClient, db_session
 ):
-    """Accepted tradeoff: a message older than the 500-row recency window is not
-    resolvable by short ref.
+    """A message older than the 500 most-recent messages is correctly resolved.
 
-    The implementation fetches ORDER BY created_at DESC LIMIT 500 then filters
-    in Python.  A message whose created_at predates the 500 most-recent messages
-    falls outside the scan window and results in a 404, not a match.
-
-    This is the intentional design: the window covers recent messages (the common
-    case); very old messages in large projects may require the full UUID.
+    The implementation fetches all project message IDs without a recency cap,
+    so a message whose created_at predates the 500 most-recent messages is still
+    matched and returned rather than returning 404.
     """
     import uuid as _uuid
 
@@ -2068,14 +2063,16 @@ async def test_resolve_message_ref_tail_tradeoff_old_message_not_found(
 
     await db_session.commit()
 
-    # The target's unique prefix cannot be found — it is outside the 500-row window.
+    # The target is the oldest message but should still be resolved correctly.
     target_ref = target_id.hex[:24]
     token = create_agent_token(str(task.id), task.vm_instance_id)
     res = await client.get(
         f"/api/agent/projects/{project.id}/messages/{target_ref}",
         headers={"x-agent-token": token},
     )
-    assert res.status_code == 404, res.text
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["id"] == str(target_id)
+    assert res.json()["data"]["content"] == "old target"
 
 
 @pytest.mark.asyncio

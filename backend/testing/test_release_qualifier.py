@@ -23085,6 +23085,69 @@ async def test_qualification_verdict_persists_blind_merge_grade(db_session):
     assert rq.format_verdict_for_api(row)["blind_merge_grade"] == _grade
 
 
+@pytest.mark.asyncio
+async def test_goal_alignment_propagates_to_verdict(db_session):
+    """goal_alignment from the audit report propagates through finalize into
+    both last_qualification (base_record) and the persisted QualificationVerdict
+    row; an audit report without goal_alignment yields None without error."""
+    from app import release_promotion as rp
+
+    _goal_alignment = {"covered": True, "rationale": "All milestones addressed."}
+
+    # --- With goal_alignment present in audit report ---------------------------
+    _project, version = await _make_project_and_version(db_session)
+    base_record = {
+        "candidate_sha": "sha-goal",
+        "confidence": 0.80,
+        "threshold": 0.75,
+        "status": "not_promoted",
+        "goal_alignment": _goal_alignment,
+    }
+    version.last_qualification = dict(base_record)
+    db_session.add(version)
+
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        base_record,
+        terminal_status="not_promoted",
+        would_promote=False,
+        promotion_enabled=False,
+    )
+    await db_session.commit()
+
+    rows = await _load_only_verdict(db_session, version)
+    assert len(rows) == 1
+    assert rows[0].goal_alignment == _goal_alignment
+    assert rq.format_verdict_for_api(rows[0])["goal_alignment"] == _goal_alignment
+
+    # --- Without goal_alignment (no version goal or older report) -------------
+    _project2, version2 = await _make_project_and_version(db_session)
+    base_record_no_goal = {
+        "candidate_sha": "sha-no-goal",
+        "confidence": 0.80,
+        "threshold": 0.75,
+        "status": "not_promoted",
+    }
+    version2.last_qualification = dict(base_record_no_goal)
+    db_session.add(version2)
+
+    await rp._record_qualification_verdict(
+        db_session,
+        version2,
+        base_record_no_goal,
+        terminal_status="not_promoted",
+        would_promote=False,
+        promotion_enabled=False,
+    )
+    await db_session.commit()
+
+    rows2 = await _load_only_verdict(db_session, version2)
+    assert len(rows2) == 1
+    assert rows2[0].goal_alignment is None
+    assert rq.format_verdict_for_api(rows2[0])["goal_alignment"] is None
+
+
 def test_format_verdict_for_api_surfaces_acceptance_window_signal_without_changing_composite():
     """format_verdict_for_api surfaces acceptance-window aggregate as top-level keys.
 

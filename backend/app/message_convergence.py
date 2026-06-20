@@ -251,19 +251,21 @@ async def resolve_message_ref(
             status_code=400,
             detail="message reference must contain only hex characters (0-9, a-f)",
         )
-    # Scope to the project FIRST so cross-project rows are never candidates,
-    # then match id-hex prefix in Python (sqlite-safe, status-agnostic).
-    # ORDER BY created_at DESC ensures the 500-row window covers the most
-    # recent messages, which are almost always the ones being referenced.
-    # Limit caps worst-case memory; 500 rows is ample for short-prefix
-    # disambiguation in all but pathologically large projects.
-    result = await session.execute(
-        select(ProjectMessage)
-        .where(ProjectMessage.project_id == project_id)
-        .order_by(ProjectMessage.created_at.desc())
-        .limit(500)
+    # Two-phase lookup: first fetch only IDs (cheap, no limit) scoped to the
+    # project, match the prefix in Python, then load the full row(s) for any
+    # hit. This avoids both the 500-row recency cap and loading full JSONB for
+    # every candidate row.
+    id_result = await session.execute(
+        select(ProjectMessage.id).where(ProjectMessage.project_id == project_id)
     )
-    matches = [m for m in result.scalars().all() if m.id.hex.startswith(prefix)]
+    all_ids: list[uuid.UUID] = list(id_result.scalars().all())
+    matched_ids = [mid for mid in all_ids if mid.hex.startswith(prefix)]
+    if not matched_ids:
+        raise HTTPException(status_code=404, detail="Message not found")
+    full_result = await session.execute(
+        select(ProjectMessage).where(ProjectMessage.id.in_(matched_ids))
+    )
+    matches = list(full_result.scalars().all())
     if not matches:
         raise HTTPException(status_code=404, detail="Message not found")
     if len(matches) > 1:

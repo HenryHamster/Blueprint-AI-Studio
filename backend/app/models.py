@@ -40,7 +40,10 @@ import uuid
 from datetime import datetime, timezone
 from app.capability_registry import derive_provider_marker
 from app.time_utils import _utcnow
-from app.vm_cost_rates import get_cloud_run_rate_for_machine_type, get_vm_rate_per_second
+from app.vm_cost_rates import (
+    get_cloud_run_rate_for_machine_type,
+    get_vm_rate_per_second,
+)
 
 
 class NaiveUTCDateTime(TypeDecorator):
@@ -4104,7 +4107,7 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
 
-    # Goal-alignment grade: {grade, gap, reasoning_summary, ...}
+    # Goal-alignment grade: {covered, rationale, ...}
     # Nullable: existing verdict rows carry no goal_alignment data.
     goal_alignment: Any | None = Field(
         default=None,

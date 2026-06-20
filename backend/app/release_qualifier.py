@@ -3256,6 +3256,10 @@ async def _finalize_qualification(
         # survives finalization and is reusable on re-qualification of the same
         # candidate SHA (blind_merge_grade_satisfied short-circuits the re-run).
         BLIND_MERGE_GRADE_KEY: qual.get(BLIND_MERGE_GRADE_KEY),
+        # Goal-alignment grade emitted by the release_audit agent when
+        # version.goal is set. None when no goal is configured or the audit
+        # predates this field.
+        "goal_alignment": (audit_report or {}).get("goal_alignment"),
     }
 
     # Advisory WARN notification: theme cert advisory shortfall (not a hard block).
