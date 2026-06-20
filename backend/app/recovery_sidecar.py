@@ -123,7 +123,6 @@ async def _sweep_stranded_sidecar_sources() -> None:
                             sidecar.id,
                             source.id,
                         )
-                    break  # one sidecar per source per sweep pass
             if resolved:
                 logger.info(
                     "[SIDECAR-RECOVERY] Resolved %d stranded source task(s)", resolved
@@ -164,6 +163,31 @@ async def _sweep_stranded_sidecar_sources() -> None:
                 )
             )
             terminal_sources = pending_result.scalars().all()
+
+            # Batch-load terminal-source sidecars to avoid N+1 queries.
+            _terminal_sidecar_uuids_to_fetch: list = []
+            for source in terminal_sources:
+                ctx = source.context or {}
+                marker = ctx.get(_SIDECAR_VERDICT_APPLICATION_PENDING_KEY)
+                if not isinstance(marker, dict):
+                    continue
+                sidecar_ref = marker.get("sidecar_task_id")
+                try:
+                    _terminal_sidecar_uuids_to_fetch.append(
+                        _uuid.UUID(str(sidecar_ref))
+                    )
+                except (ValueError, TypeError):
+                    continue
+
+            terminal_sidecars_by_id: dict = {}
+            if _terminal_sidecar_uuids_to_fetch:
+                _terminal_sidecar_rows = await session.execute(
+                    select(Task).where(Task.id.in_(_terminal_sidecar_uuids_to_fetch))
+                )
+                terminal_sidecars_by_id = {
+                    s.id: s for s in _terminal_sidecar_rows.scalars().all()
+                }
+
             retried = 0
             for source in terminal_sources:
                 ctx = source.context or {}
@@ -175,7 +199,7 @@ async def _sweep_stranded_sidecar_sources() -> None:
                     sidecar_uuid = _uuid.UUID(str(sidecar_ref))
                 except (ValueError, TypeError):
                     continue
-                sidecar = await session.get(Task, sidecar_uuid)
+                sidecar = terminal_sidecars_by_id.get(sidecar_uuid)
                 if sidecar is None or sidecar.status not in {
                     TaskStatus.COMPLETED,
                     TaskStatus.FAILED,

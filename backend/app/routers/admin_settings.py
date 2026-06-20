@@ -648,6 +648,9 @@ async def get_settings(
         )
         > 0,
         "max_plan_accounts": max_plan_accounts,
+        "cloud_run_task_type_allowlist": sorted(
+            _runtime_config.get("cloud_run_task_type_allowlist") or []
+        ),
     }
 
 
@@ -2992,6 +2995,14 @@ async def _apply_settings(
                         _runtime_config.get(
                             "evergreen_fill_deferred_memo_enrollment", False
                         )
+                    ),
+                    # Persist the Cloud Run task-type allowlist so an operator
+                    # configuration survives a Cloud Run restart. runtime_config_state.
+                    # sync_* reads this key back on boot; without it the in-memory
+                    # allowlist reverts to [] (no Cloud Run routing) and the configured
+                    # types are lost.
+                    "cloud_run_task_type_allowlist": sorted(
+                        _runtime_config.get("cloud_run_task_type_allowlist") or []
                     ),
                 }
                 if "direction_refractory_minutes" not in _runtime_config:

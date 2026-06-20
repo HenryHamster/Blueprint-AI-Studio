@@ -9633,6 +9633,7 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
     session.add(source)
     await session.commit()
 
+
     await _sweep_stranded_sidecar_sources()
 
     await session.refresh(source)

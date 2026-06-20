@@ -1453,6 +1453,19 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "warm_pool_enabled",
                         bool(config_json["warm_pool_enabled"]),
                     )
+                if "cloud_run_task_type_allowlist" in config_json:
+                    # Persisted Cloud Run task-type allowlist. Normalize to a
+                    # sorted list of strings — mirroring the admin PATCH surface —
+                    # so every instance agrees on the allowlist and the setting
+                    # survives across restarts.
+                    raw_allow = config_json["cloud_run_task_type_allowlist"]
+                    if isinstance(raw_allow, str):
+                        raw_allow = raw_allow.split(",")
+                    if isinstance(raw_allow, (list, tuple, set)):
+                        _set(
+                            "cloud_run_task_type_allowlist",
+                            sorted({str(t).strip() for t in raw_allow if str(t).strip()}),
+                        )
                 if "warm_pool_account_retarget_enabled" in config_json:
                     _set(
                         "warm_pool_account_retarget_enabled",

@@ -1661,6 +1661,10 @@ let firstToolUseAt: number | null = null; // @per-role
 // pollForNextRole on a warm VM, false on the initial cold-start role.
 let isWarmStart = false; // @per-role
 
+// True when the agent is running in Cloud Run Job mode (CLOUD_RUN_JOB=1).
+// Set at startup from the env var injected by compute_cloud_run.py.
+let isJobMode = false;
+
 export function recordToolUse(toolName: string, input: unknown): void {
   if (firstToolUseAt === null) {
     firstToolUseAt = Date.now();
@@ -1699,6 +1703,16 @@ export function _setWarmStartForTesting(value: boolean): void {
 /** Test-only: read the warm-start flag. */
 export function _getWarmStartForTesting(): boolean {
   return isWarmStart;
+}
+
+/** Test-only: read the job-mode flag. */
+export function _getJobModeForTesting(): boolean {
+  return isJobMode;
+}
+
+/** Test-only: set the job-mode flag. */
+export function _setJobModeForTesting(value: boolean): void {
+  isJobMode = value;
 }
 
 /** Test-only: set the baked agent-runtime fingerprint used in heartbeats. */
@@ -2955,6 +2969,10 @@ export async function main() {
   // the moment node starts so a pre-claim death still leaves /tmp logs.
   startEventLoopLagMonitor();
   installExitMarkers();
+
+  // Detect Cloud Run Job execution mode from the CLOUD_RUN_JOB sentinel
+  // injected by compute_cloud_run.py. Used for job-mode behavioral branching.
+  isJobMode = process.env.CLOUD_RUN_JOB === '1';
 
   log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
   log(`Registered handlers (${Object.keys(handlers).length}): ${Object.keys(handlers).join(', ')}`);
