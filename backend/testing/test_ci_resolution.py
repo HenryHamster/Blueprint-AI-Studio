@@ -52,12 +52,48 @@ def test_proceed_on_no_checks_staging_base_proceeds():
     assert ci_resolution.proceed_on_no_checks(_proj(), "plan/cycle-1") is True
 
 
-def test_proceed_on_no_checks_no_ci_project_proceeds_any_base():
-    # The greenfield-repo fix: no-CI project proceeds on a definitive no_checks
-    # for ANY base (e.g. a fresh repo with no GitHub Actions).
-    p = _proj({"requires_ci_checks": False})
-    assert ci_resolution.proceed_on_no_checks(p, "main") is True
-    assert ci_resolution.proceed_on_no_checks(p, None) is True
+def test_proceed_on_no_checks_relaxed_ci_capable_repo_keeps_required_branch_strict():
+    # A CI-capable repo (has_ci=True) that relaxed requires_ci_checks — to skip
+    # per-PR CI on its integration branch — must STILL gate its
+    # ci_required_branches members (default ["main"], the promotion target)
+    # strictly: a no_checks on the promotion PR must never merge on absence of
+    # signal. The integration branch (automain), whose PRs now legitimately carry
+    # zero checks, proceeds. This closes the promotion race (Blueprint's config).
+    p = _proj({"has_ci": True, "requires_ci_checks": False})
+    assert ci_resolution.proceed_on_no_checks(p, "main") is False  # required → strict
+    assert ci_resolution.proceed_on_no_checks(p, "automain") is True  # integration → proceed
+
+
+def test_proceed_on_no_checks_ci_required_branches_override():
+    # An explicit ci_required_branches override controls which bases stay strict
+    # (only for a confirmed-CI repo that relaxed requires_ci_checks).
+    p = _proj(
+        {
+            "has_ci": True,
+            "requires_ci_checks": False,
+            "ci_required_branches": ["main", "release"],
+        }
+    )
+    assert ci_resolution.proceed_on_no_checks(p, "main") is False
+    assert ci_resolution.proceed_on_no_checks(p, "release") is False
+    assert ci_resolution.proceed_on_no_checks(p, "automain") is True
+    # Empty override → no branch is forced strict; relaxed repo proceeds anywhere.
+    p_open = _proj(
+        {"has_ci": True, "requires_ci_checks": False, "ci_required_branches": []}
+    )
+    assert ci_resolution.proceed_on_no_checks(p_open, "main") is True
+
+
+def test_proceed_on_no_checks_required_branch_override_scoped_to_has_ci_true():
+    # The required-branch override is scoped to has_ci is True, so external no-CI
+    # repos are untouched and never wedged into polling on their real base:
+    #   * has_ci=False → short-circuits to proceed (e.g. stsbot2).
+    #   * has_ci=None (undetermined) → falls back to requires_ci_checks, NOT forced
+    #     strict — an external no-CI repo merging to main still proceeds.
+    p_false = _proj({"has_ci": False, "requires_ci_checks": False})
+    assert ci_resolution.proceed_on_no_checks(p_false, "main") is True
+    p_none = _proj({"requires_ci_checks": False})  # has_ci undetermined
+    assert ci_resolution.proceed_on_no_checks(p_none, "main") is True
 
 
 def test_proceed_on_no_checks_has_ci_false_proceeds_even_when_requires_ci_stale():

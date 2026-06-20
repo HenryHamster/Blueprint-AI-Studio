@@ -1673,9 +1673,21 @@ async def _reconcile_if_managed_check_wait(
                 # never run — treat it as "proceed" and fall through to the merge
                 # step rather than leaving the version stranded waiting on checks
                 # that cannot run.
-                from app.ci_resolution import requires_ci_checks
+                #
+                # Base-aware: gate on proceed_on_no_checks(project,
+                # promotion_target) rather than the bare project-wide
+                # requires_ci_checks. The promotion PR targets ``promotion_target``
+                # (``main``), which is a ci_required_branches member by default —
+                # so a no_checks there is NEVER treated as proceed, even when the
+                # project relaxed requires_ci_checks for its integration branch.
+                # This closes the race where the promotion PR's empty-checks window
+                # (PR open, GitHub hasn't posted check-runs yet) could otherwise
+                # merge to main untested.
+                from app.ci_resolution import proceed_on_no_checks
 
-                if ci_state == _CI_NO_CHECKS and not requires_ci_checks(project):
+                if ci_state == _CI_NO_CHECKS and proceed_on_no_checks(
+                    project, promotion_target
+                ):
                     logger.info(
                         "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
                         "for v%d reports no_checks on a no-CI repo — proceeding "

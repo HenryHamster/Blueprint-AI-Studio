@@ -13,7 +13,18 @@ on:
     # section; with 'edited' each body update fired a full ~21-min 8-shard run
     # on an unchanged tree. CI is SHA-keyed (resolve_ci_status), so 'synchronize'
     # (a real new commit) is the only event that needs to gate — body edits don't.
-    branches: [main, automain]
+    #
+    # 'automain' intentionally REMOVED (2026-06-20): the full 8-shard suite was
+    # re-running on every task PR and rollup PR into the integration branch,
+    # burning the bulk of GitHub Actions minutes. Per-task targeted tests already
+    # gate each change during the task; the full suite now runs once, at the
+    # automain->main promotion PR (which still targets `main` below).
+    # REQUIRES companion config: the Blueprint project must have
+    # build_config.requires_ci_checks=false (PATCH /api/admin/projects/{id}),
+    # else automain PRs — which get zero check-runs under this trigger — stall at
+    # the merge gate and FAIL at the CI-wait backstop (~60min) then cancel their
+    # children. See ci_resolution.proceed_on_no_checks / requires_ci_checks.
+    branches: [main]
     types: [opened, synchronize, reopened]
   workflow_dispatch:
 
