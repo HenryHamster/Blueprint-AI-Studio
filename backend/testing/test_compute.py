@@ -9493,6 +9493,79 @@ def test_gcp_startup_script_no_clone_without_token():
     assert "git clone" not in script
 
 
+def test_gcp_startup_script_classifies_clone_failure_with_typed_reason():
+    """A clone failure must be ATTRIBUTABLE: stderr is captured (not discarded),
+    classified into auth/ratelimit/network/timeout, token-scrubbed, and folded into
+    the bundle — and the serial console only ever sees `repo_clone_failed:<class>`,
+    never the captured stderr text (which can echo the tokened URL)."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 -m pkg.eval",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        repo_clone={"owner": "octo", "repo": "demo", "ref": "main"},
+        repo_token="ghs_FAKETOKEN1234567890",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # stderr is captured to a file, NOT discarded to /dev/null.
+    assert "2>/tmp/blueprint_clone.err" in script
+    assert "git clone --depth 1 --branch main" in script
+    # The failure is classified into a typed bucket; ratelimit is distinguished
+    # from auth so a drained GitHub quota is separable from a bad/expired token.
+    assert "CLONE_CLASS=ratelimit" in script
+    assert "CLONE_CLASS=auth" in script
+    assert "CLONE_CLASS=network" in script
+    assert "CLONE_CLASS=timeout" in script
+    # The typed reason flows to BOTH the serial marker and the durable record.
+    assert (
+        f"{compute_backends_module._SERIAL_REASON_PREFIX}repo_clone_failed:$CLONE_CLASS"
+        in script
+    )
+    assert "FAILED 1 repo_clone_failed:$CLONE_CLASS" in script
+    # The captured stderr is token-scrubbed before it lands in the durable bundle.
+    assert "x-access-token:REDACTED@" in script
+    # ...and the scrubbed file is copied into the artifact dir so it ships in the
+    # GCS bundle for full post-hoc diagnosis.
+    assert "cp /tmp/blueprint_clone.err" in script
+    assert "/clone.err" in script
+    # The captured stderr is never echoed to the serial console (only the typed
+    # reason is) — guard against a `cat`/`echo` of the raw file leaking the token.
+    assert "cat /tmp/blueprint_clone.err" not in script
+
+
+def test_gcp_startup_script_writes_boot_beacon_before_command():
+    """A boot beacon (provisional FAILED record) is written BEFORE the clone and
+    command so an ungraceful mid-run VM death still uploads a durable terminal.json
+    — turning the blind 'no marker, no bundle' FAILURE into an attributable one.
+    Every later phase overwrites it with the true outcome."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 -m pkg.eval",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        repo_clone={"owner": "octo", "repo": "demo", "ref": "main"},
+        repo_token="ghs_FAKETOKEN1234567890",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "FAILED 1 vm_terminated_before_completion" in script
+    # The beacon is armed only AFTER the EXIT trap (so a death always uploads it)
+    # and BEFORE the command actually runs (so a mid-command death is covered).
+    # Anchor command_idx on the INVOCATION, not the near-top base64 decode line
+    # `... > /tmp/blueprint_command_runner.py` (which `index` would match first).
+    trap_idx = script.index("trap upload_artifacts EXIT")
+    beacon_idx = script.index("vm_terminated_before_completion")
+    command_idx = script.index("python3 /tmp/blueprint_command_runner.py")
+    assert trap_idx < beacon_idx < command_idx
+
+
 async def test_attach_repo_clone_sets_repo_and_token(db_session, monkeypatch):
     """_attach_repo_clone resolves owner/repo + ref (from base_branch) + a token."""
     project = Project(

@@ -1005,15 +1005,42 @@ def _build_gcp_startup_script(
         _clone_url = (
             f"https://x-access-token:{spec.repo_token}@github.com/{_owner}/{_repo}.git"
         )
+        # The clone's stderr is captured to a file (not discarded) so a FAILURE is
+        # ATTRIBUTABLE — bare "repo_clone_failed" hid whether a 4 MB clone of a
+        # branch that exists died on auth, a drained GitHub quota, a network blip,
+        # or a timeout. We classify the cause from that file, scrub any token out of
+        # it, then fold the scrubbed text into the durable bundle. The serial
+        # console only ever sees the TYPED reason (repo_clone_failed:<class>) — the
+        # captured stderr (which can echo the tokened URL) never reaches it.
+        _clone_err_q = shlex.quote("/tmp/blueprint_clone.err")
+        _clone_err_artifact = shlex.quote(
+            os.path.join(_GCP_ARTIFACT_DIR_PATH, "clone.err")
+        )
         repo_setup_block = (
             f"rm -rf {_repo_dir_q}\n"
             f"if ! git clone --depth 1 --branch {shlex.quote(_ref)} "
-            f"{shlex.quote(_clone_url)} {_repo_dir_q} >/dev/null 2>&1; then\n"
-            f'  echo "{_SERIAL_REASON_PREFIX}repo_clone_failed"\n'
+            f"{shlex.quote(_clone_url)} {_repo_dir_q} >/dev/null 2>{_clone_err_q}; then\n"
+            f"  CLONE_CLASS=unknown\n"
+            f"  if grep -qiE 'rate limit|too many requests|429' {_clone_err_q} "
+            f"2>/dev/null; then CLONE_CLASS=ratelimit\n"
+            f"  elif grep -qiE 'authentication failed|invalid username or password|"
+            f"could not read from remote|repository not found|access denied|403|401' "
+            f"{_clone_err_q} 2>/dev/null; then CLONE_CLASS=auth\n"
+            f"  elif grep -qiE 'could not resolve host|name or service not known|"
+            f"connection refused|network is unreachable|failed to connect|"
+            f"could not connect' {_clone_err_q} 2>/dev/null; then CLONE_CLASS=network\n"
+            f"  elif grep -qiE 'timed out|timeout' {_clone_err_q} 2>/dev/null; "
+            f"then CLONE_CLASS=timeout\n"
+            f"  fi\n"
+            f"  sed -i -E 's#x-access-token:[^@]*@#x-access-token:REDACTED@#g; "
+            f"s#gh[a-z]_[A-Za-z0-9]{{20,}}#REDACTED#g' {_clone_err_q} "
+            f"2>/dev/null || true\n"
+            f"  cp {_clone_err_q} {_clone_err_artifact} 2>/dev/null || true\n"
+            f'  echo "{_SERIAL_REASON_PREFIX}repo_clone_failed:$CLONE_CLASS"\n'
             f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             f"  python3 /tmp/blueprint_terminal_record.py "
-            f"{artifact_dir} FAILED 1 repo_clone_failed "
+            f"{artifact_dir} FAILED 1 repo_clone_failed:$CLONE_CLASS "
             f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
             f'  kill "$TTL_PID" 2>/dev/null || true\n'
@@ -1032,6 +1059,14 @@ def _build_gcp_startup_script(
         )
     else:
         deadline_seconds = 3600
+    # Boot beacon (written into the script body right after `mkdir -p`): a
+    # provisional FAILED terminal record laid down BEFORE the clone/command so an
+    # ungraceful VM death mid-run (OOM, host kill) still leaves a durable
+    # terminal.json in the bundle. The reconcile path then reports
+    # `vm_terminated_before_completion` instead of the blind "stopped without a
+    # terminal marker" FAILURE that uploaded nothing. Every later phase
+    # (clone-fail / runtime-TTL / completion) OVERWRITES this record with the true
+    # outcome, so it only survives a death that writes nothing else.
     command = shlex.quote(spec.command)
     artifact_bundle = shlex.quote(_GCP_ARTIFACT_BUNDLE_PATH)
     artifact_upload_url = shlex.quote(artifact_upload_url)
@@ -1096,6 +1131,9 @@ export {ARTIFACT_DIR_ENV}={artifact_dir}
 rm -f {result_file}
 rm -f {command_log_path}
 mkdir -p {artifact_dir}
+python3 /tmp/blueprint_terminal_record.py \
+  {artifact_dir} FAILED 1 vm_terminated_before_completion {result_file} {command_log_path} \
+  >/dev/null 2>&1 || true
 {repo_setup_block}
 {cwd_line}
 EXIT_CODE=0
