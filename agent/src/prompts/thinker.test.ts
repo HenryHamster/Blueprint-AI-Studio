@@ -618,6 +618,107 @@ describe('runThinkerWithGate', () => {
   });
 });
 
+// ── runThinkerWithGate validateParsedValue guard ──────────────────────────────
+//
+// The repair path's validateParsedValue hook rejects schema-template placeholder
+// echoes (purpose='<from analysis>', '...', or '') so recordFormatRepairSuccess
+// only fires when the extracted value is actually usable. When the guard fires,
+// problemModelRepair.value is null → writeFileSync(problemModelPath) is skipped →
+// filesPresent() remains false → the focused retry (3rd runClaudeCode call)
+// fires. Tests here lock that path against silent regression.
+
+describe('runThinkerWithGate validateParsedValue guard', () => {
+  const mockRunClaudeCode = vi.mocked(runClaudeCode);
+  const mockPersistAndPostStatus = vi.mocked(persistAndPostStatus);
+
+  const taskId = 'test-task-123';
+  const problemModelPath = `/tmp/problem_model_${taskId}.json`;
+  const runningUpdatePath = `/tmp/running_update_${taskId}.md`;
+  const ws = null;
+  const statusRef = { value: '' };
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    fsMockState.presentFiles.clear();
+    mockRunClaudeCode.mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    mockPersistAndPostStatus.mockResolvedValue(undefined);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockImplementation(
+      (path: string) => fsMockState.presentFiles.has(path),
+    );
+    vi.mocked(fs.writeFileSync as (path: string, data: unknown) => void).mockImplementation(
+      (path: string) => { if (typeof path === 'string') fsMockState.presentFiles.add(path); },
+    );
+  });
+
+  it('rejects XML-tag placeholder intent.purpose="<from analysis>" — focused retry fires, file not written', async () => {
+    fsMockState.presentFiles.add(runningUpdatePath);
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"intent":{"purpose":"<from analysis>"},"gaps":[]}',
+        lastResultText: '{"intent":{"purpose":"<from analysis>"},"gaps":[]}',
+      })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'focused retry output', lastResultText: '' });
+
+    await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(3);
+    expect(fsMockState.presentFiles.has(problemModelPath)).toBe(false);
+  });
+
+  it('rejects ellipsis placeholder intent.purpose="..." — focused retry fires, file not written', async () => {
+    fsMockState.presentFiles.add(runningUpdatePath);
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"intent":{"purpose":"..."},"gaps":[]}',
+        lastResultText: '{"intent":{"purpose":"..."},"gaps":[]}',
+      })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'focused retry output', lastResultText: '' });
+
+    await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(3);
+    expect(fsMockState.presentFiles.has(problemModelPath)).toBe(false);
+  });
+
+  it('rejects empty-string placeholder intent.purpose="" — focused retry fires, file not written', async () => {
+    fsMockState.presentFiles.add(runningUpdatePath);
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"intent":{"purpose":""},"gaps":[]}',
+        lastResultText: '{"intent":{"purpose":""},"gaps":[]}',
+      })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'focused retry output', lastResultText: '' });
+
+    await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(3);
+    expect(fsMockState.presentFiles.has(problemModelPath)).toBe(false);
+  });
+
+  it('accepts real intent.purpose — no focused retry, file written, returns ok:true', async () => {
+    fsMockState.presentFiles.add(runningUpdatePath);
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"intent":{"purpose":"real project purpose"},"gaps":[]}',
+        lastResultText: '{"intent":{"purpose":"real project purpose"},"gaps":[]}',
+      });
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
+    expect(fsMockState.presentFiles.has(problemModelPath)).toBe(true);
+    expect(result).toEqual({ ok: true, analysisText: 'analysis without JSON' });
+  });
+});
+
 describe('buildThinkerPrompt on_automain annotation', () => {
   const base: ThinkerPromptParams = {
     contextPrefix: '',
