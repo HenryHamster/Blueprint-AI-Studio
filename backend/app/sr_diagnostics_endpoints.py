@@ -51,6 +51,7 @@ from app.sr_blind_spots import (
     is_skipped_sr_outcome as _is_skipped_sr_outcome,
     _REVIEWER_ORIGINS,
     reviewer_confirmed_categories,
+    safe_check_results,
 )
 from app.research_completion import lookup_findings_by_source_ref
 from app.research_actionability import (
@@ -204,7 +205,7 @@ async def list_sr_missed_retrospectives(
     async for t in task_stream.scalars():
         ctx = t.context or {}
         sr_outcome = ctx.get("_self_review_outcome") or {}
-        check_results = sr_outcome.get("check_results") or {}
+        check_results = safe_check_results(sr_outcome)
         if not check_results:
             continue
         reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
@@ -866,7 +867,7 @@ async def fetch_sr_reviewer_disagreement_tasks(
         sro = ctx.get("_self_review_outcome")
         if not sro or _is_skipped_sr_outcome(sro):
             continue
-        check_results = sro.get("check_results") or {}
+        check_results = safe_check_results(sro)
         reviewer_findings = sro.get("reviewer_findings") or []
         if not reviewer_findings:
             continue
@@ -1116,7 +1117,7 @@ async def get_sr_recent_misses(
         reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
         if not reviewer_confirmed_cats:
             continue
-        check_results = sr_outcome.get("check_results") or {}
+        check_results = safe_check_results(sr_outcome)
         sr_failed = _author_sr_failed_categories(check_results)
         missed = reviewer_confirmed_cats - sr_failed
         if not missed:

@@ -398,7 +398,10 @@ def compute_sr_quality_by_fingerprint(
     top_disagreement_categories: int = 3,
 ) -> dict[str, dict[str, Any]]:
     """Compute additive SR-quality metrics for prompt fingerprint analytics."""
-    from app.sr_blind_spots import is_skipped_sr_outcome  # noqa: PLC0415
+    from app.sr_blind_spots import (  # noqa: PLC0415
+        is_skipped_sr_outcome,
+        safe_check_results,
+    )
 
     buckets: dict[str, dict[str, Any]] = {}
     project_catch_hits = 0
@@ -425,7 +428,7 @@ def compute_sr_quality_by_fingerprint(
         if not sro or is_skipped_sr_outcome(sro):
             continue
         bucket["sr_sample_size"] += 1
-        check_results = sro.get("check_results") or {}
+        check_results = safe_check_results(sro)
         sr_failed = {
             cat
             for cat, result in check_results.items()

@@ -24,6 +24,7 @@ from app.sr_blind_spots import (
     _REVIEWER_ORIGINS,
     is_skipped_sr_outcome,
     reviewer_confirmed_categories,
+    safe_check_results,
 )
 
 
@@ -252,7 +253,7 @@ def _stats_for_tasks(
         # reviewed and missed". The skip rate is surfaced separately.
         if is_skipped_sr_outcome(sro):
             continue
-        check_results = sro.get("check_results") or {}
+        check_results = safe_check_results(sro)
         # Combined view (author SR + reviewer save) — feeds hit/origin-split
         # counters below where _origin_bucket separates `sr_alone` vs
         # `reviewer_save`, so reviewer-stamped entries must remain present.

@@ -150,6 +150,53 @@ def test_filter_mutates_sro_in_place():
 
 
 # ---------------------------------------------------------------------------
+# Ingest normalization + helper: check_results shape (dict vs list)
+#
+# Agents occasionally emit ``check_results`` as a JSON list instead of the
+# expected category->record dict. The outer-only ``Dict[str, Any]`` schema
+# validation lets it through, and a non-empty list is truthy so the
+# ``... or {}`` guard misses it. The ingest funnel normalizes a non-dict shape
+# to ``{}`` and the ``safe_check_results`` helper guards individual reads.
+# ---------------------------------------------------------------------------
+
+
+def test_filter_normalizes_list_shaped_check_results_to_empty_dict():
+    sro = {
+        "verdict": "pass",
+        "blind_spots": [],
+        "check_results": [
+            {"category": "correctness", "passed": False},
+            {"category": "security", "passed": False},
+        ],
+    }
+    result = filter_disallowed_blind_spots(sro)
+    assert result["check_results"] == {}
+
+
+def test_filter_leaves_valid_dict_check_results_untouched():
+    valid = {"correctness": {"passed": True}, "security": {"passed": False}}
+    sro = {"verdict": "pass", "blind_spots": [], "check_results": valid}
+    result = filter_disallowed_blind_spots(sro)
+    assert result["check_results"] == valid
+
+
+def test_filter_does_not_add_check_results_when_absent():
+    sro = {"verdict": "pass", "blind_spots": []}
+    result = filter_disallowed_blind_spots(sro)
+    assert "check_results" not in result
+
+
+def test_safe_check_results_guards_non_dict_shapes():
+    from app.sr_blind_spots import safe_check_results
+
+    assert safe_check_results({"check_results": [{"category": "x"}]}) == {}
+    assert safe_check_results({"check_results": None}) == {}
+    assert safe_check_results({}) == {}
+    valid = {"correctness": {"passed": True}}
+    assert safe_check_results({"check_results": valid}) == valid
+
+
+# ---------------------------------------------------------------------------
 # Contract: prompt examples must match the backend blocklist
 # ---------------------------------------------------------------------------
 

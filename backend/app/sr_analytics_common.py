@@ -11,7 +11,17 @@ from typing import Any, Optional
 
 from app.models import Task
 from app.shared_state import DEFAULT_TASK_SCOPE
-from app.sr_blind_spots import _REVIEWER_ORIGINS, reviewer_confirmed_categories
+from app.sr_blind_spots import (
+    _REVIEWER_ORIGINS,
+    reviewer_confirmed_categories,
+    safe_check_results,
+)
+
+# Re-exported from sr_blind_spots (the lowest-level SR module) so consumers that
+# already import from sr_analytics_common can reach the guard without reaching
+# past it. Defining it here instead would create an import cycle, since this
+# module imports from sr_blind_spots above.
+__all__ = ["safe_check_results"]
 
 
 # In-app Alert row title prefixes for SR catch-rate alerts. The router that
@@ -208,7 +218,7 @@ def _compute_cat_fp_stats(
         sro = ctx.get("_self_review_outcome")
         if not sro:
             continue
-        check_results = sro.get("check_results") or {}
+        check_results = safe_check_results(sro)
         sr_failed = {
             category
             for category, result in check_results.items()
@@ -259,7 +269,7 @@ def _compute_cat_severity_calibration(
         sro = ctx.get("_self_review_outcome")
         if not sro:
             continue
-        check_results = sro.get("check_results") or {}
+        check_results = safe_check_results(sro)
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         if not rev_hist:
             continue
@@ -333,7 +343,7 @@ def _compute_reasoning_engagement(
         sro = ctx.get("_self_review_outcome")
         if not sro or is_skipped_sr_outcome(sro):
             continue
-        check_results = sro.get("check_results") or {}
+        check_results = safe_check_results(sro)
         for cat in cats:
             entry = check_results.get(cat)
             if not isinstance(entry, dict) or not entry.get("passed", True):
@@ -405,7 +415,7 @@ def _compute_miss_latency_stats(tasks: list) -> dict:
     for task in tasks:
         ctx = task.context or {}
         sr_outcome = ctx.get("_self_review_outcome") or {}
-        check_results = sr_outcome.get("check_results") or {}
+        check_results = safe_check_results(sr_outcome)
         rejection_cats = ctx.get("_first_attempt_rejection_categories") or {}
 
         if not check_results or not rejection_cats:

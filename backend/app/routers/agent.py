@@ -75,6 +75,7 @@ from app.claim_analytics import stamp_cold_claim_timing
 from app.sr_blind_spots import (
     aggregate_sr_blind_spot_themes,
     aggregate_sr_co_failure_pairs,
+    safe_check_results,
 )
 from app.pipeline_health import compute_pipeline_health_summary
 from app.knowledge_query import (
@@ -665,9 +666,8 @@ async def _stamp_reviewer_recovery_count(
         or any(
             isinstance(v, dict)
             and v.get("origin") == "reviewer_recovery_after_incomplete_sr"
-            for v in (
-                (t.context or {}).get("_self_review_outcome", {}).get("check_results")
-                or {}
+            for v in safe_check_results(
+                (t.context or {}).get("_self_review_outcome", {})
             ).values()
         )
     )
@@ -5088,7 +5088,7 @@ async def merge_operator_reviewer_findings(
     if recovery_origin:
         sr["reviewer_recovery_origin"] = recovery_origin
 
-    check_results = dict(sr.get("check_results") or {})
+    check_results = dict(safe_check_results(sr))
     for finding in findings_dicts:
         cat = finding.get("category")
         if cat:

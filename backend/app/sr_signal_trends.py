@@ -14,7 +14,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Alert, AlertSeverity, Project, StrategicCycle, _utcnow
-from app.sr_blind_spots import _REVIEWER_ORIGINS
+from app.sr_blind_spots import _REVIEWER_ORIGINS, safe_check_results
 from app.sr_catch_rate_trends import (
     _MIN_SR_SAMPLE,
     _SR_CODE_CHANGE_TYPES,
@@ -74,7 +74,7 @@ async def compute_sr_regression_risk_test_signal_trends(
         sro = ctx.get("_self_review_outcome")
         if not sro or is_skipped_sr_outcome(sro):
             return False
-        rr = (sro.get("check_results") or {}).get("regression_risk")
+        rr = safe_check_results(sro).get("regression_risk")
         return isinstance(rr, dict) and "passed" in rr
 
     def _has_test_signal(task) -> bool:
@@ -101,7 +101,7 @@ async def compute_sr_regression_risk_test_signal_trends(
             if not _qualifies(t):
                 continue
             sro = (t.context or {}).get("_self_review_outcome") or {}
-            rr = (sro.get("check_results") or {}).get("regression_risk") or {}
+            rr = safe_check_results(sro).get("regression_risk") or {}
             sr_passed = bool(rr.get("passed"))
             signal = _has_test_signal(t)
             if sr_passed and signal:
@@ -532,7 +532,7 @@ def get_sr_alert_drilldown_tasks(
         ctx = t.context or {}
         if "_self_review_outcome" not in ctx:
             continue
-        check_results = ctx["_self_review_outcome"].get("check_results") or {}
+        check_results = safe_check_results(ctx["_self_review_outcome"])
         # Author SR failures only — a reviewer-rescued category should still
         # surface in the drilldown as `missed_in_target` because the SR itself
         # did not catch it.
