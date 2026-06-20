@@ -413,7 +413,6 @@ async def _spawn_residual_fingerprint_remediation(
                     f"[AUTO REMEDIATION] depth lookup failed for {fp[:32]}: {_depth_exc}"
                 )
         remediation_context = {
-            "auto_remediation": True,
             "spawned_by": "residual_fingerprint_remediation",
             "error_fingerprint": fp,
             "sample_message": primary_sample[:500],
@@ -429,6 +428,7 @@ async def _spawn_residual_fingerprint_remediation(
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
+            auto_remediation=True,
         )
         session.add(new_task)
         session.add(
@@ -601,7 +601,6 @@ async def _spawn_viewport_regression_remediation(
             "autonomous_research:viewport_regression_remediation",
         )
         remediation_context = {
-            "auto_remediation": True,
             "spawned_by": "viewport_regression_remediation",
             "viewport_fingerprint": fp,
             "component": component,
@@ -620,6 +619,7 @@ async def _spawn_viewport_regression_remediation(
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
+            auto_remediation=True,
         )
         session.add(new_task)
         session.add(

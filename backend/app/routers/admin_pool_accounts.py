@@ -554,6 +554,8 @@ async def _compute_account_health_summary(
                             *_mp_predicates,
                         ),
                     )
+                    .order_by(Task.updated_at.desc())
+                    .limit(1000)
                 )
             )
             .scalars()
@@ -887,7 +889,7 @@ async def remove_max_plan_account(
                 Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]),
                 or_(
                     Task.account_id == account_id,
-                    Task.context["llm_account_id"].as_string() == account_id,
+                    Task.llm_account_id == account_id,
                     Task.context["max_plan_account_id"].as_string() == account_id,
                 ),
             )

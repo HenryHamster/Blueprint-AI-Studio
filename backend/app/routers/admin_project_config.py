@@ -27,8 +27,8 @@ from app.models import (
     Task,
     TaskStatus,
     _utcnow,
-    get_task_current_attempt_vm_cost_usd,
 )
+from app.vm_cost_rates import get_cloud_run_rate_for_machine_type, get_vm_rate_per_second
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
 from app.resource_envelope import (
@@ -71,52 +71,58 @@ async def cost_summary(
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
     by_type: Dict[str, Any] = {}
     total_cost = 0.0
-    tasks = (
-        (
-            await session.execute(
-                select(Task)
-                .options(
-                    load_only(
-                        Task.id,
-                        Task.provider,
-                        Task.vm_spot,
-                        Task.vm_machine_type,
-                        Task.vm_provisioned_at,
-                        Task.vm_stopped_at,
-                        Task.created_at,
-                        raiseload=True,
-                    )
-                )
-                .where(
-                    Task.created_at >= cutoff,
-                    Task.vm_provisioned_at.is_not(None),
-                    Task.vm_stopped_at.is_not(None),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
 
-    for task in tasks:
-        key = f"{task.provider or 'unknown'}:{'spot' if task.vm_spot else 'on-demand'}"
-        duration_seconds = float(
-            (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
+    # GROUP BY (provider, vm_spot, vm_machine_type) so we compute duration totals
+    # in SQL rather than loading thousands of Task rows into Python for arithmetic.
+    agg_rows = (
+        await session.execute(
+            select(
+                Task.provider,
+                Task.vm_spot,
+                Task.vm_machine_type,
+                func.count().label("n"),
+                func.sum(
+                    func.greatest(
+                        0.0,
+                        func.extract(
+                            "epoch", Task.vm_stopped_at - Task.vm_provisioned_at
+                        ),
+                    )
+                ).label("total_seconds"),
+            )
+            .where(
+                Task.created_at >= cutoff,
+                Task.vm_provisioned_at.is_not(None),
+                Task.vm_stopped_at.is_not(None),
+            )
+            .group_by(Task.provider, Task.vm_spot, Task.vm_machine_type)
         )
-        estimated_cost = get_task_current_attempt_vm_cost_usd(task)
-        row = by_type.setdefault(
-            key,
-            {
-                "count": 0,
-                "total_seconds": 0.0,
-                "estimated_cost": 0.0,
-                "provider": task.provider,
-                "spot": task.vm_spot,
-            },
-        )
-        row["count"] += 1
-        row["total_seconds"] += duration_seconds
-        row["estimated_cost"] += estimated_cost
+    ).all()
+
+    for agg in agg_rows:
+        provider = agg.provider
+        vm_spot = agg.vm_spot
+        machine_type = agg.vm_machine_type
+        key = f"{provider or 'unknown'}:{'spot' if vm_spot else 'on-demand'}"
+        total_seconds = float(agg.total_seconds or 0)
+        if machine_type and machine_type.startswith("cloud-run-"):
+            rate = get_cloud_run_rate_for_machine_type(machine_type)
+        else:
+            rate = get_vm_rate_per_second(machine_type=machine_type, spot=vm_spot)
+        estimated_cost = total_seconds * rate
+        existing = by_type.get(key)
+        if existing is not None:
+            existing["count"] += agg.n
+            existing["total_seconds"] += total_seconds
+            existing["estimated_cost"] += estimated_cost
+        else:
+            by_type[key] = {
+                "count": agg.n,
+                "total_seconds": total_seconds,
+                "estimated_cost": estimated_cost,
+                "provider": provider,
+                "spot": vm_spot,
+            }
         total_cost += estimated_cost
 
     for row in by_type.values():
@@ -176,27 +182,28 @@ async def get_auto_remediation_config(
                 .where(
                     Task.project_id == project_id,
                     Task.created_at >= seven_days_ago,
+                    Task.auto_remediation.is_(True),
                 )
                 .options(
                     load_only(
                         Task.id,
                         Task.status,
                         Task.title,
+                        Task.auto_remediation,
                         Task.context,
                         Task.created_at,
                         raiseload=True,
                     )
                 )
                 .order_by(Task.created_at.desc())
+                .limit(500)
             )
         )
         .scalars()
         .all()
     )
 
-    auto_tasks = [
-        t for t in recent_rows if (t.context or {}).get("auto_remediation") is True
-    ]
+    auto_tasks = [t for t in recent_rows if t.auto_remediation is True]
     spawned_24h = sum(
         1 for t in auto_tasks if t.created_at and t.created_at >= twenty_four_hours_ago
     )

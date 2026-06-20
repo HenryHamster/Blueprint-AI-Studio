@@ -10507,7 +10507,7 @@ async def test_residual_fingerprint_remediation_spawns_task(
     ]
     assert len(create_tasks) == 1
     t = create_tasks[0]
-    assert t.context["auto_remediation"] is True
+    assert t.auto_remediation is True
     assert sample_msg in t.first_payload["prompt"]
     assert t.context["spawned_by"] == "residual_fingerprint_remediation"
     assert t.context["error_fingerprint"] == fp
@@ -11481,7 +11481,7 @@ async def test_viewport_regression_remediation_spawns_task(
     ]
     assert len(create_tasks) == 1
     t = create_tasks[0]
-    assert t.context["auto_remediation"] is True
+    assert t.auto_remediation is True
     assert t.context["spawned_by"] == "viewport_regression_remediation"
     assert t.context["viewport_fingerprint"] == fp
     assert t.context["component"] == "MyComponent"
