@@ -1822,7 +1822,9 @@ async def update_agent_status(
                                 )
                                 should_requeue = False
                             else:
-                                delay = exponential_backoff(api_retries, base=240, cap=1800, jitter=0)
+                                delay = exponential_backoff(
+                                    api_retries, base=240, cap=1800, jitter=0
+                                )
                                 set_retry_after(ctx, delay / 60)
                                 logger.info(
                                     f"[AGENT STATUS] Task {task.id} EXTERNAL_API retry {api_retries} — backoff {delay}s"
@@ -2323,7 +2325,15 @@ async def update_agent_status(
                 )
                 _teardown_deferred = False
         if not _teardown_deferred:
-            fire_and_forget_vm_delete(old_vm_id, reason="agent_completion")
+            # Cloud Run executions self-terminate when the agent process exits;
+            # there is no GCE VM to delete. Skip fire_and_forget_vm_delete for
+            # CR-backed tasks so we don't call the GCE delete API with a
+            # synthetic vm_id that was never a real GCE instance.
+            from app.compute_cloud_run import is_cloud_run_task
+
+            _is_cr_task = is_cloud_run_task(task.vm_machine_type)
+            if not _is_cr_task:
+                fire_and_forget_vm_delete(old_vm_id, reason="agent_completion")
 
         # Backlog-reuse / warm-pool circuit breakers: if this FAILED task was
         # originally claimed via a warm path, record a failure event so the
@@ -2767,7 +2777,12 @@ async def update_agent_status(
 
                 rl_hit_count = rl_counts.get(str(acct_id), 1) if acct_id else 1
                 # Exponential backoff: 30min * 2^(n-1), ±20% jitter
-                delay_minutes = exponential_backoff(rl_hit_count, base=30 * 60, cap=240 * 60, jitter=0.2) / 60
+                delay_minutes = (
+                    exponential_backoff(
+                        rl_hit_count, base=30 * 60, cap=240 * 60, jitter=0.2
+                    )
+                    / 60
+                )
                 # Audit W1: pass task — set_retry_after now writes the column
                 # in addition to the context counter.
                 task.context = ctx

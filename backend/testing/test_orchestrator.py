@@ -8122,3 +8122,294 @@ async def test_retry_after_release_clears_failure_class(db_session, mocker):
     assert initial_task.retry_after_until is None, (
         "retry_after_until must be cleared when releasing from retry_after hold"
     )
+
+
+class TestCloudRunDispatch:
+    """Tests for the Cloud Run Jobs dispatch path in the orchestrator.
+
+    Verifies the dark-gate behaviour: an empty allowlist leaves the GCE path
+    unchanged, and an allowlisted read-only type is routed to
+    ``launch_agent_cloud_run_job`` instead of ``provision_agent_vm``.
+
+    Reuses the ``orch_warm_db`` / ``_run_one_cycle`` harness from
+    ``TestWarmVMSkipProvision`` — same in-memory SQLite DB, same mocks.
+    """
+
+    # ── borrow the fixture + helper from TestWarmVMSkipProvision ─────────────
+    orch_warm_db = TestWarmVMSkipProvision.orch_warm_db  # type: ignore[attr-defined]
+    _run_one_cycle = staticmethod(TestWarmVMSkipProvision._run_one_cycle)  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _naive_utcnow():
+        from datetime import timezone as _tz
+
+        return datetime.now(_tz.utc).replace(tzinfo=None)
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_dispatch_routes_allowlisted_type(
+        self, orch_warm_db, mocker
+    ):
+        """When cloud_run_task_type_allowlist contains a read-only task type and
+        a task of that type is dispatched, launch_agent_cloud_run_job() is called
+        and provision_agent_vm() is NOT called.
+
+        This is the named acceptance-evidence test:
+          target: test_cloud_run_dispatch_routes_allowlisted_type
+        """
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        # Put "research" on the allowlist — it is a read-only type.
+        _orch_module._runtime_config["cloud_run_task_type_allowlist"] = ["research"]
+        try:
+            prov_mock = mocker.patch(
+                "app.orchestrator.provision_agent_vm",
+                new_callable=AsyncMock,
+                return_value=True,
+            )
+            cr_mock = mocker.patch(
+                "app.orchestrator.launch_agent_cloud_run_job",
+                new_callable=AsyncMock,
+                return_value=True,
+            )
+            mocker.patch(
+                "app.orchestrator._sync_runtime_config_from_state",
+                new_callable=AsyncMock,
+                return_value=[],
+            )
+            # Supply dummy credentials so the orchestrator reaches the
+            # provision branch (no env LLM keys in CI).
+            mocker.patch(
+                "app.orchestrator._resolve_env_runtime_fallback",
+                return_value=("fake-api-key", "anthropic", "api_key", "claude-opus-4-8", None, {}),
+            )
+
+            async with orch_warm_db() as session:
+                project = make_project(name="CR Dispatch Test", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "research", "prompt": "Analyse the codebase"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+
+            # Cloud Run path must have been taken; GCE path must NOT.
+            assert cr_mock.called, (
+                "launch_agent_cloud_run_job must be called for an allowlisted "
+                "read-only task type"
+            )
+            assert not prov_mock.called, (
+                "provision_agent_vm must NOT be called when the task type is "
+                "routed to Cloud Run"
+            )
+
+            # Task must have been committed as PROVISIONING.
+            async with orch_warm_db() as verify:
+                row = (
+                    (await verify.execute(_select(Task).where(Task.id == task_id)))
+                    .scalars()
+                    .first()
+                )
+                assert row is not None
+                assert row.status == TaskStatus.PROVISIONING, (
+                    f"Task should be PROVISIONING after CR dispatch, got {row.status}"
+                )
+        finally:
+            _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_empty_allowlist_uses_gce_path(self, orch_warm_db, mocker):
+        """When cloud_run_task_type_allowlist is empty (the default), all task
+        types use the unchanged provision_agent_vm() GCE path."""
+        import app.orchestrator as _orch_module
+
+        # Ensure allowlist is empty (default).
+        _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        cr_mock = mocker.patch(
+            "app.orchestrator.launch_agent_cloud_run_job",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        # Supply dummy credentials so the orchestrator reaches the
+        # provision branch (no env LLM keys in CI).
+        mocker.patch(
+            "app.orchestrator._resolve_env_runtime_fallback",
+            return_value=("fake-api-key", "anthropic", "api_key", "claude-opus-4-8", None, {}),
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="GCE Default Test", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "research", "prompt": "Analyse the codebase"}],
+                context={},
+            )
+            session.add(task)
+            await session.commit()
+
+        await self._run_one_cycle(mocker)
+
+        # GCE path must be taken; CR path must NOT.
+        assert prov_mock.called, (
+            "provision_agent_vm must be called when cloud_run_task_type_allowlist "
+            "is empty"
+        )
+        assert not cr_mock.called, (
+            "launch_agent_cloud_run_job must NOT be called when the allowlist is empty"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_write_type_not_routed(self, orch_warm_db, mocker):
+        """Even if a write task type were somehow on the allowlist, it must NOT
+        be routed to Cloud Run — only types in CLOUD_RUN_CANDIDATE_TASK_TYPES
+        (= READ_ONLY_TASK_TYPES) are eligible."""
+        import app.orchestrator as _orch_module
+        from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES
+
+        # Sanity: "create" is not a candidate.
+        assert "create" not in CLOUD_RUN_CANDIDATE_TASK_TYPES
+
+        # Force the allowlist to include a write type (operator error).
+        _orch_module._runtime_config["cloud_run_task_type_allowlist"] = ["create"]
+        try:
+            prov_mock = mocker.patch(
+                "app.orchestrator.provision_agent_vm",
+                new_callable=AsyncMock,
+                return_value=True,
+            )
+            cr_mock = mocker.patch(
+                "app.orchestrator.launch_agent_cloud_run_job",
+                new_callable=AsyncMock,
+                return_value=True,
+            )
+            mocker.patch(
+                "app.orchestrator._sync_runtime_config_from_state",
+                new_callable=AsyncMock,
+                return_value=[],
+            )
+            # Supply dummy credentials so the orchestrator reaches the
+            # provision branch (no env LLM keys in CI).
+            mocker.patch(
+                "app.orchestrator._resolve_env_runtime_fallback",
+                return_value=("fake-api-key", "anthropic", "api_key", "claude-opus-4-8", None, {}),
+            )
+
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Write-Type Safety Test", user_id=_TEST_USER
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "create", "prompt": "Add feature"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+
+            await self._run_one_cycle(mocker)
+
+            # GCE path must be taken for a write type regardless of the allowlist.
+            assert prov_mock.called, (
+                "provision_agent_vm must be called for a write task type even if it "
+                "appears in cloud_run_task_type_allowlist"
+            )
+            assert not cr_mock.called, (
+                "launch_agent_cloud_run_job must NOT be called for write task types"
+            )
+        finally:
+            _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []
+
+
+class TestCloudRunAllowlistValidation:
+    """Tests for the admin PATCH /settings cloud_run_task_type_allowlist gate.
+
+    Drives the real _apply_settings handler via AsyncClient to ensure the
+    production write-type rejection block in admin_settings.py is actually
+    exercised (not re-implemented inline).
+    """
+
+    @pytest.mark.asyncio
+    async def test_write_type_rejected(self, client):
+        """Submitting a write task type returns HTTP 400 from the real handler."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"cloud_run_task_type_allowlist": ["create"]},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_valid_read_only_type_accepted(self, client):
+        """A valid read-only task type is accepted and stored sorted."""
+        import app.shared_state as _ss
+
+        original = list(_ss.runtime_config.get("cloud_run_task_type_allowlist", []))
+        try:
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"cloud_run_task_type_allowlist": ["research"]},
+            )
+            assert resp.status_code == 200
+            assert "research" in _ss.runtime_config.get(
+                "cloud_run_task_type_allowlist", []
+            )
+        finally:
+            _ss.runtime_config["cloud_run_task_type_allowlist"] = original
+
+    @pytest.mark.asyncio
+    async def test_mixed_valid_and_write_type_rejected(self, client):
+        """A list containing both a valid read-only and a write type is rejected."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"cloud_run_task_type_allowlist": ["research", "fix"]},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_empty_list_accepted(self, client):
+        """An empty list (disabling Cloud Run routing) is always valid."""
+        import app.shared_state as _ss
+
+        original = list(_ss.runtime_config.get("cloud_run_task_type_allowlist", []))
+        try:
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"cloud_run_task_type_allowlist": []},
+            )
+            assert resp.status_code == 200
+            assert _ss.runtime_config.get("cloud_run_task_type_allowlist") == []
+        finally:
+            _ss.runtime_config["cloud_run_task_type_allowlist"] = original

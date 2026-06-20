@@ -96,6 +96,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "autonomous_direction_cooldown_minutes",
         "autonomous_periodic_tasks",
         "autonomous_research_interval_minutes",
+        "cloud_run_task_type_allowlist",
         "evergreen_fill_mode",
         "evergreen_fill_interval_minutes",
         "evergreen_fill_util_threshold",
@@ -1276,6 +1277,38 @@ async def _apply_settings(
                 detail="warm_pool_cross_provider_retarget_enabled must be a boolean",
             )
         _runtime_config["warm_pool_cross_provider_retarget_enabled"] = val
+    if "cloud_run_task_type_allowlist" in payload:
+        from app.task_capabilities import READ_ONLY_TASK_TYPES
+
+        raw = payload["cloud_run_task_type_allowlist"]
+        # Accept a JSON list or comma-separated string of task type names.
+        # An empty allowlist disables Cloud Run routing (default behavior).
+        if isinstance(raw, str):
+            raw = [t.strip() for t in raw.split(",") if t.strip()]
+        if not isinstance(raw, list):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "cloud_run_task_type_allowlist must be a list of task type names "
+                    "(or a comma-separated string)"
+                ),
+            )
+        if not all(isinstance(t, str) for t in raw):
+            raise HTTPException(
+                status_code=400,
+                detail="cloud_run_task_type_allowlist entries must be strings",
+            )
+        invalid = [t for t in raw if t not in READ_ONLY_TASK_TYPES]
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"cloud_run_task_type_allowlist contains write/unknown task types: "
+                    f"{sorted(invalid)} — only read-only task types are eligible for "
+                    f"Cloud Run routing. Valid types: {sorted(READ_ONLY_TASK_TYPES)}"
+                ),
+            )
+        _runtime_config["cloud_run_task_type_allowlist"] = sorted(set(raw))
     if "warm_pool_project_allowlist" in payload:
         raw = payload["warm_pool_project_allowlist"]
         # Accept a JSON list, a comma-separated string, or a single id — the

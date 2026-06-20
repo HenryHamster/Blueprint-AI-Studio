@@ -57,6 +57,11 @@ from app.compute import (
     record_zone_failure,
     zone_recovery_wait_seconds,
 )
+from app.compute_cloud_run import (
+    _resolve_machine_type as _cr_resolve_machine_type,
+    launch_agent_cloud_run_job,
+)
+from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES
 from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.depends_on_provenance import remap_structural_depends_on
 from app.models import (
@@ -2118,6 +2123,29 @@ async def orchestrator_worker():
                     project_active_counts[_active_task.project_id] = (
                         project_active_counts.get(_active_task.project_id, 0) + 1
                     )
+
+                # Capacity partition: Cloud Run tasks run in a container and never
+                # consume a GCE VM slot. Compute the effective CR type set (candidate
+                # set ∩ runtime allowlist) and exclude those tasks from the GCE
+                # dispatch budget. `payloads` is loaded by ACTIVE_TASKS_LIGHT_COLUMNS.
+                _cr_capacity_allowlist = frozenset(
+                    _runtime_config.get("cloud_run_task_type_allowlist", [])
+                )
+                _effective_cr_types_capacity = (
+                    CLOUD_RUN_CANDIDATE_TASK_TYPES & _cr_capacity_allowlist
+                )
+                if _effective_cr_types_capacity:
+                    _cr_active_count = sum(
+                        1
+                        for _t in active_tasks_result
+                        if ((_t.first_payload or {}).get("type", ""))
+                        in _effective_cr_types_capacity
+                    )
+                else:
+                    _cr_active_count = 0
+                # GCE-only active count for the VM slot budget.
+                _gce_active_count = active_count - _cr_active_count
+
                 # Cross-check with actual GCP VM count (cached, refreshed every 2 min)
                 actual_vm_count = await _get_actual_gcp_vm_count()
                 # Warm-pool slot accounting: a pre-provisioned idle pool VM is a
@@ -2164,12 +2192,13 @@ async def orchestrator_worker():
                 gcp_dispatch_vms = max(
                     0, actual_vm_count - idle_pool_count - orphaned_leased_count
                 )
-                effective_count = max(active_count, gcp_dispatch_vms)
-                if gcp_dispatch_vms > active_count + 2:
+                # Use _gce_active_count (CR tasks excluded) for the GCE VM budget.
+                effective_count = max(_gce_active_count, gcp_dispatch_vms)
+                if gcp_dispatch_vms > _gce_active_count + 2:
                     logger.warning(
                         f"[ORCHESTRATOR] GCP VM count ({actual_vm_count}, "
                         f"{idle_pool_count} idle-pool, {orphaned_leased_count} orphaned-lease) "
-                        f"> DB active count ({active_count}) — possible orphans, "
+                        f"> DB active count ({_gce_active_count}) — possible orphans, "
                         f"using GCP count for slot calculation"
                     )
                 slots_available = max(
@@ -3653,11 +3682,29 @@ async def orchestrator_worker():
                         # (runtime_selection is None — the cold path's no-account handling
                         # takes over). On no lease, fall through to the existing cold path
                         # and count it as a cold dispatch.
+                        # Cloud Run types bypass the warm VM pool — they run in
+                        # a Cloud Run Job container, not on a pool VM. Compute
+                        # the effective CR set here from the runtime allowlist.
+                        _cr_dispatch_allowlist = frozenset(
+                            _runtime_config.get("cloud_run_task_type_allowlist", [])
+                        )
+                        _effective_cr_types_dispatch = (
+                            CLOUD_RUN_CANDIDATE_TASK_TYPES & _cr_dispatch_allowlist
+                        )
+                        _task_type_dispatch = (
+                            (task.first_payload or {}).get("type", "")
+                            if task.payloads
+                            else ""
+                        )
+                        _is_cloud_run_dispatch = (
+                            _task_type_dispatch in _effective_cr_types_dispatch
+                        )
                         if (
                             not _warm_target_vm_id
                             and not task.depends_on
                             and is_warm_pool_enabled()
                             and runtime_selection is not None
+                            and not _is_cloud_run_dispatch
                         ):
                             _leased_member = await try_pool_dispatch(
                                 session,
@@ -4240,24 +4287,56 @@ async def orchestrator_worker():
                                     ),
                                 )
 
-                                success = await provision_agent_vm(
-                                    vm_id,
-                                    t_id,
-                                    payload_uri,
-                                    oauth_token=secret_value,
-                                    claude_config_json=config_json,
-                                    task_type=t_type,
-                                    secret_version_name=secret_version_name,
-                                    provider=llm_provider,
-                                    auth_mode=llm_auth_mode,
-                                    model=llm_model,
-                                    execution_mode=llm_execution_mode,
-                                    provider_metadata=llm_provider_metadata,
-                                    provider_settings=llm_provider_settings,
-                                    provisioning_model="STANDARD"
-                                    if force_standard
-                                    else None,
+                                # Dispatch to Cloud Run Jobs when the task type
+                                # is in the effective Cloud Run allowlist
+                                # (CLOUD_RUN_CANDIDATE_TASK_TYPES ∩ runtime allowlist).
+                                _cr_allowlist = frozenset(
+                                    _runtime_config.get(
+                                        "cloud_run_task_type_allowlist", []
+                                    )
                                 )
+                                _effective_cr_types = (
+                                    CLOUD_RUN_CANDIDATE_TASK_TYPES & _cr_allowlist
+                                )
+                                if t_type in _effective_cr_types:
+                                    # Stamp the Cloud Run sentinel machine type
+                                    # so cost attribution and teardown skips work.
+                                    async with AsyncSessionLocal() as _cr_stamp_session:
+                                        _cr_task = await _cr_stamp_session.get(
+                                            Task, t_id
+                                        )
+                                        if _cr_task is not None:
+                                            _cr_task.vm_machine_type = (
+                                                _cr_resolve_machine_type(t_type)
+                                            )
+                                            _cr_stamp_session.add(_cr_task)
+                                            await _cr_stamp_session.commit()
+                                    success = await launch_agent_cloud_run_job(
+                                        vm_id,
+                                        t_id,
+                                        payload_uri,
+                                        secret_version_name,
+                                        t_type,
+                                    )
+                                else:
+                                    success = await provision_agent_vm(
+                                        vm_id,
+                                        t_id,
+                                        payload_uri,
+                                        oauth_token=secret_value,
+                                        claude_config_json=config_json,
+                                        task_type=t_type,
+                                        secret_version_name=secret_version_name,
+                                        provider=llm_provider,
+                                        auth_mode=llm_auth_mode,
+                                        model=llm_model,
+                                        execution_mode=llm_execution_mode,
+                                        provider_metadata=llm_provider_metadata,
+                                        provider_settings=llm_provider_settings,
+                                        provisioning_model="STANDARD"
+                                        if force_standard
+                                        else None,
+                                    )
                                 if success:
                                     # Verify the task still wants this VM — stale recovery may have
                                     # requeued the task with a new vm_id while we were provisioning.

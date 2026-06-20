@@ -883,6 +883,14 @@ COMPUTE_SUBSTRATE_TASK_TYPES: frozenset[str] = frozenset(
     for capability in TASK_CAPABILITIES
     if capability.requires_compute and not capability.requires_code
 )
+# Canonical set of task types eligible for Cloud Run Jobs routing.
+# This is the static registry-derived set; intersection with the runtime
+# ``cloud_run_task_type_allowlist`` (default empty) determines which types are
+# actually routed to Cloud Run at dispatch time. All read-only types are
+# candidates — they never push a branch/PR, never need persistent disk, and
+# are the dominant idle-cost component. The intersection happens in
+# orchestrator.py; this set never imports runtime_config_state.
+CLOUD_RUN_CANDIDATE_TASK_TYPES: frozenset[str] = READ_ONLY_TASK_TYPES
 
 
 def runs_on_compute_substrate(task_type: str | TaskType | None) -> bool:

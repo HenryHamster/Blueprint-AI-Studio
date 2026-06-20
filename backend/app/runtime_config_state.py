@@ -740,6 +740,14 @@ runtime_config: Dict = {
     # retarget is a further opt-in below.
     "warm_pool_account_retarget_enabled": False,
     "warm_pool_cross_provider_retarget_enabled": False,
+    # Cloud Run Jobs routing allowlist. When non-empty, task types listed here
+    # that are also in CLOUD_RUN_CANDIDATE_TASK_TYPES (all read-only types) are
+    # dispatched to Cloud Run Jobs instead of a dedicated e2-standard-2 GCE VM.
+    # Default EMPTY — no types are routed to Cloud Run until an operator adds
+    # them, so the change is completely inert on merge. Validated at PATCH time:
+    # only read-only (non-merging) task types are accepted.
+    # Set via /api/admin/settings.
+    "cloud_run_task_type_allowlist": [],
     # Per-project warm-pool enablement scope (allowlist). An EMPTY list (the
     # default) means the pool is fleet-wide — the legacy all-or-nothing behavior
     # where the maintainer reconciles every demand-active project once

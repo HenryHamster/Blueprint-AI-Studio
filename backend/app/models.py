@@ -40,7 +40,7 @@ import uuid
 from datetime import datetime, timezone
 from app.capability_registry import derive_provider_marker
 from app.time_utils import _utcnow
-from app.vm_cost_rates import get_vm_rate_per_second
+from app.vm_cost_rates import get_cloud_run_rate_for_machine_type, get_vm_rate_per_second
 
 
 class NaiveUTCDateTime(TypeDecorator):
@@ -1584,6 +1584,8 @@ def get_task_current_attempt_vm_cost_usd(
         return 0.0
 
     machine_type = task.__dict__.get("vm_machine_type")
+    if machine_type and machine_type.startswith("cloud-run-"):
+        return runtime_seconds * get_cloud_run_rate_for_machine_type(machine_type)
     return runtime_seconds * get_vm_rate_per_second(
         machine_type=machine_type, spot=task.vm_spot
     )
