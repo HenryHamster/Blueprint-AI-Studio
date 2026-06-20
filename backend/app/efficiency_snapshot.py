@@ -2732,22 +2732,61 @@ def _extract_ts_template_literal_length(src: str, const_name: str) -> int | None
     return None
 
 
+def _extract_ts_plain_string_length(src: str, const_name: str) -> int | None:
+    """Find a TypeScript `const NAME = '...'` or `"..."` and return its source char count.
+
+    Walks forward from the opening quote, honouring backslash escape sequences.
+    Returns None if the constant declaration is not found or the string is unterminated.
+    """
+    pattern = re.compile(r"\bconst\s+" + re.escape(const_name) + r"""\s*=\s*(['"])""")
+    m = pattern.search(src)
+    if not m:
+        return None
+    quote = m.group(1)
+    pos = m.end()
+    start = pos
+    n = len(src)
+    while pos < n:
+        ch = src[pos]
+        if ch == "\\":
+            pos += 2
+        elif ch == quote:
+            return pos - start
+        else:
+            pos += 1
+    return None
+
+
 _PROMPT_STATIC_CONST_NAMES: tuple[str, ...] = (
+    "SHARED_LIFECYCLE_PREAMBLE",
+    "BLUEPRINT_CHECK_INTRO",
     "SHARED_LIFECYCLE_REMAINDER",
     "READ_THE_FAILURE_MESSAGE",
     "SIZE_GUARDRAIL_GUIDANCE",
     "PRIOR_ATTEMPT_DIVERGENCE",
     "BEYOND_SCOPE_REPORTING",
     "EDGES_CONSIDERED_GUIDANCE",
+    "PLAYBOOK_GUIDANCE",
 )
+
+# Plain-string constants (single- or double-quoted) that are also part of the
+# static prompt footprint and are not template literals.
+_PROMPT_STATIC_PLAIN_CONST_NAMES: tuple[str, ...] = ("DEFAULT_TOOL_GUIDANCE",)
 
 
 def _compute_prompt_static_bytes() -> int | None:
-    """Sum the source character lengths of the major static code-change prompt sections.
+    """Sum the source character lengths of all static code-change prompt sections.
 
-    Reads agent/src/prompt.ts and measures SHARED_LIFECYCLE_REMAINDER plus the five
-    blocks concatenated by assembleFailureGuidanceBlocks(). Returns None when prompt.ts
-    is unavailable (production backend containers that do not mount agent/src).
+    Reads agent/src/prompt.ts and measures the template-literal constants in
+    _PROMPT_STATIC_CONST_NAMES plus the plain-string constants in
+    _PROMPT_STATIC_PLAIN_CONST_NAMES. Returns None when prompt.ts is unavailable
+    (production backend containers that do not mount agent/src) or when any
+    declared constant is absent from the source.
+
+    Baseline (post-v16, 2026-06-20): ~16 420 bytes / ~4 678 tokens.
+    The 2026-06-19 experiment measured ~34 997 bytes before v16 prompt reductions
+    (SHARED_LIFECYCLE_REMAINDER cut from ~6 742 to ~1 712 tokens in PR #10960;
+    SIZE_GUARDRAIL_GUIDANCE cut from ~573 to ~266 tokens in PR #10956).
     """
     agent_src = _find_agent_src()
     if agent_src is None:
@@ -2763,6 +2802,11 @@ def _compute_prompt_static_bytes() -> int | None:
     total = 0
     for name in _PROMPT_STATIC_CONST_NAMES:
         length = _extract_ts_template_literal_length(src, name)
+        if length is None:
+            return None
+        total += length
+    for name in _PROMPT_STATIC_PLAIN_CONST_NAMES:
+        length = _extract_ts_plain_string_length(src, name)
         if length is None:
             return None
         total += length

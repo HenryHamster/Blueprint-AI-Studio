@@ -31,7 +31,9 @@ from app.efficiency_snapshot import (
     SELF_REPAIR_MIN_ATTEMPTS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
     _PROMPT_STATIC_CONST_NAMES,
+    _PROMPT_STATIC_PLAIN_CONST_NAMES,
     _compute_checkpoint_loss_rate,
+    _extract_ts_plain_string_length,
     _extract_ts_template_literal_length,
     _compute_cold_start_breakdown_p50,
     _compute_lane_cost_per_merged_pr,
@@ -4100,13 +4102,20 @@ def test_axis_llm_cost_constant_value():
 
 def test_code_change_prompt_static_bytes():
     """AXIS_PROMPT_STATIC_BYTES is registered in ALL_AXES and AXIS_CONSUMERS, and
-    _compute_prompt_static_bytes() returns a positive integer within the guard
-    threshold when agent/src/prompt.ts is available.
+    _compute_prompt_static_bytes() returns a value within a meaningful range when
+    agent/src/prompt.ts is available.
 
     This is the acceptance test for the prompt_static_bytes gauge (d-22af1f55):
     it exercises the production parsing logic against the live prompt.ts source,
     so a PR that grows the static prompt budget past PROMPT_STATIC_BYTES_THRESHOLD
     will fail here before reaching production.
+
+    Baseline (post-v16, 2026-06-20): ~16 420 bytes across all measured constants.
+    The 2026-06-19 compute experiment measured ~34 997 bytes; subsequent v16
+    reductions (SHARED_LIFECYCLE_REMAINDER -75% in PR #10960, SIZE_GUARDRAIL_GUIDANCE
+    -53% in PR #10956) brought the total to the current baseline.  The lower-bound
+    guard below catches catastrophic regressions such as a constant being silently
+    dropped from _PROMPT_STATIC_CONST_NAMES / _PROMPT_STATIC_PLAIN_CONST_NAMES.
     """
     assert AXIS_PROMPT_STATIC_BYTES in ALL_AXES, (
         f"{AXIS_PROMPT_STATIC_BYTES!r} must be in ALL_AXES"
@@ -4125,7 +4134,12 @@ def test_code_change_prompt_static_bytes():
         pytest.skip("agent/src/prompt.ts not available in this environment")
 
     assert isinstance(result, int), f"Expected int, got {type(result)!r}"
-    assert result > 0, f"prompt_static_bytes must be positive, got {result}"
+    assert result > 8_000, (
+        f"prompt_static_bytes={result} is below the expected lower bound (8 000 bytes). "
+        "A constant may have been removed from _PROMPT_STATIC_CONST_NAMES or "
+        "_PROMPT_STATIC_PLAIN_CONST_NAMES, or the prompt sections shrank dramatically. "
+        f"Post-v16 baseline: ~16 420 bytes. Investigate before lowering this bound."
+    )
     assert result <= PROMPT_STATIC_BYTES_THRESHOLD, (
         f"prompt_static_bytes={result} exceeds PROMPT_STATIC_BYTES_THRESHOLD="
         f"{PROMPT_STATIC_BYTES_THRESHOLD}. A recent change grew the static prompt "
@@ -7173,16 +7187,25 @@ def test_extract_ts_template_literal_length_unterminated_returns_none():
 
 
 def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
-    """When all _PROMPT_STATIC_CONST_NAMES are found in prompt.ts the result
-    is a positive integer equal to the sum of their body lengths."""
+    """When all template-literal and plain-string constants are found the result
+    is a positive integer equal to the sum of all their body lengths."""
     from unittest.mock import mock_open, patch
 
-    # Build a synthetic prompt.ts that defines every required constant.
-    bodies = {name: f"body of {name} " * 5 for name in _PROMPT_STATIC_CONST_NAMES}
+    # Build a synthetic prompt.ts with all template-literal constants.
+    tl_bodies = {name: f"body of {name} " * 5 for name in _PROMPT_STATIC_CONST_NAMES}
     synthetic_src = "\n".join(
-        f"const {name} = `{body}`;" for name, body in bodies.items()
+        f"const {name} = `{body}`;" for name, body in tl_bodies.items()
     )
-    expected_total = sum(len(b) for b in bodies.values())
+    # Append plain-string constants.
+    ps_bodies = {
+        name: f"plain body of {name} " * 3 for name in _PROMPT_STATIC_PLAIN_CONST_NAMES
+    }
+    synthetic_src += "\n" + "\n".join(
+        f"const {name} = '{body}';" for name, body in ps_bodies.items()
+    )
+    expected_total = sum(len(b) for b in tl_bodies.values()) + sum(
+        len(b) for b in ps_bodies.values()
+    )
 
     import app.efficiency_snapshot as es_mod
 
@@ -7201,10 +7224,14 @@ def test_compute_prompt_static_bytes_missing_constant_returns_none():
     """Returns None when any one of _PROMPT_STATIC_CONST_NAMES is absent."""
     from unittest.mock import mock_open, patch
 
-    # Omit the last constant from the synthetic source.
+    # Omit the last template-literal constant from the synthetic source.
     present_names = _PROMPT_STATIC_CONST_NAMES[:-1]
     synthetic_src = "\n".join(
         f"const {name} = `body of {name}`;" for name in present_names
+    )
+    # Include all plain-string constants so the failure is from the template-literal gap.
+    synthetic_src += "\n" + "\n".join(
+        f"const {name} = 'plain body';" for name in _PROMPT_STATIC_PLAIN_CONST_NAMES
     )
 
     import app.efficiency_snapshot as es_mod
@@ -7217,6 +7244,46 @@ def test_compute_prompt_static_bytes_missing_constant_returns_none():
         result = _compute_prompt_static_bytes()
 
     assert result is None
+
+
+def test_compute_prompt_static_bytes_missing_plain_constant_returns_none():
+    """Returns None when any plain-string constant in _PROMPT_STATIC_PLAIN_CONST_NAMES
+    is absent from the source."""
+    from unittest.mock import mock_open, patch
+
+    # Include all template-literal constants but omit plain-string ones.
+    synthetic_src = "\n".join(
+        f"const {name} = `body of {name}`;" for name in _PROMPT_STATIC_CONST_NAMES
+    )
+
+    import app.efficiency_snapshot as es_mod
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", return_value=True),
+        patch("builtins.open", mock_open(read_data=synthetic_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result is None
+
+
+def test_extract_ts_plain_string_length_single_quote():
+    """_extract_ts_plain_string_length extracts the body of a single-quoted constant."""
+    src = "const MY_CONST = 'hello world';"
+    assert _extract_ts_plain_string_length(src, "MY_CONST") == len("hello world")
+
+
+def test_extract_ts_plain_string_length_double_quote():
+    """_extract_ts_plain_string_length extracts the body of a double-quoted constant."""
+    src = 'const MY_CONST = "hello world";'
+    assert _extract_ts_plain_string_length(src, "MY_CONST") == len("hello world")
+
+
+def test_extract_ts_plain_string_length_missing_returns_none():
+    """_extract_ts_plain_string_length returns None when the constant is absent."""
+    src = "const OTHER = 'value';"
+    assert _extract_ts_plain_string_length(src, "MY_CONST") is None
 
 
 def test_compute_prompt_static_bytes_no_agent_src_returns_none():
