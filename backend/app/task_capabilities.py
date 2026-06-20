@@ -35,6 +35,7 @@ class TaskType(str, Enum):
     self_audit = "self_audit"
     release_audit = "release_audit"
     release_audit_challenge = "release_audit_challenge"
+    release_merge_grade = "release_merge_grade"
     memo = "memo"
     verify_tests = "verify_tests"
     compute_experiment = "compute_experiment"
@@ -522,6 +523,24 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         # No forward gate: the deterministic release qualifier consumes the
         # challenge artifact directly instead of grading it through a generic
         # terminal-artifact forward-quality check here.
+        evaluation="none",
+    ),
+    TaskCapability(
+        TaskType.release_merge_grade,
+        "Release Merge Grade",
+        "read_only",
+        description=(
+            "Blind goal-coverage grade: an uninvested agent grades the merged "
+            "diffs of a release version against the frozen version goal — blind "
+            "to the strategist running_update — and names the single biggest "
+            "thing not done toward the goal."
+        ),
+        run_shape="single_agent",
+        output_kind="verdict",
+        evaluation_strategy="review_only",
+        cost_ceiling_usd=4.0,
+        # No forward gate: the deterministic release qualifier consumes the
+        # merge-grade artifact directly as a hard promotion blocker.
         evaluation="none",
     ),
     TaskCapability(

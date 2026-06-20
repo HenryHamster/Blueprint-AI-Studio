@@ -947,6 +947,73 @@ class TestMaxPlanPool:
         chosen = await select_max_plan_account(_TEST_USER)
         assert chosen["id"] == "x2"
 
+    # ── Test 9: orchestrator reconcile uses Task.llm_account_id column ────────
+
+    @pytest.mark.asyncio
+    async def test_reconcile_reads_llm_account_id_column_not_context(
+        self, db_session, reset_max_plan_pool
+    ):
+        """
+        The orchestrator reconcile query must read Task.llm_account_id (the promoted
+        scalar column) rather than Task.context JSONB. Tasks in PROVISIONING or
+        IN_PROGRESS are counted; COMPLETED tasks are excluded.
+
+        This test exercises the select(Task.llm_account_id) path directly —
+        asserting the column is populated at write-time and is readable via a
+        narrow column select (not a full-context JSONB fetch).
+        """
+        from sqlmodel import select as _select
+
+        acct_id = str(uuid.uuid4())
+
+        project = make_project(name="Reconcile column test", user_id="user1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Two PROVISIONING/IN_PROGRESS tasks with llm_account_id set on the column
+        for status in [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]:
+            t = make_task(
+                project_id=project.id,
+                status=status,
+                llm_account_id=acct_id,
+            )
+            db_session.add(t)
+        # COMPLETED task — must not be counted
+        completed = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            llm_account_id=acct_id,
+        )
+        db_session.add(completed)
+        # Task with no account — must not affect count
+        anon = make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(anon)
+        await db_session.commit()
+
+        # Replicate the orchestrator reconcile query verbatim
+        rows = (
+            await db_session.execute(
+                _select(Task.llm_account_id).where(
+                    Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
+                )
+            )
+        ).all()
+
+        active_per_account: dict = {}
+        for row in rows:
+            aid = row[0]
+            if aid:
+                active_per_account[aid] = active_per_account.get(aid, 0) + 1
+
+        assert active_per_account.get(acct_id) == 2, (
+            "Reconcile must count PROVISIONING + IN_PROGRESS tasks by llm_account_id column; "
+            "COMPLETED and no-account tasks must be excluded"
+        )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Section 3 — Research Task Spawning & Deduplication

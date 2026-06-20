@@ -102,6 +102,7 @@ EXPECTED_TYPES = {
     "self_audit",
     "release_audit",
     "release_audit_challenge",
+    "release_merge_grade",
     "memo",
     "verify_tests",
     "compute_experiment",
@@ -183,6 +184,7 @@ def test_fix_passes():
         "perf",
         "self_audit",
         "release_audit_challenge",
+        "release_merge_grade",
         "verify_tests",
         "compute_experiment",
     ],
@@ -1158,7 +1160,11 @@ _VALID_EVIDENCE = {
 def test_acceptance_evidence_valid_kinds_round_trip(task_type, evidence_key):
     """Each code/PR-producing type accepts a valid declaration of each kind and round-trips it."""
     evidence = dict(_VALID_EVIDENCE[evidence_key])
-    raw = {"type": task_type, **_ACCEPTANCE_TYPES[task_type], "acceptance_evidence": evidence}
+    raw = {
+        "type": task_type,
+        **_ACCEPTANCE_TYPES[task_type],
+        "acceptance_evidence": evidence,
+    }
     result = _valid(raw)
     assert result["acceptance_evidence"]["kind"] == evidence["kind"]
     # Optional sub-fields that were None are dropped by exclude_none; declared
@@ -1237,7 +1243,12 @@ def test_read_acceptance_evidence_accessor():
     from app.payload_schemas import AcceptanceEvidence, read_acceptance_evidence
 
     parsed = read_acceptance_evidence(
-        {"acceptance_evidence": {"kind": "named_test", "test_path": "backend/testing/test_agent.py"}}
+        {
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_agent.py",
+            }
+        }
     )
     assert isinstance(parsed, AcceptanceEvidence)
     assert parsed.kind == "named_test"
@@ -1247,9 +1258,17 @@ def test_read_acceptance_evidence_accessor():
     assert read_acceptance_evidence({}) is None
     assert read_acceptance_evidence({"acceptance_evidence": None}) is None
     assert read_acceptance_evidence({"acceptance_evidence": "nope"}) is None
-    assert read_acceptance_evidence(
-        {"acceptance_evidence": {"kind": "named_test", "test_path": "backend/app/main.py"}}
-    ) is None
+    assert (
+        read_acceptance_evidence(
+            {
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/app/main.py",
+                }
+            }
+        )
+        is None
+    )
 
 
 def test_acceptance_evidence_round_trips_through_model_instance():
@@ -1391,9 +1410,7 @@ def test_visual_evidence_resolve_found_and_missing():
     expected_obj = viewport_object_name(project_id, component, width)
 
     # URI present and matching → verified.
-    ctx_match = {
-        "viewport_failure_screenshot_uri": f"gs://my-bucket/{expected_obj}"
-    }
+    ctx_match = {"viewport_failure_screenshot_uri": f"gs://my-bucket/{expected_obj}"}
     result = resolve_visual_evidence(project_id, component, width, ctx_match)
     assert result["resolved"] is True
     assert result["status"] == "verified"

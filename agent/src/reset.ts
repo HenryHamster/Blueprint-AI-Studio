@@ -73,6 +73,7 @@ export const TMP_OUTPUT_NAMES = [
   'web_research_document',
   'release_audit_report',
   'release_audit_challenge',
+  'release_merge_grade',
   'self_audit_findings',
   'self_review',
   'symbols',

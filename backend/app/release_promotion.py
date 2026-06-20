@@ -410,6 +410,19 @@ async def _record_qualification_verdict(
             theme_delivery=base_record.get("theme_delivery"),
             goal_alignment=base_record.get("goal_alignment"),
             blind_merge_grade=base_record.get("blind_merge_grade"),
+            # Blind merge-grade goal-coverage verdict (dir d-c0fe439f) — durably
+            # retained so a re-qualification overwrite of last_qualification does
+            # not drop which goal the merges failed to cover. Keys match
+            # _finalize_qualification's base_record exactly.
+            merge_grade_status=base_record.get("merge_grade_status"),
+            merge_grade_coverage=(
+                float(base_record["merge_grade_coverage"])
+                if isinstance(base_record.get("merge_grade_coverage"), (int, float))
+                and not isinstance(base_record.get("merge_grade_coverage"), bool)
+                else None
+            ),
+            merge_grade_biggest_gap=base_record.get("merge_grade_biggest_gap"),
+            merge_grade_detail=base_record.get("merge_grade"),
             promotion_pr_url=base_record.get("pr_url"),
             promotion_conflict=(conflict if isinstance(conflict, bool) else None),
             promotion_error_detail=promotion_error_detail,

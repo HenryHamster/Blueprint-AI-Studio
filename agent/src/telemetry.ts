@@ -115,6 +115,7 @@ export type SchemaLabel =
   | 'self_audit'
   | 'release_audit'
   | 'audit_challenge'
+  | 'merge_grade'
   | 'research_spawn_adversarial_challenge'
   | 'design'
   | 'research_plan'

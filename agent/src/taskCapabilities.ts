@@ -37,6 +37,7 @@ export const AGENT_TASK_TYPE_IDS = [
   'self_audit',
   'release_audit',
   'release_audit_challenge',
+  'release_merge_grade',
   'memo',
   'verify_tests',
   'compute_experiment',

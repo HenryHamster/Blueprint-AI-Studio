@@ -72,6 +72,7 @@ AUTHORIZED_TEST_DELETIONS: tuple[AuthorizedTestDeletion, ...] = (
     ),
 )
 
+
 def _get_lifecycle_bounded_authorized_deletions() -> tuple[AuthorizedTestDeletion, ...]:
     """Return only the currently-active AUTHORIZED_TEST_DELETIONS entries.
 
@@ -140,6 +141,93 @@ def _clamp01(value: float) -> float:
     if v > 1.0:
         return 1.0
     return v
+
+
+# Default coverage threshold used ONLY when the merge-grade artifact omits an
+# explicit ``covers_goal`` boolean but does report a numeric ``coverage_score``.
+# The agent's explicit boolean is authoritative when present.
+_MERGE_GRADE_COVERAGE_THRESHOLD = 0.5
+
+
+def evaluate_merge_grade(
+    goal: str | None,
+    artifact: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Normalise a blind merge-grade artifact into a goal-coverage verdict.
+
+    Pure / deterministic — the qualifier reads the ``RELEASE_MERGE_GRADE``
+    artifact and passes (goal, artifact) here.  Semantics:
+
+      * ``goal`` empty / unset → ``status="not_applicable"`` (nothing to grade
+        against).  The gate is a no-op PASS: ``blocked`` False.
+      * ``artifact`` not a usable dict, or carries neither an explicit
+        ``covers_goal`` bool nor a numeric ``coverage_score`` → ``status=
+        "unparseable"``.  The caller routes this to a HOLD (infra_failure) — a
+        required grade that produced no usable verdict must not silently pass.
+      * an explicit ``covers_goal`` bool is authoritative; otherwise a numeric
+        ``coverage_score`` is thresholded at ``_MERGE_GRADE_COVERAGE_THRESHOLD``.
+        ``covers_goal`` True → ``status="pass"``, ``blocked`` False; False →
+        ``status="fail"``, ``blocked`` True (the hard promotion blocker).
+
+    Returns ``{status, covers_goal, coverage, biggest_gap, blocked, detail}``.
+    ``status`` is one of ``pass`` | ``fail`` | ``not_applicable`` |
+    ``unparseable``.
+    """
+    goal_text = (goal or "").strip()
+    if not goal_text:
+        return {
+            "status": "not_applicable",
+            "covers_goal": None,
+            "coverage": None,
+            "biggest_gap": None,
+            "blocked": False,
+            "detail": None,
+        }
+    if not isinstance(artifact, dict):
+        return {
+            "status": "unparseable",
+            "covers_goal": None,
+            "coverage": None,
+            "biggest_gap": None,
+            "blocked": False,
+            "detail": None,
+        }
+
+    raw_covers = artifact.get("covers_goal")
+    raw_score = artifact.get("coverage_score")
+    coverage: float | None = None
+    if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool):
+        coverage = _clamp01(raw_score)
+
+    if isinstance(raw_covers, bool):
+        covers_goal = raw_covers
+    elif coverage is not None:
+        covers_goal = coverage >= _MERGE_GRADE_COVERAGE_THRESHOLD
+    else:
+        # Neither an explicit boolean nor a numeric score → no usable verdict.
+        return {
+            "status": "unparseable",
+            "covers_goal": None,
+            "coverage": coverage,
+            "biggest_gap": None,
+            "blocked": False,
+            "detail": artifact,
+        }
+
+    biggest_gap_raw = artifact.get("biggest_gap")
+    biggest_gap = (
+        str(biggest_gap_raw).strip()[:_FINDING_SUMMARY_MAX]
+        if biggest_gap_raw not in (None, "")
+        else None
+    )
+    return {
+        "status": "pass" if covers_goal else "fail",
+        "covers_goal": covers_goal,
+        "coverage": coverage,
+        "biggest_gap": biggest_gap,
+        "blocked": not covers_goal,
+        "detail": artifact,
+    }
 
 
 def compute_composite(
@@ -277,10 +365,13 @@ def compute_composite(
         # Ships dark by default (threshold=0.0 never fires).
         blocker = "theme_delivery_shortfall"
     elif merge_grade_blocked:
-        # The merged diffs 'misses' the version goal per the blind grade and the
-        # operator has raised merge_grade_block_threshold above 0.0 to arm
-        # hard-blocking.  Ships dark by default (threshold=0.0 never fires).
-        blocker = "merge_grade_misses"
+        # The blind merge-grade gate (dir d-c0fe439f): an uninvested agent
+        # graded the merged DIFFS against the frozen version.goal and found they
+        # do NOT advance the goal (covers_goal == False).  The hard gate fires
+        # when the child-task gate fails (merge_grade_goal_coverage); the armable-
+        # dark gate fires when coverage_verdict == "misses" AND the operator has
+        # raised merge_grade_block_threshold above 0.0 (merge_grade_misses).
+        blocker = "merge_grade_goal_coverage"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.

@@ -5465,6 +5465,128 @@ async def test_run_qualification_records_ci_red(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_spawns_merge_grade_child_when_goal_set(
+    db_session, mocker
+):
+    """When version.goal is non-empty, run_qualification spawns a blind
+    release_merge_grade child alongside the audit task, records its id in
+    last_qualification, and the payload DOES NOT contain running_update
+    (blindness invariant).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.goal = "deliver user analytics dashboard"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    candidate = "feed1234" * 5
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+    mocker.patch(
+        "app.release_qualifier._merged_pr_numbers_for_version",
+        new=AsyncMock(return_value=[101, 102]),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["merge_grade_task_id"] is not None, (
+        "version.goal is set — merge_grade_task_id must be recorded in last_qualification"
+    )
+
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task_types = sorted((t.first_payload or {}).get("type") for t in tasks)
+    assert "release_merge_grade" in task_types, (
+        f"expected release_merge_grade child task; got types={task_types}"
+    )
+
+    merge_grade_task = next(
+        t for t in tasks if (t.first_payload or {}).get("type") == "release_merge_grade"
+    )
+    payload = merge_grade_task.first_payload
+    # Blindness invariant: running_update must NEVER appear in the payload.
+    assert not any("running_update" in str(k).lower() for k in payload), (
+        "release_merge_grade payload must be BLIND to running_update"
+    )
+    assert payload["candidate_sha"] == candidate
+    assert payload["version_goal"] == "deliver user analytics dashboard"
+    assert payload["merged_prs"] == [101, 102]
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_no_merge_grade_child_when_goal_empty(
+    db_session, mocker
+):
+    """When version.goal is empty, run_qualification skips the merge_grade child
+    and records merge_grade_task_id=None (gate is a no-op PASS at finalize time).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # version.goal defaults to None/empty — no merge grade child should spawn.
+
+    candidate = "abc0" * 10
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+
+    await db_session.refresh(version)
+    assert version.last_qualification.get("merge_grade_task_id") is None
+
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task_types = [(t.first_payload or {}).get("type") for t in tasks]
+    assert "release_merge_grade" not in task_types, (
+        "no merge_grade child should be spawned when goal is empty"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_no_credentials(db_session, mocker):
     """With no resolvable GitHub token, run_qualification records an error and
     does not spawn children."""
@@ -6466,6 +6588,9 @@ async def _seed_qualification_children(
     smoke_logs: dict | None,
     challenge_verdicts: list[dict] | None = None,
     ci_green: bool = True,
+    version_goal: str | None = None,
+    seed_merge_grade: bool = False,
+    merge_grade_logs: dict | None = None,
 ):
     """Create the qualifier child tasks + their report artifacts, and stamp
     version.last_qualification with their ids (pending state).
@@ -6545,6 +6670,37 @@ async def _seed_qualification_children(
         await db_session.refresh(challenge_task)
         challenge_task_id = str(challenge_task.id)
 
+    # Blind merge-grade child (dir d-c0fe439f). When seed_merge_grade is set, a
+    # COMPLETED release_merge_grade child is created and its id recorded; when
+    # merge_grade_logs is supplied a RELEASE_MERGE_GRADE artifact is attached
+    # (omit it to exercise the MISSING-artifact infra-hold path).
+    merge_grade_task_id: str | None = None
+    if seed_merge_grade:
+        merge_grade_task = Task(
+            project_id=project.id,
+            title="merge-grade",
+            payloads=[{"type": "release_merge_grade", "base_branch": "main"}],
+            vm_instance_id="vm-merge-grade",
+            status=TaskStatus.COMPLETED,
+            context={"candidate_sha": _candidate_sha},
+        )
+        db_session.add(merge_grade_task)
+        await db_session.flush()
+        if merge_grade_logs is not None:
+            db_session.add(
+                Artifact(
+                    task_id=merge_grade_task.id,
+                    artifact_type=ArtifactType.RELEASE_MERGE_GRADE,
+                    logs=json.dumps(merge_grade_logs),
+                )
+            )
+        await db_session.flush()
+        await db_session.refresh(merge_grade_task)
+        merge_grade_task_id = str(merge_grade_task.id)
+
+    if version_goal is not None:
+        version.goal = version_goal
+
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": _candidate_sha,
@@ -6554,6 +6710,7 @@ async def _seed_qualification_children(
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": str(smoke_task.id),
         "challenge_task_id": challenge_task_id,
+        "merge_grade_task_id": merge_grade_task_id,
     }
     db_session.add(version)
     await db_session.commit()
@@ -8207,6 +8364,143 @@ async def test_finalize_blocks_on_migration_apply_drift(db_session, mocker):
     assert lq["migration_apply_safety"] == "block"
     assert lq["migration_apply_safety_detail"] == apply_detail
     assert "computejob" in lq["migration_apply_safety_detail"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mocker):
+    """The blind merge-grade gate (dir d-c0fe439f) blocks stabilize->qualify
+    promotion unless the merged diffs cover the version goal.
+
+    Three scenarios prove the gate is load-bearing AND unskippable — an
+    otherwise-clean candidate (audit 1.0 / smoke green / no migration drift)
+    that would promote is decided ONLY by the merge-grade verdict:
+      (a) a FAILING merge-grade -> not_promoted, blocker merge_grade_goal_coverage,
+          version stays stabilize/open (the hard block).
+      (b) the required merge-grade artifact MISSING -> held (infra_failure),
+          NOT promoted (the gate cannot be skipped).
+      (c) a PASSING merge-grade with everything else green -> promote proceeds.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    clean_audit = {
+        "audit_score": 1.0,
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 5,
+            "test_count_delta": 2,
+        },
+    }
+    clean_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+    goal = "Deliver the blind merge-grade qualification gate on stabilize->qualify"
+
+    # --- (a) FAILING merge-grade -> hard block, cannot promote --------------
+    project_a, version_a = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_a,
+        version_a,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs={
+            "covers_goal": False,
+            "coverage_score": 0.1,
+            "biggest_gap": "The gate was never wired into compute_composite.",
+            "candidate_sha": "feed" * 10,
+        },
+    )
+    promote_a = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result_a = await rq._finalize_qualification(db_session, version_a)
+    await db_session.commit()
+
+    assert result_a["status"] == "not_promoted"
+    assert result_a["blocker"] == "merge_grade_goal_coverage"
+    assert result_a["confidence"] == 0.0
+    promote_a.assert_not_called()
+
+    await db_session.refresh(version_a)
+    lq_a = version_a.last_qualification
+    assert lq_a["status"] == "not_promoted"
+    assert lq_a["blocker"] == "merge_grade_goal_coverage"
+    assert lq_a["confidence"] == 0.0
+    assert lq_a["merge_grade_status"] == "fail"
+    assert "never wired" in lq_a["merge_grade_biggest_gap"]
+    # The gate did NOT finalize to promotion: version stays in stabilize, open.
+    assert version_a.phase == "stabilize"
+    assert version_a.status == "open"
+    # The durable verdict row carries the merge-grade columns + blocker.
+    vrow_a = (
+        (
+            await db_session.execute(
+                select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version_a.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert vrow_a is not None
+    assert vrow_a.merge_grade_status == "fail"
+    assert vrow_a.blocker == "merge_grade_goal_coverage"
+    assert "never wired" in (vrow_a.merge_grade_biggest_gap or "")
+
+    # --- (b) MISSING merge-grade artifact -> infra hold, cannot be skipped --
+    project_b, version_b = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_b,
+        version_b,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=None,  # child ran but emitted no usable artifact
+    )
+    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result_b = await rq._finalize_qualification(db_session, version_b)
+    await db_session.commit()
+
+    assert result_b["status"] == "infra_failure"
+    promote_b.assert_not_called()
+    await db_session.refresh(version_b)
+    assert version_b.last_qualification["status"] == "infra_failure"
+    assert version_b.phase == "stabilize"
+    assert version_b.status == "open"
+
+    # --- (c) PASSING merge-grade -> promote proceeds as before --------------
+    project_c, version_c = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_c,
+        version_c,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs={
+            "covers_goal": True,
+            "coverage_score": 0.95,
+            "biggest_gap": "Minor: docs could mention the env override.",
+            "candidate_sha": "feed" * 10,
+        },
+    )
+    promote_c = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+    result_c = await rq._finalize_qualification(db_session, version_c)
+    await db_session.commit()
+
+    promote_c.assert_called_once()
+    assert result_c == {"status": "promoted"}
 
 
 @pytest.mark.asyncio
@@ -25168,6 +25462,114 @@ async def test_finalize_carries_blind_merge_grade_forward(db_session, mocker):
 
 
 # ===========================================================================
+# evaluate_merge_grade — pure scoring function unit tests
+# ===========================================================================
+
+
+class TestEvaluateMergeGrade:
+    """Pure unit tests for rs.evaluate_merge_grade (all branches)."""
+
+    def test_not_applicable_when_goal_empty(self):
+        """Empty goal → status=not_applicable, blocked=False (no-op PASS)."""
+        result = rs.evaluate_merge_grade("", {"covers_goal": False})
+        assert result["status"] == "not_applicable"
+        assert result["blocked"] is False
+        assert result["covers_goal"] is None
+
+    def test_not_applicable_when_goal_none(self):
+        """None goal → status=not_applicable, blocked=False."""
+        result = rs.evaluate_merge_grade(None, {"covers_goal": False})
+        assert result["status"] == "not_applicable"
+        assert result["blocked"] is False
+
+    def test_not_applicable_when_goal_whitespace(self):
+        """Whitespace-only goal → status=not_applicable, blocked=False."""
+        result = rs.evaluate_merge_grade("   ", {"covers_goal": True})
+        assert result["status"] == "not_applicable"
+        assert result["blocked"] is False
+
+    def test_unparseable_when_artifact_none(self):
+        """Non-empty goal + None artifact → status=unparseable, blocked=False."""
+        result = rs.evaluate_merge_grade("deliver analytics dashboard", None)
+        assert result["status"] == "unparseable"
+        assert result["blocked"] is False
+
+    def test_unparseable_when_artifact_not_dict(self):
+        """Non-empty goal + non-dict artifact → status=unparseable, blocked=False."""
+        result = rs.evaluate_merge_grade("deliver analytics dashboard", "bad")
+        assert result["status"] == "unparseable"
+        assert result["blocked"] is False
+
+    def test_pass_when_covers_goal_true(self):
+        """Explicit covers_goal=True → status=pass, blocked=False."""
+        result = rs.evaluate_merge_grade(
+            "deliver analytics dashboard",
+            {"covers_goal": True, "biggest_gap": "minor edge case"},
+        )
+        assert result["status"] == "pass"
+        assert result["covers_goal"] is True
+        assert result["blocked"] is False
+
+    def test_fail_when_covers_goal_false(self):
+        """Explicit covers_goal=False → status=fail, blocked=True."""
+        result = rs.evaluate_merge_grade(
+            "deliver analytics dashboard",
+            {"covers_goal": False, "biggest_gap": "dashboard not shipped"},
+        )
+        assert result["status"] == "fail"
+        assert result["covers_goal"] is False
+        assert result["blocked"] is True
+
+    def test_coverage_score_above_threshold_derives_pass(self):
+        """coverage_score ≥ 0.5 with no covers_goal bool → derived pass."""
+        result = rs.evaluate_merge_grade(
+            "deliver analytics dashboard",
+            {"coverage_score": 0.8},
+        )
+        assert result["status"] == "pass"
+        assert result["covers_goal"] is True
+        assert result["blocked"] is False
+
+    def test_coverage_score_below_threshold_derives_fail(self):
+        """coverage_score < 0.5 with no covers_goal bool → derived fail, blocked=True."""
+        result = rs.evaluate_merge_grade(
+            "deliver analytics dashboard",
+            {"coverage_score": 0.3},
+        )
+        assert result["status"] == "fail"
+        assert result["covers_goal"] is False
+        assert result["blocked"] is True
+
+    def test_coverage_score_exactly_threshold_derives_pass(self):
+        """coverage_score == 0.5 (on the boundary) → pass (≥ threshold)."""
+        result = rs.evaluate_merge_grade(
+            "deliver analytics dashboard",
+            {"coverage_score": 0.5},
+        )
+        assert result["status"] == "pass"
+        assert result["blocked"] is False
+
+    def test_covers_goal_bool_takes_precedence_over_score(self):
+        """Explicit covers_goal bool wins over coverage_score."""
+        # False covers_goal overrides a high coverage_score.
+        result = rs.evaluate_merge_grade(
+            "deliver analytics dashboard",
+            {"covers_goal": False, "coverage_score": 0.99},
+        )
+        assert result["status"] == "fail"
+        assert result["blocked"] is True
+
+    def test_unparseable_when_neither_bool_nor_score(self):
+        """Dict artifact with no usable covers_goal or coverage_score → unparseable."""
+        result = rs.evaluate_merge_grade(
+            "deliver analytics dashboard",
+            {"something_else": "irrelevant"},
+        )
+        assert result["status"] == "unparseable"
+        assert result["blocked"] is False
+
+
+# ===========================================================================
 # Blind merge-grade hard-block hook (armable-dark)
 # ===========================================================================
 
@@ -25178,7 +25580,7 @@ class TestBlindMergeGradeBlock:
     # --- Unit tests: compute_composite integration --------------------------
 
     def test_compute_composite_merge_grade_blocked_fires(self):
-        """merge_grade_blocked=True forces confidence=0.0 and blocker=merge_grade_misses."""
+        """merge_grade_blocked=True forces confidence=0.0 and the merge_grade blocker label."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
@@ -25189,7 +25591,7 @@ class TestBlindMergeGradeBlock:
         )
         assert result["confidence"] == 0.0
         assert result["promote"] is False
-        assert result["blocker"] == "merge_grade_misses"
+        assert result["blocker"] == "merge_grade_goal_coverage"
 
     def test_compute_composite_merge_grade_blocked_default_false(self):
         """Backward compat: omitting merge_grade_blocked does not block."""
@@ -25345,8 +25747,8 @@ class TestBlindMergeGradeBlock:
         assert result2["status"] == "not_promoted", (
             f"armed threshold + misses must not_promote; got {result2['status']!r}"
         )
-        assert result2.get("blocker") == "merge_grade_misses", (
-            f"expected blocker=merge_grade_misses; got {result2.get('blocker')!r}"
+        assert result2.get("blocker") == "merge_grade_goal_coverage", (
+            f"expected merge_grade blocker; got {result2.get('blocker')!r}"
         )
         assert lq2_final.get("confidence") == 0.0, (
             f"expected confidence=0.0; got {lq2_final.get('confidence')!r}"

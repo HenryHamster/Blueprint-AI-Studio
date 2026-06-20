@@ -145,6 +145,7 @@ from app.release_qualifier_audit import (
     _spawn_qualifier_smoketest_task,
     _spawn_release_audit_challenge_task,
     _spawn_release_audit_task,
+    _spawn_release_merge_grade_task,
     get_infra_failure_stats,  # noqa: F401 — re-exported for callers/tests
     get_latest_qualification_audit_findings,  # noqa: F401 — re-exported for callers/tests
     get_latest_release_audit_challenge,  # noqa: F401 — re-exported for callers/tests
@@ -194,6 +195,7 @@ from app.release_scoring import (
     _score_smoketest,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
+    evaluate_merge_grade,
 )
 from app.acceptance_gate import summarize_version_acceptance_aggregate
 from app.release_stall_alerts import (
@@ -488,6 +490,10 @@ async def _qualification_in_flight(
         required_keys.append("smoketest_task_id")
     if qual.get("challenge_task_id"):
         required_keys.append("challenge_task_id")
+    # The blind merge-grade child is required whenever it was spawned (a
+    # non-empty version goal) — finalize must wait for it like the audit child.
+    if qual.get("merge_grade_task_id"):
+        required_keys.append("merge_grade_task_id")
 
     child_ids: list[uuid.UUID] = []
     parse_failed = False
@@ -1467,6 +1473,13 @@ async def run_qualification(
     audit_challenge_spawn_error: str | None = None
     audit_challenge_spawn_pending = True
     smoketest_task_id: str | None = None
+    merge_grade_task_id: str | None = None
+    # Blind merge-grade gate (dir d-c0fe439f): grade the merged diffs against the
+    # frozen goal.  The goal is the ONLY narrative the grader sees — the spawn
+    # helper enforces blindness to running_update.  When the goal is empty there
+    # is nothing to grade against, so no child is spawned and the finalize gate
+    # is a no-op PASS (see _finalize_qualification).
+    version_goal = (version.goal or "").strip()
     try:
         audit_task = await _spawn_release_audit_task(
             session,
@@ -1478,6 +1491,19 @@ async def run_qualification(
             version_goal=version.goal,
         )
         audit_task_id = str(audit_task.id)
+        if version_goal:
+            merged_pr_numbers = await _merged_pr_numbers_for_version(session, version)
+            merge_grade_task = await _spawn_release_merge_grade_task(
+                session,
+                project_id,
+                version_id=version.id,
+                base_branch=promotion_target,
+                diff_range=diff_range,
+                candidate_sha=candidate_sha,
+                version_goal=version_goal,
+                merged_pr_numbers=merged_pr_numbers,
+            )
+            merge_grade_task_id = str(merge_grade_task.id)
         if smoketest_enabled:
             smoketest_task = await _spawn_qualifier_smoketest_task(
                 session,
@@ -1532,6 +1558,7 @@ async def run_qualification(
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
+        "merge_grade_task_id": merge_grade_task_id,
         "prior_infra_streak": prior_infra_streak,
         "previous_infra_failure_signature": prior_infra_failure_signature,
         "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
@@ -1575,6 +1602,7 @@ async def run_qualification(
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
+        "merge_grade_task_id": merge_grade_task_id,
     }
 
 
@@ -1617,6 +1645,12 @@ _BLOCKER_LABELS: dict[str, str] = {
     "migration_apply_drift": (
         "the candidate's migration chain does not apply cleanly against "
         "production's recorded schema state (deploy-fatal drift)"
+    ),
+    "theme_delivery_shortfall": (
+        "the candidate's diffstat directionally contradicts its stated theme"
+    ),
+    "merge_grade_goal_coverage": (
+        "the blind merge-grade found the merged diffs do not advance the version goal"
     ),
     "merge_grade_misses": (
         "the merged diffs 'misses' the version goal per the blind merge-grade "
@@ -2116,6 +2150,47 @@ async def _guard_ci_unresolved_promotion_in_flight(
     }
 
 
+async def _merged_pr_numbers_for_version(
+    session: AsyncSession,
+    version_obj: release_version.ReleaseVersion,
+) -> list[int]:
+    """Return the PR numbers merged into this version's acceptance window.
+
+    Reuses the SAME landed-merge predicate the theme-evidence path uses
+    (``landed_signal_predicate`` + the version's opened_at window) so the blind
+    merge-grade child grades exactly the diffs that landed in this version.
+    Pure DB read — no GitHub I/O; the agent fetches each PR's diff itself.
+
+    Blind by construction: this discovers merged PRs from the task ledger only;
+    it never reads ``Project.running_update``.  Returns a sorted, de-duplicated
+    list; empty when the version has no opened_at or no landed merges yet.
+    """
+    if version_obj.opened_at is None:
+        return []
+    rows = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == version_obj.project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    landed_signal_predicate(session),
+                    Task.updated_at >= version_obj.opened_at,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    pr_numbers: list[int] = []
+    for task in rows:
+        if release_version._task_completed_at(task) < version_obj.opened_at:
+            continue
+        pn = (task.first_payload or {}).get("pr_number")
+        if isinstance(pn, int) and pn > 0 and pn not in pr_numbers:
+            pr_numbers.append(pn)
+    return sorted(pr_numbers)
+
+
 async def _fetch_version_theme_evidence(
     session: AsyncSession,
     version_obj: release_version.ReleaseVersion,
@@ -2196,6 +2271,7 @@ async def _finalize_qualification(
     challenge_task_id = qual.get("challenge_task_id")
     audit_challenge_task_id = qual.get("audit_challenge_task_id") or challenge_task_id
     smoketest_task_id = qual.get("smoketest_task_id")
+    merge_grade_task_id = qual.get("merge_grade_task_id")
     # Audit H3: whether the qualifying run had the smoketest subsystem enabled.
     # Read from the recorded qualification (NOT live runtime_config) — the
     # config could have flipped between spawn and finalize, and the composite
@@ -2408,6 +2484,39 @@ async def _finalize_qualification(
                 "[RELEASE_QUALIFIER] invalid smoketest_task_id %s on version v%d "
                 "(skipping infra-failure check)",
                 smoketest_task_id,
+                version.version_number,
+            )
+
+    # --- Blind merge-grade child: required-child terminal-status gate -------
+    # The merge-grade child (spawned only when the version goal is non-empty) is
+    # a REQUIRED child: a FAILED/CANCELLED/BLOCKED merge-grade means the grade
+    # never produced a usable verdict, so the gate cannot be skipped — route to
+    # _handle_infra_failure (HOLD, no verdict recorded) exactly like the audit /
+    # smoketest legs.
+    _merge_grade_task_obj: Task | None = None
+    if merge_grade_task_id:
+        try:
+            _merge_grade_task_obj = await session.get(
+                Task, uuid.UUID(str(merge_grade_task_id))
+            )
+            if (
+                _merge_grade_task_obj is not None
+                and _merge_grade_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES
+            ):
+                return await _handle_infra_failure(
+                    session,
+                    version,
+                    qual,
+                    _enrich_infra_error(
+                        f"merge_grade_task_{_merge_grade_task_obj.status.lower()}",
+                        _merge_grade_task_obj,
+                    ),
+                )
+        except (ValueError, TypeError):
+            logger.warning(
+                "[RELEASE_QUALIFIER] invalid merge_grade_task_id %s on version "
+                "v%d (skipping infra-failure check)",
+                merge_grade_task_id,
                 version.version_number,
             )
 
@@ -3143,6 +3252,53 @@ async def _finalize_qualification(
     )
     _theme_blocked = _theme_cert.get("state") == "blocked"
 
+    # --- Blind merge-grade goal-coverage gate (dir d-c0fe439f) --------------
+    # An uninvested release_merge_grade agent graded the merged diffs against the
+    # frozen version.goal (blind to running_update).  Read its verdict and turn a
+    # FAILING goal-coverage grade into a HARD promotion blocker.  Semantics:
+    #   * version.goal empty/unset → the gate is a no-op PASS (nothing to grade
+    #     against); no child was spawned, merge_grade_task_id is None.
+    #   * goal non-empty + a usable grade → covers_goal False is a hard block.
+    #   * goal non-empty but the required grade is MISSING / UNPARSEABLE → HOLD
+    #     (infra_failure): the gate cannot be skipped or waved through.
+    merge_grade_cert: dict[str, Any] = {
+        "status": "not_applicable",
+        "covers_goal": None,
+        "coverage": None,
+        "biggest_gap": None,
+        "blocked": False,
+        "detail": None,
+    }
+    merge_grade_blocked = False
+    if merge_grade_task_id:
+        merge_grade_artifact: dict[str, Any] | None = None
+        try:
+            merge_grade_artifact = await _latest_artifact_logs(
+                session,
+                uuid.UUID(str(merge_grade_task_id)),
+                ArtifactType.RELEASE_MERGE_GRADE,
+            )
+        except (ValueError, TypeError):
+            logger.warning(
+                "[RELEASE_QUALIFIER] invalid merge_grade_task_id %s on version v%d",
+                merge_grade_task_id,
+                version.version_number,
+            )
+        merge_grade_cert = evaluate_merge_grade(version.goal, merge_grade_artifact)
+        # A spawned merge-grade child MUST produce a usable goal-coverage verdict
+        # to finalize.  A COMPLETED child with an absent artifact, or a present
+        # but malformed artifact, is an infrastructure failure (the agent ran but
+        # emitted no usable output) — route to a HOLD so the gate cannot be
+        # skipped or waved through, exactly like the audit/smoketest legs.
+        if merge_grade_cert["status"] == "unparseable":
+            label = (
+                "merge_grade_report_missing"
+                if merge_grade_artifact is None
+                else "merge_grade_report_unparseable"
+            )
+            return await _handle_infra_failure(session, version, qual, label)
+        merge_grade_blocked = bool(merge_grade_cert["blocked"])
+
     # --- Blind merge-grade block (armable-dark) ----------------------------
     # The blind grade (coverage_verdict) is persisted on qual under
     # BLIND_MERGE_GRADE_KEY.  A "misses" verdict only hard-blocks when the
@@ -3156,6 +3312,7 @@ async def _finalize_qualification(
     _merge_grade_blocked = (
         _coverage_verdict == "misses" and _merge_grade_block_threshold > 0.0
     )
+    merge_grade_blocked = merge_grade_blocked or _merge_grade_blocked
 
     # --- Compute the composite ---------------------------------------------
     composite = compute_composite(
@@ -3169,7 +3326,7 @@ async def _finalize_qualification(
         migration_collision=migration_collision,
         migration_apply_blocked=migration_apply_blocked,
         theme_delivery_blocked=_theme_blocked,
-        merge_grade_blocked=_merge_grade_blocked,
+        merge_grade_blocked=merge_grade_blocked,
     )
 
     # --- Acceptance-window aggregate (additive evidence, no score impact) --
@@ -3252,6 +3409,14 @@ async def _finalize_qualification(
         "migration_apply_safety_detail": apply_detail,
         "acceptance_aggregate": acceptance_aggregate,
         "theme_delivery": _theme_cert,
+        # Blind merge-grade goal-coverage verdict (dir d-c0fe439f). Mirrored into
+        # last_qualification AND persisted on QualificationVerdict so an operator
+        # can see the single biggest gap toward the goal.
+        "merge_grade_task_id": merge_grade_task_id,
+        "merge_grade_status": merge_grade_cert["status"],
+        "merge_grade_coverage": merge_grade_cert["coverage"],
+        "merge_grade_biggest_gap": merge_grade_cert["biggest_gap"],
+        "merge_grade": merge_grade_cert,
         # Carry the blind merge-grade forward from the pending record so it
         # survives finalization and is reusable on re-qualification of the same
         # candidate SHA (blind_merge_grade_satisfied short-circuits the re-run).
@@ -3380,6 +3545,14 @@ async def _finalize_qualification(
             # would fail to create, not just the generic blocker label.
             if composite["blocker"] == "migration_apply_drift" and apply_detail:
                 blocker_label = f"{blocker_label} — {apply_detail}"
+            # The merge-grade blocker carries the single biggest gap so the
+            # operator sees WHAT the merges failed to deliver toward the goal.
+            if composite[
+                "blocker"
+            ] == "merge_grade_goal_coverage" and merge_grade_cert.get("biggest_gap"):
+                blocker_label = (
+                    f"{blocker_label} — biggest gap: {merge_grade_cert['biggest_gap']}"
+                )
             notify_event = "release_blocked"
             notify_summary = (
                 f"v{version.version_number} blocked from promotion — "
@@ -3518,6 +3691,8 @@ async def _required_children_terminal(
     smoketest_task_id_raw = qual.get("smoketest_task_id")
     challenge_task_id_raw = qual.get("challenge_task_id")
     challenge_required = bool(challenge_task_id_raw)
+    merge_grade_task_id_raw = qual.get("merge_grade_task_id")
+    merge_grade_required = bool(merge_grade_task_id_raw)
 
     if not audit_task_id_raw or (smoketest_required and not smoketest_task_id_raw):
         logger.warning(
@@ -3541,14 +3716,19 @@ async def _required_children_terminal(
         challenge_task_id = (
             uuid.UUID(str(challenge_task_id_raw)) if challenge_required else None
         )
+        merge_grade_task_id = (
+            uuid.UUID(str(merge_grade_task_id_raw)) if merge_grade_required else None
+        )
     except (ValueError, TypeError, AttributeError):
         logger.warning(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d has unparseable "
-            "child task ids (audit=%r challenge=%r smoke=%r) — not ready",
+            "child task ids (audit=%r challenge=%r smoke=%r merge_grade=%r) — "
+            "not ready",
             version.version_number,
             audit_task_id_raw,
             challenge_task_id_raw,
             smoketest_task_id_raw,
+            merge_grade_task_id_raw,
         )
         return False
 
@@ -3563,11 +3743,17 @@ async def _required_children_terminal(
         if challenge_task_id is not None
         else None
     )
+    merge_grade_task: Task | None = (
+        await session.get(Task, merge_grade_task_id)
+        if merge_grade_task_id is not None
+        else None
+    )
 
     if (
         audit_task is None
         or (smoketest_required and smoketest_task is None)
         or (challenge_required and challenge_task is None)
+        or (merge_grade_required and merge_grade_task is None)
     ):
         logger.debug(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d required child "
@@ -3587,6 +3773,11 @@ async def _required_children_terminal(
             challenge_required
             and challenge_task is not None
             and challenge_task.status not in _TERMINAL_STATUSES
+        )
+        or (
+            merge_grade_required
+            and merge_grade_task is not None
+            and merge_grade_task.status not in _TERMINAL_STATUSES
         )
     ):
         # A required child is still running — not time to finalize yet.
