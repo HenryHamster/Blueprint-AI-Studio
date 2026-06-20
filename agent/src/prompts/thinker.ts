@@ -392,18 +392,35 @@ export async function runThinkerWithGate(
   }
 
   let problemModelParseable = false;
-  try {
-    const problemModelProbe = extractJsonObjectDetailed(analysisText, 'intent');
-    if (problemModelProbe.ok) {
+
+  // First, check if the file was already written to disk (authoritative source).
+  if (fs.existsSync(problemModelPath)) {
+    try {
+      const fileContent = fs.readFileSync(problemModelPath, 'utf8');
+      JSON.parse(fileContent);
       problemModelParseable = true;
-      try {
-        fs.writeFileSync(problemModelPath, `${JSON.stringify(problemModelProbe.value, null, 2)}\n`);
-      } catch (e) {
-        sendLog(ws, `[WARNING] Parsed strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
-      }
+      sendLog(ws, `[INFO] Problem model file exists on disk and is valid JSON; skipping repair reopen.\n`);
+    } catch (e) {
+      sendLog(ws, `[WARNING] Problem model file exists but is invalid JSON: ${String(e)}\n`);
+      problemModelParseable = false;
     }
-  } catch {
-    problemModelParseable = false;
+  }
+
+  // If file doesn't exist or is invalid, try parsing from stdout.
+  if (!problemModelParseable) {
+    try {
+      const problemModelProbe = extractJsonObjectDetailed(analysisText, 'intent');
+      if (problemModelProbe.ok) {
+        problemModelParseable = true;
+        try {
+          fs.writeFileSync(problemModelPath, `${JSON.stringify(problemModelProbe.value, null, 2)}\n`);
+        } catch (e) {
+          sendLog(ws, `[WARNING] Parsed strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
+        }
+      }
+    } catch {
+      problemModelParseable = false;
+    }
   }
 
   let problemModelRepair: RepairStructuredOutputResult<Record<string, unknown>> | null = null;

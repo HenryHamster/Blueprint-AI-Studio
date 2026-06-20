@@ -111,6 +111,7 @@ describe('format-compliance telemetry', () => {
   it('starts at zero', () => {
     expect(getFormatComplianceTelemetry()).toEqual({
       format_miss_by_reason: {},
+      format_repair_miss_by_reason: {},
       format_error_total: 0,
       format_repair_attempts: 0,
       format_repair_successes: 0,
@@ -147,6 +148,7 @@ describe('format-compliance telemetry', () => {
 
     expect(getFormatComplianceTelemetry()).toEqual({
       format_miss_by_reason: { unbalanced_json: 1 },
+      format_repair_miss_by_reason: {},
       format_error_total: 1,
       format_repair_attempts: 1,
       format_repair_successes: 1,
@@ -173,6 +175,7 @@ describe('format-compliance telemetry', () => {
         unbalanced_json: 2,
         malformed_json: 1,
       },
+      format_repair_miss_by_reason: {},
       format_error_total: 4,
       format_repair_attempts: 0,
       format_repair_successes: 0,
@@ -195,6 +198,7 @@ describe('format-compliance telemetry', () => {
     snap.format_error_total = 999;
     expect(getFormatComplianceTelemetry()).toEqual({
       format_miss_by_reason: { no_json_start: 1 },
+      format_repair_miss_by_reason: {},
       format_error_total: 1,
       format_repair_attempts: 0,
       format_repair_successes: 0,
@@ -217,6 +221,7 @@ describe('format-compliance telemetry', () => {
     resetFormatComplianceTelemetry();
     expect(getFormatComplianceTelemetry()).toEqual({
       format_miss_by_reason: {},
+      format_repair_miss_by_reason: {},
       format_error_total: 0,
       format_repair_attempts: 0,
       format_repair_successes: 0,

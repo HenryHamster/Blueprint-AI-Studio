@@ -513,6 +513,30 @@ describe('runThinkerWithGate', () => {
     expect(mockPersistAndPostStatus).not.toHaveBeenCalled();
   });
 
+  it('(a2) valid problem_model file on disk + unparseable stdout → adopts file and skips repair', async () => {
+    // Gate should check the authoritative written file before deciding to repair,
+    // so a valid file + imperfect stdout does NOT trigger a repair reopen.
+    const validProblemModel = '{"intent":{"purpose":"real intent"},"gaps":[],"capabilities":[]}';
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockReturnValueOnce(
+      validProblemModel,
+    );
+    mockRunClaudeCode.mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: 'analysis without parseable problem_model JSON',
+      lastResultText: '',
+    });
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    // Should return success without running a repair reopen.
+    expect(result).toEqual({ ok: true, analysisText: 'analysis without parseable problem_model JSON' });
+    // Only the initial thinker run, no repair reopen recorded.
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(1);
+    expect(mockPersistAndPostStatus).not.toHaveBeenCalled();
+  });
+
   it('(b) clean exit with unparseable problem_model reopens once, writes the recovered model, and skips manual fallback', async () => {
     mockRunClaudeCode
       .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis output without JSON', lastResultText: '' })

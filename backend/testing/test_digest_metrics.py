@@ -5598,6 +5598,114 @@ def test_format_compliance_metrics_empty_list():
     assert result["by_type"] == {}
 
 
+def test_format_miss_by_reason_aggregation():
+    """format_miss_by_reason is rolled up across tasks into the returned block."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_miss_by_reason": {"malformed_json": 2, "no_json_start": 1},
+                "format_error_total": 3,
+                "format_repair_attempts": 3,
+                "format_repair_successes": 2,
+            },
+        ),
+        _fc_task(
+            "fix",
+            {
+                "format_miss_by_reason": {"malformed_json": 1, "schema_mismatch": 1},
+                "format_error_total": 2,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 1,
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["format_miss_by_reason"] == {
+        "malformed_json": 3,
+        "no_json_start": 1,
+        "schema_mismatch": 1,
+    }
+    # repair miss dict is empty when no field present
+    assert overall["format_repair_miss_by_reason"] == {}
+
+
+def test_format_repair_miss_by_reason_aggregation():
+    """format_repair_miss_by_reason (reopen failure reason) is rolled up separately."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 2,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 0,
+                "format_repair_miss_by_reason": {
+                    "malformed_json": 1,
+                    "no_json_start": 1,
+                },
+            },
+        ),
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 0,
+                "format_repair_miss_by_reason": {"malformed_json": 1},
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["format_repair_miss_by_reason"] == {
+        "malformed_json": 2,
+        "no_json_start": 1,
+    }
+    # self_repair_success_rate unaffected — additive only
+    assert overall["self_repair_success_rate"] == 0.0
+
+
+def test_format_miss_by_reason_missing_fields_are_empty():
+    """Tasks lacking format_miss_by_reason or format_repair_miss_by_reason contribute
+    nothing to those rollups — backward-compatible with older summaries."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+                # neither reason field present
+            },
+        ),
+        _fc_task("create", None),  # NULL summary — excluded entirely
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["format_miss_by_reason"] == {}
+    assert overall["format_repair_miss_by_reason"] == {}
+    assert overall["self_repair_success_rate"] == 1.0
+
+
+def test_format_miss_by_reason_independent_from_repair_miss():
+    """First-attempt and reopen reason dicts are tracked independently."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_miss_by_reason": {"schema_mismatch": 3},
+                "format_error_total": 3,
+                "format_repair_attempts": 3,
+                "format_repair_successes": 1,
+                "format_repair_miss_by_reason": {"malformed_json": 2},
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["format_miss_by_reason"] == {"schema_mismatch": 3}
+    assert overall["format_repair_miss_by_reason"] == {"malformed_json": 2}
+    # success rate unchanged — additive only
+    assert overall["self_repair_success_rate"] == round(1 / 3, 3)
+
+
 def test_self_repair_rate_excludes_reopen_infra_failures():
     """Crashed reopens (infra failures) are excluded from the denominator.
 
@@ -5685,6 +5793,54 @@ def test_self_repair_rate_infra_failures_by_schema_aggregated():
     by_schema = overall["by_schema"]
     assert "ResearchPlan" in by_schema
     assert by_schema["ResearchPlan"]["repair_infra_failures"] == 2
+    # clean_attempts = 4 - 2 = 2; rate = 2/2 = 1.0
+    assert by_schema["ResearchPlan"]["self_repair_success_rate"] == 1.0
+
+
+def test_format_compliance_by_schema_success_rate():
+    """Per-schema self_repair_success_rate is derived from per-schema counts.
+
+    Thinker schema: 1 success / (3 attempts - 1 infra) = 0.5
+    Other schema:   2 success / (2 attempts - 0 infra) = 1.0
+    Schema with only infra failures: None (clean denominator == 0)
+    """
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 2,
+                "format_repair_attempts": 5,
+                "format_repair_successes": 3,
+                "format_repair_infra_failures": 1,
+                "format_repair_attempts_by_schema": {"thinker": 3, "Other": 2},
+                "format_repair_successes_by_schema": {"thinker": 1, "Other": 2},
+                "format_repair_infra_failures_by_schema": {"thinker": 1, "Other": 0},
+            },
+        ),
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 0,
+                "format_repair_infra_failures": 2,
+                "format_repair_attempts_by_schema": {"InfraOnly": 2},
+                "format_repair_successes_by_schema": {"InfraOnly": 0},
+                "format_repair_infra_failures_by_schema": {"InfraOnly": 2},
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    by_schema = overall["by_schema"]
+
+    # thinker: 1 success / (3 - 1) clean = 0.5
+    assert by_schema["thinker"]["self_repair_success_rate"] == 0.5
+
+    # Other: 2 success / (2 - 0) clean = 1.0
+    assert by_schema["Other"]["self_repair_success_rate"] == 1.0
+
+    # InfraOnly: clean_attempts = 2 - 2 = 0 → None
+    assert by_schema["InfraOnly"]["self_repair_success_rate"] is None
 
 
 def _fc_clean(task_type="create"):

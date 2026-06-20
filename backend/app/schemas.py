@@ -404,6 +404,7 @@ class HeartbeatRequest(BaseModel):
     # don't emit these leave Task.format_compliance_summary NULL. format_miss_by_reason
     # maps each extraction-layer reason class to a count of unparseable final outputs.
     format_miss_by_reason: Dict[str, int] | None = None
+    format_repair_miss_by_reason: Dict[str, int] | None = None
     format_error_total: int | None = Field(None, ge=0)
     format_repair_attempts: int | None = Field(None, ge=0)
     format_repair_successes: int | None = Field(None, ge=0)

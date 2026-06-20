@@ -124,6 +124,7 @@ export type SchemaLabel =
   | 'unknown';
 
 let _formatMissByReason: Record<string, number> = {}; // @per-role
+let _formatRepairMissByReason: Record<string, number> = {}; // @per-role
 let _formatErrorTotal = 0; // @per-role
 let _formatRepairAttempts = 0; // @per-role
 let _formatRepairSuccesses = 0; // @per-role
@@ -146,6 +147,13 @@ export function recordFormatMiss(reason: FormatMissReason, schemaLabel?: SchemaL
   if (schemaLabel !== undefined) {
     _formatMissBySchema[schemaLabel] = (_formatMissBySchema[schemaLabel] ?? 0) + 1;
   }
+}
+
+/** Record one unparseable reopen output, bucketed by the extraction verdict's
+ *  reason class. Distinct from recordFormatMiss (which records the first-attempt
+ *  miss); this records the reopen's failure reason when self-repair still fails. */
+export function recordFormatRepairMiss(reason: FormatMissReason, _schemaLabel?: SchemaLabel): void {
+  _formatRepairMissByReason[reason] = (_formatRepairMissByReason[reason] ?? 0) + 1;
 }
 
 /** Record that a handler attempted a self-repair re-ask after a format miss. */
@@ -202,6 +210,7 @@ export function recordFormatRepairTokens(
  *  posts. Returns a plain dict (fresh copies of all per-reason and per-schema maps). */
 export function getFormatComplianceTelemetry(): {
   format_miss_by_reason: Record<string, number>;
+  format_repair_miss_by_reason: Record<string, number>;
   format_error_total: number;
   format_repair_attempts: number;
   format_repair_successes: number;
@@ -217,6 +226,7 @@ export function getFormatComplianceTelemetry(): {
 } {
   return {
     format_miss_by_reason: { ..._formatMissByReason },
+    format_repair_miss_by_reason: { ..._formatRepairMissByReason },
     format_error_total: _formatErrorTotal,
     format_repair_attempts: _formatRepairAttempts,
     format_repair_successes: _formatRepairSuccesses,
@@ -235,6 +245,7 @@ export function getFormatComplianceTelemetry(): {
 /** Reset between roles so per-task counters don't bleed across warm-VM continuity. */
 export function resetFormatComplianceTelemetry(): void {
   _formatMissByReason = {};
+  _formatRepairMissByReason = {};
   _formatErrorTotal = 0;
   _formatRepairAttempts = 0;
   _formatRepairSuccesses = 0;

@@ -4725,6 +4725,7 @@ async def agent_heartbeat(
     # agents that don't ship these fields leave format_compliance_summary NULL.
     if (
         req.format_miss_by_reason is not None
+        or req.format_repair_miss_by_reason is not None
         or req.format_error_total is not None
         or req.format_repair_attempts is not None
         or req.format_repair_successes is not None
@@ -4742,6 +4743,10 @@ async def agent_heartbeat(
             "format_miss_by_reason": {
                 str(reason): int(count)
                 for reason, count in (req.format_miss_by_reason or {}).items()
+            },
+            "format_repair_miss_by_reason": {
+                str(reason): int(count)
+                for reason, count in (req.format_repair_miss_by_reason or {}).items()
             },
             "format_error_total": int(req.format_error_total or 0),
             "format_repair_attempts": int(req.format_repair_attempts or 0),
