@@ -142,6 +142,7 @@ def compute_composite(
     migration_collision: bool = False,
     migration_apply_blocked: bool = False,
     theme_delivery_blocked: bool = False,
+    merge_grade_blocked: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -263,6 +264,11 @@ def compute_composite(
         # raised theme_block_threshold above 0.0 to arm hard-blocking.
         # Ships dark by default (threshold=0.0 never fires).
         blocker = "theme_delivery_shortfall"
+    elif merge_grade_blocked:
+        # The merged diffs 'misses' the version goal per the blind grade and the
+        # operator has raised merge_grade_block_threshold above 0.0 to arm
+        # hard-blocking.  Ships dark by default (threshold=0.0 never fires).
+        blocker = "merge_grade_misses"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.

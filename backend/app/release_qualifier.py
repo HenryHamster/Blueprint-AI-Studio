@@ -310,7 +310,7 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
                 f"runtime_config promotion_weights sum to {weight_sum:.4f}, expected ~1.0"
             )
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
-        for _k in ("theme_warn_threshold", "theme_block_threshold"):
+        for _k in ("theme_warn_threshold", "theme_block_threshold", "merge_grade_block_threshold"):
             _v = _runtime_config.get(_k)
             if _v is not None:
                 with contextlib.suppress(TypeError, ValueError):
@@ -373,7 +373,7 @@ def _resolve_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
             )
 
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
-        for _k in ("theme_warn_threshold", "theme_block_threshold"):
+        for _k in ("theme_warn_threshold", "theme_block_threshold", "merge_grade_block_threshold"):
             if _k in parsed:
                 with contextlib.suppress(TypeError, ValueError):
                     result[_k] = float(parsed[_k])
@@ -1608,6 +1608,10 @@ _BLOCKER_LABELS: dict[str, str] = {
     "migration_apply_drift": (
         "the candidate's migration chain does not apply cleanly against "
         "production's recorded schema state (deploy-fatal drift)"
+    ),
+    "merge_grade_misses": (
+        "the merged diffs 'misses' the version goal per the blind merge-grade "
+        "and the merge_grade_block_threshold is armed"
     ),
 }
 
@@ -3124,6 +3128,20 @@ async def _finalize_qualification(
     )
     _theme_blocked = _theme_cert.get("state") == "blocked"
 
+    # --- Blind merge-grade block (armable-dark) ----------------------------
+    # The blind grade (coverage_verdict) is persisted on qual under
+    # BLIND_MERGE_GRADE_KEY.  A "misses" verdict only hard-blocks when the
+    # operator has raised merge_grade_block_threshold above 0.0; the default
+    # (0.0) ships dark so the gate can be observed before it gates.
+    _blind_grade_record = qual.get(BLIND_MERGE_GRADE_KEY) or {}
+    _coverage_verdict = _blind_grade_record.get("coverage_verdict", "")
+    _merge_grade_block_threshold = float(
+        policy.get("merge_grade_block_threshold", 0.0) or 0.0
+    )
+    _merge_grade_blocked = (
+        _coverage_verdict == "misses" and _merge_grade_block_threshold > 0.0
+    )
+
     # --- Compute the composite ---------------------------------------------
     composite = compute_composite(
         ci_green=ci_green,
@@ -3136,6 +3154,7 @@ async def _finalize_qualification(
         migration_collision=migration_collision,
         migration_apply_blocked=migration_apply_blocked,
         theme_delivery_blocked=_theme_blocked,
+        merge_grade_blocked=_merge_grade_blocked,
     )
 
     # --- Acceptance-window aggregate (additive evidence, no score impact) --
@@ -3218,6 +3237,10 @@ async def _finalize_qualification(
         "migration_apply_safety_detail": apply_detail,
         "acceptance_aggregate": acceptance_aggregate,
         "theme_delivery": _theme_cert,
+        # Carry the blind merge-grade forward from the pending record so it
+        # survives finalization and is reusable on re-qualification of the same
+        # candidate SHA (blind_merge_grade_satisfied short-circuits the re-run).
+        BLIND_MERGE_GRADE_KEY: qual.get(BLIND_MERGE_GRADE_KEY),
     }
 
     # Advisory WARN notification: theme cert advisory shortfall (not a hard block).

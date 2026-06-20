@@ -22993,6 +22993,90 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     assert out_legacy["theme_delivery"] is None
 
 
+@pytest.mark.asyncio
+async def test_qualification_verdict_persists_blind_merge_grade(db_session):
+    """The blind merge-grade certificate is mirrored from base_record onto the
+    immutable QualificationVerdict row at finalize, surfaced intact by
+    format_verdict_for_api, and absent (None, not error) on legacy rows."""
+    from app import release_promotion as rp
+    from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
+
+    _grade = {
+        "candidate_sha": "abc123",
+        "coverage_verdict": "partial",
+        "biggest_gap": "no end-to-end test for the promote path",
+        "model": "claude-opus-4-8",
+        "pr_count": 3,
+        "graded_at": "2026-06-20T00:00:00+00:00",
+    }
+
+    # --- Formatter surfaces the grade intact from the durable column. -------
+    verdict = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="abc123",
+        confidence=0.42,
+        blocker=None,
+        audit_missing_reason=None,
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+        threshold=0.75,
+        blind_merge_grade=_grade,
+    )
+    out = rq.format_verdict_for_api(verdict)
+    assert out["blind_merge_grade"] == _grade
+
+    # Legacy rows (no grade) must return None, never raise.
+    verdict_legacy = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="legacy",
+        confidence=0.9,
+        blocker=None,
+        audit_missing_reason=None,
+        would_promote=True,
+        promotion_enabled=True,
+        terminal_status="promoted",
+        threshold=0.8,
+    )
+    out_legacy = rq.format_verdict_for_api(verdict_legacy)
+    assert out_legacy["blind_merge_grade"] is None
+
+    # --- Finalize path persists the grade onto the immutable row. -----------
+    # BLIND_MERGE_GRADE_KEY is the stable key release_qualifier writes into
+    # base_record at finalize; _record_qualification_verdict must mirror it.
+    assert BLIND_MERGE_GRADE_KEY == "blind_merge_grade"
+
+    _project, version = await _make_project_and_version(db_session)
+    base_record = {
+        "candidate_sha": "abc123",
+        "confidence": 0.42,
+        "threshold": 0.75,
+        "status": "not_promoted",
+        BLIND_MERGE_GRADE_KEY: _grade,
+    }
+    version.last_qualification = dict(base_record)
+    db_session.add(version)
+
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        base_record,
+        terminal_status="not_promoted",
+        would_promote=False,
+        promotion_enabled=False,
+    )
+    await db_session.commit()
+
+    rows = await _load_only_verdict(db_session, version)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.blind_merge_grade == _grade
+    # And the formatter round-trips the persisted row.
+    assert rq.format_verdict_for_api(row)["blind_merge_grade"] == _grade
+
+
 def test_format_verdict_for_api_surfaces_acceptance_window_signal_without_changing_composite():
     """format_verdict_for_api surfaces acceptance-window aggregate as top-level keys.
 
@@ -24941,4 +25025,329 @@ class TestThemeDeliveryCertification:
         assert len(theme_notify_calls) >= 1, (
             "expected at least one theme_delivery_shortfall notification; "
             f"got notify calls: {[c.args[2] for c in notify_spy.call_args_list]}"
+        )
+
+
+# ===========================================================================
+# blind_merge_grade carry-forward into finalized record
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_finalize_carries_blind_merge_grade_forward(db_session, mocker):
+    """_finalize_qualification must carry blind_merge_grade from the pending
+    record into the finalized last_qualification so it survives all finalize
+    outcomes and is reusable on re-qualification of the same candidate SHA.
+    """
+    from app import shared_state
+    from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Embed a blind merge-grade on the pending record (as run_qualification does).
+    blind_grade = {
+        "candidate_sha": version.last_qualification["candidate_sha"],
+        "coverage_verdict": "partial",
+        "biggest_gap": "Auth module changes not covered by merged PRs",
+        "graded_at": "2026-06-20T00:00:00",
+    }
+    version.last_qualification[BLIND_MERGE_GRADE_KEY] = blind_grade
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    lq = version.last_qualification
+    assert lq.get("status") != "pending", (
+        f"record was not finalized: {lq.get('status')}"
+    )
+
+    carried = lq.get(BLIND_MERGE_GRADE_KEY)
+    assert carried is not None, (
+        f"blind_merge_grade was dropped from finalized record; last_qualification={lq!r}"
+    )
+    assert carried.get("coverage_verdict") == "partial"
+    assert carried.get("biggest_gap") == "Auth module changes not covered by merged PRs"
+
+# ===========================================================================
+# Blind merge-grade hard-block hook (armable-dark)
+# ===========================================================================
+
+
+class TestBlindMergeGradeBlock:
+    """Armable-dark hard-block hook for the 'misses' blind merge-grade coverage verdict."""
+
+    # --- Unit tests: compute_composite integration --------------------------
+
+    def test_compute_composite_merge_grade_blocked_fires(self):
+        """merge_grade_blocked=True forces confidence=0.0 and blocker=merge_grade_misses."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            merge_grade_blocked=True,
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "merge_grade_misses"
+
+    def test_compute_composite_merge_grade_blocked_default_false(self):
+        """Backward compat: omitting merge_grade_blocked does not block."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+        )
+        assert result["blocker"] is None
+        assert result["promote"] is True
+
+    def test_compute_composite_blocker_precedence_theme_before_merge_grade(self):
+        """theme_delivery_blocked fires before merge_grade_blocked in the chain."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            theme_delivery_blocked=True,
+            merge_grade_blocked=True,
+        )
+        assert result["blocker"] == "theme_delivery_shortfall"
+
+    # --- Integration tests: _finalize_qualification gate -------------------
+
+    @pytest.mark.asyncio
+    async def test_blind_merge_grade_block_armable_dark(self, db_session, mocker):
+        """ACCEPTANCE: armed knob makes a 'misses' verdict force confidence 0.0/no-promote;
+        dark default (threshold=0.0) leaves promotion unchanged.
+
+        Case 1: coverage_verdict=misses + threshold=0.0 (dark) → promotes (confidence 1.0).
+        Case 2: coverage_verdict=misses + threshold=0.5 (armed) → not_promoted,
+                blocker=merge_grade_misses, confidence=0.0.
+        """
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        _clean_audit_logs = {
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        }
+        _clean_smoke_logs = {
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        }
+
+        _misses_grade = {
+            "candidate_sha": "feed" * 10,
+            "coverage_verdict": "misses",
+            "biggest_gap": "goal not delivered at all",
+            "model": "test-model",
+            "pr_count": 1,
+            "graded_at": "2026-06-20T00:00:00",
+        }
+
+        # --- Case 1: misses + dark threshold (0.0) → promotes ---------------
+        _dark_policy = {
+            "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+            "threshold": 0.75,
+            "merge_grade_block_threshold": 0.0,
+        }
+        mocker.patch("app.release_qualifier._load_policy", return_value=_dark_policy)
+
+        project, version = await _make_project_and_version(db_session)
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs=_clean_audit_logs,
+            smoke_logs=_clean_smoke_logs,
+        )
+        # Inject a 'misses' grade into last_qualification under BLIND_MERGE_GRADE_KEY
+        from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
+
+        lq = dict(version.last_qualification or {})
+        lq[BLIND_MERGE_GRADE_KEY] = _misses_grade
+        version.last_qualification = lq
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(version, "last_qualification")
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        mocker.patch(
+            "app.release_qualifier._fetch_version_theme_evidence",
+            new=AsyncMock(return_value=None),
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        lq1 = version.last_qualification
+        assert lq1.get("blocker") != "merge_grade_misses", (
+            f"dark threshold=0.0 must NOT hard-block; got blocker={lq1.get('blocker')!r}"
+        )
+        assert result["status"] in ("promoted", "dry_run", "not_promoted"), (
+            f"unexpected status with dark threshold: {result['status']!r}"
+        )
+        # blind_merge_grade must be surfaced in the finalized record
+        assert "blind_merge_grade" in lq1, (
+            "blind_merge_grade must be present in the finalized last_qualification record"
+        )
+        assert lq1["blind_merge_grade"]["coverage_verdict"] == "misses"
+
+        # --- Case 2: misses + armed threshold (0.5) → hard block ------------
+        _armed_policy = {
+            "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+            "threshold": 0.75,
+            "merge_grade_block_threshold": 0.5,
+        }
+        mocker.patch("app.release_qualifier._load_policy", return_value=_armed_policy)
+
+        project2, version2 = await _make_project_and_version(db_session)
+        db_session.add(version2)
+        await db_session.commit()
+        await db_session.refresh(version2)
+
+        await _seed_qualification_children(
+            db_session,
+            project2,
+            version2,
+            audit_logs=_clean_audit_logs,
+            smoke_logs=_clean_smoke_logs,
+        )
+        lq2 = dict(version2.last_qualification or {})
+        lq2[BLIND_MERGE_GRADE_KEY] = {**_misses_grade, "candidate_sha": "feed" * 10}
+        version2.last_qualification = lq2
+        flag_modified(version2, "last_qualification")
+        db_session.add(version2)
+        await db_session.commit()
+        await db_session.refresh(version2)
+
+        result2 = await rq._finalize_qualification(db_session, version2)
+        await db_session.commit()
+        await db_session.refresh(version2)
+
+        lq2_final = version2.last_qualification
+        assert result2["status"] == "not_promoted", (
+            f"armed threshold + misses must not_promote; got {result2['status']!r}"
+        )
+        assert result2.get("blocker") == "merge_grade_misses", (
+            f"expected blocker=merge_grade_misses; got {result2.get('blocker')!r}"
+        )
+        assert lq2_final.get("confidence") == 0.0, (
+            f"expected confidence=0.0; got {lq2_final.get('confidence')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_blind_merge_grade_covers_not_blocked(self, db_session, mocker):
+        """coverage_verdict=covers + armed threshold → no merge-grade block."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        _armed_policy = {
+            "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+            "threshold": 0.75,
+            "merge_grade_block_threshold": 0.5,
+        }
+        mocker.patch("app.release_qualifier._load_policy", return_value=_armed_policy)
+
+        _clean_audit_logs = {
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        }
+        _clean_smoke_logs = {
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        }
+
+        project, version = await _make_project_and_version(db_session)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs=_clean_audit_logs,
+            smoke_logs=_clean_smoke_logs,
+        )
+
+        from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
+        from sqlalchemy.orm.attributes import flag_modified
+
+        lq = dict(version.last_qualification or {})
+        lq[BLIND_MERGE_GRADE_KEY] = {
+            "candidate_sha": "feed" * 10,
+            "coverage_verdict": "covers",
+            "biggest_gap": "weakest aspect: test coverage",
+            "model": "test-model",
+            "pr_count": 1,
+            "graded_at": "2026-06-20T00:00:00",
+        }
+        version.last_qualification = lq
+        flag_modified(version, "last_qualification")
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        mocker.patch(
+            "app.release_qualifier._fetch_version_theme_evidence",
+            new=AsyncMock(return_value=None),
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        assert result.get("blocker") != "merge_grade_misses", (
+            f"covers verdict must not trigger merge_grade_misses blocker; "
+            f"got blocker={result.get('blocker')!r}"
         )

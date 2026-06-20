@@ -408,6 +408,7 @@ async def _record_qualification_verdict(
             smoketest_detail=base_record.get("smoketest_detail"),
             audit_reconciliation=base_record.get("audit_reconciliation"),
             theme_delivery=base_record.get("theme_delivery"),
+            blind_merge_grade=base_record.get("blind_merge_grade"),
             promotion_pr_url=base_record.get("pr_url"),
             promotion_conflict=(conflict if isinstance(conflict, bool) else None),
             promotion_error_detail=promotion_error_detail,

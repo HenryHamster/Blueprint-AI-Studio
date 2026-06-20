@@ -4102,6 +4102,14 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
 
+    # Blind merge-grade certificate: {candidate_sha, coverage_verdict,
+    # biggest_gap, model, pr_count, graded_at}.
+    # Nullable: existing verdict rows carry no blind merge-grade data.
+    blind_merge_grade: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
     # Promotion-attempt context (only set on the promotion_failed / promoted
     # paths): the merge PR URL, whether the merge hit a conflict, and the
     # error/detail string describing why the merge failed.
