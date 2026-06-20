@@ -1,5 +1,7 @@
 """Focused tests for review-fix lane-pilot cost attribution."""
 
+import uuid
+
 import pytest
 from datetime import timedelta
 from sqlalchemy import select
@@ -1380,3 +1382,133 @@ def test_lane_baseline_trend_returns_none_when_fewer_than_two():
         waste_task_count=0,
     )
     assert compute_lane_baseline_trend([single]) is None
+
+
+@pytest.mark.asyncio
+async def test_emit_lane_event_message_dedupe_is_db_bounded(db_session):
+    """emit_lane_event_message uses a DB-side dedupe filter (LIMIT 1), not a full scan.
+
+    Verifies:
+    1. A message is inserted on first call.
+    2. A duplicate is NOT inserted on a second call with the same dedupe_key.
+    3. A different dedupe_key does get its own message.
+    """
+    from sqlalchemy import select as sa_select
+
+    from app.models import MessageType, ProjectMessage
+    from app.review_fix_lane_pilot import emit_lane_event_message
+    from testing.factories import make_project
+
+    project = make_project(is_self_repo=True)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    lane_id = uuid.uuid4()
+
+    # First call: should insert one message.
+    await emit_lane_event_message(
+        db_session, project.id, lane_id, "test_event", "detail A"
+    )
+    await db_session.commit()
+
+    msgs = (
+        (
+            await db_session.execute(
+                sa_select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs) == 1
+    assert msgs[0].message_type == MessageType.NOTE
+    assert msgs[0].context["dedupe_key"] == f"lane_test_event_{lane_id}"
+
+    # Second call with same args: dedupe should prevent a second insert.
+    await emit_lane_event_message(
+        db_session, project.id, lane_id, "test_event", "detail A again"
+    )
+    await db_session.commit()
+
+    msgs2 = (
+        (
+            await db_session.execute(
+                sa_select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs2) == 1, "duplicate insert must be suppressed by DB-side dedupe"
+
+    # Different event type: a new message should be inserted.
+    await emit_lane_event_message(
+        db_session, project.id, lane_id, "other_event", "detail B"
+    )
+    await db_session.commit()
+
+    msgs3 = (
+        (
+            await db_session.execute(
+                sa_select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs3) == 2, "distinct dedupe_key must produce a separate message"
+
+
+@pytest.mark.asyncio
+async def test_raise_gate_integrity_alert_dedupe_is_db_bounded(db_session):
+    """raise_gate_integrity_alert uses a DB-side dedupe filter (LIMIT 1), not a full scan.
+
+    Verifies:
+    1. A BLOCKER message is inserted on first call.
+    2. A duplicate is NOT inserted on a second call.
+    """
+    from sqlalchemy import select as sa_select
+
+    from app.models import MessageType, ProjectMessage
+    from app.review_fix_lane_pilot import raise_gate_integrity_alert
+    from testing.factories import make_project
+
+    project = make_project(is_self_repo=True)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First call: should insert one BLOCKER message.
+    await raise_gate_integrity_alert(db_session, project.id, "gate integrity broken")
+    await db_session.commit()
+
+    msgs = (
+        (
+            await db_session.execute(
+                sa_select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs) == 1
+    assert msgs[0].message_type == MessageType.BLOCKER
+    assert msgs[0].context["dedupe_key"] == "review_fix_lane_gate_integrity_violation"
+
+    # Second call: dedupe must suppress the second insert.
+    await raise_gate_integrity_alert(
+        db_session, project.id, "gate integrity broken again"
+    )
+    await db_session.commit()
+
+    msgs2 = (
+        (
+            await db_session.execute(
+                sa_select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs2) == 1, "duplicate BLOCKER must be suppressed by DB-side dedupe"

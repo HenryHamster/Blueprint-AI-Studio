@@ -1299,7 +1299,11 @@ async def kill_single_lane(
         await record_lane_reservation_cause(session, lane_id, "force_expired")
         cleared += 1
 
-    logger.info("[LANE-PILOT] KILL lane %s (operator) killed=1 reservations=%d", lane_id, cleared)
+    logger.info(
+        "[LANE-PILOT] KILL lane %s (operator) killed=1 reservations=%d",
+        lane_id,
+        cleared,
+    )
     return {"lanes_killed": 1, "reservations_cleared": cleared}
 
 
@@ -1410,19 +1414,16 @@ async def emit_lane_event_message(
     else:
         dedupe_key = f"pilot_{event_type}_{project_id}"
 
-    existing = (
-        (
-            await session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.status == "open",
-                )
-            )
+    result = await session.execute(
+        select(ProjectMessage.id)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.status == "open",
+            ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
         )
-        .scalars()
-        .all()
+        .limit(1)
     )
-    already = any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing)
+    already = result.scalar() is not None
     if already:
         return
     session.add(
@@ -1452,19 +1453,16 @@ async def raise_gate_integrity_alert(
     from app.models import MessageType, ProjectMessage
 
     dedupe_key = "review_fix_lane_gate_integrity_violation"
-    existing = (
-        (
-            await session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.status == "open",
-                )
-            )
+    result = await session.execute(
+        select(ProjectMessage.id)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.status == "open",
+            ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
         )
-        .scalars()
-        .all()
+        .limit(1)
     )
-    already = any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing)
+    already = result.scalar() is not None
     if already:
         return
     session.add(
