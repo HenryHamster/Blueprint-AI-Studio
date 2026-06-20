@@ -8,7 +8,7 @@ into its own router seam; behavior and contracts are unchanged.
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
@@ -871,6 +871,27 @@ async def test_agent_fetch_message_too_short_ref_fails_loudly(
         headers={"x-agent-token": token},
     )
     assert res.status_code == 400, res.text
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_message_non_hex_ref_returns_400(
+    client: AsyncClient, db_session
+):
+    """A ref with non-hex characters (wildcards, letters outside a-f) is rejected (400)."""
+    project, task = await _make_project_task(db_session)
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    # Test with a wildcard character '%' — must not be treated as a LIKE wildcard
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/deadbeef%",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 400, res.text
+    # Test with underscore wildcard '_'
+    res2 = await client.get(
+        f"/api/agent/projects/{project.id}/messages/deadbeef_",
+        headers={"x-agent-token": token},
+    )
+    assert res2.status_code == 400, res2.text
 
 
 @pytest.mark.asyncio
@@ -1837,3 +1858,131 @@ async def test_audit_finding_resolution_rejects_stale_task_version(
         .first()
     )
     assert row is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_message_ref DB-side prefix filter tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_message_ref_python_side_filter_within_recent_window(
+    client: AsyncClient, db_session
+):
+    """resolve_message_ref fetches the 500 most-recent project messages
+    (ORDER BY created_at DESC LIMIT 500) and filters in Python via
+    str.startswith(prefix).
+
+    Strategy: create a target message and several non-target messages all with
+    the same 8-char hex prefix; the target is distinguishable by a longer
+    (24-char) prefix.  All messages are within the 500-row recency window, so
+    the target is found and the unique prefix resolves unambiguously.
+    """
+    import uuid as _uuid
+
+    project, task = await _make_project_task(db_session, vm="agent-vm-pyfilter")
+
+    base_ts = datetime(2026, 1, 1, 12, 0, 0)
+
+    # All messages share a common 8-hex prefix.
+    common_prefix = "bb000000"
+    # Create 10 non-target messages with a different suffix pattern.
+    for i in range(1, 11):
+        mid = _uuid.UUID(common_prefix + "0000" + "4000" + "8000" + f"{i:012x}")
+        msg = ProjectMessage(
+            id=mid,
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="non-target",
+            status="open",
+            created_at=base_ts + timedelta(seconds=i),
+        )
+        db_session.add(msg)
+
+    # Target message — arrives after all non-targets so it's in the recency window.
+    target_id = _uuid.UUID(common_prefix + "0000" + "4000" + "8000" + "ffffffffffff")
+    target_msg = ProjectMessage(
+        id=target_id,
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="agent",
+        content="the target",
+        status="open",
+        created_at=base_ts + timedelta(seconds=100),
+    )
+    db_session.add(target_msg)
+    await db_session.commit()
+    await db_session.refresh(target_msg)
+
+    # 24-char prefix uniquely identifies the target (non-targets end in 0…, target ends in f…).
+    target_ref = target_id.hex[:24]
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/{target_ref}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["id"] == str(target_id)
+    assert res.json()["data"]["content"] == "the target"
+
+
+@pytest.mark.asyncio
+async def test_resolve_message_ref_tail_tradeoff_old_message_not_found(
+    client: AsyncClient, db_session
+):
+    """Accepted tradeoff: a message older than the 500-row recency window is not
+    resolvable by short ref.
+
+    The implementation fetches ORDER BY created_at DESC LIMIT 500 then filters
+    in Python.  A message whose created_at predates the 500 most-recent messages
+    falls outside the scan window and results in a 404, not a match.
+
+    This is the intentional design: the window covers recent messages (the common
+    case); very old messages in large projects may require the full UUID.
+    """
+    import uuid as _uuid
+
+    project, task = await _make_project_task(db_session, vm="agent-vm-tail")
+
+    base_ts = datetime(2026, 1, 2, 0, 0, 0)
+
+    # Target message is the OLDEST in the project (created_at = base_ts).
+    target_prefix = "cc000000"
+    target_id = _uuid.UUID(target_prefix + "0000" + "4000" + "8000" + "aaaaaaaaaaaa")
+    target_msg = ProjectMessage(
+        id=target_id,
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="old target",
+        status="open",
+        created_at=base_ts,
+    )
+    db_session.add(target_msg)
+
+    # Create 500 newer messages with a distinct prefix so they don't collide.
+    filler_prefix = "dd000000"
+    for i in range(500):
+        mid = _uuid.UUID(filler_prefix + "0000" + "4000" + "8000" + f"{i:012x}")
+        msg = ProjectMessage(
+            id=mid,
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="filler",
+            status="open",
+            created_at=base_ts + timedelta(seconds=i + 1),
+        )
+        db_session.add(msg)
+
+    await db_session.commit()
+
+    # The target's unique prefix cannot be found — it is outside the 500-row window.
+    target_ref = target_id.hex[:24]
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/{target_ref}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404, res.text

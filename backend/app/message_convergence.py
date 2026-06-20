@@ -16,6 +16,7 @@ No new DB columns or migrations are required.
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import TYPE_CHECKING
 
@@ -86,7 +87,9 @@ def is_bug_class(msg: "ProjectMessage") -> bool:
     return raw in BUG_CLASS_TYPES
 
 
-def bug_message_cluster_signature(msg: "ProjectMessage") -> tuple[tuple[str, str], ...] | None:
+def bug_message_cluster_signature(
+    msg: "ProjectMessage",
+) -> tuple[tuple[str, str], ...] | None:
     """Return a conservative structured signature for duplicate bug messages.
 
     The signature only includes stable context fields that already carry
@@ -113,9 +116,7 @@ def bug_message_cluster_signature(msg: "ProjectMessage") -> tuple[tuple[str, str
     return tuple(signature)
 
 
-def bug_messages_share_cluster(
-    lhs: "ProjectMessage", rhs: "ProjectMessage"
-) -> bool:
+def bug_messages_share_cluster(lhs: "ProjectMessage", rhs: "ProjectMessage") -> bool:
     """Return True when two bug-class messages have the same structured signature."""
     lhs_sig = bug_message_cluster_signature(lhs)
     if lhs_sig is None:
@@ -168,12 +169,17 @@ def get_message_link(msg: "ProjectMessage") -> dict | None:
     return link
 
 
+_HEX_RE = re.compile(r"^[0-9a-f]*$")
+
+
 def _normalize_message_ref(ref: str) -> str:
     """Normalize a short ref or full UUID to a lowercase, dash-free hex prefix."""
     return str(ref or "").strip().lower().replace("-", "")
 
 
-def _message_ref_candidates(matches: list["ProjectMessage"]) -> list[dict[str, str | None]]:
+def _message_ref_candidates(
+    matches: list["ProjectMessage"],
+) -> list[dict[str, str | None]]:
     """Return deterministic disambiguators for ambiguous message refs.
 
     Each candidate includes a collision-free hex prefix (at least
@@ -192,7 +198,9 @@ def _message_ref_candidates(matches: list["ProjectMessage"]) -> list[dict[str, s
     candidates: list[dict[str, str | None]] = []
     for msg in ordered:
         msg_type = getattr(msg, "message_type", None)
-        type_value = msg_type.value if hasattr(msg_type, "value") else str(msg_type or "")
+        type_value = (
+            msg_type.value if hasattr(msg_type, "value") else str(msg_type or "")
+        )
         candidates.append(
             {
                 "id": str(msg.id),
@@ -237,6 +245,11 @@ async def resolve_message_ref(
                 f"message reference too short: need at least "
                 f"{MIN_MESSAGE_REF_HEXLEN} hex characters"
             ),
+        )
+    if not _HEX_RE.match(prefix):
+        raise HTTPException(
+            status_code=400,
+            detail="message reference must contain only hex characters (0-9, a-f)",
         )
     # Scope to the project FIRST so cross-project rows are never candidates,
     # then match id-hex prefix in Python (sqlite-safe, status-agnostic).
