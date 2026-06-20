@@ -2,7 +2,7 @@ import { createContext, createElement, useContext, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import type { TaskCapabilityContract, TaskCapabilityContractEntry } from './types/settings';
 
-export const TASK_CAPABILITIES = [
+const TASK_CAPABILITIES = [
   {
     id: 'create',
     label: 'Create',
@@ -212,9 +212,8 @@ export const TASK_CAPABILITIES = [
   },
 ] as const;
 
-export type TaskCapability = (typeof TASK_CAPABILITIES)[number];
+type TaskCapability = (typeof TASK_CAPABILITIES)[number];
 export type TaskType = TaskCapability['id'];
-export type BackendTaskType = Extract<TaskCapability, { synthetic: false }>['id'];
 export type UserLaunchableTaskType = Extract<TaskCapability, { userLaunchable: true }>['id'];
 
 export const TASK_CAPABILITY_BY_ID = Object.fromEntries(
@@ -225,20 +224,9 @@ export const FILTER_TASK_TYPE_IDS: readonly TaskType[] = TASK_CAPABILITIES
   .filter(capability => capability.filterVisible)
   .map(capability => capability.id);
 
-export const PROVIDER_ROUTABLE_TASK_TYPE_IDS: readonly BackendTaskType[] = TASK_CAPABILITIES
-  .filter((capability): capability is Extract<TaskCapability, { synthetic: false; providerConfigurable: true }> => (
-    !capability.synthetic && capability.providerConfigurable
-  ))
-  .map(capability => capability.id);
-
 export const USER_LAUNCHABLE_TASK_TYPE_IDS: readonly UserLaunchableTaskType[] = TASK_CAPABILITIES
   .filter((capability): capability is Extract<TaskCapability, { userLaunchable: true }> => capability.userLaunchable)
   .map(capability => capability.id);
-
-export const FILTER_TASK_TYPE_OPTIONS = FILTER_TASK_TYPE_IDS.map(id => ({
-  value: id,
-  label: TASK_CAPABILITY_BY_ID[id].label,
-}));
 
 /**
  * Shape of a launchable-task-type option rendered by the New Task launcher.

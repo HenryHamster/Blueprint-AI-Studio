@@ -31,6 +31,19 @@ const PROOF_ALL_DONE = {
   first_autonomous_improvement_at: '2026-06-01T10:00:00Z',
 };
 
+// Two steps completed (5 min apart) but frontier has been pending for days — stall threshold exceeded.
+const PROOF_STALLED = {
+  repo_added_at: '2026-06-01T09:00:00Z',
+  bootstrap_completed_at: '2026-06-01T09:05:00Z',
+  first_task_spawned_at: null,
+  first_pr_opened_at: null,
+  first_merge_gate_verdict_at: null,
+  first_merge_gate_executed_tests: null,
+  first_merge_gate_unverified_reason: null,
+  first_pr_merged_at: null,
+  first_autonomous_improvement_at: null,
+};
+
 const PROOF_PENDING = {
   repo_added_at: '2026-06-01T09:00:00Z',
   bootstrap_completed_at: null,
@@ -181,6 +194,72 @@ describe('OnboardingProofPanel — viewport regression', () => {
     });
     if (host.firstChild !== null) {
       throw new Error('OnboardingProofPanel rendered content when onboarding_proof is absent');
+    }
+  });
+
+  test('renders stall warning when frontier has been pending 2× longer than max prior step', async () => {
+    await renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_STALLED });
+    const text = host!.textContent ?? '';
+    if (!text.includes('Journey stalled')) {
+      throw new Error('Expected stall warning "Journey stalled" but it was not rendered');
+    }
+  });
+
+  test('no stall warning when only repo_added_at is set (no prior step durations)', async () => {
+    await renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_PENDING });
+    const text = host!.textContent ?? '';
+    if (text.includes('Journey stalled')) {
+      throw new Error('Stall warning must not render when there are no prior step durations to compare');
+    }
+  });
+
+  test('no stall warning when journey is fully complete', async () => {
+    await renderWith({ ...BASE_PROJECT, onboarding_proof: PROOF_ALL_DONE });
+    const text = host!.textContent ?? '';
+    if (text.includes('Journey stalled')) {
+      throw new Error('Stall warning must not render when journey is fully complete');
+    }
+  });
+
+  test('stall warning includes failed task count when tasks have failed', async () => {
+    await renderWith({
+      ...BASE_PROJECT,
+      onboarding_proof: PROOF_STALLED,
+      task_status_counts: { queued: 0, running: 0, evaluating: 0, blocked: 0, failed: 3, completed: 5, total: 8 },
+    });
+    const text = host!.textContent ?? '';
+    if (!text.includes('Journey stalled')) {
+      throw new Error('Expected stall warning but it was not rendered');
+    }
+    if (!text.includes('3 failed tasks')) {
+      throw new Error('Expected stall warning to include "3 failed tasks" but it was not found');
+    }
+  });
+
+  test('stall warning uses singular "task" for single failed task', async () => {
+    await renderWith({
+      ...BASE_PROJECT,
+      onboarding_proof: PROOF_STALLED,
+      task_status_counts: { queued: 0, running: 0, evaluating: 0, blocked: 0, failed: 1, completed: 5, total: 6 },
+    });
+    const text = host!.textContent ?? '';
+    if (!text.includes('1 failed task')) {
+      throw new Error('Expected stall warning to include "1 failed task" (singular) but it was not found');
+    }
+  });
+
+  test('stall warning omits failed task count when no tasks have failed', async () => {
+    await renderWith({
+      ...BASE_PROJECT,
+      onboarding_proof: PROOF_STALLED,
+      task_status_counts: { queued: 0, running: 0, evaluating: 0, blocked: 0, failed: 0, completed: 5, total: 5 },
+    });
+    const text = host!.textContent ?? '';
+    if (!text.includes('Journey stalled')) {
+      throw new Error('Expected stall warning but it was not rendered');
+    }
+    if (text.includes('failed task')) {
+      throw new Error('Stall warning should not include failed task count when failed=0');
     }
   });
 });

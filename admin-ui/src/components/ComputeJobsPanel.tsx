@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package } from 'lucide-react';
 import { analyzeComputeJob, fetchComputeJobs, killComputeJob, type ComputeJob } from '../api';
 import { usePoller } from '../hooks/usePoller';
@@ -376,6 +376,54 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                         <span className="text-neutral-500">{k}:</span> {String(v)}
                       </span>
                     ))}
+                  </div>
+                );
+              })()}
+              {(() => {
+                if (active) return null;
+                const sc = job.success_criterion;
+                const verdict = job.criterion_verdict;
+                if (!sc) return null;
+                const expr = `${sc.metric} ${sc.operator} ${sc.threshold}`;
+                let chip: React.ReactNode;
+                if (!verdict) {
+                  chip = (
+                    <span className="rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-neutral-400">
+                      not reported
+                    </span>
+                  );
+                } else if (verdict.met) {
+                  chip = (
+                    <span
+                      className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-emerald-300"
+                      data-testid="criterion-met"
+                    >
+                      met
+                    </span>
+                  );
+                } else {
+                  chip = (
+                    <span
+                      className="rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-red-300"
+                      data-testid="criterion-unmet"
+                    >
+                      {verdict.measurable ? 'unmet' : 'unmet (not measurable)'}
+                    </span>
+                  );
+                }
+                return (
+                  <div
+                    className="mt-1.5 flex items-center gap-1.5 text-[10px] font-mono"
+                    data-testid="criterion-verdict-row"
+                  >
+                    <span className="text-neutral-500 shrink-0">Criterion</span>
+                    <span className="text-neutral-300 break-words">{expr}</span>
+                    {verdict && verdict.value !== null && verdict.value !== undefined && (
+                      <span className="text-neutral-500">
+                        (measured: {verdict.value})
+                      </span>
+                    )}
+                    {chip}
                   </div>
                 );
               })()}

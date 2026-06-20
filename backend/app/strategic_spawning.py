@@ -2150,11 +2150,6 @@ _MEMO_HEAVY_FIELDS = ("citations", "final_metrics")
 _MEMO_VERBOSE_FIELDS = ("rationale", "reasoning")
 
 
-def _strip_heavy_fields(m: dict) -> dict:
-    """Return a copy of the memo entry without the heaviest optional fields."""
-    return {k: v for k, v in m.items() if k not in _MEMO_HEAVY_FIELDS}
-
-
 def _strip_verbose_fields(m: dict) -> dict:
     """Return a copy without heavy AND verbose optional fields."""
     drop = set(_MEMO_HEAVY_FIELDS) | set(_MEMO_VERBOSE_FIELDS)

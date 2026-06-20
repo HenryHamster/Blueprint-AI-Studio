@@ -181,8 +181,8 @@ export function trendStroke(t: SrCategoryTrend['trend'], versionChanged?: boolea
 
 export const FLOOR_HIT_RATE = 0.5;
 export const FLOOR_MIN_WINDOWS = 2;
-export const ENGAGEMENT_THINNING_THRESHOLD = 0.5;
-export const ENGAGEMENT_THINNING_MIN_PASSES = 10;
+const ENGAGEMENT_THINNING_THRESHOLD = 0.5;
+const ENGAGEMENT_THINNING_MIN_PASSES = 10;
 
 export function isBelowFloor(
   c: SrCategoryTrend,

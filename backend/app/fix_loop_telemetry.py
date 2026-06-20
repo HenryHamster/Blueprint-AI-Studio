@@ -17,14 +17,12 @@ lists are capped so a runaway agent can't blow the column up.
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import Task
-from app.time_utils import _utcnow
 
 
 # Recognized per-task fix loops. Anything outside this set is rejected at
@@ -67,36 +65,6 @@ DIVERGENCE_EXIT_REASONS: frozenset[str] = frozenset(
 # The staleness watchdog in pipeline_regression_dispatcher imports this to keep
 # the threshold co-located with the module that owns the data shape.
 FIX_LOOP_DIVERGENCE_STALENESS_WINDOW_DAYS: int = 7
-
-
-def stamp_fix_loop_divergence_computed_at(
-    doc: dict,
-    now: datetime | None = None,
-) -> None:
-    """Write the current UTC timestamp into *doc* under the fix_loop_divergence
-    signal_last_computed_at key consumed by the pipeline staleness watchdog.
-
-    Centralising the write here keeps the design-doc key name canonical and
-    lets callers avoid hardcoding it.  Pass *now* in tests to fix the clock.
-
-    Audit C10: stamp with the project-standard _utcnow() (naive UTC) so the
-    heartbeat string round-trips through the staleness watchdog's naive parse
-    identically to other task_results-derived timestamps, and bare
-    datetime.utcnow() DTZ deprecation clears.
-    """
-    ts = (now or _utcnow()).isoformat()
-    doc["fix_loop_divergence_signal_last_computed_at"] = ts
-
-
-def normalize_fix_loop_error_fingerprint(message: str | None) -> str:
-    """Normalize fix-loop error text into a stable grouping fingerprint.
-
-    Delegates to the existing failure-classification normalizer so UUIDs,
-    numbers, and size tokens cluster identically across telemetry consumers.
-    """
-    from app.failure_classification import _fingerprint_message  # noqa: PLC0415
-
-    return _fingerprint_message(message or "")
 
 
 class FixLoopEventIn(BaseModel):

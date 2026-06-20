@@ -42,7 +42,7 @@ export type { RecentCompletion } from '../types/digest';
 
 export type TimeWindow = 'last_visit' | '6h' | '24h' | '7d';
 
-export type DismissEntry = { type: 'dismiss' } | { type: 'snooze'; until: number };
+type DismissEntry = { type: 'dismiss' } | { type: 'snooze'; until: number };
 export type DismissedState = Record<string, DismissEntry>;
 
 export function formatDuration(seconds: number): string {
@@ -78,7 +78,7 @@ export function formatSnoozeRemaining(until: number): string {
 const CATCH_UP_VIEWED_KEY_BASE = 'blueprint-admin:lastCatchUpViewed';
 
 /** Returns the localStorage key for the last-catch-up-viewed timestamp, scoped per operator when userEmail is provided. */
-export function getCatchUpViewedKey(userEmail?: string | null): string {
+function getCatchUpViewedKey(userEmail?: string | null): string {
   return userEmail ? `${CATCH_UP_VIEWED_KEY_BASE}:${userEmail}` : CATCH_UP_VIEWED_KEY_BASE;
 }
 
@@ -88,16 +88,6 @@ export function getLastCatchUpViewed(userEmail?: string | null): number | null {
     const ts = stored ? parseInt(stored, 10) : null;
     return ts && !isNaN(ts) ? ts : null;
   } catch { return null; }
-}
-
-export function markCatchUpViewed(userEmail?: string | null): void {
-  try { localStorage.setItem(getCatchUpViewedKey(userEmail), String(Date.now())); } catch { /* */ }
-}
-
-/** Merges local and backend last-seen timestamps, preferring the backend value when it is newer (cross-device). */
-export function resolveLastCatchUpViewed(localTs: number | null, backendTs: number | null): number | null {
-  if (backendTs != null && (localTs == null || backendTs > localTs)) return backendTs;
-  return localTs;
 }
 
 export function windowToHours(window: TimeWindow, lastViewed: number | null): number {
@@ -113,27 +103,3 @@ export function windowToHours(window: TimeWindow, lastViewed: number | null): nu
   }
 }
 
-export type TrendPeriod = {
-  period_end: string;
-  success_rate: number | null;
-  completed: number;
-  failed: number;
-  failed_by_taxonomy?: Record<string, number>;
-  failed_by_class?: Record<string, number>;
-  first_attempt_success_rate?: number | null;
-  period_cost_usd?: number | null;
-};
-
-export type ClassTrend = { arrow: string; color: string };
-
-/** Computes trend arrow/color for a failure class by comparing the recent 2 periods vs prior 2 periods. */
-export function computeClassTrend(classHistory: TrendPeriod[], failureClass: string): ClassTrend {
-  if (classHistory.length < 4) return { arrow: '–', color: 'text-neutral-500' };
-  const sumAt = (arr: TrendPeriod[]) =>
-    arr.reduce((a, p) => a + (p.failed_by_class?.[failureClass] ?? 0), 0);
-  const recent = sumAt(classHistory.slice(-2));
-  const prior = sumAt(classHistory.slice(-4, -2));
-  if (recent > prior) return { arrow: '↑', color: 'text-red-400' };
-  if (recent < prior) return { arrow: '↓', color: 'text-emerald-400' };
-  return { arrow: '–', color: 'text-neutral-500' };
-}

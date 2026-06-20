@@ -17,6 +17,7 @@ from app.efficiency_snapshot import (
     AXIS_LLM_COST_PER_MERGED_PR,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
+    AXIS_PROMPT_STATIC_BYTES,
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
     DESIGN_DOC_KEY,
@@ -25,13 +26,18 @@ from app.efficiency_snapshot import (
     LLM_TOKEN_PRICING,
     METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
+    PROMPT_STATIC_BYTES_THRESHOLD,
+    SELF_REPAIR_BURN_SHARE_KEY,
     SELF_REPAIR_MIN_ATTEMPTS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
+    _PROMPT_STATIC_CONST_NAMES,
     _compute_checkpoint_loss_rate,
+    _extract_ts_template_literal_length,
     _compute_cold_start_breakdown_p50,
     _compute_lane_cost_per_merged_pr,
     _compute_lane_warm_resume_rate,
     _compute_llm_cost_pricing_coverage,
+    _compute_prompt_static_bytes,
     _last_run_due,
     _task_llm_attempts,
     compute_current_axes,
@@ -498,7 +504,14 @@ async def test_compute_current_axes_empty_returns_none(db_session):
     # Scalar axes are None when no tasks exist. Structural metadata keys
     # (vm_cold_start_breakdown, llm_cost_pricing_coverage) are exempt —
     # they return None / empty-dict rather than a scalar None.
-    assert all(axes[k] is None for k in ALL_AXES)
+    # AXIS_PROMPT_STATIC_BYTES is also exempt: it is environment-derived
+    # (parses agent/src/prompt.ts) and returns a positive int regardless
+    # of whether any tasks exist.
+    task_data_axes = [k for k in ALL_AXES if k != AXIS_PROMPT_STATIC_BYTES]
+    assert all(axes[k] is None for k in task_data_axes)
+    assert axes[AXIS_PROMPT_STATIC_BYTES] is None or isinstance(
+        axes[AXIS_PROMPT_STATIC_BYTES], int
+    )
 
 
 @pytest.mark.asyncio
@@ -3914,6 +3927,42 @@ async def test_format_compliance_backfilled_into_preexisting_baseline(db_session
 
 
 @pytest.mark.asyncio
+async def test_snapshot_surfaces_repair_infra_failures(db_session):
+    """repair_infra_failures is surfaced in the format_compliance snapshot block."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            format_compliance_summary={
+                "format_error_total": 2,
+                "format_repair_attempts": 6,
+                "format_repair_successes": 3,
+                "format_repair_infra_failures": 3,
+            },
+        )
+    )
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    block = snap[FORMAT_COMPLIANCE_KEY]
+    assert block["repair_attempts"] == 6
+    assert block["repair_successes"] == 3
+    # New field surfaced in the snapshot block.
+    assert block["repair_infra_failures"] == 3
+    # Clean denominator = 6 - 3 = 3; rate = 3/3 = 1.0
+    assert block[SELF_REPAIR_SUCCESS_RATE_KEY] == 1.0
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    fc = drift[FORMAT_COMPLIANCE_KEY]
+    assert fc["repair_infra_failures"] == 3
+
+
+@pytest.mark.asyncio
 async def test_efficiency_axes_endpoint_exposes_format_compliance(
     client: AsyncClient, db_session
 ):
@@ -4045,6 +4094,42 @@ def test_nested_snapshot_metrics_have_ground_truth_and_named_consumer():
 def test_axis_llm_cost_constant_value():
     """AXIS_LLM_COST_PER_MERGED_PR resolves to the expected string key."""
     assert AXIS_LLM_COST_PER_MERGED_PR == "llm_cost_per_merged_pr"
+
+
+def test_code_change_prompt_static_bytes():
+    """AXIS_PROMPT_STATIC_BYTES is registered in ALL_AXES and AXIS_CONSUMERS, and
+    _compute_prompt_static_bytes() returns a positive integer within the guard
+    threshold when agent/src/prompt.ts is available.
+
+    This is the acceptance test for the prompt_static_bytes gauge (d-22af1f55):
+    it exercises the production parsing logic against the live prompt.ts source,
+    so a PR that grows the static prompt budget past PROMPT_STATIC_BYTES_THRESHOLD
+    will fail here before reaching production.
+    """
+    assert AXIS_PROMPT_STATIC_BYTES in ALL_AXES, (
+        f"{AXIS_PROMPT_STATIC_BYTES!r} must be in ALL_AXES"
+    )
+    assert AXIS_PROMPT_STATIC_BYTES in AXIS_CONSUMERS, (
+        f"{AXIS_PROMPT_STATIC_BYTES!r} must have an entry in AXIS_CONSUMERS"
+    )
+    assert AXIS_CONSUMERS[AXIS_PROMPT_STATIC_BYTES].get("pending") or AXIS_CONSUMERS[
+        AXIS_PROMPT_STATIC_BYTES
+    ].get("consumer"), (
+        "AXIS_CONSUMERS entry for prompt_static_bytes must have a 'pending' or 'consumer' key"
+    )
+
+    result = _compute_prompt_static_bytes()
+    if result is None:
+        pytest.skip("agent/src/prompt.ts not available in this environment")
+
+    assert isinstance(result, int), f"Expected int, got {type(result)!r}"
+    assert result > 0, f"prompt_static_bytes must be positive, got {result}"
+    assert result <= PROMPT_STATIC_BYTES_THRESHOLD, (
+        f"prompt_static_bytes={result} exceeds PROMPT_STATIC_BYTES_THRESHOLD="
+        f"{PROMPT_STATIC_BYTES_THRESHOLD}. A recent change grew the static prompt "
+        "budget past the guard. Either revert the growth or raise the threshold "
+        "with justification in efficiency_snapshot.py."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4218,6 +4303,60 @@ def test_llm_cost_breakdown_by_task_type_merge_credited_once():
     input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
     expected_cost = round((1000 + 250) * input_rate + (400 + 150) * output_rate, 6)
     assert fix_row["total_cost_usd"] == expected_cost
+
+
+def test_compute_llm_cost_by_task_type():
+    """mean_input_tokens_per_call = total_input_tokens / llm_call_count; None when
+    call count is zero; computed correctly under a real merge-test verdict."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # Merged task: 2000 input tokens over 8 calls -> mean = 250
+    merged_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 800,
+            "llm_call_count": 8,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    # Task with no llm_call_count -> mean should be None
+    no_calls_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "review"}],
+        api_call_summary={
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "llm_call_count": 0,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([merged_task, no_calls_task])
+    by_type = {r["task_type"]: r for r in rows}
+
+    create_row = by_type["create"]
+    assert create_row["llm_call_count"] == 8
+    assert create_row["total_input_tokens"] == 2000
+    assert create_row["mean_input_tokens_per_call"] == 250  # 2000 / 8
+
+    review_row = by_type["review"]
+    assert review_row["llm_call_count"] == 0
+    assert review_row["mean_input_tokens_per_call"] is None
+
+    # Verify merged task is counted correctly
+    assert create_row["merged_count"] == 1
+    assert create_row["verified_merged_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -6774,3 +6913,385 @@ def test_recommended_sample_rate_at_threshold_boundary():
     result = compute_recommended_challenger_sample_rate(eff)
     assert result["status"] == "gate_earning"
     assert result["recommended_sample_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_in_snapshot(db_session):
+    """write_snapshot includes self_repair_burn_share in llm_cost_attribution.
+
+    self_repair_burn_share = repair_attempts / total_llm_call_count.
+    Tasks with format_compliance_summary carrying repair_attempts contribute
+    to the numerator; api_call_summary.llm_call_count contributes to the denominator.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with 10 LLM calls and 2 repair attempts.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 1}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 1000,
+            "llm_call_count": 10,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 2,
+            "format_repair_attempts": 2,
+            "format_repair_successes": 1,
+            "format_repair_infra_failures": 0,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    attr = snap.get("llm_cost_attribution")
+    assert attr is not None, "llm_cost_attribution must be present"
+    assert SELF_REPAIR_BURN_SHARE_KEY in attr, "self_repair_burn_share must be present"
+    # 2 repair attempts / 10 total LLM calls = 0.2
+    assert attr[SELF_REPAIR_BURN_SHARE_KEY] == pytest.approx(0.2, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_none_when_no_llm_calls(db_session):
+    """self_repair_burn_share is None when total_llm_call_count is zero."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with no api_call_summary (no LLM calls recorded).
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 2}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    attr = snap.get("llm_cost_attribution")
+    assert attr is not None
+    assert attr[SELF_REPAIR_BURN_SHARE_KEY] is None
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_in_llm_cost_attribution_trend(db_session):
+    """read_baseline_with_drift includes self_repair_burn_share in each trend entry."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 3}],
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 1500,
+            "llm_call_count": 20,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 1,
+            "format_repair_attempts": 4,
+            "format_repair_successes": 3,
+            "format_repair_infra_failures": 0,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    trend = drift.get("llm_cost_attribution_trend")
+    assert isinstance(trend, list)
+    assert len(trend) >= 1
+    for entry in trend:
+        assert SELF_REPAIR_BURN_SHARE_KEY in entry, (
+            "each trend entry must carry self_repair_burn_share"
+        )
+    # 4 repair attempts / 20 LLM calls = 0.2
+    assert trend[-1][SELF_REPAIR_BURN_SHARE_KEY] == pytest.approx(0.2, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_token_weighted(db_session):
+    """self_repair_burn_share uses token-cost ratio when repair token data is present.
+
+    repair_token_count / total_token_count where repair_token_count =
+    format_repair_input_tokens + format_repair_output_tokens.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with 2000 input + 500 output total tokens; 100 input + 50 output repair tokens.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 10}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 500,
+            "llm_call_count": 10,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 1,
+            "format_repair_attempts": 2,
+            "format_repair_successes": 1,
+            "format_repair_infra_failures": 0,
+            "format_repair_input_tokens": 100,
+            "format_repair_output_tokens": 50,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    attr = snap.get("llm_cost_attribution")
+    assert attr is not None
+    assert SELF_REPAIR_BURN_SHARE_KEY in attr
+    # Token-based: (100 + 50) / (2000 + 500) = 150 / 2500 = 0.06
+    assert attr[SELF_REPAIR_BURN_SHARE_KEY] == pytest.approx(0.06, abs=1e-4)
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_fallback_to_call_count(db_session):
+    """self_repair_burn_share falls back to call-count ratio for pre-token-tracking tasks.
+
+    When format_compliance_summary lacks format_repair_input_tokens, the formula
+    is repair_attempts / total_llm_call_count (the original formula).
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task without repair token fields (pre-dates the feature).
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 11}],
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 1000,
+            "llm_call_count": 20,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 1,
+            "format_repair_attempts": 4,
+            "format_repair_successes": 3,
+            "format_repair_infra_failures": 0,
+            # No format_repair_input_tokens / format_repair_output_tokens
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    attr = snap.get("llm_cost_attribution")
+    assert attr is not None
+    assert SELF_REPAIR_BURN_SHARE_KEY in attr
+    # Fallback: 4 repair attempts / 20 LLM calls = 0.2
+    assert attr[SELF_REPAIR_BURN_SHARE_KEY] == pytest.approx(0.2, abs=1e-6)
+
+
+# ── _extract_ts_template_literal_length tests ────────────────────────────────
+
+
+def test_extract_ts_template_literal_length_basic():
+    """Returns correct char count for a simple template literal."""
+    src = "const HELLO = `hello world`;"
+    result = _extract_ts_template_literal_length(src, "HELLO")
+    assert result == len("hello world")
+
+
+def test_extract_ts_template_literal_length_multiline():
+    """Counts newlines and all chars within the literal."""
+    body = "line one\nline two\nline three"
+    src = f"const MULTI = `{body}`;"
+    result = _extract_ts_template_literal_length(src, "MULTI")
+    assert result == len(body)
+
+
+def test_extract_ts_template_literal_length_escaped_backtick():
+    """Escaped backticks inside the literal do not terminate the scan early."""
+    body = r"prefix \` suffix"
+    src = f"const ESCAPED = `{body}`;"
+    result = _extract_ts_template_literal_length(src, "ESCAPED")
+    assert result == len(body)
+
+
+def test_extract_ts_template_literal_length_missing_const_returns_none():
+    """Returns None when the named constant is not present in the source."""
+    src = "const OTHER = `some content`;"
+    result = _extract_ts_template_literal_length(src, "MISSING_NAME")
+    assert result is None
+
+
+def test_extract_ts_template_literal_length_unterminated_returns_none():
+    """Returns None when the template literal has no closing backtick."""
+    src = "const OPEN = `no closing backtick"
+    result = _extract_ts_template_literal_length(src, "OPEN")
+    assert result is None
+
+
+# ── _compute_prompt_static_bytes tests ───────────────────────────────────────
+
+
+def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
+    """When all _PROMPT_STATIC_CONST_NAMES are found in prompt.ts the result
+    is a positive integer equal to the sum of their body lengths."""
+    from unittest.mock import mock_open, patch
+
+    # Build a synthetic prompt.ts that defines every required constant.
+    bodies = {name: f"body of {name} " * 5 for name in _PROMPT_STATIC_CONST_NAMES}
+    synthetic_src = "\n".join(
+        f"const {name} = `{body}`;" for name, body in bodies.items()
+    )
+    expected_total = sum(len(b) for b in bodies.values())
+
+    import app.efficiency_snapshot as es_mod
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", return_value=True),
+        patch("builtins.open", mock_open(read_data=synthetic_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result == expected_total
+    assert result > 0
+
+
+def test_compute_prompt_static_bytes_missing_constant_returns_none():
+    """Returns None when any one of _PROMPT_STATIC_CONST_NAMES is absent."""
+    from unittest.mock import mock_open, patch
+
+    # Omit the last constant from the synthetic source.
+    present_names = _PROMPT_STATIC_CONST_NAMES[:-1]
+    synthetic_src = "\n".join(
+        f"const {name} = `body of {name}`;" for name in present_names
+    )
+
+    import app.efficiency_snapshot as es_mod
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", return_value=True),
+        patch("builtins.open", mock_open(read_data=synthetic_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result is None
+
+
+def test_compute_prompt_static_bytes_no_agent_src_returns_none():
+    """Returns None when _find_agent_src cannot locate the agent/src directory."""
+    from unittest.mock import patch
+
+    import app.efficiency_snapshot as es_mod
+
+    with patch.object(es_mod, "_find_agent_src", return_value=None):
+        result = _compute_prompt_static_bytes()
+
+    assert result is None
+
+
+# ── self_repair_burn_share suppression test ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_zero_clean_attempts_suppresses_drift(db_session):
+    """When all repair attempts are infra failures, clean_attempts=0 falls below
+    SELF_REPAIR_MIN_ATTEMPTS so drift_pct on self_repair_success_rate is None."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed a baseline snapshot first.
+    task_first = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 20}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 10,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 2,
+            "format_repair_attempts": 2,
+            "format_repair_successes": 1,
+            "format_repair_infra_failures": 0,
+        },
+    )
+    db_session.add(task_first)
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    # Now add a second task where ALL repair attempts are infra failures
+    # → clean_attempts = 0 < SELF_REPAIR_MIN_ATTEMPTS → drift_pct suppressed.
+    task_second = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "pr_number": 21}],
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 200,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 3,
+            "format_repair_attempts": 3,
+            "format_repair_successes": 0,
+            "format_repair_infra_failures": 3,  # all infra failures → clean=0
+        },
+    )
+    db_session.add(task_second)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    sr_axis = drift.get("format_compliance", {}).get(SELF_REPAIR_SUCCESS_RATE_KEY, {})
+    # clean_attempts = repair_attempts - infra_failures = 3 - 3 = 0 < SELF_REPAIR_MIN_ATTEMPTS
+    # → drift suppressed
+    assert sr_axis.get("drift_pct") is None

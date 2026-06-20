@@ -3342,7 +3342,9 @@ async def repair_state(
         all_children = (
             (
                 await session.execute(
-                    select(Task).where(Task.parent_task_id.in_(parent_ids))
+                    select(Task)
+                    .where(Task.parent_task_id.in_(parent_ids))
+                    .limit(5000)
                 )
             )
             .scalars()

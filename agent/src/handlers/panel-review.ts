@@ -44,6 +44,7 @@ import {
 } from '../prompts/review-prompt.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { downloadViewportShots } from '../utils/viewport-shot-download.js';
+import { recordViewportScreenshotDownload } from '../telemetry.js';
 
 export const PANEL_REVIEW_LENSES = [
   {
@@ -455,6 +456,7 @@ export async function handlePanelReview(
     });
     if (downloadedShotPaths.length > 0) {
       sendLog(ws, `[VIEWPORT] Downloaded ${downloadedShotPaths.length} screenshot(s) for panel review\n`);
+      recordViewportScreenshotDownload(downloadedShotPaths.length);
     }
   }
   // Prompt section listing the downloaded PNGs so each lens can Read them when

@@ -28,7 +28,6 @@ vi.mock('../index.js', async (importOriginal) => {
     readHandlerOutput: vi.fn(),
     validateBranchName: vi.fn((b: string, _label: string) => b),
     git: vi.fn().mockReturnValue(''),
-    gitCommit: vi.fn().mockReturnValue(true),
     setupWorkspace: vi.fn().mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' }),
     runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
     sendHeartbeatSync: vi.fn(),
@@ -708,6 +707,88 @@ describe('pre-implementation analysis note', () => {
     // Header appears exactly once (no duplicate prefix when the stored plan already includes it).
     expect(prompt.match(/## Pre-Implementation Analysis/g) ?? []).toHaveLength(1);
     expect(prompt).toContain('Module X imports Y.');
+  });
+
+  it('caps oversized pre-implementation analysis context injection on fresh-analysis path', async () => {
+    const { sendLog } = await import('../index.js');
+    vi.clearAllMocks();
+    const underCapSentinel = 'UNDER_CAP_SENTINEL';
+    const overCapSentinel = 'OVER_CAP_SENTINEL';
+    // Build a string that exceeds 32000 chars; place sentinel past the cap
+    const analysisResult = underCapSentinel + 'x'.repeat(32000) + overCapSentinel;
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: '', lastResultText: analysisResult,
+    });
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('## Pre-Implementation Analysis');
+    expect(prompt).toContain('[Analysis truncated at 32000 chars');
+    expect(prompt).not.toContain(overCapSentinel);
+    expectCalledWith(sendLog, null, expect.stringContaining('WARNING: analysis result'));
+  });
+
+  it('does not truncate or warn for sub-cap analysis on fresh-analysis path', async () => {
+    const { sendLog } = await import('../index.js');
+    vi.clearAllMocks();
+    const analysisResult = 'Short analysis within cap.';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: '', lastResultText: analysisResult,
+    });
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain(analysisResult);
+    expect(prompt).not.toContain('[Analysis truncated');
+    const warnCalls = vi.mocked(sendLog).mock.calls.filter(
+      ([, msg]) => typeof msg === 'string' && msg.includes('WARNING: analysis result'),
+    );
+    expect(warnCalls).toHaveLength(0);
+  });
+
+  it('caps oversized _previous_analysis_plan on the reuse path', async () => {
+    const { sendLog } = await import('../index.js');
+    vi.clearAllMocks();
+    const underCapSentinel = 'UNDER_CAP_SENTINEL';
+    const overCapSentinel = 'OVER_CAP_SENTINEL';
+    // Build a stored plan that exceeds 32000 chars; sentinel past the cap should be excluded.
+    const priorPlan = underCapSentinel + 'x'.repeat(32000) + overCapSentinel;
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium', _previous_analysis_plan: priorPlan },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // Reuse path must NOT fire the analysis Claude Code call.
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('## Pre-Implementation Analysis');
+    expect(prompt).toContain('[Analysis truncated at 32000 chars');
+    expect(prompt).not.toContain(overCapSentinel);
+    expectCalledWith(sendLog, null, expect.stringContaining('WARNING: analysis result'));
+  });
+
+  it('does not truncate or warn when _previous_analysis_plan is within cap on reuse path', async () => {
+    const { sendLog } = await import('../index.js');
+    vi.clearAllMocks();
+    const priorPlan = 'Short stored plan within cap.';
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium', _previous_analysis_plan: priorPlan },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // Reuse path must NOT fire the analysis Claude Code call.
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const prompt = capturedPrompt();
+    expect(prompt).toContain(priorPlan);
+    expect(prompt).not.toContain('[Analysis truncated');
+    const warnCalls = vi.mocked(sendLog).mock.calls.filter(
+      ([, msg]) => typeof msg === 'string' && msg.includes('WARNING: analysis result'),
+    );
+    expect(warnCalls).toHaveLength(0);
   });
 });
 

@@ -783,220 +783,6 @@ async def test_sr_blind_spots_example_task_id_matches_source_task(
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_blind_spot_themes_stamps_design_doc(db_session):
-    """compute_sr_blind_spot_themes stamps sr_blind_spot_signal_last_computed_at."""
-    from app.sr_blind_spots import compute_sr_blind_spot_themes
-
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    assert (project.design_doc or {}).get(
-        "sr_blind_spot_signal_last_computed_at"
-    ) is None
-
-    fixed_now = _utcnow().replace(microsecond=0)
-    await compute_sr_blind_spot_themes(db_session, project.id, now=fixed_now)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    assert (
-        project.design_doc["sr_blind_spot_signal_last_computed_at"]
-        == fixed_now.isoformat()
-    )
-
-
-def _make_rr_task(project_id, *, sr_passed, test_attempts, task_type="create"):
-    """Build a Task-like object with SR regression_risk + fix_loop_history.test."""
-    check_results: dict = {}
-    if sr_passed is not None:
-        check_results["regression_risk"] = {"passed": sr_passed}
-    history: dict = {}
-    if test_attempts is not None:
-        history["test"] = test_attempts
-    return make_task(
-        project_id=project_id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": task_type, "prompt": "x"}],
-        context={"_self_review_outcome": {"check_results": check_results}},
-        fix_loop_history=history,
-    )
-
-
-def test_aggregate_sr_regression_risk_test_signal_below_min_sample_returns_none():
-    """Fewer than _SR_MIN_SAMPLE qualifying tasks → None."""
-    from app.sr_blind_spots import aggregate_sr_regression_risk_test_signal
-    import uuid
-
-    pid = uuid.uuid4()
-    tasks = [_make_rr_task(pid, sr_passed=True, test_attempts=[]) for _ in range(4)]
-    assert aggregate_sr_regression_risk_test_signal(tasks) is None
-
-
-def test_aggregate_sr_regression_risk_test_signal_passed_no_signal_is_not_a_miss():
-    """SR passed + no test loop activity → true-pass, miss_by_test_signal_rate == 0."""
-    from app.sr_blind_spots import aggregate_sr_regression_risk_test_signal
-    import uuid
-
-    pid = uuid.uuid4()
-    tasks = [_make_rr_task(pid, sr_passed=True, test_attempts=[]) for _ in range(5)]
-    result = aggregate_sr_regression_risk_test_signal(tasks)
-    assert result is not None
-    assert result["sr_passed_no_signal"] == 5
-    assert result["sr_passed_with_signal"] == 0
-    assert result["miss_by_test_signal_rate"] == 0.0
-    assert result["numerator"] == 0
-    assert result["denominator"] == 5
-
-
-def test_aggregate_sr_regression_risk_test_signal_passed_with_testfix_counts_as_miss():
-    """SR passed + testFix loop ran ≥1 non-trivial iteration → miss-by-test-signal."""
-    from app.sr_blind_spots import aggregate_sr_regression_risk_test_signal
-    import uuid
-
-    pid = uuid.uuid4()
-    miss_attempts = [
-        {"iteration": 1, "exit_reason": "in_progress"},
-        {"iteration": 2, "exit_reason": "passed"},
-    ]
-    tasks = [
-        _make_rr_task(pid, sr_passed=True, test_attempts=miss_attempts)
-        for _ in range(3)
-    ] + [_make_rr_task(pid, sr_passed=True, test_attempts=[]) for _ in range(2)]
-    result = aggregate_sr_regression_risk_test_signal(tasks)
-    assert result is not None
-    assert result["sr_passed_with_signal"] == 3
-    assert result["sr_passed_no_signal"] == 2
-    assert result["miss_by_test_signal_rate"] == round(3 / 5, 3)
-
-
-def test_aggregate_sr_regression_risk_test_signal_failed_with_signal_counts_as_hit():
-    """SR failed regression_risk + testFix loop ran → hit-by-test-signal (not a miss)."""
-    from app.sr_blind_spots import aggregate_sr_regression_risk_test_signal
-    import uuid
-
-    pid = uuid.uuid4()
-    hit_attempts = [{"iteration": 1, "exit_reason": "divergence_detected"}]
-    tasks = [
-        _make_rr_task(pid, sr_passed=False, test_attempts=hit_attempts)
-        for _ in range(5)
-    ]
-    result = aggregate_sr_regression_risk_test_signal(tasks)
-    assert result is not None
-    assert result["sr_failed_with_signal"] == 5
-    assert result["sr_passed_with_signal"] == 0
-    # No SR-passed tasks → denominator is 0
-    assert result["denominator"] == 0
-    assert result["miss_by_test_signal_rate"] is None
-
-
-def _make_sd_task(project_id, *, sr_passed, expansion_ratio, task_type="create"):
-    """Build a Task-like object with SR scope-drift check + expansion_ratio in context."""
-    ctx = {
-        "_self_review_outcome": {
-            "check_results": {"scope-drift": {"passed": sr_passed}}
-        },
-        "expansion_ratio": expansion_ratio,
-    }
-    return make_task(
-        project_id=project_id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": task_type, "prompt": "x"}],
-        context=ctx,
-    )
-
-
-def test_aggregate_sr_scope_drift_vs_expansion_below_min_sample_returns_none():
-    """Fewer than _SR_MIN_SAMPLE qualifying tasks → None."""
-    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
-    import uuid
-
-    pid = uuid.uuid4()
-    tasks = [_make_sd_task(pid, sr_passed=True, expansion_ratio=1.0) for _ in range(4)]
-    assert aggregate_sr_scope_drift_vs_expansion(tasks) is None
-
-
-def test_aggregate_sr_scope_drift_vs_expansion_consistent_bucket():
-    """SR passed + ratio ≤1.5 → consistent, miss rate == 0."""
-    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
-    import uuid
-
-    pid = uuid.uuid4()
-    tasks = [_make_sd_task(pid, sr_passed=True, expansion_ratio=1.2) for _ in range(5)]
-    result = aggregate_sr_scope_drift_vs_expansion(tasks)
-    assert result is not None
-    assert result["consistent"] == 5
-    assert result["miss_by_expansion"] == 0
-    assert result["miss_by_expansion_rate"] == 0.0
-    assert result["numerator"] == 0
-    assert result["denominator"] == 5
-
-
-def test_aggregate_sr_scope_drift_vs_expansion_miss_bucket():
-    """SR passed + ratio ≥2.0 → miss_by_expansion; rate = misses / (consistent+misses)."""
-    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
-    import uuid
-
-    pid = uuid.uuid4()
-    tasks = [
-        _make_sd_task(pid, sr_passed=True, expansion_ratio=2.5) for _ in range(3)
-    ] + [_make_sd_task(pid, sr_passed=True, expansion_ratio=1.0) for _ in range(2)]
-    result = aggregate_sr_scope_drift_vs_expansion(tasks)
-    assert result is not None
-    assert result["miss_by_expansion"] == 3
-    assert result["consistent"] == 2
-    assert result["miss_by_expansion_rate"] == round(3 / 5, 3)
-
-
-def test_aggregate_sr_scope_drift_vs_expansion_hit_bucket():
-    """SR failed scope-drift + ratio ≥1.5 → hit_by_expansion; denominator is 0."""
-    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
-    import uuid
-
-    pid = uuid.uuid4()
-    tasks = [_make_sd_task(pid, sr_passed=False, expansion_ratio=2.0) for _ in range(5)]
-    result = aggregate_sr_scope_drift_vs_expansion(tasks)
-    assert result is not None
-    assert result["hit_by_expansion"] == 5
-    assert result["miss_by_expansion"] == 0
-    assert result["denominator"] == 0
-    assert result["miss_by_expansion_rate"] is None
-
-
-def test_aggregate_sr_scope_drift_vs_expansion_fp_candidate_bucket():
-    """SR failed scope-drift + ratio ≤1.0 → fp_candidate."""
-    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
-    import uuid
-
-    pid = uuid.uuid4()
-    tasks = [_make_sd_task(pid, sr_passed=False, expansion_ratio=1.0) for _ in range(5)]
-    result = aggregate_sr_scope_drift_vs_expansion(tasks)
-    assert result is not None
-    assert result["fp_candidate"] == 5
-    assert result["hit_by_expansion"] == 0
-    assert result["miss_by_expansion"] == 0
-    assert result["miss_by_expansion_rate"] is None
-
-
-def test_aggregate_sr_scope_drift_vs_expansion_skip_tasks_without_expansion_ratio():
-    """Tasks without expansion_ratio in context are excluded from qualification."""
-    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
-    import uuid
-
-    pid = uuid.uuid4()
-    ctx = {"_self_review_outcome": {"check_results": {"scope-drift": {"passed": True}}}}
-    no_ratio_task = make_task(
-        project_id=pid,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create", "prompt": "x"}],
-        context=ctx,
-    )
-    # 10 tasks but all lack expansion_ratio → fewer than min_sample qualify
-    assert aggregate_sr_scope_drift_vs_expansion([no_ratio_task] * 10) is None
-
-
-@pytest.mark.asyncio
 async def test_prompt_fingerprint_analytics_groups_by_fingerprint(
     client: AsyncClient, db_session
 ):
@@ -1830,7 +1616,11 @@ async def test_sr_reviewer_disagreement_tasks_category_filter(
                     "check_results": {"correctness": {"passed": True}},
                     "blind_spots": [],
                     "reviewer_findings": [
-                        {"category": "correctness", "severity": "HIGH", "description": "x"}
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": "x",
+                        }
                     ],
                 }
             },
@@ -1848,7 +1638,11 @@ async def test_sr_reviewer_disagreement_tasks_category_filter(
                     "check_results": {"security": {"passed": True}},
                     "blind_spots": [],
                     "reviewer_findings": [
-                        {"category": "security", "severity": "CRITICAL", "description": "y"}
+                        {
+                            "category": "security",
+                            "severity": "CRITICAL",
+                            "description": "y",
+                        }
                     ],
                 }
             },
@@ -2878,7 +2672,9 @@ async def test_sr_missed_retrospectives_zero_based_pagination(
 
     ids0 = {item["task_id"] for item in body0["items"]}
     ids1 = {item["task_id"] for item in body1["items"]}
-    assert ids0.isdisjoint(ids1), "page=0 and page=1 must return non-overlapping task sets"
+    assert ids0.isdisjoint(ids1), (
+        "page=0 and page=1 must return non-overlapping task sets"
+    )
 
 
 @pytest.mark.asyncio
@@ -2936,7 +2732,10 @@ async def test_sr_missed_retrospectives_category_counts_stable_across_pages(
                 status=TaskStatus.COMPLETED,
                 payloads=[{"type": "create"}],
                 context={
-                    "_first_attempt_rejection_categories": {"correctness": 1, "architecture": 1},
+                    "_first_attempt_rejection_categories": {
+                        "correctness": 1,
+                        "architecture": 1,
+                    },
                     "_self_review_outcome": {
                         "verdict": "pass",
                         "fixes_applied": False,
@@ -3173,9 +2972,7 @@ async def test_sr_missed_retrospectives_drilldown_fields_present(
 
 
 @pytest.mark.asyncio
-async def test_sr_missed_retrospectives_scope_filter(
-    client: AsyncClient, db_session
-):
+async def test_sr_missed_retrospectives_scope_filter(client: AsyncClient, db_session):
     """?scope=<value> filters items and rolls up total/category_counts honestly."""
     project = make_project()
     db_session.add(project)
@@ -3337,9 +3134,7 @@ async def test_sr_missed_retrospectives_min_severity_filter(
 
 
 @pytest.mark.asyncio
-async def test_sr_unhandled_edges_task_types_returned(
-    client: AsyncClient, db_session
-):
+async def test_sr_unhandled_edges_task_types_returned(client: AsyncClient, db_session):
     """task_types field lists all types in matched set, independent of task_type filter."""
     project = make_project()
     db_session.add(project)
@@ -3357,9 +3152,7 @@ async def test_sr_unhandled_edges_task_types_returned(
                     "_self_review_outcome": {
                         "verdict": "pass",
                         "fixes_applied": False,
-                        "edges_considered": [
-                            {"case": "empty input", "handled": False}
-                        ],
+                        "edges_considered": [{"case": "empty input", "handled": False}],
                         "blind_spots": [],
                     },
                 },
@@ -3428,9 +3221,7 @@ async def test_sr_unhandled_edges_total_not_capped_at_page_size(
 
 
 @pytest.mark.asyncio
-async def test_sr_unhandled_edges_blind_spot_counts(
-    client: AsyncClient, db_session
-):
+async def test_sr_unhandled_edges_blind_spot_counts(client: AsyncClient, db_session):
     """blind_spot_counts aggregates themes with first-6-token normalisation,
     dedupes per task, drops disallowed themes, and remains anchored to the
     days+task_type universe when the blind_spot filter narrows rows."""

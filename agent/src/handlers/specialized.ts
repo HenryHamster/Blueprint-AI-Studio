@@ -1003,6 +1003,21 @@ Return ONLY the JSON object for /tmp/investigation_report_${taskId}.json with to
       effort,
       disallowedTools,
       retryStatus: 'Repairing investigation report JSON...',
+      // Enforce the full 6-field contract here so recordFormatRepairSuccess only
+      // fires when the caller will actually accept the value (not merely when the
+      // two extractor keys root_cause + recommended_fix happen to parse).
+      validateParsedValue: (value) => {
+        const obj = value as Record<string, unknown>;
+        const missingFields = requiredFields.filter(k => !(k in obj));
+        if (missingFields.length > 0) {
+          return {
+            ok: false,
+            reason: 'parsed_object_missing_key',
+            detail: `missing required fields: ${missingFields.join(', ')}`,
+          };
+        }
+        return { ok: true };
+      },
     });
     const repairedValue = repaired.value;
     if (repairedValue !== null && requiredFields.every(k => k in repairedValue)) {

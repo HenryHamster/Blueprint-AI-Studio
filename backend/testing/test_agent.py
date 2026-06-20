@@ -17742,6 +17742,93 @@ async def test_heartbeat_backward_compat_no_by_schema(client: AsyncClient, db_se
     assert summary["format_repair_successes_by_schema"] == {}
 
 
+@pytest.mark.asyncio
+async def test_heartbeat_persists_infra_failure_fields(client: AsyncClient, db_session):
+    """Heartbeat carrying format_repair_infra_failures and
+    format_repair_infra_failures_by_schema persists both into
+    Task.format_compliance_summary."""
+    project = Project(name="Infra Failure Fields", user_id="test-user-infra")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-infra-fail",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-infra-fail")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "format_error_total": 3,
+            "format_repair_attempts": 5,
+            "format_repair_successes": 2,
+            "format_repair_infra_failures": 2,
+            "format_repair_infra_failures_by_schema": {"ResearchPlan": 1, "Verdict": 1},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.format_compliance_summary
+    assert summary is not None
+    assert summary["format_repair_attempts"] == 5
+    assert summary["format_repair_successes"] == 2
+    assert summary["format_repair_infra_failures"] == 2
+    assert summary["format_repair_infra_failures_by_schema"] == {
+        "ResearchPlan": 1,
+        "Verdict": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_only_infra_fields_triggers_persistence(
+    client: AsyncClient, db_session
+):
+    """A heartbeat carrying ONLY the two new infra-failure fields (no legacy fields)
+    still triggers format_compliance_summary persistence — the guard was extended."""
+    project = Project(name="Infra Only Fields", user_id="test-user-infra-only")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-infra-only",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.format_compliance_summary is None
+
+    token = create_agent_token(str(task.id), "agent-vm-infra-only")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "format_repair_infra_failures": 3,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.format_compliance_summary
+    assert summary is not None
+    assert summary["format_repair_infra_failures"] == 3
+    assert summary["format_repair_infra_failures_by_schema"] == {}
+
+
 # ===========================================================================
 # Release-qualifier finalization from EVERY terminal path (automain/LTS)
 #

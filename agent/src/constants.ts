@@ -297,6 +297,12 @@ export const GREENFIELD_SOURCE_FILE_THRESHOLD = 8;
 // implementation budget on a task that will hit SCOPE_OVERFLOW_THRESHOLDS.
 export const MEDIUM_ANALYSIS_PLAN_FILE_LIMIT = 10;
 
+// Maximum characters of analysis text injected into the implementation prompt.
+// Prevents unbounded growth from large pre-implementation analysis results.
+// When truncation fires, a clearly-marked notice is appended and a warning is
+// sent via sendLog so the agent knows the plan was cut.
+export const ANALYSIS_CONTEXT_CHAR_CAP = 32_000;
+
 // Mid-stream stall detection: if a tool_use event is in-flight for longer
 // than this WITHOUT EMITTING ANY SUB-PROGRESS (no further stream-json event of
 // any kind under it — including nested sub-agent assistant/tool/result events),

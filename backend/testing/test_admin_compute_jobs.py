@@ -7,6 +7,7 @@ test seeds the role it exercises.
 """
 
 import uuid
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -109,7 +110,10 @@ async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
     assert jobs[0]["id"] == str(job.id)
     assert jobs[0]["task_title"] == "compute_experiment task"
     assert jobs[0]["task_type"] == "compute_experiment"
-    assert jobs[0]["result_reference"] == "https://storage.example.com/jobs/job-1/result.json"
+    assert (
+        jobs[0]["result_reference"]
+        == "https://storage.example.com/jobs/job-1/result.json"
+    )
     # A job with only a raw result_reference and no linked Artifact must expose
     # the descriptor explicitly as null so operators can tell the two apart.
     assert jobs[0]["artifact"] is None
@@ -117,14 +121,14 @@ async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_list_compute_jobs_paginates_newest_first(client: AsyncClient, db_session):
+async def test_list_compute_jobs_paginates_newest_first(
+    client: AsyncClient, db_session
+):
     project = await _make_project(db_session, name="Paged")
     await _add_member(db_session, project.id, "viewer")
     _task_1, job_1, _artifact_1 = await _make_job(db_session, project, title="job 1")
     _task_2, job_2, _artifact_2 = await _make_job(db_session, project, title="job 2")
-    _task_3, _job_3, _artifact_3 = await _make_job(
-        db_session, project, title="job 3"
-    )
+    _task_3, _job_3, _artifact_3 = await _make_job(db_session, project, title="job 3")
 
     resp = await client.get(
         f"/api/admin/projects/{project.id}/compute-jobs?limit=2&offset=1"
@@ -279,7 +283,9 @@ async def test_kill_compute_job_missing_404(client: AsyncClient, db_session):
 async def test_kill_already_terminal_returns_409(client: AsyncClient, db_session):
     project = await _make_project(db_session, name="Already Done")
     await _add_member(db_session, project.id, "member")
-    _task, job, _artifact = await _make_job(db_session, project, status=ComputeJobStatus.SUCCEEDED)
+    _task, job, _artifact = await _make_job(
+        db_session, project, status=ComputeJobStatus.SUCCEEDED
+    )
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
     assert resp.status_code == 409
@@ -312,7 +318,9 @@ async def _make_job_with_polling_metadata(session, project, polling_metadata):
 
 
 @pytest.mark.asyncio
-async def test_list_compute_jobs_redacts_launch_secrets(client: AsyncClient, db_session):
+async def test_list_compute_jobs_redacts_launch_secrets(
+    client: AsyncClient, db_session
+):
     """Operator list must not expose raw env values, command, or cwd, but must
     preserve operator-useful keys like live_release_evidence, result_metrics,
     and compute_rpc_diagnostic."""
@@ -324,7 +332,10 @@ async def test_list_compute_jobs_redacts_launch_secrets(client: AsyncClient, db_
         {
             "command": ["python3", "run_experiment.py"],
             "cwd": "/workspace",
-            "env": {"SECRET_TOKEN": "super-secret-value", "ANOTHER_VAR": "another-secret"},
+            "env": {
+                "SECRET_TOKEN": "super-secret-value",
+                "ANOTHER_VAR": "another-secret",
+            },
             "live_release_evidence": {"version": "v8", "metrics": {"cpm": 1.23}},
             "result_metrics": {"accuracy": 0.95},
             "compute_rpc_diagnostic": {"operation": "poll", "error_message": "timeout"},
@@ -427,7 +438,6 @@ async def test_kill_peer_terminal_returns_final_state(client: AsyncClient, db_se
     assert body["outcome"] == ComputeJobOutcome.CANCELLED.value
 
 
-
 _SENSITIVE_POLLING_METADATA = {
     "env": {"SECRET_KEY": "mysecret", "DATABASE_URL": "postgres://..."},
     "command": "python3 run_experiment.py --flag",
@@ -479,6 +489,81 @@ async def test_kill_compute_job_strips_sensitive_polling_metadata(
     assert "cwd" not in metadata
     # Non-sensitive fields survive (result_metrics is not mutated by the kill path)
     assert metadata.get("result_metrics") == {"accuracy": 0.95}
+
+
+# ---------------------------------------------------------------------------
+# Success criterion / verdict serialization tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_includes_success_criterion_and_verdict(
+    client: AsyncClient, db_session
+):
+    """The list endpoint augments each job with the declared success criterion
+    from its task payload and the evaluated verdict from plan_output."""
+    project = await _make_project(db_session, name="Criterion Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    criterion = {"metric": "accuracy", "operator": ">=", "threshold": 0.9}
+    verdict = {
+        "metric": "accuracy",
+        "operator": ">=",
+        "threshold": 0.9,
+        "value": 0.95,
+        "met": True,
+        "measurable": True,
+    }
+    task = Task(
+        project_id=project.id,
+        title="criterion task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "success_criterion": criterion}],
+        plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": verdict}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        accrued_cost_usd=1.0,
+        completed_at=datetime.utcnow(),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert len(jobs) == 1
+
+    assert jobs[0]["success_criterion"] == criterion
+    assert jobs[0]["criterion_verdict"] == verdict
+    assert jobs[0]["criterion_verdict"]["met"] is True
+    assert jobs[0]["criterion_verdict"]["value"] == 0.95
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_no_criterion_returns_null(
+    client: AsyncClient, db_session
+):
+    """When the task has no declared success_criterion, both fields are null."""
+    project = await _make_project(db_session, name="No Criterion Project")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job, _artifact = await _make_job(db_session, project)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert len(jobs) == 1
+    assert jobs[0]["success_criterion"] is None
+    assert jobs[0]["criterion_verdict"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +652,9 @@ async def test_analyze_compute_job_nonterminal_returns_409(
 ):
     project = await _make_project(db_session, name="Analyze Running")
     await _add_member(db_session, project.id, "member")
-    _task, job, _artifact = await _make_job(db_session, project, status=ComputeJobStatus.RUNNING)
+    _task, job, _artifact = await _make_job(
+        db_session, project, status=ComputeJobStatus.RUNNING
+    )
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/analyze")
     assert resp.status_code == 409

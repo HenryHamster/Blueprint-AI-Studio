@@ -1,7 +1,7 @@
 // Issue-string deduplication helpers extracted from review-fix.ts.
 // These are pure functions with no I/O dependencies.
 
-export type ReviewHistoryIssue = { severity: string; description: string; file?: string; line?: number };
+type ReviewHistoryIssue = { severity: string; description: string; file?: string; line?: number };
 export type ReviewHistoryEntry = {
   iteration: number;
   feedback: string;
@@ -12,7 +12,7 @@ export type ReviewHistoryEntry = {
 export type AnnotatedIssue = ReviewHistoryIssue & { resolvedInIteration?: number };
 export type AnnotatedEntry = { iteration: number; feedback: string; issues?: AnnotatedIssue[] };
 
-export function fmtIssueLoc(i: { file?: string; line?: number }): string {
+function fmtIssueLoc(i: { file?: string; line?: number }): string {
   if (i.file && typeof i.line === 'number') return ` [${i.file}:${i.line}]`;
   if (i.file) return ` [${i.file}]`;
   return '';

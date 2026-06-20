@@ -316,6 +316,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
           refreshError={versionLifecycleError}
           lastSuccessfulRefreshAt={versionLifecycleLastSuccessAt}
           refreshing={versionLifecycleRefreshing}
+          agentServingShas={agentServingShas}
         />
       )}
 

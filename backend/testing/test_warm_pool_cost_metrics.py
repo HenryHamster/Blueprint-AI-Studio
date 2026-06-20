@@ -18,7 +18,7 @@ from app.efficiency_snapshot import (
     settle_pool_vm_idle_cost,
 )
 from app.models import PoolVm, PoolVmState, Project, _utcnow
-from app.vm_cost_rates import get_fleet_vm_rate_per_second
+from app.vm_cost_rates import fleet_provisioning_is_spot, get_vm_rate_per_second
 from app.warm_backlog_reuse import (
     get_pool_funnel_snapshot,
     record_pool_cold_dispatch,
@@ -266,7 +266,7 @@ async def test_compute_pool_idle_cost_banked_plus_live(db_session):
     RETIRING member is excluded from size but its banked cost still sums."""
     project = await _make_project(db_session)
     now = _utcnow()
-    rate = get_fleet_vm_rate_per_second()
+    rate = get_vm_rate_per_second(spot=fleet_provisioning_is_spot())
 
     # IDLE for 600s, nothing banked yet → live accrual only.
     idle = PoolVm(
@@ -298,9 +298,7 @@ async def test_compute_pool_idle_cost_banked_plus_live(db_session):
     assert result["idle_count"] == 1
     assert result["settled_idle_cost_usd"] == pytest.approx(0.07, abs=1e-6)
     assert result["live_idle_cost_usd"] == pytest.approx(600 * rate, rel=1e-3)
-    assert result["total_idle_cost_usd"] == pytest.approx(
-        0.07 + 600 * rate, rel=1e-3
-    )
+    assert result["total_idle_cost_usd"] == pytest.approx(0.07 + 600 * rate, rel=1e-3)
 
 
 @pytest.mark.asyncio
@@ -318,7 +316,7 @@ async def test_settle_pool_vm_idle_cost_banks_and_advances(db_session):
     await db_session.commit()
 
     banked = settle_pool_vm_idle_cost(member, now=now)
-    rate = get_fleet_vm_rate_per_second()
+    rate = get_vm_rate_per_second(spot=fleet_provisioning_is_spot())
     assert banked == pytest.approx(300 * rate, rel=1e-3)
     assert member.idle_cost_banked == pytest.approx(300 * rate, rel=1e-3)
     # idle_since advanced to now → a second settle at the same instant is a no-op.
@@ -332,7 +330,7 @@ async def test_settle_adds_onto_existing_banked_cost(db_session):
     already banked cost from a prior idle stint), never overwriting it."""
     project = await _make_project(db_session)
     now = _utcnow()
-    rate = get_fleet_vm_rate_per_second()
+    rate = get_vm_rate_per_second(spot=fleet_provisioning_is_spot())
     prior = 0.05
     member = PoolVm(
         vm_instance_id="vm-settle-add",
@@ -394,7 +392,7 @@ async def test_lease_banks_accrued_idle_cost(db_session):
         model="claude-opus-4-8",
     )
     await db_session.commit()
-    rate = get_fleet_vm_rate_per_second()
+    rate = get_vm_rate_per_second(spot=fleet_provisioning_is_spot())
     assert leased is not None
     assert leased.state == PoolVmState.LEASED
     assert leased.idle_since is None
@@ -420,7 +418,7 @@ async def test_mark_retiring_banks_accrued_idle_cost(db_session):
 
     retired = await mark_pool_vm_retiring(db_session, "vm-retiring-bank")
     await db_session.commit()
-    rate = get_fleet_vm_rate_per_second()
+    rate = get_vm_rate_per_second(spot=fleet_provisioning_is_spot())
     assert retired is not None
     assert retired.state == PoolVmState.RETIRING
     assert retired.idle_since is None
@@ -515,7 +513,7 @@ async def test_compute_pool_idle_cost_by_account(db_session):
     drive cost. A member with no account_id buckets under 'unattributed'."""
     project = await _make_project(db_session)
     now = _utcnow()
-    rate = get_fleet_vm_rate_per_second()
+    rate = get_vm_rate_per_second(spot=fleet_provisioning_is_spot())
 
     # acct-a: one IDLE member accruing live, one LEASED with banked cost.
     db_session.add_all(

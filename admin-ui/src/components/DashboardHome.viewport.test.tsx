@@ -199,7 +199,6 @@ vi.mock('../api', () => ({
   authHeaders: vi.fn(async () => ({})),
   fetchTask: vi.fn(async () => ({})),
   fetchTaskSerialConsole: vi.fn(async () => ({ available: false })),
-  fetchAutonomyDebug: vi.fn(async () => ({})),
   resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/artifacts/test.json'),
   fetchRetirementCritiques: vi.fn(async () => ({ critiques: [] })),
   fetchResearchActionability: vi.fn(async () => ({
@@ -207,7 +206,6 @@ vi.mock('../api', () => ({
     summary: null,
   })),
   fetchSrMissedRetrospectives: vi.fn(async () => ({ items: [], total: 0 })),
-  fetchSrRecentMisses: vi.fn(async () => ({ items: [] })),
   fetchSrUnhandledEdgesRetrospectives: vi.fn(async () => ({ items: [], total: 0 })),
   fetchSrCatchRateHealth: vi.fn(async () => ({
     status: 'healthy',

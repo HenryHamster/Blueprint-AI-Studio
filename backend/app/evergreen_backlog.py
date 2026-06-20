@@ -312,25 +312,6 @@ def _reset_observability_for_tests() -> None:
     _OBSERVABILITY = _FillObservability()
 
 
-async def _persist_fill_decision(
-    session, decision: FillDecision, *, project_id: str | None = None
-) -> None:
-    """Write one EvergreenFillDecisionLog row for durable observability.
-
-    Called from check_evergreen_fill() after record_decision() — the caller
-    commits the session so this row lands in the same transaction as any probe
-    spawn, or in the next periodic commit if no spawn occurred.
-    """
-    row = EvergreenFillDecisionLog(
-        id=uuid.uuid4(),
-        project_id=uuid.UUID(project_id) if project_id else None,
-        action=decision.action,
-        reason=decision.reason,
-        trigger=decision.trigger,
-    )
-    session.add(row)
-
-
 async def get_fill_observability_from_db(
     session, *, window_hours: int = 24
 ) -> Dict[str, Any]:

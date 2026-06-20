@@ -3,7 +3,6 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { SearchFilterBar } from './SearchFilterBar';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
-import { FILTER_TASK_TYPE_OPTIONS } from '../taskCapabilities';
 
 describe('SearchFilterBar — viewport regression', () => {
   let root: Root | null = null;
@@ -97,7 +96,7 @@ describe('SearchFilterBar — viewport regression', () => {
           <SearchFilterBar
             searchQuery="test"
             onSearchChange={() => {}}
-            taskTypeFilter={FILTER_TASK_TYPE_OPTIONS.slice(0, 3).map(o => o.value)}
+            taskTypeFilter={['create', 'review', 'panel_review']}
             onTypeFilterChange={() => {}}
             dateRange="24h"
             onDateRangeChange={() => {}}

@@ -1,6 +1,6 @@
 import { CheckCircle, Circle } from 'lucide-react';
 import type { Project, OnboardingProof } from '../types/project';
-import { formatAbsolute, formatDurationMs, parseTimestamp } from '../utils/time';
+import { formatAbsolute, formatDurationMs, parseTimestamp, staleFrontierWarning } from '../utils/time';
 import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 
 interface Props {
@@ -92,11 +92,45 @@ export function OnboardingProofPanel({ project }: Props) {
   const timeToMerge = elapsed(proof.first_pr_merged_at);
   const showDora = timeToImprovement != null || timeToMerge != null;
 
+  // Detect stalled frontier: ordered milestone timestamps, find first pending.
+  const orderedTimestamps = [
+    proof.repo_added_at,
+    proof.bootstrap_completed_at,
+    proof.first_task_spawned_at,
+    proof.first_pr_opened_at,
+    proof.first_merge_gate_verdict_at,
+    proof.first_pr_merged_at,
+    proof.first_autonomous_improvement_at,
+  ];
+  const firstPendingIdx = orderedTimestamps.findIndex((ts) => !ts);
+  const isJourneyComplete = firstPendingIdx === -1;
+  let stallWarning: { stalled: boolean; pendingFor: string } | null = null;
+  if (!isJourneyComplete && firstPendingIdx > 0) {
+    const completedMs = orderedTimestamps
+      .slice(0, firstPendingIdx)
+      .map((ts) => parseTimestamp(ts!).getTime());
+    const stepDurationsMs: number[] = [];
+    for (let i = 1; i < completedMs.length; i++) {
+      stepDurationsMs.push(completedMs[i] - completedMs[i - 1]);
+    }
+    stallWarning = staleFrontierWarning(completedMs[completedMs.length - 1], stepDurationsMs);
+  }
+
+  const failedTaskCount = project.task_status_counts?.failed ?? 0;
+
   return (
     <div className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950/60 p-3">
       <div className="text-[11px] font-bold text-neutral-300 uppercase tracking-widest mb-2">
         Onboarding proof — {repoSlug}
       </div>
+      {stallWarning?.stalled && (
+        <div className="mb-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 px-2.5 py-1.5">
+          <span className="text-[11px] font-semibold text-amber-400">
+            Journey stalled — pending for {stallWarning.pendingFor}
+            {failedTaskCount > 0 && ` (${failedTaskCount} failed ${failedTaskCount === 1 ? 'task' : 'tasks'})`}
+          </span>
+        </div>
+      )}
       {showDora && (
         <div className="mb-2.5 rounded-lg bg-neutral-900/60 border border-neutral-800 px-2.5 py-1.5 space-y-0.5">
           {timeToImprovement != null && (

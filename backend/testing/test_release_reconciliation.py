@@ -4082,6 +4082,96 @@ async def test_agent_image_indeterminate_no_fleet_reported_stays_unconfirmed(
     assert artifact.reason_code is None
 
 
+@pytest.mark.agent_image_gate
+@pytest.mark.asyncio
+async def test_agent_image_indeterminate_paths_emit_structured_log(
+    db_session, mocker, caplog
+):
+    """The three indeterminate return paths each emit a structured log message
+    identifying path=base_sha_unobservable, path=rebake_lookup_indeterminate,
+    or path=fleet_not_yet_serving, plus version_id and promoted_sha."""
+    import logging
+
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+
+    promoted_at = _utcnow()
+
+    async def _run_check(
+        version, rebake_return, fleet_return=False, *, no_deploy_state=False
+    ):
+        mocker.patch(
+            "app.github_refs.agent_image_rebake_expected",
+            new=AsyncMock(return_value=rebake_return),
+        )
+        mocker.patch(
+            "app.compute.fleet_serving_source_sha",
+            new=AsyncMock(return_value=fleet_return),
+        )
+        if not no_deploy_state:
+            await _set_deploy_state(
+                db_session,
+                status=DeploymentStatus.STABLE,
+                current_sha=_SHA_A,
+                prior_deploy_sha=_SHA_B,
+                deployed_at=promoted_at + timedelta(minutes=5),
+            )
+        await _confirm_serving_or_fail(
+            version.id,
+            session_factory=_shared_session_factory(db_session),
+            now=promoted_at + timedelta(minutes=20),
+        )
+
+    deadline = promoted_at + timedelta(hours=1)
+
+    # --- path: base_sha_unobservable (no deploy state → no base_sha) ---
+    _project1, version1 = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    with caplog.at_level(logging.INFO, logger="app.release_artifacts"):
+        await _run_check(version1, rebake_return=True, no_deploy_state=True)
+    assert any(
+        "base_sha_unobservable" in r.message
+        and str(version1.id) in r.message
+        and version1.promoted_sha in r.message
+        for r in caplog.records
+    ), f"Expected base_sha_unobservable log; got: {[r.message for r in caplog.records]}"
+
+    caplog.clear()
+
+    # --- path: rebake_lookup_indeterminate (rebake returns None) ---
+    _project2, version2 = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    with caplog.at_level(logging.INFO, logger="app.release_artifacts"):
+        await _run_check(version2, rebake_return=None)
+    assert any(
+        "rebake_lookup_indeterminate" in r.message
+        and str(version2.id) in r.message
+        and version2.promoted_sha in r.message
+        for r in caplog.records
+    ), (
+        f"Expected rebake_lookup_indeterminate log; got: {[r.message for r in caplog.records]}"
+    )
+
+    caplog.clear()
+
+    # --- path: fleet_not_yet_serving (rebake=True but fleet returns False) ---
+    _project3, version3 = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    with caplog.at_level(logging.INFO, logger="app.release_artifacts"):
+        await _run_check(version3, rebake_return=True, fleet_return=False)
+    assert any(
+        "fleet_not_yet_serving" in r.message
+        and str(version3.id) in r.message
+        and version3.promoted_sha in r.message
+        for r in caplog.records
+    ), f"Expected fleet_not_yet_serving log; got: {[r.message for r in caplog.records]}"
+
+
 @pytest.mark.asyncio
 async def test_self_repo_promotion_creates_both_serving_artifacts(db_session):
     """A deploy-identity promotion opens the multi-artifact serving window: the

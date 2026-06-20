@@ -3099,4 +3099,153 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.queryByTestId('historical-audit-context')).not.toBeInTheDocument();
     });
   });
+
+  describe('agent_image fleet match annotation', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    function makeAgentServingShas(buckets: Partial<api.AgentServingShaBucket>[]): api.AgentServingShasResponse {
+      return {
+        fleet: {
+          total_observed: buckets.reduce((s, b) => s + (b.count ?? 0), 0),
+          unknown_count: 0,
+          mixed: false,
+          buckets: buckets.map((b) => ({
+            source_sha: b.source_sha ?? 'sha-a',
+            count: b.count ?? 1,
+            warm_pool_count: 0,
+            task_vm_count: 0,
+            image_names: [],
+            latest_build_ts: null,
+            last_heartbeat_at: null,
+            matches_active_candidate: b.matches_active_candidate,
+          })),
+        },
+        current_image: null,
+        backend_served_sha: null,
+        active_candidate_sha: 'sha-a',
+        integration_branch: null,
+        integration_head_sha: null,
+        promotion_target: null,
+        promotion_head_sha: null,
+      };
+    }
+
+    it('shows fleet VM count for agent_image artifact when serving is pending', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_unconfirmed',
+                summary: 'Awaiting confirmation.',
+                serving_status: 'unconfirmed',
+              },
+              serving: { status: 'unconfirmed' },
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abc', served_at: '2026-01-01T00:00:00Z', reason_code: null },
+                { artifact_kind: 'agent_image', required: true, serving_status: 'unconfirmed', served_identifier: null, served_at: null, reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          agentServingShas={makeAgentServingShas([
+            { source_sha: 'sha-a', count: 2, matches_active_candidate: true },
+            { source_sha: 'sha-b', count: 3, matches_active_candidate: false },
+          ])}
+        />
+      );
+      const rows = screen.getAllByTestId('artifact-evidence-row');
+      const agentRow = rows.find((r) => r.getAttribute('data-artifact-kind') === 'agent_image');
+      expect(agentRow).toBeDefined();
+      expect(agentRow?.querySelector('[data-testid="fleet-match-count"]')).toHaveTextContent('2 VMs on candidate');
+    });
+
+    it('shows 0 VMs on candidate when no fleet VMs match', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_unconfirmed',
+                summary: 'Awaiting confirmation.',
+                serving_status: 'unconfirmed',
+              },
+              serving: { status: 'unconfirmed' },
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abc', served_at: '2026-01-01T00:00:00Z', reason_code: null },
+                { artifact_kind: 'agent_image', required: true, serving_status: 'unconfirmed', served_identifier: null, served_at: null, reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          agentServingShas={makeAgentServingShas([
+            { source_sha: 'sha-b', count: 5, matches_active_candidate: false },
+          ])}
+        />
+      );
+      const rows = screen.getAllByTestId('artifact-evidence-row');
+      const agentRow = rows.find((r) => r.getAttribute('data-artifact-kind') === 'agent_image');
+      expect(agentRow).toBeDefined();
+      expect(agentRow?.querySelector('[data-testid="fleet-match-count"]')).toHaveTextContent('0 VMs on candidate');
+    });
+
+    it('omits fleet match annotation when agentServingShas is not provided', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_unconfirmed',
+                summary: 'Awaiting confirmation.',
+                serving_status: 'unconfirmed',
+              },
+              serving: { status: 'unconfirmed' },
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abc', served_at: '2026-01-01T00:00:00Z', reason_code: null },
+                { artifact_kind: 'agent_image', required: true, serving_status: 'unconfirmed', served_identifier: null, served_at: null, reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('fleet-match-count')).not.toBeInTheDocument();
+    });
+
+    it('omits fleet match annotation for agent_image when already serving_confirmed', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              qualification_state: {
+                state: 'promoted_serving',
+                summary: 'All artifacts confirmed.',
+                serving_status: 'serving_confirmed',
+              },
+              serving: { status: 'serving_confirmed' },
+              artifacts: [
+                { artifact_kind: 'backend_revision', required: true, serving_status: 'serving_confirmed', served_identifier: 'abc', served_at: '2026-01-01T00:00:00Z', reason_code: null },
+                { artifact_kind: 'agent_image', required: true, serving_status: 'serving_confirmed', served_identifier: 'img-1', served_at: '2026-01-01T00:01:00Z', reason_code: null },
+              ],
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          agentServingShas={makeAgentServingShas([
+            { source_sha: 'sha-a', count: 5, matches_active_candidate: true },
+          ])}
+        />
+      );
+      expect(screen.queryByTestId('fleet-match-count')).not.toBeInTheDocument();
+    });
+  });
 });

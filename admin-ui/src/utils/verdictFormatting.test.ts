@@ -1,9 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   formatVerdict,
-  verdictTone,
   verdictToneBadgeClass,
-  verdictBadgeClass,
 } from './verdictFormatting';
 
 describe('formatVerdict', () => {
@@ -50,12 +48,12 @@ describe('formatVerdict', () => {
 
 describe('verdictTone / badge classes', () => {
   it('selects neutral styling for undetected', () => {
-    expect(verdictTone('undetected')).toBe('neutral');
-    expect(verdictBadgeClass('undetected')).toContain('neutral');
+    expect(formatVerdict('undetected').tone).toBe('neutral');
+    expect(verdictToneBadgeClass(formatVerdict('undetected').tone)).toContain('neutral');
   });
 
   it('selects info (cyan) styling for unknown tokens', () => {
-    expect(verdictBadgeClass('something_else')).toContain('cyan');
+    expect(verdictToneBadgeClass(formatVerdict('something_else').tone)).toContain('cyan');
   });
 
   it('verdictToneBadgeClass reuses the canonical class strings', () => {

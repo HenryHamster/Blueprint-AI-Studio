@@ -18,9 +18,12 @@ each axis as ``current_value`` / ``baseline_value`` / ``drift_pct``.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import statistics
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, Mapping
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -96,9 +99,16 @@ AXIS_LLM_COST_PER_MERGED_PR = "llm_cost_per_merged_pr"
 AXIS_LANE_COST_PER_MERGED_PR = "lane_cost_per_merged_pr"
 AXIS_LANE_WARM_RESUME_RATE = "lane_warm_resume_rate"
 AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
+AXIS_PROMPT_STATIC_BYTES = "prompt_static_bytes"
+
+# Guard threshold for prompt_static_bytes: alert when static prompt size exceeds
+# this many source characters. Set well above the current measured value (~31k chars)
+# to catch significant growth while avoiding false positives on minor edits.
+PROMPT_STATIC_BYTES_THRESHOLD = 55_000
 FORMAT_COMPLIANCE_KEY = "format_compliance"
 FORMAT_COMPLIANCE_RATE_KEY = "format_compliance_rate"
 SELF_REPAIR_SUCCESS_RATE_KEY = "self_repair_success_rate"
+SELF_REPAIR_BURN_SHARE_KEY = "self_repair_burn_share"
 # Minimum repair_attempts in the current snapshot window before self_repair_success_rate
 # drift is meaningful. Below this threshold the ratio is too noisy (rare-event denominator)
 # and drift_pct is suppressed to None to avoid phantom regression signals.
@@ -114,6 +124,7 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_LANE_COST_PER_MERGED_PR,
     AXIS_LANE_WARM_RESUME_RATE,
     AXIS_CHECKPOINT_LOSS_RATE,
+    AXIS_PROMPT_STATIC_BYTES,
 )
 
 # ---------------------------------------------------------------------------
@@ -158,6 +169,10 @@ AXIS_CONSUMERS: dict[str, dict] = {
     AXIS_CHECKPOINT_LOSS_RATE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
+    AXIS_PROMPT_STATIC_BYTES: {
+        "pending": "drift alerting — leading indicator for static prompt budget growth "
+        "before mean_input_tokens_per_call rises in production"
+    },
 }
 
 NESTED_METRIC_CONSUMERS: dict[str, dict] = {
@@ -170,7 +185,7 @@ NESTED_METRIC_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)",
     },
     "llm_cost_attribution": {
-        "ground_truth": "Task.llm_*_tokens_banked + api_call_summary tokens priced via LLM_TOKEN_PRICING",
+        "ground_truth": "Task.llm_*_tokens_banked + api_call_summary tokens priced via LLM_TOKEN_PRICING; self_repair_burn_share from Task.format_compliance_summary.format_repair_attempts",
         "consumer": "read_baseline_with_drift -> llm_cost_attribution (strategic_spawning digest payload)",
     },
     "panel_review_effectiveness": {
@@ -278,7 +293,13 @@ _SNAPSHOT_HISTORY_MAX = 365
 # v8: per-driver LLM cost attribution block (by_model, by_task_type, rework_share,
 #     total_llm_usd) folded into the daily snapshot for retroactive decomposition
 #     of llm_cost_per_merged_pr drift.
-METRIC_DEF_VERSION = "v8"
+# v9: self_repair_burn_share added to llm_cost_attribution — fraction of total LLM
+#     calls that are self-repair reopen attempts, quantifying repair overhead as a
+#     cost driver alongside rework_share.
+# v10: prompt_static_bytes axis added — source character count of the dominant static
+#      prompt sections (SHARED_LIFECYCLE_REMAINDER + assembleFailureGuidanceBlocks
+#      constants in agent/src/prompt.ts) as a leading indicator for token budget growth.
+METRIC_DEF_VERSION = "v10"
 
 
 async def _load_recent_tasks(
@@ -1793,6 +1814,11 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
                 b["cost_usd"], b["verified_merged_count"]
             ),
             "share_of_total_cost": _share(b["cost_usd"]),
+            "mean_input_tokens_per_call": (
+                round(b["input_tokens"] / b["llm_call_count"])
+                if b["llm_call_count"] > 0
+                else None
+            ),
         }
         for task_type, b in sorted(
             buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
@@ -2448,10 +2474,21 @@ def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
     per-(provider,model) cost, per-task-type cost, and the first-pass/rework
     split.  Priced rows only in by_model so zero-cost unpriced combos don't
     inflate the block; unpriced_coverage carries the honesty signal.
+
+    self_repair_burn_share is computed as a token-cost ratio when repair token
+    data is available (format_repair_input_tokens / format_repair_output_tokens
+    from format_compliance_summary): repair_token_count / total_token_count,
+    which is a cost-correlated fraction assuming consistent per-token pricing
+    across primary and repair calls. Falls back to the call-count ratio
+    (repair_attempts / total_llm_call_count) for tasks that predate repair-token
+    tracking. None when the denominator is zero.
     """
+    from app.digest_metrics import _accumulate_format_compliance  # noqa: PLC0415
+
     breakdown = compute_llm_cost_breakdown(tasks)
     by_type_rows = compute_llm_cost_by_task_type(tasks)
     rework = compute_pr_rework_chain_breakdown(tasks)
+    fc = _accumulate_format_compliance(tasks)
 
     total_usd = round(breakdown["totals"]["total_cost_usd"], 6)
     by_model = [
@@ -2468,12 +2505,41 @@ def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
         for r in by_type_rows
         if r["total_cost_usd"] > 0
     ]
+
+    # Prefer token-cost ratio when repair token data is present; fall back to
+    # call-count ratio for tasks that predate repair-token tracking.
+    # _accumulate_format_compliance always emits repair_input_tokens as int 0
+    # when no task carried token fields, so None-check is insufficient —
+    # distinguish by whether any repair tokens were actually recorded.
+    repair_token_count = (fc.get("repair_input_tokens") or 0) + (
+        fc.get("repair_output_tokens") or 0
+    )
+    repair_attempts = fc.get("repair_attempts") or 0
+    if repair_token_count > 0 or repair_attempts == 0:
+        # Token-weighted burn share: repair tokens / total fleet tokens.
+        # Uses combined input+output tokens as the denominator — a cost-correlated
+        # proxy that is accurate for homogeneous-model fleets.
+        total_tokens = (
+            breakdown["totals"]["total_input_tokens"]
+            + breakdown["totals"]["total_output_tokens"]
+        )
+        self_repair_burn_share: float | None = (
+            round(repair_token_count / total_tokens, 4) if total_tokens > 0 else None
+        )
+    else:
+        # Legacy fallback: fraction of LLM calls that are repair reopens.
+        # Applies when repair attempts exist but no token data (pre-token-tracking tasks).
+        total_llm_calls = sum(r["llm_call_count"] for r in breakdown["by_provider"])
+        self_repair_burn_share = (
+            round(repair_attempts / total_llm_calls, 4) if total_llm_calls > 0 else None
+        )
     return {
         "by_model": by_model,
         "by_task_type": by_task_type,
         "rework_share": rework.get("rework_share_of_total_llm_cost"),
         "total_llm_usd": total_usd,
         "unpriced_coverage": breakdown["totals"].get("unpriced_coverage_fraction"),
+        SELF_REPAIR_BURN_SHARE_KEY: self_repair_burn_share,
     }
 
 
@@ -2607,6 +2673,91 @@ def compute_recommended_challenger_sample_rate(
     }
 
 
+def _find_agent_src() -> str | None:
+    """Locate the agent/src directory for prompt.ts static-size introspection.
+
+    Search order mirrors test_agent_branch_invariants._resolve_agent_src_root:
+      1. AGENT_SRC_ROOT env override.
+      2. /agent/src — Docker volume-mount path used by scripts/test-backend.sh.
+      3. Host filesystem relative to this file (backend/app -> repo root -> agent/src).
+
+    Returns the first existing directory path, or None.
+    """
+    candidates: list[Path] = []
+    env_override = os.environ.get("AGENT_SRC_ROOT")
+    if env_override:
+        candidates.append(Path(env_override))
+    candidates.append(Path("/agent/src"))
+    candidates.append(Path(__file__).resolve().parents[2] / "agent" / "src")
+    for c in candidates:
+        if c.is_dir():
+            return str(c)
+    return None
+
+
+def _extract_ts_template_literal_length(src: str, const_name: str) -> int | None:
+    """Find a TypeScript `const NAME = backtick...backtick` and return its source char count.
+
+    Scans from the opening backtick to the matching unescaped closing backtick,
+    advancing by 2 on any backslash escape sequence so that escaped backticks and
+    escaped backslashes inside the literal do not prematurely terminate the scan.
+    Returns None if the constant is not found or the literal is unterminated.
+    """
+    pattern = re.compile(r"\bconst\s+" + re.escape(const_name) + r"\s*=\s*`")
+    m = pattern.search(src)
+    if not m:
+        return None
+    pos = m.end()
+    start = pos
+    n = len(src)
+    while pos < n:
+        ch = src[pos]
+        if ch == "\\":
+            pos += 2
+        elif ch == "`":
+            return pos - start
+        else:
+            pos += 1
+    return None
+
+
+_PROMPT_STATIC_CONST_NAMES: tuple[str, ...] = (
+    "SHARED_LIFECYCLE_REMAINDER",
+    "READ_THE_FAILURE_MESSAGE",
+    "SIZE_GUARDRAIL_GUIDANCE",
+    "PRIOR_ATTEMPT_DIVERGENCE",
+    "BEYOND_SCOPE_REPORTING",
+    "EDGES_CONSIDERED_GUIDANCE",
+)
+
+
+def _compute_prompt_static_bytes() -> int | None:
+    """Sum the source character lengths of the major static code-change prompt sections.
+
+    Reads agent/src/prompt.ts and measures SHARED_LIFECYCLE_REMAINDER plus the five
+    blocks concatenated by assembleFailureGuidanceBlocks(). Returns None when prompt.ts
+    is unavailable (production backend containers that do not mount agent/src).
+    """
+    agent_src = _find_agent_src()
+    if agent_src is None:
+        return None
+    prompt_ts = os.path.join(agent_src, "prompt.ts")
+    if not os.path.exists(prompt_ts):
+        return None
+    try:
+        with open(prompt_ts, encoding="utf-8") as fh:
+            src = fh.read()
+    except OSError:
+        return None
+    total = 0
+    for name in _PROMPT_STATIC_CONST_NAMES:
+        length = _extract_ts_template_literal_length(src, name)
+        if length is None:
+            return None
+        total += length
+    return total
+
+
 async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
@@ -2656,6 +2807,7 @@ async def compute_current_axes(
         AXIS_LANE_COST_PER_MERGED_PR: _compute_lane_cost_per_merged_pr(lanes),
         AXIS_LANE_WARM_RESUME_RATE: _compute_lane_warm_resume_rate(lanes),
         AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),
+        AXIS_PROMPT_STATIC_BYTES: _compute_prompt_static_bytes(),
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
         "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],
@@ -3065,6 +3217,9 @@ async def read_baseline_with_drift(
             "total_llm_usd": (snap.get("llm_cost_attribution") or {}).get(
                 "total_llm_usd"
             ),
+            SELF_REPAIR_BURN_SHARE_KEY: (snap.get("llm_cost_attribution") or {}).get(
+                SELF_REPAIR_BURN_SHARE_KEY
+            ),
         }
         for snap in snapshots
         if snap.get("llm_cost_attribution")
@@ -3250,18 +3405,26 @@ async def read_baseline_with_drift(
             ],
         }
 
+    # Suppress drift on self_repair_success_rate when the clean denominator
+    # (attempts minus infra failures) is below SELF_REPAIR_MIN_ATTEMPTS — the
+    # clean count is what the metric actually divides by, so it's the right
+    # threshold.  Falls back to gross repair_attempts for older snapshots that
+    # predate infra-failure reporting (infra_failures absent => 0).
     _current_repair_attempts = latest_format.get("repair_attempts") or 0
+    _current_infra_failures = latest_format.get("repair_infra_failures") or 0
+    _current_clean_attempts = _current_repair_attempts - _current_infra_failures
     format_compliance = {
         FORMAT_COMPLIANCE_RATE_KEY: _format_rate_axis(FORMAT_COMPLIANCE_RATE_KEY),
         SELF_REPAIR_SUCCESS_RATE_KEY: _format_rate_axis(
             SELF_REPAIR_SUCCESS_RATE_KEY,
-            suppress_drift=_current_repair_attempts < SELF_REPAIR_MIN_ATTEMPTS,
+            suppress_drift=_current_clean_attempts < SELF_REPAIR_MIN_ATTEMPTS,
         ),
         "tasks_measured": latest_format.get("tasks_measured"),
         "well_formed_tasks": latest_format.get("well_formed_tasks"),
         "format_error_total": latest_format.get("format_error_total"),
         "repair_attempts": latest_format.get("repair_attempts"),
         "repair_successes": latest_format.get("repair_successes"),
+        "repair_infra_failures": latest_format.get("repair_infra_failures"),
     }
 
     return {

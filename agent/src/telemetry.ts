@@ -39,6 +39,7 @@ export function getCurrentPromptFingerprint(): string | null {
 let _llmCallCount = 0; // @per-role
 let _totalInputTokens = 0; // @per-role
 let _totalOutputTokens = 0; // @per-role
+let _viewportScreenshotForwardedCount = 0; // @per-role
 
 /** Increment the per-task LLM call counter (one per CLI invocation). */
 export function recordLlmCallStart(): void {
@@ -55,16 +56,25 @@ export function recordLlmTokens(inputTokens: number, outputTokens: number): void
   }
 }
 
+/** Record that viewport screenshots were downloaded and forwarded into an agent prompt. */
+export function recordViewportScreenshotDownload(count: number): void {
+  if (count > 0) {
+    _viewportScreenshotForwardedCount += count;
+  }
+}
+
 /** Snapshot the current cumulative LLM telemetry for heartbeat / status posts. */
 export function getLlmTelemetry(): {
   llm_call_count: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  viewport_screenshot_forwarded_count: number;
 } {
   return {
     llm_call_count: _llmCallCount,
     total_input_tokens: _totalInputTokens,
     total_output_tokens: _totalOutputTokens,
+    viewport_screenshot_forwarded_count: _viewportScreenshotForwardedCount,
   };
 }
 
@@ -73,6 +83,7 @@ export function resetLlmTelemetry(): void {
   _llmCallCount = 0;
   _totalInputTokens = 0;
   _totalOutputTokens = 0;
+  _viewportScreenshotForwardedCount = 0;
 }
 
 // ── Per-task structured-output format-compliance telemetry (equipping d-46468a41) ─
@@ -116,9 +127,15 @@ let _formatMissByReason: Record<string, number> = {}; // @per-role
 let _formatErrorTotal = 0; // @per-role
 let _formatRepairAttempts = 0; // @per-role
 let _formatRepairSuccesses = 0; // @per-role
+let _formatRepairInfraFailures = 0; // @per-role
+let _formatRepairInputTokens = 0; // @per-role
+let _formatRepairOutputTokens = 0; // @per-role
 let _formatMissBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 let _formatRepairAttemptsBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 let _formatRepairSuccessesBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
+let _formatRepairInfraFailuresBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
+let _formatRepairInputTokensBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
+let _formatRepairOutputTokensBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 
 /** Record one unparseable final output, bucketed by the extraction verdict's
  *  reason class and, when provided, by the bounded schema label. Bumps the
@@ -147,6 +164,40 @@ export function recordFormatRepairSuccess(schemaLabel?: SchemaLabel): void {
   }
 }
 
+/** Record that a self-repair reopen run crashed (exitCode !== 0) — an
+ *  infrastructure failure distinct from a clean-but-unparseable reopen. */
+export function recordFormatRepairInfraFailure(schemaLabel?: SchemaLabel): void {
+  _formatRepairInfraFailures += 1;
+  if (schemaLabel !== undefined) {
+    _formatRepairInfraFailuresBySchema[schemaLabel] = (_formatRepairInfraFailuresBySchema[schemaLabel] ?? 0) + 1;
+  }
+}
+
+/** Record the LLM tokens consumed by a single self-repair reopen call.
+ *  Called with the delta (after - before) from getLlmTelemetry() snapshots
+ *  taken immediately before and after the repair runClaudeCode() call.
+ *  Non-positive deltas (e.g. zero tokens from a crashed reopen) are ignored. */
+export function recordFormatRepairTokens(
+  inputTokensDelta: number,
+  outputTokensDelta: number,
+  schemaLabel?: SchemaLabel,
+): void {
+  if (Number.isFinite(inputTokensDelta) && inputTokensDelta > 0) {
+    const floored = Math.floor(inputTokensDelta);
+    _formatRepairInputTokens += floored;
+    if (schemaLabel !== undefined) {
+      _formatRepairInputTokensBySchema[schemaLabel] = (_formatRepairInputTokensBySchema[schemaLabel] ?? 0) + floored;
+    }
+  }
+  if (Number.isFinite(outputTokensDelta) && outputTokensDelta > 0) {
+    const floored = Math.floor(outputTokensDelta);
+    _formatRepairOutputTokens += floored;
+    if (schemaLabel !== undefined) {
+      _formatRepairOutputTokensBySchema[schemaLabel] = (_formatRepairOutputTokensBySchema[schemaLabel] ?? 0) + floored;
+    }
+  }
+}
+
 /** Snapshot the cumulative format-compliance telemetry for heartbeat / status
  *  posts. Returns a plain dict (fresh copies of all per-reason and per-schema maps). */
 export function getFormatComplianceTelemetry(): {
@@ -154,18 +205,30 @@ export function getFormatComplianceTelemetry(): {
   format_error_total: number;
   format_repair_attempts: number;
   format_repair_successes: number;
+  format_repair_infra_failures: number;
+  format_repair_input_tokens: number;
+  format_repair_output_tokens: number;
   format_miss_by_schema: Partial<Record<SchemaLabel, number>>;
   format_repair_attempts_by_schema: Partial<Record<SchemaLabel, number>>;
   format_repair_successes_by_schema: Partial<Record<SchemaLabel, number>>;
+  format_repair_infra_failures_by_schema: Partial<Record<SchemaLabel, number>>;
+  format_repair_input_tokens_by_schema: Partial<Record<SchemaLabel, number>>;
+  format_repair_output_tokens_by_schema: Partial<Record<SchemaLabel, number>>;
 } {
   return {
     format_miss_by_reason: { ..._formatMissByReason },
     format_error_total: _formatErrorTotal,
     format_repair_attempts: _formatRepairAttempts,
     format_repair_successes: _formatRepairSuccesses,
+    format_repair_infra_failures: _formatRepairInfraFailures,
+    format_repair_input_tokens: _formatRepairInputTokens,
+    format_repair_output_tokens: _formatRepairOutputTokens,
     format_miss_by_schema: { ..._formatMissBySchema },
     format_repair_attempts_by_schema: { ..._formatRepairAttemptsBySchema },
     format_repair_successes_by_schema: { ..._formatRepairSuccessesBySchema },
+    format_repair_infra_failures_by_schema: { ..._formatRepairInfraFailuresBySchema },
+    format_repair_input_tokens_by_schema: { ..._formatRepairInputTokensBySchema },
+    format_repair_output_tokens_by_schema: { ..._formatRepairOutputTokensBySchema },
   };
 }
 
@@ -175,9 +238,15 @@ export function resetFormatComplianceTelemetry(): void {
   _formatErrorTotal = 0;
   _formatRepairAttempts = 0;
   _formatRepairSuccesses = 0;
+  _formatRepairInfraFailures = 0;
+  _formatRepairInputTokens = 0;
+  _formatRepairOutputTokens = 0;
   _formatMissBySchema = {};
   _formatRepairAttemptsBySchema = {};
   _formatRepairSuccessesBySchema = {};
+  _formatRepairInfraFailuresBySchema = {};
+  _formatRepairInputTokensBySchema = {};
+  _formatRepairOutputTokensBySchema = {};
 }
 
 /** Estimate token count from character count (4 chars ≈ 1 token).

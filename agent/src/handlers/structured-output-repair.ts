@@ -6,6 +6,7 @@ import {
 } from '../json-extract.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
+  recordFormatRepairInfraFailure, recordFormatRepairTokens, getLlmTelemetry,
   type FormatMissReason, type SchemaLabel,
 } from '../telemetry.js';
 
@@ -206,8 +207,15 @@ export async function repairStructuredOutput<T = unknown>(
     if (retryStatus) statusRef.value = retryStatus;
 
     const missAwarePrompt = buildMissAwarePrompt(firstAttempt.missReason, requiredKeys, reopenPrompt);
+    const tokensBefore = getLlmTelemetry();
     const retryRun = await runClaudeCode(
       missAwarePrompt, ws, statusRef, model, effort, disallowedTools,
+    );
+    const tokensAfter = getLlmTelemetry();
+    recordFormatRepairTokens(
+      tokensAfter.total_input_tokens - tokensBefore.total_input_tokens,
+      tokensAfter.total_output_tokens - tokensBefore.total_output_tokens,
+      schemaLabel,
     );
     retry = {
       exitCode: retryRun.exitCode,
@@ -226,6 +234,11 @@ export async function repairStructuredOutput<T = unknown>(
         retryAttempt.value = null;
         retryAttempt.missReason = validation.reason;
       }
+    }
+    if (retry.exitCode !== 0) {
+      // A non-zero exit (e.g. a filesystem warning) does not invalidate
+      // structured output produced during the run — adopt it when parseable.
+      recordFormatRepairInfraFailure(schemaLabel);
     }
     value = retryAttempt.value as T | null;
     if (value !== null) recordFormatRepairSuccess(schemaLabel);

@@ -460,6 +460,7 @@ const EFFICIENCY_AXES: EfficiencyAxisDef[] = [
   { key: 'lane_cost_per_merged_pr', label: 'Lane cost per merged PR', unit: '$', favorableDirection: 'lower' },
   { key: 'lane_warm_resume_rate', label: 'Lane warm resume rate', unit: '', favorableDirection: 'higher' },
   { key: 'checkpoint_loss_rate', label: 'Checkpoint loss rate', unit: '', favorableDirection: 'lower' },
+  { key: 'prompt_static_bytes', label: 'Static prompt size', unit: ' B', favorableDirection: 'lower' },
 ];
 
 function getDriftColor(driftPct: number | null, favorableDirection: 'lower' | 'higher'): string {

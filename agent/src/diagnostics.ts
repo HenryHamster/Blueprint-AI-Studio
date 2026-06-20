@@ -49,13 +49,6 @@ export function startEventLoopLagMonitor(): void {
   if (typeof eventLoopMonitorTimer.unref === 'function') eventLoopMonitorTimer.unref();
 }
 
-export function stopEventLoopLagMonitor(): void {
-  if (eventLoopMonitorTimer) {
-    clearInterval(eventLoopMonitorTimer);
-    eventLoopMonitorTimer = null;
-  }
-}
-
 export function traceHeartbeat(
   attemptKind: 'initial' | 'periodic' | 'retry-409' | 'sync',
   startMs: number,

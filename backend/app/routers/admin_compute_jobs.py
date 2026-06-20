@@ -22,6 +22,7 @@ from app.compute_jobs import kill_compute_job, list_compute_jobs
 from app.database import get_session
 from app.models import Artifact, ComputeJob, ComputeJobStatus, Task
 from app.schemas import serialize_compute_job_response_safe
+from app.task_evaluators import _declared_success_criterion
 
 logger = logging.getLogger(__name__)
 
@@ -61,36 +62,60 @@ def _artifact_descriptor(artifact: Artifact) -> Dict[str, Any]:
     }
 
 
-async def _build_compute_job_payload(session: AsyncSession, jobs) -> list[Dict[str, Any]]:
-    """Serialize jobs and augment each with the launching task's title/type and
-    an optional descriptor for the job's linked durable Artifact."""
+async def _build_compute_job_payload(
+    session: AsyncSession, jobs
+) -> list[Dict[str, Any]]:
+    """Serialize jobs and augment each with the launching task's title/type,
+    an optional descriptor for the job's linked durable Artifact, and the
+    declared success criterion + its computed verdict when present."""
     task_ids = {job.task_id for job in jobs if job.task_id is not None}
-    titles: Dict[uuid.UUID, tuple[str | None, str | None]] = {}
+    # Maps task_id -> (title, task_type, success_criterion, criterion_verdict)
+    task_meta: Dict[uuid.UUID, tuple[str | None, str | None, Any, Any]] = {}
     if task_ids:
         rows = (
-            await session.execute(select(Task).where(Task.id.in_(task_ids)))
-        ).scalars().all()
+            (await session.execute(select(Task).where(Task.id.in_(task_ids))))
+            .scalars()
+            .all()
+        )
         for task in rows:
             task_type = str(task.first_payload.get("type") or "") or None
-            titles[task.id] = (task.title, task_type)
+            normalized = _declared_success_criterion(task)
+            success_criterion = (
+                {"metric": normalized[0], "operator": normalized[1], "threshold": normalized[2]}
+                if normalized is not None
+                else None
+            )
+            compute_result = (task.plan_output or {}).get("compute_result") or {}
+            verdict = compute_result.get("criterion")
+            if not isinstance(verdict, dict):
+                verdict = None
+            task_meta[task.id] = (task.title, task_type, success_criterion, verdict)
 
     # Batch-load linked artifacts to avoid an N+1 query across the listed jobs.
     artifact_ids = {job.artifact_id for job in jobs if job.artifact_id is not None}
     artifacts: Dict[uuid.UUID, Artifact] = {}
     if artifact_ids:
         artifact_rows = (
-            await session.execute(
-                select(Artifact).where(Artifact.id.in_(artifact_ids))
+            (
+                await session.execute(
+                    select(Artifact).where(Artifact.id.in_(artifact_ids))
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         artifacts = {artifact.id: artifact for artifact in artifact_rows}
 
     payload: list[Dict[str, Any]] = []
     for job in jobs:
         data = serialize_compute_job_response_safe(job)
-        title, task_type = titles.get(job.task_id, (None, None))
+        title, task_type, success_criterion, criterion_verdict = task_meta.get(
+            job.task_id, (None, None, None, None)
+        )
         data["task_title"] = title
         data["task_type"] = task_type
+        data["success_criterion"] = success_criterion
+        data["criterion_verdict"] = criterion_verdict
         linked_artifact = artifacts.get(job.artifact_id) if job.artifact_id else None
         data["artifact"] = (
             _artifact_descriptor(linked_artifact) if linked_artifact else None
@@ -153,7 +178,9 @@ async def kill_project_compute_job(
             killed_by=current_user.get("email") or current_user.get("user_id"),
         )
     except ValueError as exc:
-        logger.warning("Validation error killing compute job: %s: %s", type(exc).__name__, exc)
+        logger.warning(
+            "Validation error killing compute job: %s: %s", type(exc).__name__, exc
+        )
         raise HTTPException(status_code=409, detail="Invalid request") from exc
     if killed is None:
         # A peer drove the job terminal during the lock-free RPC window; re-fetch

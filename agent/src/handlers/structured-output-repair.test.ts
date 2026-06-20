@@ -21,6 +21,12 @@ vi.mock('../telemetry.js', async (importOriginal) => {
     recordFormatMiss: vi.fn(),
     recordFormatRepairAttempt: vi.fn(),
     recordFormatRepairSuccess: vi.fn(),
+    recordFormatRepairInfraFailure: vi.fn(),
+    recordFormatRepairTokens: vi.fn(),
+    getLlmTelemetry: vi.fn().mockReturnValue({
+      llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
+    }),
   };
 });
 
@@ -29,6 +35,7 @@ import { repairStructuredOutput, type RunResult } from './structured-output-repa
 import { runClaudeCode } from '../index.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
+  recordFormatRepairInfraFailure, recordFormatRepairTokens, getLlmTelemetry,
 } from '../telemetry.js';
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -345,6 +352,32 @@ describe('repairStructuredOutput', () => {
     expect(vi.mocked(recordFormatRepairSuccess).mock.calls[0]).toEqual([undefined]);
   });
 
+  it('does not record a repair success when validateParsedValue rejects the retry value', async () => {
+    // Retry produces parseable JSON but validateParsedValue rejects it —
+    // recordFormatRepairSuccess must NOT fire even though the JSON parsed.
+    const parseableButRejected = JSON.stringify({ summary: 'ok', reasoning: 'ok' });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: parseableButRejected, lastResultText: parseableButRejected,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    const res = await repairStructuredOutput({
+      ...baseOpts(makeFirst({ exitCode: 0, lastResultText: '', allOutput: 'no json' })),
+      validateParsedValue: () => ({
+        ok: false,
+        reason: 'parsed_object_schema_mismatch',
+        detail: 'sentinel rejection for test',
+      }),
+    });
+
+    expect(runClaudeCode).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    // The retry parsed but validateParsedValue rejected it — success must NOT be recorded.
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
+    expect(res.value).toBeNull();
+    expect(res.retry).not.toBeNull();
+  });
+
   it('parsed_array_invalid_value: preamble says shape did not match (not missing required keys)', async () => {
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
@@ -387,5 +420,100 @@ describe('repairStructuredOutput', () => {
     expect(sentPrompt).toContain('incomplete or malformed JSON');
     expect(sentPrompt).toContain(REOPEN_PROMPT);
     expect(vi.mocked(recordFormatMiss).mock.calls[0][0]).toBe('malformed_json');
+  });
+
+  // ── infra-failure classification (reopen exitCode !== 0) ─────────────────────
+
+  it('adopts valid output and records both infra failure and repair success when reopen exitCode is nonzero', async () => {
+    // Reopen run exits non-zero (e.g. filesystem warning) but emits parseable
+    // output. The recovered value MUST be returned and repair success recorded —
+    // a non-zero exit does not invalidate valid structured output.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 1, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: false, stderrTail: 'process crashed',
+    });
+
+    const res = await repairStructuredOutput({
+      ...baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json here', lastResultText: '' })),
+      schemaLabel: 'design',
+    });
+
+    expect(runClaudeCode).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairInfraFailure).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairInfraFailure).mock.calls[0]).toEqual(['design']);
+    // Value was valid — success is recorded even though exit was non-zero.
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
+    expect(res.value).toEqual({ summary: 'A concise summary.', reasoning: 'Detailed reasoning here.' });
+    expect(res.retry?.exitCode).toBe(1);
+  });
+
+  it('records only infra failure (not success) when reopen exitCode is nonzero and output is unparseable', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 1, allOutput: '', lastResultText: '',
+      codexTurnCompleted: false, stderrTail: 'oom',
+    });
+
+    const res = await repairStructuredOutput({
+      ...baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json here', lastResultText: '' })),
+      schemaLabel: 'design',
+    });
+
+    expect(recordFormatRepairInfraFailure).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
+    expect(res.value).toBeNull();
+    expect(res.retry?.exitCode).toBe(1);
+  });
+
+  it('does NOT record infra failure when reopen exitCode is zero but output is unparseable', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'still no json', lastResultText: 'nope',
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json first try', lastResultText: '' })),
+    );
+
+    expect(recordFormatRepairInfraFailure).not.toHaveBeenCalled();
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
+  });
+
+  it('records infra failure without schemaLabel when none provided', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 2, allOutput: '', lastResultText: '',
+      codexTurnCompleted: false, stderrTail: 'oom',
+    });
+
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json', lastResultText: '' })),
+    );
+
+    expect(recordFormatRepairInfraFailure).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairInfraFailure).mock.calls[0]).toEqual([undefined]);
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
+  });
+
+  it('records repair token delta via recordFormatRepairTokens with schemaLabel when the reopen run consumes tokens', async () => {
+    // Simulate getLlmTelemetry returning different snapshots before and after the reopen run.
+    vi.mocked(getLlmTelemetry)
+      .mockReturnValueOnce({ llm_call_count: 3, total_input_tokens: 500, total_output_tokens: 200, viewport_screenshot_forwarded_count: 0 })
+      .mockReturnValueOnce({ llm_call_count: 4, total_input_tokens: 900, total_output_tokens: 450, viewport_screenshot_forwarded_count: 0 });
+
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    await repairStructuredOutput({
+      ...baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json first try', lastResultText: '' })),
+      schemaLabel: 'thinker',
+    });
+
+    // getLlmTelemetry must be called before and after the reopen run.
+    expect(getLlmTelemetry).toHaveBeenCalledTimes(2);
+    // recordFormatRepairTokens must receive the delta (input: 400, output: 250) and schemaLabel.
+    expect(recordFormatRepairTokens).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairTokens).mock.calls[0]).toEqual([400, 250, 'thinker']);
   });
 });

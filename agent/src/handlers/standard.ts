@@ -32,7 +32,7 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 import { extractReservedMigrationRevision, buildReservedRevisionGuidance } from './review-fix-migration.js';
 import { resolveMigrationLayout } from './specialized.js';
-import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, DEFAULT_CLONE_DEPTH } from '../constants.js';
+import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, DEFAULT_CLONE_DEPTH, ANALYSIS_CONTEXT_CHAR_CAP } from '../constants.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { runCodeChangeTask } from './code-change.js';
 import { consumeAndCommitArtifacts } from './artifact-consume.js';
@@ -547,9 +547,10 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     // Claude Code session re-deriving the same analysis.
     sendLog(ws, '\n[Analysis Phase] Reusing plan from previous attempt — skipping re-analysis.\n');
     const trimmed = previousAnalysisPlan.trim();
-    analysisContext = trimmed.startsWith('## Pre-Implementation Analysis')
-      ? `${trimmed}\n\n`
-      : `## Pre-Implementation Analysis\n\n${trimmed}\n\n`;
+    const cappedTrimmed = capAnalysisText(trimmed, ws);
+    analysisContext = cappedTrimmed.startsWith('## Pre-Implementation Analysis')
+      ? `${cappedTrimmed}\n\n`
+      : `## Pre-Implementation Analysis\n\n${cappedTrimmed}\n\n`;
   } else if (taskScope === 'medium') {
     sendLog(ws, '\n[Analysis Phase] Mapping module interfaces and dependencies...\n');
     statusRef.value = 'Analyzing module interfaces...';
@@ -667,7 +668,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         sendLog(ws, `[Analysis Phase] Plan narrowed to ${plannedFiles.length} production files (${plannedTestFiles.length} test files, uncapped; ${plannedVerifyFiles.length} verify-only files, uncapped).\n`);
       }
 
-      analysisContext = `## Pre-Implementation Analysis\n\n${effectiveAnalysis}\n\n`;
+      analysisContext = `## Pre-Implementation Analysis\n\n${capAnalysisText(effectiveAnalysis, ws)}\n\n`;
       sendLog(ws, '[Analysis Phase] Complete.\n');
     } else {
       sendLog(ws, '[Analysis Phase] Skipped — proceeding to implementation.\n');
@@ -941,6 +942,18 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
  *
  * Throws on fatal errors: invalid prompt, git clone failure, etc.
  */
+
+/**
+ * Cap analysis text at ANALYSIS_CONTEXT_CHAR_CAP characters.
+ * When truncation fires, appends a notice and emits a warning via sendLog.
+ * When text is within the cap, returns it unchanged.
+ */
+function capAnalysisText(text: string, ws: WebSocket | null): string {
+  if (text.length <= ANALYSIS_CONTEXT_CHAR_CAP) return text;
+  sendLog(ws, `[Analysis Phase] WARNING: analysis result (${text.length} chars) exceeds cap (${ANALYSIS_CONTEXT_CHAR_CAP} chars) — truncating before injection.\n`);
+  return `${text.slice(0, ANALYSIS_CONTEXT_CHAR_CAP)}\n\n[Analysis truncated at ${ANALYSIS_CONTEXT_CHAR_CAP} chars — tail omitted]`;
+}
+
 export async function handleCreate(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },

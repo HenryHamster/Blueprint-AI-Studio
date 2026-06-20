@@ -448,12 +448,6 @@ Create a compute job for the current task.
 
 Fetch the current status and result metadata for an agent-launched compute job.
 
-### `POST /api/agent/compute-analysis`
-
-Submit or request analysis for compute-experiment output.
-
----
-
 ### `POST /api/agent/vm-heartbeat`
 
 VM-scoped liveness for warm-VM continuity.

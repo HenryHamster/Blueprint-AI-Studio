@@ -1,4 +1,4 @@
-import { Check, AlertTriangle, RefreshCw, X } from 'lucide-react';
+import { AlertTriangle, RefreshCw, X } from 'lucide-react';
 import type { SrCatchRateHealthResponse } from '../api';
 
 export interface SrCheckResultEntry {
@@ -26,57 +26,10 @@ export interface SrMissedTask {
   reviewer_findings?: SrReviewerFinding[];
 }
 
-// eslint-disable-next-line react-refresh/only-export-components -- shared non-component constants for retrospective panels
-export const RETROSPECTIVE_DAY_OPTIONS = [7, 14, 30, 90] as const;
+const RETROSPECTIVE_DAY_OPTIONS = [7, 14, 30, 90] as const;
 
-// eslint-disable-next-line react-refresh/only-export-components -- shared non-component constants for retrospective panels
-export const SR_CANONICAL_CATEGORIES: { id: string; label: string }[] = [
-  { id: 'correctness', label: 'Correctness' },
-  { id: 'error-handling', label: 'Error Handling' },
-  { id: 'security', label: 'Security' },
-  { id: 'style-conventions', label: 'Style Conventions' },
-  { id: 'type-safety', label: 'Type Safety' },
-  { id: 'documentation', label: 'Documentation' },
-  { id: 'performance', label: 'Performance' },
-  { id: 'architecture', label: 'Architecture' },
-  { id: 'test-coverage', label: 'Test Coverage' },
-  { id: 'scope-drift', label: 'Scope Drift' },
-  { id: 'regression_risk', label: 'Regression Risk' },
-  { id: 'cross-system-contract', label: 'Cross-System Contract' },
-];
-
-const CATCH_RATE_HEALTH_STATUS_STYLE: Record<SrCatchRateHealthResponse['status'], { badge: string; label: string; titlePrefix: string }> = {
-  healthy: {
-    badge: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20',
-    label: 'fresh',
-    titlePrefix: 'Fresh snapshot',
-  },
-  stale: {
-    badge: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
-    label: 'snapshot stale',
-    titlePrefix: 'Snapshot stale',
-  },
-  frozen: {
-    badge: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
-    label: 'snapshot stale',
-    titlePrefix: 'Frozen snapshot',
-  },
-  low_data: {
-    badge: 'bg-neutral-800/70 text-neutral-300 border-neutral-700/70',
-    label: 'low data',
-    titlePrefix: 'Low data',
-  },
-  never_sufficient: {
-    badge: 'bg-orange-500/10 text-orange-400 border-orange-500/20',
-    label: 'never sufficient',
-    titlePrefix: 'Never sufficient',
-  },
-  missing: {
-    badge: 'bg-red-500/10 text-red-400 border-red-500/20',
-    label: 'no snapshot',
-    titlePrefix: 'No snapshot',
-  },
-};
+export { SR_CANONICAL_CATEGORIES } from './srTrendBreakdown/types';
+export { SrCatchRateFreshnessPill } from './srTrendBreakdown/primitives';
 
 const HEALTH_TOOLTIP: Record<SrCatchRateHealthResponse['status'], string> = {
   healthy: '',
@@ -86,53 +39,6 @@ const HEALTH_TOOLTIP: Record<SrCatchRateHealthResponse['status'], string> = {
   never_sufficient: 'The signal has been computed but never reached sufficient data to report a catch rate.',
   missing: 'No SR catch-rate snapshot has been computed yet for this project.',
 };
-
-function formatHealthAge(hours: number | null | undefined): string | null {
-  if (hours == null || Number.isNaN(hours)) return null;
-  const rounded = hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10;
-  return `${rounded}h`;
-}
-
-function healthSampleLabel(health: SrCatchRateHealthResponse): string {
-  return `${health.categories_with_hit_rate}/${health.category_count} categories with hit rate`;
-}
-
-function healthTooltip(health: SrCatchRateHealthResponse): string {
-  const style = CATCH_RATE_HEALTH_STATUS_STYLE[health.status];
-  const lines = [style.titlePrefix];
-  const signalAge = formatHealthAge(health.signal_age_hours);
-  const sufficientAge = formatHealthAge(health.last_sufficient_age_hours);
-  if (signalAge) lines.push(`signal age ${signalAge}`);
-  if (sufficientAge) lines.push(`sufficient age ${sufficientAge}`);
-  lines.push(`sample ${healthSampleLabel(health)}`);
-  if (health.overall_hit_rate != null) {
-    lines.push(`overall ${Math.round(health.overall_hit_rate * 100)}% hit rate`);
-  }
-  return lines.join(' · ');
-}
-
-export function SrCatchRateFreshnessPill({ health }: { health?: SrCatchRateHealthResponse | null }) {
-  if (!health) return null;
-  const style = CATCH_RATE_HEALTH_STATUS_STYLE[health.status];
-  const sufficientAge = formatHealthAge(health.last_sufficient_age_hours);
-  const label = (() => {
-    if (health.status === 'healthy') return style.label;
-    if ((health.status === 'stale' || health.status === 'frozen') && sufficientAge) return `${style.label} (${sufficientAge})`;
-    if (health.status === 'low_data') return `${style.label} (n=${health.categories_with_hit_rate})`;
-    return style.label;
-  })();
-
-  return (
-    <span
-      data-testid={`sr-catch-rate-health-${health.status}`}
-      className={`inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded border text-[9px] font-mono ${style.badge}`}
-      title={healthTooltip(health)}
-    >
-      {health.status === 'healthy' && <Check className="w-2.5 h-2.5 shrink-0" aria-hidden="true" />}
-      <span>{label}</span>
-    </span>
-  );
-}
 
 export function RetrospectiveDayWindowButtons({ days, onChange }: { days: number; onChange: (days: number) => void }) {
   return (

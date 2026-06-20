@@ -104,6 +104,7 @@ async def get_activity(
                     ]
                 ),
             )
+            .limit(1000)
             .order_by(Artifact.created_at.asc())
         )
         for a in artifacts_result.scalars().all():

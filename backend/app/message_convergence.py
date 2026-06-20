@@ -86,21 +86,6 @@ def is_bug_class(msg: "ProjectMessage") -> bool:
     return raw in BUG_CLASS_TYPES
 
 
-def is_open_system_bug_message(msg: "ProjectMessage") -> bool:
-    """Return True if msg is an OPEN, system/agent-authored BUG_REPORT/BLOCKER.
-
-    This is the eligibility predicate for the open-owned auto-resolve sweep. It
-    is deliberately DISJOINT from the linked-convergence sweep, which selects
-    ``status == LINKED_STATUS`` — this one selects ``status == OPEN_STATUS`` — so
-    the two never overlap or double-process a message.
-    """
-    if not is_bug_class(msg):
-        return False
-    if getattr(msg, "status", None) != OPEN_STATUS:
-        return False
-    return getattr(msg, "from_type", None) in SYSTEM_AUTHORED_FROM_TYPES
-
-
 def bug_message_cluster_signature(msg: "ProjectMessage") -> tuple[tuple[str, str], ...] | None:
     """Return a conservative structured signature for duplicate bug messages.
 

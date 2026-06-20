@@ -5598,6 +5598,95 @@ def test_format_compliance_metrics_empty_list():
     assert result["by_type"] == {}
 
 
+def test_self_repair_rate_excludes_reopen_infra_failures():
+    """Crashed reopens (infra failures) are excluded from the denominator.
+
+    attempts=10, successes=6, infra_failures=4 → clean_attempts=6 → rate=1.0
+    """
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 2,
+                "format_repair_attempts": 10,
+                "format_repair_successes": 6,
+                "format_repair_infra_failures": 4,
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["repair_attempts"] == 10
+    assert overall["repair_successes"] == 6
+    assert overall["repair_infra_failures"] == 4
+    # clean denominator = 10 - 4 = 6; rate = 6/6 = 1.0
+    assert overall["self_repair_success_rate"] == 1.0
+
+
+def test_self_repair_rate_infra_failures_equals_attempts_yields_none():
+    """When infra_failures == attempts the clean denominator is 0 → rate is None."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 3,
+                "format_repair_attempts": 5,
+                "format_repair_successes": 0,
+                "format_repair_infra_failures": 5,
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["repair_infra_failures"] == 5
+    assert overall["self_repair_success_rate"] is None
+
+
+def test_self_repair_rate_backward_compat_no_infra_failures():
+    """Tasks without format_repair_infra_failures key behave identically to before.
+
+    The field defaults to 0, so the denominator is unchanged and the legacy rate
+    is preserved exactly.
+    """
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 3,
+                "format_repair_successes": 2,
+                # no format_repair_infra_failures key — older agent
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["repair_infra_failures"] == 0
+    assert overall["self_repair_success_rate"] == round(2 / 3, 3)
+
+
+def test_self_repair_rate_infra_failures_by_schema_aggregated():
+    """Per-schema infra failure counts are aggregated and surfaced in by_schema."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 4,
+                "format_repair_successes": 2,
+                "format_repair_infra_failures": 2,
+                "format_repair_attempts_by_schema": {"ResearchPlan": 4},
+                "format_repair_successes_by_schema": {"ResearchPlan": 2},
+                "format_repair_infra_failures_by_schema": {"ResearchPlan": 2},
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["repair_infra_failures"] == 2
+    # clean_attempts = 4 - 2 = 2; rate = 2/2 = 1.0
+    assert overall["self_repair_success_rate"] == 1.0
+    by_schema = overall["by_schema"]
+    assert "ResearchPlan" in by_schema
+    assert by_schema["ResearchPlan"]["repair_infra_failures"] == 2
+
+
 def _fc_clean(task_type="create"):
     """Task with a clean (well-formed) format_compliance_summary."""
     return _fc_task(
@@ -5810,6 +5899,141 @@ def test_format_compliance_metrics_mixed_old_new_agents():
     # Empty by_schema when no tasks carry per-schema data.
     result_old_only = compute_format_compliance_metrics([old_agent_task])
     assert result_old_only["overall"]["by_schema"] == {}
+
+
+def test_repair_token_accumulation_and_llm_usd():
+    """repair_llm_usd is non-zero when repair_attempts > 0 and matches the pricing formula.
+
+    Pricing: Sonnet 4.6 — 3e-6 USD/input-token, 15e-6 USD/output-token.
+    Task: 1000 input tokens + 500 output tokens consumed by repair calls.
+    Expected: 1000 * 3e-6 + 500 * 15e-6 = 0.003 + 0.0075 = 0.0105 USD.
+    """
+    task = _fc_task(
+        "create",
+        {
+            "format_error_total": 1,
+            "format_repair_attempts": 1,
+            "format_repair_successes": 1,
+            "format_repair_input_tokens": 1000,
+            "format_repair_output_tokens": 500,
+        },
+    )
+    overall = compute_format_compliance_metrics([task])["overall"]
+
+    assert overall["repair_attempts"] == 1
+    assert overall["repair_input_tokens"] == 1000
+    assert overall["repair_output_tokens"] == 500
+    assert overall["repair_llm_usd"] is not None
+    assert overall["repair_llm_usd"] > 0
+    expected_usd = round(1000 * 3e-6 + 500 * 15e-6, 6)
+    assert overall["repair_llm_usd"] == pytest.approx(expected_usd)
+
+
+def test_repair_llm_usd_none_when_no_repair_attempts():
+    """repair_llm_usd is None when repair_attempts == 0 (no repair calls occurred)."""
+    task = _fc_task(
+        "create",
+        {
+            "format_error_total": 0,
+            "format_repair_attempts": 0,
+            "format_repair_successes": 0,
+        },
+    )
+    overall = compute_format_compliance_metrics([task])["overall"]
+    assert overall["repair_attempts"] == 0
+    assert overall["repair_llm_usd"] is None
+    assert overall["tokens_per_repair_attempt"] is None
+
+
+def test_repair_token_backward_compat_missing_keys():
+    """Tasks without token fields contribute 0 tokens — no error, backwards-compatible."""
+    task = _fc_task(
+        "create",
+        {
+            "format_error_total": 1,
+            "format_repair_attempts": 2,
+            "format_repair_successes": 1,
+            # no format_repair_input_tokens / format_repair_output_tokens (older agent)
+        },
+    )
+    overall = compute_format_compliance_metrics([task])["overall"]
+    assert overall["repair_input_tokens"] == 0
+    assert overall["repair_output_tokens"] == 0
+    # repair_llm_usd is 0.0 (not None) because repair_attempts > 0 but tokens are 0
+    assert overall["repair_llm_usd"] == pytest.approx(0.0)
+    # tokens_per_repair_attempt is 0.0 (0 tokens / 2 attempts)
+    assert overall["tokens_per_repair_attempt"] == pytest.approx(0.0)
+
+
+def test_repair_tokens_accumulate_across_tasks():
+    """Token counts are summed across all measured tasks."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+                "format_repair_input_tokens": 800,
+                "format_repair_output_tokens": 300,
+            },
+        ),
+        _fc_task(
+            "fix",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 0,
+                "format_repair_input_tokens": 600,
+                "format_repair_output_tokens": 200,
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    assert overall["repair_input_tokens"] == 1400
+    assert overall["repair_output_tokens"] == 500
+    assert overall["tokens_per_repair_attempt"] == pytest.approx(
+        (1400 + 500) / 2, rel=1e-3
+    )
+    expected_usd = round(1400 * 3e-6 + 500 * 15e-6, 6)
+    assert overall["repair_llm_usd"] == pytest.approx(expected_usd)
+
+
+def test_repair_tokens_by_schema_aggregation():
+    """Per-schema token maps are summed and appear in by_schema."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+                "format_repair_input_tokens": 500,
+                "format_repair_output_tokens": 200,
+                "format_repair_input_tokens_by_schema": {"memo": 500},
+                "format_repair_output_tokens_by_schema": {"memo": 200},
+            },
+        ),
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+                "format_repair_input_tokens": 300,
+                "format_repair_output_tokens": 100,
+                "format_repair_input_tokens_by_schema": {"memo": 200, "design": 100},
+                "format_repair_output_tokens_by_schema": {"memo": 70, "design": 30},
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    by_schema = overall["by_schema"]
+
+    assert by_schema["memo"]["repair_input_tokens"] == 700
+    assert by_schema["memo"]["repair_output_tokens"] == 270
+    assert by_schema["design"]["repair_input_tokens"] == 100
+    assert by_schema["design"]["repair_output_tokens"] == 30
 
 
 # ── Park/wake operational health (feat: surface park/wake health) ────────────

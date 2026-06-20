@@ -851,18 +851,6 @@ async def record_lane_reservation_cause(
     return bool(result.rowcount)
 
 
-async def clear_lane_warm_workspace(session, lane_id: uuid.UUID | str) -> bool:
-    """Force a lane workspace back to COLD and clear its warm-resume VM pointer."""
-    from app.models import ImprovementLane
-
-    result = await session.execute(
-        update(ImprovementLane)
-        .where(ImprovementLane.id == uuid.UUID(str(lane_id)))
-        .values(workspace_state="COLD", workspace_vm_instance_id=None)
-    )
-    return bool(result.rowcount)
-
-
 async def clear_lane_warm_workspace_if_matching_member(
     session,
     lane_id: uuid.UUID | str,

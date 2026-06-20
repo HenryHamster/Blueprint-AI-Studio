@@ -19,8 +19,6 @@ from app.spawn_calibration import (
 from app.source_ref_validation import (
     _parse_ref,
     _symbol_defined_at_head,
-    collect_stale_refs,
-    extract_source_file_paths,
     summarize_ungrounded_claims,
     summarize_broken_refs,
     validate_source_refs,
@@ -1447,63 +1445,6 @@ class TestStructuralActionabilityDowngrade:
         # HIGH requires: effective_claims >= 2 AND valid_sources >= 1 AND len(desc) >= 80
         # This has 1 claim, so it cannot be HIGH, will downgrade to MEDIUM at best
         assert findings[0]["actionability_grade"] in ("MEDIUM", "LOW")
-
-
-class TestExtractSourceFilePaths:
-    """extract_source_file_paths: reverse-index helper for file citations."""
-
-    def test_extracts_file_type_sources(self):
-        sources = [
-            {"type": "file", "ref": "backend/app/foo.py"},
-            {"type": "file", "ref": "backend/app/bar.py:10-20"},
-            {"type": "pr", "ref": "1234"},
-        ]
-        paths = extract_source_file_paths(sources)
-        assert paths == ["backend/app/foo.py", "backend/app/bar.py"]
-
-    def test_deduplicates_same_path(self):
-        sources = [
-            {"type": "file", "ref": "backend/app/foo.py:5"},
-            {"type": "file", "ref": "backend/app/foo.py:10"},
-        ]
-        paths = extract_source_file_paths(sources)
-        assert paths == ["backend/app/foo.py"]
-
-    def test_skips_non_file_types(self):
-        sources = [{"type": "pr", "ref": "42"}, {"type": "message", "ref": "m-123"}]
-        assert extract_source_file_paths(sources) == []
-
-    def test_none_returns_empty(self):
-        assert extract_source_file_paths(None) == []
-
-    def test_skips_sources_missing_ref(self):
-        sources = [{"type": "file"}]
-        assert extract_source_file_paths(sources) == []
-
-
-class TestCollectStaleRefs:
-    """collect_stale_refs: extract invalid refs from validate_source_refs output."""
-
-    def test_returns_invalid_refs(self):
-        validated = [
-            {"type": "file", "ref": "backend/app/gone.py", "valid": False},
-            {"type": "file", "ref": "backend/app/present.py"},
-        ]
-        stale = collect_stale_refs(validated)
-        assert stale == ["backend/app/gone.py"]
-
-    def test_empty_when_all_valid(self):
-        validated = [{"type": "file", "ref": "backend/app/foo.py"}]
-        assert collect_stale_refs(validated) == []
-
-    def test_multiple_stale_refs(self):
-        validated = [
-            {"type": "file", "ref": "a.py", "valid": False},
-            {"type": "file", "ref": "b.py", "valid": False},
-            {"type": "file", "ref": "c.py"},
-        ]
-        stale = collect_stale_refs(validated)
-        assert stale == ["a.py", "b.py"]
 
 
 class TestSummarizeBrokenRefs:

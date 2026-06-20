@@ -130,9 +130,21 @@ export function deployWindowStatus(deadline: string | number): { overdue: boolea
   };
 }
 
-/** "10m 30s" since signal first crossed threshold to case opening. */
-export function formatTimeToDetect(firstSeenAt: string | null, signalFirstCrossedAt?: string | null): string {
-  if (!firstSeenAt || !signalFirstCrossedAt) return 'unknown';
-  const seconds = (parseTimestamp(firstSeenAt).getTime() - parseTimestamp(signalFirstCrossedAt).getTime()) / 1000;
-  return formatDurationSec(Math.max(0, seconds));
+/**
+ * Detect whether an onboarding journey frontier has stalled.
+ *
+ * Returns `stalled: true` when `now - lastCompletedMs` exceeds
+ * `max(maxStepDuration * 2, 30 minutes)` and there is at least one prior
+ * step duration to compare against. When `stepDurationsMs` is empty (only
+ * one completed milestone, no intervals yet), returns `stalled: false`.
+ */
+export function staleFrontierWarning(
+  lastCompletedMs: number,
+  stepDurationsMs: number[],
+): { stalled: boolean; pendingFor: string } {
+  const pendingMs = Date.now() - lastCompletedMs;
+  const pendingFor = formatDurationMs(pendingMs);
+  if (stepDurationsMs.length === 0) return { stalled: false, pendingFor };
+  const thresholdMs = Math.max(Math.max(...stepDurationsMs) * 2, 30 * 60 * 1000);
+  return { stalled: pendingMs > thresholdMs, pendingFor };
 }

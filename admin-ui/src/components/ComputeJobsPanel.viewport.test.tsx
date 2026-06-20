@@ -54,12 +54,68 @@ const stressJobs: ComputeJob[] = [
   },
 ];
 
+const criterionJobs: ComputeJob[] = [
+  {
+    id: 'job-crit-met',
+    project_id: 'proj-1',
+    task_id: 'task-crit-met',
+    backend: 'gcp_compute_engine',
+    external_compute_id: null,
+    machine_type: 'e2-standard-2',
+    status: 'SUCCEEDED',
+    terminal_reason: 'experiment completed',
+    outcome: 'SUCCESS',
+    spend_cap_usd: 5.0,
+    wall_clock_deadline: null,
+    created_at: new Date(Date.now() - 600_000).toISOString(),
+    updated_at: new Date(Date.now() - 300_000).toISOString(),
+    started_at: new Date(Date.now() - 590_000).toISOString(),
+    completed_at: new Date(Date.now() - 300_000).toISOString(),
+    last_polled_at: new Date(Date.now() - 300_000).toISOString(),
+    accrued_cost_usd: 1.5,
+    final_cost_usd: 1.5,
+    result_reference: null,
+    task_title: 'Benchmark: accuracy >= 0.9',
+    task_type: 'compute_experiment',
+    success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+    criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.95, met: true, measurable: true },
+  },
+  {
+    id: 'job-crit-unmet',
+    project_id: 'proj-1',
+    task_id: 'task-crit-unmet',
+    backend: 'gcp_compute_engine',
+    external_compute_id: null,
+    machine_type: 'e2-standard-2',
+    status: 'SUCCEEDED',
+    terminal_reason: 'experiment completed',
+    outcome: 'SUCCESS',
+    spend_cap_usd: 5.0,
+    wall_clock_deadline: null,
+    created_at: new Date(Date.now() - 700_000).toISOString(),
+    updated_at: new Date(Date.now() - 400_000).toISOString(),
+    started_at: new Date(Date.now() - 690_000).toISOString(),
+    completed_at: new Date(Date.now() - 400_000).toISOString(),
+    last_polled_at: new Date(Date.now() - 400_000).toISOString(),
+    accrued_cost_usd: 2.0,
+    final_cost_usd: 2.0,
+    result_reference: null,
+    task_title: 'Benchmark: latency_ms <= 100',
+    task_type: 'compute_experiment',
+    success_criterion: { metric: 'latency_ms', operator: '<=', threshold: 100 },
+    criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 145, met: false, measurable: true },
+  },
+];
+
+let jobsToReturn: ComputeJob[] = stressJobs;
+
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
   return {
     ...actual,
-    fetchComputeJobs: vi.fn(async () => stressJobs),
+    fetchComputeJobs: vi.fn(async () => jobsToReturn),
     killComputeJob: vi.fn(async () => stressJobs[0]),
+    analyzeComputeJob: vi.fn(),
   };
 });
 
@@ -76,8 +132,28 @@ describe('ComputeJobsPanel — viewport regression', () => {
   });
 
   test('renders active + killed jobs without overflow/truncation/small-target at 375px', async () => {
+    jobsToReturn = stressJobs;
     await expectFullViewportAt(
       375,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+      },
+      { waitMs: 60 },
+    );
+  });
+
+  test('renders success-criterion met/unmet verdict without overflow at 1280px', async () => {
+    jobsToReturn = criterionJobs;
+    await expectFullViewportAt(
+      1280,
       async () => {
         host = document.createElement('div');
         host.style.padding = '12px';

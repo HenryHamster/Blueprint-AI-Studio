@@ -141,7 +141,7 @@ export interface DirectionFindingChallengeSummary {
   fail_closed_unparseable?: number;
 }
 
-export interface LaneRelayTimings {
+interface LaneRelayTimings {
   wall_clock_seconds?: number | null;
   active_seconds?: number | null;
   gap_seconds?: number | null;
@@ -302,7 +302,7 @@ export interface ModelEfficiencyRow extends EfficiencyBucket {
 
 // Aggregated model-fallback (downgrade) records: a requested model resolved to
 // a different effective model (preview->GA, rate-limit fallback, etc.).
-export interface EfficiencyFallbackCombo {
+interface EfficiencyFallbackCombo {
   requested: string;
   effective: string;
   provider: string;

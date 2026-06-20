@@ -1049,6 +1049,43 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         </div>
       ) : null}
 
+      {task.status === 'PARKED' ? (
+        <div className="bg-violet-950/30 border border-violet-900/40 rounded-lg px-2.5 py-2 mb-2">
+          <div className="flex items-center gap-1.5 mb-0.5">
+            <Clock className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+            <span className="text-[11px] font-semibold text-violet-400">Parked</span>
+            {task.wake_registration?.wake_source_kind ? (
+              <span className="text-[9px] uppercase tracking-wider font-mono bg-violet-500/10 text-violet-300 border border-violet-500/20 px-1.5 py-0.5 rounded">
+                {task.wake_registration.wake_source_kind}
+              </span>
+            ) : null}
+            {task.wake_registration?.delivery_state ? (
+              <span className={`text-[9px] uppercase tracking-wider font-mono px-1.5 py-0.5 rounded border ${
+                task.wake_registration.delivery_state === 'DELIVERED' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20' :
+                task.wake_registration.delivery_state === 'FIRED' ? 'bg-blue-500/10 text-blue-300 border-blue-500/20' :
+                task.wake_registration.delivery_state === 'EXPIRED' || task.wake_registration.delivery_state === 'FAILED' ? 'bg-red-500/10 text-red-300 border-red-500/20' :
+                'bg-violet-500/10 text-violet-300 border-violet-500/20'
+              }`}>
+                {task.wake_registration.delivery_state}
+              </span>
+            ) : null}
+          </div>
+          {task.park_reason ? (
+            <p className="text-[11px] text-violet-200/80 break-words">{task.park_reason}</p>
+          ) : null}
+          {(() => {
+            if (!task.wake_registration?.deadline_at) return null;
+            const deadlineTime = parseTimestamp(task.wake_registration.deadline_at).getTime();
+            const isFuture = deadlineTime > now30;
+            if (isFuture) {
+              const mins = Math.max(1, Math.ceil((deadlineTime - now30) / 60000));
+              return <p className="text-[10px] text-violet-400/80 mt-0.5 font-mono">Wake deadline in {mins}m</p>;
+            }
+            return <p className="text-[10px] text-red-400/80 mt-0.5 font-mono">Wake deadline passed</p>;
+          })()}
+        </div>
+      ) : null}
+
       {task.depends_on && task.depends_on.length > 0 ? (
         <div className="text-[10px] text-neutral-500 mb-2 font-mono flex items-center gap-1">
           <GitFork className="w-3 h-3" />

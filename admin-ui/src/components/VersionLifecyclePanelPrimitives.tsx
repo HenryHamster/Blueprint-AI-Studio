@@ -3,6 +3,7 @@ import { useState, useEffect } from 'react';
 import type { JSX } from 'react';
 import { fetchVersionSummary } from '../api';
 import type {
+  AgentServingShasResponse,
   AuditFinding,
   AuditReconciliation,
   ChallengerRefutedFinding,
@@ -470,7 +471,13 @@ const ARTIFACT_STATUS_STYLE: Record<string, { cls: string; label: string }> = {
 // artifact is pending/failed/recovered behind the aggregate headline. Renders
 // nothing for the legacy single-artifact case (or when the API omits the list),
 // so a backend-only response looks exactly as it did before this breakdown.
-export function ArtifactEvidenceList({ artifacts }: { artifacts?: ReleaseArtifactEvidence[] | null }) {
+export function ArtifactEvidenceList({
+  artifacts,
+  agentServingShas,
+}: {
+  artifacts?: ReleaseArtifactEvidence[] | null;
+  agentServingShas?: AgentServingShasResponse | null;
+}) {
   if (!artifacts || artifacts.length <= 1) return null;
   return (
     <div
@@ -481,6 +488,13 @@ export function ArtifactEvidenceList({ artifacts }: { artifacts?: ReleaseArtifac
         const style =
           ARTIFACT_STATUS_STYLE[a.serving_status ?? ''] ??
           { cls: 'text-neutral-500', label: a.serving_status ?? 'n/a' };
+        const showFleetMatch =
+          a.artifact_kind === 'agent_image' &&
+          a.serving_status !== 'serving_confirmed' &&
+          agentServingShas != null;
+        const fleetMatchCount = showFleetMatch && agentServingShas
+          ? agentServingShas.fleet.buckets.filter((b) => b.matches_active_candidate === true).reduce((sum, b) => sum + b.count, 0)
+          : 0;
         return (
           <div
             key={a.artifact_kind}
@@ -498,6 +512,14 @@ export function ArtifactEvidenceList({ artifacts }: { artifacts?: ReleaseArtifac
             {a.served_at && <span className="text-neutral-600">{timeAgo(a.served_at)}</span>}
             {a.reason_code && (
               <span className="text-red-300/80 truncate max-w-[180px]" title={a.reason_code}>{a.reason_code}</span>
+            )}
+            {showFleetMatch && (
+              <span
+                data-testid="fleet-match-count"
+                className={fleetMatchCount > 0 ? 'text-blue-400' : 'text-neutral-500'}
+              >
+                {fleetMatchCount} VM{fleetMatchCount !== 1 ? 's' : ''} on candidate
+              </span>
             )}
           </div>
         );

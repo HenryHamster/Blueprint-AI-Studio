@@ -11,11 +11,3 @@ export type {
   DirectionsEndpointResponse, GapHistoryEvent, RevisionLogEntry,
   RunningUpdateReconciliation,
 } from './problemModel';
-
-/** Budget utilization fields shared between DirectionCard and DirectionProgressSection. */
-export interface DirectionBudgetInfo {
-  estimated_cost_usd?: number | null;
-  cost_budget_usd?: number | null;
-  budget_utilization_pct?: number | null;
-  budget_exceeded?: boolean;
-}

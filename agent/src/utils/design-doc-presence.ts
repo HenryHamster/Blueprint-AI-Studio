@@ -41,7 +41,7 @@ import path from 'path';
 const PRESENT_SYSTEM_STATUSES = new Set(['mature', 'functional', 'partial']);
 const PRESENT_CAPABILITY_STATUSES = new Set(['working', 'partial']);
 
-export type EntryKind = 'system' | 'capability';
+type EntryKind = 'system' | 'capability';
 
 // Matches source-file paths embedded in free text — mirrors the backend's
 // `_FILE_PATH_RE` (backend/app/playbook_lifecycle.py). Constructed fresh per
