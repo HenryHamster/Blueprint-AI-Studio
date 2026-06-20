@@ -4947,7 +4947,7 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
             "key": "systems/database",
             "value": {
                 "name": "Database",
-                "modules": ["backend/app/db.py", "backend/app/models.py"],
+                "modules": ["backend/app/database.py", "backend/app/models.py"],
             },
         },
         headers=headers,
@@ -4957,7 +4957,7 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
     await db_session.refresh(project)
     idx = project.design_doc["_file_to_system"]
     assert idx["backend/app/auth.py"] == "auth"
-    assert idx["backend/app/db.py"] == "database"
+    assert idx["backend/app/database.py"] == "database"
     # last-write-wins for shared file: database set second
     assert idx["backend/app/models.py"] == "database"
 
@@ -4988,7 +4988,7 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
     await db_session.refresh(project)
     idx = project.design_doc["_file_to_system"]
     assert "backend/app/auth.py" not in idx
-    assert idx["backend/app/db.py"] == "database"
+    assert idx["backend/app/database.py"] == "database"
 
 
 @pytest.mark.asyncio
