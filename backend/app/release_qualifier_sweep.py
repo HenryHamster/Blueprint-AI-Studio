@@ -24,7 +24,12 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app import release_version
 from app.database import AsyncSessionLocal
-from app.models import Alert, AlertSeverity, AuditFindingResolution, ReleaseDeployArtifact
+from app.models import (
+    Alert,
+    AlertSeverity,
+    AuditFindingResolution,
+    ReleaseDeployArtifact,
+)
 from app.release_artifacts import required_release_artifact_kinds
 from app.release_promotion import _notify_operator
 from app.release_reconciliation import (
@@ -547,9 +552,8 @@ async def _auto_stale_not_promoted_findings(
                 key,
                 "stale",
                 severity=str(f.get("severity") or "").lower() or None,
-                note=(
-                    "auto-staled: automain advanced past not_promoted candidate SHA"
-                ),
+                note=("auto-staled: automain advanced past not_promoted candidate SHA"),
+                verified_against_sha=head_sha,
             )
             written += 1
 

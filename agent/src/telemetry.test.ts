@@ -10,6 +10,7 @@ import {
   getLlmTelemetry,
   resetLlmTelemetry,
   recordFormatMiss,
+  recordFormatRepairMiss,
   recordFormatRepairAttempt,
   recordFormatRepairSuccess,
   recordFormatRepairTokens,
@@ -124,6 +125,7 @@ describe('format-compliance telemetry', () => {
       format_repair_infra_failures_by_schema: {},
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
+      format_repair_miss_by_schema: {},
     });
   });
 
@@ -161,6 +163,7 @@ describe('format-compliance telemetry', () => {
       format_repair_infra_failures_by_schema: {},
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
+      format_repair_miss_by_schema: {},
     });
   });
 
@@ -188,6 +191,7 @@ describe('format-compliance telemetry', () => {
       format_repair_infra_failures_by_schema: {},
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
+      format_repair_miss_by_schema: {},
     });
   });
 
@@ -211,6 +215,7 @@ describe('format-compliance telemetry', () => {
       format_repair_infra_failures_by_schema: {},
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
+      format_repair_miss_by_schema: {},
     });
   });
 
@@ -234,6 +239,7 @@ describe('format-compliance telemetry', () => {
       format_repair_infra_failures_by_schema: {},
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
+      format_repair_miss_by_schema: {},
     });
   });
 
@@ -326,6 +332,35 @@ describe('format-compliance telemetry — schema dimension', () => {
     (snap.format_miss_by_schema as Record<string, number>)['web_research'] = 999;
 
     expect(getFormatComplianceTelemetry().format_miss_by_schema).toEqual({ web_research: 1 });
+  });
+
+  it('recordFormatRepairMiss with schemaLabel buckets into format_repair_miss_by_schema', () => {
+    recordFormatRepairMiss('unbalanced_json', 'thinker');
+    recordFormatRepairMiss('missing_required_key', 'thinker');
+    recordFormatRepairMiss('no_json_start', 'memo');
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_miss_by_reason).toEqual({ unbalanced_json: 1, missing_required_key: 1, no_json_start: 1 });
+    expect(tel.format_repair_miss_by_schema).toEqual({ thinker: 2, memo: 1 });
+  });
+
+  it('recordFormatRepairMiss without schemaLabel does not create per-schema entry but still updates reason bucket', () => {
+    recordFormatRepairMiss('malformed_json');
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_miss_by_reason).toEqual({ malformed_json: 1 });
+    expect(tel.format_repair_miss_by_schema).toEqual({});
+  });
+
+  it('reset clears format_repair_miss_by_schema', () => {
+    recordFormatRepairMiss('unbalanced_json', 'thinker');
+    resetFormatComplianceTelemetry();
+    expect(getFormatComplianceTelemetry().format_repair_miss_by_schema).toEqual({});
+  });
+
+  it('format_repair_miss_by_schema snapshot is a copy — mutating it does not affect internal state', () => {
+    recordFormatRepairMiss('unbalanced_json', 'thinker');
+    const snap = getFormatComplianceTelemetry();
+    (snap.format_repair_miss_by_schema as Record<string, number>)['thinker'] = 999;
+    expect(getFormatComplianceTelemetry().format_repair_miss_by_schema).toEqual({ thinker: 1 });
   });
 });
 

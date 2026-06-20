@@ -1144,6 +1144,7 @@ describe('handleReview — verdict file parsing', () => {
       format_repair_infra_failures_by_schema: {},
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
+      format_repair_miss_by_schema: {},
     });
   });
 
@@ -1200,6 +1201,7 @@ describe('handleReview — verdict file parsing', () => {
       format_repair_infra_failures_by_schema: {},
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
+      format_repair_miss_by_schema: {},
     });
   });
 

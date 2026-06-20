@@ -5843,6 +5843,44 @@ def test_format_compliance_by_schema_success_rate():
     assert by_schema["InfraOnly"]["self_repair_success_rate"] is None
 
 
+def test_per_schema_repair_miss_aggregated():
+    """format_repair_miss_by_schema is aggregated across tasks and surfaced in by_schema."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 2,
+                "format_repair_attempts": 3,
+                "format_repair_successes": 1,
+                "format_repair_miss_by_schema": {"thinker": 2},
+                "format_repair_attempts_by_schema": {"thinker": 3},
+                "format_repair_successes_by_schema": {"thinker": 1},
+            },
+        ),
+        _fc_task(
+            "fix",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 0,
+                "format_repair_miss_by_schema": {"thinker": 1, "memo": 1},
+                "format_repair_attempts_by_schema": {"thinker": 2},
+                "format_repair_successes_by_schema": {},
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    by_schema = overall["by_schema"]
+
+    # thinker: 2 + 1 = 3 repair misses across both tasks
+    assert "thinker" in by_schema
+    assert by_schema["thinker"]["repair_miss"] == 3
+
+    # memo: 1 repair miss from second task only
+    assert "memo" in by_schema
+    assert by_schema["memo"]["repair_miss"] == 1
+
+
 def _fc_clean(task_type="create"):
     """Task with a clean (well-formed) format_compliance_summary."""
     return _fc_task(

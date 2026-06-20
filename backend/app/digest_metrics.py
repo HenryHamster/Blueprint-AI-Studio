@@ -421,6 +421,7 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
     repair_infra_failures_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_input_tokens_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_output_tokens_by_schema: defaultdict[str, int] = defaultdict(int)
+    repair_miss_by_schema: defaultdict[str, int] = defaultdict(int)
     for t in tasks:
         summary = getattr(t, "format_compliance_summary", None)
         if not isinstance(summary, dict):
@@ -468,6 +469,10 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
             summary.get("format_repair_output_tokens_by_schema") or {}
         ).items():
             repair_output_tokens_by_schema[str(schema)] += int(count)
+        for schema, count in (
+            summary.get("format_repair_miss_by_schema") or {}
+        ).items():
+            repair_miss_by_schema[str(schema)] += int(count)
     all_schemas = (
         set(miss_by_schema)
         | set(repair_attempts_by_schema)
@@ -475,6 +480,7 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         | set(repair_infra_failures_by_schema)
         | set(repair_input_tokens_by_schema)
         | set(repair_output_tokens_by_schema)
+        | set(repair_miss_by_schema)
     )
 
     def _schema_entry(schema: str) -> dict:
@@ -487,6 +493,7 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
             "repair_attempts": attempts,
             "repair_successes": successes,
             "repair_infra_failures": infra,
+            "repair_miss": repair_miss_by_schema.get(schema, 0),
             "repair_input_tokens": repair_input_tokens_by_schema.get(schema, 0),
             "repair_output_tokens": repair_output_tokens_by_schema.get(schema, 0),
             "self_repair_success_rate": round(successes / clean, 3)

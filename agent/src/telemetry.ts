@@ -137,6 +137,7 @@ let _formatRepairSuccessesBySchema: Partial<Record<SchemaLabel, number>> = {}; /
 let _formatRepairInfraFailuresBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 let _formatRepairInputTokensBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 let _formatRepairOutputTokensBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
+let _formatRepairMissBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 
 /** Record one unparseable final output, bucketed by the extraction verdict's
  *  reason class and, when provided, by the bounded schema label. Bumps the
@@ -150,10 +151,14 @@ export function recordFormatMiss(reason: FormatMissReason, schemaLabel?: SchemaL
 }
 
 /** Record one unparseable reopen output, bucketed by the extraction verdict's
- *  reason class. Distinct from recordFormatMiss (which records the first-attempt
- *  miss); this records the reopen's failure reason when self-repair still fails. */
-export function recordFormatRepairMiss(reason: FormatMissReason, _schemaLabel?: SchemaLabel): void {
+ *  reason class and, when provided, by the bounded schema label. Distinct from
+ *  recordFormatMiss (which records the first-attempt miss); this records the
+ *  reopen's failure reason when self-repair still fails. */
+export function recordFormatRepairMiss(reason: FormatMissReason, schemaLabel?: SchemaLabel): void {
   _formatRepairMissByReason[reason] = (_formatRepairMissByReason[reason] ?? 0) + 1;
+  if (schemaLabel !== undefined) {
+    _formatRepairMissBySchema[schemaLabel] = (_formatRepairMissBySchema[schemaLabel] ?? 0) + 1;
+  }
 }
 
 /** Record that a handler attempted a self-repair re-ask after a format miss. */
@@ -223,6 +228,7 @@ export function getFormatComplianceTelemetry(): {
   format_repair_infra_failures_by_schema: Partial<Record<SchemaLabel, number>>;
   format_repair_input_tokens_by_schema: Partial<Record<SchemaLabel, number>>;
   format_repair_output_tokens_by_schema: Partial<Record<SchemaLabel, number>>;
+  format_repair_miss_by_schema: Partial<Record<SchemaLabel, number>>;
 } {
   return {
     format_miss_by_reason: { ..._formatMissByReason },
@@ -239,6 +245,7 @@ export function getFormatComplianceTelemetry(): {
     format_repair_infra_failures_by_schema: { ..._formatRepairInfraFailuresBySchema },
     format_repair_input_tokens_by_schema: { ..._formatRepairInputTokensBySchema },
     format_repair_output_tokens_by_schema: { ..._formatRepairOutputTokensBySchema },
+    format_repair_miss_by_schema: { ..._formatRepairMissBySchema },
   };
 }
 
@@ -258,6 +265,7 @@ export function resetFormatComplianceTelemetry(): void {
   _formatRepairInfraFailuresBySchema = {};
   _formatRepairInputTokensBySchema = {};
   _formatRepairOutputTokensBySchema = {};
+  _formatRepairMissBySchema = {};
 }
 
 /** Estimate token count from character count (4 chars ≈ 1 token).
