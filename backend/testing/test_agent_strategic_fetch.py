@@ -2062,6 +2062,7 @@ async def test_resolve_message_ref_old_message_beyond_500_found(
         db_session.add(msg)
 
     await db_session.commit()
+    await db_session.refresh(target_msg)
 
     # The target is the oldest message but should still be resolved correctly.
     target_ref = target_id.hex[:24]
