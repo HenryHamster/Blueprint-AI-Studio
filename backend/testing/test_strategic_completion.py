@@ -3416,22 +3416,26 @@ async def test_memo_citations_include_structured_retirement_context(db_session, 
     assert len(cites) == 1, "Expected one enriched memo citation"
     entry = cites[0]
 
-    assert entry["summary_excerpt"].startswith("The direction delivered its full scope.")
+    assert entry["summary_excerpt"].startswith(
+        "The direction delivered its full scope."
+    )
     assert entry.get("reasoning_kind") == "direction_retirement", (
         "reasoning_kind from payload must be included in citation"
     )
     assert entry.get("direction_id") == direction_id, (
         "direction_id from payload must be included in citation"
     )
-    assert entry.get("success_evidence") == "All 5 acceptance tests passed; zero regressions.", (
-        "success_evidence from memo must be included"
-    )
-    assert entry.get("retirement_condition") == "All KPIs above threshold for 2 consecutive cycles.", (
-        "retirement_condition from memo must be included"
-    )
-    assert entry.get("citation_refs") == f"direction:{direction_id}, task:{parent_task.id}", (
-        "citation references must be preserved in compact form"
-    )
+    assert (
+        entry.get("success_evidence")
+        == "All 5 acceptance tests passed; zero regressions."
+    ), "success_evidence from memo must be included"
+    assert (
+        entry.get("retirement_condition")
+        == "All KPIs above threshold for 2 consecutive cycles."
+    ), "retirement_condition from memo must be included"
+    assert (
+        entry.get("citation_refs") == f"direction:{direction_id}, task:{parent_task.id}"
+    ), "citation references must be preserved in compact form"
     assert "final_prs_merged=6" in entry.get("final_metrics_excerpt", ""), (
         "final metrics must be preserved in compact form"
     )
@@ -3441,16 +3445,14 @@ async def test_memo_citations_include_structured_retirement_context(db_session, 
     assert entry.get("rationale_excerpt") == rationale, (
         "retirement rationale must be preserved in compact form"
     )
-    assert entry.get("reasoning_excerpt", "").startswith("Direction: Direction X retired"), (
-        "memo reasoning must be preserved in compact form"
-    )
+    assert entry.get("reasoning_excerpt", "").startswith(
+        "Direction: Direction X retired"
+    ), "memo reasoning must be preserved in compact form"
     assert entry.get("tags") == [
         "direction-retirement",
         "success-evidence",
         "retirement-condition",
-    ], (
-        "tags from memo must be included"
-    )
+    ], "tags from memo must be included"
     # Verify that full cycle flow also persists these enriched fields via
     # _handle_strategic_completion.
     cycle = await strategic_cycle.create(db_session, project_id=project.id)
@@ -3483,12 +3485,14 @@ async def test_memo_citations_include_structured_retirement_context(db_session, 
     assert persisted.get("direction_id") == direction_id, (
         "direction_id must survive the summarizer and persist in cycle_metadata"
     )
-    assert persisted.get("success_evidence") == "All 5 acceptance tests passed; zero regressions.", (
-        "success_evidence must survive summarizer trimming"
-    )
-    assert persisted.get("citation_refs") == f"direction:{direction_id}, task:{parent_task.id}", (
-        "citation_refs must survive summarizer trimming"
-    )
+    assert (
+        persisted.get("success_evidence")
+        == "All 5 acceptance tests passed; zero regressions."
+    ), "success_evidence must survive summarizer trimming"
+    assert (
+        persisted.get("citation_refs")
+        == f"direction:{direction_id}, task:{parent_task.id}"
+    ), "citation_refs must survive summarizer trimming"
     assert "final_prs_merged=6" in persisted.get("final_metrics_excerpt", ""), (
         "final_metrics_excerpt must survive summarizer trimming"
     )
@@ -3498,9 +3502,9 @@ async def test_memo_citations_include_structured_retirement_context(db_session, 
     assert persisted.get("rationale_excerpt") == rationale, (
         "rationale_excerpt must survive summarizer trimming"
     )
-    assert persisted.get("reasoning_excerpt", "").startswith("Direction: Direction X retired"), (
-        "reasoning_excerpt must survive summarizer trimming"
-    )
+    assert persisted.get("reasoning_excerpt", "").startswith(
+        "Direction: Direction X retired"
+    ), "reasoning_excerpt must survive summarizer trimming"
 
 
 @pytest.mark.asyncio
@@ -4788,9 +4792,7 @@ async def test_set_strategic_challenge_non_object_returns_400(client, db_session
 
 
 @pytest.mark.asyncio
-async def test_retirement_gated_on_challenge_second_opinion(
-    client, db_session, mocker
-):
+async def test_retirement_gated_on_challenge_second_opinion(client, db_session, mocker):
     """Agent retirements fail closed on unsupported second opinions in enforce mode."""
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -4944,12 +4946,16 @@ async def test_retirement_gated_on_challenge_second_opinion(
         assert spawned is True
         from sqlmodel import select
 
-        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
         spawned_tasks = [t for t in result.scalars().all() if t.id != rejected.id]
         assert spawned_tasks, "Expected a new strategic_review task after deferral"
         spawned_payload = spawned_tasks[0].payloads[0]
         assert spawned_payload["type"] == "strategic_review"
-        assert spawned_payload["retirement_deferrals"][0]["direction_id"] == "d-rejected"
+        assert (
+            spawned_payload["retirement_deferrals"][0]["direction_id"] == "d-rejected"
+        )
         assert spawned_payload["retirement_deferrals"][0]["verdict"] == "rejected"
         assert spawned_payload["retirement_deferrals"][0]["challenge_status"] == "ok"
 
@@ -5104,9 +5110,7 @@ async def _post_strategic_op(client, task, vm: str, op: str, data: dict):
 
 
 @pytest.mark.asyncio
-async def test_create_direction_rejected_portfolio_operation_blocks(
-    client, db_session
-):
+async def test_create_direction_rejected_portfolio_operation_blocks(client, db_session):
     task = await _make_strategic_task(db_session, name="PO-CREATE", vm="vm-po-create")
     await _set_portfolio_operation_challenge(
         db_session,
@@ -5142,9 +5146,7 @@ async def test_create_direction_rejected_portfolio_operation_blocks(
 
 
 @pytest.mark.asyncio
-async def test_retire_direction_rejected_portfolio_operation_blocks(
-    client, db_session
-):
+async def test_retire_direction_rejected_portfolio_operation_blocks(client, db_session):
     task = await _make_strategic_task(
         db_session,
         name="PO-RETIRE",
@@ -5186,9 +5188,7 @@ async def test_retire_direction_rejected_portfolio_operation_blocks(
 
 
 @pytest.mark.asyncio
-async def test_stage_direction_rejected_portfolio_operation_blocks(
-    client, db_session
-):
+async def test_stage_direction_rejected_portfolio_operation_blocks(client, db_session):
     from app import release_version as rv
 
     task = await _make_strategic_task(
@@ -5272,9 +5272,7 @@ async def test_approve_direction_rejected_portfolio_operation_blocks(
 
 
 @pytest.mark.asyncio
-async def test_reject_direction_rejected_portfolio_operation_blocks(
-    client, db_session
-):
+async def test_reject_direction_rejected_portfolio_operation_blocks(client, db_session):
     task = await _make_strategic_task(
         db_session,
         name="PO-REJECT",
@@ -5331,9 +5329,7 @@ async def test_set_strategic_challenge_copied_into_cycle_metadata(
         vm="vm-sc-meta",
         directions=[{"id": "d-1", "status": "active", "text": "runner"}],
     )
-    token = create_agent_token(
-        str(task.id), "vm-sc-meta", task_type="strategic_review"
-    )
+    token = create_agent_token(str(task.id), "vm-sc-meta", task_type="strategic_review")
     chresp = await client.post(
         "/api/agent/strategic",
         json={
@@ -5343,7 +5339,7 @@ async def test_set_strategic_challenge_copied_into_cycle_metadata(
                 "status": "ok",
                 "evidence_progress": [
                     {"direction_id": "d-1", "status": "met", "verdict": "approved"}
-                ]
+                ],
             },
         },
         headers={"x-agent-token": token},
@@ -6787,9 +6783,15 @@ class TestFormatFindingsForPrompt:
             "[HIGH/pattern_inferred downgraded-from=code_verified] Stale finding:"
             in result
         )
-        assert "downgrade: HEAD validation failed: 1 broken source ref, 0 ungrounded claims" in result
+        assert (
+            "downgrade: HEAD validation failed: 1 broken source ref, 0 ungrounded claims"
+            in result
+        )
         assert "[HIGH/pattern_inferred] Honest inference:" in result
-        assert "Honest inference" in result and "downgraded-from" not in result.splitlines()[-1]
+        assert (
+            "Honest inference" in result
+            and "downgraded-from" not in result.splitlines()[-1]
+        )
 
     def test_verification_basis_defaults_when_missing(self):
         from app.strategic_completion import format_findings_for_prompt
@@ -8889,7 +8891,7 @@ class TestSanitizeStrategicChallengeRecord:
                 "status": "advancing",
                 "verdict": "approved",
                 "rationale": "ships real evidence",
-                }
+            }
         ]
         assert rec["retirement_approvals"] == [
             {
@@ -9057,8 +9059,16 @@ class TestPortfolioOperations:
                 "portfolio_operations": [
                     "not a dict",
                     {"op": "set_vision", "direction_id": "d-1", "verdict": "rejected"},
-                    {"op": "retire_direction", "direction_id": "d-2", "verdict": "nope"},
-                    {"op": "retire_direction", "direction_id": "d-3", "verdict": "rejected"},
+                    {
+                        "op": "retire_direction",
+                        "direction_id": "d-2",
+                        "verdict": "nope",
+                    },
+                    {
+                        "op": "retire_direction",
+                        "direction_id": "d-3",
+                        "verdict": "rejected",
+                    },
                 ],
             }
         )
@@ -9069,9 +9079,13 @@ class TestPortfolioOperations:
             {
                 "status": "ok",
                 "portfolio_operations": [
-                    {"op": "retire_direction", "direction_id": "d-1", "verdict": "rejected"},
+                    {
+                        "op": "retire_direction",
+                        "direction_id": "d-1",
+                        "verdict": "rejected",
+                    },
                     {"op": "retire", "direction_id": "d-1", "verdict": "approved"},
-                ]
+                ],
             }
         )
         assert len(rec["portfolio_operations"]) == 1
@@ -9082,8 +9096,16 @@ class TestPortfolioOperations:
             {
                 "status": "blocked",
                 "portfolio_operations": [
-                    {"op": "retire_direction", "direction_id": "d-1", "verdict": "rejected"},
-                    {"op": "create_direction", "text": "build x", "verdict": "rejected"},
+                    {
+                        "op": "retire_direction",
+                        "direction_id": "d-1",
+                        "verdict": "rejected",
+                    },
+                    {
+                        "op": "create_direction",
+                        "text": "build x",
+                        "verdict": "rejected",
+                    },
                 ],
             }
         )
@@ -9100,16 +9122,12 @@ class TestPortfolioOperationFingerprint:
         a = portfolio_operation_fingerprint("create_direction", text="Build  X")
         b = portfolio_operation_fingerprint("create_direction", text="build x")
         assert a == b
-        assert a != portfolio_operation_fingerprint(
-            "create_direction", text="build y"
-        )
+        assert a != portfolio_operation_fingerprint("create_direction", text="build y")
 
     def test_different_ops_do_not_collide(self):
         assert portfolio_operation_fingerprint(
             "retire_direction", direction_id="d-1"
-        ) != portfolio_operation_fingerprint(
-            "stage_direction", direction_id="d-1"
-        )
+        ) != portfolio_operation_fingerprint("stage_direction", direction_id="d-1")
 
 
 class TestChallengeRejectsPortfolioOp:
@@ -9151,7 +9169,11 @@ class TestChallengeRejectsPortfolioOp:
             {
                 "status": "blocked",
                 "portfolio_operations": [
-                    {"op": "retire_direction", "direction_id": "d-1", "verdict": "rejected"}
+                    {
+                        "op": "retire_direction",
+                        "direction_id": "d-1",
+                        "verdict": "rejected",
+                    }
                 ],
             }
         )
@@ -9165,9 +9187,12 @@ class TestChallengeRejectsPortfolioOp:
         rec = self._rec(
             [{"op": "retire_direction", "direction_id": "d-1", "verdict": "rejected"}]
         )
-        assert challenge_rejects_portfolio_op(
-            rec, "retire_direction", direction_id="d-2"
-        )[0] is True
+        assert (
+            challenge_rejects_portfolio_op(rec, "retire_direction", direction_id="d-2")[
+                0
+            ]
+            is True
+        )
 
     def test_missing_record_does_not_block(self):
         assert challenge_rejects_portfolio_op(
@@ -9223,19 +9248,30 @@ class TestStrategicChallengeSummary:
                 "retirement_critique_quality": {"verdict": "uncertain"},
                 "portfolio_shape_risk": {"verdict": "rejected"},
                 "portfolio_operations": [
-                    {"op": "stage_direction", "direction_id": "d-4", "verdict": "warned"},
-                    {"op": "retire_direction", "direction_id": "d-5", "verdict": "rejected"},
+                    {
+                        "op": "stage_direction",
+                        "direction_id": "d-4",
+                        "verdict": "warned",
+                    },
+                    {
+                        "op": "retire_direction",
+                        "direction_id": "d-5",
+                        "verdict": "rejected",
+                    },
                 ],
             }
         )
-        assert strategic_challenge_summary(rec) == {
-            "mode": "ok",
-            # rejected anywhere -> overall blocked
-            "verdict": "blocked",
-            "warned_count": 3,  # one uncertain item + one uncertain section + one warned op
-            "blocked_count": 3,  # one rejected item + one rejected section + one rejected op
-            "gate_mode": "enforce",
-        }
+        assert (
+            strategic_challenge_summary(rec)
+            == {
+                "mode": "ok",
+                # rejected anywhere -> overall blocked
+                "verdict": "blocked",
+                "warned_count": 3,  # one uncertain item + one uncertain section + one warned op
+                "blocked_count": 3,  # one rejected item + one rejected section + one rejected op
+                "gate_mode": "enforce",
+            }
+        )
 
     def test_only_uncertain_rolls_up_to_warned(self):
         rec = sanitize_strategic_challenge_record(
@@ -9285,7 +9321,13 @@ class TestStrategicChallengeSummary:
         )
         summary = strategic_challenge_summary(rec)
         # Only the four compact scalar fields — none of the bounded item lists.
-        assert set(summary) == {"mode", "verdict", "warned_count", "blocked_count", "gate_mode"}
+        assert set(summary) == {
+            "mode",
+            "verdict",
+            "warned_count",
+            "blocked_count",
+            "gate_mode",
+        }
         # elevated portfolio_shape_risk counts as warned; rejected evidence item as blocked
         assert summary["blocked_count"] == 1
         assert summary["warned_count"] == 1
@@ -9354,7 +9396,11 @@ class TestStrategicChallengeSummary:
             {
                 "status": "ok",
                 "evidence_progress": [
-                    {"direction_id": "d-1", "status": "advancing", "verdict": "approved"}
+                    {
+                        "direction_id": "d-1",
+                        "status": "advancing",
+                        "verdict": "approved",
+                    }
                 ],
                 "retirement_critique_quality": {"verdict": "solid"},
                 "portfolio_shape_risk": {"verdict": "low"},
@@ -9458,9 +9504,12 @@ class TestChallengeApprovesEvidenceProgress:
 
     def test_missing_status_field_returns_false(self):
         # A record with no status field must not be treated as ok.
-        rec = {"version": 1, "evidence_progress": [
-            {"direction_id": "d-1", "status": "advancing", "verdict": "approved"}
-        ]}
+        rec = {
+            "version": 1,
+            "evidence_progress": [
+                {"direction_id": "d-1", "status": "advancing", "verdict": "approved"}
+            ],
+        }
         assert challenge_approves_evidence_progress(rec, "d-1", "advancing") is False
 
 
@@ -9502,9 +9551,7 @@ class TestChallengeApprovesRetirement:
     def test_missing_status_field_returns_false(self):
         rec = {
             "version": 1,
-            "retirement_approvals": [
-                {"direction_id": "d-1", "verdict": "approved"}
-            ],
+            "retirement_approvals": [{"direction_id": "d-1", "verdict": "approved"}],
         }
         assert challenge_approves_retirement(rec, "d-1") is False
 
@@ -9528,7 +9575,10 @@ class TestStrategicChallengeGate:
         d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
         d["id"] = "d-1"
         return Project(
-            name="CG", user_id="u1", vision={"purpose": "p", "revision": 1}, directions=[d]
+            name="CG",
+            user_id="u1",
+            vision={"purpose": "p", "revision": 1},
+            directions=[d],
         )
 
     def test_apply_stamps_challenge_approved_when_challenge_approves(self):
@@ -9539,7 +9589,11 @@ class TestStrategicChallengeGate:
                 "version": 1,
                 "status": "ok",
                 "evidence_progress": [
-                    {"direction_id": "d-1", "status": "advancing", "verdict": "approved"}
+                    {
+                        "direction_id": "d-1",
+                        "status": "advancing",
+                        "verdict": "approved",
+                    }
                 ],
             },
         )
@@ -9554,7 +9608,11 @@ class TestStrategicChallengeGate:
                 "version": 1,
                 "status": "ok",
                 "evidence_progress": [
-                    {"direction_id": "d-1", "status": "advancing", "verdict": "rejected"}
+                    {
+                        "direction_id": "d-1",
+                        "status": "advancing",
+                        "verdict": "rejected",
+                    }
                 ],
             },
         )
@@ -9770,6 +9828,7 @@ class TestStrategicChallengeGateMode:
     def test_advisory_logs_warning_when_gate_would_block(self, mocker, caplog):
         """Advisory mode emits a warning log when gate_would_block is True."""
         import logging
+
         mocker.patch.dict(
             "app.strategic_completion._runtime_config",
             {"strategic_challenge_gate_mode": "advisory"},
@@ -9788,6 +9847,7 @@ class TestStrategicChallengeGateMode:
     def test_observe_no_warning_when_gate_would_block(self, mocker, caplog):
         """Observe mode does NOT emit a warning log."""
         import logging
+
         mocker.patch.dict(
             "app.strategic_completion._runtime_config",
             {"strategic_challenge_gate_mode": "observe"},
@@ -9832,7 +9892,11 @@ class TestStrategicChallengeGateMode:
                 "version": 1,
                 "status": "ok",
                 "evidence_progress": [
-                    {"direction_id": "d-1", "status": "advancing", "verdict": "approved"}
+                    {
+                        "direction_id": "d-1",
+                        "status": "advancing",
+                        "verdict": "approved",
+                    }
                 ],
             },
         )
@@ -10281,7 +10345,7 @@ async def test_fallback_direction_ops_respect_rejected_challenge(db_session, moc
                     "op": "reject_direction",
                     "direction_id": "d-reject",
                     "verdict": "rejected",
-                }
+                },
             ],
         }
     )
@@ -10357,7 +10421,7 @@ async def test_fallback_direction_ops_respect_rejected_challenge(db_session, moc
                     "op": "reject_direction",
                     "direction_id": "d-reject",
                     "rationale": "should never reject",
-                }
+                },
             ],
         }
     )
@@ -10370,15 +10434,18 @@ async def test_fallback_direction_ops_respect_rejected_challenge(db_session, moc
         "d-approve",
         "d-reject",
     ]
-    assert next(d for d in project.directions if d.get("id") == "d-stage")[
-        "status"
-    ] == "active"
-    assert next(d for d in project.directions if d.get("id") == "d-approve")[
-        "status"
-    ] == "proposed"
-    assert next(d for d in project.directions if d.get("id") == "d-reject")[
-        "status"
-    ] == "proposed"
+    assert (
+        next(d for d in project.directions if d.get("id") == "d-stage")["status"]
+        == "active"
+    )
+    assert (
+        next(d for d in project.directions if d.get("id") == "d-approve")["status"]
+        == "proposed"
+    )
+    assert (
+        next(d for d in project.directions if d.get("id") == "d-reject")["status"]
+        == "proposed"
+    )
 
 
 @pytest.mark.asyncio
@@ -10559,7 +10626,9 @@ async def test_fallback_direction_ops_preserve_prior_creates_before_approve(
 
     await db_session.refresh(project)
     created = [
-        d for d in (project.directions or []) if d.get("text") == "Created before approve"
+        d
+        for d in (project.directions or [])
+        if d.get("text") == "Created before approve"
     ]
     assert len(created) == 1
     assert created[0].get("status") == "active"
@@ -10636,7 +10705,9 @@ async def test_fallback_direction_ops_preserve_prior_creates_before_reject(
 
     await db_session.refresh(project)
     created = [
-        d for d in (project.directions or []) if d.get("text") == "Created before reject"
+        d
+        for d in (project.directions or [])
+        if d.get("text") == "Created before reject"
     ]
     assert len(created) == 1
     assert created[0].get("status") == "active"
@@ -10697,7 +10768,9 @@ async def test_fallback_direction_ops_accept_http_style_create_direction(
 
     await db_session.refresh(project)
     created = [
-        d for d in (project.directions or []) if d.get("text") == "HTTP style fallback create"
+        d
+        for d in (project.directions or [])
+        if d.get("text") == "HTTP style fallback create"
     ]
     assert len(created) == 1
     assert created[0].get("status") == "active"
@@ -11552,7 +11625,9 @@ class TestDesignDocCompletionStrategistEvent:
         strat_fail_db.add(project)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(project)
-        task = await _make_failure_task(strat_fail_db, project, task_type="design_doc_update")
+        task = await _make_failure_task(
+            strat_fail_db, project, task_type="design_doc_update"
+        )
 
         # Phase-2 spawn deferred (active strategic task exists).
         mocker.patch(
@@ -11570,7 +11645,9 @@ class TestDesignDocCompletionStrategistEvent:
         assert emit.await_args.kwargs["completion"]["status"] == "deferred"
 
     @pytest.mark.asyncio
-    async def test_emits_completed_when_phase2_spawn_raises(self, strat_fail_db, mocker):
+    async def test_emits_completed_when_phase2_spawn_raises(
+        self, strat_fail_db, mocker
+    ):
         from unittest.mock import AsyncMock
         from app.task_completion import _handle_design_doc_completion
 
@@ -11578,15 +11655,15 @@ class TestDesignDocCompletionStrategistEvent:
         strat_fail_db.add(project)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(project)
-        task = await _make_failure_task(strat_fail_db, project, task_type="design_doc_update")
+        task = await _make_failure_task(
+            strat_fail_db, project, task_type="design_doc_update"
+        )
 
         mocker.patch(
             "app.strategic_spawning._spawn_strategic_review",
             new=AsyncMock(side_effect=RuntimeError("spawn boom")),
         )
-        mocker.patch(
-            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
-        )
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=AsyncMock())
         emit = AsyncMock()
         mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
 
@@ -11596,7 +11673,9 @@ class TestDesignDocCompletionStrategistEvent:
         assert emit.await_args.args == (project.id, task.id, 1)
         assert emit.await_args.kwargs["phase_state"] == "deferred"
         assert emit.await_args.kwargs["completion"]["status"] == "deferred"
-        assert "FAILED to spawn" in emit.await_args.kwargs["completion"]["status_message"]
+        assert (
+            "FAILED to spawn" in emit.await_args.kwargs["completion"]["status_message"]
+        )
 
     @pytest.mark.asyncio
     async def test_phase2_raise_writes_retry_marker_even_when_task_expired(
@@ -11659,7 +11738,9 @@ class TestDesignDocCompletionStrategistEvent:
         strat_fail_db.add(project)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(project)
-        task = await _make_failure_task(strat_fail_db, project, task_type="design_doc_update")
+        task = await _make_failure_task(
+            strat_fail_db, project, task_type="design_doc_update"
+        )
 
         # Successful Phase-2 spawn emits its OWN started — the cycle stays active,
         # so Phase 1 must NOT emit completed here.
@@ -12092,8 +12173,10 @@ async def test_apply_reconciled_running_update_two_agent_writes_one_cycle_both_p
 
     # First agent write in the cycle.
     rejected1 = apply_reconciled_running_update(
-        project, baseline=strategic_cycle.baseline_running_update(cycle),
-        agent="AGENT DOC A", cycle=cycle,
+        project,
+        baseline=strategic_cycle.baseline_running_update(cycle),
+        agent="AGENT DOC A",
+        cycle=cycle,
     )
     db_session.add(project)
     db_session.add(cycle)
@@ -12106,8 +12189,10 @@ async def test_apply_reconciled_running_update_two_agent_writes_one_cycle_both_p
     # Second agent write in the SAME cycle: reconcile against the advanced
     # baseline (read fresh as both write paths do), not the cycle-start snapshot.
     rejected2 = apply_reconciled_running_update(
-        project, baseline=strategic_cycle.baseline_running_update(cycle),
-        agent="AGENT DOC B", cycle=cycle,
+        project,
+        baseline=strategic_cycle.baseline_running_update(cycle),
+        agent="AGENT DOC B",
+        cycle=cycle,
     )
     db_session.add(project)
     db_session.add(cycle)
@@ -12117,9 +12202,9 @@ async def test_apply_reconciled_running_update_two_agent_writes_one_cycle_both_p
 
     await db_session.refresh(project)
     ledger = (project.vision or {}).get(REJECTED_EDITS_KEY) or []
-    assert not any(
-        e.get("kind") == RUNNING_UPDATE_REJECTED_KIND for e in ledger
-    ), f"No running_update should be recorded as superseded; got {ledger}"
+    assert not any(e.get("kind") == RUNNING_UPDATE_REJECTED_KIND for e in ledger), (
+        f"No running_update should be recorded as superseded; got {ledger}"
+    )
 
 
 @pytest.mark.asyncio
@@ -12156,8 +12241,10 @@ async def test_apply_reconciled_running_update_operator_edit_between_writes_stil
 
     # First agent write.
     apply_reconciled_running_update(
-        project, baseline=strategic_cycle.baseline_running_update(cycle),
-        agent="AGENT DOC A", cycle=cycle,
+        project,
+        baseline=strategic_cycle.baseline_running_update(cycle),
+        agent="AGENT DOC A",
+        cycle=cycle,
     )
     db_session.add(project)
     db_session.add(cycle)
@@ -12173,8 +12260,10 @@ async def test_apply_reconciled_running_update_operator_edit_between_writes_stil
     # Second agent write: current (OPERATOR HAND EDIT) diverges from the advanced
     # baseline (AGENT DOC A), so operator wins and the agent doc is recorded.
     rejected = apply_reconciled_running_update(
-        project, baseline=strategic_cycle.baseline_running_update(cycle),
-        agent="AGENT DOC B", cycle=cycle,
+        project,
+        baseline=strategic_cycle.baseline_running_update(cycle),
+        agent="AGENT DOC B",
+        cycle=cycle,
     )
     db_session.add(project)
     db_session.add(cycle)
@@ -12199,7 +12288,9 @@ def test_reconcile_running_update_invalid_event_type_in_middle_is_operator_edit(
     from app.running_update_merge import reconcile_running_update
 
     valid_line_1 = "- [2026-06-03 12:00] **pr_merged**: Merged PR #103"
-    invalid_line = "- [2026-06-03 12:30] **custom_operator_note**: operator's hand-written note"
+    invalid_line = (
+        "- [2026-06-03 12:30] **custom_operator_note**: operator's hand-written note"
+    )
     valid_line_2 = "- [2026-06-03 13:00] **cycle_summary**: Cycle complete"
 
     current = f"BASELINE\n{valid_line_1}\n{invalid_line}\n{valid_line_2}"
@@ -12453,9 +12544,7 @@ class TestMessageConvergenceLinkage:
         assert link["id"] == "d-fix001"
 
     @pytest.mark.asyncio
-    async def test_fallback_path_explicit_resolve_overrides_link(
-        self, convergence_db
-    ):
+    async def test_fallback_path_explicit_resolve_overrides_link(self, convergence_db):
         """(b) An explicit resolve (no ownership fields) terminally resolves
         the message, even if it was previously in 'linked' state.
         """
@@ -12619,9 +12708,7 @@ class TestMessageConvergenceLinkage:
 
         task = Task(
             project_id=project.id,
-            payloads=[
-                {"type": "strategic_review", "prompt": "review", "vision": {}}
-            ],
+            payloads=[{"type": "strategic_review", "prompt": "review", "vision": {}}],
         )
         convergence_db.add(task)
         await convergence_db.commit()
@@ -12636,7 +12723,7 @@ class TestMessageConvergenceLinkage:
                         "owned_by_direction": "d-dup",
                         "resolution": "Fix owned by direction d-dup",
                     }
-                ]
+                ],
             }
         )
         await _handle_strategic_completion(task, logs, convergence_db)
@@ -12696,9 +12783,7 @@ class TestMessageConvergenceLinkage:
 
         task = Task(
             project_id=project.id,
-            payloads=[
-                {"type": "strategic_review", "prompt": "review", "vision": {}}
-            ],
+            payloads=[{"type": "strategic_review", "prompt": "review", "vision": {}}],
         )
         convergence_db.add(task)
         await convergence_db.commit()
@@ -12713,7 +12798,7 @@ class TestMessageConvergenceLinkage:
                         "owned_by_direction": "d-distinct",
                         "resolution": "Fix owned by direction d-distinct",
                     }
-                ]
+                ],
             }
         )
         await _handle_strategic_completion(task, logs, convergence_db)
@@ -12727,9 +12812,21 @@ class TestMessageConvergenceLinkage:
         assert get_message_link(distinct) is None
 
     @pytest.mark.asyncio
-    async def test_resolved_message_also_excluded_from_open_feed(
+    async def test_link_clustered_bug_messages_query_is_ordered_by_created_at(
         self, convergence_db
     ):
+        """_link_clustered_bug_messages must order by created_at asc before .limit(500)."""
+        import inspect
+        from app.strategic_completion import _link_clustered_bug_messages
+
+        source = inspect.getsource(_link_clustered_bug_messages)
+        assert "order_by(ProjectMessage.created_at.asc())" in source, (
+            "_link_clustered_bug_messages must include order_by(ProjectMessage.created_at.asc()) "
+            "before .limit(500) to make the limit deterministic"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolved_message_also_excluded_from_open_feed(self, convergence_db):
         """Sanity: resolved messages (terminal) also stay out of the feed."""
         from app.models import MessageType, Project, ProjectMessage
         from app.strategic_spawning import _fetch_open_messages
@@ -12793,7 +12890,9 @@ async def test_strategic_completion_grounds_emitted_bug_report(db_session, mocke
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -12852,7 +12951,9 @@ async def test_strategic_completion_present_citation_not_flagged(db_session, moc
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -12898,7 +12999,9 @@ async def test_strategic_completion_mixed_present_citation_is_flagged(
     )
     mocker.patch(
         "app.source_ref_validation._file_exists_at_head",
-        new=AsyncMock(side_effect=lambda path, **_: True if "alive.py" in path else False),
+        new=AsyncMock(
+            side_effect=lambda path, **_: True if "alive.py" in path else False
+        ),
     )
 
     project = Project(
@@ -12910,7 +13013,9 @@ async def test_strategic_completion_mixed_present_citation_is_flagged(
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -12968,7 +13073,9 @@ async def test_strategic_completion_note_message_not_grounded(db_session, mocker
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}],
+        payloads=[
+            {"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}
+        ],
         context={},
     )
     db_session.add(task)
@@ -13002,27 +13109,21 @@ async def test_strategic_completion_note_message_not_grounded(db_session, mocker
 
 
 def test_spawn_budget_status_under_both_caps_is_ok():
-    ok, scope, reason = spawn_budget_status(
-        3, 5, per_review_cap=12, window_cap=20
-    )
+    ok, scope, reason = spawn_budget_status(3, 5, per_review_cap=12, window_cap=20)
     assert ok is True
     assert scope is None
     assert reason is None
 
 
 def test_spawn_budget_status_per_review_cap_exhausted():
-    ok, scope, reason = spawn_budget_status(
-        12, 5, per_review_cap=12, window_cap=20
-    )
+    ok, scope, reason = spawn_budget_status(12, 5, per_review_cap=12, window_cap=20)
     assert ok is False
     assert scope == "per_review"
     assert "12/12" in reason
 
 
 def test_spawn_budget_status_window_cap_exhausted():
-    ok, scope, reason = spawn_budget_status(
-        2, 20, per_review_cap=12, window_cap=20
-    )
+    ok, scope, reason = spawn_budget_status(2, 20, per_review_cap=12, window_cap=20)
     assert ok is False
     assert scope == "window"
     assert "20/20" in reason
@@ -13030,9 +13131,7 @@ def test_spawn_budget_status_window_cap_exhausted():
 
 def test_spawn_budget_status_per_review_takes_precedence():
     # Both exhausted — per_review reported first.
-    ok, scope, _ = spawn_budget_status(
-        12, 20, per_review_cap=12, window_cap=20
-    )
+    ok, scope, _ = spawn_budget_status(12, 20, per_review_cap=12, window_cap=20)
     assert ok is False
     assert scope == "per_review"
 
@@ -13253,7 +13352,10 @@ class TestBuildRetirementSnapshot:
         long_text = "x" * 500
         direction = {
             "text": long_text,
-            "context": {"success_evidence": long_text, "retirement_condition": long_text},
+            "context": {
+                "success_evidence": long_text,
+                "retirement_condition": long_text,
+            },
             "research_history": [],
         }
         snap = _build_retirement_snapshot(direction, long_text)
@@ -13293,8 +13395,18 @@ async def test_retirement_memo_carries_direction_snapshot(db_session):
                     "retirement_condition": "All acceptance criteria verified",
                 },
                 "research_history": [
-                    {"cycles": 1, "prs_merged": 2, "tasks_completed": 3, "tasks_failed": 0},
-                    {"cycles": 1, "prs_merged": 1, "tasks_completed": 2, "tasks_failed": 1},
+                    {
+                        "cycles": 1,
+                        "prs_merged": 2,
+                        "tasks_completed": 3,
+                        "tasks_failed": 0,
+                    },
+                    {
+                        "cycles": 1,
+                        "prs_merged": 1,
+                        "tasks_completed": 2,
+                        "tasks_failed": 1,
+                    },
                 ],
             }
         ],
@@ -13347,7 +13459,9 @@ async def test_retirement_memo_carries_direction_snapshot(db_session):
         if isinstance(t.context, dict)
         and t.context.get("memo_reasoning_kind") == "direction_retirement"
     ]
-    assert len(retirement_memos) == 1, f"expected 1 retirement memo, got {len(retirement_memos)}"
+    assert len(retirement_memos) == 1, (
+        f"expected 1 retirement memo, got {len(retirement_memos)}"
+    )
     memo = retirement_memos[0]
 
     # Verify source_finding in payload
@@ -13363,7 +13477,9 @@ async def test_retirement_memo_carries_direction_snapshot(db_session):
 
     # Verify context carries mirrored fields
     assert memo.context.get("success_evidence") == "CI passes on main for 7 days"
-    assert memo.context.get("retirement_condition") == "All acceptance criteria verified"
+    assert (
+        memo.context.get("retirement_condition") == "All acceptance criteria verified"
+    )
 
     # Verify synthesized reasoning references the evidence
     assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
@@ -13405,8 +13521,18 @@ async def test_rationale_absent_retirement_memo_completed_at_spawn(db_session):
                     "retirement_condition": "Metrics streaming confirmed",
                 },
                 "research_history": [
-                    {"cycles": 2, "prs_merged": 3, "tasks_completed": 5, "tasks_failed": 1},
-                    {"cycles": 1, "prs_merged": 1, "tasks_completed": 2, "tasks_failed": 0},
+                    {
+                        "cycles": 2,
+                        "prs_merged": 3,
+                        "tasks_completed": 5,
+                        "tasks_failed": 1,
+                    },
+                    {
+                        "cycles": 1,
+                        "prs_merged": 1,
+                        "tasks_completed": 2,
+                        "tasks_failed": 0,
+                    },
                 ],
             }
         ],
@@ -13455,7 +13581,9 @@ async def test_rationale_absent_retirement_memo_completed_at_spawn(db_session):
         if isinstance(t.context, dict)
         and t.context.get("memo_reasoning_kind") == "direction_retirement"
     ]
-    assert len(retirement_memos) == 1, f"expected 1 retirement memo, got {len(retirement_memos)}"
+    assert len(retirement_memos) == 1, (
+        f"expected 1 retirement memo, got {len(retirement_memos)}"
+    )
     memo = retirement_memos[0]
 
     # No QUEUED VM-bearing memo — must be synthesized at spawn time
@@ -13578,8 +13706,11 @@ async def test_spawn_retirement_memo_empty_snapshot_completes_inline_no_vm(db_se
         .scalars()
         .all()
     )
-    assert len(artifacts) == 1, "empty-snapshot memo must have exactly one pre-baked artifact"
+    assert len(artifacts) == 1, (
+        "empty-snapshot memo must have exactly one pre-baked artifact"
+    )
     import json
+
     artifact_data = json.loads(artifacts[0].logs)
     assert artifact_data.get("summary"), "memo artifact must have a non-empty summary"
     assert memo.plan_output and memo.plan_output.get("memo"), (
@@ -13618,7 +13749,12 @@ async def test_spawn_retirement_memos_creates_knowledge_document(db_session):
                     "retirement_condition": "All acceptance criteria verified",
                 },
                 "research_history": [
-                    {"cycles": 1, "prs_merged": 2, "tasks_completed": 3, "tasks_failed": 0},
+                    {
+                        "cycles": 1,
+                        "prs_merged": 2,
+                        "tasks_completed": 3,
+                        "tasks_failed": 0,
+                    },
                 ],
             },
             {
@@ -13659,8 +13795,14 @@ async def test_spawn_retirement_memos_creates_knowledge_document(db_session):
         db_session,
         project,
         parent_task,
-        retired_ids=[direction_id_with_rationale, direction_id_snapshot_only, direction_id_minimal],
-        rationales={direction_id_with_rationale: "Pipeline complete and all criteria met."},
+        retired_ids=[
+            direction_id_with_rationale,
+            direction_id_snapshot_only,
+            direction_id_minimal,
+        ],
+        rationales={
+            direction_id_with_rationale: "Pipeline complete and all criteria met."
+        },
     )
     assert spawned == 3
 
@@ -13671,7 +13813,8 @@ async def test_spawn_retirement_memos_creates_knowledge_document(db_session):
             await db_session.execute(
                 select(KnowledgeDocument).where(
                     KnowledgeDocument.project_id == project.id,
-                    KnowledgeDocument.source_kind == SourceKind.DIRECTION_RETIREMENT.value,
+                    KnowledgeDocument.source_kind
+                    == SourceKind.DIRECTION_RETIREMENT.value,
                 )
             )
         )
@@ -13693,7 +13836,9 @@ async def test_spawn_retirement_memos_creates_knowledge_document(db_session):
 
     # Branch 2: snapshot-substantive (no rationale but has context)
     doc2 = docs_by_direction.get(direction_id_snapshot_only)
-    assert doc2 is not None, "KnowledgeDocument missing for snapshot-substantive direction"
+    assert doc2 is not None, (
+        "KnowledgeDocument missing for snapshot-substantive direction"
+    )
     assert doc2.source_kind == SourceKind.DIRECTION_RETIREMENT.value
     assert doc2.topic == "direction-retirement"
     assert doc2.body, "body must be non-empty"
@@ -13853,22 +13998,30 @@ def test_compute_model_gc_telemetry_basic_fields():
                 {"name": "cap2", "status": "working"},
             ],
             "gaps": [
-                {"id": "g1", "name": "gap1", "description": "d", "evidence": "", "status": "active"},
+                {
+                    "id": "g1",
+                    "name": "gap1",
+                    "description": "d",
+                    "evidence": "",
+                    "status": "active",
+                },
             ],
             "friction": [],
         },
     )
     task = Task(
         project_id=project.id or uuid.uuid4(),
-        payloads=[{
-            "type": "strategic_review",
-            "_packer_meta": {
-                "budget_total": 120000,
-                "budget_used": 80000,
-                "trimmed": [],
-                "dropped": [],
-            },
-        }],
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 80000,
+                    "trimmed": [],
+                    "dropped": [],
+                },
+            }
+        ],
         context={},
     )
 
@@ -13897,15 +14050,22 @@ def test_compute_model_gc_telemetry_detects_directions_dropped():
     )
     task = Task(
         project_id=project.id or uuid.uuid4(),
-        payloads=[{
-            "type": "strategic_review",
-            "_packer_meta": {
-                "budget_total": 120000,
-                "budget_used": 119000,
-                "trimmed": [],
-                "dropped": [{"key": "directions_summary", "reason": "exceeds remaining budget"}],
-            },
-        }],
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 119000,
+                    "trimmed": [],
+                    "dropped": [
+                        {
+                            "key": "directions_summary",
+                            "reason": "exceeds remaining budget",
+                        }
+                    ],
+                },
+            }
+        ],
         context={},
     )
 
@@ -13929,15 +14089,17 @@ def test_compute_model_gc_telemetry_detects_problem_model_truncated():
     )
     task = Task(
         project_id=project.id or uuid.uuid4(),
-        payloads=[{
-            "type": "strategic_review",
-            "_packer_meta": {
-                "budget_total": 120000,
-                "budget_used": 100000,
-                "trimmed": [{"key": "problem_model", "kind": "floored"}],
-                "dropped": [],
-            },
-        }],
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 100000,
+                    "trimmed": [{"key": "problem_model", "kind": "floored"}],
+                    "dropped": [],
+                },
+            }
+        ],
         context={},
     )
 
@@ -13956,44 +14118,58 @@ def test_compute_model_gc_telemetry_gap_memory_trimmed_present():
             "intent": {"purpose": "test", "current_focus": ""},
             "capabilities": [],
             "gaps": [
-                {"id": "g1", "name": "gap1", "description": "d", "evidence": "", "status": "active"},
-                {"id": "g2", "name": "gap2", "description": "d", "evidence": "", "status": "active"},
+                {
+                    "id": "g1",
+                    "name": "gap1",
+                    "description": "d",
+                    "evidence": "",
+                    "status": "active",
+                },
+                {
+                    "id": "g2",
+                    "name": "gap2",
+                    "description": "d",
+                    "evidence": "",
+                    "status": "active",
+                },
             ],
             "friction": [],
         },
     )
     task = Task(
         project_id=project.id or uuid.uuid4(),
-        payloads=[{
-            "type": "strategic_review",
-            "_packer_meta": {
-                "budget_total": 120000,
-                "budget_used": 100000,
-                "trimmed": [],
-                "dropped": [],
-                "gap_memory_trimmed": [
-                    {
-                        "key": "problem_model",
-                        "gaps": [
-                            {
-                                "gap_id": "g1",
-                                "fields": {
-                                    "history": {"shown": 3, "total": 8},
-                                    "past_moves": {"shown": 1, "total": 4},
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 100000,
+                    "trimmed": [],
+                    "dropped": [],
+                    "gap_memory_trimmed": [
+                        {
+                            "key": "problem_model",
+                            "gaps": [
+                                {
+                                    "gap_id": "g1",
+                                    "fields": {
+                                        "history": {"shown": 3, "total": 8},
+                                        "past_moves": {"shown": 1, "total": 4},
+                                    },
                                 },
-                            },
-                            {
-                                "gap_id": "g2",
-                                "fields": {
-                                    "history": {"shown": 2, "total": 5},
-                                    "past_moves": {"shown": 0, "total": 3},
+                                {
+                                    "gap_id": "g2",
+                                    "fields": {
+                                        "history": {"shown": 2, "total": 5},
+                                        "past_moves": {"shown": 0, "total": 3},
+                                    },
                                 },
-                            },
-                        ],
-                    },
-                ],
-            },
-        }],
+                            ],
+                        },
+                    ],
+                },
+            }
+        ],
         context={},
     )
 
@@ -14018,15 +14194,17 @@ def test_compute_model_gc_telemetry_gap_memory_absent():
     )
     task = Task(
         project_id=project.id or uuid.uuid4(),
-        payloads=[{
-            "type": "strategic_review",
-            "_packer_meta": {
-                "budget_total": 120000,
-                "budget_used": 80000,
-                "trimmed": [],
-                "dropped": [],
-            },
-        }],
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 80000,
+                    "trimmed": [],
+                    "dropped": [],
+                },
+            }
+        ],
         context={},
     )
 

@@ -968,6 +968,7 @@ async def _link_clustered_bug_messages(
             ProjectMessage.project_id == project.id,
             ProjectMessage.status == "open",
         )
+        .order_by(ProjectMessage.created_at.asc())
         .limit(500)
     )
     linked = 0

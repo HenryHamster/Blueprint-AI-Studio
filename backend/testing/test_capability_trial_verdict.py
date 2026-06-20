@@ -4251,7 +4251,7 @@ class TestRaiseAmbiguousLiftEscalationNotice:
         mock_session.add = MagicMock()
 
         scalars_mock = MagicMock()
-        scalars_mock.all.return_value = open_messages or []
+        scalars_mock.first.return_value = open_messages[0] if open_messages else None
         execute_result = MagicMock()
         execute_result.scalars.return_value = scalars_mock
         mock_session.execute = AsyncMock(return_value=execute_result)

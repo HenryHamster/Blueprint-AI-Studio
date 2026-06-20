@@ -1174,14 +1174,15 @@ async def raise_ambiguous_lift_escalation_notice(
                 .where(
                     ProjectMessage.project_id == project_id,
                     ProjectMessage.status == "open",
+                    ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
                 )
                 .limit(200)
             )
         )
         .scalars()
-        .all()
+        .first()
     )
-    if any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing):
+    if existing:
         return
 
     since_str = entry.get("ambiguous_lift_since")
