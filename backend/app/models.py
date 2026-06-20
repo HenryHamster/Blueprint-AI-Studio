@@ -2282,8 +2282,9 @@ def _stamp_task_provider_floor(mapper, connection, target: Task):
 @event.listens_for(Task.status, "set")
 def _on_status_set(target: Task, value, oldvalue, initiator):
     if value and isinstance(oldvalue, str) and value != oldvalue:
+        now = _utcnow()
         entry = {
-            "t": _utcnow().isoformat(),
+            "t": now.isoformat(),
             "msg": f"Status changed: {oldvalue} → {value}",
         }
         try:
@@ -2293,6 +2294,18 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
             # the expired-attribute / dead-connection rationale.
             logger.debug(
                 "[MODELS] _on_status_set: skipped status_log append (%s)",
+                e,
+            )
+        # Explicitly stamp updated_at so any transition path that leaves the
+        # column null (e.g. a load_only fetch that never loaded the column, or
+        # a code path that bypassed onupdate) is self-healing.  The reaper
+        # staleness sweep filters on updated_at < cutoff, so a null value makes
+        # the task invisible to the sweep and it orphans forever.
+        try:
+            target.updated_at = now
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "[MODELS] _on_status_set: skipped updated_at stamp (%s)",
                 e,
             )
         task_id = str(target.id)

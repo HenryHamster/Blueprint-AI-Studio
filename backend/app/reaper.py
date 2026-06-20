@@ -226,7 +226,10 @@ _BATCH = 5000
 from app.retry_prompt import _copy_analysis_artifacts_to_previous  # noqa: E402, F401, RUF100
 
 
-from app.reaper_evaluating_sweeps import sweep_evaluating_parents
+from app.reaper_evaluating_sweeps import (
+    sweep_evaluating_parents,
+    sweep_orphaned_direction_provider_tasks,
+)
 from app.reaper_sweeps import (
     sweep_queued_age_alerts,
     sweep_stalled_strategic_cycles,
@@ -2331,6 +2334,13 @@ async def reaper_service():
                     _mark_reaper_progress,
                     landed_cb=_mark_landed_parent_dependents,
                 )
+
+                # Step 3.5: Cancel EVALUATING provider tasks whose direction closed.
+                # Research/refactor tasks that provided for a now-retired direction
+                # hold no VM but sit EVALUATING forever — auto-cancel them so they
+                # don't accumulate as invisible orphans.
+                _mark_reaper_progress()
+                await sweep_orphaned_direction_provider_tasks(session)
 
                 # Step 5: Infrastructure recovery sweep + hold maintenance.
                 # Delegates to reaper_infra_recovery for resurrection (5),

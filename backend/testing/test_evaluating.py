@@ -33,6 +33,7 @@ from app.services import (
 from app.rollup_management import _check_and_trigger_rollup
 from app.task_lifecycle import park_task
 from app.models import (
+    Direction,
     Project,
     Task,
     TaskStatus,
@@ -4643,3 +4644,182 @@ async def test_handle_approval_gate_timeout_dispositions_and_contract(eval_db, m
     assert await _call(no_approval) is False
     await eval_db.refresh(no_approval)
     assert no_approval.status == TaskStatus.EVALUATING
+
+
+# ── Orphaned direction provider task sweep ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sweep_orphaned_provider_task_cancelled_for_retired_direction(
+    eval_db, mocker
+):
+    """An EVALUATING research task whose direction is retired must be cancelled.
+
+    Regression: EVALUATING provider tasks (no VM held) with a retired direction
+    could accumulate forever because they have nowhere to land once the direction
+    closes.  The sweep should detect and cancel them cleanly.
+    """
+    from app.reaper_evaluating_sweeps import sweep_orphaned_direction_provider_tasks
+
+    project = Project(name="Orphan Provider Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    direction_key = "d-orphan01"
+
+    # Direction row with a retired status.
+    direction = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        status="completed",
+        data={"id": direction_key, "status": "completed"},
+    )
+    eval_db.add(direction)
+    await eval_db.commit()
+
+    # EVALUATING task tied to that direction (no VM held — slots already released).
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "direction provider"}],
+        status=TaskStatus.EVALUATING,
+        context={"direction_id": direction_key},
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    cancelled = await sweep_orphaned_direction_provider_tasks(eval_db)
+
+    assert cancelled == 1
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+    assert direction_key in (task.latest_status_message or "")
+    assert "completed" in (task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_sweep_orphaned_provider_task_null_updated_at_cancelled(
+    eval_db, mocker
+):
+    """A null-updated_at EVALUATING task on a closed direction is reaped.
+
+    Regression: null updated_at makes a task invisible to the staleness sweep
+    (NULL < cutoff evaluates to NULL/false in SQL).  Simulate the null by
+    force-setting updated_at to None after insert, then verify the orphan sweep
+    still detects and cancels the task via the direction-status check.
+    """
+    from sqlalchemy import text
+    from app.reaper_evaluating_sweeps import sweep_orphaned_direction_provider_tasks
+
+    project = Project(name="Null UpdatedAt Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    direction_key = "d-nullupd01"
+    direction = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        status="retired",
+        data={"id": direction_key, "status": "retired"},
+    )
+    eval_db.add(direction)
+    await eval_db.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "refactor", "prompt": "null updated_at provider"}],
+        status=TaskStatus.EVALUATING,
+        context={"direction_id": direction_key},
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    # Force updated_at to NULL via raw SQL to simulate the production scenario
+    # where some insertion path bypassed the ORM default (SQLite does not enforce
+    # NOT NULL the same way Postgres does when using a raw UPDATE).
+    await eval_db.execute(
+        text("UPDATE task SET updated_at = NULL WHERE id = :id"),
+        {"id": str(task.id)},
+    )
+    await eval_db.commit()
+
+    cancelled = await sweep_orphaned_direction_provider_tasks(eval_db)
+
+    assert cancelled == 1
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_sweep_orphaned_provider_task_active_direction_not_cancelled(
+    eval_db, mocker
+):
+    """An EVALUATING task whose direction is still active must NOT be cancelled."""
+    from app.reaper_evaluating_sweeps import sweep_orphaned_direction_provider_tasks
+
+    project = Project(name="Active Direction Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    direction_key = "d-active01"
+    direction = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        status="active",
+        data={"id": direction_key, "status": "active"},
+    )
+    eval_db.add(direction)
+    await eval_db.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "active direction provider"}],
+        status=TaskStatus.EVALUATING,
+        context={"direction_id": direction_key},
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    cancelled = await sweep_orphaned_direction_provider_tasks(eval_db)
+
+    assert cancelled == 0
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_sweep_orphaned_provider_task_no_direction_row_not_cancelled(
+    eval_db, mocker
+):
+    """An EVALUATING task with a direction_id that has no Direction row is left alone.
+
+    Missing row != retired; the sweep must not cancel tasks for directions that
+    simply were never synced to the Direction table.
+    """
+    from app.reaper_evaluating_sweeps import sweep_orphaned_direction_provider_tasks
+
+    project = Project(name="No Direction Row Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "no direction row"}],
+        status=TaskStatus.EVALUATING,
+        context={"direction_id": "d-missing01"},
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    cancelled = await sweep_orphaned_direction_provider_tasks(eval_db)
+
+    assert cancelled == 0
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.EVALUATING

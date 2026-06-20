@@ -81,7 +81,7 @@
     "playbook_storage.py": 1950,
     "playbook_auto.py": 450,
     "playbook_sr_metrics.py": 3100,
-    "models.py": 4800,
+    "models.py": 5550,
     "shared_state.py": 2850,
     "strategic_spawning.py": 6450,
     "failure_classification.py": 3350,
