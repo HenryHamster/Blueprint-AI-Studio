@@ -18594,6 +18594,8 @@ class TestFormatQualificationForApi:
             "promotion_pr_url": "https://example.com/pr/123",
             "promotion_conflict": True,
             "promotion_error_detail": "merge conflict",
+            "theme_delivery": {"theme_class": "leanness", "assessed_grade": 1.0},
+            "goal_alignment": {"covered": True, "grade": 0.85},
         }
         out = rq.format_qualification_for_api(qual)
         assert out["confidence"] == 0.82
@@ -18615,6 +18617,8 @@ class TestFormatQualificationForApi:
         assert out["promotion_pr_url"] == "https://example.com/pr/123"
         assert out["promotion_conflict"] is True
         assert out["promotion_error_detail"] == "merge conflict"
+        assert out["theme_delivery"] == qual["theme_delivery"]
+        assert out["goal_alignment"] == qual["goal_alignment"]
 
 
 # ===========================================================================
@@ -22952,6 +22956,7 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         promotion_conflict=True,
         promotion_error_detail="merge conflict",
         theme_delivery=_theme_cert,
+        goal_alignment={"covered": True, "grade": 0.9},
     )
 
     out = rq.format_verdict_for_api(verdict)
@@ -22976,6 +22981,8 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     assert out["promotion_error_detail"] == "merge conflict"
     # Theme-delivery cert surfaces from migration-0305 column.
     assert out["theme_delivery"] == _theme_cert
+    # Goal-alignment cert surfaces from migration-0328 column.
+    assert out["goal_alignment"] == {"covered": True, "grade": 0.9}
     # Legacy rows (no theme_delivery set) must return None, not raise.
     verdict_legacy = QualificationVerdict(
         project_id=uuid.uuid4(),
@@ -22991,6 +22998,7 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     )
     out_legacy = rq.format_verdict_for_api(verdict_legacy)
     assert out_legacy["theme_delivery"] is None
+    assert out_legacy["goal_alignment"] is None
 
 
 @pytest.mark.asyncio

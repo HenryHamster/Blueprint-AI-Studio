@@ -4102,6 +4102,13 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
 
+    # Goal-alignment grade: {grade, gap, reasoning_summary, ...}
+    # Nullable: existing verdict rows carry no goal_alignment data.
+    goal_alignment: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
     # Blind merge-grade certificate: {candidate_sha, coverage_verdict,
     # biggest_gap, model, pr_count, graded_at}.
     # Nullable: existing verdict rows carry no blind merge-grade data.

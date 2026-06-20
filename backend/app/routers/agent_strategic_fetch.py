@@ -317,6 +317,8 @@ async def agent_fetch_qualification(
             "excluded_findings": verdict.excluded_audit_findings or [],
             "challenger_refuted_findings": verdict.challenger_refuted_audit_findings
             or [],
+            "theme_delivery": verdict.theme_delivery,
+            "goal_alignment": verdict.goal_alignment,
             "source": "qualification_verdict",
             **requalification_extra,
         }
@@ -332,6 +334,8 @@ async def agent_fetch_qualification(
         "excluded_findings": qual.get("excluded_audit_findings") or [],
         "challenger_refuted_findings": qual.get("challenger_refuted_audit_findings")
         or [],
+        "theme_delivery": qual.get("theme_delivery"),
+        "goal_alignment": qual.get("goal_alignment"),
         "source": "last_qualification",
         **requalification_extra,
     }

@@ -1461,6 +1461,96 @@ async def test_agent_fetch_qualification_rejects_cross_project(
     assert res.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_includes_goal_alignment(
+    client: AsyncClient, db_session
+):
+    """QualificationVerdict with goal_alignment set surfaces assessed_grade/state/biggest_gap."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qa-goal"
+    )
+
+    goal_alignment_data = {
+        "assessed_grade": 0.75,
+        "state": "shortfall",
+        "biggest_gap": "Auth improvements not addressed",
+        "reasoning_summary": "Three of five goal areas covered; auth work missing.",
+    }
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="aabbccdd" * 5,
+        confidence=0.8,
+        terminal_status="dry_run",
+        audit_findings=[],
+        goal_alignment=goal_alignment_data,
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(verdict)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "qualification_verdict"
+    ga = body["goal_alignment"]
+    assert ga is not None
+    assert ga["assessed_grade"] == pytest.approx(0.75)
+    assert ga["state"] == "shortfall"
+    assert ga["biggest_gap"] == "Auth improvements not addressed"
+    assert (
+        ga["reasoning_summary"]
+        == "Three of five goal areas covered; auth work missing."
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_goal_alignment_in_fallback(
+    client: AsyncClient, db_session
+):
+    """goal_alignment in last_qualification JSONB is surfaced on the fallback path."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qa-goal-fb"
+    )
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    version.last_qualification = {
+        "status": "not_promoted",
+        "confidence": 0.5,
+        "candidate_sha": "cafebabe" * 5,
+        "goal_alignment": {
+            "assessed_grade": 0.6,
+            "state": "shortfall",
+            "biggest_gap": "Performance work incomplete",
+            "reasoning_summary": "Goal partially met.",
+        },
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "last_qualification"
+    ga = body["goal_alignment"]
+    assert ga is not None
+    assert ga["assessed_grade"] == pytest.approx(0.6)
+    assert ga["biggest_gap"] == "Performance work incomplete"
+
+
 # ---------------------------------------------------------------------------
 # audit-finding-resolution endpoint tests
 # ---------------------------------------------------------------------------

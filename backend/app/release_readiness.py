@@ -328,6 +328,7 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "promotion_conflict": qual.get("promotion_conflict"),
         "promotion_error_detail": qual.get("promotion_error_detail"),
         "theme_delivery": qual.get("theme_delivery"),
+        "goal_alignment": qual.get("goal_alignment"),
         "blind_merge_grade": qual.get("blind_merge_grade"),
     }
 
@@ -421,6 +422,8 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "acceptance_aggregate": acceptance_aggregate,
         # Theme-delivery cert (additive; None on legacy rows predating migration 0305).
         "theme_delivery": verdict.theme_delivery,
+        # Goal-alignment cert (additive; None on legacy rows predating migration 0328).
+        "goal_alignment": verdict.goal_alignment,
         # Blind merge-grade cert (additive; None on legacy rows predating migration 0327).
         "blind_merge_grade": verdict.blind_merge_grade,
     }

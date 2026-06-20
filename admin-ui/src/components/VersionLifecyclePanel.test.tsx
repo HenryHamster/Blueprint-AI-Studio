@@ -1361,6 +1361,190 @@ describe('VersionLifecyclePanel', () => {
       const evidence = screen.getByTestId('durable-qualification-evidence');
       expect(within(evidence).queryByTestId('challenger-refuted-findings')).not.toBeInTheDocument();
     });
+
+    it('renders theme_delivery certified chip with grade', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                theme_delivery: { state: 'certified', assessed_grade: 1.0 },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('theme-delivery-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('theme certified 100%');
+    });
+
+    it('renders theme_delivery shortfall chip with gap sentence in title', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                theme_delivery: {
+                  state: 'shortfall',
+                  assessed_grade: 0.4,
+                  shortfalls: [{ criterion: 'leanness', why: 'Diff added unrelated auth boilerplate' }],
+                },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('theme-delivery-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('theme shortfall 40%');
+      expect(chip).toHaveAttribute('title', 'Diff added unrelated auth boilerplate');
+    });
+
+    it('does not render theme_delivery chip when state is not_applicable', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                theme_delivery: { state: 'not_applicable' },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('theme-delivery-chip')).not.toBeInTheDocument();
+    });
+
+    it('does not render theme_delivery chip when theme_delivery is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('theme-delivery-chip')).not.toBeInTheDocument();
+    });
+
+    it('renders goal_alignment aligned chip with grade', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                goal_alignment: { state: 'aligned', assessed_grade: 0.9 },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('goal-alignment-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('goal aligned 90%');
+    });
+
+    it('renders goal_alignment shortfall chip with biggest_gap in title', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                goal_alignment: {
+                  state: 'shortfall',
+                  assessed_grade: 0.3,
+                  biggest_gap: 'DB hot-loop over-fetch was not addressed',
+                },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('goal-alignment-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('goal shortfall 30%');
+      expect(chip).toHaveAttribute('title', 'DB hot-loop over-fetch was not addressed');
+    });
+
+    it('does not render goal_alignment chip when state is not_applicable', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                goal_alignment: { state: 'not_applicable' },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('goal-alignment-chip')).not.toBeInTheDocument();
+    });
+
+    it('does not render goal_alignment chip when goal_alignment is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('goal-alignment-chip')).not.toBeInTheDocument();
+    });
   });
 
   describe('qualification verdict staleness', () => {

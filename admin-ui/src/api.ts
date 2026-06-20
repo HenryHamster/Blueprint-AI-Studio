@@ -1670,6 +1670,14 @@ export interface ThemeDeliveryCert {
   net_loc?: number | null;
   directional_contradiction?: boolean | null;
   state?: string | null;
+  shortfalls?: Array<{ criterion: string; why: string; evidence?: Record<string, unknown> }> | null;
+}
+
+export interface GoalAlignment {
+  assessed_grade?: number | null;
+  state?: string | null;  // 'aligned' | 'shortfall' | 'not_applicable'
+  biggest_gap?: string | null;
+  reasoning_summary?: string | null;
 }
 
 export interface AuditFinding {
@@ -1741,6 +1749,7 @@ export interface VersionQualification {
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
   theme_delivery?: ThemeDeliveryCert | null;
+  goal_alignment?: GoalAlignment | null;
 }
 
 /** Single resolved serving block — the canonical answer to "is this version live?"
@@ -2321,6 +2330,7 @@ export interface QualificationVerdictRecord {
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
   theme_delivery?: ThemeDeliveryCert | null;
+  goal_alignment?: GoalAlignment | null;
 }
 
 export interface QualificationVerdictsInfraContext {
