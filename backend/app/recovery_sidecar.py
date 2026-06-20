@@ -59,10 +59,39 @@ async def _sweep_stranded_sidecar_sources() -> None:
         async with services.AsyncSessionLocal() as session:
             result = await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.context,
+                        raiseload=True,
+                    )
+                )
                 .where(Task.status == TaskStatus.EVALUATING)
                 .limit(_SIDECAR_SWEEP_MAX_PER_CYCLE)
             )
             evaluating = result.scalars().all()
+
+            # Pre-collect sidecar UUIDs so we can batch-load them in one
+            # query instead of issuing a session.get per source task (N+1).
+            _sidecar_uuids_to_fetch: list = []
+            for _src in evaluating:
+                _ctx = _src.context or {}
+                for _key in _AWAITING_SIDECAR_KEYS:
+                    _ref = _ctx.get(_key)
+                    if not _ref or _ref is True:
+                        continue
+                    try:
+                        _sidecar_uuids_to_fetch.append(_uuid.UUID(str(_ref)))
+                    except (ValueError, TypeError):
+                        continue
+                    break
+            sidecars_by_id: dict = {}
+            if _sidecar_uuids_to_fetch:
+                _sidecar_rows = await session.execute(
+                    select(Task).where(Task.id.in_(_sidecar_uuids_to_fetch))
+                )
+                sidecars_by_id = {s.id: s for s in _sidecar_rows.scalars().all()}
 
             resolved = 0
             for source in evaluating:
@@ -75,7 +104,7 @@ async def _sweep_stranded_sidecar_sources() -> None:
                         sidecar_uuid = _uuid.UUID(str(ref))
                     except (ValueError, TypeError):
                         continue
-                    sidecar = await session.get(Task, sidecar_uuid)
+                    sidecar = sidecars_by_id.get(sidecar_uuid)
                     if sidecar is None or sidecar.status not in _TERMINAL:
                         continue
                     logger.warning(

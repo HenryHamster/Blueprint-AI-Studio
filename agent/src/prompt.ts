@@ -1097,10 +1097,6 @@ paths, DTO fields, shared types. grep the other side(s) for matching definitions
 \`passed: false\` with \`"major"\` for URL/route mismatches, \`"minor"\` for
 type-name drift. If not cross-system: \`"issue": "diff does not cross system boundaries"\`.
 
-**Visual-verification (optional; admin-ui/src/components only):** Record a
-TOP-LEVEL \`visual_verification\` object with \`passed\`, \`pairs_inspected\`,
-\`pairs_changed\`, \`note\`, \`caught_visual_issue\`.
-
 **Regressing-category reasoning (required for Self-Review Blind Spots categories):**
 For every regressing category, add a \`"reasoning"\` field describing what you inspected
 and the evidence supporting the call. Required for BOTH pass and fail outcomes.

@@ -4292,12 +4292,9 @@ describe('SELF_REVIEW_PROMPT_VERSION — regime version lock', () => {
   });
 });
 
-// ── Viewport before/after screenshot pilot (Phase 0) ──────────────────────────
+// ── Viewport before/after screenshot pilot ────────────────────────────────────
 // The create/fix/refactor hints must reference the committed snapshot script at
-// its exact path, gated on an admin-ui/src/components diff. The self-review
-// template must expose `visual_verification` as a TOP-LEVEL field — never a
-// `check_results` category (that vocabulary is parity-locked with the backend in
-// backend/testing/test_invariants.py).
+// its exact path, gated on an admin-ui/src/components diff.
 describe('viewport snapshot pilot — agent prompt wiring', () => {
   it('VIEWPORT_SNAPSHOT_HINT references the committed script path and the components guard', () => {
     expect(VIEWPORT_SNAPSHOT_HINT).toContain('bash scripts/viewport-snapshot.sh');
@@ -4320,20 +4317,6 @@ describe('viewport snapshot pilot — agent prompt wiring', () => {
     });
   }
 
-  it('self-review template documents the optional top-level visual_verification field', () => {
-    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('visual_verification');
-    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('caught_visual_issue');
-    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('pairs_inspected');
-  });
-
-  it('visual_verification is NOT inside the SR_CATEGORIES sentinel region (backend parity is zero-change)', () => {
-    const start = CODE_CHANGE_HELPER_GUIDANCE.indexOf('SR_CATEGORIES_START');
-    const end = CODE_CHANGE_HELPER_GUIDANCE.indexOf('SR_CATEGORIES_END');
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    const region = CODE_CHANGE_HELPER_GUIDANCE.slice(start, end);
-    expect(region).not.toContain('visual_verification');
-  });
 });
 
 describe('buildViewportScreenshotSection — downloaded PNG wiring', () => {

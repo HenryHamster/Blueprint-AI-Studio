@@ -3505,40 +3505,6 @@ export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSet
   }
 }
 
-export interface VisualPilotShotEntry {
-  name: string;
-  magnitude?: number;
-}
-
-export interface VisualPilotCaughtEntry {
-  task_id: string;
-  task_title: string;
-  note: string | null;
-  created_at: string;
-  viewport_shot_names: string[];
-  viewport_shot_entries?: VisualPilotShotEntry[];
-}
-
-export interface VisualPilotStatus {
-  project_id: string;
-  admin_task_count: number;
-  entry_count: number;
-  malformed_count: number;
-  pairs_inspected: number;
-  pairs_changed: number;
-  infra_total: number;
-  infra_rate: number;
-  days_elapsed: number;
-  caught_count: number;
-  caught: VisualPilotCaughtEntry[];
-  thresholds: {
-    target_admin_tasks: number;
-    target_days: number;
-    early_pause_infra_rate: number;
-  };
-  generated_at: string;
-}
-
 export async function declareCapabilityVerdict(
   projectId: string,
   capName: string,
@@ -3556,18 +3522,3 @@ export async function declareCapabilityVerdict(
   if (!res.ok) throw new Error(`Failed to declare capability verdict: ${res.status}`);
 }
 
-export async function fetchVisualPilotStatus(
-  projectId: string,
-  signal?: AbortSignal,
-): Promise<VisualPilotStatus> {
-  const params = new URLSearchParams({ project_id: projectId });
-  const res = await apiFetch(
-    `/api/admin/visual-pilot-status?${params.toString()}`,
-    undefined,
-    2,
-    30000,
-    signal,
-  );
-  if (!res.ok) throw new Error(`Failed to fetch visual pilot status: ${res.status}`);
-  return res.json();
-}

@@ -39,13 +39,6 @@ const richTask: Task = {
         { category: 'correctness', severity: 'HIGH', description: 'The loop iterates past the end of the array when the input length is exactly a multiple of the batch size' },
         { category: 'error-handling', severity: 'MEDIUM', description: 'Unhandled promise rejection in the background sync path' },
       ],
-      visual_verification: {
-        passed: true,
-        pairs_inspected: 3,
-        pairs_changed: 1,
-        note: 'Layout correct at 375px, no unintended drift in other components',
-        caught_visual_issue: false,
-      },
     },
     _first_attempt_rejection_categories: {
       'correctness': { note: 'flagged by reviewer' },
@@ -55,34 +48,6 @@ const richTask: Task = {
   },
 };
 
-const taskWithCaughtVisualIssue: Task = {
-  ...richTask,
-  context: {
-    _self_review_outcome: {
-      verdict: 'fail',
-      check_results: {},
-      visual_verification: {
-        passed: false,
-        pairs_inspected: 2,
-        pairs_changed: 2,
-        note: 'Button colour regression detected at 375px',
-        caught_visual_issue: true,
-      },
-    },
-  },
-};
-
-const taskWithoutVisualVerification: Task = {
-  ...richTask,
-  context: {
-    _self_review_outcome: {
-      verdict: 'pass',
-      check_results: {
-        'correctness': { passed: true, reasoning: 'No issues found.' },
-      },
-    },
-  },
-};
 
 async function renderExpanded(host: HTMLDivElement, r: Root) {
   await act(async () => { r.render(<SelfReviewPanel task={richTask} />); });
@@ -182,61 +147,4 @@ describe('TaskDetailDrawerSelfReview SelfReviewPanel — viewport regression', (
     expect(apiFetchMock.mock.calls[0][1]).toEqual({ method: 'POST' });
   });
 
-  test('renders visual_verification sub-block with pair counts and note', async () => {
-    host = document.createElement('div');
-    document.body.appendChild(host);
-    const r = createRoot(host);
-    root = r;
-    await renderExpanded(host, r);
-
-    const content = host.textContent ?? '';
-    expect(content).toContain('Visual verification');
-    expect(content).toContain('3 pairs inspected');
-    expect(content).toContain('1 changed');
-    expect(content).toContain('Layout correct at 375px');
-  });
-
-  test('renders prominent caught_visual_issue indicator when true', async () => {
-    host = document.createElement('div');
-    document.body.appendChild(host);
-    const r = createRoot(host);
-    root = r;
-    await act(async () => { r.render(<SelfReviewPanel task={taskWithCaughtVisualIssue} />); });
-    const buttons = host.querySelectorAll('button');
-    const srButton = Array.from(buttons).find(b => b.textContent?.includes('Self-Review'));
-    if (srButton) { await act(async () => { srButton.click(); }); }
-
-    const content = host.textContent ?? '';
-    expect(content).toContain('Visual verification');
-    expect(content).toContain('Visual issue caught');
-    expect(content).toContain('Button colour regression detected');
-  });
-
-  test('renders nothing new when visual_verification is absent', async () => {
-    host = document.createElement('div');
-    document.body.appendChild(host);
-    const r = createRoot(host);
-    root = r;
-    await act(async () => { r.render(<SelfReviewPanel task={taskWithoutVisualVerification} />); });
-    const buttons = host.querySelectorAll('button');
-    const srButton = Array.from(buttons).find(b => b.textContent?.includes('Self-Review'));
-    if (srButton) { await act(async () => { srButton.click(); }); }
-
-    const content = host.textContent ?? '';
-    expect(content).not.toContain('Visual verification');
-    expect(content).not.toContain('pairs inspected');
-  });
-
-  test('renders visual_verification at 375px without horizontal overflow', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await act(async () => { r.render(<SelfReviewPanel task={taskWithCaughtVisualIssue} />); });
-      const buttons = host.querySelectorAll('button');
-      const srButton = Array.from(buttons).find(b => b.textContent?.includes('Self-Review'));
-      if (srButton) { await act(async () => { srButton.click(); }); }
-    });
-  });
 });

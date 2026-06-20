@@ -58,6 +58,18 @@ AUTHORIZED_TEST_DELETIONS: tuple[AuthorizedTestDeletion, ...] = (
         commit_ref="3085d8d8",
         rationale="parseViewportSubkey had zero production callers; test and subject co-deleted together.",
     ),
+    AuthorizedTestDeletion(
+        path_suffix="test_visual_verification_audit.py",
+        co_deleted_subject="visual_verification_audit.py (aggregate_visual_pilot, VisualPilotAggregates)",
+        commit_ref="7547d74",
+        rationale="Dark feature cut: visual_verification_audit.py had zero live writers; the field it aggregated was never written by any code path, so 0 pairs inspected permanently. Entire module and its tests co-deleted.",
+    ),
+    AuthorizedTestDeletion(
+        path_suffix="VisualVerificationPilotPanel.viewport.test.tsx",
+        co_deleted_subject="VisualVerificationPilotPanel.tsx (VisualVerificationPilotPanel component)",
+        commit_ref="7547d74",
+        rationale="Dark feature cut: VisualVerificationPilotPanel consumed the always-zero /api/admin/visual-pilot-status endpoint. Component and its viewport tests co-deleted.",
+    ),
 )
 
 def _get_lifecycle_bounded_authorized_deletions() -> tuple[AuthorizedTestDeletion, ...]:

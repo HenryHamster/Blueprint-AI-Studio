@@ -2,7 +2,6 @@
 
 Usage:
     python scripts/audit_tasks_prs.py
-    python scripts/audit_tasks_prs.py --visual-pilot --created-after 2026-06-01T00:00:00Z
 
 The script combines deployed orchestrator task state with GitHub PR metadata.
 It does not mutate tasks, branches, PRs, or repo state.
@@ -23,7 +22,6 @@ from blueprint_api import api, get_project_id, load_config
 
 ACTIVE_STATUSES = {"QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"}
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
-VISUAL_INFRA_SENTINEL = "VIEWPORT_GATE_INFRA_UNAVAILABLE"
 STATUSES = [
     "QUEUED",
     "PROVISIONING",
@@ -157,89 +155,6 @@ def _changed_files(task: dict[str, Any]) -> list[str]:
     return [str(path) for path in raw if path]
 
 
-def _touches_admin_ui(task: dict[str, Any]) -> bool:
-    return any(path == "admin-ui" or path.startswith("admin-ui/") or "/admin-ui/" in path for path in _changed_files(task))
-
-
-def _visual_entry(task: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
-    outcome = (task.get("context") or {}).get("_self_review_outcome") or task.get("self_review_outcome")
-    if isinstance(outcome, str):
-        try:
-            outcome = json.loads(outcome)
-        except json.JSONDecodeError:
-            return None, True
-    if not isinstance(outcome, dict):
-        return None, False
-    entry = outcome.get("visual_verification")
-    if entry is None and isinstance(outcome.get("check_results"), dict):
-        entry = outcome["check_results"].get("visual_verification")
-    return (entry, not isinstance(entry, dict)) if entry is not None else (None, False)
-
-
-def _intish(value: Any) -> int:
-    if isinstance(value, bool):
-        return int(value)
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _infra_occurrences(entry: dict[str, Any]) -> int:
-    raw = entry.get("infra_failures") or entry.get("infra_failure_occurrences")
-    if isinstance(raw, list):
-        return len(raw)
-    count = _intish(raw)
-    text = " ".join(str(entry.get(k, "")) for k in ("failure_class", "failure_reason", "issue", "evidence"))
-    return max(count, 1 if VISUAL_INFRA_SENTINEL in text or "viewport infra-unavailable" in text.lower() else 0)
-
-
-def _print_visual_pilot_report(tasks: list[dict[str, Any]], *, created_after: str | None, created_before: str | None) -> None:
-    before = _parse_iso(created_before)
-    completed = [t for t in tasks if t.get("status") == "COMPLETED"]
-    if before:
-        completed = [t for t in completed if (_parse_iso(t.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)) <= before]
-    admin_tasks = [t for t in completed if _touches_admin_ui(t)]
-    entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    malformed = 0
-    for task in admin_tasks:
-        entry, bad = _visual_entry(task)
-        malformed += int(bad)
-        if entry:
-            entries.append((task, entry))
-
-    pairs_inspected = sum(_intish(e.get("pairs_inspected")) for _, e in entries)
-    pairs_changed = sum(_intish(e.get("pairs_changed")) for _, e in entries)
-    infra_total = sum(_infra_occurrences(e) for _, e in entries)
-    caught = [(t, e) for t, e in entries if bool(e.get("caught_visual_issue"))]
-    start = _parse_iso(created_after) or min((_parse_iso(t.get("created_at")) for t, _ in entries), default=None)
-    days_elapsed = (datetime.now(timezone.utc) - start).days if start else 0
-    infra_rate = (infra_total / len(entries)) if entries else 0.0
-
-    print("=== Visual Verification Pilot Outcome ===")
-    print(f"Completed admin-ui-touching tasks scanned: {len(admin_tasks)}")
-    print(f"Tasks carrying visual_verification entries: {len(entries)}")
-    print(f"Malformed visual_verification entries skipped: {malformed}")
-    print(f"Pairs inspected/changed: {pairs_inspected} / {pairs_changed}")
-    print(f"Infra-failure occurrences (viewport infra-unavailable): {infra_total}")
-    print()
-    print("caught_visual_issue=true tasks")
-    if caught:
-        for task, entry in caught:
-            fix = entry.get("in_session_fix_followed", entry.get("fix_followed"))
-            if fix is None:
-                outcome = (task.get("context") or {}).get("_self_review_outcome")
-                fix = outcome.get("fixes_applied") if isinstance(outcome, dict) else None
-            print(f"- {str(task.get('id', ''))[:8]} {_task_pr_url(task)} fix_followed={fix if fix is not None else 'unknown'}")
-    else:
-        print("- none")
-    print()
-    print("Kill-Criterion Inputs")
-    print(f"- Window progress: {len(entries)} of 25 PR/tasks, {days_elapsed} of 42 days elapsed")
-    print(f"- Catches beyond assertion gates: {len(caught)}")
-    print(f"- Infra-failure rate: {infra_total}/{len(entries)} ({infra_rate:.1%})")
-
-
 def _task_line(task: dict[str, Any], width: int = 86) -> str:
     task_id = str(task.get("id", ""))[:8]
     status = task.get("status", "?")
@@ -348,10 +263,8 @@ def _classify_pr(pr: dict[str, Any], linked_tasks: list[dict[str, Any]]) -> str:
 
 def _args(argv: list[str] | None = None):
     parser = ArgumentParser(description="Read-only audit of Blueprint tasks and PRs.")
-    parser.add_argument("--visual-pilot", action="store_true", help="print only visual_verification pilot outcome aggregates")
     parser.add_argument("--created-after", help="ISO timestamp lower bound for task.created_at")
     parser.add_argument("--created-before", help="ISO timestamp upper bound for task.created_at")
-    parser.add_argument("--task-window", type=int, default=200, help="max completed task rows to scan in visual-pilot mode")
     return parser.parse_args(argv)
 
 
@@ -364,17 +277,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Project: {project_id}")
     print(f"Repo:    {repo}")
     print()
-
-    if args.visual_pilot:
-        # An upper bound needs the full completed-task stream so older matches
-        # are not truncated away before local filtering.
-        tasks = _fetch_tasks(
-            "COMPLETED",
-            created_after=args.created_after,
-            max_rows=None if args.created_before else args.task_window,
-        )
-        _print_visual_pilot_report(tasks, created_after=args.created_after, created_before=args.created_before)
-        return 0
 
     deploy = api("GET", "/api/admin/deploy-state")
     settings = api("GET", "/api/admin/settings")

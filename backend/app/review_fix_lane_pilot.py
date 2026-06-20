@@ -47,7 +47,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.time_utils import _utcnow
-from app.visual_verification_audit import VisualPilotAggregates, aggregate_visual_pilot
 
 # Canonical keys/constants are OWNED by the measurement subtask — import them
 # verbatim, never re-type the literals (a drifted key silently de-populates the
@@ -2012,58 +2011,6 @@ async def compute_lane_pilot_aggregates(
         else None
     )
 
-    # ── Per-arm visual-verification aggregates ───────────────────────────────
-    # Fetch the context + status columns needed by aggregate_visual_pilot().
-    # A separate query keeps the cost/merge query above unchanged and avoids
-    # fetching large context blobs into the already-complex chain-grouping loop.
-    vis_rows = (
-        await session.execute(
-            select(
-                Task.id, Task.status, Task.context, Task.created_at, _arm_expr
-            ).where(
-                Task.project_id == project_id,
-                Task.status.in_(
-                    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
-                ),
-                _arm_expr.in_(["lane", "control"]),
-            )
-        )
-    ).all()
-
-    lane_vis_tasks: list[dict[str, Any]] = []
-    control_vis_tasks: list[dict[str, Any]] = []
-    for _task_id, status_val, ctx_val, created_at_val, arm_val in vis_rows:
-        arm = str(arm_val) if arm_val is not None else None
-        if arm not in ("lane", "control"):
-            continue
-        task_dict: dict[str, Any] = {
-            "status": str(status_val) if status_val is not None else None,
-            "context": ctx_val if isinstance(ctx_val, dict) else {},
-            "created_at": (
-                created_at_val.isoformat() if created_at_val is not None else None
-            ),
-        }
-        if arm == "lane":
-            lane_vis_tasks.append(task_dict)
-        else:
-            control_vis_tasks.append(task_dict)
-
-    def _vis_agg_to_dict(agg: VisualPilotAggregates) -> dict[str, Any]:
-        return {
-            "admin_task_count": agg.admin_task_count,
-            "entry_count": agg.entry_count,
-            "malformed_count": agg.malformed_count,
-            "pairs_inspected": agg.pairs_inspected,
-            "pairs_changed": agg.pairs_changed,
-            "infra_total": agg.infra_total,
-            "infra_rate": agg.infra_rate,
-            "caught_count": len(agg.caught),
-            "days_elapsed": agg.days_elapsed,
-        }
-
-    lane_visual = _vis_agg_to_dict(aggregate_visual_pilot(lane_vis_tasks))
-    control_visual = _vis_agg_to_dict(aggregate_visual_pilot(control_vis_tasks))
-
     return {
         "n_lane": n_lane,
         "n_control": n_control,
@@ -2084,8 +2031,6 @@ async def compute_lane_pilot_aggregates(
         "warm_resume_fraction": warm_resume_fraction,
         "checkpoint_fraction": checkpoint_fraction,
         "lane_fix_tasks_sampled": lane_fix_tasks_sampled,
-        "lane_visual": lane_visual,
-        "control_visual": control_visual,
     }
 
 
