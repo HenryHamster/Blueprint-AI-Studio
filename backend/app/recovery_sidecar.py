@@ -85,7 +85,6 @@ async def _sweep_stranded_sidecar_sources() -> None:
                         _sidecar_uuids_to_fetch.append(_uuid.UUID(str(_ref)))
                     except (ValueError, TypeError):
                         continue
-                    break
             sidecars_by_id: dict = {}
             if _sidecar_uuids_to_fetch:
                 _sidecar_rows = await session.execute(

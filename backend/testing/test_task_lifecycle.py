@@ -9557,6 +9557,90 @@ async def test_sweep_stranded_skips_non_terminal_sidecar(tl_db, mocker):
     )
 
 
+@pytest.mark.asyncio
+async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
+    """A multi-lane source with a dead sidecar in a non-first _AWAITING_SIDECAR_KEYS
+    slot must be detected and resolved by _sweep_stranded_sidecar_sources.
+
+    Previously a `break` in the pre-fetch loop caused only the first matching key
+    per source to have its UUID collected; the second key's sidecar was never loaded
+    so sidecars_by_id.get() returned None and the source stayed EVALUATING forever.
+    """
+    from app.services import _sweep_stranded_sidecar_sources
+    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
+
+    session, Session = tl_db
+    mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.task_completion._maybe_release_safeguard_gate",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
+    )
+
+    project = await _make_project(session)
+
+    # Create a live (IN_PROGRESS) sidecar for the FIRST awaiting key (quality_grader).
+    # Its UUID will be collected; since it's not terminal the source stays EVALUATING
+    # for that lane — this is by design.
+    live_grader = Task(
+        project_id=project.id,
+        payloads=[{"type": "investigate", "prompt": "grade", "base_branch": "main"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(live_grader)
+    await session.commit()
+    await session.refresh(live_grader)
+
+    # Source task — EVALUATING with TWO awaiting keys.
+    source = Task(
+        project_id=project.id,
+        payloads=[{"type": "security_audit", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(source)
+    await session.commit()
+    await session.refresh(source)
+
+    # Create a FAILED sidecar for the SECOND awaiting key (safeguard_challenge).
+    dead_challenge = Task(
+        project_id=project.id,
+        payloads=[{"type": "investigate", "prompt": "assess", "base_branch": "main"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(source.id)},
+        latest_status_message="Reaper killed",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(dead_challenge)
+    await session.commit()
+    await session.refresh(dead_challenge)
+
+    # Wire source context: first key has a live sidecar, second has the dead one.
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    source.context = {
+        "awaiting_quality_grader": str(live_grader.id),
+        "awaiting_safeguard_challenge": str(dead_challenge.id),
+    }
+    _flag_modified(source, "context")
+    session.add(source)
+    await session.commit()
+
+    await _sweep_stranded_sidecar_sources()
+
+    await session.refresh(source)
+    assert source.status != TaskStatus.EVALUATING, (
+        "source must not remain EVALUATING after sweep detects the dead non-first sidecar"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Adversarial Gate Challenger Provenance
 #
