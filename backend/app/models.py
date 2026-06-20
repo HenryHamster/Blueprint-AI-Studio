@@ -2528,7 +2528,7 @@ class OrchestratorErrorAck(SQLModel, table=True):
     key: str = Field(primary_key=True, max_length=255)
     acknowledged_at: datetime = Field(
         default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=False),
+        sa_column=Column(NaiveUTCDateTime, nullable=False, index=True),
     )
     acknowledged_by: str = Field(default="")
 

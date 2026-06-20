@@ -253,9 +253,9 @@ async def _load_acknowledgements(session: AsyncSession) -> Dict[str, datetime]:
     """Return all persisted error-bucket acknowledgements as a key→datetime map."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=90)
     result = await session.execute(
-        select(OrchestratorErrorAck).where(
-            OrchestratorErrorAck.acknowledged_at >= cutoff
-        )
+        select(OrchestratorErrorAck)
+        .where(OrchestratorErrorAck.acknowledged_at >= cutoff)
+        .limit(500)
     )
     return {row.key: row.acknowledged_at for row in result.scalars().all()}
 
