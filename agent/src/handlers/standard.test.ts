@@ -725,10 +725,7 @@ describe('pre-implementation analysis note', () => {
     expect(prompt).toContain('## Pre-Implementation Analysis');
     expect(prompt).toContain('[Analysis truncated at 32000 chars');
     expect(prompt).not.toContain(overCapSentinel);
-    expect(vi.mocked(sendLog)).toHaveBeenCalledWith(
-      null,
-      expect.stringContaining('WARNING: analysis result'),
-    );
+    expectCalledWith(sendLog, null, expect.stringContaining('WARNING: analysis result'));
   });
 
   it('does not truncate or warn for sub-cap analysis on fresh-analysis path', async () => {
@@ -769,10 +766,7 @@ describe('pre-implementation analysis note', () => {
     expect(prompt).toContain('## Pre-Implementation Analysis');
     expect(prompt).toContain('[Analysis truncated at 32000 chars');
     expect(prompt).not.toContain(overCapSentinel);
-    expect(vi.mocked(sendLog)).toHaveBeenCalledWith(
-      null,
-      expect.stringContaining('WARNING: analysis result'),
-    );
+    expectCalledWith(sendLog, null, expect.stringContaining('WARNING: analysis result'));
   });
 
   it('does not truncate or warn when _previous_analysis_plan is within cap on reuse path', async () => {
