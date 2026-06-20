@@ -275,6 +275,37 @@ describe('format-compliance telemetry', () => {
   });
 });
 
+describe('format-compliance telemetry — repair miss by schema', () => {
+  it('recordFormatRepairMiss with schemaLabel fills format_repair_miss_by_schema', () => {
+    recordFormatRepairMiss('no_json_start', 'thinker');
+    recordFormatRepairMiss('malformed_json', 'thinker');
+    recordFormatRepairMiss('unbalanced_json', 'audit');
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_miss_by_schema).toEqual({ thinker: 2, audit: 1 });
+    expect(tel.format_repair_miss_by_reason).toEqual({ no_json_start: 1, malformed_json: 1, unbalanced_json: 1 });
+  });
+
+  it('calls without schemaLabel do not create per-schema entries but still update format_repair_miss_by_reason', () => {
+    recordFormatRepairMiss('malformed_json');
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_repair_miss_by_reason).toEqual({ malformed_json: 1 });
+    expect(tel.format_repair_miss_by_schema).toEqual({});
+  });
+
+  it('reset clears format_repair_miss_by_schema', () => {
+    recordFormatRepairMiss('no_json_start', 'thinker');
+    resetFormatComplianceTelemetry();
+    expect(getFormatComplianceTelemetry().format_repair_miss_by_schema).toEqual({});
+  });
+
+  it('format_repair_miss_by_schema snapshot is a copy — mutating it does not affect internal state', () => {
+    recordFormatRepairMiss('unbalanced_json', 'memo');
+    const snap = getFormatComplianceTelemetry();
+    (snap.format_repair_miss_by_schema as Record<string, number>)['memo'] = 999;
+    expect(getFormatComplianceTelemetry().format_repair_miss_by_schema).toEqual({ memo: 1 });
+  });
+});
+
 describe('format-compliance telemetry — schema dimension', () => {
   it('records_format_compliance_by_schema_without_losing_totals', () => {
     // This is the named acceptance test: schema-bucketed events must accumulate

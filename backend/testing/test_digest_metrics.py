@@ -5881,6 +5881,51 @@ def test_per_schema_repair_miss_aggregated():
     assert by_schema["memo"]["repair_miss"] == 1
 
 
+def test_format_repair_miss_by_schema_missing_key_contributes_zero():
+    """Tasks lacking format_repair_miss_by_schema contribute to reason totals only."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 0,
+                "format_repair_miss_by_reason": {"malformed_json": 1},
+                "format_repair_attempts_by_schema": {"thinker": 1},
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    by_schema = overall["by_schema"]
+
+    # thinker appears because of repair_attempts_by_schema, but repair_miss should be 0
+    assert "thinker" in by_schema
+    assert by_schema["thinker"]["repair_miss"] == 0
+    assert overall["format_repair_miss_by_reason"] == {"malformed_json": 1}
+
+
+def test_format_repair_miss_by_schema_in_schema_entry():
+    """by_schema entries for schemas with repair-miss data expose the repair_miss field."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 3,
+                "format_repair_attempts": 3,
+                "format_repair_successes": 1,
+                "format_repair_attempts_by_schema": {"thinker": 3},
+                "format_repair_successes_by_schema": {"thinker": 1},
+                "format_repair_miss_by_schema": {"thinker": 2},
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    thinker = overall["by_schema"]["thinker"]
+    assert thinker["repair_miss"] == 2
+    assert thinker["repair_attempts"] == 3
+    assert thinker["repair_successes"] == 1
+
+
 def _fc_clean(task_type="create"):
     """Task with a clean (well-formed) format_compliance_summary."""
     return _fc_task(
