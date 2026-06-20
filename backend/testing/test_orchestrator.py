@@ -3239,14 +3239,27 @@ class TestBatchedDepRowsSurviveCommit:
         await db_session.commit()
         await db_session.refresh(candidate)
 
-        # Mirror the orchestrator: batch-fetch dep rows in a SEPARATE session,
-        # build the lookup dict, then DETACH them.
+        # Mirror the orchestrator: batch-fetch dep rows in a SEPARATE session
+        # with the same load_only projection, build the lookup dict, then DETACH.
+        from sqlalchemy.orm import load_only as _load_only
+
         dep_by_id = {}
         async with AsyncSessionLocal() as dep_batch_session:
             rows = (
                 (
                     await dep_batch_session.execute(
-                        select(Task).where(Task.id.in_([dep.id]))
+                        select(Task)
+                        .where(Task.id.in_([dep.id]))
+                        .options(
+                            _load_only(
+                                Task.id,
+                                Task.status,
+                                Task.context,
+                                Task.payloads,
+                                Task.project_id,
+                                raiseload=True,
+                            )
+                        )
                     )
                 )
                 .scalars()
@@ -3262,8 +3275,8 @@ class TestBatchedDepRowsSurviveCommit:
         await db_session.commit()
 
         # Reading status / context / first_payload on the detached dep row must
-        # NOT raise (DetachedInstanceError / MissingGreenlet) — every column was
-        # loaded by the full select(Task) above.
+        # NOT raise (DetachedInstanceError / MissingGreenlet) — projected columns
+        # are cached and accessible on the detached instance.
         detached_dep = dep_by_id[dep.id]
         assert detached_dep.status == TaskStatus.COMPLETED
         assert detached_dep.first_payload.get("type") == "research"
@@ -3281,6 +3294,135 @@ class TestBatchedDepRowsSurviveCommit:
         assert result == "eligible", (
             f"COMPLETED same-base research dep should be eligible, got {result!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_dep_batch_create_type_verify_accesses_project_id(self, db_session):
+        """A COMPLETED create-type dep whose verify callback reads task.project_id
+        must not raise InvalidRequestError — project_id must be in the load_only set.
+
+        This guards the regression where the dep-batch projection omitted project_id
+        and _verify_pr_merged (the create-type verify callback) hit raiseload on the
+        GitHub-API fallback path (rollup_pr_verification.py:315, 325-326, 399-400).
+        """
+        from sqlalchemy.orm import load_only as _load_only
+        from sqlmodel import select
+        from app.database import AsyncSessionLocal
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = make_project(name="Create Dep ProjID", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # A COMPLETED create-type dependency (same base branch).
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "create dep"}],
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        candidate = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "cand"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(candidate)
+        await db_session.commit()
+        await db_session.refresh(candidate)
+
+        # Mirror the orchestrator dep-batch fetch with the full projection
+        # (including project_id, which _verify_pr_merged reads on detached rows).
+        dep_by_id = {}
+        async with AsyncSessionLocal() as dep_batch_session:
+            rows = (
+                (
+                    await dep_batch_session.execute(
+                        select(Task)
+                        .where(Task.id.in_([dep.id]))
+                        .options(
+                            _load_only(
+                                Task.id,
+                                Task.status,
+                                Task.context,
+                                Task.payloads,
+                                Task.project_id,
+                                raiseload=True,
+                            )
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            dep_by_id = {dt.id: dt for dt in rows}
+            dep_batch_session.expunge_all()
+
+        detached_dep = dep_by_id[dep.id]
+        # project_id must be accessible on the detached row — no InvalidRequestError.
+        assert detached_dep.project_id == project.id, (
+            "project_id must be loaded by the dep-batch projection; "
+            "raiseload=True will raise InvalidRequestError if it is missing."
+        )
+
+        # Verify callback that reads task.project_id (simulates the fallback path
+        # in _verify_pr_merged when context['pr_merged'] is absent/False).
+        accessed_project_ids = []
+
+        async def _verify_reads_project_id(task, _session):
+            accessed_project_ids.append(task.project_id)
+            return True
+
+        dep_tasks = [dep_by_id[dep.id]]
+        result, _ = await _check_candidate_task_deps(
+            candidate, dep_tasks, [dep.id], db_session, _verify_reads_project_id
+        )
+        assert result == "eligible", (
+            f"COMPLETED create-type dep should be eligible, got {result!r}"
+        )
+        # The verify callback must have been called and project_id accessible.
+        assert accessed_project_ids, "verify callback was never invoked"
+        assert all(pid == project.id for pid in accessed_project_ids), (
+            f"verify callback read wrong project_id: {accessed_project_ids}"
+        )
+
+    def test_dep_batch_projection_excludes_heavy_columns(self):
+        """The dep-batch load_only must exclude plan_output/status_log/depends_on
+        and retain status/context/payloads needed by _check_candidate_task_deps."""
+        from sqlalchemy.dialects import postgresql
+        from sqlalchemy.orm import load_only as _load_only
+        from sqlmodel import select
+
+        stmt = (
+            select(Task)
+            .where(Task.id.in_([]))
+            .options(
+                _load_only(
+                    Task.id,
+                    Task.status,
+                    Task.context,
+                    Task.payloads,
+                    Task.project_id,
+                    raiseload=True,
+                )
+            )
+        )
+        sql_text = str(stmt.compile(dialect=postgresql.dialect()))
+
+        for heavy in ("plan_output", "status_log", "depends_on"):
+            assert heavy not in sql_text, (
+                f"Dep-batch projection must exclude '{heavy}' — "
+                "re-adding it reintroduces the over-fetch this projection removes."
+            )
+        for required in ("status", "context", "payloads", "project_id"):
+            assert required in sql_text, (
+                f"Dep-batch projection must include '{required}' — "
+                "removing it will cause DetachedInstanceError in _check_candidate_task_deps."
+            )
 
     def test_collect_dep_uuids_dedupes_and_skips_malformed(self):
         from app.orchestrator_filters import collect_dep_uuids
@@ -8181,7 +8323,14 @@ class TestCloudRunDispatch:
             # provision branch (no env LLM keys in CI).
             mocker.patch(
                 "app.orchestrator._resolve_env_runtime_fallback",
-                return_value=("fake-api-key", "anthropic", "api_key", "claude-opus-4-8", None, {}),
+                return_value=(
+                    "fake-api-key",
+                    "anthropic",
+                    "api_key",
+                    "claude-opus-4-8",
+                    None,
+                    {},
+                ),
             )
 
             async with orch_warm_db() as session:
@@ -8256,7 +8405,14 @@ class TestCloudRunDispatch:
         # provision branch (no env LLM keys in CI).
         mocker.patch(
             "app.orchestrator._resolve_env_runtime_fallback",
-            return_value=("fake-api-key", "anthropic", "api_key", "claude-opus-4-8", None, {}),
+            return_value=(
+                "fake-api-key",
+                "anthropic",
+                "api_key",
+                "claude-opus-4-8",
+                None,
+                {},
+            ),
         )
 
         async with orch_warm_db() as session:
@@ -8319,7 +8475,14 @@ class TestCloudRunDispatch:
             # provision branch (no env LLM keys in CI).
             mocker.patch(
                 "app.orchestrator._resolve_env_runtime_fallback",
-                return_value=("fake-api-key", "anthropic", "api_key", "claude-opus-4-8", None, {}),
+                return_value=(
+                    "fake-api-key",
+                    "anthropic",
+                    "api_key",
+                    "claude-opus-4-8",
+                    None,
+                    {},
+                ),
             )
 
             async with orch_warm_db() as session:

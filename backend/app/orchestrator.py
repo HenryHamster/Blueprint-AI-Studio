@@ -2617,8 +2617,8 @@ async def orchestrator_worker():
                 # session; loading the dep rows in their own session and detaching
                 # them keeps their already-loaded column values (status / context /
                 # payloads, read via first_payload) intact for the downstream
-                # ``_check_candidate_task_deps`` reads — a full ``select(Task)``
-                # (no load_only) loads every column, so reading them on a detached
+                # ``_check_candidate_task_deps`` reads — load_only projects exactly
+                # the columns those reads need, so accessing them on the detached
                 # instance returns the cached value rather than firing a sync
                 # lazy-load → MissingGreenlet (the rollback-expiry / detached-read
                 # trap in reference_load_only_lazy_load_trap.md). The
@@ -2632,11 +2632,29 @@ async def orchestrator_worker():
 
                 _dep_by_id: dict[uuid.UUID, Task] = {}
                 if _all_dep_uuids:
+                    # Column projection for the dep batch: _check_candidate_task_deps
+                    # reads status, context (_replaced_by_task_id / has_landed_signal /
+                    # is_genuine_code_dependency / verify_pr_merged), and payloads
+                    # (first_payload for _same_base_branch + task-type checks).
+                    # Drops plan_output / status_log / depends_on and other heavy JSONB.
+                    # Rows are detached (expunge_all) so loaded columns remain accessible
+                    # without triggering async lazy-loads (MissingGreenlet). raiseload=True
+                    # catches accidental projection-widening during development.
+                    _dep_light = load_only(
+                        Task.id,
+                        Task.status,
+                        Task.context,
+                        Task.payloads,
+                        Task.project_id,
+                        raiseload=True,
+                    )
                     async with AsyncSessionLocal() as _dep_batch_session:
                         _dep_rows = (
                             (
                                 await _dep_batch_session.execute(
-                                    select(Task).where(Task.id.in_(_all_dep_uuids))
+                                    select(Task)
+                                    .where(Task.id.in_(_all_dep_uuids))
+                                    .options(_dep_light)
                                 )
                             )
                             .scalars()
