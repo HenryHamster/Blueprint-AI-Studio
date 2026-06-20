@@ -23669,3 +23669,91 @@ async def test_admin_viewport_shots_download_url_firebase_user_returns_json(
     )
     assert resp.status_code == 200
     assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_sr_analytics_sibling_isolation_after_rollback(
+    client: AsyncClient, db_session, mocker
+):
+    """A rollback in one SR-analytics call must not poison sibling calls.
+
+    Regression: when compute_review_effectiveness raised and triggered
+    session.rollback(), the shared high_iter_rows ORM objects were expired.
+    Sibling calls (compute_sr_false_attestation_trends, etc.) then accessed
+    expired attributes, hitting MissingGreenlet / raiseload=True failures.
+
+    With the fix (expunge before analytics block), the rows are detached before
+    any analytics call so rollbacks cannot expire their loaded attributes.
+    """
+    project = Project(name="SR Sibling Isolation", user_id="test-user-sr-sib")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # History task with identifiable context data the sibling call will read.
+    history_task = Task(
+        project_id=project.id,
+        title="Past create task",
+        payloads=[{"type": "create", "prompt": "Build something"}],
+        vm_instance_id="agent-vm-sr-sib-history",
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {
+                "check_results": {
+                    "regression_risk": {"passed": True, "severity": "major"},
+                }
+            }
+        },
+    )
+    db_session.add(history_task)
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Claim SR sibling test",
+        payloads=[{"type": "create", "prompt": "Create something"}],
+        vm_instance_id="agent-vm-sr-sib-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    # Patch the FIRST analytics function to raise, triggering session.rollback().
+    mocker.patch(
+        "app.review_learning.compute_review_effectiveness",
+        side_effect=RuntimeError("simulated first-analytics failure"),
+    )
+
+    # Capture the all_tasks argument received by a SIBLING analytics call.
+    captured_all_tasks: list = []
+
+    async def _capture_and_return(project_id, session, all_tasks):
+        captured_all_tasks.extend(all_tasks)
+        return None
+
+    mocker.patch(
+        "app.sr_analytics.compute_sr_false_attestation_trends",
+        side_effect=_capture_and_return,
+    )
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-sr-sib-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    # Sibling analytics must have been called with at least the history task.
+    assert len(captured_all_tasks) >= 1, (
+        "compute_sr_false_attestation_trends was never called — "
+        "sibling may have raised before reaching this point"
+    )
+
+    # All captured rows must have intact, readable attributes — not expired ORM
+    # objects that would raise on attribute access (MissingGreenlet / raiseload).
+    for t in captured_all_tasks:
+        ctx = t.context  # must not raise
+        fp = t.first_payload  # accesses t.payloads (load_only'd) — must not raise
+        assert isinstance(ctx, (dict, type(None))), (
+            f"context is not a dict/None after sibling rollback: {type(ctx)}"
+        )
+        assert isinstance(fp, dict), (
+            f"first_payload is not a dict after sibling rollback: {type(fp)}"
+        )

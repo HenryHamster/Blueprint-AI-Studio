@@ -1268,6 +1268,15 @@ async def claim_task(
                     history_artifact
                 )
         history_tasks_rows = [history_tasks_by_id[tid] for tid in history_task_order]
+        # Detach history rows from the session so that a session.rollback() in
+        # one SR-analytics error handler cannot expire the already-loaded
+        # attributes and cascade MissingGreenlet lazy-load failures into sibling
+        # analytics calls (C1 rollback-on-swallow discipline; incident
+        # 2026-05-29, reference_load_only_lazy_load_trap).  All columns
+        # required by the SR functions are covered by _history_loadonly, so
+        # detached objects are fully readable.
+        for _hr in history_tasks_rows:
+            session.expunge(_hr)
 
         from app.failure_classification import classify_failure
 
