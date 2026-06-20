@@ -3063,8 +3063,10 @@ from sqlmodel import select as _sql_select  # noqa: E402
 
 from app.efficiency_snapshot import (  # noqa: E402
     LAST_ALERTED_PAYOFF_KEY,
+    LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY,
     POOL_PAYOFF_PROVEN_MIN_WARM_STARTS,
     maybe_alert_pool_payoff_transition,
+    maybe_alert_self_repair_burn_share,
 )
 from app.models import Alert, AlertSeverity  # noqa: E402
 from app.shared_state import runtime_config as _runtime_config  # noqa: E402
@@ -7295,3 +7297,125 @@ async def test_self_repair_burn_share_zero_clean_attempts_suppresses_drift(db_se
     # clean_attempts = repair_attempts - infra_failures = 3 - 3 = 0 < SELF_REPAIR_MIN_ATTEMPTS
     # → drift suppressed
     assert sr_axis.get("drift_pct") is None
+
+
+async def _self_repair_burn_share_alerts(db_session, project_id):
+    """Fetch self-repair burn-share alerts for a project."""
+    stmt = _sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title.contains("Self-repair token overhead"),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
+    """Alert fires when self_repair_burn_share exceeds threshold.
+
+    Verify that:
+    1. An alert fires when repair burn-share crosses above the threshold
+    2. The alert contains the numeric values (current burn share, threshold)
+    3. A second call at the same level dedupes (one alert only)
+    4. Recovery below threshold re-arms the alert
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    # Create a project with merged tasks. Repair burn-share is:
+    # (repair_input_tokens + repair_output_tokens) / (total_input + total_output)
+    # We'll create tasks such that burn-share exceeds the 0.20 (20%) threshold.
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with high repair overhead: 3000 repair tokens out of 10000 total = 30%
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 7000,
+            "total_output_tokens": 3000,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 5,
+            "format_repair_attempts": 5,
+            "format_repair_successes": 3,
+            "format_repair_infra_failures": 0,
+            "format_repair_input_tokens": 2000,  # repair tokens contribute to burn_share
+            "format_repair_output_tokens": 1000,  # total repair = 3000 tokens
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # First alert: burn-share at 30%, exceeds 20% threshold
+    fired = await maybe_alert_self_repair_burn_share(db_session, project.id)
+    assert fired is True
+
+    alerts = await _self_repair_burn_share_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "Self-repair token overhead" in alerts[0].title
+    # The message should contain percentages for operator context
+    assert "30.0%" in alerts[0].message  # current burn share
+    assert "20.0%" in alerts[0].message  # threshold
+
+    # Verify the marker was set to "elevated"
+    await db_session.refresh(project)
+    marker = project.design_doc.get(DESIGN_DOC_KEY, {}).get(
+        LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY
+    )
+    assert marker == "elevated"
+
+    # Second alert at same level: deduped (one alert only)
+    fired2 = await maybe_alert_self_repair_burn_share(db_session, project.id)
+    assert fired2 is None  # no new alert fired
+
+    alerts = await _self_repair_burn_share_alerts(db_session, project.id)
+    assert len(alerts) == 1  # still only one alert
+
+    # Now simulate recovery: replace task with one that has lower burn-share
+    # New burn-share: 500 repair tokens out of 10000 total = 5% (below 20%)
+    stmt = _sql_select(type(task)).where(type(task).id == task.id)
+    old_task = (await db_session.execute(stmt)).scalar_one_or_none()
+    if old_task:
+        await db_session.delete(old_task)
+    await db_session.commit()
+
+    task_recovered = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 9000,
+            "total_output_tokens": 1000,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 1,
+            "format_repair_attempts": 1,
+            "format_repair_successes": 1,
+            "format_repair_infra_failures": 0,
+            "format_repair_input_tokens": 300,
+            "format_repair_output_tokens": 200,
+        },
+    )
+    db_session.add(task_recovered)
+    await db_session.commit()
+
+    # Alert should not fire while below threshold
+    fired3 = await maybe_alert_self_repair_burn_share(db_session, project.id)
+    assert fired3 is None  # marker advanced to "healthy", no alert
+
+    # Verify the marker was set to "healthy"
+    await db_session.refresh(project)
+    marker = project.design_doc.get(DESIGN_DOC_KEY, {}).get(
+        LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY
+    )
+    assert marker == "healthy"

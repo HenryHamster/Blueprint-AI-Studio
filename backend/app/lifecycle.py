@@ -688,6 +688,7 @@ async def lifespan(app):
         from app.efficiency_snapshot import (
             SNAPSHOT_INTERVAL_SECONDS,
             maybe_alert_pool_payoff_transition,
+            maybe_alert_self_repair_burn_share,
             maybe_alert_unpriced_models_coverage,
             maybe_write_daily_snapshot,
         )
@@ -764,6 +765,29 @@ async def lifespan(app):
                                 "error=%s",
                                 project_id,
                                 unpriced_exc,
+                            )
+                        # Self-repair burn-share alert: same hourly tick, edge-
+                        # triggered, so elevated repair token overhead pages the
+                        # operator instead of silently degrading efficiency. Best-
+                        # effort — isolated try/except + commit.
+                        try:
+                            repair_fired = await maybe_alert_self_repair_burn_share(
+                                scan_session, project_id
+                            )
+                            await scan_session.commit()
+                            if repair_fired:
+                                logger.info(
+                                    "[EFFICIENCY_SNAPSHOT] project=%s "
+                                    "self-repair-burn-share alert fired",
+                                    project_id,
+                                )
+                        except Exception as repair_exc:
+                            await scan_session.rollback()
+                            logger.warning(
+                                "[EFFICIENCY_SNAPSHOT] project=%s "
+                                "self-repair-burn-share alert error=%s",
+                                project_id,
+                                repair_exc,
                             )
             except asyncio.CancelledError:
                 raise

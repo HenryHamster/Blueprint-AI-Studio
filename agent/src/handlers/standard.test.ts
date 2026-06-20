@@ -714,8 +714,8 @@ describe('pre-implementation analysis note', () => {
     vi.clearAllMocks();
     const underCapSentinel = 'UNDER_CAP_SENTINEL';
     const overCapSentinel = 'OVER_CAP_SENTINEL';
-    // Build a string that exceeds 32000 chars; place sentinel past the cap
-    const analysisResult = underCapSentinel + 'x'.repeat(32000) + overCapSentinel;
+    // Build a string that exceeds 16000 chars; place sentinel past the cap
+    const analysisResult = underCapSentinel + 'x'.repeat(16000) + overCapSentinel;
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: '', lastResultText: analysisResult,
     });
@@ -723,7 +723,7 @@ describe('pre-implementation analysis note', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prompt = capturedPrompt();
     expect(prompt).toContain('## Pre-Implementation Analysis');
-    expect(prompt).toContain('[Analysis truncated at 32000 chars');
+    expect(prompt).toContain('[Analysis truncated at 16000 chars');
     expect(prompt).not.toContain(overCapSentinel);
     expectCalledWith(sendLog, null, expect.stringContaining('WARNING: analysis result'));
   });
@@ -751,8 +751,8 @@ describe('pre-implementation analysis note', () => {
     vi.clearAllMocks();
     const underCapSentinel = 'UNDER_CAP_SENTINEL';
     const overCapSentinel = 'OVER_CAP_SENTINEL';
-    // Build a stored plan that exceeds 32000 chars; sentinel past the cap should be excluded.
-    const priorPlan = underCapSentinel + 'x'.repeat(32000) + overCapSentinel;
+    // Build a stored plan that exceeds 16000 chars; sentinel past the cap should be excluded.
+    const priorPlan = underCapSentinel + 'x'.repeat(16000) + overCapSentinel;
     const task = {
       title: 'Task',
       description: '',
@@ -764,7 +764,7 @@ describe('pre-implementation analysis note', () => {
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
     const prompt = capturedPrompt();
     expect(prompt).toContain('## Pre-Implementation Analysis');
-    expect(prompt).toContain('[Analysis truncated at 32000 chars');
+    expect(prompt).toContain('[Analysis truncated at 16000 chars');
     expect(prompt).not.toContain(overCapSentinel);
     expectCalledWith(sendLog, null, expect.stringContaining('WARNING: analysis result'));
   });

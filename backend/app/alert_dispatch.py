@@ -1085,6 +1085,72 @@ async def _maybe_create_unpriced_models_alert(
     )
 
 
+_SELF_REPAIR_BURN_SHARE_ALERT_TITLE_PREFIX = "Self-repair token overhead"
+
+
+async def _maybe_create_self_repair_burn_share_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    burn_share: float,
+    threshold: float,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> None:
+    """Create a deduplicated operator Alert when a project's self-repair burn-share
+    exceeds the efficiency ceiling.
+
+    Self-repair tokens (reopen attempts during structured-output format recovery)
+    represent overhead that reduces LLM productivity. When repair tokens consume
+    an excessive fraction of total LLM tokens, it signals a drift in repair
+    effectiveness and warrants investigation of the underlying failure patterns.
+    This alert informs the operator without requiring manual polling of metrics.
+
+    Deduplicated by ``(project_id, title, dismissed_at IS NULL)`` on a STABLE
+    title — so an elevated burn-share that persists across many snapshot ticks
+    raises exactly ONE alert per project. The current burn-share value lives in
+    the message so the metric is visible without polling. Caller owns the
+    transition-edge gating; this helper only enforces title-level dedup and
+    commits its own ``Alert`` row.
+    """
+    title = f"{_SELF_REPAIR_BURN_SHARE_ALERT_TITLE_PREFIX} on project {str(project_id)[:8]}"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    burn_share_pct = (burn_share * 100) if burn_share is not None else 0.0
+    threshold_pct = threshold * 100
+    message = (
+        f"Self-repair tokens consumed {burn_share_pct:.1f}% of total LLM tokens, "
+        f"exceeding the efficiency ceiling of {threshold_pct:.1f}%. High repair "
+        f"overhead indicates multiple format-recovery attempts are required; "
+        f"investigate whether recent prompt or schema changes have degraded "
+        f"structured-output success rates."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=severity,
+        title=title,
+        message=message,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+
+
 async def _maybe_create_precondition_blocker_alert(
     task: "Task",
     session: AsyncSession,
