@@ -6167,6 +6167,103 @@ class TestNotificationConfigSettings:
             _app.dependency_overrides.pop(_ra, None)
 
 
+class TestEvergreenFillSettingsPersist:
+    """evergreen_fill_* runtime knobs persist to DeploymentState.runtime_config_json
+    and are restored by sync_runtime_config_from_state so every instance converges."""
+
+    @pytest.mark.asyncio
+    async def test_evergreen_fill_mode_persists_and_restores(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH evergreen_fill_mode=observe writes to runtime_config_json;
+        sync_runtime_config_from_state restores it on a fresh in-memory config."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "evergreen_fill_mode": "observe",
+                "evergreen_fill_interval_minutes": 30,
+                "evergreen_fill_util_threshold": 0.6,
+                "evergreen_fill_min_free_slots": 3,
+                "evergreen_fill_max_active": 2,
+                "evergreen_fill_daily_cap": 5,
+                "evergreen_fill_deferred_memo_enrollment": True,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        # GET /settings returns the updated values
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["evergreen_fill_mode"] == "observe"
+        assert body["evergreen_fill_interval_minutes"] == 30
+        assert body["evergreen_fill_util_threshold"] == 0.6
+        assert body["evergreen_fill_min_free_slots"] == 3
+        assert body["evergreen_fill_max_active"] == 2
+        assert body["evergreen_fill_daily_cap"] == 5
+        assert body["evergreen_fill_deferred_memo_enrollment"] is True
+
+        # Values are persisted to DeploymentState.runtime_config_json
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        assert row.runtime_config_json["evergreen_fill_mode"] == "observe"
+        assert row.runtime_config_json["evergreen_fill_interval_minutes"] == 30
+        assert row.runtime_config_json["evergreen_fill_util_threshold"] == 0.6
+        assert row.runtime_config_json["evergreen_fill_min_free_slots"] == 3
+        assert row.runtime_config_json["evergreen_fill_max_active"] == 2
+        assert row.runtime_config_json["evergreen_fill_daily_cap"] == 5
+        assert (
+            row.runtime_config_json["evergreen_fill_deferred_memo_enrollment"] is True
+        )
+
+        # Config-sync restore applies persisted values to a fresh in-memory config
+        _shared_state.runtime_config["evergreen_fill_mode"] = "off"
+        _shared_state.runtime_config["evergreen_fill_interval_minutes"] = 15
+        _shared_state.runtime_config["evergreen_fill_util_threshold"] = 0.5
+        _shared_state.runtime_config["evergreen_fill_min_free_slots"] = 2
+        _shared_state.runtime_config["evergreen_fill_max_active"] = 1
+        _shared_state.runtime_config["evergreen_fill_daily_cap"] = 3
+        _shared_state.runtime_config["evergreen_fill_deferred_memo_enrollment"] = False
+
+        await sync_runtime_config_from_state(row)
+
+        assert _shared_state.runtime_config["evergreen_fill_mode"] == "observe"
+        assert _shared_state.runtime_config["evergreen_fill_interval_minutes"] == 30
+        assert _shared_state.runtime_config["evergreen_fill_util_threshold"] == 0.6
+        assert _shared_state.runtime_config["evergreen_fill_min_free_slots"] == 3
+        assert _shared_state.runtime_config["evergreen_fill_max_active"] == 2
+        assert _shared_state.runtime_config["evergreen_fill_daily_cap"] == 5
+        assert (
+            _shared_state.runtime_config["evergreen_fill_deferred_memo_enrollment"]
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_evergreen_fill_mode_junk_falls_back(
+        self, client: AsyncClient, db_session
+    ):
+        """Junk value in runtime_config_json for evergreen_fill_mode is ignored on restore."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        state = DeploymentState()
+        state.runtime_config_json = {"evergreen_fill_mode": "invalid_junk"}
+        db_session.add(state)
+        await db_session.commit()
+
+        _shared_state.runtime_config["evergreen_fill_mode"] = "off"
+        await sync_runtime_config_from_state(state)
+        # Junk value is ignored — original default survives
+        assert _shared_state.runtime_config["evergreen_fill_mode"] == "off"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # dispatch_external_notification — webhook dispatch logic
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -15077,13 +15174,17 @@ class TestRecordFindingResolution:
 
         # Verify the row exists in the DB.
         row = (
-            await db_session.execute(
-                select(AuditFindingResolution).where(
-                    AuditFindingResolution.release_version_id == version.id,
-                    AuditFindingResolution.finding_key == "adb632b709685086",
+            (
+                await db_session.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == version.id,
+                        AuditFindingResolution.finding_key == "adb632b709685086",
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         assert row is not None
         assert row.state == "resolved"
 
@@ -15107,13 +15208,17 @@ class TestRecordFindingResolution:
         assert resp.json()["state"] == "stale"
 
         row = (
-            await db_session.execute(
-                select(AuditFindingResolution).where(
-                    AuditFindingResolution.release_version_id == version.id,
-                    AuditFindingResolution.finding_key == "deadbeef12345678",
+            (
+                await db_session.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == version.id,
+                        AuditFindingResolution.finding_key == "deadbeef12345678",
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         assert row is not None
         assert row.state == "stale"
 
@@ -15160,9 +15265,7 @@ class TestRecordFindingResolution:
         project = await _make_project(db_session)
         version = await _make_open_version(db_session, project.id)
 
-        member = ProjectMember(
-            project_id=project.id, user_id=viewer_id, role="viewer"
-        )
+        member = ProjectMember(project_id=project.id, user_id=viewer_id, role="viewer")
         db_session.add(member)
         await db_session.commit()
 
@@ -15191,7 +15294,9 @@ class TestRecordFindingResolution:
             _app.dependency_overrides.pop(override_get_session, None)
 
     @pytest.mark.asyncio
-    async def test_upsert_overwrites_existing_row(self, client: AsyncClient, db_session):
+    async def test_upsert_overwrites_existing_row(
+        self, client: AsyncClient, db_session
+    ):
         """A second write for the same (finding_key, release_version_id) updates
         the existing row rather than inserting a duplicate."""
         from app.models import AuditFindingResolution
@@ -15226,13 +15331,17 @@ class TestRecordFindingResolution:
 
         # Only one row in the DB.
         rows = (
-            await db_session.execute(
-                select(AuditFindingResolution).where(
-                    AuditFindingResolution.release_version_id == version.id,
-                    AuditFindingResolution.finding_key == "adb632b709685086",
+            (
+                await db_session.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == version.id,
+                        AuditFindingResolution.finding_key == "adb632b709685086",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(rows) == 1
         assert rows[0].state == "stale"
         assert rows[0].note == "second write"

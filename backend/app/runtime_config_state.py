@@ -1369,6 +1369,12 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "evergreen_fill_deferred_memo_enrollment",
                         bool(config_json["evergreen_fill_deferred_memo_enrollment"]),
                     )
+                if "evergreen_fill_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["evergreen_fill_mode"] or "").strip().lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("evergreen_fill_mode", raw_mode)
                 if "cochange_decomposition_enabled" in config_json:
                     _set(
                         "cochange_decomposition_enabled",
@@ -1587,6 +1593,10 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "reaper_max_orphans_per_cycle",
                     "usage_headroom_threshold_pct",
                     "max_concurrent_act_on_verdict_followons",
+                    "evergreen_fill_interval_minutes",
+                    "evergreen_fill_min_free_slots",
+                    "evergreen_fill_max_active",
+                    "evergreen_fill_daily_cap",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
@@ -1598,6 +1608,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "related_tests_holdback_fraction",
                     "affected_consumers_holdback_fraction",
                     "diagnostics_after_edit_holdback_fraction",
+                    "evergreen_fill_util_threshold",
                 ):
                     if float_key in config_json:
                         _set(float_key, float(config_json[float_key]))

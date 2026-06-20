@@ -2920,6 +2920,29 @@ async def _apply_settings(
                     "diagnostics_after_edit_enabled": bool(
                         _runtime_config.get("diagnostics_after_edit_enabled", True)
                     ),
+                    "evergreen_fill_mode": str(
+                        _runtime_config.get("evergreen_fill_mode", "off")
+                    ),
+                    "evergreen_fill_interval_minutes": int(
+                        _runtime_config.get("evergreen_fill_interval_minutes", 15)
+                    ),
+                    "evergreen_fill_util_threshold": float(
+                        _runtime_config.get("evergreen_fill_util_threshold", 0.5)
+                    ),
+                    "evergreen_fill_min_free_slots": int(
+                        _runtime_config.get("evergreen_fill_min_free_slots", 2)
+                    ),
+                    "evergreen_fill_max_active": int(
+                        _runtime_config.get("evergreen_fill_max_active", 1)
+                    ),
+                    "evergreen_fill_daily_cap": int(
+                        _runtime_config.get("evergreen_fill_daily_cap", 3)
+                    ),
+                    "evergreen_fill_deferred_memo_enrollment": bool(
+                        _runtime_config.get(
+                            "evergreen_fill_deferred_memo_enrollment", False
+                        )
+                    ),
                 }
                 if "direction_refractory_minutes" not in _runtime_config:
                     runtime_config_json.pop("direction_refractory_minutes", None)
@@ -3342,9 +3365,7 @@ async def repair_state(
         all_children = (
             (
                 await session.execute(
-                    select(Task)
-                    .where(Task.parent_task_id.in_(parent_ids))
-                    .limit(5000)
+                    select(Task).where(Task.parent_task_id.in_(parent_ids)).limit(5000)
                 )
             )
             .scalars()
