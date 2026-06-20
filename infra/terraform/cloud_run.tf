@@ -324,13 +324,16 @@ resource "google_cloud_run_v2_job" "blueprint_agent_job" {
   }
 }
 
-# Grant the orchestrator SA permission to create executions of the Job
-# (run_job). roles/run.developer is the narrowest predefined role that
-# includes run.jobs.run; roles/run.invoker does NOT cover executing a Job.
+# Grant the orchestrator SA least-privilege permissions to trigger executions
+# of the Job with container env overrides. roles/run.jobsExecutorWithOverrides
+# is the narrowest predefined role covering run.jobs.run and
+# run.jobs.runWithOverrides — required because compute_cloud_run.py calls
+# client.run_job with RunJobRequest.Overrides. The former broad
+# roles/run.developer is replaced by this single narrower predefined role.
 resource "google_cloud_run_v2_job_iam_member" "orchestrator_runs_agent_job" {
   location = google_cloud_run_v2_job.blueprint_agent_job.location
   project  = google_cloud_run_v2_job.blueprint_agent_job.project
   name     = google_cloud_run_v2_job.blueprint_agent_job.name
-  role     = "roles/run.developer"
+  role     = "roles/run.jobsExecutorWithOverrides"
   member   = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }

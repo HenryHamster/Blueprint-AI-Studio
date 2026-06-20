@@ -3022,6 +3022,9 @@ export async function main() {
   // so the backend heartbeat endpoint accepts this task_id before claim runs.
   const PRE_CLAIM_TASK_ID = process.env.TASK_ID || '';
   const poolMode = process.env.BLUEPRINT_POOL_MODE === '1';
+  // Cloud Run Job containers run exactly one task per execution — no warm
+  // continuity poll, no heartbeat idle window between roles.
+  const jobMode = process.env.CLOUD_RUN_JOB === '1';
 
   // Report a pre-claim failure via the existing heartbeat endpoint. The backend's
   // /api/agent/heartbeat accepts PROVISIONING-status tasks, so this turns silent
@@ -3171,6 +3174,13 @@ export async function main() {
       lastTaskId = claimResult.taskId;
       lastPrNumber = claimResult.prNumber;
       lastBaseBranch = claimResult.baseBranch;
+
+      // Cloud Run Job executions run exactly one task — skip warm-continuity
+      // poll entirely (no multi-role warm VM; container exits after this role).
+      if (jobMode) {
+        log('[job-mode] Cloud Run Job — skipping warm-continuity poll, single-role execution complete');
+        break;
+      }
 
       // After a successful role completion, poll for a warm next role. The
       // backend decides whether this is an ordinary warm claim or a PARK
