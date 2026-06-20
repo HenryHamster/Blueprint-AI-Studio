@@ -171,7 +171,9 @@ def _metadata_shape_drift(
     for table_name, required_table in required_metadata.tables.items():
         present_table = present_tables.get(table_name)
         if present_table is None:
-            drift.append(f"table '{table_name}' is missing from the candidate migration chain")
+            drift.append(
+                f"table '{table_name}' is missing from the candidate migration chain"
+            )
             continue
         present_columns = {column.name for column in present_table.columns}
         drift.extend(
@@ -560,15 +562,16 @@ async def _build_candidate_required_metadata_from_snapshot(
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
-            detail = stderr.decode(errors="replace").strip() or stdout.decode(
-                errors="replace"
-            ).strip()
+            detail = (
+                stderr.decode(errors="replace").strip()
+                or stdout.decode(errors="replace").strip()
+            )
             raise _MigrationApplyError(
                 f"candidate code snapshot at {candidate_ref!r} could not be imported "
                 f"to derive required metadata: {detail or f'exit {proc.returncode}'}"
             )
         try:
-            shape = json.loads(stdout.decode())
+            shape = await asyncio.to_thread(json.loads, stdout.decode())
         except Exception as exc:
             raise _MigrationApplyError(
                 f"candidate code snapshot at {candidate_ref!r} returned malformed "

@@ -240,8 +240,15 @@ async def resolve_message_ref(
         )
     # Scope to the project FIRST so cross-project rows are never candidates,
     # then match id-hex prefix in Python (sqlite-safe, status-agnostic).
+    # ORDER BY created_at DESC ensures the 500-row window covers the most
+    # recent messages, which are almost always the ones being referenced.
+    # Limit caps worst-case memory; 500 rows is ample for short-prefix
+    # disambiguation in all but pathologically large projects.
     result = await session.execute(
-        select(ProjectMessage).where(ProjectMessage.project_id == project_id)
+        select(ProjectMessage)
+        .where(ProjectMessage.project_id == project_id)
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(500)
     )
     matches = [m for m in result.scalars().all() if m.id.hex.startswith(prefix)]
     if not matches:

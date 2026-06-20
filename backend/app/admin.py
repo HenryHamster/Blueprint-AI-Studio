@@ -1111,7 +1111,7 @@ async def get_task(
             research_findings = a.logs[:100000]  # raw logs; resolved below
         if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs:
             try:
-                parsed = json.loads(a.logs[:100000])
+                parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
                 if isinstance(parsed, dict):
                     merge_test_result = parsed
             except (json.JSONDecodeError, AttributeError):

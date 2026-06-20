@@ -36,6 +36,7 @@ path; it does not touch them.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -1359,7 +1360,7 @@ async def _load_compute_job_from_logs(
     falls the caller back to the deterministic document.
     """
     try:
-        payload = json.loads(logs) if logs else None
+        payload = await asyncio.to_thread(json.loads, logs) if logs else None
     except (json.JSONDecodeError, ValueError):
         return None
     if not isinstance(payload, dict):
@@ -1471,7 +1472,11 @@ async def _gather_compute_evidence(
         if artifact is not None:
             storage_uri = (artifact.storage_uri or "").strip() or None
             try:
-                art_logs = json.loads(artifact.logs) if artifact.logs else None
+                art_logs = (
+                    await asyncio.to_thread(json.loads, artifact.logs)
+                    if artifact.logs
+                    else None
+                )
             except (json.JSONDecodeError, ValueError):
                 art_logs = None
             if isinstance(art_logs, dict):
@@ -1558,7 +1563,7 @@ async def _gather_compute_evidence(
     # JSON; fall back to reading from the Artifact row's logs if absent there.
     command_log_text: str | None = None
     try:
-        result_obj = json.loads(logs) if logs else None
+        result_obj = await asyncio.to_thread(json.loads, logs) if logs else None
         if isinstance(result_obj, dict):
             cl = str(result_obj.get("command_log_text") or "").strip()
             if cl:

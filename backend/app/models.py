@@ -2367,6 +2367,8 @@ class Alert(SQLModel, table=True):
     __table_args__ = (
         Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),
         Index("ix_alert_project_id_dismissed", "project_id", "dismissed_at"),
+        Index("ix_alert_severity", "severity"),
+        Index("ix_alert_project_severity", "project_id", "severity"),
     )
 
 
@@ -2682,6 +2684,8 @@ class ProjectMessage(SQLModel, table=True):
             postgresql_where=text("idempotency_key IS NOT NULL"),
             sqlite_where=text("idempotency_key IS NOT NULL"),
         ),
+        Index("ix_projectmessage_created_at", "created_at"),
+        Index("ix_projectmessage_project_created_at", "project_id", "created_at"),
     )
 
 

@@ -5,6 +5,7 @@ Contains the two artifact-gated spawn blocks that were inlined in
 update_agent_status, plus the session-recovery helper they share.
 """
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -110,7 +111,7 @@ async def maybe_spawn_smoketest_fix(
     # 3b. Parse and store smoketest result in task.plan_output + document in history
     if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.logs:
         try:
-            smoketest_data = json.loads(payload.logs)
+            smoketest_data = await asyncio.to_thread(json.loads, payload.logs)
             # smoketest_data is always a dict (keys: passed, tests, suites) — query_findings_index
             # skips non-list plan_output, so smoketest tasks are excluded from the Findings Journal.
             task.plan_output = smoketest_data
@@ -174,7 +175,7 @@ async def maybe_spawn_smoketest_fix(
         and not (task.context or {}).get("qualifier_smoketest")
     ):
         try:
-            smoketest_data = json.loads(payload.logs)
+            smoketest_data = await asyncio.to_thread(json.loads, payload.logs)
             if not smoketest_data.get("passed"):
                 failed_tests = [
                     t
@@ -453,7 +454,7 @@ async def maybe_spawn_debug_create(
     # 3c. Parse debug result, store in plan_output, and optionally spawn a fix task
     if payload.artifact_type == ArtifactType.DEBUG_RESULT and payload.logs:
         try:
-            debug_data = json.loads(payload.logs)
+            debug_data = await asyncio.to_thread(json.loads, payload.logs)
             # debug_data is always a dict (keys: confidence, fix_prompt, root_cause) — query_findings_index
             # skips non-list plan_output, so debug tasks are excluded from the Findings Journal.
             task.plan_output = debug_data

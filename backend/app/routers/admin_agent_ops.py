@@ -3012,11 +3012,13 @@ async def admin_declare_capability_verdict(
         stall_msgs = (
             (
                 await session.execute(
-                    select(ProjectMessage).where(
+                    select(ProjectMessage)
+                    .where(
                         ProjectMessage.project_id == project_id,
                         ProjectMessage.status == "open",
                         ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
                     )
+                    .limit(10)
                 )
             )
             .scalars()
