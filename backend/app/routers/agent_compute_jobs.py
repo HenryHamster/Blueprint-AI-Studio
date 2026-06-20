@@ -4,21 +4,23 @@ import logging
 import uuid
 from typing import Any, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.compute_jobs import (
     ComputeLaunchPreconditionFailed,
+    _COMPUTE_JOB_TERMINAL_STATUSES,
     create_compute_job,
     get_compute_job_for_task,
 )
 from app.database import get_session
-from app.models import Task
+from app.models import ComputeJob, ComputeJobStatus, Task
 from app.routers.agent import verify_agent_token
 from app.schemas import serialize_compute_job_response
 from app.shared_state import limiter
 from app.task_capabilities import COMPUTE_JOB_LAUNCH_TASK_TYPES
+from app.time_utils import _utcnow
 from app.vm_cost_rates import resolve_compute_machine_type, supported_machine_types
 
 logger = logging.getLogger(__name__)
@@ -145,3 +147,49 @@ async def poll_compute_job(
     if job is None:
         raise HTTPException(status_code=404, detail="Compute job not found")
     return {"status": "success", "data": serialize_compute_job_response(job)}
+
+
+@router.post("/compute-jobs/{job_id}/heartbeat", status_code=204)
+@limiter.limit("120/minute")
+async def compute_job_vm_heartbeat(
+    request: Request,
+    job_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """Liveness push from a GCP compute-job VM.
+
+    The VM's startup script POSTs here (bearer = job UUID) every ~60 s so the
+    orchestrator can confirm the VM is alive without relying on serial-console
+    polls or the GCP insert long-running-operation.  The first heartbeat also
+    transitions the job from STARTING to RUNNING so provisioning success is
+    declared on boot rather than on LRO completion.
+
+    Authentication: the bearer token is the job UUID (128 bits of entropy —
+    equivalent to a random secret).  The endpoint is rate-limited and only
+    accepts active (non-terminal) job IDs.
+    """
+    auth = request.headers.get("Authorization", "")
+    bearer = auth.removeprefix("Bearer ").strip()
+    if bearer != str(job_id):
+        raise HTTPException(status_code=403, detail="Invalid compute job token")
+
+    job = await session.get(ComputeJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Compute job not found")
+
+    if job.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+        # VM doesn't need to know it has been terminated — just return 204 so
+        # it can finish its cleanup without retrying on an error response.
+        return Response(status_code=204)
+
+    now = _utcnow()
+    job.last_heartbeat_at = now
+    job.updated_at = now
+    # First heartbeat: the VM has booted — transition from STARTING to RUNNING
+    # so the provisioning timeout no longer applies and cost accrual begins.
+    if job.status == ComputeJobStatus.STARTING:
+        job.status = ComputeJobStatus.RUNNING
+        if job.started_at is None:
+            job.started_at = now
+    await session.commit()
+    return Response(status_code=204)

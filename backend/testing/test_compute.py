@@ -4,6 +4,7 @@ Tests for app/compute.py
 Covers:
 - _store_agent_secret IAM policy ETag retry + idempotency.
 - Zone success-rate tracking (rolling window, zone ordering, reset, summary).
+- Compute-job VM heartbeat endpoint and provisioning-timeout guard.
 """
 
 import asyncio
@@ -10136,3 +10137,435 @@ def test_terminal_record_b64_file_redacts_command_log(tmp_path):
     b64_non_str = tr._b64_file(str(non_str_file), redact_command_log=True)
     decoded_non_str = json_mod.loads(base64.b64decode(b64_non_str).decode("utf-8"))
     assert decoded_non_str["text"] == 42, "non-str text field must be encoded verbatim"
+
+
+# ── Compute-job VM heartbeat endpoint + provisioning timeout guard ─────────
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_wrong_bearer_rejected(
+    client, db_session, monkeypatch
+):
+    """POST /compute-jobs/{id}/heartbeat with a wrong bearer returns 403."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Auth Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_missing_job_returns_404(client, monkeypatch):
+    """POST /compute-jobs/{id}/heartbeat for an unknown ID returns 404."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    fake_id = uuid.uuid4()
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{fake_id}/heartbeat",
+        headers={"Authorization": f"Bearer {fake_id}"},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_transitions_starting_to_running(
+    client, db_session, monkeypatch
+):
+    """First heartbeat from the VM transitions STARTING → RUNNING and sets last_heartbeat_at."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Transition Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    # Manually set to STARTING to simulate mid-provisioning state.
+    job.status = ComputeJobStatus.STARTING
+    job.last_heartbeat_at = None
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING, (
+        "first heartbeat must transition STARTING→RUNNING"
+    )
+    assert job.last_heartbeat_at is not None, "last_heartbeat_at must be set"
+    assert job.started_at is not None, "started_at must be set on first heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_updates_running_job(
+    client, db_session, monkeypatch
+):
+    """Subsequent heartbeats on a RUNNING job only update last_heartbeat_at."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Running Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING, "status must remain RUNNING"
+    assert job.last_heartbeat_at is not None
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_noop_for_terminal_job(
+    client, db_session, monkeypatch
+):
+    """Heartbeat for a terminal job returns 204 without modifying the row."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Terminal Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.completed_at = datetime.utcnow()
+    job.last_heartbeat_at = None
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+    assert resp.status_code == 204, "terminal job heartbeat must not error"
+
+    await db_session.refresh(job)
+    assert job.last_heartbeat_at is None, "terminal job row must not be modified"
+    assert job.status == ComputeJobStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_provisioning_deadline_skipped_when_vm_heartbeated(
+    db_session, monkeypatch
+):
+    """A job whose provisioning deadline has passed but whose VM has heartbeated
+    must NOT be terminated.  The heartbeat is proof the VM booted and is alive;
+    the next monitor tick will handle it via the normal running path.
+
+    This is the regression case from compute job 50116a8f: the GCP insert LRO
+    was slow, the orchestrator's provisioning deadline fired, and the VM was
+    terminated and reaped while still RUNNING.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Prov Deadline Guard", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    # Expire the provisioning deadline AND the wall-clock deadline so the monitor
+    # sees provisioning_timeout_seconds == 0.0 on its first pass.
+    meta = dict(job.polling_metadata or {})
+    meta["provisioning_deadline_at"] = (
+        datetime.utcnow() - timedelta(seconds=10)
+    ).isoformat()
+    job.polling_metadata = meta
+    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=10)
+    # Simulate the VM having already heartbeated (endpoint set this).
+    job.last_heartbeat_at = datetime.utcnow() - timedelta(seconds=5)
+    job.status = ComputeJobStatus.STARTING
+    await db_session.commit()
+
+    terminate_reasons: list[str] = []
+
+    class FakeBackend:
+        def external_id_for(self, j):
+            return "hb-guard-vm"
+
+        async def launch(self, spec):
+            raise AssertionError("launch must not be called when deadline passed")
+
+        async def terminate(self, j, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert terminate_reasons == [], (
+        "heartbeating VM must NOT be terminated at provisioning deadline"
+    )
+    assert job.status not in {ComputeJobStatus.TIMED_OUT, ComputeJobStatus.FAILED}, (
+        f"job must not be in terminal status; got {job.status}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_provisioning_deadline_still_terminates_without_heartbeat(
+    db_session, monkeypatch
+):
+    """Control: a job whose provisioning deadline passed AND has no heartbeat
+    must still be terminated as TIMED_OUT — the guard must not suppress the
+    existing fallback behavior for VMs that die before their first heartbeat."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Prov Deadline Control", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["provisioning_deadline_at"] = (
+        datetime.utcnow() - timedelta(seconds=10)
+    ).isoformat()
+    job.polling_metadata = meta
+    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=10)
+    job.last_heartbeat_at = None  # No heartbeat — VM never booted
+    job.status = ComputeJobStatus.STARTING
+    await db_session.commit()
+
+    terminate_reasons: list[str] = []
+
+    class FakeBackend:
+        def external_id_for(self, j):
+            return "no-hb-vm"
+
+        async def launch(self, spec):
+            raise AssertionError("launch must not be called when deadline passed")
+
+        async def terminate(self, j, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert "provisioning" in terminate_reasons, (
+        "non-heartbeating VM must be terminated at deadline"
+    )
+    assert job.status == ComputeJobStatus.TIMED_OUT
+
+
+@pytest.mark.asyncio
+async def test_launch_lro_timeout_skipped_when_vm_heartbeated(db_session, monkeypatch):
+    """When the monitor's asyncio.wait_for fires during backend.launch() but the
+    VM has already heartbeated (endpoint wrote last_heartbeat_at), the monitor must
+    NOT terminate the job — the VM is alive despite the slow GCP LRO.
+
+    This tests the asyncio.TimeoutError guard path in _process_single_compute_job.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB LRO Timeout Guard", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    # Set a deadline far enough in the future for the monitor to reach wait_for,
+    # but short enough that the 1-second launch sleep causes a TimeoutError.
+    meta = dict(job.polling_metadata or {})
+    meta["provisioning_deadline_at"] = (
+        datetime.utcnow() + timedelta(milliseconds=300)
+    ).isoformat()
+    job.polling_metadata = meta
+    job.wall_clock_deadline = datetime.utcnow() + timedelta(seconds=300)
+    job.status = ComputeJobStatus.STARTING
+    # Pre-write only last_heartbeat_at, leaving status=STARTING.  This simulates
+    # the race where the VM's POST /heartbeat wrote last_heartbeat_at AFTER
+    # _reserve_compute_job_launch acquired its lock (so the monitor entered the
+    # launch path with STARTING), but before wait_for fired.  The guard in the
+    # asyncio.TimeoutError handler detects the heartbeat and completes the
+    # STARTING→RUNNING transition that the endpoint normally does atomically.
+    job.last_heartbeat_at = datetime.utcnow()
+    await db_session.commit()
+
+    terminate_reasons: list[str] = []
+    launch_started = asyncio.Event()
+
+    class SlowBackendWithHeartbeat:
+        def external_id_for(self, j):
+            return "lro-slow-vm"
+
+        async def launch(self, spec):
+            launch_started.set()
+            # Simulate a slow GCP insert LRO that outlasts the provisioning budget.
+            await asyncio.sleep(1.0)
+            return ComputeLaunchResult(
+                external_id="lro-slow-vm",
+                started_at=datetime.utcnow(),
+                cost_rate_per_second=0.0,
+                message="done",
+            )
+
+        async def terminate(self, j, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _: SlowBackendWithHeartbeat()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    assert launch_started.is_set(), "launch coroutine must have been entered"
+
+    await db_session.refresh(job)
+    assert terminate_reasons == [], (
+        "VM that heartbeated during slow LRO must NOT be terminated"
+    )
+    assert job.status == ComputeJobStatus.RUNNING, (
+        f"job must remain RUNNING after heartbeat-guarded LRO timeout; got {job.status}"
+    )

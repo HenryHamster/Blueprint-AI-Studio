@@ -1040,6 +1040,8 @@ def _build_gcp_startup_script(
     command_runner_b64 = _COMMAND_RUNNER_B64
     artifact_upload_b64 = _ARTIFACT_UPLOAD_B64
     terminal_record_b64 = _TERMINAL_RECORD_B64
+    orchestrator_url_q = shlex.quote(compute.ORCHESTRATOR_URL)
+    job_id_q = shlex.quote(str(spec.job_id))
     return f"""#!/bin/bash
 set -u -o pipefail
 TTL_SECONDS={deadline_seconds}
@@ -1089,6 +1091,19 @@ trap upload_artifacts EXIT HUP INT TERM QUIT
   poweroff || shutdown -h now || true
 ) &
 TTL_PID=$!
+_COMPUTE_ORCHESTRATOR_URL={orchestrator_url_q}
+_COMPUTE_JOB_ID={job_id_q}
+_compute_heartbeat() {{
+  curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_JOB_ID" "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
+}}
+_compute_heartbeat
+(
+  while true; do
+    sleep 55
+    _compute_heartbeat
+  done
+) &
+_HEARTBEAT_PID=$!
 echo "{_SERIAL_STATUS_PREFIX}RUNNING"
 {env_block}
 export {RESULT_FILE_ENV}={result_file}
@@ -1137,7 +1152,7 @@ python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} "$STATUS" "$EXIT_CODE" "$REASON" {result_file} {command_log_path} \
   >/dev/null 2>&1 || true
 upload_artifacts
-kill "$TTL_PID" 2>/dev/null || true
+kill "$TTL_PID" "$_HEARTBEAT_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true
 exit "$EXIT_CODE"
 """
