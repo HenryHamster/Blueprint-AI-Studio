@@ -105,21 +105,20 @@ async def _emit_crash_episode_alert(
     created = 0
     async with session_factory() as ep_session:
         ep_project_ids = (await ep_session.execute(select(Project.id))).scalars().all()
-        for project_id in ep_project_ids:
-            existing_ep = (
-                (
-                    await ep_session.execute(
-                        select(Alert).where(
-                            Alert.project_id == project_id,
-                            Alert.title == episode_title,
-                            Alert.dismissed_at.is_(None),
-                        )
-                    )
+        if not ep_project_ids:
+            return 0
+        existing_alerts = (
+            await ep_session.execute(
+                select(Alert.project_id).where(
+                    Alert.project_id.in_(ep_project_ids),
+                    Alert.title == episode_title,
+                    Alert.dismissed_at.is_(None),
                 )
-                .scalars()
-                .first()
             )
-            if existing_ep:
+        ).scalars().all()
+        alerted_project_ids = set(existing_alerts)
+        for project_id in ep_project_ids:
+            if project_id in alerted_project_ids:
                 continue
             ep_session.add(
                 Alert(

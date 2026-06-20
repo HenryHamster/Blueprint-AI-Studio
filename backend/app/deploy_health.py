@@ -352,7 +352,7 @@ async def _check_monitoring_window():
                 # Create ERROR alert on all projects
                 rollback_title = f"Rollback recommended: {reason}"
                 project_ids = (
-                    (await session.execute(select(Project.id))).scalars().all()
+                    (await session.execute(select(Project.id).limit(1000))).scalars().all()
                 )
                 for project_id in project_ids:
                     alert = Alert(

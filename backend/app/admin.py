@@ -1136,11 +1136,14 @@ async def get_task(
         for h in all_history
     ]
 
-    # Fetch child task IDs
+    # Fetch child task IDs (capped at 1000 to bound memory for high-fan-out parents)
+    _CHILD_ID_LIMIT = 1000
     child_ids_result = await session.execute(
-        select(Task.id).where(Task.parent_task_id == tid)
+        select(Task.id).where(Task.parent_task_id == tid).limit(_CHILD_ID_LIMIT + 1)
     )
-    child_task_ids = [str(row) for row in child_ids_result.scalars().all()]
+    _raw_child_ids = child_ids_result.scalars().all()
+    child_task_ids_truncated = len(_raw_child_ids) > _CHILD_ID_LIMIT
+    child_task_ids = [str(row) for row in _raw_child_ids[:_CHILD_ID_LIMIT]]
 
     wake_registration_result = await session.execute(
         select(TaskWakeRegistration)
@@ -1220,6 +1223,7 @@ async def get_task(
         ),
         "history": history,
         "child_task_ids": child_task_ids,
+        "child_task_ids_truncated": child_task_ids_truncated,
         "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(task),
         "api_call_summary": task.api_call_summary,
     }
