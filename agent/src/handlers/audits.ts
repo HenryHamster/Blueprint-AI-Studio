@@ -1,3 +1,23 @@
+/**
+ * Audit handlers — security, self-audit, and release audit task implementations.
+ *
+ * Provides three handler types:
+ *
+ * - **handleSecurityAudit**: Scans code for security vulnerabilities (injection,
+ *   auth flaws, etc.) and emits a structured verdict with findings and fix recommendations.
+ *
+ * - **handleSelfAudit**: Evaluates system maturity and operational readiness,
+ *   producing a maturity assessment and operating mode recommendations.
+ *
+ * - **handleReleaseAudit**: Examines release-candidate diffs for risky changes,
+ *   migration issues, breaking changes, and deployment blockers. Spawns a child
+ *   release_audit_challenge task for adversarial verification. Used in the
+ *   qualify→promote gate to block unsafe releases.
+ *
+ * All audit handlers are structured-output producers that emit JSON verdicts
+ * persisted as Artifacts and embedded in task context for downstream consumers.
+ */
+
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {

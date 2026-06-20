@@ -1,4 +1,20 @@
 import fs from 'fs';
+/**
+ * Design document update handler — refine and expand project design docs.
+ *
+ * Reads the project's existing design document (stored in project.design_doc
+ * JSONB), allows Claude to propose edits, and applies updates to specific
+ * sections or entire documents. Used for incremental refinement as the project
+ * evolves or new requirements emerge.
+ *
+ * Unlike the design handler (which creates new design documents from scratch),
+ * this task modifies existing design docs: updating strategic decisions, adding
+ * new system components, or clarifying ambiguous areas.
+ *
+ * Does not clone repo or produce PR; updates are stored directly on the project
+ * design document artifact.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sendLog, validateBranchName,

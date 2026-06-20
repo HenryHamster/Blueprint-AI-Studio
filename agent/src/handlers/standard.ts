@@ -1,5 +1,29 @@
 import { execFileSync } from 'child_process';
 import fs from 'fs';
+/**
+ * Standard task handlers — core code-change operations.
+ *
+ * Provides handlers for common code-change task types:
+ *
+ * - **handleCreate**: Implement a new feature from a prompt. Clones repo, runs
+ *   Claude Code with full tool access, creates a PR with changes.
+ *
+ * - **handleRefactor**: Refactor existing code for clarity, performance, or
+ *   consistency. Clones repo, runs Claude Code, creates a PR.
+ *
+ * - **handleDocs**: Write or update documentation. May edit code comments,
+ *   README, or dedicated doc files. Clones repo, runs Claude Code, creates a PR.
+ *
+ * - **handleDeps**: Update dependencies (npm packages, pip requirements, etc.).
+ *   Clones repo, runs Claude Code, creates a PR with updated lock files.
+ *
+ * - **handleQA**: Write or run quality assurance tests. Clones repo, runs Claude
+ *   Code, may run test suites, creates a PR with test additions/fixes.
+ *
+ * All standard handlers follow the same template: clone, setup workspace,
+ * run Claude Code, fix loop (if tests fail), commit, and create PR.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sendLog, validateBranchName,

@@ -1,4 +1,27 @@
 import { execFileSync } from 'child_process';
+/**
+ * Specialized task handlers — domain-specific operations.
+ *
+ * - **handleMigrate**: Write database migrations. Clones repo, runs Claude Code,
+ *   produces a new Alembic migration file, creates a PR.
+ *
+ * - **handleSmoketest**: Run smoke tests against a deployment. Clones repo,
+ *   executes test scripts, validates deployment health, reports pass/fail.
+ *
+ * - **handleDebug**: Investigate and diagnose a bug. Clones repo, runs Claude Code
+ *   with debugging tools, may run tests, produces analysis and proposed fixes.
+ *
+ * - **handlePerf**: Profile and optimize performance. Clones repo, runs profilers,
+ *   analyzes hot paths, produces optimized code, creates a PR.
+ *
+ * - **handleInvestigate**: Open-ended investigation of an issue or area. Clones
+ *   repo, runs Claude Code exploration, produces findings artifact.
+ *
+ * - **handleRepoBootstrap**: Inspect a newly onboarded repository and produce
+ *   bootstrap metadata (build config, test runners, environment setup guidance).
+ *   Does not clone repo or produce PR; artifact-first.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sanitizeError, sendLog, validateBranchName, readHandlerOutput,

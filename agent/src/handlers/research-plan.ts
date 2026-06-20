@@ -1,5 +1,21 @@
 import fs from 'fs';
 import { execFileSync } from 'child_process';
+/**
+ * Research and planning handlers — exploratory analysis and implementation planning.
+ *
+ * - **handleResearch**: Analyze a codebase area (specified by focus, root, or file
+ *   list) and produce research findings. Clones repo, runs Claude Code analysis,
+ *   captures findings, and stores them as a ResearchFinding artifact.
+ *
+ * - **handlePlan**: Generate an implementation plan for a feature or refactor.
+ *   Clones repo, analyzes code structure, produces a structured plan with
+ *   milestones and file changes, stores as PlanFinding artifact. Does not edit code.
+ *
+ * These handlers are reconnaissance tasks: they gather information and produce
+ * structured analysis artifacts that downstream create/fix/refactor tasks consume.
+ * Research feeds strategic cycles; plans guide implementation tasks.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,

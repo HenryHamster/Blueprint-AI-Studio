@@ -1,4 +1,17 @@
 import { execFileSync } from 'child_process';
+/**
+ * Release audit challenge handler — independent re-examination of audit findings.
+ *
+ * Spawned during the release qualification gate to independently verify release-audit
+ * findings. Takes the parent audit's payload (base_branch, diff_range, candidate_sha)
+ * and produces a structured verdict (issues found, severity assessments, recommended
+ * actions) that can affirm or challenge the parent audit's conclusions.
+ *
+ * Used for adversarial review: if the parent audit missed critical issues or
+ * over-flagged benign changes, the challenge handler surfaces those disagreements.
+ * Verdicts are persisted on ReleaseVersion.last_qualification for merge-gating logic.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,

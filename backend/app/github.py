@@ -1,3 +1,16 @@
+"""GitHub API client and rate-limit tracking.
+
+Provides a pooled async HTTP client for GitHub API operations (pull requests,
+commits, branches, checks, etc.) with automatic JWT and installation-token auth,
+rate-limit tracking across two buckets (install-token 5000/hr, app-JWT ~60/hr),
+and fail-fast backoff when rate limits are exhausted. Tracks API call volumes
+per endpoint (POST /repos/{{owner}}/{{repo}}/pulls, GET /repos/{{owner}}/{{repo}}/commits/{sha},
+etc.) to surface quota consumption hot spots on the admin dashboard.
+
+Functions are designed for use in the orchestrator, agent, and background workers.
+Client lifecycle is managed by app.lifecycle (init on startup, close on shutdown).
+"""
+
 import asyncio
 import contextlib
 import random

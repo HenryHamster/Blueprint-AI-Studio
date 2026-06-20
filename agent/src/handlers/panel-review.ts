@@ -1,4 +1,20 @@
 import { execFileSync } from 'child_process';
+/**
+ * Panel review handler — multi-agent structured PR review.
+ *
+ * Spawns a fixed multi-agent review workflow over a PR to independently
+ * examine code changes across multiple dimensions (correctness, security,
+ * performance, style, etc.) and produce a durable, structured verdict.
+ *
+ * Unlike handleReview (which posts comments), panel_review runs parallel
+ * agent lanes and persists a single PanelReviewVerdict artifact with unified
+ * findings, severity scores, and merge-readiness assessment. Used for high-stakes
+ * reviews and to catch issues a single reviewer might miss.
+ *
+ * Verdicts are stored as Artifacts and can be displayed in UI or used by
+ * merge gates to block or require modifications.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE,

@@ -1,3 +1,20 @@
+/**
+ * Design task handler — codebase-grounded design document generation.
+ *
+ * Produces a durable design document for a specified area (payload.design_topic)
+ * or problem. The agent receives prior research findings, analysis constraints,
+ * and architectural context, then outputs a structured design document with
+ * target goals, implementation approach, success metrics, and source citations
+ * grounded to actual repo files.
+ *
+ * Design documents are stored as Artifacts (ArtifactType.DESIGN) and can be
+ * referenced by later design-doc-update tasks to refine or expand.
+ * Citations are validated against the cloned repo to ensure file references
+ * resolve; ungrounded citations trigger a continuation repair.
+ *
+ * This task type does not produce a PR or merge; it is artifact-first.
+ */
+
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';

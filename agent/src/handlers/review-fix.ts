@@ -1,5 +1,21 @@
 import fs from 'fs';
 import { execFileSync } from 'child_process';
+/**
+ * Review and fix handlers — code review and iterative repair.
+ *
+ * - **handleReview**: Comments on an open PR's code diff. Checks out the PR
+ *   branch, analyzes changes, and posts review comments via GitHub API (no local
+ *   changes or new commit). Useful for human-in-the-loop workflows.
+ *
+ * - **handleFix**: Repairs code issues identified in a prior review or analysis.
+ *   Checks out the PR branch, makes fixes, commits, and pushes updates to the
+ *   same PR. Implements feedback from parent review tasks or self-improvement loops.
+ *
+ * These handlers form the review→fix cycle: a review task identifies issues,
+ * then downstream fix tasks address them. Fix tasks can loop: the fix handler
+ * may run tests, analyze failures, iterate, and re-push until COMPLETED.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,

@@ -1,3 +1,15 @@
+/**
+ * Verify tests handler — run test suite on a PR and report pass/fail.
+ *
+ * Checks out a PR branch, auto-detects the build config and test runners,
+ * executes the test suite, captures results, and posts a structured pass/fail
+ * verdict as a comment on the PR.
+ *
+ * Does not modify code; used for continuous integration checks and to validate
+ * that PRs don't break existing tests. Useful for human-reviewed PRs or to gate
+ * merges on test success before entering the merge queue.
+ */
+
 import fs from 'fs';
 import type WebSocket from 'ws';
 import {
