@@ -30,6 +30,24 @@ from app.time_utils import _utcnow
 # Stored as signed int64 (PostgreSQL bigint) via two's-complement conversion.
 _BACKGROUND_LOCK_ID: int = ctypes.c_int64(0xB1EB1EB1EB1EB1EB).value
 
+# pg_locks records a single-bigint advisory lock as three columns: classid =
+# high 32 bits of the key, objid = low 32 bits, objsubid = 1. The *unsigned*
+# 64-bit key (0xB1EB…) exceeds bigint's max, so the stale-leader reaper matches
+# on the two unsigned 32-bit halves rather than reconstructing the whole key.
+_BACKGROUND_LOCK_CLASSID: int = (_BACKGROUND_LOCK_ID & 0xFFFFFFFFFFFFFFFF) >> 32
+_BACKGROUND_LOCK_OBJID: int = _BACKGROUND_LOCK_ID & 0xFFFFFFFF
+
+# Stale-leader reap threshold. A live leader re-asserts the advisory lock every
+# LEADER_KEEPALIVE_SECONDS (default 30s; see lifespan), so its lock-holding
+# backend's pg_stat_activity.state_change is never older than one interval. A
+# holder older than this has missed several keepalives — it is a leader that was
+# SIGKILLed mid-wedge (graceful lock release never ran) or whose event loop is
+# hung — so the non-leader watchdog reaps it and leadership recovers in one
+# probe cycle instead of waiting on Postgres' passive TCP death detection
+# (minutes), or, for a committed-idle wedged process, never. Default 3x the
+# keepalive interval so a live leader is provably never reaped.
+_LEADER_STALE_REAP_SECONDS: float = float(os.getenv("LEADER_STALE_REAP_SECONDS", "90"))
+
 # Background-service crash-episode escalation. When a single named background
 # service crashes >= _BACKGROUND_CRASH_EPISODE_THRESHOLD times inside
 # _BACKGROUND_CRASH_EPISODE_WINDOW_SECONDS it is a crash *episode* (a flapping
@@ -227,6 +245,70 @@ async def _leader_lock_keepalive_tick(leader_session) -> str:
         logger.error("[MONITOR] Leader-lock re-acquire failed: %s", reacq_exc)  # noqa: TRY400
         return "error"
     return "reacquired" if reacquired else "lost"
+
+
+async def _reap_stale_leader_lock_holder(
+    probe_session, stale_secs: float = _LEADER_STALE_REAP_SECONDS
+) -> int:
+    """Forcibly free the background-leader lock from a dead/wedged holder.
+
+    Called from the non-leader watchdog ONLY after a ``pg_try_advisory_lock``
+    probe fails (the lock is held by a peer). Finds the backend holding THIS
+    advisory lock (matched on the exact key) whose last activity
+    (``pg_stat_activity.state_change``) is older than ``stale_secs`` — i.e. it
+    has missed several keepalive ticks and is dead or wedged — and
+    ``pg_terminate_backend``s it. Terminating the connection makes Postgres
+    release the SESSION-scoped lock immediately, instead of the watchdog waiting
+    on passive TCP death detection (minutes) or, for a committed-idle connection
+    on a still-alive-but-hung process, forever.
+
+    Returns the number of backends terminated (0 when the holder is live or the
+    lock is genuinely free). Safe by construction: a live leader's holder always
+    has a fresh ``state_change`` (it re-asserts every LEADER_KEEPALIVE_SECONDS)
+    and ``stale_secs`` defaults to 3x that, so an active leader is never reaped.
+    Kept module-level (not a closure) so it is unit-testable in isolation.
+    """
+    pids = (
+        (
+            await probe_session.execute(
+                _text(
+                    "SELECT a.pid FROM pg_locks l "
+                    "JOIN pg_stat_activity a ON a.pid = l.pid "
+                    "WHERE l.locktype = 'advisory' AND l.objsubid = 1 "
+                    "AND l.classid::bigint = :classid AND l.objid::bigint = :objid "
+                    "AND l.granted AND a.pid <> pg_backend_pid() "
+                    "AND a.state_change < now() - (:stale_secs * interval '1 second')"
+                ),
+                {
+                    "classid": _BACKGROUND_LOCK_CLASSID,
+                    "objid": _BACKGROUND_LOCK_OBJID,
+                    "stale_secs": stale_secs,
+                },
+            )
+        )
+        .scalars()
+        .all()
+    )
+    reaped = 0
+    for pid in pids:
+        terminated = bool(
+            (
+                await probe_session.execute(
+                    _text("SELECT pg_terminate_backend(:pid)"), {"pid": pid}
+                )
+            ).scalar()
+        )
+        if terminated:
+            reaped += 1
+            logger.warning(
+                "[MONITOR] Reaped stale background-leader lock-holder pid=%s "
+                "(idle/wedged > %.0fs); session-scoped advisory lock released — "
+                "this watchdog will take over leadership on re-probe.",
+                pid,
+                stale_secs,
+            )
+    await probe_session.commit()
+    return reaped
 
 
 def _log_startup_deploy_identity() -> None:
@@ -518,6 +600,25 @@ async def lifespan(app):
                                     )
                                 ).scalar()
                             )
+                            # The first probe failed → the lock is held. If a
+                            # stale (dead/wedged) leader still holds it and never
+                            # released, reap it and retry the probe in THIS cycle
+                            # so leadership recovers in one watchdog interval
+                            # instead of waiting on Postgres' passive TCP death
+                            # detection (minutes) — or, for a committed-idle
+                            # wedged process, never.
+                            if (
+                                not _probe_acquired
+                                and await _reap_stale_leader_lock_holder(_probe_session)
+                            ):
+                                _probe_acquired = bool(
+                                    (
+                                        await _probe_session.execute(
+                                            _text("SELECT pg_try_advisory_lock(:lock_id)"),
+                                            {"lock_id": _BACKGROUND_LOCK_ID},
+                                        )
+                                    ).scalar()
+                                )
                             if _probe_acquired:
                                 # Release before exiting so the respawned
                                 # process (or a peer that probes during our
