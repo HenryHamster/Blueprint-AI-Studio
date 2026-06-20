@@ -10,6 +10,64 @@ with reasoning, and a risk note.
 
 ---
 
+## Item 0 — Cloud Run min-instances: 3 → 1 (deploy.yml)
+
+**File:** `.github/workflows/deploy.yml`
+**Job:** `deploy-backend` (line 129)
+**Estimated savings:** ~$40–60/month (continuous compute, not per-run minutes)
+
+### Reasoning
+
+This is the largest recurring cost lever in the entire file set — not a CI minutes
+saving but a continuous GCP Compute cost.
+
+`deploy.yml` line 129 deploys the Cloud Run service with `--min-instances 3`. Cloud
+Run charges for minimum instances **24 hours a day, 7 days a week**, even when
+there is zero inbound traffic. At `--min-instances 3`, three full Cloud Run
+instances are always allocated:
+
+- Cloud Run CPU/memory pricing for an always-on instance (e2 equivalent, 1 vCPU
+  / 512 MB): ~$0.02–0.03/hour per instance
+- Three instances × 24 h × 30 days = **2 160 always-on instance-hours/month**
+- Rough monthly cost: **~$50–65/month** for idle minimum capacity
+
+Reducing to `--min-instances 1` keeps one warm instance (zero cold-start latency
+for the autonomous pipeline) and eliminates **~2 continuous instance-hours per
+hour** of waste.
+
+This saving dwarfs every per-run CI minutes item in this document, which are each
+measured in cents per month.
+
+### Apply-ready diff
+
+```diff
+--- a/.github/workflows/deploy.yml
++++ b/.github/workflows/deploy.yml
+@@ -127,7 +127,7 @@ jobs:
+           gcloud run deploy blueprint-orchestrator \
+             --image "${{ env.AR_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE }}:${{ github.sha }}" \
+             --region ${{ env.REGION }} \
+-            --min-instances 3 \
++            --min-instances 1 \
+             --max-instances 12 \
+             --concurrency 20 \
+             --update-env-vars DEPLOY_SHA=${{ github.sha }}
+```
+
+### Risk / caveats
+
+- **Cold starts:** With `--min-instances 1`, traffic spikes that exceed 1 concurrent
+  request trigger cold starts for new instances. The autonomous pipeline generates
+  steady low-frequency traffic, so a single warm instance is almost always sufficient.
+  Monitor p95 latency in Cloud Run metrics after applying.
+- **Revert path:** Trivially reversible — change `1` back to `3` in deploy.yml and
+  re-deploy.
+- **`--min-instances 0`:** Would save the remaining always-on cost entirely but
+  causes cold-start delays when the orchestrator is first called after an idle
+  period. Not recommended for a polling-based backend.
+
+---
+
 ## Status: automain CI removal (already done — no edit needed)
 
 `ci.yml` `on.pull_request.branches` is already `[main]` only. The header comment
@@ -407,3 +465,60 @@ playbook notes. The operator should calibrate against the actual billing dashboa
 
 The per-step timing data from a single real run is more reliable than any estimate
 in this document.
+
+---
+
+## Item 5 — Remove terraform push trigger with no apply (terraform.yml)
+
+**File:** `.github/workflows/terraform.yml`
+**Job:** `terraform` (lines 3–8 trigger, lines 59–63 plan, lines 80–87 apply)
+**Estimated savings:** ~2–3 runner-minutes per infra push to main, ~0–15 runner-minutes/month
+
+### Reasoning
+
+`terraform.yml` declares a `push` trigger on `main` (lines 3–8) that fires whenever
+`infra/terraform/**` files land on the main branch. The workflow runs `terraform plan`
+(lines 59–63) but the Apply step is permanently commented out (lines 80–87) with the
+explicit note: `Apply is disabled until a remote backend (GCS) is configured.`
+
+This means every merge of a terraform file to main pays a full job cost — checkout,
+`terraform init`, `terraform plan` (which calls GCP APIs to refresh state) — for a
+plan that **can never be applied** by this workflow. The plan output is displayed in
+the job log and immediately discarded. The `pull_request` trigger already runs the
+same plan for review purposes before the merge, so the post-merge push plan is
+entirely redundant.
+
+Removing the `push` trigger from the `on:` block eliminates these zero-ROI runs.
+The `pull_request` and `workflow_dispatch` triggers should be kept: the former
+validates infra changes in PRs, and the latter provides an operator escape hatch
+to run a plan manually.
+
+### Apply-ready diff
+
+```diff
+--- a/.github/workflows/terraform.yml
++++ b/.github/workflows/terraform.yml
+@@ -1,10 +1,6 @@
+ name: Terraform Infrastructure
+
+ on:
+-  push:
+-    branches: [main]
+-    paths:
+-      - 'infra/terraform/**'
+   pull_request:
+     paths:
+       - 'infra/terraform/**'
+```
+
+### Risk / caveats
+
+- **No loss of plan visibility:** The `pull_request` trigger already runs `terraform
+  plan` and posts a comment on the PR before merge. Removing the `push` trigger
+  loses nothing from the code-review workflow.
+- **Apply is still blocked:** Removing the push trigger does not enable or disable
+  Apply — that step is commented out regardless. The only path to Apply today is
+  `workflow_dispatch` with `action: apply`.
+- **When to re-add:** Once a GCS remote backend is configured and Apply is
+  uncommented, re-evaluate whether a post-merge `push` trigger makes sense. At that
+  point a push-triggered Apply (not just Plan) would be meaningful.
