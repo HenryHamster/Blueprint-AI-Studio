@@ -143,6 +143,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "direction_saturation_refractory_minutes",
         "promotion_enabled",
         "promotion_enabled_by_project",
+        "merge_grade_block_threshold",
         "promotion_threshold",
         "promotion_weights",
         "park_and_retarget_enabled",
@@ -465,6 +466,9 @@ async def get_settings(
             ).items()
         },
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
+        "merge_grade_block_threshold": float(
+            _runtime_config.get("merge_grade_block_threshold", 0.0) or 0.0
+        ),
         "promotion_threshold": _runtime_config.get("promotion_threshold"),
         "promotion_weights": _runtime_config.get("promotion_weights"),
         "warm_continuity_enabled": bool(
@@ -1058,6 +1062,19 @@ async def _apply_settings(
         _runtime_config["promotion_weights"] = {
             wk: round(cleaned_weights[wk], 4) for wk in _PROMOTION_WEIGHT_KEYS
         }
+    if "merge_grade_block_threshold" in payload:
+        try:
+            val = float(payload["merge_grade_block_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400, detail="merge_grade_block_threshold must be a number"
+            )
+        if not (0.0 <= val <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="merge_grade_block_threshold must be between 0.0 and 1.0",
+            )
+        _runtime_config["merge_grade_block_threshold"] = round(val, 4)
     if "evaluating_fail_hours" in payload:
         try:
             val = int(payload["evaluating_fail_hours"])

@@ -58,7 +58,11 @@ class TestBuildPromptBlindnessInvariant:
         assert running_update not in prompt
         # Stronger: no substring of running_update appears.
         for word in ["refactored", "metrics", "system", "caching"]:
-            assert word not in prompt.lower() or word in goal.lower() or word in diff_text.lower()
+            assert (
+                word not in prompt.lower()
+                or word in goal.lower()
+                or word in diff_text.lower()
+            )
 
         # The prompt MUST contain the goal and diff.
         assert goal in prompt
@@ -267,7 +271,10 @@ class TestPersistBlindMergeGrade:
         bmg.persist_blind_merge_grade(version, new_record)
 
         assert version.last_qualification[bmg.BLIND_MERGE_GRADE_KEY] == new_record
-        assert version.last_qualification[bmg.BLIND_MERGE_GRADE_KEY]["candidate_sha"] == "new_sha"
+        assert (
+            version.last_qualification[bmg.BLIND_MERGE_GRADE_KEY]["candidate_sha"]
+            == "new_sha"
+        )
 
     def test_persist_preserves_other_keys(self):
         """Persisting a grade preserves other keys in last_qualification."""
@@ -411,6 +418,40 @@ class TestBlindMergeGradeSatisfied:
 
         assert bmg.blind_merge_grade_satisfied(version, "abc123") is False
 
+    def test_not_satisfied_when_skipped_pr_count_nonzero(self):
+        """A grade with skipped_pr_count > 0 does NOT satisfy the gate."""
+        version = MagicMock(spec=ReleaseVersion)
+        version.last_qualification = {
+            "blind_merge_grade": {
+                "candidate_sha": "abc123",
+                "coverage_verdict": "covers",
+                "biggest_gap": "missing feature",
+                "model": "claude-opus",
+                "pr_count": 5,
+                "skipped_pr_count": 2,
+                "graded_at": "2026-01-01T00:00:00Z",
+            }
+        }
+
+        assert bmg.blind_merge_grade_satisfied(version, "abc123") is False
+
+    def test_satisfied_when_skipped_pr_count_is_zero(self):
+        """A grade with explicit skipped_pr_count=0 satisfies the gate."""
+        version = MagicMock(spec=ReleaseVersion)
+        version.last_qualification = {
+            "blind_merge_grade": {
+                "candidate_sha": "abc123",
+                "coverage_verdict": "partial",
+                "biggest_gap": "missing feature",
+                "model": "claude-opus",
+                "pr_count": 5,
+                "skipped_pr_count": 0,
+                "graded_at": "2026-01-01T00:00:00Z",
+            }
+        }
+
+        assert bmg.blind_merge_grade_satisfied(version, "abc123") is True
+
 
 # ===========================================================================
 # blind_merge_grade_disabled
@@ -452,6 +493,40 @@ class TestBlindMergeGradeDisabled:
 
 
 @pytest.mark.asyncio
+async def test_compute_returns_none_when_goal_is_empty(monkeypatch, caplog):
+    """Empty version.goal → logs WARNING and returns None (no LLM call)."""
+    import logging
+
+    # No API key or GitHub patching needed — goal check is the first gate.
+    session = AsyncMock()
+    project = AsyncMock(spec=Project)
+    version = AsyncMock(spec=ReleaseVersion)
+    version.goal = ""
+
+    with caplog.at_level(logging.WARNING, logger="app.blind_merge_grade"):
+        result = await bmg.compute_blind_merge_grade(
+            session, project, version, "abc123"
+        )
+
+    assert result is None
+    assert any("no goal" in r.message.lower() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_compute_returns_none_when_goal_is_whitespace_only(monkeypatch):
+    """Whitespace-only version.goal → returns None (no LLM call)."""
+    # No API key or GitHub patching needed — goal check is the first gate.
+    session = AsyncMock()
+    project = AsyncMock(spec=Project)
+    version = AsyncMock(spec=ReleaseVersion)
+    version.goal = "   "
+
+    result = await bmg.compute_blind_merge_grade(session, project, version, "abc123")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_compute_fails_closed_when_no_api_key(monkeypatch):
     """No ANTHROPIC_API_KEY → returns None (fail-closed)."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -460,9 +535,7 @@ async def test_compute_fails_closed_when_no_api_key(monkeypatch):
     project = AsyncMock(spec=Project)
     version = AsyncMock(spec=ReleaseVersion)
 
-    result = await bmg.compute_blind_merge_grade(
-        session, project, version, "abc123"
-    )
+    result = await bmg.compute_blind_merge_grade(session, project, version, "abc123")
 
     assert result is None
 
@@ -481,9 +554,7 @@ async def test_compute_fails_closed_when_github_creds_unresolved(monkeypatch):
     project.id = "proj1"
     version = AsyncMock(spec=ReleaseVersion)
 
-    result = await bmg.compute_blind_merge_grade(
-        session, project, version, "abc123"
-    )
+    result = await bmg.compute_blind_merge_grade(session, project, version, "abc123")
 
     assert result is None
 
@@ -505,9 +576,7 @@ async def test_compute_fails_closed_on_diff_assembly_error(monkeypatch):
     project = AsyncMock(spec=Project)
     version = AsyncMock(spec=ReleaseVersion)
 
-    result = await bmg.compute_blind_merge_grade(
-        session, project, version, "abc123"
-    )
+    result = await bmg.compute_blind_merge_grade(session, project, version, "abc123")
 
     assert result is None
 
@@ -522,7 +591,7 @@ async def test_compute_fails_closed_on_parse_error_after_retry(monkeypatch):
     )
     monkeypatch.setattr(
         "app.blind_merge_grade._gather_merged_diff_text",
-        AsyncMock(return_value=("some diffs", 1)),
+        AsyncMock(return_value=("some diffs", 1, 0)),
     )
     # Simulate an LLM response that is invalid JSON.
     monkeypatch.setattr(
@@ -535,9 +604,7 @@ async def test_compute_fails_closed_on_parse_error_after_retry(monkeypatch):
     version = AsyncMock(spec=ReleaseVersion)
     version.goal = "some goal"
 
-    result = await bmg.compute_blind_merge_grade(
-        session, project, version, "abc123"
-    )
+    result = await bmg.compute_blind_merge_grade(session, project, version, "abc123")
 
     assert result is None
 
@@ -574,6 +641,135 @@ class TestModelSelection:
 # ===========================================================================
 # Valid verdicts
 # ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_compute_includes_skipped_pr_count_in_artifact(monkeypatch):
+    """skipped_pr_count from diff assembly is included in the returned grade artifact."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
+    monkeypatch.setattr(
+        "app.blind_merge_grade._resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    monkeypatch.setattr(
+        "app.blind_merge_grade._gather_merged_diff_text",
+        AsyncMock(return_value=("some diffs", 3, 2)),
+    )
+    monkeypatch.setattr(
+        "app.blind_merge_grade._grade_once",
+        AsyncMock(return_value={"coverage_verdict": "partial", "biggest_gap": "gap"}),
+    )
+
+    session = AsyncMock()
+    project = AsyncMock(spec=Project)
+    version = AsyncMock(spec=ReleaseVersion)
+    version.goal = "some goal"
+
+    result = await bmg.compute_blind_merge_grade(session, project, version, "abc123")
+
+    assert result is not None
+    assert result["skipped_pr_count"] == 2
+    assert result["pr_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_pr_fetch_failure_logs_warning(monkeypatch, caplog):
+    """A PR fetch failure in _gather_merged_diff_text logs at WARNING level."""
+    import logging
+
+    from app import blind_merge_grade as bmg_module
+
+    async def fake_get_pr_files(token, owner, repo, pr_number, include_patch=False):
+        if pr_number == 42:
+            raise RuntimeError("simulated fetch failure")
+        return []
+
+    monkeypatch.setattr("app.blind_merge_grade.github.get_pr_files", fake_get_pr_files)
+
+    version = MagicMock(spec=ReleaseVersion)
+    version.opened_at = None  # short-circuit before DB query
+
+    with caplog.at_level(logging.WARNING, logger="app.blind_merge_grade"):
+        # opened_at=None returns early with empty diff
+        diff_text, pr_count, skipped = await bmg_module._gather_merged_diff_text(
+            AsyncMock(), MagicMock(), version, token="tok", owner="o", repo="r"
+        )
+
+    assert diff_text == ""
+    assert pr_count == 0
+    assert skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_pr_fetch_failure_increments_skipped_count(monkeypatch):
+    """When a PR file fetch raises, skipped_pr_count is incremented and WARNING is logged."""
+    from app import blind_merge_grade as bmg_module
+    from app.models import TaskStatus
+
+    # Stub out the DB session to return two tasks with pr_numbers 1 and 2
+    task1 = MagicMock()
+    task1.project_id = "proj"
+    task1.status = TaskStatus.COMPLETED
+    task1.first_payload = {"pr_number": 1}
+    task1.updated_at = MagicMock()
+
+    task2 = MagicMock()
+    task2.project_id = "proj"
+    task2.status = TaskStatus.COMPLETED
+    task2.first_payload = {"pr_number": 2}
+    task2.updated_at = MagicMock()
+
+    fake_scalars = MagicMock()
+    fake_scalars.all.return_value = [task1, task2]
+    fake_result = MagicMock()
+    fake_result.scalars.return_value = fake_scalars
+
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=fake_result)
+
+    version = MagicMock(spec=ReleaseVersion)
+    import datetime
+
+    version.opened_at = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    version.project_id = "proj"
+
+    # Make _task_completed_at return a time after opened_at
+    monkeypatch.setattr(
+        "app.blind_merge_grade.release_version._task_completed_at",
+        lambda t: datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc),
+    )
+    # landed_signal_predicate returns a truthy clause (stub)
+    monkeypatch.setattr(
+        "app.blind_merge_grade.landed_signal_predicate",
+        lambda session: True,
+    )
+
+    # PR #1 succeeds, PR #2 fails
+    async def fake_get_pr_files(token, owner, repo, pr_number, include_patch=False):
+        if pr_number == 2:
+            raise RuntimeError("simulated fetch failure")
+        return [{"filename": "a.py", "additions": 1, "deletions": 0, "patch": "patch"}]
+
+    monkeypatch.setattr("app.blind_merge_grade.github.get_pr_files", fake_get_pr_files)
+
+    import io
+    import logging
+
+    log_stream = io.StringIO()
+    handler = logging.StreamHandler(log_stream)
+    handler.setLevel(logging.WARNING)
+    bmg_module.logger.addHandler(handler)
+    try:
+        diff_text, pr_count, skipped = await bmg_module._gather_merged_diff_text(
+            session, MagicMock(), version, token="tok", owner="o", repo="r"
+        )
+    finally:
+        bmg_module.logger.removeHandler(handler)
+
+    assert pr_count == 1
+    assert skipped == 1
+    log_output = log_stream.getvalue()
+    assert "PR #2" in log_output  # skipped PR logged at WARNING
 
 
 class TestValidVerdicts:

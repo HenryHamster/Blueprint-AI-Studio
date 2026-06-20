@@ -1545,6 +1545,98 @@ describe('VersionLifecyclePanel', () => {
       const evidence = screen.getByTestId('durable-qualification-evidence');
       expect(within(evidence).queryByTestId('goal-alignment-chip')).not.toBeInTheDocument();
     });
+
+    it('renders blind_merge_grade covers chip', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                blind_merge_grade: { coverage_verdict: 'covers', biggest_gap: 'No significant gap' },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('blind-merge-grade-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('merge covers');
+      expect(chip).toHaveAttribute('title', 'No significant gap');
+    });
+
+    it('renders blind_merge_grade misses chip with red styling', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                blind_merge_grade: { coverage_verdict: 'misses', biggest_gap: 'Core feature not implemented' },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('blind-merge-grade-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('merge misses');
+      expect(chip).toHaveAttribute('title', 'Core feature not implemented');
+    });
+
+    it('renders blind_merge_grade partial chip with biggest_gap in title', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                blind_merge_grade: { coverage_verdict: 'partial', biggest_gap: 'DB migration not addressed' },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('blind-merge-grade-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('merge partial');
+      expect(chip).toHaveAttribute('title', 'DB migration not addressed');
+    });
+
+    it('does not render blind_merge_grade chip when blind_merge_grade is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('blind-merge-grade-chip')).not.toBeInTheDocument();
+    });
   });
 
   describe('qualification verdict staleness', () => {

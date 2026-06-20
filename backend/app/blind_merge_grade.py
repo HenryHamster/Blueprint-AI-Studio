@@ -104,6 +104,8 @@ def blind_merge_grade_satisfied(
         return False
     if record.get("candidate_sha") != candidate_sha:
         return False
+    if record.get("skipped_pr_count", 0) > 0:
+        return False
     biggest_gap = record.get("biggest_gap")
     verdict = record.get("coverage_verdict")
     return bool(
@@ -136,16 +138,16 @@ async def _gather_merged_diff_text(
     token: str,
     owner: str,
     repo: str,
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     """Assemble the merged-diff text for the version's landed PRs.
 
     Mirrors ``release_qualifier._fetch_version_theme_evidence``'s query: COMPLETED
     + landed tasks since ``version.opened_at``, read each PR number via
     ``task.first_payload``, fetch per-PR file patches.  Returns
-    ``(diff_text, pr_count)``.  Bounded by ``_MAX_PRS`` / per-file / total caps.
+    ``(diff_text, pr_count, skipped_pr_count)``.  Bounded by ``_MAX_PRS`` / per-file / total caps.
     """
     if version.opened_at is None:
-        return ("", 0)
+        return ("", 0, 0)
 
     rows = (
         (
@@ -176,16 +178,18 @@ async def _gather_merged_diff_text(
     parts: list[str] = []
     total = 0
     graded_prs = 0
+    skipped_prs = 0
     for pn in pr_numbers[:_MAX_PRS]:
         try:
             files = await github.get_pr_files(
                 token, owner, repo, pn, include_patch=True
             )
         except Exception:  # noqa: BLE001 — a single PR fetch failure must not abort the grade
-            logger.info(
+            logger.warning(
                 "[BLIND_MERGE_GRADE] could not fetch files for PR #%s — skipping",
                 pn,
             )
+            skipped_prs += 1
             continue
         graded_prs += 1
         parts.append(f"### PR #{pn}")
@@ -206,7 +210,7 @@ async def _gather_merged_diff_text(
             parts.append("\n…[remaining PRs truncated for length]…")
             break
 
-    return ("\n".join(parts), graded_prs)
+    return ("\n".join(parts), graded_prs, skipped_prs)
 
 
 def _build_prompt(goal: str, diff_text: str, pr_count: int) -> str:
@@ -266,6 +270,16 @@ async def compute_blind_merge_grade(
     unavailable/unparseable after a retry).  A ``None`` return must FAIL CLOSED
     at the call site — it never fabricates a passing grade.
     """
+    goal = (version.goal or "").strip()
+    if not goal:
+        logger.warning(
+            "[BLIND_MERGE_GRADE] version %s has no goal text — cannot grade candidate %s "
+            "(grade unavailable; will retry on next qualification)",
+            getattr(version, "version_number", "?"),
+            (candidate_sha or "")[:8],
+        )
+        return None
+
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         logger.info(
@@ -291,7 +305,7 @@ async def compute_blind_merge_grade(
     token, owner, repo = resolved
 
     try:
-        diff_text, pr_count = await _gather_merged_diff_text(
+        diff_text, pr_count, skipped_pr_count = await _gather_merged_diff_text(
             session, project, version, token=token, owner=owner, repo=repo
         )
     except Exception as exc:  # noqa: BLE001 — diff assembly failure defers (fail closed)
@@ -302,7 +316,7 @@ async def compute_blind_merge_grade(
         )
         return None
 
-    prompt = _build_prompt(version.goal or "", diff_text, pr_count)
+    prompt = _build_prompt(goal, diff_text, pr_count)
     model = _model_id()
 
     # One JSON-parse retry, then fail closed.  A parse error is retryable (the
@@ -317,6 +331,7 @@ async def compute_blind_merge_grade(
         "biggest_gap": parsed["biggest_gap"],
         "model": model,
         "pr_count": pr_count,
+        "skipped_pr_count": skipped_pr_count,
         "graded_at": _utcnow().isoformat(),
     }
 

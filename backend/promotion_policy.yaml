@@ -23,3 +23,4 @@ threshold: 0.90        # composite confidence required to promote.
 
 theme_warn_threshold: 0.70   # assessed_grade below this -> advisory shortfall
 theme_block_threshold: 0.0   # raise (>0) to arm hard-blocking; ships dark
+merge_grade_block_threshold: 0.0  # raise (>0, typically 1.0) to hard-block on blind merge-grade "misses"

@@ -6,6 +6,7 @@ import type {
   AgentServingShasResponse,
   AuditFinding,
   AuditReconciliation,
+  BlindMergeGrade,
   ChallengerRefutedFinding,
   CiResolution,
   CurrentVersion,
@@ -678,6 +679,7 @@ export type DurableQualificationEvidence = {
   promotion_error_detail?: string | null;
   theme_delivery?: ThemeDeliveryCert | null;
   goal_alignment?: GoalAlignment | null;
+  blind_merge_grade?: BlindMergeGrade | null;
 };
 
 function formatCompactDetail(value: unknown): string {
@@ -851,6 +853,28 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
         title={ga.biggest_gap ?? ga.state ?? undefined}
       >
         goal {ga.state ?? 'unknown'}{gradeLabel}
+      </span>,
+    );
+  }
+
+  if (q.blind_merge_grade) {
+    const bmg = q.blind_merge_grade;
+    const verdict = bmg.coverage_verdict;
+    const isCovers = verdict === 'covers';
+    const isMisses = verdict === 'misses';
+    const colorClass = isCovers
+      ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
+      : isMisses
+        ? 'bg-red-500/10 text-red-400 border-red-500/20'
+        : 'bg-amber-500/10 text-amber-300 border-amber-500/20';
+    chips.push(
+      <span
+        key="blind-merge-grade"
+        data-testid="blind-merge-grade-chip"
+        className={`text-[10px] px-1.5 py-0.5 rounded border ${colorClass}`}
+        title={bmg.biggest_gap ?? verdict ?? undefined}
+      >
+        merge {verdict ?? 'unknown'}
       </span>,
     );
   }

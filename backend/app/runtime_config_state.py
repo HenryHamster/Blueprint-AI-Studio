@@ -1048,7 +1048,11 @@ def _seed_promotion_policy() -> None:
         }
     runtime_config["promotion_threshold"] = float(policy["threshold"])
     runtime_config["promotion_weights"] = dict(policy["weights"])
-    for _k in ("theme_warn_threshold", "theme_block_threshold"):
+    for _k in (
+        "theme_warn_threshold",
+        "theme_block_threshold",
+        "merge_grade_block_threshold",
+    ):
         if _k in policy:
             runtime_config[_k] = policy[_k]
 

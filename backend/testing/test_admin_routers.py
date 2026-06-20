@@ -5941,6 +5941,51 @@ class TestNotificationConfigSettings:
                 )
 
     @pytest.mark.asyncio
+    async def test_merge_grade_block_threshold_round_trip(self, client: AsyncClient):
+        """merge_grade_block_threshold is settable via PATCH, bounded to [0, 1],
+        visible on GET, and defaults to 0.0 (ships dark)."""
+        from app.shared_state import runtime_config as _rc
+
+        original = _rc.get("merge_grade_block_threshold", 0.0)
+        try:
+            resp = await client.patch(
+                "/api/admin/settings", json={"merge_grade_block_threshold": 1.0}
+            )
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["merge_grade_block_threshold"] == pytest.approx(1.0)
+
+            # 0.0 is allowed (disarms the gate).
+            resp0 = await client.patch(
+                "/api/admin/settings", json={"merge_grade_block_threshold": 0.0}
+            )
+            assert resp0.status_code == 200
+
+            # Out of range rejected.
+            assert (
+                await client.patch(
+                    "/api/admin/settings", json={"merge_grade_block_threshold": -0.1}
+                )
+            ).status_code == 400
+            assert (
+                await client.patch(
+                    "/api/admin/settings", json={"merge_grade_block_threshold": 1.5}
+                )
+            ).status_code == 400
+            # Non-numeric rejected.
+            assert (
+                await client.patch(
+                    "/api/admin/settings",
+                    json={"merge_grade_block_threshold": "high"},
+                )
+            ).status_code == 400
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={"merge_grade_block_threshold": original},
+            )
+
+    @pytest.mark.asyncio
     async def test_unknown_settings_key_rejected(self, client: AsyncClient):
         """An unknown/misspelled settings key is rejected with 400 (and logged)
         rather than silently ignored — so a typo is detectable."""

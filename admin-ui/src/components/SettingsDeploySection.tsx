@@ -1,7 +1,69 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Play, Pause, RotateCw, Wrench, CheckCircle, Zap, AlertTriangle } from 'lucide-react';
 import { parseTimestamp } from '../utils/time';
+import { apiFetch } from '../api';
 import type { DeployState, FailedRollbackInfo } from '../types/settings';
+
+function MergeGradeGateSettings() {
+  const [threshold, setThreshold] = useState<number>(0.0);
+  const [input, setInput] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveOk, setSaveOk] = useState(false);
+
+  const load = useCallback(async () => {
+    const res = await apiFetch('/api/admin/settings');
+    if (res.ok) {
+      const data = await res.json();
+      const val = data?.merge_grade_block_threshold ?? 0.0;
+      setThreshold(val);
+      setInput(String(val));
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const save = async () => {
+    const val = parseFloat(input);
+    if (isNaN(val) || val < 0 || val > 1) { setSaveError('Must be a number between 0.0 and 1.0'); return; }
+    setSaving(true); setSaveError(null); setSaveOk(false);
+    try {
+      const res = await apiFetch('/api/admin/settings', { method: 'PATCH', body: JSON.stringify({ merge_grade_block_threshold: val }) });
+      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d?.detail || `HTTP ${res.status}`); }
+      setThreshold(val); setSaveOk(true); setTimeout(() => setSaveOk(false), 2000);
+    } catch (e) { setSaveError((e as Error).message); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <div>
+      <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Release Gate Thresholds</h3>
+      <p className="text-[11px] text-neutral-500 mb-3">
+        Arm the blind merge-grade hard block by raising <code className="font-mono">merge_grade_block_threshold</code> above <code className="font-mono">0.0</code> (typically <code className="font-mono">1.0</code>).
+        When the blind merge-grade verdict is <em>misses</em> and this threshold is &gt;&nbsp;0, qualification is blocked.
+        Default <code className="font-mono">0.0</code> ships dark (gate never fires).
+      </p>
+      <div className="flex items-center gap-3">
+        <label className="text-xs text-neutral-400 w-48">merge_grade_block_threshold</label>
+        <input
+          type="number" min={0} max={1} step={0.1}
+          value={input} onChange={e => setInput(e.target.value)}
+          className="w-24 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+          data-testid="merge-grade-block-threshold-input"
+        />
+        <button
+          onClick={save} disabled={saving}
+          className="inline-flex items-center justify-center min-h-[32px] bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded px-3 py-1 text-xs transition-colors disabled:opacity-50"
+          data-testid="merge-grade-block-threshold-save"
+        >
+          {saving ? 'Saving…' : saveOk ? 'Saved' : 'Save'}
+        </button>
+        <span className="text-[11px] text-neutral-500">current: <span className="font-mono text-neutral-300">{threshold}</span></span>
+      </div>
+      {saveError && <p className="text-xs text-red-400 mt-1">{saveError}</p>}
+    </div>
+  );
+}
 
 const EXTERNAL_DEP_ORDER = ['github_api', 'db', 'dispatch_api', 'anthropic_api', 'openai_api', 'gemini_api', 'gcp'] as const;
 
@@ -334,6 +396,9 @@ export function DeploySection({
           <p className="text-xs text-neutral-600">No data yet</p>
         )}
       </div>
+
+      {/* Release Gate Thresholds */}
+      <MergeGradeGateSettings />
     </div>
   );
 }

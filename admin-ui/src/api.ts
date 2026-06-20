@@ -1680,6 +1680,11 @@ export interface GoalAlignment {
   reasoning_summary?: string | null;
 }
 
+export interface BlindMergeGrade {
+  coverage_verdict?: string | null;  // 'covers' | 'partial' | 'misses'
+  biggest_gap?: string | null;
+}
+
 export interface AuditFinding {
   severity: string;
   summary: string;
@@ -1750,6 +1755,7 @@ export interface VersionQualification {
   promotion_error_detail?: string | null;
   theme_delivery?: ThemeDeliveryCert | null;
   goal_alignment?: GoalAlignment | null;
+  blind_merge_grade?: BlindMergeGrade | null;
 }
 
 /** Single resolved serving block — the canonical answer to "is this version live?"
@@ -2331,6 +2337,7 @@ export interface QualificationVerdictRecord {
   promotion_error_detail?: string | null;
   theme_delivery?: ThemeDeliveryCert | null;
   goal_alignment?: GoalAlignment | null;
+  blind_merge_grade?: BlindMergeGrade | null;
 }
 
 export interface QualificationVerdictsInfraContext {
