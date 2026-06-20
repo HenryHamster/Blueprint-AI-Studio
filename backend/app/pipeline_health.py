@@ -38,7 +38,7 @@ from app.models import (
 )
 from app.time_utils import _coerce_naive_utc
 from app.routers.admin_analytics import _derive_completed_at
-from app.sr_blind_spots import has_reviewer_confirmed_categories
+from app.sr_blind_spots import has_reviewer_confirmed_categories, safe_check_results
 from app.sr_review_quality_metrics import (
     _compute_edges_considered_metrics,
     _serialize_sr_catch_rate_trends,
@@ -862,9 +862,9 @@ async def compute_pipeline_health_summary(
         # between tasks where that category flagged issues vs tasks where it passed clean.
         all_categories: set = set()
         for t in tasks_with_self_review:
-            check_results = (t.context or {}).get("_self_review_outcome", {}).get(
-                "check_results"
-            ) or {}
+            check_results = safe_check_results(
+                (t.context or {}).get("_self_review_outcome", {})
+            )
             all_categories.update(check_results.keys())
 
         category_correlation: Dict[str, Any] = {}
@@ -872,9 +872,9 @@ async def compute_pipeline_health_summary(
             tasks_cat_findings = [
                 t
                 for t in tasks_with_self_review
-                if not (t.context or {})
-                .get("_self_review_outcome", {})
-                .get("check_results", {})
+                if not safe_check_results(
+                    (t.context or {}).get("_self_review_outcome", {})
+                )
                 .get(cat, {})
                 .get("passed", True)
             ]
@@ -882,15 +882,12 @@ async def compute_pipeline_health_summary(
                 t
                 for t in tasks_with_self_review
                 if cat
-                in (
-                    (t.context or {})
-                    .get("_self_review_outcome", {})
-                    .get("check_results")
-                    or {}
+                in safe_check_results(
+                    (t.context or {}).get("_self_review_outcome", {})
                 )
-                and (t.context or {})
-                .get("_self_review_outcome", {})
-                .get("check_results", {})
+                and safe_check_results(
+                    (t.context or {}).get("_self_review_outcome", {})
+                )
                 .get(cat, {})
                 .get("passed", True)
             ]

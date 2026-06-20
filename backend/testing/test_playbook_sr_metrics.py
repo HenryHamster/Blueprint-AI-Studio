@@ -9941,3 +9941,76 @@ async def test_overall_sr_alone_fields_present_when_data_insufficient(
     assert isinstance(rate, float) and 0.0 <= rate <= 1.0, (
         f"overall_sr_alone_hit_rate should be float in [0,1], got {rate!r}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression: malformed (list-shaped) check_results must not crash consumers
+#
+# Agents occasionally emit ``_self_review_outcome.check_results`` as a JSON
+# list instead of the expected category->record dict. The outer-only
+# ``Dict[str, Any]`` schema validation lets it through, and a NON-EMPTY list is
+# truthy so the ``... or {}`` guard does not catch it — consumers that then call
+# ``.items()/.keys()/.get()`` raised AttributeError (≈90 in prod on the
+# claim_task hot path; the /prompt-fingerprint-analytics endpoint 500'd). The
+# ``safe_check_results`` guard degrades a non-dict shape to ``{}``.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_list_shaped_sr_task(project_id, *, task_type: str = "create") -> Task:
+    """Build a code-change task whose check_results is a NON-EMPTY list."""
+    task = Task(
+        project_id=project_id,
+        title="malformed SR task",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {
+                # The bug shape: agent emitted a list rather than a dict.
+                "check_results": [
+                    {"category": "correctness", "passed": False},
+                    {"category": "security", "passed": False},
+                ],
+                "reviewer_findings": [{"category": "correctness"}],
+            },
+            "_first_attempt_rejection_categories": {"correctness": 1},
+            "review_loop": {"ci_passed": True},
+        },
+    )
+    task.created_at = _utcnow() - timedelta(days=1)
+    return task
+
+
+def test_list_shaped_check_results_does_not_crash_stats_for_tasks():
+    """`_stats_for_tasks` tolerates list-shaped check_results (no AttributeError)."""
+    from app.playbook_learning import _stats_for_tasks
+
+    project_id = uuid.uuid4()
+    tasks = [_make_list_shaped_sr_task(project_id) for _ in range(3)]
+
+    # Must not raise; the malformed entries degrade to an empty mapping.
+    count, cat_stats, _type_cat, _all_iter, _sev, _scope_cat = _stats_for_tasks(tasks)
+    assert isinstance(cat_stats, dict)
+
+
+def test_list_shaped_check_results_does_not_crash_co_failure_pairs():
+    """`aggregate_sr_co_failure_pairs` tolerates list-shaped check_results."""
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
+
+    project_id = uuid.uuid4()
+    tasks = [_make_list_shaped_sr_task(project_id) for _ in range(6)]
+
+    # Must not raise; with no recoverable category failures, returns None or [].
+    result = aggregate_sr_co_failure_pairs(tasks, min_sample=5, min_co_count=2)
+    assert result is None or result == []
+
+
+def test_list_shaped_check_results_does_not_crash_quality_by_fingerprint():
+    """`compute_sr_quality_by_fingerprint` tolerates list-shaped check_results."""
+    from app.playbook_learning import compute_sr_quality_by_fingerprint
+
+    project_id = uuid.uuid4()
+    tasks = [_make_list_shaped_sr_task(project_id) for _ in range(3)]
+
+    # Must not raise; returns a well-formed (possibly empty) mapping.
+    result = compute_sr_quality_by_fingerprint(tasks, min_sample_size=1)
+    assert isinstance(result, dict)

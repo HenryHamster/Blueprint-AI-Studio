@@ -85,6 +85,20 @@ def is_disallowed_blind_spot(entry: str) -> bool:
     return any(p.search(entry) for p in DISALLOWED_BLIND_SPOT_PATTERNS)
 
 
+def safe_check_results(sro: Dict[str, Any]) -> Dict[str, Any]:
+    """Return ``sro['check_results']`` only when it is a dict, else ``{}``.
+
+    Agents occasionally emit ``check_results`` as a JSON list instead of the
+    expected category->record dict. The outer-only ``Dict[str, Any]`` schema
+    validation does not catch this, and ``sro.get("check_results") or {}`` lets
+    a non-empty list through (truthy) — downstream ``.items()/.keys()/.get()``
+    calls then raise AttributeError. Route dict-assuming reads through this
+    helper to degrade gracefully to an empty mapping.
+    """
+    cr = sro.get("check_results")
+    return cr if isinstance(cr, dict) else {}
+
+
 def filter_disallowed_blind_spots(sro: Dict[str, Any]) -> Dict[str, Any]:
     """Drop disallowed blind_spot entries from *sro* in-place and record the count.
 
@@ -103,6 +117,16 @@ def filter_disallowed_blind_spots(sro: Dict[str, Any]) -> Dict[str, Any]:
     dropped = len(blind_spots) - len(kept)
     sro["blind_spots"] = kept
     sro["_filtered_blind_spots_count"] = dropped
+    # Some agents emit ``check_results`` as a JSON list instead of the expected
+    # category->record dict. The outer-only ``Dict[str, Any]`` schema validation
+    # lets it through, and a non-empty list is truthy so the ubiquitous
+    # ``sro.get("check_results") or {}`` guard does not catch it — downstream
+    # ``.items()/.keys()/.get()`` calls then raise AttributeError. Folding a list
+    # back into records is unsafe (the shapes are not unambiguously
+    # ``{category, passed}``), so we drop to an empty dict: correct graceful
+    # degradation. A valid dict is left untouched.
+    if "check_results" in sro and not isinstance(sro.get("check_results"), dict):
+        sro["check_results"] = {}
     return sro
 
 
@@ -394,7 +418,7 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
         sro = ctx.get("_self_review_outcome")
         if not sro or is_skipped_sr_outcome(sro):
             continue
-        check_results = sro.get("check_results") or {}
+        check_results = safe_check_results(sro)
         reviewer_findings = sro.get("reviewer_findings") or []
         reviewer_cats = {
             finding.get("category")
@@ -611,7 +635,7 @@ def aggregate_sr_false_attestation_rates(
         sro = ctx.get("_self_review_outcome")
         if not sro or is_skipped_sr_outcome(sro):
             continue
-        check_results = sro.get("check_results") or {}
+        check_results = safe_check_results(sro)
         review_loop = ctx.get("review_loop") or {}
         ci_passed_val = review_loop.get("ci_passed")  # True, False, or None
 
@@ -674,7 +698,7 @@ def aggregate_sr_co_failure_pairs(
         if not sro or is_skipped_sr_outcome(sro):
             continue
         total += 1
-        check_results = sro.get("check_results") or {}
+        check_results = safe_check_results(sro)
         failed = {
             c
             for c, r in check_results.items()

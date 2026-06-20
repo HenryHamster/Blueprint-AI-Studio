@@ -3855,3 +3855,44 @@ def test_rate_limit_retry_minutes_clamped_to_max_via_set_retry_after():
     assert written <= max_allowed
     # And must be significantly longer than the prior 2-minute fixed default.
     assert written > _utcnow() + timedelta(minutes=10)
+
+
+# ── Regression: list-shaped check_results must not crash the SR branch ────────
+
+
+@pytest.mark.asyncio
+async def test_self_review_effectiveness_tolerates_list_shaped_check_results():
+    """The self-review-effectiveness branch must not crash when an agent emits
+    ``check_results`` as a JSON list instead of the expected dict.
+
+    A non-empty list is truthy, so the ``... or {}`` guard misses it and the
+    branch previously raised AttributeError on ``check_results.keys()``. The
+    ``safe_check_results`` guard degrades a non-dict shape to ``{}``.
+    """
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    # >= 3 terminal tasks with _self_review_outcome present to enter the branch.
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+            payloads=[{"type": "create", "prompt": "x"}],
+            context={
+                "_self_review_outcome": {
+                    "check_results": [
+                        {"category": "correctness", "passed": False},
+                        {"category": "security", "passed": False},
+                    ],
+                },
+            },
+        )
+        for _ in range(3)
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    # Must not raise; the malformed shape degrades to an empty mapping.
+    result = await compute_pipeline_health_summary(session, project_id)
+    assert "self_review_effectiveness" in result

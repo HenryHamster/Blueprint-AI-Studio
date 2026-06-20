@@ -16,6 +16,7 @@ from app.sr_blind_spots import (
     has_reviewer_confirmed_categories,
     is_skipped_sr_outcome,
     reviewer_confirmed_categories,
+    safe_check_results,
 )
 from app.time_utils import _to_naive_utc
 
@@ -67,10 +68,16 @@ def _author_sr_failed_categories(check_results: Dict[str, Any]) -> set[str]:
 
     Reviewer-stamped check_results entries are intentionally excluded so
     reviewer rescues are not misattributed as author catches.
+
+    Agents occasionally emit ``check_results`` as a list rather than the
+    expected dict; a non-empty list slips past ``... or {}`` (truthy) and would
+    raise on ``.items()``, so guard the shape explicitly here.
     """
+    if not isinstance(check_results, dict):
+        return set()
     return {
         category
-        for category, result in (check_results or {}).items()
+        for category, result in check_results.items()
         if isinstance(result, dict)
         and not result.get("passed", True)
         and result.get("origin") not in _REVIEWER_ORIGINS
@@ -275,7 +282,7 @@ def _compute_fresh_reviewer_effectiveness(
         ctx = t.context or {}
         findings = ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
         reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
-        check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
+        check_results = safe_check_results(ctx.get("_self_review_outcome", {}))
         agent_failed = _author_sr_failed_categories(check_results)
         for finding in findings:
             cat = finding.get("category") if isinstance(finding, dict) else None
@@ -304,7 +311,7 @@ def _compute_fresh_reviewer_effectiveness(
 def _sr_miss_drilldown(
     sr_outcome: Dict[str, Any], missed_categories: set[str]
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    check_results = sr_outcome.get("check_results") or {}
+    check_results = safe_check_results(sr_outcome)
     sr_check_results = {}
     for cat in missed_categories:
         result = check_results.get(cat)
@@ -521,7 +528,7 @@ def compute_sr_prediction_accuracy(
     tasks_with_rejections = 0
     for t in tasks_with_both:
         ctx = t.context or {}
-        check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
+        check_results = safe_check_results(ctx.get("_self_review_outcome", {}))
         # All-iterations reviewer-confirmed truth set (falls back to the
         # first-attempt set only when absent) — shared with the sibling FP
         # surfaces so a later-iteration confirmation is not scored as a false

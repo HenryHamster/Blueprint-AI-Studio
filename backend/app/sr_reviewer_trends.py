@@ -14,7 +14,11 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Project, StrategicCycle, TaskStatus, _utcnow
-from app.sr_blind_spots import _REVIEWER_ORIGINS, reviewer_confirmed_categories
+from app.sr_blind_spots import (
+    _REVIEWER_ORIGINS,
+    reviewer_confirmed_categories,
+    safe_check_results,
+)
 from app.sr_catch_rate_trends import (
     _MIN_SR_SAMPLE,
     _SR_CODE_CHANGE_TYPES,
@@ -97,9 +101,7 @@ async def compute_fresh_reviewer_trend(
                 ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
             )
             reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
-            check_results = (
-                ctx.get("_self_review_outcome", {}).get("check_results") or {}
-            )
+            check_results = safe_check_results(ctx.get("_self_review_outcome", {}))
             # Author SR failures only — a reviewer-stamped override means the
             # author SR did NOT catch the category, so it must still count
             # toward `cat_added_value` when the human confirms the rescue.
