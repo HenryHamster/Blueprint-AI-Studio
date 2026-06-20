@@ -15043,6 +15043,201 @@ class TestGetProjectFindings:
         assert resp.status_code == 404
 
 
+class TestRecordFindingResolution:
+    """POST /api/admin/projects/{id}/finding-resolution — operator ledger write."""
+
+    @pytest.mark.asyncio
+    async def test_success_resolved_state(self, client: AsyncClient, db_session):
+        """Member can write a 'resolved' entry; DB row is created."""
+        from app.models import AuditFindingResolution
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/finding-resolution",
+            json={
+                "finding_key": "adb632b709685086",
+                "release_version_id": str(version.id),
+                "state": "resolved",
+                "severity": "medium",
+                "note": "Fixed in PR #42",
+                "resolving_ref": "abc123",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["finding_key"] == "adb632b709685086"
+        assert data["state"] == "resolved"
+        assert data["severity"] == "medium"
+        assert data["note"] == "Fixed in PR #42"
+        assert data["resolving_ref"] == "abc123"
+        assert data["project_id"] == str(project.id)
+        assert data["release_version_id"] == str(version.id)
+
+        # Verify the row exists in the DB.
+        row = (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id,
+                    AuditFindingResolution.finding_key == "adb632b709685086",
+                )
+            )
+        ).scalars().first()
+        assert row is not None
+        assert row.state == "resolved"
+
+    @pytest.mark.asyncio
+    async def test_success_stale_state(self, client: AsyncClient, db_session):
+        """Member can write a 'stale' entry; row state is persisted correctly."""
+        from app.models import AuditFindingResolution
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/finding-resolution",
+            json={
+                "finding_key": "deadbeef12345678",
+                "release_version_id": str(version.id),
+                "state": "stale",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["state"] == "stale"
+
+        row = (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id,
+                    AuditFindingResolution.finding_key == "deadbeef12345678",
+                )
+            )
+        ).scalars().first()
+        assert row is not None
+        assert row.state == "stale"
+
+    @pytest.mark.asyncio
+    async def test_bad_state_returns_422(self, client: AsyncClient, db_session):
+        """An invalid state value is rejected by Pydantic with 422."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/finding-resolution",
+            json={
+                "finding_key": "adb632b709685086",
+                "release_version_id": str(version.id),
+                "state": "garbage",
+            },
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_wrong_project_returns_404(self, client: AsyncClient, db_session):
+        """A release_version_id belonging to a different project returns 404."""
+        project1 = await _make_project(db_session, name="Project 1")
+        project2 = await _make_project(db_session, name="Project 2")
+        version_p2 = await _make_open_version(db_session, project2.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project1.id}/finding-resolution",
+            json={
+                "finding_key": "adb632b709685086",
+                "release_version_id": str(version_p2.id),
+                "state": "resolved",
+            },
+        )
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_viewer_role_returns_403(self, override_get_session, db_session):
+        """Viewer role is rejected with 403 (member role required)."""
+        from app.auth import get_current_user
+
+        viewer_id = "viewer-user-99"
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        member = ProjectMember(
+            project_id=project.id, user_id=viewer_id, role="viewer"
+        )
+        db_session.add(member)
+        await db_session.commit()
+
+        async def override_viewer():
+            return {"user_id": viewer_id, "email": "viewer@example.com", "role": "user"}
+
+        from app.main import app as _app
+
+        _app.dependency_overrides[get_current_user] = override_viewer
+        _app.dependency_overrides[override_get_session] = lambda: db_session
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=_app), base_url="http://test"
+            ) as viewer_client:
+                resp = await viewer_client.post(
+                    f"/api/admin/projects/{project.id}/finding-resolution",
+                    json={
+                        "finding_key": "adb632b709685086",
+                        "release_version_id": str(version.id),
+                        "state": "resolved",
+                    },
+                )
+            assert resp.status_code == 403
+        finally:
+            _app.dependency_overrides.pop(get_current_user, None)
+            _app.dependency_overrides.pop(override_get_session, None)
+
+    @pytest.mark.asyncio
+    async def test_upsert_overwrites_existing_row(self, client: AsyncClient, db_session):
+        """A second write for the same (finding_key, release_version_id) updates
+        the existing row rather than inserting a duplicate."""
+        from app.models import AuditFindingResolution
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        # First write: resolved.
+        resp1 = await client.post(
+            f"/api/admin/projects/{project.id}/finding-resolution",
+            json={
+                "finding_key": "adb632b709685086",
+                "release_version_id": str(version.id),
+                "state": "resolved",
+                "note": "first write",
+            },
+        )
+        assert resp1.status_code == 200
+
+        # Second write: stale with different note.
+        resp2 = await client.post(
+            f"/api/admin/projects/{project.id}/finding-resolution",
+            json={
+                "finding_key": "adb632b709685086",
+                "release_version_id": str(version.id),
+                "state": "stale",
+                "note": "second write",
+            },
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["state"] == "stale"
+
+        # Only one row in the DB.
+        rows = (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id,
+                    AuditFindingResolution.finding_key == "adb632b709685086",
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].state == "stale"
+        assert rows[0].note == "second write"
+
+
 class TestComputeExperimentTaskLaunch:
     async def _project_with_repo(self, session, repo="compute"):
         project = Project(

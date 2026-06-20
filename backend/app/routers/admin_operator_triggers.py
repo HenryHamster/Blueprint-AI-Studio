@@ -13,7 +13,7 @@ from sqlalchemy import func as _func
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from typing import List
+from typing import List, Literal
 import uuid
 import logging
 import time
@@ -947,6 +947,82 @@ async def cancel_strategic_refresh_endpoint(
     cleared = await cancel_strategic_refresh(session, project_id)
     await session.commit()
     return {"cleared": cleared}
+
+
+class RecordFindingResolutionBody(BaseModel):
+    """Body for POST /projects/{project_id}/finding-resolution."""
+
+    finding_key: str = Field(..., min_length=1, max_length=64)
+    release_version_id: uuid.UUID
+    state: Literal["resolved", "stale"]
+    severity: str | None = Field(default=None, max_length=32)
+    note: str | None = Field(default=None, max_length=2000)
+    resolving_ref: str | None = Field(default=None, max_length=200)
+    verified_against_sha: str | None = Field(default=None, max_length=200)
+
+
+@router.post("/projects/{project_id}/finding-resolution")
+async def record_finding_resolution(
+    project_id: uuid.UUID,
+    body: RecordFindingResolutionBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Manually write a resolution-ledger entry for a carried audit finding.
+
+    Members and above can record a ``resolved`` or ``stale`` entry for a
+    ``(finding_key, release_version_id)`` pair without requiring an agent token.
+    Intended as the operator override when the automated sweep fails or a
+    one-time manual resolution is needed to unblock re-qualification.
+
+    Returns the upserted ``AuditFindingResolution`` row as a dict.
+    """
+    from app.models import ReleaseVersion
+    from app.release_readiness import apply_finding_resolution
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    # Validate that the release_version_id belongs to this project.
+    rv = (
+        await session.execute(
+            select(ReleaseVersion).where(
+                ReleaseVersion.id == body.release_version_id,
+                ReleaseVersion.project_id == project_id,
+            )
+        )
+    ).scalars().first()
+    if rv is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Release version not found for this project.",
+        )
+
+    row = await apply_finding_resolution(
+        session,
+        project_id,
+        body.release_version_id,
+        body.finding_key,
+        body.state,
+        severity=body.severity,
+        note=body.note,
+        resolving_ref=body.resolving_ref,
+        verified_against_sha=body.verified_against_sha,
+    )
+    await session.commit()
+    await session.refresh(row)
+    return {
+        "id": str(row.id),
+        "project_id": str(row.project_id),
+        "release_version_id": str(row.release_version_id),
+        "finding_key": row.finding_key,
+        "state": row.state,
+        "severity": row.severity,
+        "note": row.note,
+        "resolving_ref": row.resolving_ref,
+        "verified_against_sha": row.verified_against_sha,
+    }
 
 
 @router.get("/projects/{project_id}/findings")
