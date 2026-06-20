@@ -686,6 +686,7 @@ async def _finalize_warm_claim(
                 ctx, has_checkpoint=bool(ctx.get("lane_checkpoint_sha"))
             )
         task.context = ctx
+        task.llm_account_id = ctx.get("llm_account_id")
         flag_modified(task, "context")
         agent_token = create_agent_token(
             task_id=str(task.id),

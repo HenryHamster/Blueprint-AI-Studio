@@ -1230,6 +1230,8 @@ async def reaper_service():
                             da_ctx.pop("failure_class", None)
                             da_ctx.pop("dead_auth_matched_pattern", None)
                             task.context = da_ctx
+                            # Keep the promoted column in sync (D2 over-fetch fix).
+                            task.llm_account_id = None
                             clear_retry_after(task)
                             session.add(task)
                             await broadcast_to_project(
@@ -1274,6 +1276,8 @@ async def reaper_service():
                             # don't carry provision budget into the next dispatch.
                             rl_ctx.pop("provision_failures", None)
                             task.context = rl_ctx
+                            # Keep the promoted column in sync (D2 over-fetch fix).
+                            task.llm_account_id = None
                             clear_retry_after(task)
                             persist_authoritative_verdict(task, RATE_LIMIT)
                             session.add(task)

@@ -1696,6 +1696,7 @@ async def update_agent_status(
                                     model=fallback_model,
                                     execution_mode=get_task_llm_execution_mode(task),
                                 )
+                                task.llm_account_id = None
                                 ctx["model_fallback"] = {
                                     "requested": current_model,
                                     "effective": fallback_model,

@@ -635,6 +635,84 @@ class TestMaxPlanPool:
         assert entry["id"] == str(acct_id)
         assert entry["active_tasks"] == 2, "Only IN_PROGRESS tasks should be counted"
 
+    # ── Test 1b: hot-loop reconcile reads the promoted column, not Task.context ─
+
+    @pytest.mark.asyncio
+    async def test_reconcile_active_per_account_reads_promoted_column(self, db_session):
+        """The orchestrator 30s reconcile counts active tasks per account by
+        projecting the promoted Task.llm_account_id column — NOT by reading the
+        Task.context JSONB blob (D2 over-fetch fix, d-57436105).
+
+        Proves both halves of the contract:
+        (a) tasks whose column is set are counted under that account, and
+        (b) a task whose account id lives ONLY in context (column NULL) is NOT
+            counted — demonstrating the query no longer reads Task.context.
+        """
+        from app.orchestrator import _reconcile_active_per_account
+
+        project = make_project(name="Reconcile column test", user_id="user1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        acct_col = str(uuid.uuid4())
+        acct_ctx_only = str(uuid.uuid4())
+
+        # Two active tasks with the promoted column set → counted under acct_col.
+        for _ in range(2):
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                    status=TaskStatus.IN_PROGRESS,
+                    llm_account_id=acct_col,
+                    context={"max_plan_account_id": acct_col},
+                )
+            )
+        # PROVISIONING also counts as active.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                status=TaskStatus.PROVISIONING,
+                llm_account_id=acct_col,
+                context={},
+            )
+        )
+        # A COMPLETED task must NOT be counted even though its column is set.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                status=TaskStatus.COMPLETED,
+                llm_account_id=acct_col,
+                context={},
+            )
+        )
+        # An active task whose account id lives ONLY in context (column NULL):
+        # the new projection ignores context, so this must NOT be counted.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                status=TaskStatus.IN_PROGRESS,
+                llm_account_id=None,
+                context={"llm_account_id": acct_ctx_only},
+            )
+        )
+        await db_session.commit()
+
+        counts = await _reconcile_active_per_account(db_session)
+
+        assert counts == {acct_col: 3}, (
+            "reconcile must count the 2 IN_PROGRESS + 1 PROVISIONING tasks by "
+            "promoted column, exclude COMPLETED, and ignore the context-only row"
+        )
+        assert acct_ctx_only not in counts, (
+            "context-only account id must not be counted — proves the reconcile "
+            "query reads Task.llm_account_id, not Task.context"
+        )
+
     # ── Test 2: load excludes disabled accounts from active count but includes them ─
 
     @pytest.mark.asyncio
@@ -4538,7 +4616,9 @@ class TestWarmVMSkipProvision:
             assert "2 dependent task" in alerts[0].message
 
     @pytest.mark.asyncio
-    async def test_cascade_cancel_tears_down_provisioned_child_vms(self, orch_warm_db, mocker):
+    async def test_cascade_cancel_tears_down_provisioned_child_vms(
+        self, orch_warm_db, mocker
+    ):
         """When cascade-cancelling a dependent with provisioned-VM children, all child
         VMs are deleted alongside the dependent's VM."""
         from datetime import timezone

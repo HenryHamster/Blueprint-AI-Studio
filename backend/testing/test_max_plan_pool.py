@@ -7,6 +7,7 @@ keeping assertions deterministic without fixtures or locks.
 
 import asyncio
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import ClassVar
 from unittest.mock import AsyncMock, patch
@@ -460,9 +461,7 @@ class TestAlternateAccountRecoveryDeadline:
             recovering = _acct(
                 id="recovering",
                 user_id="u-park",
-                disabled_models={
-                    OPUS: {"at": now - timedelta(minutes=20), "hits": 1}
-                },
+                disabled_models={OPUS: {"at": now - timedelta(minutes=20), "hits": 1}},
             )
             _account_by_id.update({"failed": failed, "recovering": recovering})
             _max_plan_pools["u-park"] = [failed, recovering]
@@ -2271,8 +2270,7 @@ class TestUsageHeadroomRank:
 
     def test_missing_ranks_neutral(self):
         assert (
-            _usage_headroom_rank(_acct(), datetime.utcnow())
-            == _USAGE_HEADROOM_NEUTRAL
+            _usage_headroom_rank(_acct(), datetime.utcnow()) == _USAGE_HEADROOM_NEUTRAL
         )
 
     def test_stale_ranks_neutral(self):
@@ -2623,7 +2621,9 @@ def _pool_acct(acct_id: str, **kw) -> dict:
 
 @pytest.mark.asyncio
 class TestRecordAccountStartupFailure:
-    async def _record_n(self, acct_id: str, zones: list[str], n: int | None = None) -> None:
+    async def _record_n(
+        self, acct_id: str, zones: list[str], n: int | None = None
+    ) -> None:
         """Record n startup failures cycling through zones list."""
         count = n if n is not None else _STARTUP_FAILURE_THRESHOLD
         for i in range(count):
@@ -2678,10 +2678,14 @@ class TestRecordAccountStartupFailure:
         for i in range(10):
             _pool_acct(f"acct-{i}")
             # Each account gets failures only in one zone (zone-wide signature)
-            await self._record_n(f"acct-{i}", ["us-central1-b"], n=_STARTUP_FAILURE_THRESHOLD + 1)
+            await self._record_n(
+                f"acct-{i}", ["us-central1-b"], n=_STARTUP_FAILURE_THRESHOLD + 1
+            )
         # No account should be in startup-failure cooldown
         for i in range(10):
-            assert _account_by_id[f"acct-{i}"].get("startup_failure_cooldown_at") is None
+            assert (
+                _account_by_id[f"acct-{i}"].get("startup_failure_cooldown_at") is None
+            )
 
 
 @pytest.mark.asyncio
@@ -2715,7 +2719,9 @@ class TestRecheckClearsStartupCooldown:
         now = datetime.utcnow()
         expired_at = now - timedelta(seconds=_STARTUP_FAILURE_COOLDOWN_SECONDS + 60)
         acct["startup_failure_cooldown_at"] = expired_at
-        acct["disabled_reason"] = "startup-failure cooldown: 5 failures in 120min across zones us-central1-b, us-central1-c"
+        acct["disabled_reason"] = (
+            "startup-failure cooldown: 5 failures in 120min across zones us-central1-b, us-central1-c"
+        )
 
         # Patch DB calls so we don't need a real DB session
         monkeypatch.setattr(
@@ -2753,7 +2759,9 @@ class TestRecheckClearsStartupCooldown:
         acct = _pool_acct("a")
         now = datetime.utcnow()
         acct["startup_failure_cooldown_at"] = now - timedelta(seconds=30)  # active
-        expected_reason = "startup-failure cooldown: 5 failures across us-central1-b, us-central1-c"
+        expected_reason = (
+            "startup-failure cooldown: 5 failures across us-central1-b, us-central1-c"
+        )
         acct["disabled_reason"] = expected_reason
 
         # Simulate a previously failed rl-persist that queued a retry
@@ -2884,6 +2892,7 @@ class _FakeMaxPlanAccount:
         enabled: bool = True,
     ):
         import uuid as _uuid
+
         # uuid5 is deterministic across runs (no PYTHONHASHSEED dependency)
         self.id = _uuid.uuid5(_uuid.NAMESPACE_DNS, acct_id)
         self.name = acct_id
@@ -2950,7 +2959,9 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
     async def _load_with_accounts(self, accounts: list, monkeypatch) -> None:
         from app import max_plan_pool as mpp
 
-        monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: _FakeLoadSession(accounts))
+        monkeypatch.setattr(
+            mpp, "AsyncSessionLocal", lambda: _FakeLoadSession(accounts)
+        )
         await mpp.load_max_plan_pool()
 
     async def test_active_cooldown_restored_from_rate_limit_state(self, monkeypatch):
@@ -2970,7 +2981,9 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
         """disabled_reason from startup_failure_disabled_reason must survive restart."""
         now = datetime.utcnow()
         active_at = (now - timedelta(seconds=60)).isoformat()
-        reason = "startup-failure cooldown: 5 failures across us-central1-b, us-central1-c"
+        reason = (
+            "startup-failure cooldown: 5 failures across us-central1-b, us-central1-c"
+        )
         acct = _FakeMaxPlanAccount(
             "acct-a",
             rate_limit_state={
@@ -2981,9 +2994,13 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
         )
         await self._load_with_accounts([acct], monkeypatch)
         entry = _account_by_id[str(acct.id)]
-        assert (entry.get("disabled_reason") or "").startswith("startup-failure cooldown")
+        assert (entry.get("disabled_reason") or "").startswith(
+            "startup-failure cooldown"
+        )
 
-    async def test_active_cooldown_fallback_reason_when_no_blob_reason(self, monkeypatch):
+    async def test_active_cooldown_fallback_reason_when_no_blob_reason(
+        self, monkeypatch
+    ):
         """A cooldown without a persisted reason still gets a generic disabled_reason."""
         now = datetime.utcnow()
         active_at = (now - timedelta(seconds=60)).isoformat()
@@ -2994,12 +3011,16 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
         )
         await self._load_with_accounts([acct], monkeypatch)
         entry = _account_by_id[str(acct.id)]
-        assert (entry.get("disabled_reason") or "").startswith("startup-failure cooldown")
+        assert (entry.get("disabled_reason") or "").startswith(
+            "startup-failure cooldown"
+        )
 
     async def test_expired_cooldown_clears_stale_disabled_reason(self, monkeypatch):
         """An expired persisted cooldown must not leave a stale startup-failure reason."""
         now = datetime.utcnow()
-        expired_at = (now - timedelta(seconds=_STARTUP_FAILURE_COOLDOWN_SECONDS + 120)).isoformat()
+        expired_at = (
+            now - timedelta(seconds=_STARTUP_FAILURE_COOLDOWN_SECONDS + 120)
+        ).isoformat()
         reason = "startup-failure cooldown: 5 failures across zones"
         acct = _FakeMaxPlanAccount(
             "acct-a",
@@ -3011,9 +3032,13 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
         # Cooldown must be gone
         assert entry.get("startup_failure_cooldown_at") is None
         # Stale reason must be cleared
-        assert not (entry.get("disabled_reason") or "").startswith("startup-failure cooldown")
+        assert not (entry.get("disabled_reason") or "").startswith(
+            "startup-failure cooldown"
+        )
 
-    async def test_no_startup_cooldown_in_rate_limit_state_leaves_entry_unset(self, monkeypatch):
+    async def test_no_startup_cooldown_in_rate_limit_state_leaves_entry_unset(
+        self, monkeypatch
+    ):
         """Accounts without a startup cooldown in rate_limit_state remain unaffected."""
         acct = _FakeMaxPlanAccount(
             "acct-a",
@@ -3023,3 +3048,60 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
         await self._load_with_accounts([acct], monkeypatch)
         entry = _account_by_id[str(acct.id)]
         assert entry.get("startup_failure_cooldown_at") is None
+
+
+class TestGetTaskLlmAccountId:
+    """get_task_llm_account_id prefers the promoted Task.llm_account_id column
+    when present, falling back to the context JSONB for pre-migration rows or
+    plain-dict callers (D2 over-fetch fix, d-57436105)."""
+
+    def test_prefers_column_over_context_when_set(self):
+        from app.max_plan_pool import get_task_llm_account_id
+        from app.models import Task
+
+        task = Task(
+            project_id=uuid.uuid4(),
+            llm_account_id="acct-from-column",
+            context={
+                "llm_account_id": "acct-from-context",
+                "max_plan_account_id": "acct-legacy",
+            },
+        )
+        # Column wins even when context carries a (stale) different value.
+        assert get_task_llm_account_id(task) == "acct-from-column"
+
+    def test_falls_back_to_context_when_column_unset(self):
+        from app.max_plan_pool import get_task_llm_account_id
+        from app.models import Task
+
+        # Pre-migration row: column NULL, canonical key in context.
+        task = Task(
+            project_id=uuid.uuid4(),
+            llm_account_id=None,
+            context={"llm_account_id": "acct-ctx"},
+        )
+        assert get_task_llm_account_id(task) == "acct-ctx"
+
+    def test_falls_back_to_legacy_max_plan_key(self):
+        from app.max_plan_pool import get_task_llm_account_id
+        from app.models import Task
+
+        task = Task(
+            project_id=uuid.uuid4(),
+            llm_account_id=None,
+            context={"max_plan_account_id": "acct-legacy"},
+        )
+        assert get_task_llm_account_id(task) == "acct-legacy"
+
+    def test_plain_context_dict_uses_context_lookup(self):
+        from app.max_plan_pool import get_task_llm_account_id
+
+        # Called with a raw context Mapping (no column to prefer).
+        assert get_task_llm_account_id({"llm_account_id": "acct-dict"}) == "acct-dict"
+
+    def test_returns_none_when_neither_set(self):
+        from app.max_plan_pool import get_task_llm_account_id
+        from app.models import Task
+
+        task = Task(project_id=uuid.uuid4(), llm_account_id=None, context={})
+        assert get_task_llm_account_id(task) is None

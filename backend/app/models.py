@@ -933,6 +933,21 @@ class Task(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
 
+    # Promoted from Task.context JSONB (D2 over-fetch fix, dir d-57436105).
+    # The orchestrator Max-Plan reconcile loop runs every cycle (~30s) and
+    # previously issued ``select(Task.context)`` over all PROVISIONING/IN_PROGRESS
+    # tasks purely to read this one scalar (``ctx['llm_account_id']`` /
+    # legacy ``ctx['max_plan_account_id']``), TOAST-fetching the entire
+    # multi-MB context blob of every active task each cycle. Promoting it to a
+    # dedicated indexed column lets the reconcile loop project just this scalar.
+    # Mirrors the heartbeat-hot promotions above (last_metrics_json /
+    # heartbeat_count). The context keys are STILL written alongside this column
+    # (see max_plan_pool.apply_task_llm_runtime_context) so in-flight rows and
+    # rollbacks stay safe; this column is the preferred read path via
+    # get_task_llm_account_id, with the context lookup as fallback.
+    # Index declared explicitly in __table_args__ (ix_task_llm_account_id).
+    llm_account_id: str | None = Field(default=None)
+
     # Per-task fix-loop telemetry. Shape:
     #   {"lint": [FixLoopAttempt, ...], "test": [...], "check": [...]}
     # Each FixLoopAttempt is a loose dict validated at the ingest boundary by
@@ -1256,6 +1271,9 @@ class Task(SQLModel, table=True):
         ),
         Index("ix_task_context_gin", "context", postgresql_using="gin"),
         Index("ix_task_depends_on_gin", "depends_on", postgresql_using="gin"),
+        # D2 over-fetch fix (d-57436105): the Max-Plan reconcile loop counts
+        # active tasks per llm_account_id every ~30s; index the promoted column.
+        Index("ix_task_llm_account_id", "llm_account_id"),
         Index("ix_task_provider_created_at", "provider", "created_at"),
         Index("ix_task_account_id_created_at", "account_id", "created_at"),
         Index(

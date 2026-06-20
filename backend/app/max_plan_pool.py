@@ -65,6 +65,15 @@ def _task_context(task_or_ctx: Any) -> dict[str, Any]:
 
 
 def get_task_llm_account_id(task_or_ctx: Any) -> str | None:
+    # Prefer the promoted Task.llm_account_id column (D2 over-fetch fix,
+    # d-57436105) when passed a Task whose column is set. Fall back to the
+    # context JSONB lookup for rows written before the backfill migration or
+    # when called with a plain context dict. Nearly every reader funnels
+    # through this accessor, so the column-preference applies codebase-wide.
+    if not isinstance(task_or_ctx, Mapping):
+        col_val = getattr(task_or_ctx, "llm_account_id", None)
+        if col_val:
+            return col_val
     ctx = _task_context(task_or_ctx)
     return ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
 

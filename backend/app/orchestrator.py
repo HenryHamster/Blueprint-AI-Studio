@@ -220,6 +220,39 @@ def _ci_waiting_sql_filter(session):
     return Task.context["review_loop"]["ci_waiting"].astext == "true"
 
 
+async def _reconcile_active_per_account(session: AsyncSession) -> Dict[str, int]:
+    """Count active (PROVISIONING/IN_PROGRESS) tasks per LLM account id.
+
+    Drives the Max-Plan reconcile each ~30s dispatch cycle. D2 over-fetch fix
+    (d-57436105): projects ONLY the promoted, indexed ``Task.llm_account_id``
+    scalar column instead of TOAST-fetching every active task's full multi-MB
+    ``Task.context`` JSONB blob each cycle (the previous query was
+    ``select(Task.context)``). The backfill migration COALESCEd the legacy
+    ``context->>'max_plan_account_id'`` fallback into the column and every
+    dispatch/requeue write path keeps the column in sync, so the column is
+    authoritative for active tasks — no context read is needed.
+
+    SCALAR COLUMN PROJECTION (returns plain rows) — deliberately NOT
+    ``select(Task)`` with ``load_only``: touching a deferred attribute on a
+    returned Task in this async context risks a MissingGreenlet crash of the
+    dispatch cycle (see reference_load_only_event_listeners.md /
+    reference_load_only_lazy_load_trap.md).
+    """
+    active_per_account: Dict[str, int] = {}
+    rows = (
+        await session.execute(
+            select(Task.id, Task.llm_account_id).where(
+                Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+            )
+        )
+    ).all()
+    for row in rows:
+        acct_id = row[1]
+        if acct_id:
+            active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
+    return active_per_account
+
+
 async def _lock_task_for_mutation(
     session: AsyncSession,
     task_id: uuid.UUID,
@@ -2034,6 +2067,8 @@ async def orchestrator_worker():
                         if serial_log:
                             requeue_ctx["last_serial_log"] = serial_log
                         fresh_t.context = clear_task_llm_runtime_context(requeue_ctx)
+                        # Keep the promoted column in sync (D2 over-fetch fix).
+                        fresh_t.llm_account_id = None
                         session.add(fresh_t)
                         tasks_recovered += 1
                         if fresh_t.last_heartbeat is None:
@@ -2417,29 +2452,10 @@ async def orchestrator_worker():
                     continue
 
                 # Reconcile Max Plan active_tasks counters from DB each cycle.
-                # Fetch the JSON path raw and group in Python — avoids Postgres
-                # GROUP BY quirks with JSONB path expressions (SQLAlchemy was
-                # emitting a SELECT that Postgres saw as referencing task.context
-                # without a matching GROUP BY token).
-                active_per_account: Dict[str, int] = {}
-                _acct_id_rows = (
-                    await session.execute(
-                        select(Task.context).where(
-                            Task.status.in_(
-                                [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                            ),
-                        )
-                    )
-                ).all()
-                for row in _acct_id_rows:
-                    ctx = row[0] or {}
-                    acct_id = ctx.get("llm_account_id") or ctx.get(
-                        "max_plan_account_id"
-                    )
-                    if acct_id:
-                        active_per_account[acct_id] = (
-                            active_per_account.get(acct_id, 0) + 1
-                        )
+                # Reads only the promoted Task.llm_account_id column (no longer
+                # the full Task.context JSONB blob) — see
+                # _reconcile_active_per_account (D2 over-fetch fix, d-57436105).
+                active_per_account = await _reconcile_active_per_account(session)
                 async with _max_plan_pool_lock:
                     for acct in _account_by_id.values():
                         # Reconcile from DB — the pre-increment in select_max_plan_account() is always
@@ -4033,6 +4049,10 @@ async def orchestrator_worker():
                             model=runtime_model,
                             execution_mode=runtime_execution_mode,
                         )
+                        # Keep the promoted column in sync with context
+                        # (D2 over-fetch fix) — context keys are still written
+                        # above so in-flight rows / rollbacks stay safe.
+                        task.llm_account_id = account_id
                         # A dispatch that reaches the PROVISIONING commit resets
                         # the contained-crash counter (persisted by that commit;
                         # rolled back with everything else if prep still crashes
@@ -4154,6 +4174,8 @@ async def orchestrator_worker():
                                 )
                             _iter_preclaimed_account_id = None
                             task.context = clear_task_llm_runtime_context(task.context)
+                            # Keep the promoted column in sync (D2 over-fetch fix).
+                            task.llm_account_id = None
                             await session.rollback()
                             continue
 
@@ -4573,6 +4595,7 @@ async def orchestrator_worker():
                                                             ctx
                                                         )
                                                     )
+                                                    failed_task.llm_account_id = None
                                                 failed_task.context = ctx
                                                 inner_session.add(failed_task)
                                                 await inner_session.commit()
@@ -6421,14 +6444,12 @@ async def orchestrator_worker():
                                     )
                                 else:
                                     _spawn_deferrals = (
-                                        ci_loop.get(
-                                            "verify_tests_spawn_deferrals", 0
-                                        )
+                                        ci_loop.get("verify_tests_spawn_deferrals", 0)
                                         or 0
                                     ) + 1
-                                    ci_loop[
-                                        "verify_tests_spawn_deferrals"
-                                    ] = _spawn_deferrals
+                                    ci_loop["verify_tests_spawn_deferrals"] = (
+                                        _spawn_deferrals
+                                    )
                                     if (
                                         _spawn_deferrals
                                         >= _VERIFY_TESTS_SPAWN_DEFERRAL_CAP
