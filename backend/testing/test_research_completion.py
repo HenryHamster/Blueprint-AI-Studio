@@ -7772,6 +7772,14 @@ class TestBreakFindingDependencyCycles:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+_DEFAULT_SMOKE_SAMPLE = {
+    "exit_code": 0,
+    "startup_ok": True,
+    "metric_captured": True,
+    "timed_out": False,
+}
+
+
 def _compute_finding(
     direction_id: str,
     *,
@@ -7783,11 +7791,13 @@ def _compute_finding(
     provisioning_model=None,
     nested_key=None,
     title="Measure throughput regression",
+    smoke_sample=_DEFAULT_SMOKE_SAMPLE,
 ):
     """A compute_experiment-typed research finding carrying a launch contract.
 
     By default the launch fields are flat on the finding; pass ``nested_key`` to
     nest them under ``compute_experiment`` / ``launch_contract`` instead.
+    Pass ``smoke_sample=None`` to omit the smoke field (for negative-path tests).
     """
     from test_autonomous_research import _make_finding
 
@@ -7807,6 +7817,8 @@ def _compute_finding(
         launch["accelerator"] = accelerator
     if provisioning_model is not None:
         launch["provisioning_model"] = provisioning_model
+    if smoke_sample is not None:
+        launch["smoke_sample"] = smoke_sample
     if nested_key:
         finding[nested_key] = launch
     else:
@@ -7895,7 +7907,12 @@ class TestComputeLaunchContractValidation:
         from app.research_completion import _validate_compute_launch_contract
 
         ok, reason = _validate_compute_launch_contract(
-            {"command": "run.sh", "spend_cap_usd": 2.0, "deadline_seconds": 60}
+            {
+                "command": "run.sh",
+                "spend_cap_usd": 2.0,
+                "deadline_seconds": 60,
+                "smoke_sample": _DEFAULT_SMOKE_SAMPLE,
+            }
         )
         assert ok is True
         assert reason == ""

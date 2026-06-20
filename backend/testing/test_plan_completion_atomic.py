@@ -666,6 +666,12 @@ async def test_compute_experiment_prereq_spawns_launch_payload_and_dependency(
                     "env": {"BENCHMARK_MODE": "baseline"},
                     "accelerator": "T4",
                     "provisioning_model": "spot",
+                    "smoke_sample": {
+                        "exit_code": 0,
+                        "startup_ok": True,
+                        "metric_captured": True,
+                        "timed_out": False,
+                    },
                 },
                 {
                     "title": "Implement against the measurement",
@@ -740,6 +746,12 @@ async def test_compute_experiment_prereq_propagates_live_proof_contract(
                     },
                     "live_release_proof_marker": "plan-live-proof",
                     "requires_live_release": True,
+                    "smoke_sample": {
+                        "exit_code": 0,
+                        "startup_ok": True,
+                        "metric_captured": True,
+                        "timed_out": False,
+                    },
                 }
             ]
         }
@@ -790,6 +802,12 @@ async def test_compute_experiment_require_durable_artifact_forwarded_to_payload(
                     "deadline_seconds": 600,
                     "require_durable_artifact": True,
                     "hypothesis": "the optimized kernel beats the baseline by 10%",
+                    "smoke_sample": {
+                        "exit_code": 0,
+                        "startup_ok": True,
+                        "metric_captured": True,
+                        "timed_out": False,
+                    },
                 },
                 {
                     "title": "Run the fail-soft experiment",
@@ -798,6 +816,12 @@ async def test_compute_experiment_require_durable_artifact_forwarded_to_payload(
                     "command": "python soft_bench.py",
                     "spend_cap_usd": 2.0,
                     "deadline_seconds": 600,
+                    "smoke_sample": {
+                        "exit_code": 0,
+                        "startup_ok": True,
+                        "metric_captured": True,
+                        "timed_out": False,
+                    },
                 },
             ]
         }
@@ -1768,6 +1792,12 @@ async def test_compute_experiment_subtask_carries_downstream_artifact_evidence(
                         "kind": "downstream_artifact",
                         "artifact_id": "benchmark-result-bundle",
                     },
+                    "smoke_sample": {
+                        "exit_code": 0,
+                        "startup_ok": True,
+                        "metric_captured": True,
+                        "timed_out": False,
+                    },
                 },
             ]
         }
@@ -2093,6 +2123,12 @@ async def test_compute_experiment_subtask_inherits_plan_branch(
                     "spend_cap_usd": 2.0,
                     "deadline_seconds": 600,
                     "depends_on_indices": [0],
+                    "smoke_sample": {
+                        "exit_code": 0,
+                        "startup_ok": True,
+                        "metric_captured": True,
+                        "timed_out": False,
+                    },
                 },
             ]
         }

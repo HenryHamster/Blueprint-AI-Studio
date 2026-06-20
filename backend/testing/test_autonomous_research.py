@@ -4074,6 +4074,12 @@ async def test_compute_experiment_finding_propagates_live_proof_contract(
                     },
                     "live_release_proof_marker": "research-live-proof",
                     "requires_live_release": True,
+                    "smoke_sample": {
+                        "exit_code": 0,
+                        "startup_ok": True,
+                        "metric_captured": True,
+                        "timed_out": False,
+                    },
                 }
             ],
         )

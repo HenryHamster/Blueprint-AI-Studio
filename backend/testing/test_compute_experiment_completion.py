@@ -2828,6 +2828,12 @@ async def test_plan_spawned_compute_experiment_carries_downstream_artifact_evide
                         "kind": "downstream_artifact",
                         "artifact_id": "plan-result-bundle",
                     },
+                    "smoke_sample": {
+                        "exit_code": 0,
+                        "startup_ok": True,
+                        "metric_captured": True,
+                        "timed_out": False,
+                    },
                 },
             ]
         }

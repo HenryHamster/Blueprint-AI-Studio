@@ -172,9 +172,32 @@ def test_author_contract_omits_absent_gpu_fields():
 # --- contract validation --------------------------------------------------
 
 
+_VALID_SMOKE = {
+    "exit_code": 0,
+    "startup_ok": True,
+    "metric_captured": True,
+    "timed_out": False,
+}
+
+
 def test_validate_contract_accepts_complete():
     ok, reason = _validate_compute_launch_contract(
-        {"command": "run", "spend_cap_usd": 3.0, "deadline_seconds": 300}
+        {
+            "command": "run",
+            "spend_cap_usd": 3.0,
+            "deadline_seconds": 300,
+            "smoke_sample": _VALID_SMOKE,
+        }
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_validate_contract_accepts_without_smoke_when_require_smoke_false():
+    # Operator-triggered launches skip the smoke requirement.
+    ok, reason = _validate_compute_launch_contract(
+        {"command": "run", "spend_cap_usd": 3.0, "deadline_seconds": 300},
+        require_smoke=False,
     )
     assert ok is True
     assert reason == ""
@@ -198,9 +221,128 @@ def test_validate_contract_accepts_complete():
     ],
 )
 def test_validate_contract_rejects_malformed(contract, needle):
-    ok, reason = _validate_compute_launch_contract(contract)
+    # Basic field rejections come before smoke validation, so require_smoke=False
+    # keeps the fixture minimal while testing the field under scrutiny.
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
     assert ok is False
     assert needle in reason
+
+
+# --- smoke_sample validation ---------------------------------------------
+
+
+def _base_contract(**extra):
+    """Minimal valid base contract; caller overrides smoke_sample via **extra."""
+    return {
+        "command": "python bench.py",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 120,
+        **extra,
+    }
+
+
+def test_validate_contract_rejects_missing_smoke_sample():
+    ok, reason = _validate_compute_launch_contract(_base_contract())
+    assert ok is False
+    assert "smoke_sample" in reason
+
+
+def test_validate_contract_rejects_non_dict_smoke_sample():
+    ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample="yes"))
+    assert ok is False
+    assert "smoke_sample" in reason
+
+
+def test_validate_contract_rejects_failed_smoke_startup():
+    smoke = {
+        "exit_code": 1,
+        "startup_ok": False,
+        "metric_captured": False,
+        "error_excerpt": "ModuleNotFoundError: No module named 'backend'",
+    }
+    ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
+    assert ok is False
+    assert "smoke failed" in reason
+    assert "ModuleNotFoundError" in reason
+
+
+def test_validate_contract_rejects_unsmokable():
+    smoke = {
+        "unsmokable": True,
+        "unsmokable_reason": "requires T4 GPU not available on this VM",
+    }
+    ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
+    assert ok is False
+    assert "un-smokable" in reason
+    assert "T4 GPU" in reason
+
+
+def test_validate_contract_rejects_metric_not_captured_when_criterion_declared():
+    smoke = {
+        "exit_code": 0,
+        "startup_ok": True,
+        "metric_captured": False,
+        "timed_out": False,
+    }
+    contract = _base_contract(
+        smoke_sample=smoke,
+        success_criterion={"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+    )
+    ok, reason = _validate_compute_launch_contract(contract)
+    assert ok is False
+    assert "metric" in reason
+
+
+def test_validate_contract_accepts_valid_smoke_no_criterion():
+    # No success_criterion: startup_ok=True is sufficient even if metric not captured.
+    smoke = {
+        "exit_code": 0,
+        "startup_ok": True,
+        "metric_captured": False,
+        "timed_out": False,
+    }
+    ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
+    assert ok is True
+    assert reason == ""
+
+
+def test_validate_contract_accepts_timed_out_with_startup_ok():
+    # A timeout (exit_code=124) is acceptable when startup succeeded.
+    smoke = {
+        "exit_code": 124,
+        "startup_ok": True,
+        "metric_captured": True,
+        "timed_out": True,
+    }
+    ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
+    assert ok is True
+    assert reason == ""
+
+
+def test_author_contract_passes_through_smoke_sample():
+    # smoke_sample from the finding is carried into the contract for validation.
+    finding = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 60,
+        "smoke_sample": _VALID_SMOKE,
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["smoke_sample"] == _VALID_SMOKE
+
+
+def test_author_contract_passes_through_nested_smoke_sample():
+    # smoke_sample nested under compute_experiment is also collected.
+    finding = {
+        "compute_experiment": {
+            "command": "python run.py",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 60,
+            "smoke_sample": _VALID_SMOKE,
+        },
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["smoke_sample"] == _VALID_SMOKE
 
 
 # --- threshold resolution -------------------------------------------------

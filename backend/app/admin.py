@@ -1927,7 +1927,7 @@ async def create_compute_experiment_task(
         if val is not None:
             launch_contract[opt_key] = val
 
-    ok, reason = _validate_compute_launch_contract(launch_contract)
+    ok, reason = _validate_compute_launch_contract(launch_contract, require_smoke=False)
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
 

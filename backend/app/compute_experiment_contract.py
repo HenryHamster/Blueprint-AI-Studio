@@ -56,6 +56,7 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "live_release_proof_marker",
         "requires_live_release",
         "require_durable_artifact",
+        "smoke_sample",
     ):
         val = _pick(opt_key)
         if val is not None:
@@ -65,15 +66,26 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
 
 def _validate_compute_launch_contract(
     contract: dict[str, Any],
+    *,
+    require_smoke: bool = True,
 ) -> tuple[bool, str]:
-    """Return ``(ok, reason)`` for a proposed compute_experiment launch contract."""
+    """Return ``(ok, reason)`` for a proposed compute_experiment launch contract.
+
+    ``require_smoke=True`` (the default for author-generated contracts) requires a
+    ``smoke_sample`` proving the command starts and, when a ``success_criterion``
+    is declared, emits a numeric metric.  Operator-triggered launches may pass
+    ``require_smoke=False`` to skip that check.
+    """
     command = contract.get("command")
     if not (isinstance(command, str) and command.strip()):
         return False, "missing or empty command"
     try:
         spend = float(contract.get("spend_cap_usd"))
     except (TypeError, ValueError):
-        return False, f"spend_cap_usd is not a number ({contract.get('spend_cap_usd')!r})"
+        return (
+            False,
+            f"spend_cap_usd is not a number ({contract.get('spend_cap_usd')!r})",
+        )
     if not spend > 0:
         return False, f"spend_cap_usd must be positive (got {spend})"
     try:
@@ -85,6 +97,35 @@ def _validate_compute_launch_contract(
         )
     if not deadline > 0:
         return False, f"deadline_seconds must be positive (got {deadline})"
+
+    if require_smoke:
+        smoke = contract.get("smoke_sample")
+        if not smoke or not isinstance(smoke, dict):
+            return (
+                False,
+                "missing smoke_sample: author must smoke-test the command before "
+                "dispatch — run a short variant, capture startup_ok + metric_captured, "
+                "add smoke_sample to the finding",
+            )
+        if smoke.get("unsmokable"):
+            reason = str(smoke.get("unsmokable_reason") or "cannot be smoked cheaply")
+            return (
+                False,
+                f"un-smokable command requires explicit operator review: {reason}",
+            )
+        if not smoke.get("startup_ok"):
+            error_excerpt = str(smoke.get("error_excerpt") or "unknown error")[:200]
+            return (
+                False,
+                f"smoke failed — command did not start cleanly: {error_excerpt}",
+            )
+        if contract.get("success_criterion") and not smoke.get("metric_captured"):
+            return (
+                False,
+                "smoke did not capture declared metric — verify command writes "
+                "{metric: value} to $BLUEPRINT_RESULT_FILE",
+            )
+
     return True, ""
 
 
