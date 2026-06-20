@@ -1011,11 +1011,10 @@ const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks 
   \`npm run test:run\` suite.
 - \`./check test\` — same plus a **lightweight standalone backend test
   pass** (3 invariant files, ~30s). This VM is 8 GB; the FULL Docker
-  + Postgres pytest suite OOMs here (production 2026-05-05: tasks
-  53ef061b, b150b4d6, b15b6813 all died at exit 137 during this gate).
-  CI runs the full suite on the PR after \`./pr open\`, so this local
-  gate is just a smoke check — file-size guardrails, security regs,
-  pipeline invariants. **For full suite runs use
+  + Postgres pytest suite OOMs (exit 137) here. CI runs the full suite
+  on the PR after \`./pr open\`, so this local gate is just a smoke
+  check — file-size guardrails, security regs, pipeline invariants.
+  **For full suite runs use
   \`bash scripts/test-backend.sh --standalone --no-postgres\`** — calling
   \`scripts/test-backend.sh\` with no test-file argument runs the full
   suite and OOMs. Specific test files are fine with default Postgres:
@@ -1114,9 +1113,9 @@ needs a concrete evidence anchor in \`reasoning\`: a file:line reference
 (\`path/to/file.ts:42\`), a backtick-quoted code snippet (≥10 chars), or a named
 test file. Lower-stakes categories (style-conventions, documentation, performance,
 architecture) do not require an anchor.
-For \`scope-drift\`: Trigger A — cite diff stats vs. threshold (lines/files).
-Trigger B — cite file-set check vs. related_files. PASS without evidence anchor
-on high-stakes = unsubstantiated → downgrade to FAIL.
+For \`scope-drift\`: cite Trigger A diff stats (lines/files) and the Trigger B
+file-set check vs. related_files. PASS without an anchor on high-stakes =
+unsubstantiated → downgrade to FAIL.
 
 \`fixes_applied: true\` = you caught and fixed issues. File MUST exist for
 code-change tasks (may be degraded \`{"verdict":"unknown"}\`).

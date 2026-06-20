@@ -1175,6 +1175,8 @@ describe('handleReview — verdict file parsing', () => {
     const repairPrompt = vi.mocked(indexMod.runClaudeCode).mock.calls[1][0];
     expect(repairPrompt).toContain('ONLY the JSON object');
     expect(repairPrompt).toContain('/tmp/review_verdict_task-2b.json');
+    expect(repairPrompt).not.toContain('After your review');
+    expect(repairPrompt).toContain('Your review analysis is complete');
 
     const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
     const verdictJson = JSON.parse(String(status.verdict_json)) as { verdict: string; feedback: string; investigated_files: string[] };

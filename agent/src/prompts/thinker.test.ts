@@ -570,6 +570,12 @@ describe('runThinkerWithGate', () => {
     expect(reopenPrompt).toContain('Do NOT use placeholder or template values');
     expect(reopenPrompt).toContain('YOUR PREVIOUS ANALYSIS OUTPUT');
     expect(reopenPrompt).toContain('analysis output without JSON');
+    // Fix for placeholder-echo rejection: the schema reminder must NOT use XML-tag
+    // placeholder values like "<from analysis>" that the validateParsedValue gate
+    // rejects (BUG_REPORT 8154c2d3 / thinker repair success rate 62.4%).
+    expect(reopenPrompt).not.toContain('<from analysis>');
+    // Must include a concrete realistic example so the repair agent models real content.
+    expect(reopenPrompt).toContain('Build an automated billing system');
     expect(fsMockState.presentFiles.has(problemModelPath)).toBe(true);
     expect(mockPersistAndPostStatus).not.toHaveBeenCalled();
   });

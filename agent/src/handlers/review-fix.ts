@@ -798,7 +798,7 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
       mode: 'object',
       requiredKeys: ['verdict'],
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: buildReviewVerdictInstructions(taskId),
+      reopenPrompt: buildReviewVerdictInstructions(taskId, { repairContext: true }),
       ws,
       statusRef,
       model,

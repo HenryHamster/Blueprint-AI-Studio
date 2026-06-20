@@ -74,7 +74,7 @@ const ALLOWLIST: AllowEntry[] = [
     // project_metadata.integration_branch → fallback. Every other agent
     // call site must route through this helper.
     path: 'prompts/review-prompt.ts',
-    line: 305,
+    line: 308,
     pattern: 'fallback-main',
     rationale:
       "buildRollupReviewGuidance is downstream of resolveBaseBranch; the " +
