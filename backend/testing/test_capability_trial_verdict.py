@@ -2690,16 +2690,49 @@ class TestLaneRelayComparison:
 
 
 def _mock_async_session(existing_messages=None):
-    """Build a mock async session with configurable existing open messages."""
+    """Build a mock async session that models SQL-side dedupe_key filtering.
+
+    The production code now pushes the dedupe_key filter into the SQL WHERE clause
+    and calls result.scalar() (not .scalars().all()). This mock faithfully emulates
+    that: scalar() returns a sentinel ID only when the queried dedupe_key matches
+    one of the existing_messages.
+    """
     from unittest.mock import AsyncMock, MagicMock
 
+    msgs = existing_messages or []
+    present_keys = {
+        (m.context or {}).get("dedupe_key")
+        for m in msgs
+        if (m.context or {}).get("dedupe_key") is not None
+    }
     session = MagicMock()
-    scalars_mock = MagicMock()
-    scalars_mock.all.return_value = existing_messages or []
-    execute_result = MagicMock()
-    execute_result.scalars.return_value = scalars_mock
-    session.execute = AsyncMock(return_value=execute_result)
     session.add = MagicMock()
+
+    async def _execute(stmt, *args, **kwargs):
+        result = MagicMock()
+        result.scalar.return_value = None
+        # Walk the WHERE criteria to find the dedupe_key literal being queried.
+        # The SQL pattern is: context["dedupe_key"].as_string() == key
+        # This produces a BinaryExpression where left.right.value == 'dedupe_key'
+        # (the JSON subscript key) and right.value is the queried dedupe_key value.
+        try:
+            for clause in getattr(stmt, "_where_criteria", ()):
+                left = getattr(clause, "left", None)
+                right = getattr(clause, "right", None)
+                if left is None or right is None:
+                    continue
+                inner_key = getattr(getattr(left, "right", None), "value", None)
+                if inner_key != "dedupe_key":
+                    continue
+                queried_key = getattr(right, "value", None)
+                if queried_key is not None and queried_key in present_keys:
+                    result.scalar.return_value = "sentinel-id"
+                break
+        except Exception:
+            pass
+        return result
+
+    session.execute = AsyncMock(side_effect=_execute)
     return session
 
 
@@ -3808,19 +3841,46 @@ class TestPersistStalledTrialNotices:
     """Tests for raise_stalled_trial_notice and persist_stalled_trial_notices_in_transaction."""
 
     def _build_mock_db(self, open_messages: list | None = None):
-        """Return (mock_session, mock_cm) with configurable open ProjectMessages."""
+        """Return (mock_session, mock_cm) with configurable open ProjectMessages.
+
+        Models SQL-side dedupe_key filtering: scalar() returns a sentinel ID only
+        when the queried dedupe_key matches one of the open_messages.
+        """
         from unittest.mock import AsyncMock, MagicMock
+
+        msgs = open_messages or []
+        present_keys = {
+            (m.context or {}).get("dedupe_key")
+            for m in msgs
+            if (m.context or {}).get("dedupe_key") is not None
+        }
 
         mock_session = MagicMock()
         mock_session.commit = AsyncMock()
         mock_session.rollback = AsyncMock()
         mock_session.add = MagicMock()
 
-        scalars_mock = MagicMock()
-        scalars_mock.all.return_value = open_messages or []
-        execute_result = MagicMock()
-        execute_result.scalars.return_value = scalars_mock
-        mock_session.execute = AsyncMock(return_value=execute_result)
+        async def _execute(stmt, *args, **kwargs):
+            execute_result = MagicMock()
+            execute_result.scalar.return_value = None
+            try:
+                for clause in getattr(stmt, "_where_criteria", ()):
+                    left = getattr(clause, "left", None)
+                    right = getattr(clause, "right", None)
+                    if left is None or right is None:
+                        continue
+                    inner_key = getattr(getattr(left, "right", None), "value", None)
+                    if inner_key != "dedupe_key":
+                        continue
+                    queried_key = getattr(right, "value", None)
+                    if queried_key is not None and queried_key in present_keys:
+                        execute_result.scalar.return_value = "sentinel-id"
+                    break
+            except Exception:
+                pass
+            return execute_result
+
+        mock_session.execute = AsyncMock(side_effect=_execute)
 
         mock_cm = MagicMock()
         mock_cm.__aenter__ = AsyncMock(return_value=mock_session)

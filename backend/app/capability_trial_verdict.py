@@ -703,22 +703,16 @@ async def raise_capability_verdict_notice(
     from app.models import MessageType, ProjectMessage
 
     dedupe_key = f"capability_verdict_decided_{cap_name}_{new_verdict}"
-    existing = (
-        (
-            await session.execute(
-                select(ProjectMessage)
-                .where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.status == "open",
-                )
-                .limit(200)
-            )
+    _result = await session.execute(
+        select(ProjectMessage.id)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.status == "open",
+            ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
         )
-        .scalars()
-        .all()
+        .limit(1)
     )
-    already = any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing)
-    if already:
+    if _result.scalar() is not None:
         return
 
     lift = entry.get("lift")
@@ -1020,21 +1014,16 @@ async def raise_stalled_trial_notice(
     from app.models import MessageType, ProjectMessage
 
     dedupe_key = f"capability_trial_stalled_{cap_name}"
-    existing = (
-        (
-            await session.execute(
-                select(ProjectMessage)
-                .where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.status == "open",
-                )
-                .limit(200)
-            )
+    _result = await session.execute(
+        select(ProjectMessage.id)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.status == "open",
+            ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
         )
-        .scalars()
-        .all()
+        .limit(1)
     )
-    if any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing):
+    if _result.scalar() is not None:
         return
 
     accrual = entry.get("accrual_projection") or {}

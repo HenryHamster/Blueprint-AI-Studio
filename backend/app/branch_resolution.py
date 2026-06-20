@@ -366,17 +366,17 @@ async def signal_unsafe_branch_configuration(
 
     # Paired BLOCKER operator message, deduped by its own stable context key.
     dedupe_key = f"unsafe_branch_configuration:{project_id}:{issue_code}"
-    open_blockers = await session.execute(
-        select(ProjectMessage).where(
+    _blocker_result = await session.execute(
+        select(ProjectMessage.id)
+        .where(
             ProjectMessage.project_id == project_id,
             ProjectMessage.message_type == MessageType.BLOCKER,
             ProjectMessage.status == "open",
+            ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
         )
+        .limit(1)
     )
-    already_posted = any(
-        (msg.context or {}).get("dedupe_key") == dedupe_key
-        for msg in open_blockers.scalars().all()
-    )
+    already_posted = _blocker_result.scalar() is not None
     if not already_posted:
         session.add(
             ProjectMessage(
@@ -649,9 +649,7 @@ async def _create_promotion_target_landing_alert(
             repo_full = ctx.get("repo_full_name") or ctx.get("repo") or ""
             if repo_full:
                 pr_url = f"https://github.com/{repo_full}/pull/{pr_number}"
-        raw_critical = (
-            ctx.get("critical_files") or ctx.get("_pr_changed_files") or []
-        )
+        raw_critical = ctx.get("critical_files") or ctx.get("_pr_changed_files") or []
         critical_files = (
             [f for f in raw_critical if isinstance(f, str)][:10]
             if isinstance(raw_critical, list)
@@ -751,7 +749,10 @@ async def classify_rollup_merge_outcome(
     landed_branch = resolve_pr_landing_branch(
         task, project, merged_base_branch=merged_base_branch
     )
-    if is_custom_staged_rollup_root(task, project, landed_branch) and project is not None:
+    if (
+        is_custom_staged_rollup_root(task, project, landed_branch)
+        and project is not None
+    ):
         integration_branch = get_project_integration_branch(project)
         promotion_target = get_project_promotion_target(project)
         landed_on_integration = landed_branch == integration_branch
