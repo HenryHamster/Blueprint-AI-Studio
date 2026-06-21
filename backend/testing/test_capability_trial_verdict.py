@@ -4303,23 +4303,52 @@ class TestRaiseAmbiguousLiftEscalationNotice:
     """Tests for raise_ambiguous_lift_escalation_notice and persist_ambiguous_lift_escalations_in_transaction."""
 
     def _build_mock_db(self, open_messages=None):
+        """Return (mock_session, mock_cm) with configurable open ProjectMessages.
+
+        Models SQL-side dedupe_key filtering: scalar() returns a sentinel ID only
+        when the queried dedupe_key matches one of the open_messages.
+        """
         from unittest.mock import AsyncMock, MagicMock
+
+        msgs = open_messages or []
+        present_keys = {
+            (m.context or {}).get("dedupe_key")
+            for m in msgs
+            if (m.context or {}).get("dedupe_key") is not None
+        }
 
         mock_session = MagicMock()
         mock_session.commit = AsyncMock()
         mock_session.rollback = AsyncMock()
         mock_session.add = MagicMock()
 
-        scalars_mock = MagicMock()
-        scalars_mock.first.return_value = open_messages[0] if open_messages else None
-        execute_result = MagicMock()
-        execute_result.scalars.return_value = scalars_mock
-        mock_session.execute = AsyncMock(return_value=execute_result)
+        async def _execute(stmt, *args, **kwargs):
+            execute_result = MagicMock()
+            execute_result.scalar.return_value = None
+            try:
+                for clause in getattr(stmt, "_where_criteria", ()):
+                    left = getattr(clause, "left", None)
+                    right = getattr(clause, "right", None)
+                    if left is None or right is None:
+                        continue
+                    inner_key = getattr(getattr(left, "right", None), "value", None)
+                    if inner_key != "dedupe_key":
+                        continue
+                    queried_key = getattr(right, "value", None)
+                    if queried_key is not None and queried_key in present_keys:
+                        execute_result.scalar.return_value = "sentinel-id"
+                    break
+            except Exception:
+                pass
+            return execute_result
+
+        mock_session.execute = AsyncMock(side_effect=_execute)
 
         mock_cm = MagicMock()
         mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
         mock_cm.__aexit__ = AsyncMock(return_value=False)
         mock_cm.return_value = mock_cm
+
         return mock_session, mock_cm
 
     def _escalated_entry(self):
@@ -4418,37 +4447,48 @@ class TestRaiseAmbiguousLiftEscalationNotice:
 
 
 class TestBoundedProjectMessageQueries:
-    """Verify that dedupe scans in raise_*_notice functions are bounded with .limit()."""
+    """Verify that dedupe scans are bounded with .limit() via shared helper."""
 
-    def test_raise_capability_verdict_notice_query_is_bounded(self):
-        """raise_capability_verdict_notice must apply .limit() to ProjectMessage dedupe scan."""
+    def test_check_open_message_exists_query_is_bounded(self):
+        """_check_open_message_exists must apply .limit() to ProjectMessage dedupe scan."""
+        import inspect
+
+        from app.capability_trial_verdict import _check_open_message_exists
+
+        source = inspect.getsource(_check_open_message_exists)
+        assert ".limit(" in source, (
+            "_check_open_message_exists must bound ProjectMessage query with .limit()"
+        )
+
+    def test_raise_capability_verdict_notice_uses_helper(self):
+        """raise_capability_verdict_notice must use _check_open_message_exists for dedupe."""
         import inspect
 
         from app.capability_trial_verdict import raise_capability_verdict_notice
 
         source = inspect.getsource(raise_capability_verdict_notice)
-        assert ".limit(" in source, (
-            "raise_capability_verdict_notice must bound ProjectMessage query with .limit()"
+        assert "_check_open_message_exists" in source, (
+            "raise_capability_verdict_notice must use _check_open_message_exists"
         )
 
-    def test_raise_stalled_trial_notice_query_is_bounded(self):
-        """raise_stalled_trial_notice must apply .limit() to ProjectMessage dedupe scan."""
+    def test_raise_stalled_trial_notice_uses_helper(self):
+        """raise_stalled_trial_notice must use _check_open_message_exists for dedupe."""
         import inspect
 
         from app.capability_trial_verdict import raise_stalled_trial_notice
 
         source = inspect.getsource(raise_stalled_trial_notice)
-        assert ".limit(" in source, (
-            "raise_stalled_trial_notice must bound ProjectMessage query with .limit()"
+        assert "_check_open_message_exists" in source, (
+            "raise_stalled_trial_notice must use _check_open_message_exists"
         )
 
-    def test_raise_ambiguous_lift_escalation_notice_query_is_bounded(self):
-        """raise_ambiguous_lift_escalation_notice must apply .limit() to ProjectMessage dedupe scan."""
+    def test_raise_ambiguous_lift_escalation_notice_uses_helper(self):
+        """raise_ambiguous_lift_escalation_notice must use _check_open_message_exists for dedupe."""
         import inspect
 
         from app.capability_trial_verdict import raise_ambiguous_lift_escalation_notice
 
         source = inspect.getsource(raise_ambiguous_lift_escalation_notice)
-        assert ".limit(" in source, (
-            "raise_ambiguous_lift_escalation_notice must bound ProjectMessage query with .limit()"
+        assert "_check_open_message_exists" in source, (
+            "raise_ambiguous_lift_escalation_notice must use _check_open_message_exists"
         )
