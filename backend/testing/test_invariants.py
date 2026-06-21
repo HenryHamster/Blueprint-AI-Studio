@@ -1778,24 +1778,27 @@ class TestChainInvariantSeedFixtures:
         no other revision points to) rather than the lexicographic/filename max.
         Uses a three-migration linear chain: structural head is '0003', not '0099'.
         """
-        from app.migration_chain import build_migration_chain, find_heads
+        from app.migration_chain import validate_standalone_chain
 
         sources = {
             "0001_root.py": self._src("0001", None),
             "0002_mid.py": self._src("0002", "0001"),
             "0003_tip.py": self._src("0003", "0002"),
         }
-        chain, _dups, _unp = build_migration_chain(sources)
-        heads = find_heads(chain)
-        assert len(heads) == 1
-        structural_head = heads[0]
-        assert structural_head == "0003"
-        # A wrong EXPECTED_SCHEMA_REVISION would be caught by comparing against
-        # structural_head rather than the lexicographic max of filename prefixes.
-        wrong_expected = "0099"
-        assert wrong_expected != structural_head, (
-            "Structural head detection returned the wrong value — "
-            "EXPECTED_SCHEMA_REVISION comparison would silently accept a stale value"
+        # A wrong EXPECTED_SCHEMA_REVISION must produce a non-empty errors list.
+        errors = validate_standalone_chain(sources, expected_schema_revision="0099")
+        assert errors, (
+            "validate_standalone_chain did not fire for mismatched "
+            "EXPECTED_SCHEMA_REVISION '0099' (structural head is '0003') — "
+            "the expected-revision detector is not wired into validate_standalone_chain"
+        )
+        assert any("EXPECTED_SCHEMA_REVISION" in e for e in errors), (
+            f"Expected an EXPECTED_SCHEMA_REVISION error but got: {errors}"
+        )
+        # Passing the correct head must produce no errors.
+        no_errors = validate_standalone_chain(sources, expected_schema_revision="0003")
+        assert not no_errors, (
+            f"validate_standalone_chain reported errors for correct revision '0003': {no_errors}"
         )
 
     def test_validate_standalone_chain_aggregates_all_detectors(self):

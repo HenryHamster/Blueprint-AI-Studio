@@ -424,12 +424,21 @@ def validate_added_migrations(sources: dict[str, str]) -> str | None:
     return None
 
 
-def validate_standalone_chain(sources: dict[str, str]) -> list[str]:
+def validate_standalone_chain(
+    sources: dict[str, str],
+    *,
+    expected_schema_revision: str | None = None,
+) -> list[str]:
     """Validate that *sources* form a single clean migration chain.
 
     Aggregates the filename/revision-desync, duplicate-revision,
     missing-parent, and multi-head detectors into one call. Returns a list of
     human-readable error strings; empty when the chain is valid.
+
+    When *expected_schema_revision* is provided, also validates that it matches
+    the structural head of the chain (the revision no other revision points to).
+    This lets callers prove the EXPECTED_SCHEMA_REVISION detector fires on bad
+    fixtures rather than relying solely on the current chain being clean.
 
     Exposed as a reusable helper so the standalone smoke-set invariant test
     can (a) validate the real on-disk chain and (b) seed bad fixtures to prove
@@ -455,6 +464,12 @@ def validate_standalone_chain(sources: dict[str, str]) -> list[str]:
         errors.append(
             f"chain has {len(heads)} head(s) ({', '.join(sorted(heads))}); "
             "expected exactly 1"
+        )
+    elif expected_schema_revision is not None and heads[0] != expected_schema_revision:
+        errors.append(
+            f"EXPECTED_SCHEMA_REVISION is '{expected_schema_revision}' but "
+            f"structural chain head is '{heads[0]}'; bump EXPECTED_SCHEMA_REVISION "
+            "in main.py to match the chain head"
         )
     return errors
 
