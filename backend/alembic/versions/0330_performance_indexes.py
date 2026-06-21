@@ -7,15 +7,22 @@ without full table scans:
 - ix_projectmessage_created_at on projectmessage(created_at)
 - ix_projectmessage_project_created_at on projectmessage(project_id, created_at)
 
-Revision ID: 0309
-Revises: 0308
+Revision ID: 0330
+Revises: 0329
+
+NOTE: revision id 0309 is reserved for the DEPLOYED computejob heartbeat
+migration (applied + immutable on main).  These performance indexes were
+originally authored at 0309 on the integration branch, colliding with that
+deployed id; they are re-chained here at the head (0330, after 0329 merge_grade)
+so the Alembic graph stays linear and ``alembic upgrade head`` applies them
+fresh on every environment that already has the deployed 0309 heartbeat.
 """
 
 from alembic import op
 
 
-revision = "0309"
-down_revision = "0308"
+revision = "0330"
+down_revision = "0329"
 branch_labels = None
 depends_on = None
 
