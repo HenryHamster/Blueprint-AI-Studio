@@ -18,6 +18,7 @@ All sentinels start with ``"cloud-run-"`` so callers can check with a prefix tes
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -59,6 +60,19 @@ def _resolve_machine_type(task_type: str) -> str:
         if task_type in _HEAVY_TASK_TYPES
         else CLOUD_RUN_MACHINE_TYPE_STANDARD
     )
+
+
+def _fetch_agent_secret_token(secret_version_name: str) -> str:
+    """Fetch the agent JWT from a Secret Manager manifest version.
+
+    Raises on any error so the caller can treat fetch failures as hard errors.
+    """
+    from google.cloud import secretmanager  # type: ignore[import]
+
+    client = secretmanager.SecretManagerServiceClient()
+    response = client.access_secret_version(request={"name": secret_version_name})
+    manifest = json.loads(response.payload.data.decode("utf-8"))
+    return manifest["env"]["AGENT_SECRET_TOKEN"]
 
 
 async def launch_agent_cloud_run_job(
@@ -131,6 +145,23 @@ async def launch_agent_cloud_run_job(
         env_overrides.append(
             {"name": "AGENT_SECRET_VERSION", "value": secret_version_name}
         )
+        # The agent reads AGENT_SECRET_TOKEN (raw JWT), not AGENT_SECRET_VERSION.
+        # Fetch the manifest from Secret Manager and inject the token directly.
+        try:
+            agent_secret_token = _fetch_agent_secret_token(secret_version_name)
+            env_overrides.append(
+                {"name": "AGENT_SECRET_TOKEN", "value": agent_secret_token}
+            )
+        except Exception as exc:
+            logger.error(
+                "[CLOUD-RUN] Failed to fetch AGENT_SECRET_TOKEN from Secret Manager "
+                "for task %s (version=%s): %s",
+                task_id,
+                secret_version_name,
+                exc,
+                exc_info=True,
+            )
+            return False
 
     try:
         from google.cloud import run_v2  # type: ignore[import]
@@ -179,5 +210,8 @@ def _build_duration(seconds: int):
         from google.protobuf import duration_pb2  # type: ignore[import]
 
         return duration_pb2.Duration(seconds=seconds)
-    except ImportError:
-        return None
+    except ImportError as exc:
+        raise ImportError(
+            "_build_duration: google.protobuf is not installed; "
+            "cannot set Cloud Run job timeout override"
+        ) from exc

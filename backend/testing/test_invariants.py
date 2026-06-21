@@ -326,13 +326,7 @@ def test_all_admin_routes_require_auth():
     # Intentional exceptions — should stay empty. If a route is intentionally
     # public (for example, a monitored liveness probe), add its path here with
     # a short comment explaining why the public surface is deliberate.
-    public_allowlist: dict[str, str] = {
-        "/api/admin/viewport-shots/download-url": (
-            "Intentionally unauthenticated: endpoint returns a 302 redirect to a "
-            "time-limited GCS signed URL. Operators click these links from GitHub PR "
-            "bodies without a bearer token; the signed URL itself is the security boundary."
-        ),
-    }
+    public_allowlist: dict[str, str] = {}
 
     # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
     # JWTs; it is a valid auth callable for metrics-only endpoints.
@@ -9751,6 +9745,165 @@ def test_authorized_test_deletions_require_documentation():
         "The production matcher in release_scoring.py must use:\n"
         "  str(f) == entry.path_suffix or str(f).endswith('/' + entry.path_suffix)\n"
         "Failures:\n" + "\n".join(unanchored)
+    )
+
+
+def test_main_py_admin_endpoints_auth_and_401_path():
+    """All @app.{method}('/api/admin/...') handlers declared directly in main.py
+    must use get_current_user or get_current_user_optional, and any handler
+    using get_current_user_optional must include an explicit
+    HTTPException(status_code=401) path so unauthenticated callers are never
+    served a non-error response.
+
+    This is a static AST check on main.py only (not on included routers) to
+    complement the live-app dependency scan in test_all_admin_routes_require_auth.
+    """
+    import ast
+    from pathlib import Path
+
+    main_py = Path(__file__).parent.parent / "app" / "main.py"
+    source = main_py.read_text()
+    tree = ast.parse(source, filename=str(main_py))
+
+    # Endpoints that intentionally skip the 401-path requirement — document why.
+    OPTIONAL_401_ALLOWLIST: dict[str, str] = {}
+
+    AUTH_DEPS = {"get_current_user", "get_current_user_optional"}
+    HTTP_METHODS = {"get", "post", "put", "delete", "patch"}
+
+    def _has_status_401_raise(funcdef: ast.AST) -> bool:
+        """Return True if the function body contains raise HTTPException(status_code=401, ...)."""
+        for node in ast.walk(funcdef):
+            if not isinstance(node, ast.Raise):
+                continue
+            exc = node.exc
+            if exc is None:
+                continue
+            if not (
+                isinstance(exc, ast.Call)
+                and isinstance(exc.func, ast.Name)
+                and exc.func.id == "HTTPException"
+            ):
+                continue
+            for kw in exc.keywords:
+                if (
+                    kw.arg == "status_code"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == 401
+                ):
+                    return True
+        return False
+
+    def _dep_name_from_call(call_node: ast.expr | None) -> str | None:
+        """Return the callable name from a Depends(...) call node, or None."""
+        if call_node is None:
+            return None
+        if not (
+            isinstance(call_node, ast.Call)
+            and isinstance(call_node.func, ast.Name)
+            and call_node.func.id == "Depends"
+            and call_node.args
+        ):
+            return None
+        dep_arg = call_node.args[0]
+        if isinstance(dep_arg, ast.Name):
+            return dep_arg.id
+        return None
+
+    def _auth_deps_in_funcdef(
+        funcdef: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        """Return the set of AUTH_DEPS callables used as Depends() default values."""
+        # FastAPI resolves Depends() from the *default value* of parameters,
+        # not from the type annotation.  Positional-arg defaults are aligned to
+        # the tail of args.args; keyword-only defaults map 1:1 with kwonlyargs.
+        found: set[str] = set()
+
+        for default in funcdef.args.defaults:
+            name = _dep_name_from_call(default)
+            if name in AUTH_DEPS:
+                found.add(name)
+
+        for kw_default in funcdef.args.kw_defaults:
+            name = _dep_name_from_call(kw_default)
+            if name in AUTH_DEPS:
+                found.add(name)
+
+        return found
+
+    missing_auth: list[str] = []
+    missing_401: list[str] = []
+    found_paths: list[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        for dec in node.decorator_list:
+            # Match @app.get(...), @app.post(...), etc.
+            if not (
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Attribute)
+                and isinstance(dec.func.value, ast.Name)
+                and dec.func.value.id == "app"
+                and dec.func.attr in HTTP_METHODS
+            ):
+                continue
+
+            # Extract path from the first positional arg or the 'path' keyword.
+            path_node = None
+            if dec.args:
+                path_node = dec.args[0]
+            else:
+                for kw in dec.keywords:
+                    if kw.arg == "path":
+                        path_node = kw.value
+                        break
+
+            if not isinstance(path_node, ast.Constant) or not isinstance(
+                path_node.value, str
+            ):
+                continue
+
+            path = path_node.value
+            if not path.startswith("/api/admin/"):
+                continue
+
+            found_paths.append(path)
+
+            # Check parameter *defaults* for recognized auth dependency callables.
+            auth_deps_present = _auth_deps_in_funcdef(node)
+
+            if not auth_deps_present:
+                missing_auth.append(path)
+                continue
+
+            # For get_current_user_optional endpoints, require an explicit 401.
+            if (
+                "get_current_user_optional" in auth_deps_present
+                and "get_current_user" not in auth_deps_present
+                and path not in OPTIONAL_401_ALLOWLIST
+                and not _has_status_401_raise(node)
+            ):
+                missing_401.append(path)
+
+    assert found_paths, (
+        "No @app.{method}('/api/admin/...') handlers found in main.py — "
+        "the decorator pattern match may be broken."
+    )
+    assert not missing_auth, (
+        "The following /api/admin/ endpoints in main.py have no recognized auth "
+        "dependency (get_current_user or get_current_user_optional):\n"
+        + "\n".join(f"  - {p}" for p in sorted(missing_auth))
+        + "\n\nAdd Depends(get_current_user) or Depends(get_current_user_optional) "
+        "to the handler signature."
+    )
+    assert not missing_401, (
+        "The following /api/admin/ endpoints in main.py use get_current_user_optional "
+        "but have no explicit raise HTTPException(status_code=401) path:\n"
+        + "\n".join(f"  - {p}" for p in sorted(missing_401))
+        + "\n\nWhen current_user is None the endpoint must raise HTTPException(status_code=401). "
+        "Add a 401 path or add the endpoint to OPTIONAL_401_ALLOWLIST with justification."
     )
 
 

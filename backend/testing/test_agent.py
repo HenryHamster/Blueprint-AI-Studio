@@ -23534,10 +23534,14 @@ async def test_admin_viewport_shots_download_url_agent_token(
 
 
 @pytest.mark.asyncio
-async def test_admin_viewport_shots_download_url_agent_token_cross_task_rejected(
+async def test_admin_viewport_shots_download_url_agent_token_cross_task_allowed(
     client: AsyncClient, db_session, mocker
 ):
-    """Agent JWT scoped to task_a cannot download screenshots for task_b via the ADMIN endpoint."""
+    """Agent JWT scoped to task_a CAN download screenshots for task_b within the same project.
+
+    Cross-task access is intentionally permitted so that review/fix agents can fetch
+    screenshots uploaded by the source implementer task without needing a separate token.
+    """
     project = Project(
         name="Admin VP Shot DL Agent JWT Cross", user_id="user-admin-vp-shot-jwt-002"
     )
@@ -23562,7 +23566,15 @@ async def test_admin_viewport_shots_download_url_agent_token_cross_task_rejected
     await db_session.refresh(task_a)
     await db_session.refresh(task_b)
 
-    # Token is for task_a; request asks for task_b's screenshots
+    fake_url = (
+        "https://storage.googleapis.com/bucket/admin-vp-shot-dl-cross?X-Goog-Signature=cross"
+    )
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    # Token is for task_a; request asks for task_b's screenshots — same project, should be allowed
     token = create_agent_token(
         str(task_a.id), "vm-admin-vp-shot-jwt-cross-001", project_id=str(project.id)
     )
@@ -23575,19 +23587,64 @@ async def test_admin_viewport_shots_download_url_agent_token_cross_task_rejected
         },
         headers={"x-agent-token": token},
     )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_shots_download_url_agent_token_cross_project_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT scoped to project_a is rejected when requesting screenshots from project_b."""
+    project_a = Project(
+        name="Admin VP Shot DL Agent JWT XProj A", user_id="user-admin-vp-shot-jwt-003"
+    )
+    project_b = Project(
+        name="Admin VP Shot DL Agent JWT XProj B", user_id="user-admin-vp-shot-jwt-004"
+    )
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(
+        project_id=project_a.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix a"}],
+        vm_instance_id="vm-admin-vp-shot-jwt-xproj-001",
+    )
+    task_b = Task(
+        project_id=project_b.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix b"}],
+        vm_instance_id="vm-admin-vp-shot-jwt-xproj-002",
+    )
+    db_session.add_all([task_a, task_b])
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # Token is for project_a/task_a; request asks for project_b/task_b — must be rejected
+    token = create_agent_token(
+        str(task_a.id), "vm-admin-vp-shot-jwt-xproj-001", project_id=str(project_a.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-shots/download-url",
+        params={
+            "project_id": str(project_b.id),
+            "task_id": str(task_b.id),
+            "name": "HeroSection-1280-after",
+        },
+        headers={"x-agent-token": token},
+    )
     assert resp.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_admin_viewport_shots_download_url_no_auth_redirect(
+async def test_admin_viewport_shots_download_url_no_auth_rejected(
     unauthenticated_client: AsyncClient, db_session, mocker
 ):
-    """No-auth browser request gets a 302 redirect (operator clicking a PR-body link).
-
-    The endpoint intentionally returns a redirect for unauthenticated requests so
-    operators can follow links from GitHub PR bodies directly in their browser.
-    The JWT path (agent → JSON) is covered by test_admin_viewport_shots_download_url_agent_token.
-    """
+    """No-auth request is rejected with 401 — the unauthenticated redirect path was removed."""
     project = Project(
         name="Admin VP Shot No-Auth Test", user_id="user-admin-vp-shot-no-auth-001"
     )
@@ -23605,14 +23662,6 @@ async def test_admin_viewport_shots_download_url_no_auth_redirect(
     await db_session.commit()
     await db_session.refresh(task)
 
-    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/test?X-Goog-Signature=fake"
-    mocker.patch(
-        "app.storage.generate_download_signed_url",
-        new=AsyncMock(return_value=fake_url),
-    )
-
-    # No authentication => 302 redirect (unauthenticated_client has no get_current_user_optional
-    # override, so the dependency returns None and return_json stays False)
     resp = await unauthenticated_client.get(
         "/api/admin/viewport-shots/download-url",
         params={
@@ -23621,8 +23670,7 @@ async def test_admin_viewport_shots_download_url_no_auth_redirect(
             "name": "TestPanel-375-before",
         },
     )
-    assert resp.status_code == 302
-    assert resp.headers["location"] == fake_url
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio

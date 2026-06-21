@@ -23,7 +23,7 @@ import {
   runClaudeCode, sendHeartbeatSync, setCurrentPromptFingerprint,
   extractPytestSelectorsFromOutput,
   snapshotToolTrace, extractInvestigatedFiles,
-  resolveBaseBranch,
+  resolveBaseBranch, getAgentToken,
 } from '../index.js';
 import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -511,8 +511,7 @@ export async function handleReview(
   // Download viewport screenshots captured by the implementer for visual review.
   // The payload carries `viewport_shot_entries` (list of {name, storage_uri} dicts)
   // and `viewport_source_task_id` (the create/fix task that uploaded them).
-  // We fetch each PNG via the admin no-auth 302-redirect endpoint so we never need
-  // a cross-task JWT — this is the same path used by PR body screenshot links.
+  // The agent JWT authenticates cross-task access within the same project.
   const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
   const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
   const reviewProjectMetaEarly = task.project_metadata as Record<string, unknown> | undefined;
@@ -526,6 +525,7 @@ export async function handleReview(
       orchestratorUrl: reviewOrchestratorUrl,
       projectId: reviewProjectIdEarly,
       sourceTaskId: viewportSourceTaskId,
+      agentToken: getAgentToken(),
       onError: (name) => { sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`); },
     });
     if (downloadedShotPaths.length > 0) {
@@ -898,8 +898,7 @@ export async function handleFix(
   // Download viewport screenshots captured by the implementer for visual context.
   // The payload carries `viewport_shot_entries` (list of {name, storage_uri} dicts)
   // and `viewport_source_task_id` (the create/fix task that uploaded them).
-  // We fetch each PNG via the admin no-auth 302-redirect endpoint so we never need
-  // a cross-task JWT — this is the same path used by PR body screenshot links.
+  // The agent JWT authenticates cross-task access within the same project.
   const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
   const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
   const fixViewportProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
@@ -913,6 +912,7 @@ export async function handleFix(
       orchestratorUrl: fixViewportOrchestratorUrl,
       projectId: fixViewportProjectId,
       sourceTaskId: viewportSourceTaskId,
+      agentToken: getAgentToken(),
       onError: (name) => { sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`); },
     });
     if (downloadedFixShotPaths.length > 0) {

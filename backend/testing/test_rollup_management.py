@@ -2291,3 +2291,142 @@ async def test_landed_rollup_propagates_signal_to_carried_children(cleanup_db, m
     # recognized as a genuine integration landing by all callers.
     assert "_non_merge_unblock_reason" not in (child1.context or {})
     assert "_non_merge_unblock_reason" not in (child2.context or {})
+
+
+def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
+    """Mock setup for the re-poll-resolves-to-dirty path.
+
+    get_pull_request side_effect:
+      1. existing-PR validation (open, not merged)
+      2. diff-size fetch (small PR)
+      3. initial state after failed merge (empty or unknown — triggers repoll)
+      4. re-poll result (dirty — should trigger fix spawn, not deferral)
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "merge conflict"},
+    )
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"merged": False, "state": "open"},
+            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},
+            {"mergeable_state": initial_state, "head": {"sha": "deadbeef"}},
+            {"mergeable_state": "dirty", "head": {"sha": "deadbeef"}},
+        ],
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+    # Skip the asyncio sleep in the repoll loop so tests don't block.
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+
+
+@pytest.mark.asyncio
+async def test_repoll_resolves_empty_to_dirty_spawns_fix_in_same_sweep(
+    cleanup_db, mocker
+):
+    """When mergeable_state starts 'empty' and re-poll resolves to 'dirty',
+    the conflict-fix spawn must fire in the SAME sweep — deferral counters
+    must NOT be incremented.
+
+    Regression guard for the bug where `elif _ms != 'dirty':` trapped the
+    re-poll result inside the deferral block, causing an unconditional return
+    before the fix-spawn path was reached.
+    """
+    _mock_repoll_resolves_to_dirty(mocker, initial_state="empty")
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="fix-task-id"), None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # Fix task must be spawned in this sweep, not deferred.
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "fix"
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    # Deferral counter must NOT have been incremented — confirms we bypassed
+    # the deferral block rather than falling through after incrementing.
+    assert (parent.context or {}).get("_merge_deferred_count") is None
+
+
+@pytest.mark.asyncio
+async def test_repoll_resolves_unknown_to_dirty_spawns_fix_in_same_sweep(
+    cleanup_db, mocker
+):
+    """Same as test_repoll_resolves_empty_to_dirty but starting from 'unknown'.
+
+    Both 'empty' and 'unknown' enter the repoll sub-loop; both must fall
+    through to the conflict-fix spawn when the repoll resolves to 'dirty'.
+    """
+    _mock_repoll_resolves_to_dirty(mocker, initial_state="unknown")
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="fix-task-id"), None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "fix"
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("_merge_deferred_count") is None

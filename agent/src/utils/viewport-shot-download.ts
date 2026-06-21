@@ -12,6 +12,8 @@ export interface DownloadViewportShotsOptions {
   orchestratorUrl: string;
   projectId: string;
   sourceTaskId: string;
+  /** Agent JWT for authenticated download (x-agent-token header). Required for cross-task access. */
+  agentToken?: string;
   /** Maximum number of screenshots to download (default: 8) */
   limit?: number;
   onLog?: (msg: string) => void;
@@ -27,7 +29,7 @@ export interface DownloadViewportShotsOptions {
  * Returns the list of local file paths that were successfully downloaded.
  */
 export function downloadViewportShots(opts: DownloadViewportShotsOptions): string[] {
-  const { entries, shotDir, orchestratorUrl, projectId, sourceTaskId, limit = 8 } = opts;
+  const { entries, shotDir, orchestratorUrl, projectId, sourceTaskId, agentToken, limit = 8 } = opts;
   const downloaded: string[] = [];
 
   try { fs.mkdirSync(shotDir, { recursive: true }); } catch { /* ignore */ }
@@ -44,7 +46,15 @@ export function downloadViewportShots(opts: DownloadViewportShotsOptions): strin
       `&name=${encodeURIComponent(rawName)}`;
     const dest = `${shotDir}/${safeName}.png`;
     try {
-      execFileSync('curl', ['-sfL', '--max-time', '30', '-o', dest, downloadUrl]);
+      const curlArgs = ['-sf', '--max-time', '30'];
+      if (agentToken) {
+        curlArgs.push('-H', `x-agent-token: ${agentToken}`);
+      }
+      curlArgs.push(downloadUrl);
+      const jsonResponse = execFileSync('curl', curlArgs).toString();
+      const parsed = JSON.parse(jsonResponse) as { url: string };
+      const signedUrl = parsed.url;
+      execFileSync('curl', ['-sfL', '--max-time', '60', '-o', dest, signedUrl]);
       downloaded.push(dest);
     } catch {
       opts.onError?.(rawName);

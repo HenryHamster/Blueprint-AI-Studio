@@ -35,6 +35,7 @@ import {
   matchesAuthFailure,
   AuthFailureError,
   PROVIDER,
+  getAgentToken,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
@@ -455,6 +456,7 @@ export async function handlePanelReview(
 
   // Download viewport screenshots forwarded from the review task so panel lenses
   // have access to the rendered PNGs when evaluating visual-change PRs.
+  // The agent JWT authenticates cross-task access within the same project.
   const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
   const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
   const panelProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
@@ -468,6 +470,7 @@ export async function handlePanelReview(
       orchestratorUrl: panelOrchestratorUrl,
       projectId: panelProjectIdForShots,
       sourceTaskId: viewportSourceTaskId,
+      agentToken: getAgentToken(),
       onError: (name) => { sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`); },
     });
     if (downloadedShotPaths.length > 0) {

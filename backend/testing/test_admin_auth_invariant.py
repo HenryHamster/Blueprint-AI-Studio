@@ -28,12 +28,7 @@ from app.main import app
 # When a route genuinely should be unauthenticated (e.g. a public health check
 # under /api/admin for infra monitoring), add its path here with a comment
 # explaining why auth is intentionally absent.
-ALLOWLIST: set[str] = {
-    # Intentionally public: returns a 302 redirect to a time-limited GCS signed URL.
-    # Operators follow these links from GitHub PR bodies without a bearer token;
-    # the signed URL itself is the security boundary.
-    "/api/admin/viewport-shots/download-url",
-}
+ALLOWLIST: set[str] = {}
 
 # get_metrics_reader is a narrowly scoped read-only auth dep that accepts
 # agent JWTs; it is a valid auth callable for metrics-only endpoints.

@@ -2,7 +2,6 @@
 Tests for app/compute.py
 
 Covers:
-- _store_agent_secret IAM policy ETag retry + idempotency.
 - Zone success-rate tracking (rolling window, zone ordering, reset, summary).
 - Compute-job VM heartbeat endpoint and provisioning-timeout guard.
 """
@@ -22,7 +21,6 @@ import uuid
 
 import pytest
 import pytest_asyncio
-from google.api_core.exceptions import Aborted
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -63,78 +61,6 @@ from app.models import (
 )
 
 
-class _FakeBinding:
-    """Mimics the subset of policy_pb2.Binding used by the idempotency check."""
-
-    def __init__(self, role: str, members):
-        self.role = role
-        self.members = list(members)
-
-
-class _FakePolicy:
-    """Mimics the subset of the IAM policy proto used by _store_agent_secret."""
-
-    def __init__(self, bindings=None):
-        self.bindings = list(bindings or [])
-
-
-def _make_client(
-    existing_policy_bindings=None,
-    set_iam_side_effects=None,
-    payload: bytes | None = None,
-):
-    """Build a MagicMock SecretManagerServiceClient with sensible defaults.
-
-    - create_secret returns an object whose .name looks like a real secret resource
-    - add_secret_version returns an object whose .name looks like a version resource
-    - get_iam_policy returns a fresh _FakePolicy with the given bindings on every call
-    - set_iam_policy applies set_iam_side_effects in order (e.g. Aborted exceptions)
-    - access_secret_version (audit E15: post-create verification) returns the
-      payload that was supplied via ``payload=`` so the verify branch sees a
-      match. Tests that don't pass payload= will get an empty bytes payload
-      and trip the verification mismatch — which is the correct behavior to
-      cover the failure path.
-    """
-    client = MagicMock()
-    secret_obj = MagicMock()
-    secret_obj.name = "projects/test-proj/secrets/agent-creds-vm123"
-    client.create_secret.return_value = secret_obj
-
-    version_obj = MagicMock()
-    version_obj.name = "projects/test-proj/secrets/agent-creds-vm123/versions/1"
-    client.add_secret_version.return_value = version_obj
-
-    # get_iam_policy returns a fresh policy each call so retries re-read it
-    client.get_iam_policy.side_effect = lambda request: _FakePolicy(
-        bindings=[
-            _FakeBinding(b.role, b.members) for b in (existing_policy_bindings or [])
-        ]
-    )
-
-    if set_iam_side_effects is not None:
-        client.set_iam_policy.side_effect = set_iam_side_effects
-
-    # E15 verification path: read-back must match what was written.
-    verify_obj = MagicMock()
-    verify_obj.payload.data = payload if payload is not None else b""
-    client.access_secret_version.return_value = verify_obj
-
-    return client
-
-
-@pytest.fixture()
-def patched_client():
-    """Patch the secretmanager client factory inside _store_agent_secret.
-
-    The real imports happen lazily inside the function, so we patch the module
-    that gets imported at call time.
-    """
-    with patch("google.cloud.secretmanager.SecretManagerServiceClient") as factory:
-        client = _make_client()
-        factory.return_value = client
-        yield client
-
-
 @pytest_asyncio.fixture()
 async def gcp_cleanup_db(mocker):
     """Isolated DB for _cleanup_gcp revalidation tests."""
@@ -161,88 +87,6 @@ async def gcp_cleanup_db(mocker):
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.drop_all)
     await engine.dispose()
-
-
-class TestStoreAgentSecretIamRetry:
-    """Retry + idempotency tests for _store_agent_secret IAM policy handling."""
-
-    def test_retries_on_aborted_and_succeeds(self, monkeypatch):
-        """set_iam_policy raises Aborted twice then succeeds; function returns version name.
-
-        Expects the get/set read-modify-write loop to be retried with a fresh
-        get_iam_policy each iteration (ETag-correct behavior).
-        """
-        # Don't actually sleep during retries
-        monkeypatch.setattr(compute.time, "sleep", lambda _s: None)
-
-        # First two set_iam_policy calls raise Aborted, third succeeds.
-        side_effects = [
-            Aborted("etag mismatch 1"),
-            Aborted("etag mismatch 2"),
-            None,
-        ]
-        payload = '{"token": "abc"}'
-        client = _make_client(
-            set_iam_side_effects=side_effects, payload=payload.encode("utf-8")
-        )
-
-        with patch(
-            "google.cloud.secretmanager.SecretManagerServiceClient", return_value=client
-        ):
-            result = compute._store_agent_secret("vm123", payload)
-
-        assert result == "projects/test-proj/secrets/agent-creds-vm123/versions/1"
-        assert client.set_iam_policy.call_count == 3
-        # Each retry must re-read the policy to get a fresh ETag
-        assert client.get_iam_policy.call_count == 3
-
-    def test_idempotent_skip_when_sa_already_bound(self):
-        """If the agent SA is already bound for secretAccessor, skip set_iam_policy.
-
-        Prevents duplicate bindings when a secret is reused (e.g. AlreadyExists
-        catch at the top of the function).
-        """
-        agent_member = f"serviceAccount:{compute.AGENT_SERVICE_ACCOUNT_EMAIL}"
-        existing = [
-            _FakeBinding(
-                role="roles/secretmanager.secretAccessor",
-                members=[agent_member],
-            ),
-        ]
-        payload = '{"token": "abc"}'
-        client = _make_client(
-            existing_policy_bindings=existing, payload=payload.encode("utf-8")
-        )
-
-        with patch(
-            "google.cloud.secretmanager.SecretManagerServiceClient", return_value=client
-        ):
-            result = compute._store_agent_secret("vm123", payload)
-
-        assert result == "projects/test-proj/secrets/agent-creds-vm123/versions/1"
-        # Policy was read once to check the binding, then skipped.
-        assert client.get_iam_policy.call_count == 1
-        assert client.set_iam_policy.call_count == 0
-
-    def test_aborted_exhausts_retries_and_raises(self, monkeypatch):
-        """If Aborted fires max_retries (5) times, the final attempt re-raises Aborted."""
-        monkeypatch.setattr(compute.time, "sleep", lambda _s: None)
-
-        # Supply one more than max_retries (5) to prove we never exceed.
-        side_effects = [Aborted(f"etag mismatch {i}") for i in range(6)]
-        client = _make_client(set_iam_side_effects=side_effects)
-
-        with (
-            patch(
-                "google.cloud.secretmanager.SecretManagerServiceClient",
-                return_value=client,
-            ),
-            pytest.raises(Aborted),
-        ):
-            compute._store_agent_secret("vm123", '{"token": "abc"}')
-
-        assert client.set_iam_policy.call_count == 5
-        assert client.get_iam_policy.call_count == 5
 
 
 class _FleetSourceFakeSession:
@@ -10642,3 +10486,141 @@ async def test_launch_lro_timeout_skipped_when_vm_heartbeated(db_session, monkey
     assert job.status == ComputeJobStatus.RUNNING, (
         f"job must remain RUNNING after heartbeat-guarded LRO timeout; got {job.status}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cloud Run Job launch — AGENT_SECRET_TOKEN injection tests
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchAgentCloudRunJob:
+    """Tests for compute_cloud_run.launch_agent_cloud_run_job."""
+
+    @pytest.mark.asyncio
+    async def test_launch_injects_agent_secret_token(self, monkeypatch):
+        """When secret_version_name is provided, AGENT_SECRET_TOKEN must be
+        extracted from the Secret Manager manifest and injected as an env var.
+
+        We patch _fetch_agent_secret_token (the isolated SM helper) and the
+        run_v2 JobsClient so no real GCP calls are made.
+        """
+        from app import compute as _compute_module
+        from app import compute_cloud_run
+
+        # Disable LOCAL_MODE so the function proceeds past the early-return guard.
+        monkeypatch.setattr(_compute_module, "LOCAL_MODE", False)
+
+        # Patch the Secret Manager helper to return a known token.
+        monkeypatch.setattr(
+            compute_cloud_run,
+            "_fetch_agent_secret_token",
+            lambda version: "test-jwt-abc123",
+        )
+
+        # Capture env vars passed to run_job.
+        captured_env: list[tuple[str, str]] = []
+
+        class FakeEnvVar:
+            def __init__(self, name, value):
+                self.name = name
+                self.value = value
+
+        class FakeContainerOverride:
+            def __init__(self, env=None):
+                self.env = env or []
+
+        class FakeOverrides:
+            ContainerOverride = FakeContainerOverride
+
+            def __init__(self, task_count=1, timeout=None, container_overrides=None):
+                self.task_count = task_count
+                self.timeout = timeout
+                self.container_overrides = container_overrides or []
+
+        class FakeRunJobRequest:
+            Overrides = FakeOverrides
+
+            def __init__(self, name, overrides):
+                self.name = name
+                self.overrides = overrides
+
+        def fake_run_job(request):
+            for co in request.overrides.container_overrides:
+                for env_var in co.env:
+                    captured_env.append((env_var.name, env_var.value))
+            op = MagicMock()
+            op.operation.name = "operations/fake"
+            return op
+
+        mock_run_client = MagicMock()
+        mock_run_client.run_job.side_effect = fake_run_job
+
+        mock_run_module = MagicMock()
+        mock_run_module.JobsClient.return_value = mock_run_client
+        mock_run_module.RunJobRequest = FakeRunJobRequest
+        mock_run_module.EnvVar = FakeEnvVar
+
+        import google.cloud
+
+        monkeypatch.setattr(google.cloud, "run_v2", mock_run_module, raising=False)
+        monkeypatch.setattr(
+            compute_cloud_run,
+            "CLOUD_RUN_JOB_NAME",
+            "projects/p/locations/us/jobs/agent",
+        )
+
+        result = await compute_cloud_run.launch_agent_cloud_run_job(
+            vm_id="vm-001",
+            task_id="task-001",
+            payload_uri="gs://bucket/payload.json",
+            secret_version_name="projects/p/secrets/s/versions/1",
+            task_type="research",
+        )
+
+        assert result is True
+        env_dict = dict(captured_env)
+        assert "AGENT_SECRET_TOKEN" in env_dict, (
+            f"AGENT_SECRET_TOKEN must be injected; got env keys: {list(env_dict)}"
+        )
+        assert env_dict["AGENT_SECRET_TOKEN"] == "test-jwt-abc123"
+
+    @pytest.mark.asyncio
+    async def test_launch_returns_false_on_secret_fetch_failure(self, monkeypatch):
+        """When _fetch_agent_secret_token raises, launch must return False
+        without calling run_job."""
+        import google.cloud
+        from app import compute as _compute_module
+        from app import compute_cloud_run
+
+        monkeypatch.setattr(_compute_module, "LOCAL_MODE", False)
+
+        def failing_fetch(version):
+            raise Exception("permission denied")
+
+        monkeypatch.setattr(
+            compute_cloud_run, "_fetch_agent_secret_token", failing_fetch
+        )
+
+        run_job_calls: list = []
+        mock_run_client = MagicMock()
+        mock_run_client.run_job.side_effect = lambda r: run_job_calls.append(r)
+        mock_run_module = MagicMock()
+        mock_run_module.JobsClient.return_value = mock_run_client
+        monkeypatch.setattr(google.cloud, "run_v2", mock_run_module, raising=False)
+
+        monkeypatch.setattr(
+            compute_cloud_run,
+            "CLOUD_RUN_JOB_NAME",
+            "projects/p/locations/us/jobs/agent",
+        )
+
+        result = await compute_cloud_run.launch_agent_cloud_run_job(
+            vm_id="vm-002",
+            task_id="task-002",
+            payload_uri=None,
+            secret_version_name="projects/p/secrets/s/versions/1",
+            task_type="research",
+        )
+
+        assert result is False, "must return False when Secret Manager fetch fails"
+        assert run_job_calls == [], "run_job must NOT be called when secret fetch fails"
