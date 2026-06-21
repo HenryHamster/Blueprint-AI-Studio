@@ -57,6 +57,13 @@ variable "source_git_sha" {
 # The @anthropic-ai/claude-code install below is unpinned, so this rebuild bakes the current
 # CLI that recognizes `--model claude-opus-4-8`. Bake + deploy this image BEFORE flipping the
 # live runtime_config to opus-4-8 — otherwise every Anthropic task fails on an unknown --model.
+# Rebuild trigger 2026-06-21: pin baked pytest to 7.4.3 (was unpinned -> drifted to 9.1.1).
+# The unpinned `sudo pip3 install ... pytest ...` below (added #6902, latent since May 30) let a
+# rebuild bake pytest 9.1.1, whose console script imports the privatized `_console_main` that the
+# repo's pinned 7.4.3 (installed by the agent into ~/.local) does not export → ImportError broke
+# the agent local pytest gate fleet-wide (Blueprint fix/verify lane). Verified on a throwaway VM:
+# system 9.1.1 + user 7.4.3 -> ImportError; system pinned 7.4.3 -> real test passes EXIT=0.
+# REBUILD + REDEPLOY the agent image to take effect; merging this alone does not change live VMs.
 source "googlecompute" "agent_image" {
   project_id          = var.project_id
   source_image_family = "ubuntu-2204-lts"
@@ -99,7 +106,15 @@ build {
       "sudo docker pull python:3.11-slim",
       "sudo npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
       "sudo apt-get install -y python3-pip",
-      "sudo pip3 install ruff pytest pytest-asyncio pytest-mock pytest-timeout",
+      "# Pin the baked system pytest stack to EXACTLY backend/requirements.txt's versions.",
+      "# This install was previously unpinned, so a rebuild silently drifted to pytest 9.1.1.",
+      "# pytest privatized console_main -> _console_main after 7.x, so the 9.x system console",
+      "# script (/usr/local/bin/pytest: `from _pytest.config import _console_main`) fails to",
+      "# import against the repo's pinned 7.4.3 that the agent installs into ~/.local",
+      "#   ImportError: cannot import name '_console_main' from '_pytest.config'",
+      "# breaking the agent's local pytest gate fleet-wide. Keep these in sync with",
+      "# backend/requirements.txt; do NOT unpin.",
+      "sudo pip3 install ruff pytest==7.4.3 pytest-asyncio==0.23.2 pytest-mock==3.12.0 pytest-timeout==2.2.0",
       "git config --global user.email 'blueprint-agent@automated.dev'",
       "git config --global user.name 'Blueprint Agent'",
       "sudo mkdir -p /opt/agent /tmp/workspace",
