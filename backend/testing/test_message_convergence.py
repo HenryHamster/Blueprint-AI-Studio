@@ -182,6 +182,31 @@ async def test_resolve_message_ref_too_short(db_session):
 
 
 @pytest.mark.asyncio
+async def test_resolve_message_ref_beyond_500(db_session):
+    """Resolution survives projects with >500 messages (no recency-window cap)."""
+    project = await _make_project(db_session)
+
+    # Seed 501 messages so any window-cap of 500 would hide at least one early message.
+    msgs = []
+    for i in range(501):
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            content=f"Message {i}",
+        )
+        db_session.add(msg)
+        msgs.append(msg)
+    await db_session.commit()
+
+    # Resolve the first-inserted message by its short hex prefix.
+    # If a 500-row recency cap were in effect the earliest messages would be invisible.
+    target = msgs[0]
+    hex_ref = target.id.hex[:8]
+    resolved = await resolve_message_ref(db_session, project.id, hex_ref)
+    assert resolved.id == target.id
+
+
+@pytest.mark.asyncio
 async def test_resolve_message_ref_invalid_hex(db_session):
     """Test that non-hex characters are rejected."""
     project = await _make_project(db_session)
