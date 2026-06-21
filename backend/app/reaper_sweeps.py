@@ -1052,6 +1052,146 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     return created
 
 
+# ── Step 20: Orphaned cross-base children that can never land ─────────────────
+#
+# A research/plan parent converges to COMPLETED while a child task stays QUEUED
+# forever behind a cross-base genuine code-dependency whose landed-signal gate
+# can never be satisfied: the dep is COMPLETED but its rollup commit was
+# definitively confirmed NOT to be an ancestor of the project's integration
+# branch (``STRANDED_LANDING_REASON_KEY`` is set on the dep by the ancestry check
+# that stamped ``is_ancestor_of -> False``). No new rollup will ever land the dep
+# on integration, so the child's ``has_landed_signal`` gate can never flip.
+#
+# Conservative policy: only the ``STRANDED_LANDING_REASON_KEY`` marker triggers
+# cancellation. A dep whose ``landed_on_integration`` is merely False without
+# that marker may still receive its signal via rollup propagation (the
+# in-progress sibling fix that propagates the signal to carried children) and
+# MUST be left untouched.
+
+
+def _has_permanently_stranded_cross_base_dep(child: "Task", dep_tasks: list) -> bool:
+    """True when *child* has a permanently-stranded cross-base genuine code-dep.
+
+    A dep is permanently stranded when it is COMPLETED with no landed signal
+    AND with ``STRANDED_LANDING_REASON_KEY`` explicitly set — durable proof that
+    the dep's rollup commit is not an ancestor of the integration branch. A dep
+    that merely has ``landed_on_integration=False`` without the stranded marker
+    may still receive its signal via rollup propagation and must not be cancelled.
+    """
+    from app.orchestrator_health import _same_base_branch, is_genuine_code_dependency
+    from app.landed_signal import STRANDED_LANDING_REASON_KEY, has_landed_signal
+
+    for dep in dep_tasks:
+        if dep.status != TaskStatus.COMPLETED:
+            continue
+        if _same_base_branch(child, dep):
+            continue
+        if not is_genuine_code_dependency(child, dep):
+            continue
+        if has_landed_signal(dep):
+            continue
+        if not (dep.context or {}).get(STRANDED_LANDING_REASON_KEY):
+            continue
+        return True
+    return False
+
+
+async def sweep_orphaned_cross_base_children(session, *, batch_size: int = 500) -> int:
+    """Step 20: Cancel QUEUED children orphaned behind a permanently-stranded cross-base dep.
+
+    Scans QUEUED tasks with a parent_task_id whose parent is COMPLETED, then
+    for each such candidate checks whether any of its ``depends_on`` deps is a
+    cross-base genuine code-dependency that can never land (dep COMPLETED,
+    ``has_landed_signal`` False, ``STRANDED_LANDING_REASON_KEY`` set). Matches
+    are cancelled and stamped ``_orphaned_cross_base_cancel: True``.
+
+    Returns the number of children cancelled.
+    """
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.status == TaskStatus.QUEUED,
+                    Task.parent_task_id.isnot(None),
+                )
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    # Batched parent load: only keep candidates whose parent is COMPLETED.
+    parent_ids = list({r.parent_task_id for r in rows})
+    parent_rows = (
+        (await session.execute(select(Task).where(Task.id.in_(parent_ids))))
+        .scalars()
+        .all()
+    )
+    parent_by_id = {p.id: p for p in parent_rows}
+
+    candidates = [
+        r
+        for r in rows
+        if parent_by_id.get(r.parent_task_id) is not None
+        and parent_by_id[r.parent_task_id].status == TaskStatus.COMPLETED
+        and (r.depends_on or [])
+    ]
+    if not candidates:
+        return 0
+
+    # Batched dep load.
+    all_dep_ids: set = set()
+    for cand in candidates:
+        for raw in cand.depends_on or []:
+            try:
+                all_dep_ids.add(uuid.UUID(str(raw)))
+            except (ValueError, AttributeError):
+                continue
+    dep_rows: list = []
+    if all_dep_ids:
+        dep_rows = (
+            (await session.execute(select(Task).where(Task.id.in_(all_dep_ids))))
+            .scalars()
+            .all()
+        )
+    dep_by_id = {str(d.id): d for d in dep_rows}
+
+    cancelled = 0
+    for cand in candidates:
+        dep_tasks = [
+            dep_by_id[str(raw)]
+            for raw in (cand.depends_on or [])
+            if str(raw) in dep_by_id
+        ]
+        if not _has_permanently_stranded_cross_base_dep(cand, dep_tasks):
+            continue
+        cand.status = TaskStatus.CANCELLED
+        cand.context = {
+            **(cand.context or {}),
+            "_orphaned_cross_base_cancel": True,
+        }
+        session.add(cand)
+        cancelled += 1
+        logger.info(
+            "[REAPER] Step 20: cancelled orphaned cross-base child %s "
+            "(parent %s COMPLETED, dep permanently stranded)",
+            cand.id,
+            cand.parent_task_id,
+        )
+
+    if cancelled:
+        await session.commit()
+        logger.info(
+            "[REAPER] Step 20: cancelled %d orphaned cross-base child task(s)",
+            cancelled,
+        )
+    return cancelled
+
+
 # ── Re-exports from extracted sub-module ─────────────────────────────────────
 #
 # These symbols were extracted to app.reaper_bug_message_sweeps. They are

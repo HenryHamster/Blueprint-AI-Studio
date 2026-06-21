@@ -14329,3 +14329,219 @@ def test_spawn_gate_canary_classifies_real_verdict_vs_fail_closed():
     assert result["status"] == "fail_closed", (
         "ok parse with zero explicit verdicts must be fail_closed"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-tree base inheritance for genuine code dependents
+# ---------------------------------------------------------------------------
+
+
+@_pytest.mark.asyncio
+async def test_genuine_cross_tree_code_dependent_inherits_prerequisite_base(
+    db_session, mocker
+):
+    """A finding wired via depends_on_indices to an existing cross-tree foundation
+    with file overlap inherits the foundation's base_branch at spawn time.
+
+    This prevents the cross-base landed-signal wedge by making the pair same-base
+    from birth so the dependent never has to wait for the foundation's code to land
+    on a different integration branch.
+    """
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-xbase-inherit"
+    )
+
+    # Foundation already in-flight on a different branch, shares a file with the dep.
+    foundation_title = "Add shared auth middleware"
+    foundation_desc = "Core auth that all endpoints depend on"
+    foundation_hash = _finding_hash(foundation_title, foundation_desc)
+    existing_foundation = _Task(
+        project_id=_project.id,
+        title=foundation_title,
+        description=foundation_desc,
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={
+            "finding_hash": foundation_hash,
+            "related_files": ["backend/app/auth.py"],
+        },
+    )
+    db_session.add(existing_foundation)
+    await db_session.commit()
+    await db_session.refresh(existing_foundation)
+
+    # Research cycle surfaces both foundation (will be deduped) and dependent.
+    # finding_a matches the existing_foundation by hash, so deduplicate_findings
+    # drops it; the missing-sibling loop resolves it to existing_foundation.
+    finding_a = _make_finding(title=foundation_title, direction_id=direction["id"])
+    finding_a["description"] = foundation_desc
+    finding_a["finding_hash"] = foundation_hash
+    finding_a["related_files"] = ["backend/app/auth.py"]
+
+    finding_b = _make_finding(title="Add login endpoint", direction_id=direction["id"])
+    finding_b["depends_on_indices"] = [0]
+    # Overlapping file → genuine code-dep → should inherit foundation's base_branch.
+    finding_b["related_files"] = ["backend/app/auth.py"]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_a, finding_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    dep_children = [c for c in children if "login" in c.title.lower()]
+    assert len(dep_children) == 1, "dependent finding must spawn as a child task"
+    dep = dep_children[0]
+    assert str(existing_foundation.id) in (dep.depends_on or []), (
+        "dependent must be wired to the existing in-flight foundation"
+    )
+    assert (dep.first_payload or {}).get("base_branch") == "main", (
+        "genuine cross-tree code-dep must inherit foundation base_branch 'main'"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_ordering_only_cross_tree_dependent_keeps_own_base(db_session, mocker):
+    """An ordering-only (no file overlap) cross-tree dependency does NOT cause the
+    dependent's base_branch to be inherited — only genuine code-deps do."""
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-xbase-noinherit"
+    )
+
+    # Foundation in-flight on "main", but with disjoint files from the dependent.
+    foundation_title = "Set up deployment pipeline"
+    foundation_desc = "Automate releases via GitHub Actions"
+    foundation_hash = _finding_hash(foundation_title, foundation_desc)
+    existing_foundation = _Task(
+        project_id=_project.id,
+        title=foundation_title,
+        description=foundation_desc,
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={
+            "finding_hash": foundation_hash,
+            "related_files": ["infra/deploy.sh"],
+        },
+    )
+    db_session.add(existing_foundation)
+    await db_session.commit()
+    await db_session.refresh(existing_foundation)
+
+    finding_a = _make_finding(title=foundation_title, direction_id=direction["id"])
+    finding_a["description"] = foundation_desc
+    finding_a["finding_hash"] = foundation_hash
+    finding_a["related_files"] = ["infra/deploy.sh"]
+
+    finding_b = _make_finding(
+        title="Add user profile endpoint", direction_id=direction["id"]
+    )
+    finding_b["depends_on_indices"] = [0]
+    # Disjoint files → no code overlap → ordering-only dep → base_branch unchanged.
+    finding_b["related_files"] = ["backend/app/users.py"]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_a, finding_b],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    dep_children = [c for c in children if "profile" in c.title.lower()]
+    assert len(dep_children) == 1, "dependent finding must spawn as a child task"
+    dep = dep_children[0]
+    dep_base = (dep.first_payload or {}).get("base_branch") or ""
+    assert dep_base != "main", (
+        "ordering-only cross-tree dep must NOT inherit foundation base_branch"
+    )
+    assert "research/" in dep_base, (
+        "ordering-only cross-tree dep must keep its own research branch"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_explicit_prereq_genuine_cross_tree_inherits_base(db_session, mocker):
+    """A finding declaring an explicit {kind:task} prerequisite to a cross-tree
+    foundation with file overlap also inherits the foundation's base_branch."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-xbase-explicit"
+    )
+
+    existing_foundation = _Task(
+        project_id=_project.id,
+        title="Build payment core",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"related_files": ["backend/app/payments.py"]},
+    )
+    db_session.add(existing_foundation)
+    await db_session.commit()
+    await db_session.refresh(existing_foundation)
+
+    # Finding declares the foundation explicitly by task ID.
+    finding = _make_finding(title="Add refund endpoint", direction_id=direction["id"])
+    finding["prerequisite"] = {"kind": "task", "ref": str(existing_foundation.id)}
+    finding["related_files"] = ["backend/app/payments.py"]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    dep_children = [c for c in children if "refund" in c.title.lower()]
+    assert len(dep_children) == 1
+    dep = dep_children[0]
+    assert str(existing_foundation.id) in (dep.depends_on or []), (
+        "dependent must be wired to the explicit prerequisite foundation"
+    )
+    assert (dep.first_payload or {}).get("base_branch") == "main", (
+        "explicit genuine cross-tree code-dep must inherit foundation base_branch"
+    )

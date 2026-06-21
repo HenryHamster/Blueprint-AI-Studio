@@ -1024,6 +1024,59 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     # to the dispatcher because the transaction is still open.
     await session.flush()
 
+    # Snapshot active project tasks for cross-tree base-branch inheritance.
+    # Queried after flush so the freshly-created children (inside the open
+    # transaction) are invisible to this query; we hold them in child_tasks.
+    from sqlmodel import select as _select_tasks
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    _existing_prereq_candidates = list(
+        (
+            await session.execute(
+                _select_tasks(Task).where(
+                    Task.project_id == task.project_id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.BLOCKED,
+                            TaskStatus.PARKED,
+                        ]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    def _maybe_inherit_base(dependent: Task, foundation: Task) -> None:
+        """Inherit *foundation*'s base_branch when it is a genuine cross-tree
+        code-dep of *dependent*, preventing the cross-base landed-signal wedge."""
+        if not dependent.payloads:
+            return
+        from app.orchestrator_health import (
+            _same_base_branch,
+            is_genuine_code_dependency,
+        )
+
+        if is_genuine_code_dependency(dependent, foundation) and not _same_base_branch(
+            dependent, foundation
+        ):
+            foundation_base = (foundation.first_payload or {}).get("base_branch")
+            dependent.payloads[0]["base_branch"] = foundation_base
+            _flag_modified(dependent, "payloads")
+            session.add(dependent)
+            logger.info(
+                "[PLAN] Subtask '%s' cross-tree genuine code-dep: set "
+                "base_branch to %r (foundation %s)",
+                dependent.title,
+                foundation_base,
+                str(foundation.id),
+            )
+
     # Inject serial dependencies for subtasks that share files (additive only).
     # Save original (explicit) deps so we can restore them if injection creates a cycle.
     original_deps = {
@@ -1063,7 +1116,29 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         child_tasks[i].depends_on = dep_ids
         if dep_ids:
             remember_structural_depends_on(child_tasks[i], dep_ids)
+        # Inherit sibling foundation's base_branch for genuine cross-tree code deps.
+        for j in dep_indices:
+            if 0 <= j < len(child_tasks) and child_tasks[j] is not None:
+                _maybe_inherit_base(child_tasks[i], child_tasks[j])
         session.add(child_tasks[i])
+
+    # Explicit {kind: task} prerequisites on plan subtasks: inherit the
+    # foundation's base_branch when it is a genuine cross-tree code-dep
+    # (mirrors research_completion explicit-prereq path).
+    from app.finding_deduplication import resolve_prerequisite_task
+
+    _all_prereq_candidates = _existing_prereq_candidates + [
+        ct for ct in child_tasks if ct is not None
+    ]
+    for ct in child_tasks:
+        if ct is None:
+            continue
+        _prereq = (ct.context or {}).get("prerequisite")
+        if not isinstance(_prereq, dict) or _prereq.get("kind") != "task":
+            continue
+        foundation = resolve_prerequisite_task(_prereq, _all_prereq_candidates)
+        if foundation is not None and foundation.id != ct.id:
+            _maybe_inherit_base(ct, foundation)
 
     _log_file_overlaps(subtasks, "PLAN")
 

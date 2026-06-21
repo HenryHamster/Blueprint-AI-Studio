@@ -23,7 +23,6 @@ from datetime import datetime, timedelta
 from sqlmodel import select
 
 import app.shared_state as _shared_state
-from app import services
 from app.models import (
     Task,
     TaskStatus,
@@ -644,6 +643,7 @@ async def _verify_ci_before_backstop(
     Returns True iff CI had genuinely concluded and was handled (the caller must
     then skip the kill); False to fall through to the existing timeout path.
     """
+    from app import services
     from app.routers.agent import get_github_token_for_task
     from app.github_checks import get_check_runs_cached
     from app.ci_completion import handle_ci_completion
@@ -858,6 +858,7 @@ async def _heal_direction_outcomes_best_effort(task_id, *, label: str) -> None:
     best-effort — a failure here must not poison the sweep. Mirrors the sibling
     ``_pr_state_check_pending`` recovery path (see the merge-refresh block above).
     """
+    from app import services
     from app.direction_outcomes import refresh_direction_outcomes_after_merge
 
     try:

@@ -2165,3 +2165,168 @@ async def test_compute_experiment_subtask_inherits_plan_branch(
         f"compute_experiment base_branch {compute_base!r} must match sibling create "
         f"base_branch {create_base!r} so they are same-base in dep resolution"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-tree base inheritance for genuine code dependents
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_with_cross_tree_prereq_inherits_base(
+    db_session, mocker, _quiet_mocks
+):
+    """A plan subtask whose explicit prerequisite is a cross-tree in-flight
+    task with file overlap inherits the foundation's base_branch at spawn time.
+
+    This prevents the cross-base landed-signal wedge on the plan path: if the
+    plan branch is ``plan/abc`` but the prerequisite is on ``main``, the
+    dependent subtask must land on ``main`` to see the foundation's merged code.
+    """
+    from testing.factories import make_task
+
+    project = make_project(name="XbaseInheritPlan")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Existing in-flight foundation on main with a shared file.
+    foundation = make_task(
+        project_id=project.id,
+        title="Build payment core",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "base_branch": "main"}],
+    )
+    foundation.context = {"related_files": ["backend/app/payments.py"]}
+    db_session.add(foundation)
+    await db_session.commit()
+    await db_session.refresh(foundation)
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Add refund endpoint",
+                    "prompt": "implement refunds",
+                    "type": "create",
+                    "prerequisite": {"kind": "task", "ref": str(foundation.id)},
+                    "related_files": ["backend/app/payments.py"],
+                }
+            ]
+        }
+    )
+
+    plan_task = make_task(
+        project_id=project.id,
+        title="Plan: add refunds",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "add refunds", "base_branch": "plan/abc"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=plan_task,
+    )
+
+    await _handle_plan_completion(plan_task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == plan_task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert (child.first_payload or {}).get("base_branch") == "main", (
+        "plan subtask with cross-tree genuine code-dep prereq must inherit "
+        "foundation base_branch 'main'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_ordering_only_prereq_keeps_own_base(
+    db_session, mocker, _quiet_mocks
+):
+    """A plan subtask whose explicit prerequisite has NO file overlap does NOT
+    inherit the foundation's base_branch — it keeps its own plan branch."""
+    from testing.factories import make_task
+
+    project = make_project(name="XbaseNoInheritPlan")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Foundation on main, but with disjoint files from the dependent.
+    foundation = make_task(
+        project_id=project.id,
+        title="Set up CI pipeline",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "base_branch": "main"}],
+    )
+    foundation.context = {"related_files": ["infra/deploy.sh"]}
+    db_session.add(foundation)
+    await db_session.commit()
+    await db_session.refresh(foundation)
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Add user settings page",
+                    "prompt": "implement user settings",
+                    "type": "create",
+                    "prerequisite": {"kind": "task", "ref": str(foundation.id)},
+                    "related_files": ["frontend/src/settings.tsx"],
+                }
+            ]
+        }
+    )
+
+    plan_task = make_task(
+        project_id=project.id,
+        title="Plan: settings",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {"type": "plan", "prompt": "add settings", "base_branch": "plan/xyz"}
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=plan_task,
+    )
+
+    await _handle_plan_completion(plan_task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == plan_task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    child_base = (child.first_payload or {}).get("base_branch") or ""
+    assert child_base != "main", (
+        "ordering-only cross-tree plan subtask must NOT inherit foundation base_branch"
+    )
+    assert "plan/" in child_base, (
+        f"ordering-only dep must keep its own plan branch, got {child_base!r}"
+    )

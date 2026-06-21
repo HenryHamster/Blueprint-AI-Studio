@@ -291,6 +291,7 @@ from app.reaper_sweeps import (
     sweep_resolve_stale_open_bug_messages,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
+    sweep_orphaned_cross_base_children,
     _sweep_strategic_cycle_starvation,
 )
 
@@ -2750,6 +2751,32 @@ async def reaper_service():
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()
+
+                # Step 20: Orphaned cross-base children converge guard — cancel
+                # QUEUED children whose parent direction is COMPLETED and whose
+                # cross-base genuine code-dependency is permanently stranded (dep
+                # COMPLETED but confirmed NOT to be an ancestor of integration).
+                # Conservative: only fires when STRANDED_LANDING_REASON_KEY is
+                # explicitly set on the dep; legitimately-waiting children
+                # (dep not yet stranded) are left untouched.
+                _mark_reaper_progress()
+                try:
+                    _cross_base_cancelled = await sweep_orphaned_cross_base_children(
+                        session
+                    )
+                    if _cross_base_cancelled:
+                        logger.info(
+                            f"[REAPER] Step 20: cancelled {_cross_base_cancelled} "
+                            "orphaned cross-base child task(s)"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Orphaned cross-base children sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
             consecutive_errors = 0
             if _reaper_halt_state.get("_in_probe"):
                 _probe_failures = _reaper_halt_state.get("half_open_failures", 0)

@@ -385,6 +385,30 @@ def _promotion_target_rollup_allowed(parent: Task, target_branch: str) -> bool:
     return bool(payload.get("hotfix") or ctx.get("hotfix"))
 
 
+def _propagate_landed_to_rollup_children(
+    completed_children: list[Task], session: AsyncSession
+) -> None:
+    """Stamp landed_on_integration on children carried by a landed rollup.
+
+    When a rollup PR merges onto the integration branch every COMPLETED child
+    that merged into the rollup's staging branch (pr_merged=True but
+    landed_on_integration still False or absent) must also receive the landed
+    signal so cross-base dependents that wait on has_landed_signal(child) can
+    unblock.  Children that already carry a positive landed signal are skipped
+    (idempotent).
+    """
+    from app.landed_signal import (
+        has_landed_signal,
+        has_merge_unblock_signal,
+        mark_landed_on_integration,
+    )
+
+    for child in completed_children:
+        if has_merge_unblock_signal(child) and not has_landed_signal(child):
+            mark_landed_on_integration(child)
+            session.add(child)
+
+
 async def _hold_rollup_for_branch_safety(
     parent: Task,
     project: Project | None,
@@ -2315,6 +2339,9 @@ async def _check_and_trigger_rollup(
                                     ),
                                     non_merge_reason="merged_pr_non_integration_branch",
                                 )
+                                _propagate_landed_to_rollup_children(
+                                    completed_children, session
+                                )
                             if _terminal_rollup_merge:
                                 parent.latest_status_message = (
                                     f"Rollup PR #{existing_pr} already merged"
@@ -2718,6 +2745,9 @@ async def _check_and_trigger_rollup(
                                 parent, target_branch
                             ),
                             non_merge_reason="merged_pr_non_integration_branch",
+                        )
+                        _propagate_landed_to_rollup_children(
+                            completed_children, session
                         )
                     session.add(parent)
                     await session.commit()
@@ -3139,6 +3169,9 @@ async def _check_and_trigger_rollup(
                                     parent, target_branch
                                 ),
                                 non_merge_reason="merged_pr_non_integration_branch",
+                            )
+                            _propagate_landed_to_rollup_children(
+                                completed_children, session
                             )
                         if _terminal_rollup_merge:
                             parent.latest_status_message = (

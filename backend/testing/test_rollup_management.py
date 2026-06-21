@@ -2146,7 +2146,9 @@ async def test_rollup_review_spawn_none_pr_closed_unmerged_does_not_fail_parent(
 
     # Use automerge deps but override get_pull_request to report a large PR
     # (additions > 100) so the large-rollup → review path is taken.
-    mock_merge, _ = _mock_automerge_deps(mocker, pr_files=_files("backend/app/models.py"))
+    mock_merge, _ = _mock_automerge_deps(
+        mocker, pr_files=_files("backend/app/models.py")
+    )
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
@@ -2187,3 +2189,105 @@ async def test_rollup_review_spawn_none_pr_closed_unmerged_does_not_fail_parent(
         "parent must not be FAILED when review spawn returns None due to PR closed without merge"
     )
     assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_landed_rollup_propagates_signal_to_carried_children(cleanup_db, mocker):
+    """When a rollup PR targeting the integration branch is detected as already
+    merged, all COMPLETED children whose code merged into the staging branch
+    (pr_merged=True but landed_on_integration=False) receive the landed signal so
+    cross-base dependents waiting on has_landed_signal(child) can unblock.
+
+    Proof for acceptance evidence: a cross-base dependent of a child carried in a
+    landed rollup becomes eligible only after the rollup lands — the child's
+    landed_on_integration transitions from False to True on rollup completion.
+    """
+    from app.rollup_management import _check_and_trigger_rollup
+    from app.landed_signal import has_landed_signal
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+    # Existing-PR check returns merged=True → triggers "already merged" landing path
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "state": "closed"},
+    )
+    # verify_rollup_merge_landed is called when target_branch == integration_branch;
+    # return "landed" so _landed=True and the propagation fires.
+    mocker.patch(
+        "app.rollup_management.verify_rollup_merge_landed",
+        new_callable=AsyncMock,
+        return_value="landed",
+    )
+
+    # Project with a named integration branch so _classify_merged_rollup_landing
+    # returns _landed=True when target_branch matches.
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    # Parent targets "main" directly — not an intermediate staging branch.
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db, project.id, extra_context={"parent_base": "main"}
+    )
+
+    # Children that merged into the rollup's staging branch but whose
+    # landed_on_integration is explicitly False (the _non_merge_unblock_reason
+    # marker recorded by mark_unblocked_non_merge when a child's PR merged into
+    # a staging branch, not directly onto integration).
+    child1 = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    child2 = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+
+    await _check_and_trigger_rollup(child1, cleanup_db)
+
+    await cleanup_db.refresh(child1)
+    await cleanup_db.refresh(child2)
+
+    # Both children must now carry the landed signal — the key predicate that
+    # orchestrator_health._check_candidate_task_deps reads to unblock cross-base
+    # dependents (has_landed_signal reads context["landed_on_integration"]).
+    assert has_landed_signal(child1), (
+        "child1 must have landed signal after rollup lands on integration branch"
+    )
+    assert has_landed_signal(child2), (
+        "child2 must have landed signal after rollup lands on integration branch"
+    )
+    assert (child1.context or {}).get("landed_on_integration") is True
+    assert (child2.context or {}).get("landed_on_integration") is True
+    # The staging-branch non-merge marker must be cleared so the child is
+    # recognized as a genuine integration landing by all callers.
+    assert "_non_merge_unblock_reason" not in (child1.context or {})
+    assert "_non_merge_unblock_reason" not in (child2.context or {})
