@@ -50,6 +50,10 @@ _ROLLUP_TRANSIENT_CTX_KEYS = frozenset(
         # TTL expires. Scrub it on every terminal transition. See
         # rollup_management._ROLLUP_PR_CREATE_CLAIM_TTL_S.
         "rollup_pr_creating_at",
+        # Escalation latch: set when the empty/unknown escalation merge fires so
+        # it only triggers once per alerting cycle. Must be scrubbed on terminal
+        # so a future deferral episode can re-escalate if needed.
+        "_merge_escalation_attempted",
     }
 )
 

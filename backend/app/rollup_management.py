@@ -921,6 +921,117 @@ async def _nudge_sibling_rollup_prs(
             )
 
 
+async def _do_rollup_post_merge_housekeeping(
+    parent: Task,
+    project: "Project | None",
+    session: "AsyncSession",
+    gh_token: str,
+    owner: str,
+    repo: str,
+    rollup_pr_number: int,
+    staging_branch: str,
+    target_branch: str,
+    completed_children: "list[Task]",
+    completed_count: int,
+    landed: bool,
+    terminal: bool,
+) -> None:
+    """Post-merge housekeeping shared by the main, re-poll, and escalation merge paths.
+
+    Must be called AFTER ``session.add(parent); await session.commit()`` so the
+    FOR UPDATE lock is released before any GitHub/notification I/O. Performs:
+    direction-outcomes refresh, staging-branch deletion, PR-merged notification,
+    viewport-coverage snapshot, a second commit, optional terminal cleanup +
+    broadcast, and the merge-train sibling nudge.
+    """
+    from app.broadcast import broadcast_to_project
+    from app.github import delete_branch, get_pull_request_diff
+    from app.viewport_coverage import update_viewport_coverage_snapshot_from_diff
+
+    if landed:
+        from app.direction_outcomes import refresh_direction_outcomes_after_merge
+
+        _dir_child = next(
+            (
+                c
+                for c in completed_children
+                if (c.context or {}).get("direction_id")
+                and (c.context or {}).get("research_task_id")
+            ),
+            None,
+        )
+        if _dir_child is not None:
+            await refresh_direction_outcomes_after_merge(_dir_child, session)
+    try:
+        await delete_branch(gh_token, owner, repo, staging_branch)
+    except Exception as del_err:
+        logger.warning(
+            f"[ROLLUP] Failed to delete staging branch {staging_branch}: {del_err}"
+        )
+    logger.info(f"[ROLLUP] Auto-merged rollup into {target_branch}")
+    try:
+        from app.notification_dispatch import post_pr_merged_message
+
+        _direction_id = (parent.context or {}).get("direction_id")
+        _direction_text = "unknown direction"
+        if _direction_id:
+            _proj = await session.get(Project, parent.project_id)
+            if _proj:
+                for _d in _proj.directions or []:
+                    if str(_d.get("id", "")) == str(_direction_id):
+                        _direction_text = _d.get("text", "unknown direction")
+                        break
+        await post_pr_merged_message(
+            session,
+            parent.project_id,
+            rollup_pr_number,
+            _direction_text,
+            completed_count,
+            parent.id,
+        )
+    except Exception as _e:
+        logger.warning(f"[NOTIFY] Failed to post PR merged message: {_e}")
+    try:
+        _snap_proj = await session.get(Project, parent.project_id)
+        if _snap_proj is not None:
+            _diff_text = await get_pull_request_diff(
+                gh_token, owner, repo, rollup_pr_number
+            )
+            await update_viewport_coverage_snapshot_from_diff(
+                session, _snap_proj, rollup_pr_number, _diff_text
+            )
+    except Exception as _snap_e:
+        logger.warning(
+            f"[ROLLUP] Failed to update viewport_coverage_snapshot: {_snap_e}"
+        )
+    await session.commit()
+    if terminal:
+        await _cleanup_branches(parent, session)
+        await broadcast_to_project(
+            str(parent.project_id),
+            "task_updated",
+            {
+                "task_id": str(parent.id),
+                "status": TaskStatus.COMPLETED,
+            },
+        )
+    try:
+        await _nudge_sibling_rollup_prs(
+            parent,
+            session,
+            gh_token,
+            owner,
+            repo,
+            target_branch,
+            merged_pr_number=rollup_pr_number,
+        )
+    except Exception as _queue_exc:
+        logger.warning(
+            f"[MERGE-QUEUE] Sibling nudge after rollup PR "
+            f"#{rollup_pr_number} failed: {_queue_exc}"
+        )
+
+
 async def _check_and_trigger_rollup(
     child_task: Task, session: AsyncSession, progress_cb=None
 ) -> None:
@@ -3366,6 +3477,188 @@ async def _check_and_trigger_rollup(
                                 "unknown",
                                 "empty",
                             )
+                            # empty/unknown = GitHub hasn't finished computing
+                            # mergeability yet (async after approval; typically
+                            # resolves in seconds). Re-poll 2-3 times with a
+                            # short backoff before entering the deferral path —
+                            # in the common case this resolves quickly and we
+                            # can retry the merge in the same sweep, avoiding
+                            # a sweep-interval delay that can compound into a
+                            # CI-backstop timeout if the state stays empty
+                            # across many sweeps.
+                            if _ms_key in ("empty", "unknown"):
+                                import asyncio as _asyncio
+
+                                _repoll_n = int(
+                                    _runtime_config.get(
+                                        "rollup_mergeable_repoll_attempts", 3
+                                    )
+                                )
+                                _repoll_s = float(
+                                    _runtime_config.get(
+                                        "rollup_mergeable_repoll_delay_s", 3
+                                    )
+                                )
+                                _repoll_merged = False
+                                _repoll_success_ri: int | None = None
+                                _repoll_merge_fail_msg: str | None = None
+
+                                # Release the FOR UPDATE lock before I/O to honour
+                                # the release-lock-around-GitHub-I/O invariant
+                                # (mirrors the pre_actual_merge_snapshot pattern at
+                                # ~2972 in the main merge path). parent has no
+                                # pending uncommitted mutations at this point.
+                                pre_repoll_snapshot = await _release_parent_lock(
+                                    parent, session
+                                )
+
+                                for _ri in range(1, _repoll_n + 1):
+                                    await _asyncio.sleep(_repoll_s)
+                                    try:
+                                        _rp_detail = await get_pull_request(
+                                            gh_token,
+                                            owner,
+                                            repo,
+                                            rollup_pr_number,
+                                            project_id=str(parent.project_id),
+                                        )
+                                        _ms_rp = (
+                                            _rp_detail.get("mergeable_state") or ""
+                                        ).lower()
+                                    except Exception as _rp_exc:
+                                        logger.debug(
+                                            f"[ROLLUP] PR #{rollup_pr_number} "
+                                            f"mergeability re-poll {_ri}/{_repoll_n} "
+                                            f"failed: {_rp_exc}"
+                                        )
+                                        break
+                                    logger.info(
+                                        f"[ROLLUP] PR #{rollup_pr_number} "
+                                        f"mergeability re-poll {_ri}/{_repoll_n}: "
+                                        f"mergeable_state="
+                                        f"{_ms_rp or 'empty'}"
+                                    )
+                                    if _ms_rp == "clean":
+                                        # Resolved — retry merge inline so the
+                                        # task doesn't wait for the next sweep.
+                                        _rp_merge = await merge_pull_request(
+                                            gh_token,
+                                            owner,
+                                            repo,
+                                            rollup_pr_number,
+                                            project_id=str(parent.project_id),
+                                        )
+                                        if _rp_merge.get("merged"):
+                                            _repoll_merged = True
+                                            _repoll_success_ri = _ri
+                                        else:
+                                            _repoll_merge_fail_msg = _rp_merge.get(
+                                                "message"
+                                            )
+                                        break
+                                    elif _ms_rp and _ms_rp not in (
+                                        "empty",
+                                        "unknown",
+                                    ):
+                                        # State changed but not to clean — update
+                                        # _ms vars and fall through to the
+                                        # appropriate deferral/fix path.
+                                        _ms = _ms_rp
+                                        _ms_key = _ms_rp
+                                        _ms_display = _ms_rp
+                                        _is_unrecognized = _ms_key not in (
+                                            "blocked",
+                                            "unstable",
+                                            "unknown",
+                                            "empty",
+                                        )
+                                        break
+
+                                # Relock after the I/O window.
+                                parent = await _relock_parent(
+                                    session,
+                                    parent_id_local,
+                                    pre_repoll_snapshot,
+                                    parent_in_session=parent,
+                                )
+                                if parent is None:
+                                    return
+                                parent_ctx = parent.context or {}
+
+                                if _repoll_merged:
+                                    (
+                                        _rp_landed,
+                                        _rp_terminal,
+                                    ) = await _classify_merged_rollup_landing(
+                                        parent,
+                                        project,
+                                        session,
+                                        pr_number=rollup_pr_number,
+                                        target_branch=target_branch,
+                                        source="rollup_management.repoll_merge",
+                                    )
+                                    parent.status = (
+                                        TaskStatus.COMPLETED
+                                        if _rp_terminal
+                                        else TaskStatus.EVALUATING
+                                    )
+                                    parent.context = {
+                                        **_clear_rollup_transient_state(
+                                            parent.context
+                                        ),
+                                        "rollup_pr_url": rollup_pr_url,
+                                    }
+                                    if _rp_landed:
+                                        apply_merged_landed_signal(
+                                            parent,
+                                            project,
+                                            base_branch=target_branch,
+                                            hotfix_lane=_promotion_target_rollup_allowed(
+                                                parent, target_branch
+                                            ),
+                                        )
+                                    if _rp_terminal:
+                                        parent.latest_status_message = (
+                                            f"All {completed_count} subtasks merged, "
+                                            f"rollup PR auto-merged"
+                                        )
+                                    else:
+                                        parent.latest_status_message = (
+                                            f"All {completed_count} subtasks merged "
+                                            f"into {target_branch}; awaiting "
+                                            f"downstream landing"
+                                        )
+                                    session.add(parent)
+                                    await session.commit()
+                                    logger.info(
+                                        f"[ROLLUP] PR #{rollup_pr_number} "
+                                        f"mergeability resolved to clean on "
+                                        f"re-poll {_repoll_success_ri} — merge succeeded"
+                                    )
+                                    await _do_rollup_post_merge_housekeeping(
+                                        parent,
+                                        project,
+                                        session,
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        rollup_pr_number,
+                                        staging_branch,
+                                        target_branch,
+                                        completed_children,
+                                        completed_count,
+                                        _rp_landed,
+                                        _rp_terminal,
+                                    )
+                                    return
+                                if _repoll_merge_fail_msg is not None:
+                                    logger.warning(
+                                        f"[ROLLUP] PR #{rollup_pr_number} "
+                                        f"re-poll: resolved to clean "
+                                        f"but merge failed: {_repoll_merge_fail_msg}"
+                                    )
+                                # Fall through to the deferral path below with
+                                # updated _ms_key / fresh parent_ctx after relock.
                             # For blocked/unstable, ask GitHub to auto-merge once gates
                             # clear — mirrors the task_lifecycle auto-merge fallback so a
                             # passing rollup PR lands without waiting on the reaper's
@@ -3510,6 +3803,126 @@ async def _check_and_trigger_rollup(
                                     **parent.context,
                                     "_merge_alerted_states": sorted(alerted_states),
                                 }
+                            # Escalation for persistent empty/unknown: after the alert
+                            # threshold fires, attempt one forced merge re-try so the PR
+                            # doesn't silently wait past the CI-backstop window (~1h).
+                            # GitHub returns 405/409 for genuinely unmergeable PRs (safe),
+                            # and the rollup_management deferral path resumes on failure.
+                            # Only fires once per alerting cycle (latched on
+                            # _merge_escalation_attempted) to avoid a retry storm.
+                            if (
+                                _fast_escalate
+                                and deferred_count >= alert_threshold
+                                and not parent_ctx.get("_merge_escalation_attempted")
+                            ):
+                                parent.context = {
+                                    **parent.context,
+                                    "_merge_escalation_attempted": True,
+                                }
+                                # Release lock BEFORE merge I/O, committing all
+                                # deferral counters + escalation latch so the next
+                                # sweep sees them even if the merge call crashes.
+                                pre_esc_snapshot = await _release_parent_lock(
+                                    parent, session, context_dirty=True
+                                )
+                                try:
+                                    _esc_result = await merge_pull_request(
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        rollup_pr_number,
+                                        project_id=str(parent.project_id),
+                                    )
+                                except Exception as _esc_exc:
+                                    logger.warning(
+                                        f"[ROLLUP] PR #{rollup_pr_number} "
+                                        f"escalation merge attempt failed: {_esc_exc}"
+                                    )
+                                    _esc_result = {}
+                                # Relock after I/O window.
+                                parent = await _relock_parent(
+                                    session,
+                                    parent_id_local,
+                                    pre_esc_snapshot,
+                                    parent_in_session=parent,
+                                )
+                                if parent is None:
+                                    return
+                                parent_ctx = parent.context or {}
+                                if _esc_result.get("merged"):
+                                    (
+                                        _esc_landed,
+                                        _esc_terminal,
+                                    ) = await _classify_merged_rollup_landing(
+                                        parent,
+                                        project,
+                                        session,
+                                        pr_number=rollup_pr_number,
+                                        target_branch=target_branch,
+                                        source="rollup_management.escalation_merge",
+                                    )
+                                    parent.status = (
+                                        TaskStatus.COMPLETED
+                                        if _esc_terminal
+                                        else TaskStatus.EVALUATING
+                                    )
+                                    parent.context = {
+                                        **_clear_rollup_transient_state(
+                                            parent.context
+                                        ),
+                                        "rollup_pr_url": rollup_pr_url,
+                                    }
+                                    if _esc_landed:
+                                        apply_merged_landed_signal(
+                                            parent,
+                                            project,
+                                            base_branch=target_branch,
+                                            hotfix_lane=_promotion_target_rollup_allowed(
+                                                parent, target_branch
+                                            ),
+                                        )
+                                    if _esc_terminal:
+                                        parent.latest_status_message = (
+                                            f"All {completed_count} subtasks merged, "
+                                            f"rollup PR auto-merged"
+                                        )
+                                    else:
+                                        parent.latest_status_message = (
+                                            f"All {completed_count} subtasks merged "
+                                            f"into {target_branch}; awaiting "
+                                            f"downstream landing"
+                                        )
+                                    session.add(parent)
+                                    await session.commit()
+                                    logger.info(
+                                        f"[ROLLUP] PR #{rollup_pr_number} "
+                                        f"escalation merge succeeded after "
+                                        f"{deferred_count} deferred sweeps"
+                                    )
+                                    await _do_rollup_post_merge_housekeeping(
+                                        parent,
+                                        project,
+                                        session,
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        rollup_pr_number,
+                                        staging_branch,
+                                        target_branch,
+                                        completed_children,
+                                        completed_count,
+                                        _esc_landed,
+                                        _esc_terminal,
+                                    )
+                                    return
+                                logger.warning(
+                                    f"[ROLLUP] PR #{rollup_pr_number} "
+                                    f"escalation merge attempt after "
+                                    f"{deferred_count} deferred sweeps: "
+                                    f"not merged ({_esc_result.get('message')})"
+                                )
+                                # Fall through to total-count alert using fresh
+                                # parent_ctx after the relock above.
                             # Total-count alert: fires once when total crosses threshold,
                             # catching state-flapping PRs that evade the per-state counter.
                             if (
