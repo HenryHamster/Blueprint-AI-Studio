@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi.errors import RateLimitExceeded
+from app.csrf import CSRFMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from app.database import get_session, AsyncSessionLocal
@@ -1835,6 +1836,8 @@ def _resolve_allowed_origins(env_value: str) -> list[str]:
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
 allowed_origins = _resolve_allowed_origins(allowed_origins_env)
 
+app.add_middleware(CSRFMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -1846,6 +1849,7 @@ app.add_middleware(
         "Accept",
         "Origin",
         "X-Requested-With",
+        "X-CSRF-Token",
     ],
 )
 

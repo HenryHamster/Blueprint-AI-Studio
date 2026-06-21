@@ -301,14 +301,14 @@ if [ "$USE_POSTGRES" = "1" ]; then
     -e USE_TEST_POSTGRES=true \
     -e GCP_PROJECT_ID=test-project \
     -e LOCAL_MODE=true \
-    -e AGENT_JWT_SECRET=ci-test-secret \
-    -e WS_TICKET_SECRET=ci-test-secret"
+    -e AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
+    -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
 else
   ENV_ARGS="-e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
     -e GCP_PROJECT_ID=test-project \
     -e LOCAL_MODE=true \
-    -e AGENT_JWT_SECRET=ci-test-secret \
-    -e WS_TICKET_SECRET=ci-test-secret"
+    -e AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
+    -e WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
 fi
 
 # Mount admin-ui/src read-only so test_invariants.py's frontend size
@@ -335,8 +335,8 @@ fi
 ENV_VARS="DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
   GCP_PROJECT_ID=test-project \
   LOCAL_MODE=true \
-  AGENT_JWT_SECRET=ci-test-secret \
-  WS_TICKET_SECRET=ci-test-secret"
+  AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
+  WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
 
 _run() {
   # _run <cmd...> — runs inside Docker or directly, with env vars set

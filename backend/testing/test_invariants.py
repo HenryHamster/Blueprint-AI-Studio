@@ -19,7 +19,7 @@ import pytest
 # auth.py raises ValueError at module load if these are absent; keeping them
 # here lets the route-table invariant run in standalone mode without the
 # backend test conftest.
-os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check")
+os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check-x")
 os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
 
 

@@ -934,6 +934,7 @@ async def test_patch_integration_branch_null_skips_remote_check(
     async with AsyncClient(
         transport=ASGITransport(app=app, raise_app_exceptions=False),
         base_url="http://test",
+        headers={"Authorization": "Bearer test-token"},
     ) as safe_client:
         with patch(
             "app.github.get_repo_installation_token",
@@ -1006,6 +1007,7 @@ async def test_patch_integration_branch_equal_to_promotion_target_blocks(
     async with AsyncClient(
         transport=ASGITransport(app=app, raise_app_exceptions=False),
         base_url="http://test",
+        headers={"Authorization": "Bearer test-token"},
     ) as safe_client:
         resp = await safe_client.patch(
             f"/api/admin/projects/{project.id}/integration-branch",

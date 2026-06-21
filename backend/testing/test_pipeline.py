@@ -1525,7 +1525,9 @@ async def test_rollup_fails_parent_when_all_fail_and_limit_exhausted(rollup_db, 
     mock_requeue = mocker.patch(
         "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
     )
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     project = Project(name="All Failed Limit Exhausted Test", user_id="user1")
     rollup_db.add(project)
@@ -2117,11 +2119,7 @@ async def test_rollup_spawn_lock_timeout_poison_recovers_to_bounded_retry(
     # column directly (not the ORM entity) so the assertion reads raw values and
     # never materialises an expired instance / triggers a sync lazy-load.
     row_ids = set(
-        (
-            await rollup_db.execute(
-                _select(Task.id).where(Task.project_id == project_id)
-            )
-        )
+        (await rollup_db.execute(_select(Task.id).where(Task.project_id == project_id)))
         .scalars()
         .all()
     )
@@ -2243,7 +2241,9 @@ async def test_rollup_merge_deferred_counter_resets_on_state_change(rollup_db, m
     so transient flapping does not accidentally escalate."""
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
     )
@@ -2502,7 +2502,9 @@ async def test_rollup_auto_merge_blocked_calls_enable_auto_merge(rollup_db, mock
     path still runs so a genuinely stuck PR escalates normally."""
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
     )
@@ -2557,7 +2559,9 @@ async def test_rollup_auto_merge_skips_github_for_migration_pr(
         "app.rollup_management._validate_rollup_migration_chain",
         new=AsyncMock(return_value=("ok", None)),
     )
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
     )
@@ -2675,7 +2679,9 @@ async def test_rollup_merge_success_clears_transient_counter_state(rollup_db, mo
         new_callable=AsyncMock,
         return_value={"merged": True, "sha": "deadbeef"},
     )
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
     )
@@ -2904,7 +2910,9 @@ async def test_rollup_auto_merge_on_distinct_promotion_target_alerts_without_pr_
         new_callable=AsyncMock,
         return_value={"merged": True, "sha": "deadbeef"},
     )
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
     )
@@ -2969,7 +2977,9 @@ async def test_rollup_auto_merge_on_single_branch_sets_pr_merged(rollup_db, mock
         new_callable=AsyncMock,
         return_value={"merged": True, "sha": "deadbeef"},
     )
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
     )
@@ -3296,7 +3306,9 @@ async def test_rollup_behind_update_branch_success_clears_retry_counter(
         "app.rollup_management._spawn_pipeline_task",
         new=AsyncMock(return_value=(None, None)),
     )
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
         rollup_db, target_branch="research/parent-xyz"
@@ -3721,9 +3733,7 @@ async def test_rollup_dirty_within_merge_queue_window_defers_fix_spawn(
 
 
 @pytest.mark.asyncio
-async def test_rollup_dirty_with_stale_merge_queue_marker_spawns_fix(
-    rollup_db, mocker
-):
+async def test_rollup_dirty_with_stale_merge_queue_marker_spawns_fix(rollup_db, mocker):
     """Genuine-conflict fallback: once the merge-queue marker is older than the
     freshness window, a dirty PR takes the agent conflict-fix path unchanged."""
     from app.rollup_state import _MERGE_QUEUE_UPDATE_AT_KEY
@@ -4087,7 +4097,9 @@ async def test_strategic_op_emits_strategic_updated(strategic_db, mocker):
     bcast = mocker.patch("app.strategic_events.broadcast_to_project", new=AsyncMock())
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -4161,7 +4173,9 @@ async def test_set_vision_preserves_internal_tracking_fields(strategic_db, mocke
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -4213,7 +4227,9 @@ async def _post_spawn_task(
     }
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -4262,17 +4278,13 @@ async def test_spawn_task_idempotent_on_retry_duplicate(strategic_db):
     title = "Wire warm-pool PROVISIONING->IDLE ready signal"
     prompt = "Implement the PROVISIONING->IDLE ready-signal wiring."
 
-    first = await _post_spawn_task(
-        strategic_db, review_id, title=title, prompt=prompt
-    )
+    first = await _post_spawn_task(strategic_db, review_id, title=title, prompt=prompt)
     assert first["status"] == "ok"
     assert not first.get("deduplicated")
     first_id = first["task_id"]
 
     # The retry: identical source review, type and title.
-    second = await _post_spawn_task(
-        strategic_db, review_id, title=title, prompt=prompt
-    )
+    second = await _post_spawn_task(strategic_db, review_id, title=title, prompt=prompt)
     assert second["status"] == "ok"
     assert second.get("deduplicated") is True
     # Same task returned — no duplicate created.
@@ -4381,9 +4393,7 @@ async def test_spawn_task_allows_registry_knowledge_types(strategic_db, spawn_ty
     assert not body.get("deduplicated")
 
     spawned = (
-        await strategic_db.execute(
-            select(Task).where(Task.id == body["task_id"])
-        )
+        await strategic_db.execute(select(Task).where(Task.id == body["task_id"]))
     ).scalar_one()
     assert spawned.status == TaskStatus.QUEUED
     assert spawned.created_by == "STRATEGIC_AGENT"
@@ -5644,7 +5654,9 @@ class TestEnsureVmDeletedCountDecrement:
 
         vm_lifecycle._last_gcp_vm_count = 3
         mocker.patch(
-            "app.vm_lifecycle.delete_agent_vm", new_callable=AsyncMock, return_value=True
+            "app.vm_lifecycle.delete_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
         )
 
         from app.vm_lifecycle import _ensure_vm_deleted
@@ -5660,7 +5672,9 @@ class TestEnsureVmDeletedCountDecrement:
 
         vm_lifecycle._last_gcp_vm_count = 0
         mocker.patch(
-            "app.vm_lifecycle.delete_agent_vm", new_callable=AsyncMock, return_value=True
+            "app.vm_lifecycle.delete_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
         )
 
         from app.vm_lifecycle import _ensure_vm_deleted
@@ -5676,7 +5690,9 @@ class TestEnsureVmDeletedCountDecrement:
 
         vm_lifecycle._last_gcp_vm_count = 3
         mocker.patch(
-            "app.vm_lifecycle.delete_agent_vm", new_callable=AsyncMock, return_value=False
+            "app.vm_lifecycle.delete_agent_vm",
+            new_callable=AsyncMock,
+            return_value=False,
         )
 
         from app.vm_lifecycle import _ensure_vm_deleted

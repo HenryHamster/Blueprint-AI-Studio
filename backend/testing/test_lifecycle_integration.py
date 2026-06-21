@@ -44,8 +44,8 @@ if not (_AGENT_DIR / "node_modules").is_dir():
 # Environment bootstrap (must happen before any app imports)
 # ---------------------------------------------------------------------------
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
-os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-key-for-pytest")
-os.environ.setdefault("WS_TICKET_SECRET", "test-ws-ticket-secret")
+os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-key-for-pytest-min32")
+os.environ.setdefault("WS_TICKET_SECRET", "test-ws-ticket-secret-min-32byts")
 
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler  # noqa: E402
 

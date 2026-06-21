@@ -40,10 +40,21 @@ except Exception as e:  # noqa: BLE001 — module-load init must never crash the
 # We use HTTPBearer to automatically extract the "Authorization: Bearer <token>" header
 security = HTTPBearer()
 
+
+def _validate_jwt_secret(secret: str, env_var: str) -> None:
+    secret_bytes = secret.encode()
+    if len(secret_bytes) < 32:
+        raise ValueError(
+            f"{env_var} must be at least 32 bytes — "
+            f"got {len(secret_bytes)} bytes. JWT secret must be at least 32 bytes"
+        )
+
+
 # Secret key for signing Agent JWTs
 _agent_jwt_secret = os.getenv("AGENT_JWT_SECRET")
 if not _agent_jwt_secret:
     raise ValueError("AGENT_JWT_SECRET environment variable is required")
+_validate_jwt_secret(_agent_jwt_secret, "AGENT_JWT_SECRET")
 AGENT_JWT_SECRET: str = _agent_jwt_secret
 AGENT_JWT_ALGORITHM = "HS256"
 
@@ -51,6 +62,7 @@ AGENT_JWT_ALGORITHM = "HS256"
 _ws_ticket_secret = os.getenv("WS_TICKET_SECRET")
 if not _ws_ticket_secret:
     raise ValueError("WS_TICKET_SECRET environment variable is required")
+_validate_jwt_secret(_ws_ticket_secret, "WS_TICKET_SECRET")
 WS_TICKET_SECRET: str = _ws_ticket_secret
 
 

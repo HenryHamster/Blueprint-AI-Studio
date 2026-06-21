@@ -14,8 +14,8 @@ from sqlmodel import SQLModel
 # These are dummy values used only for tests — real credentials are not needed
 # because auth dependencies are overridden below.
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
-os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-key-for-pytest")
-os.environ.setdefault("WS_TICKET_SECRET", "test-ws-ticket-secret")
+os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-key-for-pytest-min32")
+os.environ.setdefault("WS_TICKET_SECRET", "test-ws-ticket-secret-min-32byts")
 
 # SQLite does not support PostgreSQL's JSONB type.  Add a visit_JSONB method
 # to the SQLite type compiler so it renders JSONB as plain JSON when the
@@ -312,13 +312,26 @@ def reset_rate_limiter():
     yield
 
 
+_TEST_CSRF_TOKEN = "test-csrf-token-for-client-fixture"
+
+
 @pytest_asyncio.fixture(scope="function")
 async def client(override_get_session, override_get_current_user):
     """
     Provides an async HTTP client for testing the FastAPI endpoints.
+
+    Uses matching CSRF cookie + header so the double-submit cookie check in
+    CSRFMiddleware passes without needing a Bearer token.  This keeps
+    agent-endpoint tests that supply X-Agent-Token honest: those requests
+    are exempted by the X-Agent-Token bypass path, not by Bearer.  The
+    actual auth dependency is overridden by override_get_current_user, which
+    ignores the token value.
     """
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"X-CSRF-Token": _TEST_CSRF_TOKEN},
+        cookies={"csrf_token": _TEST_CSRF_TOKEN},
     ) as ac:
         yield ac
 

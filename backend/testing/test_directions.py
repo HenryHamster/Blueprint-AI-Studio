@@ -4081,7 +4081,7 @@ async def test_strategic_api_create_direction_respects_cap(db_session, mocker):
 
         try:
             async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
+                transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
             ) as ac:
                 resp = await ac.post(
                     "/api/agent/strategic",
@@ -4174,7 +4174,7 @@ async def test_strategic_api_create_direction_advisory_on_duplicate(db_session, 
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -4268,7 +4268,7 @@ async def test_strategic_api_accumulates_direction_ids(db_session, mocker):
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             r1 = await ac.post(
                 "/api/agent/strategic",
@@ -4376,7 +4376,7 @@ async def _retire_one_direction(db_session, mocker, active_ids):
     }
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             r = await ac.post(
                 "/api/agent/strategic",
@@ -4498,7 +4498,7 @@ async def test_retire_direction_spawns_and_persists_memo_task(db_session, mocker
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             r = await ac.post(
                 "/api/agent/strategic",
@@ -4577,7 +4577,7 @@ async def test_strategic_api_create_direction_rejects_missing_structured_fields(
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             # Missing success_evidence
             resp_no_evidence = await ac.post(
@@ -4680,7 +4680,7 @@ async def test_strategic_api_set_problem_model_happy_path(db_session):
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -4784,7 +4784,7 @@ async def test_set_problem_model_double_write_same_cycle_keeps_second_values(
             current_pm=dict(baseline),
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             r1 = await ac.post(
                 "/api/agent/strategic",
@@ -4853,7 +4853,7 @@ async def test_set_problem_model_operator_edit_between_writes_still_wins(db_sess
             current_pm=dict(baseline),
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             r1 = await ac.post(
                 "/api/agent/strategic",
@@ -4918,7 +4918,7 @@ async def test_strategic_api_set_problem_model_rejects_malformed(db_session):
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             # size="enormous" is not a valid GapSize literal
             resp = await ac.post(
@@ -4956,7 +4956,7 @@ async def test_strategic_api_set_problem_model_accepts_capability_backing_paths(
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5015,7 +5015,7 @@ async def test_strategic_api_set_problem_model_accepts_old_shape_capability(db_s
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5047,7 +5047,7 @@ async def test_strategic_api_set_running_update(db_session):
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             doc = (
                 "## What's going on\nShipping problem_model v1.\n\n## Next\nMerge #103."
@@ -5080,7 +5080,7 @@ async def test_strategic_api_set_running_update_requires_markdown_field(db_sessi
     _project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5104,7 +5104,7 @@ async def test_strategic_api_set_running_update_replaces(db_session):
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             await ac.post(
                 "/api/agent/strategic",
@@ -5138,7 +5138,7 @@ async def test_strategic_api_set_running_update_rejects_over_limit(db_session):
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             # Use size that exceeds 100KB to trigger the payload size check
             oversized = "x" * 101_000
@@ -5200,7 +5200,7 @@ async def test_strategic_api_set_running_update_agent_wins_when_untouched(db_ses
             db_session, project, task_id, baseline="BASELINE", current="BASELINE"
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5235,7 +5235,7 @@ async def test_strategic_api_set_running_update_operator_edit_preserved(db_sessi
             current="OPERATOR EDITED BODY",
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5277,7 +5277,7 @@ async def test_strategic_api_set_running_update_digest_reintegrated(db_session):
             current=f"BASELINE\n{digest_line}",
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5314,7 +5314,7 @@ async def test_strategic_api_set_running_update_twice_in_one_cycle_both_persist(
             db_session, project, task_id, baseline="BASELINE", current="BASELINE"
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp1 = await ac.post(
                 "/api/agent/strategic",
@@ -5369,7 +5369,7 @@ async def test_strategic_api_set_running_update_operator_edit_between_writes_win
             db_session, project, task_id, baseline="BASELINE", current="BASELINE"
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp1 = await ac.post(
                 "/api/agent/strategic",
@@ -5455,7 +5455,7 @@ async def test_strategic_api_set_vision_operator_edit_preserved(db_session):
             db_session, project, task_id, baseline=baseline, current=current
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5493,7 +5493,7 @@ async def test_strategic_api_set_vision_agent_wins_when_untouched(db_session):
             db_session, project, task_id, baseline=baseline, current=dict(baseline)
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5530,7 +5530,7 @@ async def test_strategic_api_set_vision_legacy_no_cycle_blind_assign(db_session)
         db_session.add(project)
         await db_session.commit()
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5568,7 +5568,7 @@ async def test_strategic_api_set_vision_second_write_advances_own_proposal(db_se
             db_session, project, task_id, baseline=baseline, current=dict(baseline)
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             r1 = await ac.post(
                 "/api/agent/strategic",
@@ -5607,7 +5607,7 @@ async def test_strategic_api_create_message_rejects_over_limit(db_session):
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             oversized = "x" * (STRATEGIC_MESSAGE_CONTENT_MAX + 1)
             resp = await ac.post(
@@ -5641,7 +5641,7 @@ async def test_strategic_api_reflect(db_session):
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5678,7 +5678,7 @@ async def test_strategic_api_pending_confirm(db_session):
     project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5718,7 +5718,7 @@ async def test_strategic_api_pending_confirm_rejects_invalid_type(db_session):
     _project, task_id = await _make_strategic_project_and_task(db_session)
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5802,7 +5802,7 @@ async def test_strategic_api_approve_direction_flips_proposed_to_active(
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -5905,7 +5905,7 @@ async def test_strategic_api_approve_direction_respects_cap(db_session, mocker):
 
         try:
             async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
+                transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
             ) as ac:
                 resp = await ac.post(
                     "/api/agent/strategic",
@@ -5990,7 +5990,7 @@ async def test_strategic_api_approve_direction_rejects_non_proposed(db_session, 
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -6075,7 +6075,7 @@ async def test_strategic_api_reject_direction_creates_tombstone(db_session, mock
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -9557,7 +9557,7 @@ async def test_update_direction_round_trips_success_evidence_and_retirement_cond
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -9667,7 +9667,7 @@ async def test_strategic_api_persists_conflicts_with(db_session, mocker):
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -9725,7 +9725,7 @@ async def test_strategic_api_create_direction_conflicts_with_unknown_id_returns_
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -9793,7 +9793,7 @@ async def test_strategic_api_update_direction_sets_conflicts_with(db_session, mo
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -9867,7 +9867,7 @@ async def test_strategic_api_update_direction_clears_conflicts_with(db_session, 
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -9932,7 +9932,7 @@ async def test_strategic_api_update_direction_conflicts_with_unknown_id_returns_
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
@@ -10031,7 +10031,7 @@ async def test_strategic_api_reject_direction_cancels_queued_tasks(
 
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
         ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",

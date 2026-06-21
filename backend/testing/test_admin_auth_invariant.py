@@ -11,7 +11,7 @@ Run with: pytest testing/test_admin_auth_invariant.py -v --noconftest
 import os
 
 # auth.py raises ValueError at module load if these are absent
-os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check")
+os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check-x")
 os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
 
 from fastapi.routing import APIRoute

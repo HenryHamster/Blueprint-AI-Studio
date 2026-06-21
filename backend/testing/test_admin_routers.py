@@ -8549,7 +8549,9 @@ class TestClearDeployFailed:
         app.dependency_overrides[require_admin] = reject_admin
         try:
             async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                headers={"Authorization": "Bearer test-token"},
             ) as ac:
                 resp = await ac.post(
                     f"/api/admin/projects/{project.id}/clear-deploy-failed",
@@ -15518,7 +15520,9 @@ class TestRecordFindingResolution:
         _app.dependency_overrides[override_get_session] = lambda: db_session
         try:
             async with AsyncClient(
-                transport=ASGITransport(app=_app), base_url="http://test"
+                transport=ASGITransport(app=_app),
+                base_url="http://test",
+                headers={"Authorization": "Bearer test-token"},
             ) as viewer_client:
                 resp = await viewer_client.post(
                     f"/api/admin/projects/{project.id}/finding-resolution",
@@ -18474,7 +18478,9 @@ class TestAdminDeclareCapabilityVerdict:
         app.dependency_overrides[require_admin] = reject_admin
         try:
             async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                headers={"Authorization": "Bearer test-token"},
             ) as ac:
                 resp = await ac.post(
                     self._url(project.id),
