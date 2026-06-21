@@ -140,3 +140,26 @@ def test_threshold_is_safely_above_keepalive_cadence():
     keepalive_default = 30.0
     min_safe_threshold = 3 * keepalive_default
     assert min_safe_threshold <= _LEADER_STALE_REAP_SECONDS
+
+
+async def test_live_leader_not_reaped_within_threshold():
+    """A holder whose state_change is fresher than stale_secs is NOT terminated.
+
+    This is the SQLAlchemy pooling false-positive scenario: before the fix, an
+    AsyncSession.commit() released the physical connection back to the pool, leaving
+    the lock-holding backend idle. Its state_change would age past stale_secs and
+    _reap_stale_leader_lock_holder would pg_terminate_backend it — killing a live
+    leader's lock. With AsyncConnection, the keepalive always runs on the same
+    connection so state_change is continuously refreshed, and this reaper path
+    never fires on a healthy leader.
+
+    Here we verify the guard: when the reaper sees zero stale pids (because the
+    holder is live / recently active), it terminates nothing and returns 0.
+    """
+    session = _ReapSession(stale_pids=[])
+
+    reaped = await _reap_stale_leader_lock_holder(session, stale_secs=90.0)
+
+    assert reaped == 0
+    assert session.terminated == []
+    assert session.commits == 1

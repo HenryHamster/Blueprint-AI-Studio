@@ -29,8 +29,12 @@ class _FakeResult:
         return self._value
 
 
-class _FakeSession:
-    """Minimal async session stub keyed off the SQL text of each execute().
+class _FakeConnection:
+    """Minimal async connection stub keyed off the SQL text of each execute().
+
+    Models AsyncConnection (not AsyncSession): the same object is reused across
+    multiple tick calls, mirroring the raw-connection fix where commit() never
+    returns the connection to the pool.
 
     ``SELECT 1`` is the keepalive ping; ``pg_try_advisory_lock`` is the
     re-acquire. Each can be told to raise (simulating a dropped connection) or
@@ -68,50 +72,72 @@ class _FakeSession:
 async def test_ping_ok_returns_held_and_commits():
     """Happy path: ping succeeds, tick reports held, and it COMMITs so the
     connection is left idle (lock held) — never idle-in-transaction."""
-    session = _FakeSession()
+    conn = _FakeConnection()
 
-    outcome = await _leader_lock_keepalive_tick(session)
+    outcome = await _leader_lock_keepalive_tick(conn)
 
     assert outcome == "held"
-    assert session.commits >= 1  # proves we don't leave an open idle transaction
-    assert session.executed == ["SELECT 1"]  # no re-acquire on the happy path
+    assert conn.commits >= 1  # proves we don't leave an open idle transaction
+    assert conn.executed == ["SELECT 1"]  # no re-acquire on the happy path
 
 
 async def test_ping_fails_then_reacquires():
     """Connection blip with no peer takeover: ping raises, re-acquire wins → reacquired."""
-    session = _FakeSession(
+    conn = _FakeConnection(
         ping_error=OSError("connection is closed"), reacquire_value=1
     )
 
-    outcome = await _leader_lock_keepalive_tick(session)
+    outcome = await _leader_lock_keepalive_tick(conn)
 
     assert outcome == "reacquired"
-    assert session.rollbacks == 1  # session reset before re-acquire
-    assert any("pg_try_advisory_lock" in s for s in session.executed)
-    assert session.commits >= 1  # committed the re-acquire so it isn't idle-in-tx
+    assert conn.rollbacks == 1  # connection reset before re-acquire
+    assert any("pg_try_advisory_lock" in s for s in conn.executed)
+    assert conn.commits >= 1  # committed the re-acquire so it isn't idle-in-tx
 
 
 async def test_ping_fails_peer_owns_lock_returns_lost():
     """A peer grabbed the lock during the blip: re-acquire returns falsy → lost."""
-    session = _FakeSession(
+    conn = _FakeConnection(
         ping_error=OSError("connection is closed"), reacquire_value=0
     )
 
-    outcome = await _leader_lock_keepalive_tick(session)
+    outcome = await _leader_lock_keepalive_tick(conn)
 
     assert outcome == "lost"
 
 
 async def test_ping_fails_and_reacquire_errors_returns_error():
     """Re-acquire itself errors (DB unreachable) → error (caller hard-exits)."""
-    session = _FakeSession(
+    conn = _FakeConnection(
         ping_error=OSError("connection is closed"),
         reacquire_error=OSError("could not connect"),
     )
 
-    outcome = await _leader_lock_keepalive_tick(session)
+    outcome = await _leader_lock_keepalive_tick(conn)
 
     assert outcome == "error"
+
+
+async def test_same_connection_object_used_across_ticks():
+    """Pin the pooling fix: keepalive ticks must always run on the SAME connection
+    object so the lock-holding backend PID never changes.
+
+    With AsyncSession, commit() returns the connection to the pool so the next
+    tick's execute() can land on a DIFFERENT physical connection — leaving the
+    lock-holding connection idle long enough for _reap_stale_leader_lock_holder
+    to pg_terminate_backend it (false positive). With AsyncConnection the object
+    identity is stable: the same conn is passed to every tick.
+    """
+    conn = _FakeConnection()
+
+    outcome1 = await _leader_lock_keepalive_tick(conn)
+    outcome2 = await _leader_lock_keepalive_tick(conn)
+
+    assert outcome1 == "held"
+    assert outcome2 == "held"
+    # Both ticks executed SELECT 1 on the same object — proves connection identity
+    assert conn.executed == ["SELECT 1", "SELECT 1"]
+    assert conn.commits == 2
 
 
 @pytest.mark.parametrize("outcome", ["lost", "error"])
