@@ -11,6 +11,7 @@ import pytest
 
 from app.migration_chain import (
     find_content_divergent_revisions,
+    find_deployed_migration_content_edits,
     plan_integration_side_renumber,
 )
 from app.release_scoring import compute_composite
@@ -700,13 +701,144 @@ async def test_premerge_guard_empty_diff_defers_when_pr_head_sha_missing(mocker)
 
 
 # ===========================================================================
-# v17 defect class regression tests — the two tamper classes that birthed the
-# deploy-fatal Alembic defect (revision-0309 incident):
+# find_deployed_migration_content_edits — content-immutability check for the
+# in-place-edit class: same filename on deployed and candidate, different body.
+# Filename-only detectors (find_content_divergent_revisions) are blind to this.
+# ===========================================================================
+
+
+def test_content_edit_of_deployed_migration_is_flagged():
+    """In-place body edit is detected: same basename, different content."""
+    base = {"0309_computejob_heartbeat.py": _migration_source("0309", "0308")}
+    head = {
+        "0309_computejob_heartbeat.py": _migration_source("0309", "0308")
+        + "# tampered\n"
+    }
+    out = find_deployed_migration_content_edits(base, head)
+    assert len(out) == 1
+    assert "0309_computejob_heartbeat" in out[0]
+    assert "in-place" in out[0] or "immutable" in out[0]
+
+
+def test_content_identical_migration_is_not_flagged():
+    """Same content on both sides is clean — no false positive."""
+    src = _migration_source("0309", "0308")
+    base = {"0309_computejob_heartbeat.py": src}
+    head = {"0309_computejob_heartbeat.py": src}
+    assert find_deployed_migration_content_edits(base, head) == []
+
+
+def test_content_edit_whitespace_normalised():
+    """Trailing-whitespace differences do not trigger a false positive."""
+    src = _migration_source("0309", "0308")
+    base = {"0309_heartbeat.py": src}
+    head = {"0309_heartbeat.py": src.replace("pass", "pass  ")}  # trailing space
+    assert find_deployed_migration_content_edits(base, head) == []
+
+
+def test_content_edit_key_by_basename():
+    """Full paths and basenames are normalised by basename for comparison."""
+    src = _migration_source("0309", "0308")
+    modified = src + "# extra\n"
+    base = {"backend/alembic/versions/0309_heartbeat.py": src}
+    head = {"0309_heartbeat.py": modified}
+    out = find_deployed_migration_content_edits(base, head)
+    assert len(out) == 1
+
+
+# ===========================================================================
+# Named regression pins for the v17 defect classes.
+# ===========================================================================
+
+
+def test_v17_defect_class_reused():
+    """v17 regression pin — reused-revision class: deployed main has
+    0309 == computejob_heartbeat; automain reused 0309 for performance_indexes.
+    find_content_divergent_revisions must flag this before a merge."""
+    main = ["0309_computejob_heartbeat.py"]
+    automain = ["0309_performance_indexes.py"]
+    out = find_content_divergent_revisions(main, automain)
+    assert len(out) >= 1
+    assert any("0309" in d for d in out)
+    assert any("computejob_heartbeat" in d and "performance_indexes" in d for d in out)
+
+
+def test_v17_defect_class_renumbered():
+    """v17 regression pin — renumber class: computejob_heartbeat moved from
+    revision 0309 (main) to 0330 (automain). find_content_divergent_revisions
+    must flag the identity-under-different-id divergence."""
+    main = ["0309_computejob_heartbeat.py"]
+    automain = ["0330_computejob_heartbeat.py"]
+    out = find_content_divergent_revisions(main, automain)
+    assert len(out) >= 1
+    assert any("computejob_heartbeat" in d for d in out)
+    assert any("0309" in d and "0330" in d for d in out)
+
+
+def test_v17_defect_class_in_place_edit():
+    """v17 regression pin — in-place-edit class: a migration file with the same
+    name as a deployed one but a modified body. find_deployed_migration_content_edits
+    must flag this; the filename-only detector is blind to it."""
+    deployed = _migration_source("0309", "0308")
+    tampered = deployed + "# in-place tamper\n"
+    base = {"0309_computejob_heartbeat.py": deployed}
+    head = {"0309_computejob_heartbeat.py": tampered}
+    out = find_deployed_migration_content_edits(base, head)
+    assert len(out) >= 1
+    assert any("0309_computejob_heartbeat" in m for m in out)
+
+
+# ===========================================================================
+# _validate_rollup_migration_chain — v17 defect class integration tests.
+# Covers both tamper classes that birthed the deploy-fatal Alembic defect:
 #   1. Pre-PR rename/renumber on the integration branch (invisible to PR-diff
 #      checks because the tampered migration is not in the PR's added files).
-#   2. In-place edit of a deployed migration (invisible to filename-identity
-#      checks because the file keeps its name).
+#   2. In-place edit of a deployed migration (caught by file-status check).
 # ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_in_place_edit_of_deployed_migration_body_is_blocked(mocker):
+    """In-place-edit class: a migration whose filename matches a deployed
+    promotion-target file but whose body differs from what was applied is
+    BLOCKED. The filename-only reuse/renumber detector is blind to this class
+    (same filename → same revision id and description → no filename divergence).
+
+    Scenario: main has 0330_computejob_heartbeat.py applied; a PR on automain
+    adds a file with the same name but a modified body. The file-status check
+    catches the modification and blocks the merge."""
+    basename = "0330_computejob_heartbeat.py"
+    path = f"{_VERSIONS_DIR}/{basename}"
+
+    deployed_src = _migration_source("0330", "0329")
+    pr_src = deployed_src + "# in-place tamper\n"
+
+    patch_body = "".join(f"+{line}\n" for line in pr_src.splitlines())
+    pr_file = {
+        "filename": path,
+        "status": "modified",
+        "patch": f"@@ -1,7 +1,8 @@\n{patch_body}",
+    }
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[pr_file]))
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            # automain has 0329 as head; 0330 not present yet → no collision
+            integration=["0328_parent.py", "0329_other.py"],
+            # main has 0330 already applied
+            promotion=[
+                "0328_parent.py",
+                "0329_other.py",
+                "0330_computejob_heartbeat.py",
+            ],
+        ),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert "0330_computejob_heartbeat" in reason
+    assert "in-place" in reason or "immutable" in reason.lower()
 
 
 @pytest.mark.asyncio

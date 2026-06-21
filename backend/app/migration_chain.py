@@ -341,6 +341,45 @@ def find_content_divergence_records(
     return reused + renumbered
 
 
+def find_deployed_migration_content_edits(
+    base_sources: dict[str, str], head_sources: dict[str, str]
+) -> list[str]:
+    """Detect in-place body edits to deployed migration files.
+
+    Compares migration file content by basename across *base_sources* (the
+    deployed branch) and *head_sources* (the candidate). When the same filename
+    appears in both maps but with different bodies, the migration was modified
+    in-place — an operation that corrupts any live database that has already
+    applied the original revision, because Alembic considers the revision
+    already-applied and silently skips the changed body.
+
+    Content comparison is whitespace-normalised (trailing whitespace stripped
+    per line, trailing blank lines removed) to avoid false positives from
+    editor-introduced trailing spaces or newline-convention drift.  Returns
+    human-readable error strings; empty when all shared files are
+    content-identical.
+    """
+
+    def _normalise(src: str) -> str:
+        lines = [line.rstrip() for line in src.splitlines()]
+        while lines and not lines[-1]:
+            lines.pop()
+        return "\n".join(lines)
+
+    base_by_name = {os.path.basename(k): v for k, v in base_sources.items()}
+    head_by_name = {os.path.basename(k): v for k, v in head_sources.items()}
+
+    return [
+        (
+            f"migration '{name}' was modified in-place — deployed migration files "
+            f"are immutable once applied; a body edit on an already-applied revision "
+            f"is silently skipped by Alembic and corrupts any live database"
+        )
+        for name in sorted(set(base_by_name) & set(head_by_name))
+        if _normalise(base_by_name[name]) != _normalise(head_by_name[name])
+    ]
+
+
 def validate_added_migrations(sources: dict[str, str]) -> str | None:
     """Validate that the migrations a rollup adds form one linear extension.
 

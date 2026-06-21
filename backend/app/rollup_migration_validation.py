@@ -1,11 +1,14 @@
 """Alembic migration-chain validation used by rollup auto-merge."""
 
+import os
+
 import app.github as github
 from app.migration_chain import (
     _filename_revision_prefix,
     build_migration_chain,
     find_content_divergence_records,
     find_content_divergent_revisions,
+    find_deployed_migration_content_edits,
     find_filename_revision_mismatches,
     find_heads,
     plan_integration_side_renumber,
@@ -344,6 +347,59 @@ async def _validate_rollup_migration_chain(
                 f"to a different migration; it would be silently skipped at "
                 f"deploy): " + "; ".join(promotion_divergences),
             )
+
+        # Content-immutability guard against the deployed promotion target.
+        # find_content_divergent_revisions above is filename-only (reuse/renumber
+        # class). An in-place body edit — same filename on both refs but different
+        # content — is invisible to that check. Here we fetch any migration whose
+        # basename appears on the promotion target from that ref and compare bodies
+        # directly; a diff means a deployed-immutable migration's body was changed,
+        # which corrupts any live database that already applied the original.
+        promotion_basenames = {os.path.basename(fn) for fn in promotion_filenames}
+        shared_sources = {
+            path: src
+            for path, src in added_sources.items()
+            if os.path.basename(path) in promotion_basenames
+        }
+        if shared_sources:
+            deployed_sources: dict[str, str] = {}
+            for path in shared_sources:
+                basename = os.path.basename(path)
+                full_path = f"{_ALEMBIC_VERSIONS_DIR}/{basename}"
+                try:
+                    text = await github.get_file_text_at_ref(
+                        full_path,
+                        token=gh_token,
+                        owner=owner,
+                        repo=repo,
+                        ref=promotion_target,
+                    )
+                except Exception as e:
+                    return (
+                        "defer",
+                        f"could not fetch migration '{basename}' from promotion "
+                        f"target '{promotion_target}' for content-immutability "
+                        f"check: {type(e).__name__}: {e}",
+                    )
+                if not text:
+                    return (
+                        "defer",
+                        f"empty response fetching migration '{basename}' from "
+                        f"promotion target '{promotion_target}' — deferring "
+                        f"content-immutability check",
+                    )
+                deployed_sources[basename] = text
+
+            content_edits = find_deployed_migration_content_edits(
+                deployed_sources, shared_sources
+            )
+            if content_edits:
+                return (
+                    "block",
+                    f"deployed migration body modified in-place on promotion target "
+                    f"'{promotion_target}' — deployed migrations are immutable once "
+                    f"applied: " + "; ".join(content_edits),
+                )
     return ("ok", None)
 
 

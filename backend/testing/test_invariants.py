@@ -856,6 +856,30 @@ class TestSchemaRevisionSync:
             "migration collisions (two branches each adding the same revision id)."
         )
 
+    def test_rollup_guard_calls_content_immutability_check(self):
+        """rollup_migration_validation.py must reference find_deployed_migration_content_edits.
+
+        Regression guard for the in-place-edit defect class: a migration file
+        whose filename matches a deployed promotion-target file but whose body
+        was changed. The filename-only reuse/renumber detector
+        (find_content_divergent_revisions) is blind to this class because both
+        sides share the same filename, revision id, and description — no
+        filename divergence is reported. Dropping the content call silently
+        reverts the guard to filename-only coverage and leaves the in-place-edit
+        class undetected (the v17 third defect class).
+        """
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "rollup_migration_validation.py"
+        )
+        with open(path) as f:
+            content = f.read()
+        assert "find_deployed_migration_content_edits" in content, (
+            "rollup_migration_validation.py must reference "
+            "find_deployed_migration_content_edits. Without it the guard is blind "
+            "to in-place body edits of deployed migrations (same filename and "
+            "revision id, different content — the v17 in-place-edit defect class)."
+        )
+
     def test_backmerge_guard_uses_combined_chain_check(self):
         """The hotfix back-merge path must pass integration_branch to _validate_rollup_migration_chain.
 
