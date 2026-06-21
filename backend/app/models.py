@@ -1889,6 +1889,14 @@ class ComputeJob(SQLModel, table=True):
     next_poll_at: datetime | None = Field(
         default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
     )
+    # Timestamp of the last heartbeat received from the VM running this job.
+    # Set on the first POST to /api/agent/compute-jobs/{id}/heartbeat, which
+    # transitions the job from STARTING to RUNNING without waiting for the GCP
+    # insert LRO to complete. A non-null value is the authoritative signal that
+    # the VM booted and is alive; the provisioning timeout ignores this job.
+    last_heartbeat_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
     poll_attempt_count: int = Field(
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
