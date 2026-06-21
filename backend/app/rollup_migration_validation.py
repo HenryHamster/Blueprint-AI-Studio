@@ -285,6 +285,53 @@ async def _validate_rollup_migration_chain(
                 f"to validate cross-branch Alembic revision identity: "
                 f"{type(e).__name__}: {e}",
             )
+
+        # Defect class 2: in-place edit of a deployed migration.
+        # Any PR file with status "modified" whose basename exists on the
+        # promotion target is a deploy-fatal tamper: Alembic considers it
+        # already-applied and skips the schema change silently. The
+        # filename-identity detector is blind to this class because the file
+        # keeps its name (and therefore its revision prefix + description),
+        # so only the file-status check can catch it.
+        promotion_basenames = set(promotion_filenames)
+        modified_deployed = [
+            f["filename"]
+            for f in files
+            if f.get("status") == "modified"
+            and _touches_alembic_versions(f.get("filename", ""))
+            and f["filename"].rsplit("/", 1)[-1] in promotion_basenames
+        ]
+        if modified_deployed:
+            return (
+                "block",
+                f"PR modifies deployed migration(s) present on promotion target "
+                f"'{promotion_target}' (deployed migrations are immutable — they "
+                f"have already been applied to the production DB and cannot be "
+                f"changed in-place): " + ", ".join(sorted(modified_deployed)),
+            )
+
+        # Defect class 1: pre-PR rename/renumber on the FULL integration branch.
+        # The PR-diff checks above compare only the PR's added/modified files
+        # against the promotion target; a rename committed BEFORE this PR
+        # (e.g. a back-merge renumber that reused a revision id the deployed DB
+        # already applied) leaves no trace in the PR diff and is invisible to
+        # those checks. Comparing the FULL integration branch against the
+        # promotion target catches it: a shared revision id mapping to a
+        # different migration, or a migration that moved revision ids, is a
+        # deploy-fatal divergence regardless of which PR introduced it.
+        full_branch_divergences = find_content_divergent_revisions(
+            promotion_filenames, existing_filenames
+        )
+        if full_branch_divergences:
+            return (
+                "block",
+                f"Alembic revision-identity divergence between the full integration "
+                f"branch '{target_branch}' and the deployed promotion target "
+                f"'{promotion_target}' (a pre-PR renumber/reuse on the integration "
+                f"branch would skip or mishandle a migration the live DB already "
+                f"applied): " + "; ".join(full_branch_divergences),
+            )
+
         promotion_divergences = find_content_divergent_revisions(
             promotion_filenames, list(added_sources.keys())
         )

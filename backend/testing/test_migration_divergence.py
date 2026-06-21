@@ -454,6 +454,13 @@ def _files(*paths: str) -> list[dict]:
     return [{"filename": p, "status": "added"} for p in paths]
 
 
+def _modified_migration_file(path: str, revision: str, down_revision: str) -> dict:
+    """Create a pr_files entry for a MODIFIED (not added) migration file."""
+    src = _migration_source(revision, down_revision)
+    body = "".join(f"+{line}\n" for line in src.splitlines())
+    return {"filename": path, "status": "modified", "patch": f"@@ -0,0 +1,7 @@\n{body}"}
+
+
 def _added_migration_diff(path: str, revision: str, down_revision: str) -> str:
     """A unified diff that adds a single parseable migration file."""
     body = "".join(
@@ -540,7 +547,13 @@ async def test_premerge_guard_passes_integration_ahead_of_promotion_target(mocke
         new=_versions_by_branch(
             # Integration is well ahead of the deployed target (0144..0150 exist
             # only on integration — legitimate ahead-ness, not a collision).
-            integration=[f"{n:04d}_step.py" for n in range(141, 151)],
+            # Shared revisions (0142, 0143) carry the SAME identity on both
+            # branches; only brand-new ids differ.
+            integration=[
+                "0142_parent.py",
+                "0143_vm_contact_last_tool_use.py",
+                *[f"{n:04d}_step.py" for n in range(144, 151)],
+            ],
             promotion=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
         ),
     )
@@ -614,7 +627,13 @@ async def test_premerge_guard_empty_diff_falls_back_and_passes_clean(mocker):
     mocker.patch(
         "app.github.list_versions_at_ref",
         new=_versions_by_branch(
-            integration=[f"{n:04d}_step.py" for n in range(141, 151)],
+            # Integration carries the same shared migrations as promotion (no
+            # identity divergence on shared revisions) plus brand-new ids above.
+            integration=[
+                "0142_parent.py",
+                "0143_vm_contact_last_tool_use.py",
+                *[f"{n:04d}_step.py" for n in range(144, 151)],
+            ],
             promotion=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
         ),
     )
@@ -678,3 +697,83 @@ async def test_premerge_guard_empty_diff_defers_when_pr_head_sha_missing(mocker)
     )
     assert status == "defer"
     assert "head SHA" in reason
+
+
+# ===========================================================================
+# v17 defect class regression tests — the two tamper classes that birthed the
+# deploy-fatal Alembic defect (revision-0309 incident):
+#   1. Pre-PR rename/renumber on the integration branch (invisible to PR-diff
+#      checks because the tampered migration is not in the PR's added files).
+#   2. In-place edit of a deployed migration (invisible to filename-identity
+#      checks because the file keeps its name).
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_blocks_pre_pr_rename_on_integration_branch(mocker):
+    """Defect class 1 (v17 regression): a rename already on the integration
+    branch — committed in a PRIOR PR, not the one being evaluated — is invisible
+    to the PR-diff checks that only compare added files. The full-branch check
+    must catch it: revision 0138 maps to 'old_name' on the deployed target but
+    to 'new_name' on integration; the current PR only adds an unrelated 0140
+    and touches no 0138 file at all."""
+    path = f"{_VERSIONS_DIR}/0140_unrelated.py"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_migration_file(path, "0140", "0139")]),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            # Integration already carries the renamed 0138; the current PR adds
+            # an unrelated 0140 and never touches 0138.
+            integration=[
+                "0137_cascade.py",
+                "0138_new_name.py",
+                "0139_something.py",
+            ],
+            # Deployed main still has 0138 under the original identity.
+            promotion=["0137_cascade.py", "0138_old_name.py"],
+        ),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert "0138" in reason
+    assert "pre-PR" in reason or "integration branch" in reason
+    assert "new_name" in reason or "old_name" in reason
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_blocks_inplace_edit_of_deployed_migration(mocker):
+    """Defect class 2 (v17 regression): a PR that MODIFIES (not renames) a
+    migration already on the deployed promotion target. The file keeps its name
+    so filename-identity checks see no divergence; only the file-status check
+    catches it. The deployed DB has already applied this revision — changing the
+    file content is silently ignored at deploy time (Alembic considers it applied)
+    while the actual schema change is never applied."""
+    # The modified migration exists on main but NOT on automain (e.g. a hotfix
+    # not yet back-merged); only the new defect-class-2 check detects this.
+    modified_path = f"{_VERSIONS_DIR}/0143_vm_contact_last_tool_use.py"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[_modified_migration_file(modified_path, "0143", "0142")]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            # Automain does not yet have 0143 (hotfix not back-merged).
+            integration=["0141_x.py", "0142_parent.py"],
+            # Deployed main carries 0143 as vm_contact_last_tool_use.
+            promotion=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
+        ),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert "0143_vm_contact_last_tool_use.py" in reason
+    assert "immutable" in reason or "deployed" in reason
