@@ -200,7 +200,16 @@ async def _attempt_merge_with_retry_and_escalation(
             _ok_to_merge, _hold_reason = precomputed_migration_guard
         else:
             _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
-                gh_token, owner, repo, ci_pr_number, ci_base
+                gh_token,
+                owner,
+                repo,
+                ci_pr_number,
+                ci_base,
+                promotion_target=(
+                    get_project_promotion_target(_merge_project)
+                    if _merge_project is not None
+                    else None
+                ),
             )
         if not _ok_to_merge:
             reservation_task_id = uuid.UUID(ci_orig_id) if ci_orig_id else task.id

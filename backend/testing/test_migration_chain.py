@@ -559,6 +559,128 @@ async def test_enforce_guard_fetch_failure_holds_merge():
     assert reason and "github down" in reason
 
 
+async def test_enforce_guard_deployed_id_reuse_holds_merge():
+    """Regression: a candidate migration reusing a revision id already deployed on
+    the promotion target (the 0309-class collision) must be BLOCKED when
+    promotion_target is supplied, and allowed when it is omitted.
+
+    Mirrors the automain/main collision: 0309_performance_indexes on automain
+    reused the revision id 0309 already stamped to computejob_heartbeat on main.
+    """
+    from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+    # The PR adds 0309_performance_indexes.py (revision=0309, different identity
+    # from the deployed 0309_computejob_heartbeat.py on main).
+    pr_files = [
+        _migration_file(
+            "backend/alembic/versions/0309_performance_indexes.py", "0309", "0308"
+        )
+    ]
+
+    def _list_versions_side_effect(token, owner, repo, ref):
+        if ref == "main":
+            # Deployed promotion target has 0309=computejob_heartbeat — DIFFERENT body.
+            return ["0308_prev.py", "0309_computejob_heartbeat.py"]
+        # Integration branch (automain) does not yet have 0309.
+        return ["0308_prev.py"]
+
+    with (
+        patch("app.github.get_pr_files", return_value=pr_files),
+        patch(
+            "app.github.list_versions_at_ref",
+            side_effect=_list_versions_side_effect,
+        ),
+    ):
+        # WITH promotion_target — must block (cross-branch deployed-id reuse).
+        ok, reason = await enforce_premerge_migration_guard(
+            "t", "o", "r", 1, "automain", promotion_target="main"
+        )
+    assert ok is False, "guard must block deployed-id reuse when promotion_target given"
+    assert reason is not None and "0309" in reason
+
+    with (
+        patch("app.github.get_pr_files", return_value=pr_files),
+        patch(
+            "app.github.list_versions_at_ref",
+            side_effect=_list_versions_side_effect,
+        ),
+    ):
+        # WITHOUT promotion_target — must pass (guard was dormant before this fix).
+        ok_no_pt, _ = await enforce_premerge_migration_guard(
+            "t", "o", "r", 1, "automain"
+        )
+    assert ok_no_pt is True, (
+        "guard must pass when promotion_target is None (dormant path)"
+    )
+
+    with (
+        patch("app.github.get_pr_files", return_value=pr_files),
+        patch(
+            "app.github.list_versions_at_ref",
+            side_effect=_list_versions_side_effect,
+        ),
+    ):
+        # promotion_target == target_branch — guard skips cross-branch check.
+        ok_same, _ = await enforce_premerge_migration_guard(
+            "t", "o", "r", 1, "automain", promotion_target="automain"
+        )
+    assert ok_same is True, "guard must pass when promotion_target equals target_branch"
+
+
+async def test_enforce_guard_clean_chain_allows_merge_with_promotion_target():
+    """A clean linear chain passes even when promotion_target is supplied — no
+    false-positive when the candidate revision id is not reused on the target."""
+    from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+    pr_files = [_migration_file("backend/alembic/versions/0137_new.py", "0137", "0136")]
+
+    def _list_versions_side_effect(token, owner, repo, ref):
+        # Both integration branch and promotion target share the same clean chain
+        # up to 0136; 0137 only exists on the PR branch.
+        return ["0135_one.py", "0136_prev.py"]
+
+    with (
+        patch("app.github.get_pr_files", return_value=pr_files),
+        patch(
+            "app.github.list_versions_at_ref",
+            side_effect=_list_versions_side_effect,
+        ),
+    ):
+        ok, reason = await enforce_premerge_migration_guard(
+            "t", "o", "r", 1, "automain", promotion_target="main"
+        )
+    assert ok is True and reason is None
+
+
+async def test_enforce_guard_promotion_target_fetch_error_defers():
+    """A fetch failure for the promotion target is fail-safe: returns (False, reason)."""
+    from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+    pr_files = [_migration_file("backend/alembic/versions/0137_new.py", "0137", "0136")]
+
+    call_count = 0
+
+    def _list_versions_side_effect(token, owner, repo, ref):
+        nonlocal call_count
+        call_count += 1
+        if ref == "main":
+            raise RuntimeError("promotion target unreachable")
+        return ["0135_one.py", "0136_prev.py"]
+
+    with (
+        patch("app.github.get_pr_files", return_value=pr_files),
+        patch(
+            "app.github.list_versions_at_ref",
+            side_effect=_list_versions_side_effect,
+        ),
+    ):
+        ok, reason = await enforce_premerge_migration_guard(
+            "t", "o", "r", 1, "automain", promotion_target="main"
+        )
+    assert ok is False
+    assert reason is not None and "promotion target" in reason
+
+
 # ── plan_migration_reconciliation (pure renumber planner) ───────────────────
 
 
