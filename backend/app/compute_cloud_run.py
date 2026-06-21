@@ -83,6 +83,13 @@ async def launch_agent_cloud_run_job(
     task_type: str,
     *,
     orchestrator_url: str | None = None,
+    oauth_token: str | None = None,
+    provider: str | None = None,
+    auth_mode: str | None = None,
+    model: str | None = None,
+    execution_mode: str | None = None,
+    provider_metadata: dict | None = None,
+    provider_settings: dict | None = None,
 ) -> bool:
     """Launch the agent as a Cloud Run Job execution for a read-only task.
 
@@ -101,6 +108,13 @@ async def launch_agent_cloud_run_job(
         task_type: The task type string (e.g. "research").
         orchestrator_url: Override for the orchestrator base URL; defaults to
             the ``ORCHESTRATOR_URL`` env var used by the agent.
+        oauth_token: OAuth token / API key for LLM provider auth.
+        provider: LLM provider name (e.g. "anthropic").
+        auth_mode: LLM auth mode (e.g. "api_key" or "oauth").
+        model: LLM model identifier.
+        execution_mode: LLM execution mode.
+        provider_metadata: Provider-specific metadata dict.
+        provider_settings: Provider settings bag.
 
     Returns:
         True when the Cloud Run Job execution was submitted successfully.
@@ -158,6 +172,57 @@ async def launch_agent_cloud_run_job(
                 "for task %s (version=%s): %s",
                 task_id,
                 secret_version_name,
+                exc,
+                exc_info=True,
+            )
+            return False
+
+    # Build LLM env overrides from provider materials when LLM params are present.
+    # File-based credentials (e.g. GOOGLE_APPLICATION_CREDENTIALS=/opt/...) cannot
+    # be carried as env var overrides — skip any value that is a file path.
+    if provider is not None or oauth_token is not None or provider_settings is not None:
+        try:
+            from app.compute_manifest import (
+                _apply_llm_env,
+                _resolve_provider_materials,
+            )
+
+            materials = _resolve_provider_materials(
+                oauth_token=oauth_token,
+                claude_config_json=None,
+                provider=provider,
+                auth_mode=auth_mode,
+                model=model,
+                provider_metadata=provider_metadata,
+                provider_settings=provider_settings,
+            )
+            llm_env: dict = {
+                "PROVIDER": materials.provider_name,
+                "AUTH_MODE": materials.auth_mode_value,
+            }
+            _apply_llm_env(
+                llm_env,
+                model=model,
+                execution_mode=execution_mode,
+                provider_settings=provider_settings,
+                materials=materials,
+            )
+            for k, v in llm_env.items():
+                # Skip file-path credential values — Cloud Run env overrides
+                # cannot carry file contents and the file won't exist in the container.
+                if isinstance(v, str) and v.startswith("/"):
+                    logger.warning(
+                        "[CLOUD-RUN] Skipping file-path credential env var %s for task %s "
+                        "(value starts with '/'; file-based credentials cannot be env overrides)",
+                        k,
+                        task_id,
+                    )
+                    continue
+                env_overrides.append({"name": k, "value": str(v)})
+        except Exception as exc:
+            logger.error(
+                "[CLOUD-RUN] Failed to build LLM env overrides for task %s: %s",
+                task_id,
                 exc,
                 exc_info=True,
             )

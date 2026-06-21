@@ -4335,6 +4335,13 @@ async def orchestrator_worker():
                                         payload_uri,
                                         secret_version_name,
                                         t_type,
+                                        oauth_token=secret_value,
+                                        provider=llm_provider,
+                                        auth_mode=llm_auth_mode,
+                                        model=llm_model,
+                                        execution_mode=llm_execution_mode,
+                                        provider_metadata=llm_provider_metadata,
+                                        provider_settings=llm_provider_settings,
                                     )
                                 else:
                                     success = await provision_agent_vm(

@@ -10489,7 +10489,7 @@ async def test_launch_lro_timeout_skipped_when_vm_heartbeated(db_session, monkey
 
 
 # ---------------------------------------------------------------------------
-# Cloud Run Job launch — AGENT_SECRET_TOKEN injection tests
+# Cloud Run Job launch — AGENT_SECRET_TOKEN + LLM env injection tests
 # ---------------------------------------------------------------------------
 
 
@@ -10624,3 +10624,241 @@ class TestLaunchAgentCloudRunJob:
 
         assert result is False, "must return False when Secret Manager fetch fails"
         assert run_job_calls == [], "run_job must NOT be called when secret fetch fails"
+
+    @pytest.mark.asyncio
+    async def test_injects_llm_env_vars_anthropic_api_key(self, monkeypatch):
+        """LLM credential and settings env vars are injected for anthropic/api_key."""
+        import google.cloud.run_v2 as run_v2_mod
+        from app.compute_cloud_run import launch_agent_cloud_run_job
+        import app.compute_cloud_run as ccr_mod
+
+        monkeypatch.setattr(
+            ccr_mod, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent"
+        )
+        monkeypatch.setattr("app.compute_manifest.ANTHROPIC_API_KEY", "sk-ant-test123")
+        # Ensure not LOCAL_MODE
+        monkeypatch.setattr("app.compute.LOCAL_MODE", False)
+        # Prevent real GCP Secret Manager call — no ADC in CI.
+        monkeypatch.setattr(ccr_mod, "_fetch_agent_secret_token", lambda v: "fake-token")
+
+        submitted_env: list = []
+
+        class FakeClient:
+            def run_job(self, *, request):
+                for co in request.overrides.container_overrides:
+                    submitted_env.extend(co.env)
+                op = MagicMock()
+                op.operation.name = "fake-op"
+                return op
+
+        with patch.object(run_v2_mod, "JobsClient", return_value=FakeClient()):
+            result = await launch_agent_cloud_run_job(
+                vm_id="cr-vm-1",
+                task_id="task-abc",
+                payload_uri=None,
+                secret_version_name="projects/p/secrets/s/versions/1",
+                task_type="research",
+                provider="anthropic",
+                auth_mode="api_key",
+                provider_settings={},
+            )
+
+        assert result is True
+        env_dict = {e.name: e.value for e in submitted_env}
+        assert env_dict.get("PROVIDER") == "anthropic", (
+            f"PROVIDER missing from env overrides; got {env_dict}"
+        )
+        assert env_dict.get("AUTH_MODE") == "api_key", (
+            f"AUTH_MODE missing; got {env_dict}"
+        )
+        assert env_dict.get("ANTHROPIC_API_KEY") == "sk-ant-test123", (
+            f"ANTHROPIC_API_KEY missing; got {env_dict}"
+        )
+        assert "LLM_SETTINGS" in env_dict, (
+            f"LLM_SETTINGS missing from env overrides; got {env_dict}"
+        )
+        assert "LLM_CLI_TRANSLATION" in env_dict, (
+            f"LLM_CLI_TRANSLATION missing from env overrides; got {env_dict}"
+        )
+        # AGENT_SECRET_VERSION must still be present for the token fetch path
+        assert env_dict.get("AGENT_SECRET_VERSION") == "projects/p/secrets/s/versions/1"
+
+    @pytest.mark.asyncio
+    async def test_injects_llm_env_vars_anthropic_oauth(self, monkeypatch):
+        """CLAUDE_CODE_OAUTH_TOKEN is injected when auth_mode=oauth."""
+        import google.cloud.run_v2 as run_v2_mod
+        from app.compute_cloud_run import launch_agent_cloud_run_job
+        import app.compute_cloud_run as ccr_mod
+
+        monkeypatch.setattr(
+            ccr_mod, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent"
+        )
+        monkeypatch.setattr("app.compute.LOCAL_MODE", False)
+
+        submitted_env: list = []
+
+        class FakeClient:
+            def run_job(self, *, request):
+                for co in request.overrides.container_overrides:
+                    submitted_env.extend(co.env)
+                op = MagicMock()
+                op.operation.name = "fake-op"
+                return op
+
+        with patch.object(run_v2_mod, "JobsClient", return_value=FakeClient()):
+            result = await launch_agent_cloud_run_job(
+                vm_id="cr-vm-2",
+                task_id="task-def",
+                payload_uri=None,
+                secret_version_name=None,
+                task_type="research",
+                oauth_token="sk-ant-oauth-tok",
+                provider="anthropic",
+                auth_mode="oauth",
+                provider_settings={},
+            )
+
+        assert result is True
+        env_dict = {e.name: e.value for e in submitted_env}
+        assert env_dict.get("PROVIDER") == "anthropic"
+        assert env_dict.get("AUTH_MODE") == "oauth"
+        assert env_dict.get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oauth-tok", (
+            f"CLAUDE_CODE_OAUTH_TOKEN missing from env overrides; got {env_dict}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_skips_file_path_credentials(self, monkeypatch):
+        """File-path credential env vars (value starts with '/') are not injected."""
+        import google.cloud.run_v2 as run_v2_mod
+        from app.compute_cloud_run import launch_agent_cloud_run_job
+        from app.compute_manifest import _ProviderMaterials
+        import app.compute_cloud_run as ccr_mod
+
+        monkeypatch.setattr(
+            ccr_mod, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent"
+        )
+        monkeypatch.setattr("app.compute.LOCAL_MODE", False)
+
+        submitted_env: list = []
+
+        class FakeClient:
+            def run_job(self, *, request):
+                for co in request.overrides.container_overrides:
+                    submitted_env.extend(co.env)
+                op = MagicMock()
+                op.operation.name = "fake-op"
+                return op
+
+        # Patch _resolve_provider_materials to return a Gemini-style file-path credential
+        fake_materials = _ProviderMaterials(
+            provider_name="gemini",
+            auth_mode_value="service_account",
+            files=[],
+            cli_translation=None,
+            secret_env={"GOOGLE_APPLICATION_CREDENTIALS": "/opt/agent/gemini/sa.json"},
+        )
+        with (
+            patch.object(run_v2_mod, "JobsClient", return_value=FakeClient()),
+            patch(
+                "app.compute_manifest._resolve_provider_materials",
+                return_value=fake_materials,
+            ),
+        ):
+            result = await launch_agent_cloud_run_job(
+                vm_id="cr-vm-3",
+                task_id="task-ghi",
+                payload_uri=None,
+                secret_version_name=None,
+                task_type="research",
+                provider="gemini",
+                auth_mode="service_account",
+                provider_settings={},
+            )
+
+        assert result is True
+        env_dict = {e.name: e.value for e in submitted_env}
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in env_dict, (
+            "File-path credential must not appear in Cloud Run env overrides; "
+            f"got {env_dict}"
+        )
+        assert env_dict.get("PROVIDER") == "gemini"
+
+    @pytest.mark.asyncio
+    async def test_no_llm_params_no_llm_env(self, monkeypatch):
+        """Without LLM params only the six baseline env vars are injected."""
+        import google.cloud.run_v2 as run_v2_mod
+        from app.compute_cloud_run import launch_agent_cloud_run_job
+        import app.compute_cloud_run as ccr_mod
+
+        monkeypatch.setattr(
+            ccr_mod, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent"
+        )
+        monkeypatch.setattr("app.compute.LOCAL_MODE", False)
+        # Prevent real GCP Secret Manager call — no ADC in CI.
+        monkeypatch.setattr(ccr_mod, "_fetch_agent_secret_token", lambda v: "fake-token")
+
+        submitted_env: list = []
+
+        class FakeClient:
+            def run_job(self, *, request):
+                for co in request.overrides.container_overrides:
+                    submitted_env.extend(co.env)
+                op = MagicMock()
+                op.operation.name = "fake-op"
+                return op
+
+        with patch.object(run_v2_mod, "JobsClient", return_value=FakeClient()):
+            result = await launch_agent_cloud_run_job(
+                vm_id="cr-vm-4",
+                task_id="task-jkl",
+                payload_uri="gs://bucket/payload.json",
+                secret_version_name="projects/p/secrets/s/versions/1",
+                task_type="research",
+                # No LLM params
+            )
+
+        assert result is True
+        env_dict = {e.name: e.value for e in submitted_env}
+        baseline_keys = {
+            "VM_INSTANCE_ID",
+            "TASK_ID",
+            "ORCHESTRATOR_URL",
+            "CLOUD_RUN_JOB",
+            "PAYLOAD_URI",
+            "AGENT_SECRET_VERSION",
+            "AGENT_SECRET_TOKEN",
+        }
+        assert set(env_dict.keys()) == baseline_keys, (
+            f"Expected only baseline env keys without LLM params; got {set(env_dict.keys())}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_local_mode_returns_true_without_api_call(self, monkeypatch):
+        """LOCAL_MODE skips the Cloud Run API entirely and returns True."""
+        import google.cloud.run_v2 as run_v2_mod
+        from app.compute_cloud_run import launch_agent_cloud_run_job
+        import app.compute_cloud_run as ccr_mod
+
+        monkeypatch.setattr(
+            ccr_mod, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent"
+        )
+        monkeypatch.setattr("app.compute.LOCAL_MODE", True)
+
+        api_called = []
+
+        class FakeClient:
+            def run_job(self, *, request):
+                api_called.append(True)
+                return MagicMock()
+
+        with patch.object(run_v2_mod, "JobsClient", return_value=FakeClient()):
+            result = await launch_agent_cloud_run_job(
+                vm_id="cr-local",
+                task_id="task-local",
+                payload_uri=None,
+                secret_version_name=None,
+                task_type="research",
+            )
+
+        assert result is True
+        assert not api_called, "Cloud Run API must not be called in LOCAL_MODE"
