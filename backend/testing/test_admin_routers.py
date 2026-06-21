@@ -13376,6 +13376,99 @@ class TestModifyTaskApplySeam:
         assert task.requires_approval is True
         assert "merged_pr" not in changes
 
+    @pytest.mark.asyncio
+    async def test_rollup_approval_blocks_cross_branch_deployed_id_reuse(
+        self, db_session, mocker
+    ):
+        """Regression: operator-approved rollup is blocked when the PR's new
+        migration revision id is already deployed on the promotion_target under a
+        DIFFERENT filename (the 0309-class collision) — even though the integration
+        branch does not yet have that revision id.
+        """
+        from fastapi import HTTPException
+
+        from app.admin_task_mutations import _handle_rollup_pr_approval
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "main"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Rollup cross-branch id reuse",
+            payloads=[
+                {"type": "research", "prompt": "rollup", "base_branch": "automain"}
+            ],
+            status=TaskStatus.EVALUATING,
+            context={"rollup_pr_number": 888},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        # PR adds 0309_performance_indexes.py (revision=0309, different body from
+        # the deployed 0309_computejob_heartbeat.py on the promotion target).
+        mocker.patch(
+            "app.github.get_pr_files",
+            new_callable=AsyncMock,
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0309_performance_indexes.py",
+                    "status": "added",
+                    "patch": '+revision = "0309"\n+down_revision = "0308"',
+                }
+            ],
+        )
+        mocker.patch(
+            "app.github.get_pull_request_diff",
+            new_callable=AsyncMock,
+            return_value=(
+                "diff --git a/backend/alembic/versions/0309_performance_indexes.py "
+                "b/backend/alembic/versions/0309_performance_indexes.py\n"
+                "+++ b/backend/alembic/versions/0309_performance_indexes.py\n"
+                '+revision = "0309"\n'
+                '+down_revision = "0308"\n'
+            ),
+        )
+
+        def _list_versions_side_effect(token, owner, repo, ref):
+            if ref == "main":
+                # Deployed promotion target has 0309=heartbeat — different body.
+                return ["0308_prev.py", "0309_computejob_heartbeat.py"]
+            # Integration branch (automain) does not yet have 0309.
+            return ["0308_prev.py"]
+
+        mocker.patch(
+            "app.github.list_versions_at_ref",
+            side_effect=_list_versions_side_effect,
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+        changes: dict = {}
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_rollup_pr_approval(
+                task, task.context or {}, 888, db_session, changes
+            )
+        assert exc_info.value.status_code == 409
+        assert "0309" in str(exc_info.value.detail)
+        merge_mock.assert_not_called()
+        await db_session.refresh(task)
+        assert task.requires_approval is True
+        assert "merged_pr" not in changes
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_operator_triggers.py — Manual Operator Triggers
@@ -14422,6 +14515,108 @@ class TestTriggerRollup:
         assert result.get("merge_blocked_reason")
         assert task.status == TaskStatus.EVALUATING
         assert "dual-head" in (task.latest_status_message or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_operator_trigger_blocks_cross_branch_deployed_id_reuse(
+        self, db_session, mocker
+    ):
+        """Regression: operator-triggered intermediate auto-merge is blocked when
+        the PR's new migration revision id is already deployed on the
+        promotion_target under a DIFFERENT filename (the 0309-class collision) —
+        even though the integration branch does not yet have that revision id.
+        """
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "main"
+        project.build_config = {"staging_branch_prefixes": ["research/"]}
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Operator trigger cross-branch id reuse",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "research/intermediate-1",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "html_url": "https://github.com/owner/repo/pull/999",
+                "number": 999,
+            },
+        )
+        # PR adds 0309_performance_indexes.py (revision=0309, different body from
+        # the deployed 0309_computejob_heartbeat.py on the promotion target).
+        mocker.patch(
+            "app.github.get_pr_files",
+            new_callable=AsyncMock,
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0309_performance_indexes.py",
+                    "status": "added",
+                    "patch": '+revision = "0309"\n+down_revision = "0308"',
+                }
+            ],
+        )
+        mocker.patch(
+            "app.github.get_pull_request_diff",
+            new_callable=AsyncMock,
+            return_value=(
+                "diff --git a/backend/alembic/versions/0309_performance_indexes.py "
+                "b/backend/alembic/versions/0309_performance_indexes.py\n"
+                "+++ b/backend/alembic/versions/0309_performance_indexes.py\n"
+                '+revision = "0309"\n'
+                '+down_revision = "0308"\n'
+            ),
+        )
+
+        def _list_versions_side_effect(token, owner, repo, ref):
+            if ref == "main":
+                # Deployed promotion target has 0309=heartbeat — different body.
+                return ["0308_prev.py", "0309_computejob_heartbeat.py"]
+            # Integration branch (automain) does not yet have 0309.
+            return ["0308_prev.py"]
+
+        mocker.patch(
+            "app.github.list_versions_at_ref",
+            side_effect=_list_versions_side_effect,
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        await db_session.refresh(task)
+        merge_mock.assert_not_called()
+        assert result["rollup_pr_number"] == 999
+        assert result.get("merge_blocked_reason")
+        assert "0309" in result.get("merge_blocked_reason", "")
+        assert task.status == TaskStatus.EVALUATING
 
     @pytest.mark.asyncio
     async def test_manual_rollup_skips_when_pr_already_recorded(
@@ -18601,7 +18796,10 @@ class TestCloudRunAllowlistPersistence:
 
                 # The allowlist should be restored from the database.
                 assert "cloud_run_task_type_allowlist" in changed
-                assert sorted(_rc["cloud_run_task_type_allowlist"]) == ["memo", "research"]
+                assert sorted(_rc["cloud_run_task_type_allowlist"]) == [
+                    "memo",
+                    "research",
+                ]
         finally:
             # Restore original.
             await client.patch(
@@ -18645,7 +18843,9 @@ class TestCloudRunAllowlistPersistence:
         assert "write/unknown task types" in resp.json()["error"]["message"]
 
     @pytest.mark.asyncio
-    async def test_cloud_run_allowlist_comma_separated_string(self, client: AsyncClient):
+    async def test_cloud_run_allowlist_comma_separated_string(
+        self, client: AsyncClient
+    ):
         """Allowlist accepts comma-separated string format."""
         from app.shared_state import runtime_config as _rc
 
