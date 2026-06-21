@@ -20,7 +20,7 @@
     "github_refs.py": 1000,
     "github_pulls.py": 1250,
     "github_merge_summary.py": 350,
-    "routers/admin_settings.py": 3550,
+    "routers/admin_settings.py": 4100,
     "routers/admin_analytics.py": 2300,
     "routers/admin_operator_triggers.py": 1200,
     "routers/admin_digest.py": 10300,

@@ -17,13 +17,13 @@ Columns:
   * merge_grade_detail        — the raw graded artifact (covers_goal, scores).
 
 Revision ID: 0330
-Revises: 0328
+Revises: 0329
 Create Date: 2026-06-20 00:00:00.000000
 
-NOTE: 0330 chains from 0328 (qualificationverdict goal_alignment column)
-which itself chains from 0327 -> 0317 -> 0310.  This keeps the Alembic migration
-graph linear — a single head — so ``alembic upgrade head`` applies all
-migrations cleanly on merge.
+NOTE: 0330 chains from 0329 (qualificationverdict merge_grade columns)
+which itself chains from 0328 -> 0327 -> 0317 -> 0310.  This keeps the Alembic
+migration graph linear — a single head — so ``alembic upgrade head`` applies
+all migrations cleanly on merge.
 """
 
 from alembic import op
@@ -31,7 +31,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision = "0330"
-down_revision = "0328"
+down_revision = "0329"
 branch_labels = None
 depends_on = None
 
