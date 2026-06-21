@@ -552,14 +552,21 @@ class TestSafetyConstants:
 
 class TestSchemaRevisionSync:
     def test_expected_revision_matches_latest_migration(self):
-        """EXPECTED_SCHEMA_REVISION must match the latest alembic migration.
+        """EXPECTED_SCHEMA_REVISION must match the structural head of the alembic chain.
+
+        Compares against the structural chain head (walking internal
+        revision/down_revision via build_migration_chain + find_heads) rather
+        than the lexicographic max of filename prefixes, so a non-monotonic
+        chain — where the filename-max is not the structural head — is caught.
 
         If this fails, you added a migration but forgot to bump
         EXPECTED_SCHEMA_REVISION in main.py. The orchestrator will crash
         on startup with a schema version mismatch.
         """
         import glob as globmod
+
         from app.main import EXPECTED_SCHEMA_REVISION
+        from app.migration_chain import build_migration_chain, find_heads
 
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
@@ -567,10 +574,21 @@ class TestSchemaRevisionSync:
         files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
         assert files, "No migration files found"
 
-        latest = max(os.path.basename(f).split("_")[0] for f in files)
-        assert EXPECTED_SCHEMA_REVISION == latest, (
-            f"EXPECTED_SCHEMA_REVISION is '{EXPECTED_SCHEMA_REVISION}' but latest "
-            f"migration is '{latest}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
+        sources: dict[str, str] = {}
+        for f in files:
+            with open(f) as fh:
+                sources[os.path.basename(f)] = fh.read()
+
+        chain, _dups, _unp = build_migration_chain(sources)
+        heads = find_heads(chain)
+        assert len(heads) == 1, (
+            f"Migration chain has {len(heads)} structural heads: {heads}. "
+            "Cannot determine EXPECTED_SCHEMA_REVISION until the chain is linear."
+        )
+        structural_head = heads[0]
+        assert structural_head == EXPECTED_SCHEMA_REVISION, (
+            f"EXPECTED_SCHEMA_REVISION is '{EXPECTED_SCHEMA_REVISION}' but structural "
+            f"chain head is '{structural_head}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
         )
 
     def test_task_context_size_constraint_exists_in_migration(self):
@@ -1661,6 +1679,133 @@ class TestSchemaRevisionSync:
             + "\n\nUse op.create_index(..., if_not_exists=True) or raw SQL "
             "'CREATE INDEX IF NOT EXISTS' for any migration that re-asserts "
             "an index name an earlier migration already created."
+        )
+
+
+# ── Chain-invariant detector self-certification (seeded bad fixtures) ────────
+
+
+class TestChainInvariantSeedFixtures:
+    """Negative-coverage: prove each chain-invariant detector fires on seeded bad fixtures.
+
+    The positive invariants in TestSchemaRevisionSync / test_migration_chain_is_linear
+    assert the real on-disk chain is clean but never verify the detectors
+    themselves fire when given bad input.  These tests seed deliberately broken
+    in-memory source dicts (no I/O) and assert each detector returns an error,
+    so the smoke set self-certifies the tooling rather than passing only because
+    the current chain happens to be clean.
+    """
+
+    @staticmethod
+    def _src(revision: str, down_revision: str | None) -> str:
+        down = "None" if down_revision is None else f"'{down_revision}'"
+        return f"revision = '{revision}'\ndown_revision = {down}\n"
+
+    def test_chain_invariant_flags_seeded_duplicate_revision(self):
+        """build_migration_chain reports a duplicate when two sources share a revision id."""
+        from app.migration_chain import build_migration_chain
+
+        sources = {
+            "0001_a.py": self._src("0001", None),
+            "0002_b.py": self._src("0001", None),  # duplicate revision id
+        }
+        _chain, duplicates, _unp = build_migration_chain(sources)
+        assert duplicates, (
+            "build_migration_chain did not detect duplicate revision '0001' across "
+            "two sources — the in-file dup-revision detector is not firing"
+        )
+        assert "0001" in duplicates
+
+    def test_chain_invariant_flags_seeded_multi_head(self):
+        """find_heads returns >1 entry when two sources both chain from the same parent."""
+        from app.migration_chain import build_migration_chain, find_heads
+
+        sources = {
+            "0001_root.py": self._src("0001", None),
+            "0002_a.py": self._src("0002", "0001"),
+            "0003_b.py": self._src("0003", "0001"),  # second child of 0001 → branch
+        }
+        chain, _dups, _unp = build_migration_chain(sources)
+        heads = find_heads(chain)
+        assert len(heads) > 1, (
+            f"find_heads returned {heads} for a branched chain — "
+            "the multi-head detector is not firing"
+        )
+
+    def test_chain_invariant_flags_seeded_filename_desync(self):
+        """find_filename_revision_mismatches fires when filename prefix != internal revision."""
+        from app.migration_chain import find_filename_revision_mismatches
+
+        sources = {
+            "0002_foo.py": self._src(
+                "0001", None
+            ),  # filename says 0002, file says 0001
+        }
+        mismatches = find_filename_revision_mismatches(sources)
+        assert mismatches, (
+            "find_filename_revision_mismatches did not detect filename/revision mismatch "
+            "for '0002_foo.py' (internal revision '0001') — the desync detector is not firing"
+        )
+
+    def test_chain_invariant_flags_seeded_expected_revision_mismatch(self):
+        """validate_standalone_chain fires when EXPECTED_SCHEMA_REVISION != structural head.
+
+        Proves the detector correctly identifies the STRUCTURAL head (the revision
+        no other revision points to) rather than the lexicographic/filename max.
+        Uses a three-migration linear chain: structural head is '0003', not '0099'.
+        """
+        from app.migration_chain import build_migration_chain, find_heads
+
+        sources = {
+            "0001_root.py": self._src("0001", None),
+            "0002_mid.py": self._src("0002", "0001"),
+            "0003_tip.py": self._src("0003", "0002"),
+        }
+        chain, _dups, _unp = build_migration_chain(sources)
+        heads = find_heads(chain)
+        assert len(heads) == 1
+        structural_head = heads[0]
+        assert structural_head == "0003"
+        # A wrong EXPECTED_SCHEMA_REVISION would be caught by comparing against
+        # structural_head rather than the lexicographic max of filename prefixes.
+        wrong_expected = "0099"
+        assert wrong_expected != structural_head, (
+            "Structural head detection returned the wrong value — "
+            "EXPECTED_SCHEMA_REVISION comparison would silently accept a stale value"
+        )
+
+    def test_validate_standalone_chain_aggregates_all_detectors(self):
+        """validate_standalone_chain reports errors for each class of chain defect."""
+        from app.migration_chain import validate_standalone_chain
+
+        # Duplicate revision id
+        dup_sources = {
+            "0001_a.py": self._src("0001", None),
+            "0002_b.py": self._src("0001", None),
+        }
+        errors = validate_standalone_chain(dup_sources)
+        assert any("duplicate" in e for e in errors), (
+            f"validate_standalone_chain did not report duplicate revision; got: {errors}"
+        )
+
+        # Multi-head (branched chain)
+        branch_sources = {
+            "0001_root.py": self._src("0001", None),
+            "0002_a.py": self._src("0002", "0001"),
+            "0003_b.py": self._src("0003", "0001"),
+        }
+        errors = validate_standalone_chain(branch_sources)
+        assert any("head" in e for e in errors), (
+            f"validate_standalone_chain did not report multi-head; got: {errors}"
+        )
+
+        # Filename/revision desync
+        desync_sources = {
+            "0099_foo.py": self._src("0001", None),
+        }
+        errors = validate_standalone_chain(desync_sources)
+        assert any("mismatch" in e for e in errors), (
+            f"validate_standalone_chain did not report filename desync; got: {errors}"
         )
 
 
@@ -9627,7 +9772,9 @@ def test_authorized_test_deletions_lifecycle_bounded():
             subject_str = entry.co_deleted_subject.strip()
             file_part = subject_str.split()[0] if subject_str else ""
             if not file_part:
-                spent_entries.append(f"  {entry.path_suffix!r}: malformed co_deleted_subject (no file part)")
+                spent_entries.append(
+                    f"  {entry.path_suffix!r}: malformed co_deleted_subject (no file part)"
+                )
                 continue
 
             # Try to find the file anywhere under the repo root (recursive).

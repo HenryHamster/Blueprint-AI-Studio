@@ -385,6 +385,41 @@ def validate_added_migrations(sources: dict[str, str]) -> str | None:
     return None
 
 
+def validate_standalone_chain(sources: dict[str, str]) -> list[str]:
+    """Validate that *sources* form a single clean migration chain.
+
+    Aggregates the filename/revision-desync, duplicate-revision,
+    missing-parent, and multi-head detectors into one call. Returns a list of
+    human-readable error strings; empty when the chain is valid.
+
+    Exposed as a reusable helper so the standalone smoke-set invariant test
+    can (a) validate the real on-disk chain and (b) seed bad fixtures to prove
+    each detector fires — providing negative coverage instead of relying solely
+    on the current chain being clean.
+    """
+    errors: list[str] = []
+    mismatches = find_filename_revision_mismatches(sources)
+    errors.extend(f"filename/revision mismatch: {m}" for m in mismatches)
+    chain, duplicates, unparseable = build_migration_chain(sources)
+    errors.extend(f"no parseable revision in {f!r}" for f in sorted(unparseable))
+    errors.extend(
+        f"duplicate revision '{rev}' declared by more than one file"
+        for rev in sorted(set(duplicates))
+    )
+    errors.extend(
+        f"revision '{rev}' references down_revision '{down}' not in chain"
+        for rev, down in sorted(chain.items())
+        if down is not None and down not in chain
+    )
+    heads = find_heads(chain)
+    if len(heads) != 1:
+        errors.append(
+            f"chain has {len(heads)} head(s) ({', '.join(sorted(heads))}); "
+            "expected exactly 1"
+        )
+    return errors
+
+
 def validate_combined_migration_chain(
     existing_filenames: list[str], added_sources: dict[str, str]
 ) -> str | None:
@@ -508,9 +543,11 @@ def _renumbered_filename(old_path: str, new_revision: str) -> str:
     (e.g. ``.../0137_add_foo.py`` -> ``.../0138_add_foo.py``).
     """
     directory, basename = os.path.split(old_path)
-    suffix = basename[len(basename.split("_", 1)[0]):]  # leading "_..." (or "")
-    return os.path.join(directory, new_revision + suffix) if directory else (
-        new_revision + suffix
+    suffix = basename[len(basename.split("_", 1)[0]) :]  # leading "_..." (or "")
+    return (
+        os.path.join(directory, new_revision + suffix)
+        if directory
+        else (new_revision + suffix)
     )
 
 
@@ -628,8 +665,7 @@ def plan_migration_reconciliation(
     # revision -> path for the added set (unique: validate_added_migrations
     # rejected duplicates and unparseable files above).
     rev_to_path = {
-        parse_revision_identifiers(src)[0]: path
-        for path, src in added_sources.items()
+        parse_revision_identifiers(src)[0]: path for path, src in added_sources.items()
     }
 
     # The added chain must be a single linear tail from its root; a diamond
