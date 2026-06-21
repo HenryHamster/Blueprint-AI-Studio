@@ -18668,3 +18668,143 @@ class TestCloudRunAllowlistPersistence:
                 "/api/admin/settings",
                 json={"cloud_run_task_type_allowlist": original},
             )
+
+
+class TestTaskLlmCostFields:
+    """Unit tests for _task_llm_cost_fields helper in admin.py."""
+
+    def _make_task(self, provider=None, model=None, input_tokens=0, output_tokens=0):
+        t = Task(id=str(uuid.uuid4()), status=TaskStatus.COMPLETED)
+        t.provider = provider
+        t.model = model
+        t.api_call_summary = {
+            "llm_call_count": 1,
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+        }
+        t.attempt_history = None
+        t.llm_call_count_banked_db = None
+        return t
+
+    def test_returns_none_when_no_tokens(self):
+        from app.admin import _task_llm_cost_fields
+
+        task = self._make_task()
+        result = _task_llm_cost_fields(task)
+        assert result["task_llm_cost_usd"] is None
+        assert result["task_llm_cost_any_unpriced"] is False
+
+    def test_returns_cost_for_priced_model(self):
+        from app.admin import _task_llm_cost_fields
+        from app.efficiency_snapshot import LLM_TOKEN_PRICING
+
+        input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+        task = self._make_task(
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+        )
+        result = _task_llm_cost_fields(task)
+        expected = round(1_000_000 * input_rate + 1_000_000 * output_rate, 6)
+        assert result["task_llm_cost_usd"] == expected
+        assert result["task_llm_cost_any_unpriced"] is False
+
+    def test_any_unpriced_when_provider_missing(self):
+        from app.admin import _task_llm_cost_fields
+
+        task = self._make_task(
+            provider=None,
+            model=None,
+            input_tokens=5000,
+            output_tokens=2000,
+        )
+        result = _task_llm_cost_fields(task)
+        assert result["task_llm_cost_usd"] is None
+        assert result["task_llm_cost_any_unpriced"] is True
+
+
+class TestPostCommitPendingField:
+    """post_commit_pending is serialized in both task list and task detail responses."""
+
+    @pytest.mark.asyncio
+    async def test_task_list_exposes_post_commit_pending_true(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            post_commit_pending=True,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get("/api/admin/tasks")
+        assert resp.status_code == 200, resp.text
+        tasks = resp.json()["tasks"]
+        matched = [t for t in tasks if t["id"] == str(task.id)]
+        assert matched, "task not found in list response"
+        assert matched[0]["post_commit_pending"] is True
+
+    @pytest.mark.asyncio
+    async def test_task_list_exposes_post_commit_pending_false(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            post_commit_pending=False,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get("/api/admin/tasks")
+        assert resp.status_code == 200, resp.text
+        tasks = resp.json()["tasks"]
+        matched = [t for t in tasks if t["id"] == str(task.id)]
+        assert matched, "task not found in list response"
+        assert matched[0]["post_commit_pending"] is False
+
+    @pytest.mark.asyncio
+    async def test_task_detail_exposes_post_commit_pending_true(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            post_commit_pending=True,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["post_commit_pending"] is True
+
+    @pytest.mark.asyncio
+    async def test_task_detail_exposes_post_commit_pending_false(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            post_commit_pending=False,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["post_commit_pending"] is False

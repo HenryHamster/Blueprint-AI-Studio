@@ -43,6 +43,7 @@ import {
   VersionLifecycleRefreshBanner,
   ServingStatusBadge,
   ArtifactEvidenceList,
+  ConfidenceSparkline,
 } from './VersionLifecyclePanelPrimitives';
 
 // Generate a client idempotency key for a version cut. Prefers the native UUID
@@ -790,6 +791,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         {verdicts.length > 0 && (
           <div data-testid="verdict-history">
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
+            <ConfidenceSparkline verdicts={verdicts.slice(0, 8)} />
             <div className="space-y-1">
               {verdicts.slice(0, 8).map(v => (
                 <div key={v.id} className="space-y-0.5 pl-2 border-l-2 border-neutral-700/40">

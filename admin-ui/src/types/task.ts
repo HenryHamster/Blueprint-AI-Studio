@@ -227,6 +227,8 @@ export interface Task {
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
   child_task_ids?: string[];
   estimated_cost_usd?: number | null;
+  task_llm_cost_usd?: number | null;
+  task_llm_cost_any_unpriced?: boolean;
   api_call_summary?: {
     llm_call_count?: number;
     total_input_tokens?: number;
@@ -236,6 +238,9 @@ export interface Task {
   fix_loop_history?: Record<string, FixLoopAttempt[]> | null;
   fix_loop_summary?: FixLoopSummary[] | null;
   edges_considered?: EdgeConsidered[] | null;
+  // Transitional state: agent run completed but post-commit side effects
+  // (PR submission, child task spawns, merge) haven't fired yet.
+  post_commit_pending?: boolean | null;
 }
 
 export interface EdgeConsidered {

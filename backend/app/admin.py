@@ -81,6 +81,7 @@ from app.admin_task_mutations import (
     modify_task_apply,
 )
 from app.task_blocked import strip_fresh_attempt_context
+from app.efficiency_snapshot import _task_llm_cost as _calc_task_llm_cost
 from app.time_utils import clear_retry_after
 from app.routers.admin_operator_triggers import (  # noqa: F401
     _record_failure_result,
@@ -478,6 +479,7 @@ async def get_all_tasks(
             else None,
             "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(t),
             "fix_loop_summary": _fix_loop_summary(t.fix_loop_history),
+            "post_commit_pending": t.post_commit_pending,
         }
         result_list.append(task_dict)
 
@@ -1058,6 +1060,14 @@ async def bulk_action_tasks(
     }
 
 
+def _task_llm_cost_fields(task: Task) -> dict:
+    llm_cost, any_unpriced = _calc_task_llm_cost(task)
+    return {
+        "task_llm_cost_usd": round(llm_cost, 6) if llm_cost else None,
+        "task_llm_cost_any_unpriced": any_unpriced,
+    }
+
+
 @router.get("/tasks/{task_id}")
 async def get_task(
     task_id: str,
@@ -1226,6 +1236,8 @@ async def get_task(
         "child_task_ids_truncated": child_task_ids_truncated,
         "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(task),
         "api_call_summary": task.api_call_summary,
+        **_task_llm_cost_fields(task),
+        "post_commit_pending": task.post_commit_pending,
     }
 
 

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { ChevronDown, ChevronRight, ExternalLink } from 'lucide-react';
+import { ChevronDown, ChevronRight, ExternalLink, Clock } from 'lucide-react';
 import { getHeartbeatStatus, useElapsedTime, ResearchFindings, useDurationStats } from './TaskCard';
 import { formatAbsolute, parseTimestamp, timeAgo, formatDurationSec } from '../utils/time';
 import { hasTransitiveCycle } from '../utils/taskGraph';
@@ -209,14 +209,25 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         const calls = s.llm_call_count ?? 0;
         const input = s.total_input_tokens ?? 0;
         const output = s.total_output_tokens ?? 0;
-        const cost = task.estimated_cost_usd;
+        const llmCost = task.task_llm_cost_usd;
+        const llmCostApprox = task.task_llm_cost_any_unpriced;
+        const vmCost = task.estimated_cost_usd;
         return (
-          <DetailRow label="LLM Usage">
-            <span className="font-mono text-sm">
-              {calls.toLocaleString()} calls · {input.toLocaleString()} in / {output.toLocaleString()} out tokens
-              {cost != null && <span className="text-neutral-400"> · ${cost.toFixed(2)}</span>}
-            </span>
-          </DetailRow>
+          <>
+            <DetailRow label="LLM Usage">
+              <span className="font-mono text-sm">
+                {calls.toLocaleString()} calls · {input.toLocaleString()} in / {output.toLocaleString()} out tokens
+                {llmCost != null && (
+                  <span className="text-neutral-400"> · {llmCostApprox ? '~' : ''}${llmCost.toFixed(4)}</span>
+                )}
+              </span>
+            </DetailRow>
+            {vmCost != null && (
+              <DetailRow label="VM Cost">
+                <span className="font-mono text-sm text-neutral-400">${vmCost.toFixed(2)}</span>
+              </DetailRow>
+            )}
+          </>
         );
       })()}
       {llmProvider && <DetailRow label="LLM Provider"><span className="font-mono text-sm break-all">{llmProvider}</span></DetailRow>}
@@ -225,6 +236,15 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       <SystemMetricsSection task={task} />
 
       <BlockerSection task={task} now30={now30} tasks={tasks} onNavigateToTask={onNavigateToTask} />
+
+      {task.status === 'COMPLETED' && task.post_commit_pending && (
+        <DetailRow label="Post-commit">
+          <span className="inline-flex items-center gap-1 text-amber-400 text-sm">
+            <Clock className="w-3.5 h-3.5 shrink-0" />
+            Effects pending — PR submission, child spawns, or merge queued but not yet fired
+          </span>
+        </DetailRow>
+      )}
 
       <ParkedSection task={task} />
 

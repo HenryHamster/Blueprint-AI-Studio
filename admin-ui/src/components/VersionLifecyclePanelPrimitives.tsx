@@ -1,6 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useState, useEffect } from 'react';
 import type { JSX } from 'react';
+import { LineChart, Line, ResponsiveContainer } from 'recharts';
 import { fetchVersionSummary } from '../api';
 import type {
   AgentServingShasResponse,
@@ -13,6 +14,7 @@ import type {
   GoalAlignment,
   LatestAudit,
   OutOfBandPromotion,
+  QualificationVerdictRecord,
   ReleaseArtifactEvidence,
   RecentVersion,
   StagedDirection,
@@ -1218,6 +1220,33 @@ export function VersionLifecycleRefreshBanner({
           {refreshing ? 'Retrying...' : 'Retry'}
         </button>
       </div>
+    </div>
+  );
+}
+
+export function ConfidenceSparkline({ verdicts }: { verdicts: QualificationVerdictRecord[] }) {
+  const points = verdicts
+    .slice()
+    .reverse()
+    .filter(v => v.confidence != null)
+    .map((v, i) => ({ i, v: Math.round((v.confidence as number) * 100), promote: v.would_promote }));
+
+  if (points.length < 2) return null;
+
+  const promotedCount = points.filter(p => p.promote).length;
+  const color = promotedCount >= points.length / 2 ? '#10b981' : '#f59e0b';
+
+  return (
+    <div
+      data-testid="confidence-sparkline"
+      style={{ height: 28 }}
+      title={`Confidence trend over last ${points.length} verdicts (oldest → newest)`}
+    >
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={points} margin={{ top: 2, right: 0, left: 0, bottom: 2 }}>
+          <Line dataKey="v" stroke={color} dot={false} strokeWidth={1.5} isAnimationActive={false} />
+        </LineChart>
+      </ResponsiveContainer>
     </div>
   );
 }

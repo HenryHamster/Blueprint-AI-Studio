@@ -3524,4 +3524,83 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.queryByTestId('fleet-match-count')).not.toBeInTheDocument();
     });
   });
+
+  describe('confidence sparkline', () => {
+    function makeVerdict(confidence: number | null, wouldPromote: boolean = true): api.QualificationVerdictRecord {
+      return {
+        id: `v-${Math.random()}`,
+        release_version_id: 'rv1',
+        candidate_sha: 'abcdef123456',
+        confidence,
+        sub_scores: null,
+        blocker: null,
+        audit_missing_reason: null,
+        would_promote: wouldPromote,
+        promotion_enabled: false,
+        terminal_status: wouldPromote ? 'promoted' : 'not_promoted',
+        threshold: 0.9,
+        started_at: null,
+        finalized_at: '2026-01-01T00:00:00Z',
+        created_at: '2026-01-01T00:00:00Z',
+      };
+    }
+
+    it('renders confidence sparkline when verdicts with non-null confidence exist', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [makeVerdict(0.95), makeVerdict(0.88), makeVerdict(0.91)],
+        total: 3,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const history = await screen.findByTestId('verdict-history');
+      expect(history).toBeInTheDocument();
+      expect(screen.getByTestId('confidence-sparkline')).toBeInTheDocument();
+    });
+
+    it('omits sparkline when all confidences are null', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [makeVerdict(null), makeVerdict(null)],
+        total: 2,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await screen.findByTestId('verdict-history');
+      expect(screen.queryByTestId('confidence-sparkline')).not.toBeInTheDocument();
+    });
+
+    it('omits sparkline when fewer than 2 verdicts have non-null confidence', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [makeVerdict(0.9), makeVerdict(null)],
+        total: 2,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await screen.findByTestId('verdict-history');
+      expect(screen.queryByTestId('confidence-sparkline')).not.toBeInTheDocument();
+    });
+  });
 });
