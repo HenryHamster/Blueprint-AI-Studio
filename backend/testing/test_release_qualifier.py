@@ -19072,7 +19072,7 @@ class TestFormatQualificationForApi:
             "promotion_conflict": True,
             "promotion_error_detail": "merge conflict",
             "theme_delivery": {"theme_class": "leanness", "assessed_grade": 1.0},
-            "goal_alignment": {"covered": True, "grade": 0.85},
+            "goal_alignment": {"state": "aligned", "assessed_grade": 0.85, "biggest_gap": None, "reasoning_summary": "Goal delivered."},
         }
         out = rq.format_qualification_for_api(qual)
         assert out["confidence"] == 0.82
@@ -23440,7 +23440,7 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         promotion_conflict=True,
         promotion_error_detail="merge conflict",
         theme_delivery=_theme_cert,
-        goal_alignment={"covered": True, "grade": 0.9},
+        goal_alignment={"state": "aligned", "assessed_grade": 0.9, "biggest_gap": None, "reasoning_summary": "Goal delivered."},
     )
 
     out = rq.format_verdict_for_api(verdict)
@@ -23466,7 +23466,7 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     # Theme-delivery cert surfaces from migration-0305 column.
     assert out["theme_delivery"] == _theme_cert
     # Goal-alignment cert surfaces from migration-0328 column.
-    assert out["goal_alignment"] == {"covered": True, "grade": 0.9}
+    assert out["goal_alignment"] == {"state": "aligned", "assessed_grade": 0.9, "biggest_gap": None, "reasoning_summary": "Goal delivered."}
     # Legacy rows (no theme_delivery set) must return None, not raise.
     verdict_legacy = QualificationVerdict(
         project_id=uuid.uuid4(),
@@ -23576,7 +23576,12 @@ async def test_goal_alignment_propagates_to_verdict(db_session):
     row; an audit report without goal_alignment yields None without error."""
     from app import release_promotion as rp
 
-    _goal_alignment = {"covered": True, "rationale": "All milestones addressed."}
+    _goal_alignment = {
+        "state": "aligned",
+        "assessed_grade": 0.9,
+        "biggest_gap": None,
+        "reasoning_summary": "All milestones addressed.",
+    }
 
     # --- With goal_alignment present in audit report ---------------------------
     _project, version = await _make_project_and_version(db_session)
