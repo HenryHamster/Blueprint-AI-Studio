@@ -488,7 +488,10 @@ async def apply_post_spawn_state(
                 )
                 if reason.startswith("hash match"):
                     hash_dedup_by_dir[did] = hash_dedup_by_dir.get(did, 0) + 1
-                elif reason.startswith("word overlap"):
+                # Region-identity duplicates (active-task "region overlap with:" and
+                # recent-terminal "recent terminal region overlap with:"), plus the
+                # legacy "word overlap with:" prefix, all roll up to word_overlap_dedup.
+                elif "region overlap" in reason or reason.startswith("word overlap"):
                     word_overlap_by_dir[did] = word_overlap_by_dir.get(did, 0) + 1
                 elif reason.startswith("all files covered"):
                     file_overlap_by_dir[did] = file_overlap_by_dir.get(did, 0) + 1

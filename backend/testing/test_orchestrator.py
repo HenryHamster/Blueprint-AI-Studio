@@ -1344,7 +1344,8 @@ class TestResearchCompletion:
         await db_session.commit()
         await db_session.refresh(project)
 
-        # Existing active task whose title will match finding #1
+        # Existing active task that shares finding #1's code region (related_files,
+        # recorded on the task context at spawn time) and title.
         existing_task = Task(
             project_id=project.id,
             title="optimize database query performance",
@@ -1352,6 +1353,7 @@ class TestResearchCompletion:
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.IN_PROGRESS,
             created_by="ORCHESTRATOR",
+            context={"related_files": ["app/db/query.py", "app/db/perf.py"]},
         )
         db_session.add(existing_task)
 
@@ -1372,14 +1374,18 @@ class TestResearchCompletion:
         # Finding #2 is genuinely new
         logs = self._findings_json(
             {
-                "title": "optimize database query performance",  # duplicate — 4 matching words
+                # duplicate — same region (related_files) + 4 matching title words
+                "title": "optimize database query performance",
                 "prompt": "Improve the slow SQL queries in the reports module.",
                 "priority": "medium",
+                "related_files": ["app/db/query.py", "app/db/perf.py"],
             },
             {
-                "title": "add request tracing middleware",  # genuinely new
+                # genuinely new — different region, so not deduped
+                "title": "add request tracing middleware",
                 "prompt": "Instrument HTTP handlers with OpenTelemetry trace IDs.",
                 "priority": "medium",
+                "related_files": ["app/http/middleware.py"],
             },
         )
 
@@ -1871,7 +1877,8 @@ class TestResearchCompletion:
         await db_session.commit()
         await db_session.refresh(project)
 
-        # Existing task whose title matches the finding — triggers dedup
+        # Existing task that shares the finding's code region (related_files) and
+        # title — triggers region-identity dedup.
         existing_task = Task(
             project_id=project.id,
             title="improve test coverage for auth module",
@@ -1879,6 +1886,7 @@ class TestResearchCompletion:
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.IN_PROGRESS,
             created_by="ORCHESTRATOR",
+            context={"related_files": ["tests/test_auth.py", "app/auth.py"]},
         )
         db_session.add(existing_task)
 
@@ -1895,12 +1903,13 @@ class TestResearchCompletion:
         await db_session.commit()
         await db_session.refresh(research_task)
 
-        # Single finding that duplicates the existing task
+        # Single finding that duplicates the existing task (same region + title)
         logs = self._findings_json(
             {
                 "title": "improve test coverage for auth module",
                 "prompt": "Add unit tests for the authentication service.",
                 "priority": "medium",
+                "related_files": ["tests/test_auth.py", "app/auth.py"],
             },
         )
 
