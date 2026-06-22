@@ -38,7 +38,7 @@ Unauthenticated health check for external monitoring. The response includes the 
 
 ### `GET /metrics`
 
-Prometheus text metrics. If `METRICS_TOKEN` is set, requests must include `?token=<value>`.
+Prometheus text metrics (text/plain exposition format). Returns `403 Forbidden` if `METRICS_TOKEN` is configured but the request doesn't include a valid `?token=<value>` query parameter. When `METRICS_TOKEN` is unset, the endpoint also returns `403` (fail-closed security design). Exposes orchestrator cycle age, active VM counts, consecutive autonomous-failure counts, and related gauges.
 
 ### `GET /api/version`
 
@@ -1131,11 +1131,7 @@ provider/external dependency degradation is surfaced but does not fail the check
 
 ### `GET /metrics`
 
-Prometheus-compatible metrics in the text exposition format
-(`text/plain`). Unauthenticated by default; if the `METRICS_TOKEN` env var is
-set, the request must include a matching `?token=<value>` query parameter
-(`403` otherwise). Exposes orchestrator cycle age, active VM counts, consecutive
-autonomous-failure counts, and related gauges.
+Prometheus text metrics (text/plain exposition format). Returns `403 Forbidden` if `METRICS_TOKEN` is configured but the request doesn't include a valid `?token=<value>` query parameter. When `METRICS_TOKEN` is unset, the endpoint also returns `403` (fail-closed security design). Exposes orchestrator cycle age, active VM counts, consecutive autonomous-failure counts, and related gauges.
 
 ### `GET /api/version`
 
