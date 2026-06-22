@@ -209,6 +209,63 @@ async def test_happy_path_spawns_task(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_ci_source_sha_decouples_fix_base_from_failure_commit(
+    db_session: AsyncSession,
+):
+    """Promotion-gate harvest path: ``ci_source_sha`` supplies the failing-test
+    context (the throwaway release commit) while ``head_branch`` is the
+    integration branch the fix must land on. The latest-branch-tip guard is
+    skipped and the task is tagged so the re-qualification gate can see it.
+    """
+    project = await _create_project(db_session)
+    version_id = uuid.uuid4()
+
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI / Backend (shard 1)"],
+            "AssertionError: assert 0 == 1",
+            "test",
+            {"failing_tests": ["t::a"], "error_locations": [], "error_messages": []},
+        )
+
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme",
+            repo="webapp",
+            head_sha="ignored-tip",
+            head_branch="automain",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+            ci_source_sha="release5ha",
+            release_version_id=version_id,
+        )
+
+    # Context was extracted from the release commit, not the integration tip.
+    mock_ctx.assert_awaited_once()
+    assert mock_ctx.await_args.args[2] == "release5ha"
+
+    tasks = await session_tasks(db_session, project.id)
+    assert len(tasks) == 1
+    task = tasks[0]
+    # The fix branches off the integration branch (automain), NOT the release branch.
+    assert task.first_payload["base_branch"] == "automain"
+    # ci_failure_sha == ci_source_sha proves the latest-branch-tip guard was
+    # skipped and head_sha was overridden to the release commit.
+    assert task.context["ci_failure_sha"] == "release5ha"
+    # Tagged so compute_requalification_readiness defers re-qualify while in flight.
+    assert task.context["promotion_ci_remediation"] is True
+    assert task.context["promotion_ci_remediation_version_id"] == str(version_id)
+
+
+@pytest.mark.asyncio
 async def test_task_context_includes_error_fingerprint(db_session: AsyncSession):
     """Auto-remediation task context should carry _previous_error_fingerprint for cross-direction dedup."""
     from app.anomaly_detection import _error_fingerprint

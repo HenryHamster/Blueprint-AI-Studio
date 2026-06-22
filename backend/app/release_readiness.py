@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -34,7 +35,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import release_version
 from app.acceptance_gate import ACCEPTANCE_AGGREGATE_BUCKETS
-from app.models import AuditFindingResolution, QualificationVerdict, ReleaseVersion
+from app.models import (
+    AuditFindingResolution,
+    QualificationVerdict,
+    ReleaseVersion,
+    Task,
+    TaskStatus,
+)
 from app.release_scoring import compute_challenged_vs_unchallenged_telemetry
 from app.shared_state import resolve_project_promotion_enabled
 from app.time_utils import _utcnow
@@ -48,6 +55,21 @@ _RESOLVED_LEDGER_STATES = frozenset({"resolved", "stale"})
 # Carried-finding severities that GATE re-qualification readiness.  Low/info
 # findings are advisory and ignored by the readiness computation.
 _REQUALIFICATION_GATING_SEVERITIES = frozenset({"high", "critical", "medium"})
+
+# Task statuses that count as an in-flight promotion-CI remediation.
+_ACTIVE_TASK_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+)
+# Bounded window for the promotion-CI remediation gate. While a remediation fix
+# (spawned by the promotion-gate harvest in release_reconciliation) is active and
+# was created within this window, re-qualification is deferred so the next
+# promotion attempt waits for the fix to land on the integration branch. The
+# window is a HARD wedge-guard: a stuck/orphaned remediation task older than this
+# stops deferring, so a fix that never lands can never block re-qualify forever.
+_PROMOTION_CI_REMEDIATION_GATE_SECONDS = 6 * 3600
 
 # Maps the internal last_qualification status code to a human-readable label
 # for the version-lifecycle panel.
@@ -839,6 +861,48 @@ async def _latest_carried_audit_findings(
     return findings, truncated
 
 
+async def _has_active_promotion_ci_remediation(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    version_id: uuid.UUID,
+) -> bool:
+    """True iff a promotion-CI remediation fix task for this version is in flight.
+
+    The promotion-gate harvest
+    (``release_reconciliation._harvest_promotion_ci_failures``) spawns an
+    auto-remediation task tagged with ``promotion_ci_remediation_version_id``.
+    While such a task is active AND was created within
+    ``_PROMOTION_CI_REMEDIATION_GATE_SECONDS``, re-qualification is deferred so
+    the fix lands on the integration branch before the next promotion attempt.
+    The window bound is a hard wedge-guard — a stuck task older than it stops
+    deferring, so a fix that never lands cannot block re-qualify indefinitely.
+    """
+    cutoff = _utcnow() - timedelta(seconds=_PROMOTION_CI_REMEDIATION_GATE_SECONDS)
+    rows = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.auto_remediation.is_(True),
+                    Task.status.in_(_ACTIVE_TASK_STATUSES),
+                    Task.created_at >= cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    target = str(version_id)
+    for t in rows:
+        ctx = t.context or {}
+        if (
+            ctx.get("promotion_ci_remediation")
+            and str(ctx.get("promotion_ci_remediation_version_id") or "") == target
+        ):
+            return True
+    return False
+
+
 async def compute_requalification_readiness(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -884,6 +948,26 @@ async def compute_requalification_readiness(
             "gating_total": 0,
             "gating_resolved": 0,
             "reason": "no open release version — nothing to re-qualify",
+            "findings": [],
+        }
+
+    # Gate: while a promotion-CI remediation fix (spawned by the promotion-gate
+    # harvest for the LAST attempt's CI failures) is in flight, defer
+    # re-qualification so the fix lands on the integration branch before the next
+    # promotion attempt re-runs the same red CI. Bounded window (see helper) so a
+    # stuck remediation can never wedge re-qualify.
+    if await _has_active_promotion_ci_remediation(session, project_id, version.id):
+        return {
+            "requalification_ready": False,
+            "open_version_id": str(version.id),
+            "audit_findings_truncated": False,
+            "gating_total": 0,
+            "gating_resolved": 0,
+            "reason": (
+                "promotion-CI remediation in flight — a fix for the last "
+                "promotion attempt's CI failures is being applied to the "
+                "integration branch; deferring re-qualification until it lands"
+            ),
             "findings": [],
         }
 
