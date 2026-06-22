@@ -161,6 +161,7 @@ def compute_composite(
     *,
     smoketest_enabled: bool = True,
     ci_state: str = _CI_RED,
+    ci_required: bool = True,
     migration_collision: bool = False,
     migration_apply_blocked: bool = False,
     theme_delivery_blocked: bool = False,
@@ -170,9 +171,21 @@ def compute_composite(
     Hard blockers — each forces ``confidence = 0.0`` and ``promote = False``.
     They are evaluated in this order, and ``blocker`` reports the first match:
       * ``not ci_green`` + ``ci_state == _CI_RED``  — confirmed failing build
-        (``"ci_not_green"``).
-      * ``not ci_green`` + ``ci_state != _CI_RED``  — CI could not be evaluated
-        (pending, no check-runs, or I/O degraded) (``"ci_unresolved"``).
+        (``"ci_not_green"``).  Always a hard blocker, regardless of
+        ``ci_required`` — never promote over a known-failing build.
+      * ``not ci_green`` + ``ci_state != _CI_RED`` + ``ci_required``  — CI could
+        not be evaluated (pending, no check-runs, or I/O degraded) on a
+        CI-gated project (``"ci_unresolved"``).  When ``ci_required`` is False
+        (the project relaxed per-PR CI on its integration branch — e.g.
+        ``automain`` pushes that legitimately carry zero check-runs, so the
+        candidate has NO direct CI signal to resolve) an unresolved CI is NOT a
+        blocker: it falls through to the weighted score.  The real CI gate for
+        such a project is the promotion PR -> ``main`` itself, which stays
+        strictly CI-gated (``proceed_on_no_checks`` keeps ``main`` in
+        ``ci_required_branches``), so an unresolved candidate CI never bypasses
+        validation — it is checked for real at the promotion-PR merge.  Without
+        this, a relaxed-CI project's every candidate is permanently wedged on
+        ``ci_unresolved`` (no automain commit ever carries a green CI signal).
       * ``migration_collision`` is True — a deterministic Alembic
         revision-identity collision between the candidate and the deployed
         promotion target (the back-merge renumber class, prod incident
@@ -260,11 +273,20 @@ def compute_composite(
     # a None test_erosion only genuinely means a deleted test file when the
     # audit report itself was present (audit_score not None).
     blocker: str | None = None
-    if not ci_green:
-        # Distinguish a confirmed red build from an unresolved CI state (pending,
-        # no check-runs, or GitHub I/O degraded).  Only a real red build is a
-        # quality blocker; unresolved CI is a resolution/infrastructure concern.
-        blocker = "ci_not_green" if ci_state == _CI_RED else "ci_unresolved"
+    if not ci_green and ci_state == _CI_RED:
+        # A confirmed red build is ALWAYS a hard blocker — never promote over a
+        # known-failing build, regardless of whether the project gates per-PR
+        # merges on CI.
+        blocker = "ci_not_green"
+    elif not ci_green and ci_required:
+        # Unresolved CI (pending, no check-runs, or GitHub I/O degraded) is a
+        # resolution/infrastructure concern, not a quality signal.  It blocks
+        # ONLY on a CI-gated project.  A project that relaxed per-PR CI on its
+        # integration branch (``ci_required`` False) has no candidate-level CI
+        # signal to resolve, so blocking here would permanently wedge every
+        # promotion; the promotion PR -> ``main`` carries the real, still-strict
+        # CI gate instead.
+        blocker = "ci_unresolved"
     elif migration_collision:
         # A deterministic Alembic revision-identity collision between the
         # candidate and the deployed promotion target — checked ahead of the
