@@ -2293,6 +2293,51 @@ async def test_landed_rollup_propagates_signal_to_carried_children(cleanup_db, m
     assert "_non_merge_unblock_reason" not in (child2.context or {})
 
 
+@pytest.mark.asyncio
+async def test_propagate_skips_force_dropped_children(cleanup_db, mocker):
+    """_propagate_landed_to_rollup_children must NOT stamp landed_on_integration
+    on force-dropped children (rollup_no_pr_artifact, malformed_pr_url,
+    review_respawn_cap).  These children carry pr_merged=True but were never
+    genuinely merged; stamping them erases the force-drop evidence.
+    """
+    from app.rollup_management import _propagate_landed_to_rollup_children
+    from app.landed_signal import has_landed_signal
+
+    project = await _make_project(cleanup_db)
+
+    force_drop_reasons = [
+        "rollup_no_pr_artifact",
+        "malformed_pr_url",
+        "review_respawn_cap",
+    ]
+    children = []
+    for reason in force_drop_reasons:
+        child = await _make_task(
+            cleanup_db,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "pr_merged": True,
+                "landed_on_integration": False,
+                "_non_merge_unblock_reason": reason,
+            },
+        )
+        children.append(child)
+
+    _propagate_landed_to_rollup_children(children, cleanup_db)
+
+    for child, reason in zip(children, force_drop_reasons):
+        assert not has_landed_signal(child), (
+            f"force-dropped child ({reason}) must not receive landed signal"
+        )
+        assert (child.context or {}).get("landed_on_integration") is False, (
+            f"force-dropped child ({reason}) must retain landed_on_integration=False"
+        )
+        assert (child.context or {}).get("_non_merge_unblock_reason") == reason, (
+            f"force-dropped child ({reason}) must retain _non_merge_unblock_reason"
+        )
+
+
 def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
     """Mock setup for the re-poll-resolves-to-dirty path.
 

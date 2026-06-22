@@ -385,6 +385,11 @@ def _promotion_target_rollup_allowed(parent: Task, target_branch: str) -> bool:
     return bool(payload.get("hotfix") or ctx.get("hotfix"))
 
 
+_FORCE_DROP_REASONS = frozenset(
+    {"rollup_no_pr_artifact", "malformed_pr_url", "review_respawn_cap"}
+)
+
+
 def _propagate_landed_to_rollup_children(
     completed_children: list[Task], session: AsyncSession
 ) -> None:
@@ -396,14 +401,23 @@ def _propagate_landed_to_rollup_children(
     signal so cross-base dependents that wait on has_landed_signal(child) can
     unblock.  Children that already carry a positive landed signal are skipped
     (idempotent).
+
+    Force-dropped children (rollup_no_pr_artifact, malformed_pr_url,
+    review_respawn_cap) carry pr_merged=True but were never genuinely merged;
+    they must retain landed_on_integration=False so they are not falsely
+    credited as landed.
     """
     from app.landed_signal import (
+        NON_MERGE_UNBLOCK_REASON_KEY,
         has_landed_signal,
         has_merge_unblock_signal,
         mark_landed_on_integration,
     )
 
     for child in completed_children:
+        ctx = child.context or {}
+        if ctx.get(NON_MERGE_UNBLOCK_REASON_KEY) in _FORCE_DROP_REASONS:
+            continue
         if has_merge_unblock_signal(child) and not has_landed_signal(child):
             mark_landed_on_integration(child)
             session.add(child)
