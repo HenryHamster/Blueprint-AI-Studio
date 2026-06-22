@@ -1652,6 +1652,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "smoketest_enabled",
                         bool(config_json["smoketest_enabled"]),
                     )
+                if "no_ci_test_gate_enabled" in config_json:
+                    _set(
+                        "no_ci_test_gate_enabled",
+                        bool(config_json["no_ci_test_gate_enabled"]),
+                    )
                 if "diagnostics_after_edit_enabled" in config_json:
                     _set(
                         "diagnostics_after_edit_enabled",
