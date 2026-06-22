@@ -496,8 +496,11 @@ class TestBlindMergeGradeDisabled:
 
 
 @pytest.mark.asyncio
-async def test_compute_returns_none_when_goal_is_empty(monkeypatch, caplog):
-    """Empty version.goal → logs WARNING and returns None (no LLM call)."""
+async def test_compute_skips_no_op_when_goal_is_empty(monkeypatch, caplog):
+    """Empty version.goal → no-op SKIP record (NOT None), so the call site does
+    NOT fail closed.  Failing closed on an empty goal is a permanent wedge: the
+    goal never becomes non-empty on its own.  The gate is simply not applicable
+    — there is nothing to grade the merged diffs against."""
     import logging
 
     # No API key or GitHub patching needed — goal check is the first gate.
@@ -506,18 +509,28 @@ async def test_compute_returns_none_when_goal_is_empty(monkeypatch, caplog):
     version = AsyncMock(spec=ReleaseVersion)
     version.goal = ""
 
-    with caplog.at_level(logging.WARNING, logger="app.blind_merge_grade"):
+    with caplog.at_level(logging.INFO, logger="app.blind_merge_grade"):
         result = await bmg.compute_blind_merge_grade(
             session, project, version, "abc123"
         )
 
-    assert result is None
-    assert any("no goal" in r.message.lower() for r in caplog.records)
+    # NOT None — a non-None record means the caller treats it as a no-op pass
+    # and does not wedge the version in stabilize.
+    assert result is not None
+    assert result["status"] == "skipped"
+    assert result["reason"] == "empty_version_goal"
+    assert result["candidate_sha"] == "abc123"
+    # The skip marker must NOT satisfy the gate (no biggest_gap/coverage_verdict),
+    # so a real candidate is still graded afresh if a goal later appears.
+    version.last_qualification = {"blind_merge_grade": result}
+    assert bmg.blind_merge_grade_satisfied(version, "abc123") is False
+    assert any("not applicable" in r.message.lower() for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_compute_returns_none_when_goal_is_whitespace_only(monkeypatch):
-    """Whitespace-only version.goal → returns None (no LLM call)."""
+async def test_compute_skips_no_op_when_goal_is_whitespace_only(monkeypatch):
+    """Whitespace-only version.goal → no-op SKIP record (NOT None), same as the
+    empty-goal case — ``.strip()`` collapses it to empty."""
     # No API key or GitHub patching needed — goal check is the first gate.
     session = AsyncMock()
     project = AsyncMock(spec=Project)
@@ -526,7 +539,9 @@ async def test_compute_returns_none_when_goal_is_whitespace_only(monkeypatch):
 
     result = await bmg.compute_blind_merge_grade(session, project, version, "abc123")
 
-    assert result is None
+    assert result is not None
+    assert result["status"] == "skipped"
+    assert result["reason"] == "empty_version_goal"
 
 
 @pytest.mark.asyncio

@@ -283,16 +283,34 @@ async def compute_blind_merge_grade(
     produced (no API key, GitHub creds unresolved, or the model is
     unavailable/unparseable after a retry).  A ``None`` return must FAIL CLOSED
     at the call site — it never fabricates a passing grade.
+
+    EXCEPTION — empty version goal: when ``version.goal`` is empty there is
+    nothing to grade the merged diffs against, so the gate is *not applicable*.
+    This returns a non-None ``{"status": "skipped", "reason":
+    "empty_version_goal", ...}`` record (NOT ``None``) so the call site treats
+    it as a no-op pass.  Failing closed here would be a permanent wedge: an
+    empty goal never becomes non-empty on its own, so every qualification cycle
+    would re-block forever.  A version with a real goal is graded normally.
     """
     goal = (version.goal or "").strip()
     if not goal:
-        logger.warning(
-            "[BLIND_MERGE_GRADE] version %s has no goal text — cannot grade candidate %s "
-            "(grade unavailable; will retry on next qualification)",
+        logger.info(
+            "[BLIND_MERGE_GRADE] version %s has no goal text — gate not "
+            "applicable, skipping (no-op pass; nothing to grade candidate %s "
+            "against)",
             getattr(version, "version_number", "?"),
             (candidate_sha or "")[:8],
         )
-        return None
+        return {
+            "status": "skipped",
+            "reason": "empty_version_goal",
+            "detail": (
+                "version goal text is empty — nothing to grade the merged diffs "
+                "against; gate not applicable (no-op pass, not a fail-closed wedge)"
+            ),
+            "candidate_sha": candidate_sha,
+            "graded_at": _utcnow().isoformat(),
+        }
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
