@@ -2537,7 +2537,39 @@ export function gitAsync(args: string[], cwd = WORKSPACE, timeoutMs = 300_000): 
   });
 }
 
-/** Clone with retry — transient network failures get 3 attempts with exponential backoff. */
+/** Git authentication failures (as opposed to transient network/DNS errors).
+ *  An expired/invalid installation token surfaces as one of these. We must be
+ *  precise: a network or DNS failure is NOT an auth error and must keep today's
+ *  plain-retry behavior (re-minting a token would not help and a successful
+ *  re-mint could mask a real connectivity problem). */
+const GIT_CLONE_AUTH_ERROR = /Invalid username or token|Password authentication is not supported|Authentication failed|remote: (?:Invalid|Repository not found)|returned error:\s*40[13]\b|HTTP\s*40[13]\b/i;
+
+/** Re-mint a fresh GitHub installation token (force_refresh busts the backend's
+ *  ~50min cache) and rewrite the `x-access-token:<tok>@github.com` segment of
+ *  the matching clone-arg in place. Returns true if a URL arg was rewritten. */
+async function refreshCloneToken(args: string[], taskId: string): Promise<boolean> {
+  if (!taskId) return false;
+  const urlIdx = args.findIndex(a => /https:\/\/x-access-token:[^@]+@github\.com\//.test(a));
+  if (urlIdx === -1) return false;
+  const freshRes = await apiGet(
+    `/api/agent/github/token?task_id=${taskId}&force_refresh=true`,
+    API_MAX_RETRIES, 180_000,
+  ) as { data?: { token?: string } };
+  const freshToken = freshRes.data?.token;
+  if (!freshToken) return false;
+  // Replace only the token segment; keep host/path untouched.
+  args[urlIdx] = args[urlIdx].replace(
+    /(https:\/\/x-access-token:)[^@]+(@github\.com\/)/,
+    `$1${freshToken}$2`,
+  );
+  return true;
+}
+
+/** Clone with retry — transient network failures get 3 attempts with exponential
+ *  backoff. On an AUTH failure (expired/invalid token) we additionally re-mint a
+ *  fresh token and rewrite the clone URL before retrying — a token baked in at
+ *  role start can expire during a long queue/provision delay, and every plain
+ *  retry would otherwise reuse the same dead token. */
 export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEOUT): Promise<void> {
   const taskId = process.env.TASK_ID || '';
   for (let attempt = 0; attempt < CLONE_MAX_RETRIES; attempt++) {
@@ -2547,8 +2579,20 @@ export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEO
       return;
     } catch (e) {
       if (attempt === CLONE_MAX_RETRIES - 1) throw e;
+      const rawMsg = e instanceof Error ? e.message : String(e);
       const delay = CLONE_RETRY_BASE_DELAY * Math.pow(2, attempt);
-      log(`Git clone failed (attempt ${attempt + 1}/3), retrying in ${delay / 1000}s: ${sanitize(e instanceof Error ? e.message : String(e))}`);
+      const isAuthError = GIT_CLONE_AUTH_ERROR.test(rawMsg);
+      log(`Git clone failed (attempt ${attempt + 1}/3)${isAuthError ? ' [auth]' : ''}, retrying in ${delay / 1000}s: ${sanitize(rawMsg)}`);
+      if (isAuthError) {
+        // Re-mint a fresh installation token (the baked-in one likely expired)
+        // and rewrite the clone URL before retrying. Never log the token.
+        try {
+          const rewritten = await refreshCloneToken(args, taskId);
+          if (rewritten) log('Re-minted fresh GitHub token after clone auth failure');
+        } catch (refreshErr) {
+          log(`Token re-mint after clone auth failure failed: ${sanitizeError(refreshErr)}`);
+        }
+      }
       try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' }); } catch { /* ignore */ }
       await new Promise(r => setTimeout(r, delay));
     }
