@@ -2885,14 +2885,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         .scalars()
         .all()
     )
-    # Build compact active-task overlap candidates. The third tuple element is
-    # optional metadata consumed by finding_deduplication; tuple-only helper
-    # callers still use the legacy two-field shape.
+    # Build compact active-task overlap candidates for region-identity dedup:
+    # (direction_id, title, task_type, related_files). The related_files (4th
+    # element) are the necessary signal for region matching — a spawned task
+    # records the finding's related_files in its context (see the spawn payload
+    # below), so in-flight work exposes the files it targets.
     existing_tasks_with_dirs = [
         (
             (t.context or {}).get("direction_id"),
             t.title.lower(),
             (t.first_payload or {}).get("type"),
+            (t.context or {}).get("related_files"),
         )
         for t in existing_tasks
     ]

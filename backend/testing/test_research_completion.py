@@ -5353,10 +5353,12 @@ async def test_depends_on_indices_deduped_sibling_no_provider_spawns_standalone(
         db_session, "d-prq-dedup-standalone"
     )
 
-    # Pre-existing in-flight task whose TITLE word-overlaps foundation finding A but
-    # whose finding_hash is DIFFERENT (a prior run's body) — so A is word-overlap
-    # deduped against it, yet A's recomputed hash resolves to no provider.
+    # Pre-existing in-flight task that shares foundation finding A's code REGION
+    # (related_files) and title, but whose finding_hash is DIFFERENT (a prior
+    # run's body) — so A is region-deduped against it, yet A's recomputed hash
+    # resolves to no provider.
     foundation_title = "reconcile chosen snecko act-2 move logic to canonical"
+    foundation_files = ["stsbot/enemies.py", "stsbot/moves.py"]
     existing_inflight = _Task(
         project_id=_project.id,
         title=foundation_title,
@@ -5366,6 +5368,7 @@ async def test_depends_on_indices_deduped_sibling_no_provider_spawns_standalone(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
         context={
             "direction_id": direction["id"],
+            "related_files": foundation_files,
             # Hash from a DIFFERENT body — deliberately not equal to finding A's hash.
             "finding_hash": _finding_hash(foundation_title, "a different earlier body"),
         },
@@ -5374,9 +5377,10 @@ async def test_depends_on_indices_deduped_sibling_no_provider_spawns_standalone(
     await db_session.commit()
     await db_session.refresh(existing_inflight)
 
-    # Foundation finding A (same title → word-overlap deduped; default body → its
-    # OWN hash, which differs from the existing task's stored hash).
+    # Foundation finding A (same region + title → region-deduped; default body →
+    # its OWN hash, which differs from the existing task's stored hash).
     finding_a = _make_finding(title=foundation_title, direction_id=direction["id"])
+    finding_a["related_files"] = foundation_files
     a_hash = _finding_hash(finding_a["title"], finding_a["description"])
     assert a_hash != existing_inflight.context["finding_hash"], (
         "test precondition: A's hash must differ from the existing task's so the "
@@ -8005,7 +8009,10 @@ class TestComputeExperimentSpawn:
             payloads=[{"type": active_type}],
             status=TaskStatus.IN_PROGRESS,
             created_by="ORCHESTRATOR",
-            context={"direction_id": direction["id"]},
+            context={
+                "direction_id": direction["id"],
+                "related_files": ["app/release.py", "app/proof.py"],
+            },
         )
         db_session.add(active_task)
         await db_session.commit()
@@ -8015,6 +8022,10 @@ class TestComputeExperimentSpawn:
             spend_cap_usd=2.0,
             deadline_seconds=3600,
         )
+        # Region-identity dedup keys on related_files: same files as the active
+        # task so the compute-typed case collides (the research-typed case is
+        # still kept — blocked earlier by the compute-experiment type gate).
+        finding["related_files"] = ["app/release.py", "app/proof.py"]
         _patch_research_externals(mocker)
         mocker.patch(
             "app.research_completion._parse_research_findings", return_value=[finding]

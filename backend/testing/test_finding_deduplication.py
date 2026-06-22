@@ -419,14 +419,20 @@ def test_deduplicate_findings_hash_dedup_counter():
     assert outcome.deduplicated == []
 
 
-def test_deduplicate_findings_word_overlap_skip():
+def test_deduplicate_findings_region_identity_skip():
+    # Shared region (2+ related_files) AND title corroboration → duplicate.
     finding = {
         "title": "alpha beta gamma delta",
         "description": "desc",
         "priority": "medium",
         "direction_id": "dir-1",
+        "related_files": ["app/foo.py", "app/bar.py"],
     }
-    existing = [("dir-1", "alpha beta gamma delta something-else")]
+    # Active-task candidate is a 4-tuple: (dir, title, task_type, related_files).
+    existing = [
+        ("dir-1", "alpha beta gamma delta something-else", None,
+         ["app/foo.py", "app/bar.py"])
+    ]
     outcome = deduplicate_findings(
         [finding],
         task_context=None,
@@ -437,6 +443,85 @@ def test_deduplicate_findings_word_overlap_skip():
     )
     assert outcome.word_overlap_count == 1
     assert outcome.deduplicated == []
+    assert outcome.filtered[0]["reason"].startswith("region overlap with: ")
+
+
+def test_deduplicate_findings_title_collision_without_region_kept():
+    # Regression for the `a/b`-token false positive: titles collide on a shared
+    # token but the findings target DIFFERENT files (no region). Must NOT dedup.
+    finding = {
+        "title": "feat: STSBOT_SEARCH_MC_ROLLOUTS seam + MC-oracle leaf A/B",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-1",
+        "related_files": ["stsbot/search_agent.py"],
+    }
+    existing = [
+        ("dir-1", "obs: search-depth axis closed; per-fight A/B instrument", None,
+         ["notes/wide_search_verdict.md"])
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert outcome.word_overlap_count == 0
+    assert len(outcome.deduplicated) == 1
+
+
+def test_deduplicate_findings_shared_region_without_corroboration_kept():
+    # Two distinct findings touch some of the same files (region present, but
+    # file Jaccard < strong threshold) and neither title-overlap nor a shared
+    # claim corroborates → distinct work, kept.
+    finding = {
+        "title": "add retry backoff to dispatch",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-1",
+        "related_files": ["app/foo.py", "app/bar.py", "app/baz.py", "app/qux.py"],
+        "claims": ["dispatch lacks backoff"],
+    }
+    existing = [
+        ("dir-1", "remove dead import from helper", None,
+         ["app/foo.py", "app/bar.py", "app/other.py", "app/more.py"])
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert outcome.word_overlap_count == 0
+    assert len(outcome.deduplicated) == 1
+
+
+def test_deduplicate_findings_fileless_finding_not_region_deduped():
+    # A finding with no related_files cannot establish a region — it is left to
+    # exact-hash dedup, never region-matched, even with an identical title.
+    finding = {
+        "title": "alpha beta gamma delta",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-1",
+    }
+    existing = [
+        ("dir-1", "alpha beta gamma delta", None, ["app/foo.py", "app/bar.py"])
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert outcome.word_overlap_count == 0
+    assert len(outcome.deduplicated) == 1
 
 
 def test_deduplicate_findings_file_overlap_subset():
@@ -482,10 +567,14 @@ def test_deduplicate_findings_parent_direction_inherited_from_context():
         "title": "alpha beta gamma delta novel-end",
         "description": "desc",
         "priority": "medium",
+        "related_files": ["app/foo.py", "app/bar.py"],
         # No direction_id on finding — should fall back to task_context direction_id
     }
-    # Existing task shares 4+ words in the SAME direction (via inheritance)
-    existing = [("dir-parent", "alpha beta gamma delta different")]
+    # Existing task shares the region + 3+ words in the SAME direction (via inheritance)
+    existing = [
+        ("dir-parent", "alpha beta gamma delta different", None,
+         ["app/foo.py", "app/bar.py"])
+    ]
     outcome = deduplicate_findings(
         [finding],
         task_context={"direction_id": "dir-parent"},
@@ -504,22 +593,27 @@ def test_reworded_same_direction_duplicate_of_recent_terminal_task_suppressed():
             "description": "desc",
             "direction_id": "dir-1",
             "type": "research",
+            "related_files": ["backend/app/alpha.py", "backend/app/beta.py"],
             "sources": [{"type": "file", "ref": "backend/app/alpha.py"}],
             "claims": ["terminal chain already explored"],
         }
     ]
     findings = [
         {
+            # Same region + title corroboration → suppressed.
             "title": "duplicate recent terminal finding chain again",
             "description": "different desc",
             "priority": "medium",
             "direction_id": "dir-1",
+            "related_files": ["backend/app/alpha.py", "backend/app/beta.py"],
         },
         {
+            # Different region (no shared files) → kept despite title words.
             "title": "duplicate terminal chain noticed elsewhere",
             "description": "different desc",
             "priority": "medium",
             "direction_id": "dir-2",
+            "related_files": ["backend/app/unrelated.py"],
         },
     ]
     outcome = deduplicate_findings(
@@ -537,7 +631,7 @@ def test_reworded_same_direction_duplicate_of_recent_terminal_task_suppressed():
     assert len(outcome.filtered) == 1
     rec = outcome.filtered[0]
     assert rec["direction_id"] == "dir-1"
-    assert rec["reason"].startswith("recent terminal word overlap with: ")
+    assert rec["reason"].startswith("recent terminal region overlap with: ")
 
 
 def test_deduplicate_findings_recent_terminal_evidence_overlap_rejects_reworded_duplicate():
@@ -616,12 +710,13 @@ def test_deduplicate_findings_records_hash_dedup_reason():
     assert rec["reason"] == "hash match with prior task"
 
 
-def test_deduplicate_findings_records_word_overlap_matched_title():
+def test_deduplicate_findings_records_region_overlap_matched_title():
     finding = {
         "title": "alpha beta gamma delta novel",
         "description": "desc",
         "priority": "medium",
         "direction_id": "dir-1",
+        "related_files": ["app/foo.py", "app/bar.py"],
     }
     existing_title = "alpha beta gamma delta something-else"
     outcome = deduplicate_findings(
@@ -629,14 +724,16 @@ def test_deduplicate_findings_records_word_overlap_matched_title():
         task_context=None,
         recent_finding_hashes=set(),
         failed_hashes={},
-        existing_tasks_with_dirs=[("dir-1", existing_title)],
+        existing_tasks_with_dirs=[
+            ("dir-1", existing_title, None, ["app/foo.py", "app/bar.py"])
+        ],
         open_pr_files=set(),
     )
     assert len(outcome.filtered) == 1
     rec = outcome.filtered[0]
     assert rec["title"] == "alpha beta gamma delta novel"
     assert rec["direction_id"] == "dir-1"
-    assert rec["reason"].startswith("word overlap with: ")
+    assert rec["reason"].startswith("region overlap with: ")
     assert "alpha beta gamma delta" in rec["reason"]
     # The persisted reason must stay compact so it does not bloat the prompt.
     assert len(rec["reason"]) <= 80
@@ -649,7 +746,9 @@ def test_compute_finding_word_overlap_respects_active_task_type_metadata():
         "priority": "medium",
         "direction_id": "dir-1",
         "type": "compute_experiment",
+        "related_files": ["app/release.py", "app/proof.py"],
     }
+    _files = ["app/release.py", "app/proof.py"]
     cases = [
         ("research", "research measure live release proof acceptance evidence", 1, 0),
         (
@@ -666,7 +765,7 @@ def test_compute_finding_word_overlap_respects_active_task_type_metadata():
             recent_finding_hashes=set(),
             failed_hashes={},
             existing_tasks_with_dirs=[
-                ("dir-1", active_title, task_type),
+                ("dir-1", active_title, task_type, _files),
             ],
             open_pr_files=set(),
         )
@@ -1826,17 +1925,27 @@ def test_is_duplicate_plain_words_no_false_positive():
     assert is_duplicate(title3, "dir-1", existing3) is False
 
 
-def test_deduplicate_findings_catches_technical_token_duplicate():
-    # A reworded finding sharing a technical identifier should be blocked
+def test_deduplicate_findings_catches_same_file_region_duplicate():
+    # A reworded finding about the SAME file (declared in related_files) is
+    # blocked via region identity — the shared file establishes the region and
+    # the near-identical file set corroborates. (Previously this relied on a
+    # title technical-token gate, which also fired on generic tokens like
+    # ``a/b`` and dropped distinct work; region keying removes that.)
     findings = [
         {
             "title": "finding_deduplication.py misses paraphrased cross-cycle titles",
             "description": "The word-overlap gate does not catch reworded duplicates.",
             "priority": "medium",
+            "related_files": ["backend/app/finding_deduplication.py"],
         }
     ]
     existing = [
-        ("dir-1", "finding_deduplication.py skips reworded research findings", None)
+        (
+            "dir-1",
+            "finding_deduplication.py skips reworded research findings",
+            None,
+            ["backend/app/finding_deduplication.py"],
+        )
     ]
     outcome = deduplicate_findings(
         findings=findings,

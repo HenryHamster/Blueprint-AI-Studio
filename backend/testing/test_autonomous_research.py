@@ -3130,7 +3130,8 @@ async def test_hash_deduplication_skips_finding_with_matching_hash(db_session, m
 
 @pytest.mark.asyncio
 async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker):
-    """A finding with 4+ meaningful words overlapping an active task title is skipped."""
+    """A finding sharing an active task's code REGION (related_files) plus title
+    words is skipped by region-identity dedup."""
     direction = _active_direction("d-worddup1", "Word overlap direction")
     project = Project(
         name="Word Overlap Dedup",
@@ -3142,12 +3143,14 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Active task with a title that shares key words
+    # Active task that shares both the code region (related_files) and key words.
+    # related_files are recorded on the task context at spawn time, which is what
+    # region-identity dedup reads.
     existing = Task(
         project_id=project.id,
         title="optimize database connection pooling configuration",
         payloads=[{"type": "create", "prompt": "...", "base_branch": "main"}],
-        context={},
+        context={"related_files": ["app/db/pool.py", "app/db/config.py"]},
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -3162,7 +3165,8 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
         "app.research_completion._parse_research_findings",
         return_value=[
             {
-                # "database", "connection", "pooling", "configuration" overlap existing → ≥4 words
+                # Same region (related_files) + "database connection pooling
+                # configuration" word overlap with the active task → duplicate.
                 "title": "tune database connection pooling configuration settings",
                 "description": "Improve pooling",
                 "prompt": "Tune the connection pool",
@@ -3171,6 +3175,7 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
                 "risk": "low",
                 "type": "improvement",
                 "direction_id": direction["id"],
+                "related_files": ["app/db/pool.py", "app/db/config.py"],
             }
         ],
     )
@@ -3891,7 +3896,10 @@ async def test_filtered_findings_recorded_in_direction_history(db_session, mocke
         project_id=project.id,
         title="instrument pipeline throughput histogram latency metrics",
         payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
-        context={"direction_id": direction_id},
+        context={
+            "direction_id": direction_id,
+            "related_files": ["app/metrics.py", "app/pipeline.py"],
+        },
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -3929,6 +3937,7 @@ async def test_filtered_findings_recorded_in_direction_history(db_session, mocke
                 "risk": "low",
                 "type": "improvement",
                 "direction_id": direction_id,
+                "related_files": ["app/metrics.py", "app/pipeline.py"],
             },
         ],
     )
@@ -3945,7 +3954,7 @@ async def test_filtered_findings_recorded_in_direction_history(db_session, mocke
     reasons_by_title = {rec["title"]: rec["reason"] for rec in filtered}
     assert reasons_by_title[dup_title] == "hash match with prior task"
     word_title = "instrument pipeline throughput histogram latency counters"
-    assert reasons_by_title[word_title].startswith("word overlap with: ")
+    assert reasons_by_title[word_title].startswith("region overlap with: ")
     # filter_breakdown is unchanged (additive persistence, counters still match).
     assert entry["filter_breakdown"]["hash_dedup"] == 1
     assert entry["filter_breakdown"]["word_overlap_dedup"] == 1

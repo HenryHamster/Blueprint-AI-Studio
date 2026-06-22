@@ -8,8 +8,13 @@ Four strategies are applied, in order:
   1. Hash dedup (``finding_hash`` collides with a recent task that is either
      already merged, still running, a suppressed cancellation, or a "real"
      failure within cooldown).
-  2. Word-overlap title matching against currently active tasks, with a
-     direction-aware threshold (same-direction 4 words, cross-direction 6).
+  2. Region-identity matching against currently active tasks and recent terminal
+     findings: a candidate duplicates a finding only when their ``related_files``
+     overlap (the necessary condition) AND that overlap is corroborated by title
+     word-overlap or a shared claim. This replaced an earlier title-string-only
+     match whose single-token false positives (e.g. a shared ``a/b``) silently
+     dropped genuinely-distinct work; gating title overlap behind concrete
+     file-region overlap removes that failure mode. See :func:`_find_overlap_match`.
   3. File-overlap: skip findings whose ``related_files`` are fully covered by
      open PR artifacts.
   4. Evidence-overlap: skip findings whose source refs (≥80% Jaccard overlap)
@@ -81,11 +86,32 @@ _COMPUTE_EXPERIMENT_FINDING_TYPES = frozenset(
 )
 
 
+# ── Region-identity dedup thresholds ────────────────────────────────────────
+# A finding is a duplicate of a candidate only when they target an overlapping
+# code REGION (related_files) AND that overlap is corroborated by title/claim
+# evidence. This replaces the prior title-string-similarity match (word /
+# technical-token / bigram overlap), which produced unbounded false positives:
+# a single shared generic token (e.g. ``a/b``) collided genuinely-distinct work.
+# Requiring concrete file-region overlap as a NECESSARY precondition neutralizes
+# that failure mode while keeping the agent's title/claims as corroborators.
+#
+# region (necessary):     |related_files ∩| >= REGION_MIN_SHARED  OR  jaccard >= REGION_MIN_JACCARD
+# corroboration (any of): title word-overlap >= CORROBORATE_WORDS_SAME / _CROSS,
+#                         OR >=1 shared claim, OR file jaccard >= STRONG_REGION_JACCARD
+REGION_MIN_SHARED = 2
+REGION_MIN_JACCARD = 0.5
+STRONG_REGION_JACCARD = 0.7
+CORROBORATE_WORDS_SAME = 3
+CORROBORATE_WORDS_CROSS = 5
+
+
 @dataclass(frozen=True)
 class _OverlapCandidate:
     direction_id: Optional[str]
     title: str
     task_type: Optional[str] = None
+    related_files: frozenset = frozenset()
+    claims: frozenset = frozenset()
 
 
 # Whitelisted prerequisite kinds for the machine-resolvable {kind, ref} need
@@ -173,7 +199,12 @@ def is_duplicate(
     finding_dir_id: Optional[str],
     existing: Iterable[tuple],
 ) -> bool:
-    """Word-overlap check with direction-aware threshold.
+    """Legacy title-only word-overlap check with direction-aware threshold.
+
+    NOTE: This predicate is NOT on the research spawn path — the live finding
+    dedup uses region-identity matching (:func:`_find_overlap_match`). It is
+    retained only as a standalone title-similarity helper for callers/tests that
+    want pure title comparison; do not route new spawn-gating through it.
 
     Cross-direction: require 6+ word overlap. Independent strategic tracks
     rarely produce true duplicates, so a higher threshold avoids false
@@ -714,6 +745,35 @@ def _extract_normalized_claims(claims: list) -> set[str]:
     return normalized
 
 
+def _norm_related_files(raw: object) -> frozenset:
+    """Normalize a ``related_files`` value into a set of comparable file paths.
+
+    Strips line-number suffixes (reusing :func:`_normalize_source_ref`) and
+    lowercases for case-insensitive path comparison. Non-list inputs yield the
+    empty set so a finding/task with no declared files simply cannot establish a
+    region (it falls back to exact-hash dedup).
+    """
+    if not isinstance(raw, (list, set, tuple)):
+        return frozenset()
+    out = set()
+    for x in raw:
+        if not x:
+            continue
+        norm = _normalize_source_ref(str(x)).lower()
+        if norm:
+            out.add(norm)
+    return frozenset(out)
+
+
+def _norm_claim_set(raw: object) -> frozenset:
+    """Normalize a ``claims`` list into a set of comparable claim strings."""
+    if not isinstance(raw, (list, set, tuple)):
+        return frozenset()
+    return frozenset(
+        _normalize_claim(c) for c in raw if isinstance(c, str) and c.strip()
+    )
+
+
 def _jaccard_overlap(set_a: set, set_b: set) -> float:
     """Calculate Jaccard similarity between two sets.
 
@@ -777,6 +837,10 @@ class DedupOutcome:
 
     deduplicated: list[tuple[int, dict, str]] = field(default_factory=list)
     hash_dedup_count: int = 0
+    # Count of findings dropped by region-identity dedup (shared related_files +
+    # title/claim corroboration). Field name retained for backward compatibility
+    # with the persisted ``word_overlap_dedup`` breakdown key and its downstream
+    # consumers (digest / direction_outcomes / agent research-plan prompt).
     word_overlap_count: int = 0
     file_overlap_count: int = 0
     evidence_overlap_count: int = 0
@@ -800,7 +864,7 @@ def deduplicate_findings(
     direction_categories: Optional[dict[str, str]] = None,
     recent_terminal_findings: Optional[list[dict]] = None,
 ) -> DedupOutcome:
-    """Apply hash, word-overlap, file-overlap, and evidence-overlap dedup to ``findings``.
+    """Apply hash, region-identity, file-overlap, and evidence-overlap dedup to ``findings``.
 
     Preserves priority-first ordering (high → medium → low) with stable order
     inside each tier. Returns a :class:`DedupOutcome` carrying the surviving
@@ -848,14 +912,15 @@ def deduplicate_findings(
             continue
 
         matched_title = _find_overlap_match(
-            title, finding_dir_id, existing_tasks_with_dirs, finding_task_type
+            finding, finding_dir_id, existing_tasks_with_dirs, finding_task_type
         )
         if matched_title is not None:
             logger.warning(
-                f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task"
+                f"[RESEARCH] Skipping duplicate finding '{title}' — shares code region "
+                f"with existing task '{matched_title[:60]}'"
             )
             outcome.word_overlap_count += 1
-            reason = f"word overlap with: {matched_title[:60]}"
+            reason = f"region overlap with: {matched_title[:60]}"
             outcome.filtered.append(
                 {
                     "title": title[:120],
@@ -867,14 +932,15 @@ def deduplicate_findings(
 
         if recent_terminal_findings:
             matched_title = _find_overlap_match(
-                title, finding_dir_id, recent_terminal_findings, finding_task_type
+                finding, finding_dir_id, recent_terminal_findings, finding_task_type
             )
             if matched_title is not None:
                 logger.warning(
-                    f"[RESEARCH] Skipping finding '{title}' — matches recent terminal task"
+                    f"[RESEARCH] Skipping finding '{title}' — shares code region with "
+                    f"recent terminal finding '{matched_title[:60]}'"
                 )
                 outcome.word_overlap_count += 1
-                reason = f"recent terminal word overlap with: {matched_title[:60]}"
+                reason = f"recent terminal region overlap with: {matched_title[:60]}"
                 outcome.filtered.append(
                     {
                         "title": title[:120],
@@ -973,52 +1039,65 @@ def deduplicate_findings(
 
 
 def _find_overlap_match(
-    finding_title: str,
+    finding: dict,
     finding_dir_id: Optional[str],
     existing: Iterable[tuple],
     finding_task_type: Optional[str] = None,
 ) -> Optional[str]:
-    """Return the first existing title that word-overlaps ``finding_title``.
+    """Return the title of the first candidate that is a REGION-IDENTITY duplicate.
 
-    Uses the same threshold rules as :func:`is_duplicate` (4 words same or
-    unknown direction, 6 words cross-direction). Returns ``None`` when no
-    match is found, so callers can build a reason string with the matched
-    title.
+    A candidate duplicates ``finding`` only when both conditions hold:
 
-    Secondary gates (technical token overlap and bigram Jaccard) mirror those
-    in :func:`is_duplicate` so both entry-points enforce consistent semantics.
+    1. REGION (necessary): their ``related_files`` overlap by at least
+       :data:`REGION_MIN_SHARED` files OR Jaccard >= :data:`REGION_MIN_JACCARD`.
+       A finding/candidate with no declared files cannot establish a region and
+       is never matched here (it falls back to exact-hash dedup).
+    2. CORROBORATION (sufficient, given region): title word-overlap meets the
+       direction-aware word threshold, OR they share at least one claim, OR the
+       file sets are near-identical (Jaccard >= :data:`STRONG_REGION_JACCARD`).
+
+    This replaces the prior title-string-only match (word / technical-token /
+    bigram overlap), whose single-token false positives silently dropped
+    distinct work. Title overlap survives only as a corroborator *gated behind*
+    concrete file-region overlap, so a shared generic token alone can no longer
+    suppress a finding. Returns ``None`` when nothing matches, so callers can
+    build a reason string from the matched title.
     """
-    words = set(finding_title.lower().split()) - _STOPWORDS
-    finding_tech = _extract_technical_tokens(finding_title)
-    finding_bgs = _title_bigrams(finding_title)
+    finding_files = _norm_related_files(finding.get("related_files"))
+    if not finding_files:
+        return None
+    finding_words = set((finding.get("title") or "").lower().split()) - _STOPWORDS
+    finding_claims = _norm_claim_set(finding.get("claims"))
     for candidate_raw in existing:
         candidate = _coerce_overlap_candidate(candidate_raw)
         if candidate is None:
             continue
         if not _candidate_can_overlap(finding_task_type, candidate):
             continue
-        task_dir_id = candidate.direction_id
-        title = candidate.title
-        overlap = words & (set(title.lower().split()) - _STOPWORDS)
+        cand_files = candidate.related_files
+        if not cand_files:
+            continue
+        shared = finding_files & cand_files
+        file_jaccard = _jaccard_overlap(finding_files, cand_files)
+        region = len(shared) >= REGION_MIN_SHARED or file_jaccard >= REGION_MIN_JACCARD
+        if not region:
+            continue
         same_direction = (
-            not finding_dir_id or not task_dir_id or finding_dir_id == task_dir_id
+            not finding_dir_id
+            or not candidate.direction_id
+            or finding_dir_id == candidate.direction_id
         )
-        threshold = 4 if same_direction else 6
-        if len(overlap) >= threshold:
-            return title
-        # Technical token secondary gate
-        if finding_tech:
-            cand_tech = _extract_technical_tokens(title)
-            tech_threshold = 1 if same_direction else 2
-            if len(finding_tech & cand_tech) >= tech_threshold:
-                return title
-        # Bigram Jaccard secondary gate
-        if finding_bgs:
-            cand_bgs = _title_bigrams(title)
-            if cand_bgs:
-                jac_threshold = 0.65 if same_direction else 0.80
-                if _jaccard_overlap(finding_bgs, cand_bgs) >= jac_threshold:
-                    return title
+        word_threshold = (
+            CORROBORATE_WORDS_SAME if same_direction else CORROBORATE_WORDS_CROSS
+        )
+        title_words = set(candidate.title.lower().split()) - _STOPWORDS
+        corroborated = (
+            len(finding_words & title_words) >= word_threshold
+            or bool(finding_claims & candidate.claims)
+            or file_jaccard >= STRONG_REGION_JACCARD
+        )
+        if corroborated:
+            return candidate.title
     return None
 
 
@@ -1033,12 +1112,20 @@ def _coerce_overlap_candidate(raw: object) -> Optional[_OverlapCandidate]:
             direction_id=_optional_str(raw.get("direction_id")),
             title=str(title),
             task_type=_normalize_task_type(raw.get("task_type") or raw.get("type")),
+            related_files=_norm_related_files(raw.get("related_files")),
+            claims=_norm_claim_set(raw.get("claims")),
         )
     if isinstance(raw, tuple) and len(raw) >= 2:
+        # Active-task tuples: (direction_id, title[, task_type[, related_files]]).
+        # Legacy 2/3-tuples carry no files and so cannot establish a region —
+        # they are effectively inert under region-identity dedup, which is the
+        # safe default (no false positives) for callers that have not been
+        # updated to supply related_files.
         return _OverlapCandidate(
             direction_id=_optional_str(raw[0]),
             title=str(raw[1]),
             task_type=_normalize_task_type(raw[2]) if len(raw) >= 3 else None,
+            related_files=_norm_related_files(raw[3]) if len(raw) >= 4 else frozenset(),
         )
     return None
 
