@@ -558,6 +558,21 @@ async def _auto_stale_not_promoted_findings(
             written += 1
 
         if written:
+            await _notify_operator(
+                session,
+                version,
+                "release_qualification_auto_stale",
+                (
+                    f"v{version.version_number} auto-staled {written} finding(s): "
+                    f"automain advanced past candidate {candidate_sha[:12]} "
+                    f"to {head_sha[:12]}. A fresh qualification will be triggered."
+                ),
+                extra={
+                    "written": written,
+                    "candidate_sha": candidate_sha,
+                    "head_sha": head_sha,
+                },
+            )
             await session.commit()
             logger.info(
                 "[RELEASE_QUALIFIER] auto_stale: wrote %d stale ledger row(s) "

@@ -94,7 +94,7 @@ def evaluate_merge_grade(
             "covers_goal": None,
             "coverage": None,
             "biggest_gap": None,
-            "blocked": False,
+            "blocked": True,
             "detail": None,
         }
 
@@ -115,7 +115,7 @@ def evaluate_merge_grade(
             "covers_goal": None,
             "coverage": coverage,
             "biggest_gap": None,
-            "blocked": False,
+            "blocked": True,
             "detail": artifact,
         }
 

@@ -14010,7 +14010,9 @@ async def test_auto_stale_writes_stale_rows_when_head_advanced(db_session, mocke
     count = await rq.sweep_stuck_qualifications(
         db_session, session_factory=_shared_session_factory(db_session)
     )
-    await db_session.commit()
+    # No extra commit here: _auto_stale_not_promoted_findings calls session.commit()
+    # itself (via the shared factory) — all writes including the operator
+    # notification should be committed by the production code, not by this test.
 
     # Auto-stale writes a ledger row; re-drive fires in the same cycle → count=1.
     assert count == 1
@@ -14035,6 +14037,22 @@ async def test_auto_stale_writes_stale_rows_when_head_advanced(db_session, mocke
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
     assert len(await _audit_tasks(db_session, project.id)) == 1
+
+    # Operator notification posted with release_qualification_auto_stale event.
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.context["event_type"].as_string()
+                    == "release_qualification_auto_stale",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs) == 1
 
 
 @pytest.mark.asyncio
@@ -19072,7 +19090,12 @@ class TestFormatQualificationForApi:
             "promotion_conflict": True,
             "promotion_error_detail": "merge conflict",
             "theme_delivery": {"theme_class": "leanness", "assessed_grade": 1.0},
-            "goal_alignment": {"state": "aligned", "assessed_grade": 0.85, "biggest_gap": None, "reasoning_summary": "Goal delivered."},
+            "goal_alignment": {
+                "state": "aligned",
+                "assessed_grade": 0.85,
+                "biggest_gap": None,
+                "reasoning_summary": "Goal delivered.",
+            },
         }
         out = rq.format_qualification_for_api(qual)
         assert out["confidence"] == 0.82
@@ -23440,7 +23463,12 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         promotion_conflict=True,
         promotion_error_detail="merge conflict",
         theme_delivery=_theme_cert,
-        goal_alignment={"state": "aligned", "assessed_grade": 0.9, "biggest_gap": None, "reasoning_summary": "Goal delivered."},
+        goal_alignment={
+            "state": "aligned",
+            "assessed_grade": 0.9,
+            "biggest_gap": None,
+            "reasoning_summary": "Goal delivered.",
+        },
     )
 
     out = rq.format_verdict_for_api(verdict)
@@ -23466,7 +23494,12 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     # Theme-delivery cert surfaces from migration-0305 column.
     assert out["theme_delivery"] == _theme_cert
     # Goal-alignment cert surfaces from migration-0328 column.
-    assert out["goal_alignment"] == {"state": "aligned", "assessed_grade": 0.9, "biggest_gap": None, "reasoning_summary": "Goal delivered."}
+    assert out["goal_alignment"] == {
+        "state": "aligned",
+        "assessed_grade": 0.9,
+        "biggest_gap": None,
+        "reasoning_summary": "Goal delivered.",
+    }
     # Legacy rows (no theme_delivery set) must return None, not raise.
     verdict_legacy = QualificationVerdict(
         project_id=uuid.uuid4(),
@@ -25684,16 +25717,16 @@ class TestEvaluateMergeGrade:
         assert result["blocked"] is False
 
     def test_unparseable_when_artifact_none(self):
-        """Non-empty goal + None artifact → status=unparseable, blocked=False."""
+        """Non-empty goal + None artifact → status=unparseable, blocked=True (infra failure must hold)."""
         result = rs.evaluate_merge_grade("deliver analytics dashboard", None)
         assert result["status"] == "unparseable"
-        assert result["blocked"] is False
+        assert result["blocked"] is True
 
     def test_unparseable_when_artifact_not_dict(self):
-        """Non-empty goal + non-dict artifact → status=unparseable, blocked=False."""
+        """Non-empty goal + non-dict artifact → status=unparseable, blocked=True (infra failure must hold)."""
         result = rs.evaluate_merge_grade("deliver analytics dashboard", "bad")
         assert result["status"] == "unparseable"
-        assert result["blocked"] is False
+        assert result["blocked"] is True
 
     def test_pass_when_covers_goal_true(self):
         """Explicit covers_goal=True → status=pass, blocked=False."""
@@ -25755,13 +25788,13 @@ class TestEvaluateMergeGrade:
         assert result["blocked"] is True
 
     def test_unparseable_when_neither_bool_nor_score(self):
-        """Dict artifact with no usable covers_goal or coverage_score → unparseable."""
+        """Dict artifact with no usable covers_goal or coverage_score → unparseable, blocked=True."""
         result = rs.evaluate_merge_grade(
             "deliver analytics dashboard",
             {"something_else": "irrelevant"},
         )
         assert result["status"] == "unparseable"
-        assert result["blocked"] is False
+        assert result["blocked"] is True
 
 
 # ===========================================================================
