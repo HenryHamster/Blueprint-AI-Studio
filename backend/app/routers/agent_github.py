@@ -54,14 +54,18 @@ _COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,40}$")
 async def agent_github_get_token(
     request: Request,
     task_id: uuid.UUID,
+    force_refresh: bool = False,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
     if str(task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
 
+    # force_refresh busts the ~50min in-process token cache so the agent can
+    # re-mint a fresh installation token when a baked-in one has expired (e.g.
+    # a clone that fails authentication after a long queue/provision delay).
     gh_token, owner, repo = await _agent_router.get_github_token_for_task(
-        task_id, session
+        task_id, session, force_refresh=force_refresh
     )
     return {
         "status": "success",

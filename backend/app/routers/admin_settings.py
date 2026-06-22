@@ -82,7 +82,7 @@ def _reject_unknown_task_types(
 # stale field name — _apply_settings logs it as a WARNING and rejects the whole
 # request (400) rather than silently dropping it, so a misconfigured admin call
 # is detectable instead of vanishing. Keep this in sync with the `"<key>" in
-# payload` branches below; test_admin_settings asserts the round-trip.
+# payload` branches below; test_admin_routers asserts the round-trip.
 _KNOWN_SETTINGS_KEYS = frozenset(
     {
         "agent_prompt_suffixes",
@@ -133,6 +133,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "max_rollup_retries",
         "max_total_research_per_project",
         "next_role_poll_timeout_secs",
+        "no_ci_test_gate_enabled",
         "notification_config",
         "module_interfaces_holdback_fraction",
         "related_tests_holdback_fraction",
@@ -465,6 +466,9 @@ async def get_settings(
             ).items()
         },
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
+        "no_ci_test_gate_enabled": bool(
+            _runtime_config.get("no_ci_test_gate_enabled", True)
+        ),
         "promotion_threshold": _runtime_config.get("promotion_threshold"),
         "promotion_weights": _runtime_config.get("promotion_weights"),
         "warm_continuity_enabled": bool(
@@ -934,6 +938,10 @@ async def _apply_settings(
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
     if "smoketest_enabled" in payload:
         _runtime_config["smoketest_enabled"] = bool(payload["smoketest_enabled"])
+    if "no_ci_test_gate_enabled" in payload:
+        _runtime_config["no_ci_test_gate_enabled"] = bool(
+            payload["no_ci_test_gate_enabled"]
+        )
     if "usage_headroom_gate_enabled" in payload:
         val = payload["usage_headroom_gate_enabled"]
         if not isinstance(val, bool):
@@ -2909,6 +2917,13 @@ async def _apply_settings(
                     },
                     "smoketest_enabled": bool(
                         _runtime_config.get("smoketest_enabled", False)
+                    ),
+                    # Persist the no-CI verify_tests merge-gate kill-switch so an
+                    # operator toggle survives a Cloud Run restart (config-sync
+                    # reads this key back on boot; without it the in-memory value
+                    # reverts to the NO_CI_TEST_GATE_ENABLED env default — True).
+                    "no_ci_test_gate_enabled": bool(
+                        _runtime_config.get("no_ci_test_gate_enabled", True)
                     ),
                     "promotion_threshold": _runtime_config.get("promotion_threshold"),
                     "promotion_weights": _runtime_config.get("promotion_weights"),

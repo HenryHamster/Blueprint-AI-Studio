@@ -5851,6 +5851,64 @@ class TestNotificationConfigSettings:
         await client.patch("/api/admin/settings", json={"promotion_enabled": False})
 
     @pytest.mark.asyncio
+    async def test_no_ci_test_gate_enabled_round_trip_and_persist(
+        self, client: AsyncClient, db_session
+    ):
+        """no_ci_test_gate_enabled (the no-CI verify_tests merge-gate kill-switch)
+        is settable via PATCH, surfaces on GET, persists into
+        DeploymentState.runtime_config_json, and lands in the in-memory
+        runtime_config — so an operator can toggle the gate at runtime without a
+        redeploy.
+
+        Regression: PATCH previously rejected the key via _KNOWN_SETTINGS_KEYS
+        (400 unknown key); the only way to disable the gate was the
+        NO_CI_TEST_GATE_ENABLED env var, which needs a redeploy. Guards all four
+        wiring points (allowlist, apply branch, GET response, persist dict) plus
+        the config-sync restore key in runtime_config_state.py.
+        """
+        from app.models import DeploymentState
+        from app.shared_state import runtime_config as _rc
+
+        original = _rc.get("no_ci_test_gate_enabled", True)
+        db_session.add(DeploymentState())
+        await db_session.commit()
+        try:
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"no_ci_test_gate_enabled": False},
+            )
+            assert resp.status_code == 200, resp.text
+
+            # Round-trips on GET.
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["no_ci_test_gate_enabled"] is False
+
+            # Lands in the in-memory runtime_config the orchestrator reads.
+            assert _rc.get("no_ci_test_gate_enabled") is False
+
+            # Persists into the JSONB column so it survives a restart /
+            # config-sync restore (not just one in-memory instance).
+            row = await db_session.get(DeploymentState, 1)
+            assert row is not None
+            assert row.runtime_config_json is not None
+            assert row.runtime_config_json["no_ci_test_gate_enabled"] is False
+
+            # Re-enabling round-trips the other way too.
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"no_ci_test_gate_enabled": True},
+            )
+            assert resp.status_code == 200, resp.text
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["no_ci_test_gate_enabled"] is True
+        finally:
+            # Restore the default so the flag does not leak to other tests.
+            await client.patch(
+                "/api/admin/settings",
+                json={"no_ci_test_gate_enabled": bool(original)},
+            )
+
+    @pytest.mark.asyncio
     async def test_promotion_threshold_round_trip(self, client: AsyncClient):
         """promotion_threshold is settable via PATCH, bounded to (0, 1], and
         visible on GET — so calibrating the bar needs no redeploy."""

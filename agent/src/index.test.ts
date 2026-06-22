@@ -6867,4 +6867,95 @@ describe('cloneWithRetry', () => {
       expect(line).toContain('***');
     }
   });
+
+  it('re-mints a fresh token and rewrites the clone URL after an AUTH failure', async () => {
+    vi.useFakeTimers();
+    process.env.TASK_ID = 'task-auth-123';
+    const staleUrl = 'https://x-access-token:ghs_STALE_TOKEN@github.com/org/repo.git';
+    const authErr = "remote: Invalid username or token. Password authentication is not supported.\nfatal: Authentication failed for 'https://github.com/org/repo.git/'";
+
+    // First clone attempt fails with an auth error; second succeeds.
+    let callCount = 0;
+    const cloneArgs: string[][] = [];
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown, a: unknown) => {
+      if (cmd === 'git') {
+        callCount++;
+        cloneArgs.push((a as string[]).slice());
+        if (callCount === 1) throw new Error(authErr);
+        return '' as unknown as ReturnType<typeof execFileSync>;
+      }
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    // force_refresh token endpoint returns a fresh token.
+    const fetchMock = makeFetchMock().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: { token: 'ghs_FRESH_TOKEN', owner: 'org', repo: 'repo' } }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const logLines: string[] = [];
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      logLines.push(args.map(String).join(' '));
+    });
+
+    const clonePromise = cloneWithRetry(['clone', staleUrl, '/tmp/repo'], 1000);
+    await vi.runAllTimersAsync();
+    await clonePromise;
+
+    consoleSpy.mockRestore();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    delete process.env.TASK_ID;
+
+    // The token endpoint was hit with force_refresh=true.
+    const calledUrl = String(fetchMock.mock.calls[0][0]);
+    expect(calledUrl).toContain('/api/agent/github/token');
+    expect(calledUrl).toContain('force_refresh=true');
+
+    // The retry clone used the FRESH token, not the stale one.
+    const secondCloneArgs = cloneArgs[1];
+    expect(secondCloneArgs.some(x => x.includes('ghs_FRESH_TOKEN'))).toBe(true);
+    expect(secondCloneArgs.some(x => x.includes('ghs_STALE_TOKEN'))).toBe(false);
+
+    // No log line ever leaks a raw token.
+    for (const line of logLines) {
+      expect(line).not.toContain('ghs_STALE_TOKEN');
+      expect(line).not.toContain('ghs_FRESH_TOKEN');
+    }
+  });
+
+  it('does NOT re-mint a token for a transient NETWORK failure', async () => {
+    vi.useFakeTimers();
+    process.env.TASK_ID = 'task-net-456';
+    const url = 'https://x-access-token:ghs_NET_TOKEN@github.com/org/repo.git';
+    const netErr = 'fatal: unable to access: Could not resolve host: github.com';
+
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'git') {
+        callCount++;
+        if (callCount === 1) throw new Error(netErr);
+        return '' as unknown as ReturnType<typeof execFileSync>;
+      }
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const fetchMock = makeFetchMock().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: { token: 'ghs_SHOULD_NOT_BE_FETCHED' } }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const clonePromise = cloneWithRetry(['clone', url, '/tmp/repo'], 1000);
+    await vi.runAllTimersAsync();
+    await clonePromise;
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    delete process.env.TASK_ID;
+
+    // The token endpoint must NOT have been called for a network error.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
