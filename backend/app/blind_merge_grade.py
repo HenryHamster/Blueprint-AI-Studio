@@ -49,6 +49,20 @@ from app.landed_signal import landed_signal_predicate
 from app.models import Project, Task, TaskStatus
 from app.time_utils import _utcnow
 
+
+async def _resolve_github_with_session(session, project):
+    """Module-level wrapper so tests can patch app.blind_merge_grade._resolve_github_with_session.
+
+    The real implementation is imported lazily inside to avoid a
+    blind_merge_grade <-> release_promotion import cycle at module load.
+    """
+    from app.release_promotion import (
+        _resolve_github_with_session as _fn,
+    )
+
+    return await _fn(session, project)
+
+
 logger = logging.getLogger(__name__)
 
 # The stable sub-key under ``version.last_qualification`` where the grade lives.
@@ -289,10 +303,6 @@ async def compute_blind_merge_grade(
             (candidate_sha or "")[:8],
         )
         return None
-
-    # Resolve GitHub creds.  Imported lazily to avoid a release_promotion <->
-    # blind_merge_grade import cycle at module load.
-    from app.release_promotion import _resolve_github_with_session
 
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:

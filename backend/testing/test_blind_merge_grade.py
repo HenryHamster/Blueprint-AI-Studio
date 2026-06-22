@@ -24,7 +24,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -227,7 +227,8 @@ class TestDiffAssemblyBounds:
 class TestPersistBlindMergeGrade:
     """Grade records are merged into version.last_qualification."""
 
-    def test_persist_into_empty_qualification(self):
+    @patch("app.blind_merge_grade.flag_modified")
+    def test_persist_into_empty_qualification(self, _flag_modified):
         """Persisting a grade into an empty last_qualification sets the key."""
         version = MagicMock(spec=ReleaseVersion)
         version.last_qualification = None
@@ -246,7 +247,8 @@ class TestPersistBlindMergeGrade:
         assert version.last_qualification is not None
         assert version.last_qualification[bmg.BLIND_MERGE_GRADE_KEY] == record
 
-    def test_persist_overwrites_existing_grade(self):
+    @patch("app.blind_merge_grade.flag_modified")
+    def test_persist_overwrites_existing_grade(self, _flag_modified):
         """Persisting a new grade overwrites an old one for the same key."""
         version = MagicMock(spec=ReleaseVersion)
         old_record = {
@@ -276,7 +278,8 @@ class TestPersistBlindMergeGrade:
             == "new_sha"
         )
 
-    def test_persist_preserves_other_keys(self):
+    @patch("app.blind_merge_grade.flag_modified")
+    def test_persist_preserves_other_keys(self, _flag_modified):
         """Persisting a grade preserves other keys in last_qualification."""
         version = MagicMock(spec=ReleaseVersion)
         version.last_qualification = {
