@@ -9633,12 +9633,126 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
     session.add(source)
     await session.commit()
 
-
     await _sweep_stranded_sidecar_sources()
 
     await session.refresh(source)
     assert source.status != TaskStatus.EVALUATING, (
         "source must not remain EVALUATING after sweep detects the dead non-first sidecar"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, mocker):
+    """A source with two terminal sidecars in different lanes has both verdicts applied exactly once.
+
+    The stranded-sidecar recovery sweep must fire lane resolution once per terminal
+    awaiting_* key. This test verifies the invariant: when a source carries two
+    terminal sidecars in two different lanes (e.g., quality_grader and
+    safeguard_challenge), the sweep resolves both, and both lane verdicts are
+    recorded in the source's context exactly once.
+    """
+    from app.services import _sweep_stranded_sidecar_sources
+    from app.task_evaluators import (
+        QUALITY_GRADER_SOURCE_KEY,
+        QUALITY_GRADER_VERDICT_KEY,
+        SAFEGUARD_CHALLENGE_SOURCE_KEY,
+        SAFEGUARD_CHALLENGE_VERDICT_KEY,
+    )
+
+    session, Session = tl_db
+    mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.research_completion._handle_research_completion",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.task_completion._maybe_release_safeguard_gate",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
+    )
+
+    project = await _make_project(session)
+
+    # Source task — EVALUATING with two awaiting keys for different lanes.
+    source = Task(
+        project_id=project.id,
+        payloads=[{"type": "security_audit", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(source)
+    await session.commit()
+    await session.refresh(source)
+
+    # Create first terminal sidecar for quality_grader lane.
+    grader = Task(
+        project_id=project.id,
+        payloads=[{"type": "investigate", "prompt": "grade", "base_branch": "main"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        context={QUALITY_GRADER_SOURCE_KEY: str(source.id)},
+        latest_status_message="Grader crashed",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(grader)
+    await session.commit()
+    await session.refresh(grader)
+
+    # Create second terminal sidecar for safeguard_challenge lane.
+    challenge = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "investigate", "prompt": "challenge", "base_branch": "main"}
+        ],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(source.id)},
+        latest_status_message="Challenge timed out",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    session.add(challenge)
+    await session.commit()
+    await session.refresh(challenge)
+
+    # Wire both sidecars into the source's context, one for each lane.
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    source.context = {
+        "awaiting_quality_grader": str(grader.id),
+        "awaiting_safeguard_challenge": str(challenge.id),
+    }
+    _flag_modified(source, "context")
+    session.add(source)
+    await session.commit()
+
+    # Run the sweep.
+    await _sweep_stranded_sidecar_sources()
+
+    # Verify the source has left EVALUATING.
+    await session.refresh(source)
+    assert source.status != TaskStatus.EVALUATING, (
+        "source must not remain EVALUATING after sweep resolves both terminal sidecars"
+    )
+
+    # Verify both verdicts are present in the source's context.
+    ctx = source.context or {}
+    assert QUALITY_GRADER_VERDICT_KEY in ctx, (
+        "quality_grader verdict must be written on the source after resolution"
+    )
+    assert SAFEGUARD_CHALLENGE_VERDICT_KEY in ctx, (
+        "safeguard_challenge verdict must be written on the source after resolution"
+    )
+
+    # Verify both awaiting keys have been cleared.
+    assert "awaiting_quality_grader" not in ctx, (
+        "awaiting_quality_grader must be cleared after resolution"
+    )
+    assert "awaiting_safeguard_challenge" not in ctx, (
+        "awaiting_safeguard_challenge must be cleared after resolution"
     )
 
 

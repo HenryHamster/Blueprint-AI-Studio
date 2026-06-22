@@ -998,6 +998,46 @@ Per-project release/version lifecycle and qualification reporting
 - **`GET /api/admin/projects/{project_id}/audit-findings`** — release-audit findings.
 - **`GET /api/admin/projects/{project_id}/retirement-critiques`** — version-retirement critiques.
 
+#### Evergreen Backlog (`admin_evergreen.py`)
+
+Read/write surface for the evergreen backlog auto-fill mechanism — a ledger of findings that should be periodically revisited as code evolves.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/admin/evergreen/backlog` | Enroll a backlog candidate (deduped by `finding_key`). |
+| GET | `/api/admin/evergreen/backlog` | List evergreen backlog items for a project. |
+| GET | `/api/admin/evergreen/backlog-summary` | Per-status count summary of backlog items. |
+| GET | `/api/admin/evergreen/fill-observability` | Bounded decision counters for the fill process. |
+
+**Authentication:** Admin required.
+
+#### System State (`admin_state.py`)
+
+Canonical system-state read endpoint for CLI and UI health panels.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/admin/state` | System state snapshot (deploy + fleet; fleet-only requires admin; project-scoped view optionally includes version block). 15s cache TTL. |
+
+**Query parameters:**
+- `project_id` (optional UUID) — If supplied, includes project version state; requires at least viewer role on the project.
+
+#### Warm Pool Management (`admin_warm_pool.py`)
+
+Manual operator control for the warm-VM pool (autonomously maintained by `warm_pool_maintainer`). These endpoints complement the autonomous bootstrap and enforce the same budget ceilings and fleet constraints.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/admin/projects/{project_id}/warm-pool/seed` | Top the project's warm pool up to its configured target size. |
+| POST | `/api/admin/projects/{project_id}/warm-pool/drain` | Retire all live warm VMs for the project. |
+| POST | `/api/admin/projects/{project_id}/warm-pool/enable` | Enable warm pooling for this project (scoped allowlist), establish target, seed initial members. |
+| POST | `/api/admin/projects/{project_id}/warm-pool/disable` | Drain the project and remove from allowlist; flips master switch off only if allowlist becomes empty. |
+| GET | `/api/admin/projects/{project_id}/warm-pool/status` | Current pool state (size, capacity, allowlist, enabled flag). |
+
+**Authentication:** Admin required for all warm-pool operations.
+
+**Response fields (additive-only contract):** `seeded`, `drained`, `recycled`, `reason`, `project_id`, `enabled`, `project_allowlist`.
+
 > **New to Blueprint?** For an end-to-end walkthrough of installing the GitHub
 > App on a target repository and creating + tuning a project, see
 > **[ONBOARDING.md](ONBOARDING.md)**.

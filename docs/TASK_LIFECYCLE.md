@@ -32,7 +32,7 @@ CANCELLED (terminal, at any state)
 
 ### 1. QUEUED → PROVISIONING
 
-**Trigger:** `orchestrator_worker()` picks up the task (polls every 10 seconds)
+**Trigger:** `orchestrator_worker()` picks up the task (polls every 15 seconds, configurable via `ORCHESTRATOR_HARD_WATCHDOG_POLL_SECONDS`)
 
 **What happens:**
 - Task status updated to PROVISIONING

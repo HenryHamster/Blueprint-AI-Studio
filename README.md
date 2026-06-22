@@ -30,10 +30,8 @@ Agent VMs          Background workers
 ### Components
 
 - **Orchestrator** (`backend/`) — FastAPI backend deployed to Cloud Run. Manages projects, tasks, VM lifecycle, and autonomous research. It registers the API routers under `backend/app/routers/` and runs background workers for orchestration, reaping, cleanup, digest precompute, secret reconciliation, and pipeline alerts:
-  - `orchestrator_worker` — polls for QUEUED tasks every 10 s and provisions VMs; it
-    also drives autonomous-research spawning each cycle via `_check_idle_research()`
-    (there is no separate autonomous-research worker loop)
-  - `reaper_service` — kills VMs that miss heartbeats (5-minute timeout, 30 s cadence)
+  - `orchestrator_worker` — polls for QUEUED tasks every 15 s (configurable via `ORCHESTRATOR_HARD_WATCHDOG_POLL_SECONDS`) and provisions VMs; it also drives autonomous-research spawning each cycle via `_check_idle_research()` (there is no separate autonomous-research worker loop)
+  - `reaper_service` — kills VMs that miss heartbeats (5-minute timeout, ~60 s cycle with exponential backoff on errors)
   - `gcp_cleanup_service` — sweeps orphaned VMs every 15 min
   - `secret_reconciliation_service` / `pipeline_alert_scan_service` / `digest_precompute_service` — keep runtime secrets, operator alerts, and digest cache state in sync
 
