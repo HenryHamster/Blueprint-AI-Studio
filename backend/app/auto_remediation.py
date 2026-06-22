@@ -135,10 +135,21 @@ async def _handle_main_branch_ci_failure(
     head_branch: str,
     project_id: uuid.UUID,
     config: dict[str, Any],
+    ci_source_sha: str | None = None,
+    release_version_id: uuid.UUID | None = None,
 ) -> None:
     """Background handler: spawn a fix task for a protected-branch CI failure.
 
     Opens its own DB session (runs outside the request lifecycle).
+
+    ``ci_source_sha`` decouples *where the CI failed* from *where the fix lands*.
+    The normal webhook path leaves it None: the CI failed on ``head_branch`` at
+    ``head_sha`` and the fix branches off ``head_branch``.  The promotion-gate
+    harvest sets it to the (throwaway) release-branch commit whose full CI matrix
+    failed, while ``head_branch`` is the integration branch (automain) the fix
+    must land on — so the failing-test context is read from ``ci_source_sha`` but
+    the fix PR targets ``head_branch``.  ``release_version_id`` tags the spawned
+    task so the re-qualification gate can see remediation is in flight.
     """
     try:
         async with AsyncSessionLocal() as session:
@@ -150,6 +161,8 @@ async def _handle_main_branch_ci_failure(
                 project_id=project_id,
                 config=config,
                 session=session,
+                ci_source_sha=ci_source_sha,
+                release_version_id=release_version_id,
             )
     except Exception as exc:
         logger.error(
@@ -171,8 +184,14 @@ async def _handle_main_branch_ci_failure_inner(
     project_id: uuid.UUID,
     config: dict[str, Any],
     session: AsyncSession,
+    ci_source_sha: str | None = None,
+    release_version_id: uuid.UUID | None = None,
 ) -> None:
-    """Inner implementation, called with a live session."""
+    """Inner implementation, called with a live session.
+
+    See ``_handle_main_branch_ci_failure`` for the meaning of ``ci_source_sha``
+    and ``release_version_id``.
+    """
     max_per_hour = config.get("max_per_hour", 2)
     max_concurrent = config.get("max_concurrent", 2)
     now = _utcnow()
@@ -296,37 +315,46 @@ async def _handle_main_branch_ci_failure_inner(
     # ── Guard: check if CI already passed on latest commit ──
     # Between the webhook firing and this handler running, another push may
     # have fixed the issue. Verify the branch tip is still failing.
-    try:
-        from app.github import get_branch_sha
+    #
+    # Skipped for the promotion-gate harvest (ci_source_sha set): there the CI
+    # failed on a throwaway release-branch commit, while head_branch is the
+    # integration branch (automain) the fix must land on. The two diverge by
+    # design, so the "is head_branch's tip still failing?" check does not apply —
+    # the failure context lives at ci_source_sha, which we read directly.
+    if ci_source_sha is not None:
+        head_sha = ci_source_sha
+    else:
+        try:
+            from app.github import get_branch_sha
 
-        latest_sha = await get_branch_sha(
-            await get_repo_installation_token(owner, repo),
-            owner,
-            repo,
-            head_branch,
-        )
-        if latest_sha != head_sha:
-            latest_ci = await get_check_runs_cached(
+            latest_sha = await get_branch_sha(
                 await get_repo_installation_token(owner, repo),
                 owner,
                 repo,
-                latest_sha,
+                head_branch,
             )
-            if (
-                latest_ci.get("status") == "completed"
-                and latest_ci.get("conclusion") == "success"
-            ):
-                logger.info(
-                    "[AUTO-REMEDIATION] CI already passing on latest %s@%s — skipping",
-                    head_branch,
-                    latest_sha[:8],
+            if latest_sha != head_sha:
+                latest_ci = await get_check_runs_cached(
+                    await get_repo_installation_token(owner, repo),
+                    owner,
+                    repo,
+                    latest_sha,
                 )
-                return
-            # Update to latest SHA so the fix task prompt shows the current failure
-            head_sha = latest_sha
-    except Exception as exc:
-        logger.warning("[AUTO-REMEDIATION] Could not verify latest CI status: %s", exc)
-        # Proceed anyway — better to spawn a potentially unnecessary task than miss a real failure
+                if (
+                    latest_ci.get("status") == "completed"
+                    and latest_ci.get("conclusion") == "success"
+                ):
+                    logger.info(
+                        "[AUTO-REMEDIATION] CI already passing on latest %s@%s — skipping",
+                        head_branch,
+                        latest_sha[:8],
+                    )
+                    return
+                # Update to latest SHA so the fix task prompt shows the current failure
+                head_sha = latest_sha
+        except Exception as exc:
+            logger.warning("[AUTO-REMEDIATION] Could not verify latest CI status: %s", exc)
+            # Proceed anyway — better to spawn a potentially unnecessary task than miss a real failure
 
     # ── CI context extraction ──
     (
@@ -531,6 +559,12 @@ async def _handle_main_branch_ci_failure_inner(
         if failure_type == "migration"
         else "CODE_ERROR",
     }
+    if release_version_id is not None:
+        # Promotion-gate harvest: tag the task so compute_requalification gating
+        # can see a fix is in flight for this version and defer re-qualification
+        # until it lands on the integration branch (see release_qualifier_sweep).
+        task_context["promotion_ci_remediation"] = True
+        task_context["promotion_ci_remediation_version_id"] = str(release_version_id)
     if _ext_api_subtype and _ext_api_subtype != "other":
         task_context["external_api_subtype"] = _ext_api_subtype
     if regression_of is not None:

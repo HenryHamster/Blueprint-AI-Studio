@@ -23181,6 +23181,71 @@ async def test_requalification_ready_only_when_all_high_medium_resolved(db_sessi
 
 
 @pytest.mark.asyncio
+async def test_requalification_deferred_while_promotion_ci_remediation_in_flight(
+    db_session,
+):
+    """An in-flight promotion-CI remediation fix defers re-qualification.
+
+    The promotion-gate harvest spawns an auto-remediation task tagged for the
+    version when a promotion PR's CI fails. While that fix is active, readiness
+    must be False so the next promotion attempt waits for it to land on the
+    integration branch; once the task is terminal the gate clears.
+    """
+    from app import release_readiness as rr
+    from app.models import Task, TaskStatus
+
+    project, version = await _make_project_and_version(db_session)
+    # No carried findings → would normally be ready to re-qualify.
+    await _set_last_qualification_findings(db_session, version, [])
+    out = await rr.compute_requalification_readiness(db_session, project.id)
+    assert out["requalification_ready"] is True
+
+    task = Task(
+        project_id=project.id,
+        title="Auto-fix: CI failure on automain",
+        payloads=[{"type": "create", "base_branch": "automain"}],
+        context={
+            "promotion_ci_remediation": True,
+            "promotion_ci_remediation_version_id": str(version.id),
+        },
+        status=TaskStatus.QUEUED,
+        created_by="SYSTEM_AUTO_REMEDIATION",
+        auto_remediation=True,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    out = await rr.compute_requalification_readiness(db_session, project.id)
+    assert out["requalification_ready"] is False
+    assert "remediation in flight" in out["reason"]
+
+    # Fix lands (task reaches a terminal state) → gate clears.
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+    out = await rr.compute_requalification_readiness(db_session, project.id)
+    assert out["requalification_ready"] is True
+
+    # A remediation tagged for a DIFFERENT version must not gate this one.
+    other = Task(
+        project_id=project.id,
+        title="Auto-fix: CI failure on automain",
+        payloads=[{"type": "create", "base_branch": "automain"}],
+        context={
+            "promotion_ci_remediation": True,
+            "promotion_ci_remediation_version_id": str(uuid.uuid4()),
+        },
+        status=TaskStatus.IN_PROGRESS,
+        created_by="SYSTEM_AUTO_REMEDIATION",
+        auto_remediation=True,
+    )
+    db_session.add(other)
+    await db_session.commit()
+    out = await rr.compute_requalification_readiness(db_session, project.id)
+    assert out["requalification_ready"] is True
+
+
+@pytest.mark.asyncio
 async def test_requalification_false_when_high_medium_unresolved(db_session):
     """A single unresolved high/medium finding holds readiness False."""
     from app import release_readiness as rr

@@ -1292,6 +1292,74 @@ async def _reconcile_if_pending_auto_merge_landed(
             return False
 
 
+async def _harvest_promotion_ci_failures(
+    *,
+    project_id: uuid.UUID,
+    version_id: uuid.UUID,
+    version_number: int,
+    owner: str,
+    repo: str,
+    ci_source_sha: str,
+    integration_branch: str,
+    auto_remediation_config: dict[str, Any],
+) -> None:
+    """Spawn a CI auto-remediation fix task — on the integration branch — for a
+    just-failed promotion PR's CI failures.
+
+    The promotion PR runs the full CI matrix on a throwaway ``release-v*`` branch.
+    When it goes red the release branch is torn down and the version returns to
+    stabilize, but nothing reads those failures: the auto-remediation webhook
+    whitelist only covers the integration branch and the promotion target, never
+    the release branch (``routers/github.py``).  So the next qualification
+    re-promotes the same code and fails the same CI — a promotion-gate loop
+    (this is the side-effect of dropping CI on the integration branch: the full
+    matrix now runs only here).  We feed the failing-test context — read from
+    ``ci_source_sha`` (the release commit) — into the standard remediation handler
+    but target the fix at ``integration_branch`` so it lands where the next
+    qualification will pick it up.
+
+    Best-effort: the promotion failure is already recorded and committed by the
+    caller, so any error here is logged and swallowed — a harvest failure must
+    never turn a recorded promotion failure into an unhandled exception.  The
+    remediation handler self-gates: if ``ci_source_sha`` has no failed checks it
+    no-ops, so calling this on a non-CI promotion failure is harmless.
+    """
+    try:
+        if not auto_remediation_config.get("enabled", False):
+            logger.info(
+                "[RELEASE_QUALIFIER] promotion-CI harvest: auto-remediation "
+                "disabled for project %s — not spawning a fix for v%d CI failures",
+                project_id,
+                version_number,
+            )
+            return
+        logger.info(
+            "[RELEASE_QUALIFIER] promotion-CI harvest: spawning auto-remediation "
+            "on %s for v%d promotion CI failures (source %s)",
+            integration_branch,
+            version_number,
+            ci_source_sha[:8],
+        )
+        from app.auto_remediation import _handle_main_branch_ci_failure
+
+        await _handle_main_branch_ci_failure(
+            owner=owner,
+            repo=repo,
+            head_sha=ci_source_sha,
+            head_branch=integration_branch,
+            project_id=project_id,
+            config=auto_remediation_config,
+            ci_source_sha=ci_source_sha,
+            release_version_id=version_id,
+        )
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] promotion-CI harvest failed for v%d — the "
+            "promotion failure is already recorded; continuing",
+            version_number,
+        )
+
+
 async def _reconcile_if_managed_check_wait(
     version_id: uuid.UUID,
     *,
@@ -1362,6 +1430,17 @@ async def _reconcile_if_managed_check_wait(
             integration_branch, promotion_target = _lts_branch_names(project)
             if integration_branch == promotion_target:
                 return False
+
+            # Capture the primitives the promotion-CI harvest needs while the ORM
+            # rows are still loaded.  The terminal paths below commit (expiring
+            # these attributes); reading them afterwards would raise MissingGreenlet
+            # under async SQLAlchemy, so snapshot them as plain values now.
+            _harvest_project_id = project.id
+            _harvest_version_id = version.id
+            _harvest_version_number = version.version_number
+            _harvest_ar_config = dict(
+                (project.design_doc or {}).get("_auto_remediation", {}) or {}
+            )
 
             # Release the row lock before GitHub I/O (mirrors the other reconcilers).
             try:
@@ -1520,6 +1599,19 @@ async def _reconcile_if_managed_check_wait(
                     lock_released=True,
                 )
                 await session.commit()
+                # The PR may have been closed while CI was red (v17's case). The
+                # remediation handler self-gates: if candidate_sha has no failed
+                # checks this no-ops, so harvesting here is safe.
+                await _harvest_promotion_ci_failures(
+                    project_id=_harvest_project_id,
+                    version_id=_harvest_version_id,
+                    version_number=_harvest_version_number,
+                    owner=owner,
+                    repo=repo,
+                    ci_source_sha=candidate_sha,
+                    integration_branch=integration_branch,
+                    auto_remediation_config=_harvest_ar_config,
+                )
                 return True
 
             if pr_data.get("state") != "open":
@@ -1666,6 +1758,19 @@ async def _reconcile_if_managed_check_wait(
                     lock_released=True,
                 )
                 await session.commit()
+                # Harvest the failing tests into a fix task on the integration
+                # branch so the next qualification doesn't re-promote the same
+                # red code (promotion-gate loop). Best-effort; never raises.
+                await _harvest_promotion_ci_failures(
+                    project_id=_harvest_project_id,
+                    version_id=_harvest_version_id,
+                    version_number=_harvest_version_number,
+                    owner=owner,
+                    repo=repo,
+                    ci_source_sha=candidate_sha,
+                    integration_branch=integration_branch,
+                    auto_remediation_config=_harvest_ar_config,
+                )
                 return True
 
             if ci_state != _CI_GREEN:
