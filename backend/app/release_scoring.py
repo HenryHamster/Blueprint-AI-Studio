@@ -58,6 +58,28 @@ AUTHORIZED_TEST_DELETIONS: tuple[AuthorizedTestDeletion, ...] = (
         commit_ref="3085d8d8",
         rationale="parseViewportSubkey had zero production callers; test and subject co-deleted together.",
     ),
+    # v17 "visual verification pilot" dark-feature cut.  The pilot's audit
+    # endpoint (/api/admin/visual-pilot-status) always reported 0 pairs
+    # inspected because the field it aggregated was never written by any code
+    # path — the feature was built but never wired to a writer.  The v17
+    # candidate (commit 7547d74) co-deletes both modules together with their
+    # tests; these two entries authorize the *test* deletions so the promotion
+    # gate does not veto a clean dead-code removal.  Authored on the candidate
+    # itself, but the qualifier reads this allowlist from DEPLOYED main, so the
+    # entries must live here for the candidate to qualify (mirrors the v14
+    # viewportRegression hotfix #10772).
+    AuthorizedTestDeletion(
+        path_suffix="test_visual_verification_audit.py",
+        co_deleted_subject="visual_verification_audit.py (aggregate_visual_pilot, VisualPilotAggregates)",
+        commit_ref="7547d74",
+        rationale="Dark feature cut: visual_verification_audit.py had zero live writers; the field it aggregated was never written by any code path, so 0 pairs inspected permanently. Entire module and its tests co-deleted.",
+    ),
+    AuthorizedTestDeletion(
+        path_suffix="VisualVerificationPilotPanel.viewport.test.tsx",
+        co_deleted_subject="VisualVerificationPilotPanel.tsx (VisualVerificationPilotPanel component)",
+        commit_ref="7547d74",
+        rationale="Dark feature cut: VisualVerificationPilotPanel consumed the always-zero /api/admin/visual-pilot-status endpoint. Component and its viewport tests co-deleted.",
+    ),
 )
 
 def _get_lifecycle_bounded_authorized_deletions() -> tuple[AuthorizedTestDeletion, ...]:
