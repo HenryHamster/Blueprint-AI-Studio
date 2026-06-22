@@ -43,7 +43,7 @@ function MergeGradeGateSettings() {
         When the blind merge-grade verdict is <em>misses</em> and this threshold is &gt;&nbsp;0, qualification is blocked.
         Default <code className="font-mono">0.0</code> ships dark (gate never fires).
       </p>
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-2">
         <label className="text-xs text-neutral-400 w-48">merge_grade_block_threshold</label>
         <input
           type="number" min={0} max={1} step={0.1}
@@ -53,7 +53,7 @@ function MergeGradeGateSettings() {
         />
         <button
           onClick={save} disabled={saving}
-          className="inline-flex items-center justify-center min-h-[32px] bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded px-3 py-1 text-xs transition-colors disabled:opacity-50"
+          className="inline-flex items-center justify-center min-h-[44px] bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded px-3 py-1 text-xs transition-colors disabled:opacity-50"
           data-testid="merge-grade-block-threshold-save"
         >
           {saving ? 'Saving…' : saveOk ? 'Saved' : 'Save'}
