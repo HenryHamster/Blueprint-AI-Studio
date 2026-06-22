@@ -316,6 +316,78 @@ class TestComputeCompositeCiState:
             )
 
 
+class TestComputeCompositeCiRequired:
+    """ci_required gates whether an UNRESOLVED candidate CI hard-blocks.
+
+    A project that relaxed per-PR CI on its integration branch
+    (``requires_ci_checks=False`` — e.g. ``automain`` pushes carry zero
+    check-runs) has no candidate-level CI signal to resolve, so an unresolved
+    state must NOT wedge promotion; the promotion PR -> ``main`` carries the
+    real, still-strict CI gate. A confirmed red still blocks regardless.
+    """
+
+    def test_unresolved_not_blocking_when_ci_not_required(self):
+        """ci_required=False + pending → NO ci_unresolved block; promotes on score."""
+        for state in ("pending", "no_checks"):
+            result = rq.compute_composite(
+                ci_green=False,
+                audit_score=1.0,
+                test_erosion=1.0,
+                smoketest_score=1.0,
+                policy=_POLICY,
+                ci_state=state,
+                ci_required=False,
+            )
+            assert result["blocker"] is None, (
+                f"unexpected blocker for ci_state={state!r} ci_required=False"
+            )
+            # Sub-scores are perfect → confidence clears the 0.75 threshold.
+            assert result["promote"] is True
+            assert result["confidence"] >= _POLICY["threshold"]
+
+    def test_red_still_blocks_even_when_ci_not_required(self):
+        """A confirmed red build is ALWAYS a blocker, even with ci_required=False."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            ci_state="red",
+            ci_required=False,
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "ci_not_green"
+
+    def test_unresolved_still_blocks_when_ci_required_default(self):
+        """ci_required defaults True → unresolved still wedges (regression guard)."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            ci_state="pending",
+        )
+        assert result["blocker"] == "ci_unresolved"
+
+    def test_ci_not_required_does_not_mask_other_blockers(self):
+        """ci_required=False relaxes ONLY the CI dimension — a deleted test file
+        (test_erosion is None) still hard-blocks via its own gate."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=None,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            ci_state="pending",
+            ci_required=False,
+        )
+        assert result["promote"] is False
+        assert result["blocker"] == "test_file_deleted"
+
+
 class TestComputeCompositeWeightedSum:
     """When no blocker fires, confidence is the policy-weighted sum."""
 

@@ -158,6 +158,7 @@ from app.ci_resolution import (
     _CI_PENDING,
     _CI_RED,
     _classify_check_runs,
+    requires_ci_checks,
 )
 from app.release_scoring import (
     # Re-exports — release_qualifier is the canonical import + test-patch
@@ -3315,6 +3316,14 @@ async def _finalize_qualification(
     merge_grade_blocked = merge_grade_blocked or _merge_grade_blocked
 
     # --- Compute the composite ---------------------------------------------
+    # Whether an UNRESOLVED candidate CI (pending / no check-runs) hard-blocks
+    # depends on the project: one that relaxed per-PR CI on its integration
+    # branch (``requires_ci_checks`` False — e.g. automain pushes carry zero
+    # check-runs) has no candidate-level CI signal to resolve, so the candidate
+    # gate must NOT block on ci_unresolved (the promotion PR -> main carries the
+    # real, still-strict CI gate). A confirmed red still blocks regardless.
+    _ci_project = await session.get(Project, version.project_id)
+    ci_required = requires_ci_checks(_ci_project) if _ci_project is not None else True
     composite = compute_composite(
         ci_green=ci_green,
         audit_score=audit_score,
@@ -3323,6 +3332,7 @@ async def _finalize_qualification(
         policy=policy,
         smoketest_enabled=smoketest_enabled,
         ci_state=ci_resolution.get("state", _CI_RED),
+        ci_required=ci_required,
         migration_collision=migration_collision,
         migration_apply_blocked=migration_apply_blocked,
         theme_delivery_blocked=_theme_blocked,
