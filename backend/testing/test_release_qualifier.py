@@ -985,7 +985,7 @@ class TestScoreAudit:
         assert erosion == pytest.approx(1.0)
 
     def test_deleted_test_file_returns_none_erosion(self):
-        """A deleted test file makes the erosion score the None hard-blocker."""
+        """A deleted test file classified genuine_erosion is the None hard-blocker."""
         report = {
             "audit_score": 0.9,
             "test_erosion": {
@@ -993,6 +993,13 @@ class TestScoreAudit:
                 "assertion_delta": 0,
                 "test_count_delta": -5,
             },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_gone.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject module is present and unchanged; test removed to stop failing build.",
+                }
+            ],
             "findings": [],
         }
         audit, erosion = rq._score_audit(report)
@@ -1000,54 +1007,136 @@ class TestScoreAudit:
         assert audit == pytest.approx(1.0)
         assert erosion is None
 
-    def test_authorized_test_deletion_is_not_erosion(self):
-        """An authorized dead-code test deletion is NOT treated as erosion.
+    def test_dead_code_classification_no_hard_block(self):
+        """A dead_code_removal classification must NOT trigger the hard-blocker.
 
-        AUTHORIZED_TEST_DELETIONS lists file basenames whose removal is
-        pre-approved (the code they exercised was co-deleted with zero live
-        callers remaining).  _score_audit must return a non-None erosion score
-        when ALL deleted test files are in the authorized set, so the
-        test_file_deleted hard-blocker does not fire for a clean dead-code removal.
+        Replaces the retired AUTHORIZED_TEST_DELETIONS allowlist: disposition is
+        now driven by per-file classifications emitted by the release audit agent.
+        A deleted test file classified ``dead_code_removal`` must return a
+        non-None erosion score so the test_file_deleted hard-blocker does not fire.
         """
         report = {
             "audit_score": 0.9,
             "test_erosion": {
-                "deleted_test_files": ["admin-ui/src/utils/viewportRegression.test.ts"],
+                "deleted_test_files": ["testing/test_foo.py"],
                 "assertion_delta": 0,
                 "test_count_delta": 0,
             },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_foo.py",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject app/foo.py co-deleted in this diff; no live callers remain.",
+                }
+            ],
             "findings": [],
         }
         audit, erosion = rq._score_audit(report)
         # No findings → derived audit = 1.0
         assert audit == pytest.approx(1.0)
-        # Authorized deletion must NOT produce the None hard-blocker.
         assert erosion is not None
         assert erosion == pytest.approx(1.0)
 
-        # Confirm the authorized set is consulted via rs directly too.
-        assert any(
-            e.path_suffix == "viewportRegression.test.ts"
-            for e in rs.AUTHORIZED_TEST_DELETIONS
+    def test_genuine_erosion_classification_hard_blocks(self):
+        """A genuine_erosion classification must produce the None hard-blocker."""
+        report = {
+            "audit_score": 0.9,
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_foo.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_foo.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject app/foo.py is present and unchanged; test removed to stop failing build.",
+                }
+            ],
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion is None, (
+            "An explicit genuine_erosion classification must hard-block"
         )
 
-        # A mix of authorized + unauthorized still hard-blocks.
-        mixed_report = {
+    def test_absent_classifications_fail_open(self):
+        """A deleted test file with NO classifications entry must fail open.
+
+        The retired allowlist tightened the gate on any deletion not pre-approved;
+        the new contract fails open on absent/ambiguous classification so an
+        unclassified dead-code cut no longer vetoes promotion.
+        """
+        report = {
+            "audit_score": 0.9,
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_foo.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            # No deleted_test_file_classifications key.
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion is not None, (
+            "An unclassified deleted test file must fail open (non-None erosion)"
+        )
+        assert erosion == pytest.approx(1.0)
+
+    def test_mixed_classifications_any_genuine_blocks(self):
+        """Two deleted files where one is genuine_erosion must hard-block."""
+        report = {
             "audit_score": 0.9,
             "test_erosion": {
                 "deleted_test_files": [
-                    "admin-ui/src/utils/viewportRegression.test.ts",
-                    "testing/test_gone.py",
+                    "testing/test_dead.py",
+                    "testing/test_alive.py",
                 ],
                 "assertion_delta": 0,
                 "test_count_delta": 0,
             },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_dead.py",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject app/dead.py co-deleted; no callers remain.",
+                },
+                {
+                    "path": "testing/test_alive.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject app/alive.py present and unchanged.",
+                },
+            ],
             "findings": [],
         }
-        _, mixed_erosion = rq._score_audit(mixed_report)
-        assert mixed_erosion is None, (
-            "A mix of authorized and unauthorized deletions must still hard-block"
+        _, erosion = rq._score_audit(report)
+        assert erosion is None, (
+            "Any single genuine_erosion among mixed classifications must hard-block"
         )
+
+    def test_empty_classifications_list_fails_open(self):
+        """An empty deleted_test_file_classifications list must fail open."""
+        report = {
+            "audit_score": 0.9,
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_foo.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "deleted_test_file_classifications": [],
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion is not None, (
+            "An empty classifications list must fail open (non-None erosion)"
+        )
+        assert erosion == pytest.approx(1.0)
+
+    def test_allowlist_symbols_not_importable(self):
+        """The retired allowlist symbols must not be re-exported from release_scoring."""
+        assert not hasattr(rs, "AUTHORIZED_TEST_DELETIONS")
+        assert not hasattr(rs, "_get_lifecycle_bounded_authorized_deletions")
+        assert not hasattr(rs, "AuthorizedTestDeletion")
 
     def test_net_test_count_reduction_penalized(self):
         """A negative test_count_delta drops the erosion score below 1.0."""
@@ -1425,7 +1514,13 @@ class TestScoreAuditComputedErosion:
     from git diff) over the LLM's self-reported test_erosion when the key is present."""
 
     def test_computed_erosion_authoritative_over_llm(self):
-        """computed_test_erosion with a deleted file → None even when LLM omits it."""
+        """computed_test_erosion with a deleted file → None even when LLM omits it.
+
+        The deletion is classified genuine_erosion so the hard-blocker fires off
+        the computed (authoritative) deleted_test_files list, proving the gate
+        reads the computed deletion even when the LLM's self-reported list missed
+        it.
+        """
         report = {
             "audit_score": 0.9,
             "computed_test_erosion": {
@@ -1438,6 +1533,13 @@ class TestScoreAuditComputedErosion:
                 "assertion_delta": 0,
                 "test_count_delta": 0,
             },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_gone.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject module present and unchanged; deletion is genuine erosion.",
+                }
+            ],
             "findings": [],
         }
         _, erosion = rq._score_audit(report)
@@ -1476,13 +1578,24 @@ class TestScoreAuditComputedErosion:
         assert erosion < 1.0
 
     def test_fallback_to_llm_when_no_computed_key(self):
-        """When computed_test_erosion is absent, existing test_erosion logic is unchanged."""
+        """When computed_test_erosion is absent, the LLM test_erosion list drives the gate.
+
+        The genuine_erosion classification confirms the deletion hard-blocks off
+        the fallback (LLM-reported) deleted_test_files list.
+        """
         report = {
             "test_erosion": {
                 "deleted_test_files": ["testing/test_gone.py"],
                 "assertion_delta": 0,
                 "test_count_delta": 0,
             },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_gone.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject module present and unchanged; deletion is genuine erosion.",
+                }
+            ],
             "findings": [],
         }
         _, erosion = rq._score_audit(report)
@@ -1538,13 +1651,14 @@ class TestScoreAuditComputedErosion:
             "Zero deltas after authorized deletion must yield an unpenalized score of 1.0"
         )
 
-    def test_unauthorized_deleted_root_level_test_file_hard_blocks(self):
-        """A root-level test directory deletion detected by the TS path fix hard-blocks.
+    def test_genuine_erosion_deleted_root_level_test_file_hard_blocks(self):
+        """A root-level test deletion classified genuine_erosion hard-blocks.
 
-        Regression pin: before the TEST_PATH_RE fix, 'testing/test_foo.py'
-        (no leading slash) was NOT matched as a test file and the hard-blocker
-        would silently miss the deletion.  After the fix it is detected, so
-        _score_audit must return erosion=None for an unauthorized deletion.
+        Regression pin: 'testing/test_root_level.py' (no leading slash) is the
+        path shape 'git diff --name-status' emits for a root-level testing/
+        directory deletion.  When the release audit agent classifies it as
+        genuine_erosion, _score_audit must return erosion=None regardless of the
+        path shape.
         """
         report = {
             "audit_score": 0.9,
@@ -1555,11 +1669,18 @@ class TestScoreAuditComputedErosion:
                 "assertion_delta": 0,
                 "test_count_delta": 0,
             },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_root_level.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject module present and unchanged; deletion is genuine erosion.",
+                }
+            ],
             "findings": [],
         }
         _, erosion = rq._score_audit(report)
         assert erosion is None, (
-            "An unauthorized deleted test file must hard-block (erosion=None)"
+            "A genuine_erosion-classified deleted test file must hard-block (erosion=None)"
         )
 
 
@@ -8132,6 +8253,13 @@ async def test_finalize_not_promoted_on_blocker_sets_stabilize(db_session):
                 "assertion_delta": 0,
                 "test_count_delta": -3,
             },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_deleted.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject module present and unchanged; deletion is genuine erosion.",
+                }
+            ],
         },
         smoke_logs={
             "passed": True,
@@ -17749,6 +17877,13 @@ async def test_finalize_blocked_posts_operator_message(db_session):
                 "assertion_delta": 0,
                 "test_count_delta": -2,
             },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_gone.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject module present and unchanged; deletion is genuine erosion.",
+                }
+            ],
         },
         smoke_logs={
             "passed": True,
@@ -19021,6 +19156,13 @@ async def test_finalize_not_promoted_records_blocker_verdict_row(db_session):
                 "assertion_delta": 0,
                 "test_count_delta": -3,
             },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_deleted.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject module present and unchanged; deletion is genuine erosion.",
+                }
+            ],
         },
         smoke_logs={
             "passed": True,

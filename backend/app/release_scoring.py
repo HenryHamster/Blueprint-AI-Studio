@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from dataclasses import dataclass
 from typing import Any
 
 from app.ci_resolution import (
@@ -25,100 +24,6 @@ from app.ci_resolution import (
 from app.migration_reconciliation import AUTHORIZED_DIVERGENCES
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class AuthorizedTestDeletion:
-    """A test-file deletion that the qualifier treats as non-erosion.
-
-    Each entry requires three documentation fields so the allowlist cannot be
-    widened silently — ``test_invariants.py::test_authorized_test_deletions_require_documentation``
-    enforces their presence in CI.
-    """
-
-    path_suffix: str  # file basename or path suffix matched against deleted test paths
-    co_deleted_subject: str  # the module/file/function co-deleted with this test
-    commit_ref: str  # commit SHA or ref where the deletion was made
-    rationale: str  # why this deletion is safe (non-erosion)
-
-
-# Authorized dead-code test deletions.  Mirrors the AUTHORIZED_DIVERGENCES
-# pattern in migration_reconciliation.py.  A deleted test file whose path ends
-# with any entry's path_suffix is excluded from the hard-blocker gate so a
-# clean dead-code removal does not veto a promotion.
-#
-# Entry criteria: the test file must have zero live callers / test subjects
-# remaining in the candidate (the code it exercised was also co-deleted), AND
-# the deletion must be explicitly authorized here so it cannot silently suppress
-# a genuine test-erosion signal.
-AUTHORIZED_TEST_DELETIONS: tuple[AuthorizedTestDeletion, ...] = (
-    AuthorizedTestDeletion(
-        path_suffix="viewportRegression.test.ts",
-        co_deleted_subject="viewportRegression.ts (parseViewportSubkey)",
-        commit_ref="3085d8d8",
-        rationale="parseViewportSubkey had zero production callers; test and subject co-deleted together.",
-    ),
-    AuthorizedTestDeletion(
-        path_suffix="test_visual_verification_audit.py",
-        co_deleted_subject="visual_verification_audit.py (aggregate_visual_pilot, VisualPilotAggregates)",
-        commit_ref="7547d74",
-        rationale="Dark feature cut: visual_verification_audit.py had zero live writers; the field it aggregated was never written by any code path, so 0 pairs inspected permanently. Entire module and its tests co-deleted.",
-    ),
-    AuthorizedTestDeletion(
-        path_suffix="VisualVerificationPilotPanel.viewport.test.tsx",
-        co_deleted_subject="VisualVerificationPilotPanel.tsx (VisualVerificationPilotPanel component)",
-        commit_ref="7547d74",
-        rationale="Dark feature cut: VisualVerificationPilotPanel consumed the always-zero /api/admin/visual-pilot-status endpoint. Component and its viewport tests co-deleted.",
-    ),
-)
-
-
-def _get_lifecycle_bounded_authorized_deletions() -> tuple[AuthorizedTestDeletion, ...]:
-    """Return only the currently-active AUTHORIZED_TEST_DELETIONS entries.
-
-    Entries are considered active only when their co-deleted subject code is
-    actually deleted from the working tree. If a subject file has been restored
-    (re-added to the repo), the entry is considered "spent" and must be removed
-    from the allowlist — otherwise it becomes a permanent gate-bypass hole.
-
-    This ensures that each entry has a finite lifecycle: it is active only while
-    the code it authorized for deletion remains deleted, and must be removed if
-    that code is ever restored or the circumstances change.
-    """
-    from pathlib import Path
-
-    # Anchor to the repo root (backend/app/release_scoring.py -> repo root is 3 levels up).
-    _repo_root = Path(__file__).parent.parent.parent
-
-    active: list[AuthorizedTestDeletion] = []
-    for entry in AUTHORIZED_TEST_DELETIONS:
-        # Parse the co_deleted_subject to find file paths mentioned.
-        # Expected format: "filename.ext (functionName)" or "filename.ext"
-        subject_str = entry.co_deleted_subject.strip()
-        # Extract the first token which is typically the filename.
-        file_part = subject_str.split()[0] if subject_str else ""
-
-        # Check if the subject file exists in the working tree. If it does,
-        # the entry is "spent" (the code came back) and should not be active.
-        if file_part:
-            # Search recursively in common top-level directories from the repo root
-            # so files nested in subdirectories (e.g. admin-ui/src/utils/foo.ts) are found.
-            found = any(
-                any((_repo_root / base_dir).rglob(file_part))
-                for base_dir in ("admin-ui", "backend", "agent")
-            )
-            if not found:
-                # Also check if file_part is a full relative path from repo root.
-                found = (_repo_root / file_part).exists()
-
-            # If none of the expected paths exist, the entry is active (code is deleted).
-            if not found:
-                active.append(entry)
-        else:
-            # Malformed entry, keep it for now (the documentation test will catch it)
-            active.append(entry)
-
-    return tuple(active)
 
 
 # Hardcoded fallback used when promotion_policy.yaml is missing, unreadable, or
@@ -546,8 +451,11 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
 
     Returns ``audit_score`` (None when report is absent/unusable) and a
     ``test_erosion_score`` in [0,1] where 1.0 == no erosion.  ``test_erosion``
-    is None — the hard-blocker sentinel — when the diff deleted a test file.
-    A net reduction in tests or assertions applies a graded penalty.
+    is None — the hard-blocker sentinel — only when the diff deleted a test file
+    that the release audit agent classified as ``genuine_erosion`` (via
+    ``report["deleted_test_file_classifications"]``).  Deletions classified as
+    ``dead_code_removal``, or left unclassified/ambiguous, fail open and do NOT
+    block.  A net reduction in tests or assertions applies a graded penalty.
     """
     if not isinstance(report, dict):
         return None, None
@@ -624,22 +532,30 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
 
     deleted = erosion.get("deleted_test_files")
     if isinstance(deleted, list) and len(deleted) > 0:
-        # Exclude authorized dead-code deletions (anchored path-suffix match:
-        # requires a '/' before the suffix so that e.g. "evilFoo.test.ts"
-        # does not accidentally authorize "Foo.test.ts").
-        # Use only the lifecycle-bounded (currently-active) authorized deletions
-        # to prevent spent entries from becoming permanent gate-bypass holes.
-        active_deletions = _get_lifecycle_bounded_authorized_deletions()
-        unauthorized = [
-            f
-            for f in deleted
-            if not any(
-                str(f) == entry.path_suffix or str(f).endswith("/" + entry.path_suffix)
-                for entry in active_deletions
-            )
-        ]
-        if unauthorized:
-            # Hard blocker — any non-authorized deleted test file forces a non-promote.
+        # Per-file LLM classification replaces the old hardcoded
+        # AUTHORIZED_TEST_DELETIONS allowlist (which required a backend deploy to
+        # widen).  The release audit agent classifies each deterministically-
+        # detected deleted test file as either ``dead_code_removal`` (subject
+        # code co-deleted or zero remaining callers) or ``genuine_erosion`` (the
+        # subject is demonstrably still present and the test was removed to stop
+        # failing tests from blocking a build).
+        #
+        # Disposition is PERMISSIVE and fail-open: the hard blocker fires ONLY on
+        # an explicit ``genuine_erosion`` classification.  An absent, empty, or
+        # ambiguous classification — or an explicit ``dead_code_removal`` — does
+        # NOT block, so an unclassified dead-code cut no longer vetoes promotion.
+        classifications: dict[str, str] = {}
+        raw_cls = report.get("deleted_test_file_classifications")
+        if isinstance(raw_cls, list):
+            for item in raw_cls:
+                if isinstance(item, dict) and isinstance(item.get("path"), str):
+                    classifications[item["path"]] = str(item.get("classification", ""))
+        genuine_erosion_found = any(
+            classifications.get(str(f)) == "genuine_erosion" for f in deleted
+        )
+        if genuine_erosion_found:
+            # Hard blocker — a confirmed genuine test-erosion deletion forces a
+            # non-promote (compute_composite labels this ``test_file_deleted``).
             return audit_score, None
 
     # Graded penalty for net assertion / test-count reduction.  Each negative

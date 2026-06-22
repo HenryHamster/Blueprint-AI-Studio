@@ -9685,67 +9685,41 @@ def test_dropped_dead_orm_columns_write_sites_removed():
     )
 
 
-def test_authorized_test_deletions_require_documentation():
-    """Each AUTHORIZED_TEST_DELETIONS entry must have non-empty co_deleted_subject,
-    commit_ref, and rationale fields, and each path_suffix must be properly anchored
-    so that only a genuine path-segment match (not a prefix-collision) is authorized.
+def test_authorized_test_deletion_allowlist_is_sealed():
+    """The hardcoded test-deletion allowlist must NOT be importable.
 
-    A bare or undocumented entry can silently widen the promotion gate bypass.
-    This tripwire fails CI when any entry omits required documentation or when the
-    path_suffix matching would authorize files in unintended directories.
+    The release qualifier retired the ``AUTHORIZED_TEST_DELETIONS`` tuple and its
+    ``_get_lifecycle_bounded_authorized_deletions()`` lifecycle filter in favour
+    of per-file LLM classification emitted by the release audit agent
+    (``deleted_test_file_classifications``).  The allowlist was authorization-as-
+    code: widening it required a backend deploy, which created the catch-22 that
+    blocked two legitimate promotions (v14 viewportRegression, v17 visual-
+    verification dead-code cut).
+
+    This invariant seals the backdoor: neither symbol may be reintroduced into
+    ``app.release_scoring`` without a deliberate decision that also updates this
+    test.  Importing either name must raise ImportError.
     """
-    from app.release_scoring import AUTHORIZED_TEST_DELETIONS
+    import app.release_scoring as rs
 
-    missing: list[str] = []
-    for entry in AUTHORIZED_TEST_DELETIONS:
-        gaps = []
-        if not entry.co_deleted_subject.strip():
-            gaps.append("co_deleted_subject")
-        if not entry.commit_ref.strip():
-            gaps.append("commit_ref")
-        if not entry.rationale.strip():
-            gaps.append("rationale")
-        if gaps:
-            missing.append(f"  {entry.path_suffix!r}: missing {', '.join(gaps)}")
-
-    assert not missing, (
-        "AUTHORIZED_TEST_DELETIONS entries are missing required documentation fields.\n"
-        "Each entry must supply co_deleted_subject, commit_ref, and rationale.\n"
-        "Add the missing fields to the AuthorizedTestDeletion(...) constructor in "
-        "backend/app/release_scoring.py:\n" + "\n".join(missing)
-    )
-
-    # Verify that the production matching logic is anchored at a path separator:
-    # a file whose name merely ends with the suffix string but is NOT separated by
-    # a '/' must NOT be authorized.  This catches e.g. "evilviewportRegression.test.ts"
-    # being silently bypassed when "viewportRegression.test.ts" is in the allowlist.
-    def _is_authorized(path: str) -> bool:
-        return any(
-            path == entry.path_suffix or path.endswith("/" + entry.path_suffix)
-            for entry in AUTHORIZED_TEST_DELETIONS
+    for name in (
+        "AUTHORIZED_TEST_DELETIONS",
+        "_get_lifecycle_bounded_authorized_deletions",
+    ):
+        assert not hasattr(rs, name), (
+            f"app.release_scoring.{name} is importable again. The hardcoded "
+            "test-deletion allowlist was deliberately retired in favour of per-file "
+            "LLM classification (deleted_test_file_classifications). Do not "
+            "reintroduce the allowlist — classify deletions in the release audit "
+            "agent (agent/src/handlers/audits.ts) instead."
         )
 
-    unanchored: list[str] = []
-    for entry in AUTHORIZED_TEST_DELETIONS:
-        # A path that shares the suffix but has no preceding separator must NOT match.
-        spoofed = "evil" + entry.path_suffix
-        if _is_authorized(spoofed):
-            unanchored.append(
-                f"  {entry.path_suffix!r}: unanchored — '{spoofed}' is incorrectly authorized"
-            )
-        # The canonical suffixed path (with separator) MUST match.
-        canonical = "some/dir/" + entry.path_suffix
-        if not _is_authorized(canonical):
-            unanchored.append(
-                f"  {entry.path_suffix!r}: broken — '{canonical}' is not authorized"
-            )
-
-    assert not unanchored, (
-        "AUTHORIZED_TEST_DELETIONS path_suffix matching is not anchored at a path separator.\n"
-        "The production matcher in release_scoring.py must use:\n"
-        "  str(f) == entry.path_suffix or str(f).endswith('/' + entry.path_suffix)\n"
-        "Failures:\n" + "\n".join(unanchored)
-    )
+    with pytest.raises(ImportError):
+        from app.release_scoring import AUTHORIZED_TEST_DELETIONS  # noqa: F401
+    with pytest.raises(ImportError):
+        from app.release_scoring import (  # noqa: F401
+            _get_lifecycle_bounded_authorized_deletions,
+        )
 
 
 def test_main_py_admin_endpoints_auth_and_401_path():
@@ -9907,88 +9881,37 @@ def test_main_py_admin_endpoints_auth_and_401_path():
     )
 
 
-def test_authorized_test_deletions_lifecycle_bounded():
-    """Entries in AUTHORIZED_TEST_DELETIONS must remain active only while their
-    co-deleted subject code is actually deleted from the working tree.
+def test_deleted_test_file_classification_fails_open_when_unclassified():
+    """The deleted-test-file gate must FAIL OPEN on unclassified deletions.
 
-    When a co-deleted file is restored (re-added to the repo), its entry becomes
-    "spent" and must be removed from the allowlist. Otherwise entries accumulate
-    indefinitely as permanent gate-bypass holes, allowing test deletions that were
-    never meant to be authorized.
+    With the hardcoded allowlist retired, the only way to hard-block a deleted
+    test file is an explicit ``genuine_erosion`` classification emitted by the
+    release audit agent.  This invariant proves the absence of the allowlist does
+    NOT tighten the gate on unclassified deletions: when ``_score_audit()`` sees
+    ``deleted_test_files`` but the report carries NO matching
+    ``deleted_test_file_classifications`` entry, it must return a non-None erosion
+    score (fail-open) rather than the ``test_file_deleted`` hard-blocker sentinel.
 
-    The lifecycle-bounded filter _get_lifecycle_bounded_authorized_deletions()
-    enforces this: only entries whose subject code is still deleted remain active.
+    This is the safety contract behind retiring the allowlist — an unclassified
+    dead-code cut can no longer veto a legitimate promotion the way the v14/v17
+    catch-22 did.
     """
-    from app.release_scoring import (
-        AUTHORIZED_TEST_DELETIONS,
-        _get_lifecycle_bounded_authorized_deletions,
+    from app.release_scoring import _score_audit
+
+    report = {
+        "audit_score": 0.9,
+        "test_erosion": {
+            "deleted_test_files": ["testing/test_some_module.py"],
+            "assertion_delta": 0,
+            "test_count_delta": 0,
+        },
+        # No deleted_test_file_classifications key at all.
+        "findings": [],
+    }
+    _, erosion = _score_audit(report)
+    assert erosion is not None, (
+        "An unclassified deleted test file must fail open (non-None erosion). "
+        "The allowlist was retired; only an explicit genuine_erosion "
+        "classification may hard-block. Returning None here re-creates the "
+        "catch-22 that blocked two legitimate promotions."
     )
-    from pathlib import Path
-
-    # Anchor to the repo root (backend/testing/test_invariants.py -> repo root is 3 levels up).
-    _repo_root = Path(__file__).parent.parent.parent
-
-    def _subject_file_exists(file_part: str) -> list[str]:
-        """Return list of repo-relative paths where file_part is found (recursive search)."""
-        matches = []
-        for base_dir in ("admin-ui", "backend", "agent"):
-            for p in (_repo_root / base_dir).rglob(file_part):
-                matches.append(str(p.relative_to(_repo_root)))
-        # Also check full relative path from repo root
-        direct = _repo_root / file_part
-        if direct.exists() and str(direct.relative_to(_repo_root)) not in matches:
-            matches.append(str(direct.relative_to(_repo_root)))
-        return matches
-
-    active = _get_lifecycle_bounded_authorized_deletions()
-
-    # Verify that the filtered list contains only entries whose subject files
-    # are actually deleted (no longer exist in the working tree).
-    spent_entries = []
-    for entry in AUTHORIZED_TEST_DELETIONS:
-        if entry not in active:
-            # This entry was filtered out — check that its subject file exists.
-            # If it exists, the entry is correctly identified as spent.
-            subject_str = entry.co_deleted_subject.strip()
-            file_part = subject_str.split()[0] if subject_str else ""
-            if not file_part:
-                spent_entries.append(
-                    f"  {entry.path_suffix!r}: malformed co_deleted_subject (no file part)"
-                )
-                continue
-
-            # Try to find the file anywhere under the repo root (recursive).
-            found_paths = _subject_file_exists(file_part)
-
-            if not found_paths:
-                # Subject file does not exist but entry was filtered — this is an
-                # inconsistency. The entry should be active since the code is deleted.
-                spent_entries.append(
-                    f"  {entry.path_suffix!r}: subject file '{file_part}' is deleted "
-                    "but entry was filtered out (should be active)"
-                )
-
-    assert not spent_entries, (
-        "AUTHORIZED_TEST_DELETIONS lifecycle check failed. Entries are filtered as "
-        "'spent' only when their co-deleted subject files have been restored (re-added "
-        "to the repo). If the subject is still deleted, the entry must remain active.\n"
-        "Issues:\n" + "\n".join(spent_entries)
-    )
-
-    # Verify that active entries correspond to entries where the subject code
-    # is actually deleted (proving the entry is valid and currently-needed).
-    for entry in active:
-        subject_str = entry.co_deleted_subject.strip()
-        file_part = subject_str.split()[0] if subject_str else ""
-        if not file_part:
-            continue
-
-        # The subject file must NOT exist (must be deleted) for an entry to be active.
-        # Search recursively from the repo root so nested paths are found.
-        found_paths = _subject_file_exists(file_part)
-
-        assert not found_paths, (
-            f"AUTHORIZED_TEST_DELETIONS entry {entry.path_suffix!r} is active but its "
-            f"co-deleted subject '{file_part}' exists at {found_paths}. The entry is "
-            "'spent' (the code came back) and must be removed from AUTHORIZED_TEST_DELETIONS."
-        )

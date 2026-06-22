@@ -656,6 +656,13 @@ ${versionGoalSection}
     "assertion_delta": 12,
     "test_count_delta": 3
   },
+  "deleted_test_file_classifications": [
+    {
+      "path": "testing/test_foo.py",
+      "classification": "dead_code_removal",
+      "rationale": "The subject module foo.py was also removed in this diff (see \`D testing/test_foo.py\` and \`D app/foo.py\`); no live callers remain."
+    }
+  ],
   "findings": [
     {
       "severity": "high",
@@ -672,6 +679,11 @@ Field semantics:
 - \`test_erosion.deleted_test_files\`: list of test file paths deleted in the diff. An empty list is good.
 - \`test_erosion.assertion_delta\`: integer — positive means more assertions added than removed (good), negative means erosion.
 - \`test_erosion.test_count_delta\`: integer — positive means more tests added than removed (good), negative means erosion.
+- \`deleted_test_file_classifications\`: classify EACH file in \`test_erosion.deleted_test_files\`. One object per deleted test file with \`path\` (the exact path string from \`deleted_test_files\`), \`classification\` (\`dead_code_removal\` | \`genuine_erosion\`), and \`rationale\` (one sentence citing the diff evidence you read). Classification rules:
+  - \`dead_code_removal\`: the test file's subject code (the module/function/component it exercised) is ALSO deleted in this same diff (a \`D\` line in \`git diff --name-status\`), OR there are zero remaining callers/imports of that subject anywhere in the candidate. **Default to this when uncertain — LEAN FAIL-OPEN.**
+  - \`genuine_erosion\`: the subject code is demonstrably STILL PRESENT and unchanged, and the test file was removed specifically to stop failing tests from blocking a build. This is the rare exception and requires clear evidence — read the diff and confirm the subject is present and unchanged before using it.
+  - **Operator disposition: bias strongly toward \`dead_code_removal\`.** Reserve \`genuine_erosion\` ONLY when you have read the diff and confirmed the subject code is present and unchanged. The backend hard-blocks promotion ONLY on an explicit \`genuine_erosion\` classification; an absent, ambiguous, or \`dead_code_removal\` classification fails open.
+  - When \`deleted_test_files\` is empty, emit \`[]\` (or omit the field).
 - \`findings\`: each entry has \`severity\` (critical|high|medium|low), \`summary\` (one sentence), \`file\` (file path or empty string if cross-cutting), and \`verification_note\` (required for high/medium/critical — cite the specific file and line you read and why the issue is real, ≥ 20 non-whitespace characters). Findings at severity high/medium/critical WITHOUT a substantive \`verification_note\` are silently excluded from the score — they do not deduct points. Drop or downgrade to low/info any finding you cannot substantiate.
 
 Rules:
@@ -701,11 +713,16 @@ Rules:
     audit_score?: number;
     test_erosion?: { deleted_test_files?: unknown[]; assertion_delta?: number; test_count_delta?: number };
     computed_test_erosion?: { deleted_test_files: string[]; assertion_delta: number; test_count_delta: number };
+    deleted_test_file_classifications?: { path: string; classification: string; rationale: string }[];
     findings?: unknown[];
   } | null;
 
   // Inject computed_test_erosion into the artifact so the backend can use it
   // as the authoritative signal rather than the LLM's self-reported test_erosion.
+  // deleted_test_file_classifications (the per-file dead_code_removal /
+  // genuine_erosion disposition) is carried through verbatim from the parsed
+  // handler output so it reaches release_scoring._score_audit, which retired the
+  // hardcoded AUTHORIZED_TEST_DELETIONS allowlist in favour of this signal.
   const enrichedOutput = handlerOutput !== null && computedTestErosion !== null
     ? { ...handlerOutput, computed_test_erosion: computedTestErosion }
     : handlerOutput;
