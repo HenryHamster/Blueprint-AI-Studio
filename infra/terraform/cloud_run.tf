@@ -198,24 +198,6 @@ resource "google_service_account" "agent_job_sa" {
 #   projects/<project>/locations/us-central1/jobs/blueprint-agent-job
 # resolves what compute_cloud_run.py dispatches against.
 
-locals {
-  # The 9 long-lived provider/runtime secrets the orchestrator service already
-  # mounts via cloudbuild.yaml's --set-secrets. The Job mounts the SAME secrets
-  # so the reused agent container boots with identical credentials. Mirror any
-  # change to this list in backend/cloudbuild.yaml's --set-secrets argument.
-  blueprint_agent_job_secrets = [
-    "DATABASE_URL",
-    "AGENT_JWT_SECRET",
-    "WS_TICKET_SECRET",
-    "GITHUB_APP_ID",
-    "GITHUB_CLIENT_ID",
-    "GITHUB_CLIENT_SECRET",
-    "GITHUB_PRIVATE_KEY",
-    "GITHUB_WEBHOOK_SECRET",
-    "ADMIN_API_KEY",
-  ]
-}
-
 resource "google_cloud_run_v2_job" "blueprint_agent_job" {
   name     = "blueprint-agent-job"
   location = var.region
@@ -288,20 +270,6 @@ resource "google_cloud_run_v2_job" "blueprint_agent_job" {
         env {
           name  = "ORCHESTRATOR_URL"
           value = var.orchestrator_url
-        }
-
-        # The 9 long-lived secrets, mounted from Secret Manager :latest.
-        dynamic "env" {
-          for_each = local.blueprint_agent_job_secrets
-          content {
-            name = env.value
-            value_source {
-              secret_key_ref {
-                secret  = env.value
-                version = "latest"
-              }
-            }
-          }
         }
       }
 

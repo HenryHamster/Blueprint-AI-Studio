@@ -189,9 +189,9 @@ resource "google_project_iam_member" "agent_job_secret_accessor" {
   member  = "serviceAccount:${google_service_account.agent_job_sa.email}"
 
   condition {
-    title       = "AgentJobBootSecretsOnly"
-    description = "Restrict Cloud Run Job SA to boot secrets and per-agent agent-creds-* secrets"
-    expression  = "resource.name.extract('secrets/{secret}') in ['DATABASE_URL', 'AGENT_JWT_SECRET', 'WS_TICKET_SECRET', 'GITHUB_APP_ID', 'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'GITHUB_PRIVATE_KEY', 'GITHUB_WEBHOOK_SECRET', 'ADMIN_API_KEY'] || resource.name.extract('secrets/{secret}').startsWith('agent-creds-')"
+    title       = "AgentJobSecretsOnly"
+    description = "Restrict Cloud Run Job SA to agent-creds-* secrets only"
+    expression  = "resource.name.extract('secrets/{secret}').startsWith('agent-creds-')"
   }
 }
 
