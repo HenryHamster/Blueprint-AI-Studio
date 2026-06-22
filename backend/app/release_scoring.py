@@ -454,11 +454,11 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
 
     Returns ``audit_score`` (None when report is absent/unusable) and a
     ``test_erosion_score`` in [0,1] where 1.0 == no erosion.  ``test_erosion``
-    is None — the hard-blocker sentinel — only when the diff deleted a test file
-    that the release audit agent classified as ``genuine_erosion`` (via
-    ``report["deleted_test_file_classifications"]``).  Deletions classified as
-    ``dead_code_removal``, or left unclassified/ambiguous, fail open and do NOT
-    block.  A net reduction in tests or assertions applies a graded penalty.
+    is None — the hard-blocker sentinel — when any deleted test file is classified as
+    ``genuine_erosion``, absent, or ambiguous (via ``report["deleted_test_file_classifications"]``).
+    The gate is fail-CLOSED: only an explicit ``dead_code_removal`` classification passes;
+    absent, ambiguous, or ``genuine_erosion`` classifications all hard-block.
+    A net reduction in tests or assertions applies a graded penalty.
     """
     if not isinstance(report, dict):
         return None, None
