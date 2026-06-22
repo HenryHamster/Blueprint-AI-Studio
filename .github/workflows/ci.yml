@@ -436,8 +436,8 @@ jobs:
         run: |
           docker run --rm -v "$PWD/backend:/app" \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
-            -e AGENT_JWT_SECRET=ci-test-secret \
-            -e WS_TICKET_SECRET=ci-test-secret \
+            -e AGENT_JWT_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
+            -e WS_TICKET_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
             ${{ steps.deps.outputs.image }} \
             python -c "from app.main import app; print(f'OK: {len(app.routes)} routes')"
 
@@ -464,8 +464,8 @@ jobs:
           docker run --rm --network host -v "$PWD/backend:/app" \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
             -e USE_TEST_POSTGRES=true \
-            -e AGENT_JWT_SECRET=ci-test-secret \
-            -e WS_TICKET_SECRET=ci-test-secret \
+            -e AGENT_JWT_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
+            -e WS_TICKET_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
             ${{ steps.deps.outputs.image }} \
             python -m pytest testing/ --splits 8 --group ${{ matrix.shard }} \
               -v --tb=short --timeout=30 --timeout-method=signal --log-cli-level=WARNING 2>&1 | tee test-output.txt
