@@ -1060,12 +1060,12 @@ class TestScoreAudit:
             "An explicit genuine_erosion classification must hard-block"
         )
 
-    def test_absent_classifications_fail_open(self):
-        """A deleted test file with NO classifications entry must fail open.
+    def test_absent_classifications_fail_closed(self):
+        """A deleted test file with NO classifications entry must fail closed.
 
-        The retired allowlist tightened the gate on any deletion not pre-approved;
-        the new contract fails open on absent/ambiguous classification so an
-        unclassified dead-code cut no longer vetoes promotion.
+        Fail-closed: every deleted test file must carry an explicit
+        ``dead_code_removal`` classification to pass.  Absent/ambiguous
+        classifications block promotion the same way as ``genuine_erosion``.
         """
         report = {
             "audit_score": 0.9,
@@ -1078,10 +1078,9 @@ class TestScoreAudit:
             "findings": [],
         }
         _, erosion = rq._score_audit(report)
-        assert erosion is not None, (
-            "An unclassified deleted test file must fail open (non-None erosion)"
+        assert erosion is None, (
+            "An unclassified deleted test file must fail closed (erosion=None)"
         )
-        assert erosion == pytest.approx(1.0)
 
     def test_mixed_classifications_any_genuine_blocks(self):
         """Two deleted files where one is genuine_erosion must hard-block."""
@@ -1114,8 +1113,12 @@ class TestScoreAudit:
             "Any single genuine_erosion among mixed classifications must hard-block"
         )
 
-    def test_empty_classifications_list_fails_open(self):
-        """An empty deleted_test_file_classifications list must fail open."""
+    def test_empty_classifications_list_fails_closed(self):
+        """An empty deleted_test_file_classifications list must fail closed.
+
+        An empty list provides no explicit ``dead_code_removal`` authorisation
+        for the deleted file — gate must block (erosion=None).
+        """
         report = {
             "audit_score": 0.9,
             "test_erosion": {
@@ -1127,8 +1130,43 @@ class TestScoreAudit:
             "findings": [],
         }
         _, erosion = rq._score_audit(report)
+        assert erosion is None, (
+            "An empty classifications list must fail closed (erosion=None)"
+        )
+
+    def test_all_dead_code_removal_passes(self):
+        """Multiple deleted test files all classified dead_code_removal must pass.
+
+        Each file carries an explicit non-erosion authorisation, so the gate
+        must return a non-None erosion score (no hard block).
+        """
+        report = {
+            "audit_score": 0.9,
+            "test_erosion": {
+                "deleted_test_files": [
+                    "testing/test_foo.py",
+                    "testing/test_bar.py",
+                ],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_foo.py",
+                    "classification": "dead_code_removal",
+                    "rationale": "app/foo.py co-deleted; no callers remain.",
+                },
+                {
+                    "path": "testing/test_bar.py",
+                    "classification": "dead_code_removal",
+                    "rationale": "app/bar.py co-deleted; no callers remain.",
+                },
+            ],
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
         assert erosion is not None, (
-            "An empty classifications list must fail open (non-None erosion)"
+            "All dead_code_removal deletions must pass (non-None erosion)"
         )
         assert erosion == pytest.approx(1.0)
 
@@ -1630,6 +1668,10 @@ class TestScoreAuditComputedErosion:
         assertion_delta/test_count_delta, both deltas arrive at 0 even though
         the file itself had test content — the hard-blocker gate owns the file
         dimension, the graded penalty must see delta=0 and return 1.0.
+
+        The deletion is explicitly authorized via a dead_code_removal
+        classification — the audit agent must provide this for any non-erosion
+        deletion to pass the fail-closed gate.
         """
         report = {
             "audit_score": 0.9,
@@ -1639,6 +1681,13 @@ class TestScoreAuditComputedErosion:
                 "assertion_delta": 0,
                 "test_count_delta": 0,
             },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "admin-ui/src/utils/viewportRegression.test.ts",
+                    "classification": "dead_code_removal",
+                    "rationale": "viewport regression harness co-deleted; no callers remain.",
+                }
+            ],
             "findings": [],
         }
         _, erosion = rq._score_audit(report)
@@ -25760,6 +25809,49 @@ class TestBlindMergeGradeBlock:
         )
         assert result["blocker"] == "theme_delivery_shortfall"
 
+    def test_compute_composite_merge_grade_misses_label(self):
+        """merge_grade_misses=True emits the merge_grade_misses blocker label."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            merge_grade_misses=True,
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "merge_grade_misses"
+
+    def test_compute_composite_merge_grade_goal_coverage_label(self):
+        """merge_grade_blocked=True (child-task gate) emits merge_grade_goal_coverage."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            merge_grade_blocked=True,
+        )
+        assert result["confidence"] == 0.0
+        assert result["blocker"] == "merge_grade_goal_coverage"
+
+    def test_compute_composite_merge_grade_misses_takes_precedence_over_goal_coverage(
+        self,
+    ):
+        """When both merge_grade_misses and merge_grade_blocked are True,
+        merge_grade_misses fires first (armable-dark checked before child-task gate)."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            merge_grade_blocked=True,
+            merge_grade_misses=True,
+        )
+        assert result["blocker"] == "merge_grade_misses"
+
     # --- Integration tests: _finalize_qualification gate -------------------
 
     @pytest.mark.asyncio
@@ -25889,8 +25981,8 @@ class TestBlindMergeGradeBlock:
         assert result2["status"] == "not_promoted", (
             f"armed threshold + misses must not_promote; got {result2['status']!r}"
         )
-        assert result2.get("blocker") == "merge_grade_goal_coverage", (
-            f"expected merge_grade blocker; got {result2.get('blocker')!r}"
+        assert result2.get("blocker") == "merge_grade_misses", (
+            f"expected merge_grade_misses blocker for armed coverage_verdict==misses; got {result2.get('blocker')!r}"
         )
         assert lq2_final.get("confidence") == 0.0, (
             f"expected confidence=0.0; got {lq2_final.get('confidence')!r}"

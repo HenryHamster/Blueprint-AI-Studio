@@ -9881,24 +9881,29 @@ def test_main_py_admin_endpoints_auth_and_401_path():
     )
 
 
-def test_deleted_test_file_classification_fails_open_when_unclassified():
-    """The deleted-test-file gate must FAIL OPEN on unclassified deletions.
+def test_deleted_test_file_classification_fails_closed_without_authorization():
+    """The deleted-test-file gate must FAIL CLOSED on unclassified deletions.
 
-    With the hardcoded allowlist retired, the only way to hard-block a deleted
-    test file is an explicit ``genuine_erosion`` classification emitted by the
-    release audit agent.  This invariant proves the absence of the allowlist does
-    NOT tighten the gate on unclassified deletions: when ``_score_audit()`` sees
-    ``deleted_test_files`` but the report carries NO matching
-    ``deleted_test_file_classifications`` entry, it must return a non-None erosion
-    score (fail-open) rather than the ``test_file_deleted`` hard-blocker sentinel.
+    With the hardcoded allowlist retired, the escape hatch for a legitimate
+    test deletion is an explicit ``dead_code_removal`` classification emitted
+    by the release audit agent.  This invariant proves the gate is fail-closed:
+    when ``_score_audit()`` sees ``deleted_test_files`` but the report carries
+    NO ``deleted_test_file_classifications`` entry (or an empty one), it must
+    return ``erosion=None`` (the hard-blocker sentinel) — just like an explicit
+    ``genuine_erosion`` classification would.
 
-    This is the safety contract behind retiring the allowlist — an unclassified
-    dead-code cut can no longer veto a legitimate promotion the way the v14/v17
-    catch-22 did.
+    The v14/v17 deadlock is avoided by a different mechanism: the audit agent
+    classifies per-file at qualification time (candidate-bound), so the
+    authorisation lives in the audit report rather than a backend allowlist.
+    A ``dead_code_removal`` classification in the report is all that is needed
+    to allow the deletion; no backend deploy is required.  Fail-closed on
+    absent/ambiguous classification ensures that a missed classification does
+    not silently promote an eroding deletion.
     """
     from app.release_scoring import _score_audit
 
-    report = {
+    # Part 1: absent classifications key → fail-closed
+    report_absent = {
         "audit_score": 0.9,
         "test_erosion": {
             "deleted_test_files": ["testing/test_some_module.py"],
@@ -9908,10 +9913,32 @@ def test_deleted_test_file_classification_fails_open_when_unclassified():
         # No deleted_test_file_classifications key at all.
         "findings": [],
     }
-    _, erosion = _score_audit(report)
-    assert erosion is not None, (
-        "An unclassified deleted test file must fail open (non-None erosion). "
-        "The allowlist was retired; only an explicit genuine_erosion "
-        "classification may hard-block. Returning None here re-creates the "
-        "catch-22 that blocked two legitimate promotions."
+    _, erosion_absent = _score_audit(report_absent)
+    assert erosion_absent is None, (
+        "An unclassified deleted test file must fail closed (erosion=None). "
+        "The allowlist was retired; the escape hatch is now an explicit "
+        "dead_code_removal classification in the audit report."
+    )
+
+    # Part 2: explicit dead_code_removal classification → gate passes (non-None)
+    report_authorized = {
+        "audit_score": 0.9,
+        "test_erosion": {
+            "deleted_test_files": ["testing/test_some_module.py"],
+            "assertion_delta": 0,
+            "test_count_delta": 0,
+        },
+        "deleted_test_file_classifications": [
+            {
+                "path": "testing/test_some_module.py",
+                "classification": "dead_code_removal",
+                "rationale": "app/some_module.py co-deleted; no callers remain.",
+            }
+        ],
+        "findings": [],
+    }
+    _, erosion_authorized = _score_audit(report_authorized)
+    assert erosion_authorized is not None, (
+        "A dead_code_removal-classified deletion must pass (non-None erosion). "
+        "This is the non-deadlock escape hatch replacing the old allowlist."
     )

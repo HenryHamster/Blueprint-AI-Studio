@@ -3327,6 +3327,7 @@ async def _finalize_qualification(
         migration_apply_blocked=migration_apply_blocked,
         theme_delivery_blocked=_theme_blocked,
         merge_grade_blocked=merge_grade_blocked,
+        merge_grade_misses=_merge_grade_blocked,
     )
 
     # --- Acceptance-window aggregate (additive evidence, no score impact) --

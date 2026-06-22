@@ -148,6 +148,7 @@ def compute_composite(
     migration_apply_blocked: bool = False,
     theme_delivery_blocked: bool = False,
     merge_grade_blocked: bool = False,
+    merge_grade_misses: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -269,13 +270,15 @@ def compute_composite(
         # raised theme_block_threshold above 0.0 to arm hard-blocking.
         # Ships dark by default (threshold=0.0 never fires).
         blocker = "theme_delivery_shortfall"
+    elif merge_grade_misses:
+        # The armable-dark blind-grade gate: coverage_verdict == "misses" AND the
+        # operator has raised merge_grade_block_threshold above 0.0.  Distinct from
+        # the child-task gate (covers_goal == False) so operators see the right label.
+        blocker = "merge_grade_misses"
     elif merge_grade_blocked:
-        # The blind merge-grade gate (dir d-c0fe439f): an uninvested agent
-        # graded the merged DIFFS against the frozen version.goal and found they
-        # do NOT advance the goal (covers_goal == False).  The hard gate fires
-        # when the child-task gate fails (merge_grade_goal_coverage); the armable-
-        # dark gate fires when coverage_verdict == "misses" AND the operator has
-        # raised merge_grade_block_threshold above 0.0 (merge_grade_misses).
+        # The child-task merge-grade gate: the uninvested agent graded the merged
+        # DIFFS against the frozen version.goal and found they do NOT advance the
+        # goal (covers_goal == False).
         blocker = "merge_grade_goal_coverage"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
@@ -540,22 +543,29 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
         # subject is demonstrably still present and the test was removed to stop
         # failing tests from blocking a build).
         #
-        # Disposition is PERMISSIVE and fail-open: the hard blocker fires ONLY on
-        # an explicit ``genuine_erosion`` classification.  An absent, empty, or
-        # ambiguous classification — or an explicit ``dead_code_removal`` — does
-        # NOT block, so an unclassified dead-code cut no longer vetoes promotion.
+        # Disposition is FAIL-CLOSED: every deleted test file must carry an
+        # explicit ``dead_code_removal`` classification to pass.  An absent,
+        # empty, or ambiguous classification blocks just like ``genuine_erosion``
+        # — the caller must provide a positive authorisation, not rely on silence.
+        # ``dead_code_removal`` is the only non-blocking outcome; all other
+        # values (including the empty string from a missing key) hard-block.
+        #
+        # The candidate-bound per-file classification path introduced in 84b965a9
+        # is preserved: the gate reads ``deleted_test_file_classifications`` from
+        # the audit report at scoring time, so the deadlock that afflicted the
+        # old AUTHORIZED_TEST_DELETIONS allowlist (which required a backend
+        # deploy to widen) cannot return.
         classifications: dict[str, str] = {}
         raw_cls = report.get("deleted_test_file_classifications")
         if isinstance(raw_cls, list):
             for item in raw_cls:
                 if isinstance(item, dict) and isinstance(item.get("path"), str):
                     classifications[item["path"]] = str(item.get("classification", ""))
-        genuine_erosion_found = any(
-            classifications.get(str(f)) == "genuine_erosion" for f in deleted
-        )
-        if genuine_erosion_found:
-            # Hard blocker — a confirmed genuine test-erosion deletion forces a
-            # non-promote (compute_composite labels this ``test_file_deleted``).
+        for f in deleted:
+            cls = classifications.get(str(f), "")
+            if cls == "dead_code_removal":
+                continue  # explicit non-erosion authorisation — allow
+            # genuine_erosion or absent/ambiguous — hard block
             return audit_score, None
 
     # Graded penalty for net assertion / test-count reduction.  Each negative
