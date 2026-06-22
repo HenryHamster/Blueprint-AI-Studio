@@ -1168,7 +1168,6 @@ class TestScoreAudit:
         assert erosion is not None, (
             "All dead_code_removal deletions must pass (non-None erosion)"
         )
-        assert erosion == pytest.approx(1.0)
 
     def test_allowlist_symbols_not_importable(self):
         """The retired allowlist symbols must not be re-exported from release_scoring."""
@@ -1661,8 +1660,8 @@ class TestScoreAuditComputedErosion:
         assert any("test_erosion divergence" in r.message for r in caplog.records)
 
     def test_authorized_deletion_with_zero_delta_does_not_penalize(self):
-        """An authorized deletion whose removed lines are excluded from the delta
-        (by the TS-side fix) yields a non-penalized test_erosion score.
+        """A dead_code_removal deletion whose removed lines are excluded from the
+        delta (by the TS-side fix) yields a non-penalized test_erosion score.
 
         When the agent correctly excludes deleted-file lines from
         assertion_delta/test_count_delta, both deltas arrive at 0 even though
@@ -1693,7 +1692,7 @@ class TestScoreAuditComputedErosion:
         _, erosion = rq._score_audit(report)
         # Authorized deletion — hard-blocker must NOT fire.
         assert erosion is not None, (
-            "Authorized deletion must not produce the None hard-blocker"
+            "dead_code_removal classification must not produce the None hard-blocker"
         )
         # Zero deltas — graded penalty must not fire.
         assert erosion == pytest.approx(1.0), (

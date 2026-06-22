@@ -52,9 +52,15 @@ const TOOLTIP_STYLE = {
   labelStyle: { color: '#a3a3a3' },
 };
 
-const formatCostPerHr = (value: unknown): [string, string] => [(value as number).toFixed(2) + ' $/hr', 'VM Cost/Hr'];
+const formatCostPerHr = (value: unknown): [string, string] => {
+  if (value === null || value === undefined) return ['—', 'VM Cost/Hr'];
+  return [(value as number).toFixed(2) + ' $/hr', 'VM Cost/Hr'];
+};
 const formatActiveVMs = (value: unknown): [string, string] => [String(value) + ' VMs', 'Active VMs'];
-const formatFailureRate = (value: unknown): [string, string] => [(value as number).toFixed(1) + '%', 'Failure Rate'];
+const formatFailureRate = (value: unknown): [string, string] => {
+  if (value === null || value === undefined) return ['—', 'Failure Rate'];
+  return [(value as number).toFixed(1) + '%', 'Failure Rate'];
+};
 const makeLabelFormatter = (windowMs: number) => (ts: unknown) => formatTime(Number(ts), windowMs);
 const METRICS_EXPORT_FIELDS = ['timestamp', 'activeVMs', 'costPerHr', 'completedCount', 'failedCount'] as const;
 
@@ -650,7 +656,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             <span className="text-neutral-500 font-mono">${data.vm_cost_attribution.total_vm_usd.toFixed(2)} total</span>
           </div>
           {data.vm_cost_attribution_trend && data.vm_cost_attribution_trend.length >= 2 && (() => {
-            const trendPoints = data.vm_cost_attribution_trend!
+            const trendPoints = data.vm_cost_attribution_trend
               .filter((e): e is typeof e & { total_vm_usd: number } => e.total_vm_usd != null)
               .map(e => ({ v: e.total_vm_usd }));
             if (trendPoints.length < 2) return null;
