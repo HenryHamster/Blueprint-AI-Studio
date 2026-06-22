@@ -28,7 +28,10 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
-from app.vm_cost_rates import get_cloud_run_rate_for_machine_type, get_vm_rate_per_second
+from app.vm_cost_rates import (
+    get_cloud_run_rate_for_machine_type,
+    get_vm_rate_per_second,
+)
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
 from app.resource_envelope import (
@@ -72,53 +75,44 @@ async def cost_summary(
     by_type: Dict[str, Any] = {}
     total_cost = 0.0
 
-    # GROUP BY (provider, vm_spot, vm_machine_type) so we compute duration totals
-    # in SQL rather than loading thousands of Task rows into Python for arithmetic.
-    agg_rows = (
+    # Fetch raw rows and aggregate in Python so the query is dialect-agnostic
+    # (func.greatest and func.extract('epoch', interval) are PostgreSQL-only).
+    raw_rows = (
         await session.execute(
             select(
                 Task.provider,
                 Task.vm_spot,
                 Task.vm_machine_type,
-                func.count().label("n"),
-                func.sum(
-                    func.greatest(
-                        0.0,
-                        func.extract(
-                            "epoch", Task.vm_stopped_at - Task.vm_provisioned_at
-                        ),
-                    )
-                ).label("total_seconds"),
-            )
-            .where(
+                Task.vm_provisioned_at,
+                Task.vm_stopped_at,
+            ).where(
                 Task.created_at >= cutoff,
                 Task.vm_provisioned_at.is_not(None),
                 Task.vm_stopped_at.is_not(None),
             )
-            .group_by(Task.provider, Task.vm_spot, Task.vm_machine_type)
         )
     ).all()
 
-    for agg in agg_rows:
-        provider = agg.provider
-        vm_spot = agg.vm_spot
-        machine_type = agg.vm_machine_type
+    for row in raw_rows:
+        provider = row.provider
+        vm_spot = row.vm_spot
+        machine_type = row.vm_machine_type
         key = f"{provider or 'unknown'}:{'spot' if vm_spot else 'on-demand'}"
-        total_seconds = float(agg.total_seconds or 0)
+        duration = max(0.0, (row.vm_stopped_at - row.vm_provisioned_at).total_seconds())
         if machine_type and machine_type.startswith("cloud-run-"):
             rate = get_cloud_run_rate_for_machine_type(machine_type)
         else:
             rate = get_vm_rate_per_second(machine_type=machine_type, spot=vm_spot)
-        estimated_cost = total_seconds * rate
+        estimated_cost = duration * rate
         existing = by_type.get(key)
         if existing is not None:
-            existing["count"] += agg.n
-            existing["total_seconds"] += total_seconds
+            existing["count"] += 1
+            existing["total_seconds"] += duration
             existing["estimated_cost"] += estimated_cost
         else:
             by_type[key] = {
-                "count": agg.n,
-                "total_seconds": total_seconds,
+                "count": 1,
+                "total_seconds": duration,
                 "estimated_cost": estimated_cost,
                 "provider": provider,
                 "spot": vm_spot,

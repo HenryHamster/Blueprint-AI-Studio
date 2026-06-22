@@ -2330,3 +2330,84 @@ async def test_plan_subtask_ordering_only_prereq_keeps_own_base(
     assert "plan/" in child_base, (
         f"ordering-only dep must keep its own plan branch, got {child_base!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_plan_subtask_cross_tree_none_base_branch_is_noop(
+    db_session, mocker, _quiet_mocks
+):
+    """_maybe_inherit_base is a no-op when the foundation has no base_branch.
+
+    A foundation task with base_branch=None (e.g. an open version with no
+    goal set) must not propagate None into the dependent's payload, which
+    would crash downstream git operations expecting a string.
+    """
+    project = make_project(name="XbaseNoneFoundationPlan")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Foundation with NO base_branch in its payload (None goal / open version).
+    foundation = make_task(
+        project_id=project.id,
+        title="Foundation no base",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create"}],
+    )
+    foundation.context = {"related_files": ["backend/app/payments.py"]}
+    db_session.add(foundation)
+    await db_session.commit()
+    await db_session.refresh(foundation)
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Add refund endpoint",
+                    "prompt": "implement refunds",
+                    "type": "create",
+                    "prerequisite": {"kind": "task", "ref": str(foundation.id)},
+                    "related_files": ["backend/app/payments.py"],
+                }
+            ]
+        }
+    )
+
+    plan_task = make_task(
+        project_id=project.id,
+        title="Plan: add refunds none base",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "add refunds", "base_branch": "plan/abc"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=plan_task,
+    )
+
+    await _handle_plan_completion(plan_task, plan_logs, db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == plan_task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    child_base = (child.first_payload or {}).get("base_branch")
+    assert child_base is not None, (
+        "_maybe_inherit_base must not propagate None base_branch from foundation"
+    )
+    assert "plan/" in child_base, (
+        "child must keep its own plan branch when foundation has no base_branch, "
+        f"got {child_base!r}"
+    )

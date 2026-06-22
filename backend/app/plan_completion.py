@@ -1066,6 +1066,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             dependent, foundation
         ):
             foundation_base = (foundation.first_payload or {}).get("base_branch")
+            if foundation_base is None:
+                return
             dependent.payloads[0]["base_branch"] = foundation_base
             _flag_modified(dependent, "payloads")
             session.add(dependent)
