@@ -10497,25 +10497,16 @@ class TestLaunchAgentCloudRunJob:
     """Tests for compute_cloud_run.launch_agent_cloud_run_job."""
 
     @pytest.mark.asyncio
-    async def test_launch_injects_agent_secret_token(self, monkeypatch):
-        """When secret_version_name is provided, AGENT_SECRET_TOKEN must be
-        extracted from the Secret Manager manifest and injected as an env var.
-
-        We patch _fetch_agent_secret_token (the isolated SM helper) and the
-        run_v2 JobsClient so no real GCP calls are made.
+    async def test_launch_injects_agent_secret_version(self, monkeypatch):
+        """When secret_version_name is provided, AGENT_SECRET_VERSION must be
+        passed as an env var so the agent can fetch secrets at startup.
+        Plaintext credentials are never injected as env overrides.
         """
         from app import compute as _compute_module
         from app import compute_cloud_run
 
         # Disable LOCAL_MODE so the function proceeds past the early-return guard.
         monkeypatch.setattr(_compute_module, "LOCAL_MODE", False)
-
-        # Patch the Secret Manager helper to return a known token.
-        monkeypatch.setattr(
-            compute_cloud_run,
-            "_fetch_agent_secret_token",
-            lambda version: "test-jwt-abc123",
-        )
 
         # Capture env vars passed to run_job.
         captured_env: list[tuple[str, str]] = []
@@ -10579,35 +10570,37 @@ class TestLaunchAgentCloudRunJob:
 
         assert result is True
         env_dict = dict(captured_env)
-        assert "AGENT_SECRET_TOKEN" in env_dict, (
-            f"AGENT_SECRET_TOKEN must be injected; got env keys: {list(env_dict)}"
+        assert "AGENT_SECRET_VERSION" in env_dict, (
+            f"AGENT_SECRET_VERSION must be injected; got env keys: {list(env_dict)}"
         )
-        assert env_dict["AGENT_SECRET_TOKEN"] == "test-jwt-abc123"
+        assert env_dict["AGENT_SECRET_VERSION"] == "projects/p/secrets/s/versions/1"
+        # Plaintext secrets must never be injected
+        assert "AGENT_SECRET_TOKEN" not in env_dict
+        assert "ANTHROPIC_API_KEY" not in env_dict
 
     @pytest.mark.asyncio
-    async def test_launch_returns_false_on_secret_fetch_failure(self, monkeypatch):
-        """When _fetch_agent_secret_token raises, launch must return False
-        without calling run_job."""
+    async def test_no_secret_version_when_not_provided(self, monkeypatch):
+        """When secret_version_name is None, AGENT_SECRET_VERSION is not injected."""
         import google.cloud
         from app import compute as _compute_module
         from app import compute_cloud_run
 
         monkeypatch.setattr(_compute_module, "LOCAL_MODE", False)
 
-        def failing_fetch(version):
-            raise Exception("permission denied")
+        captured_env: list = []
 
-        monkeypatch.setattr(
-            compute_cloud_run, "_fetch_agent_secret_token", failing_fetch
-        )
+        class FakeClient:
+            def run_job(self, *, request):
+                for co in request.overrides.container_overrides:
+                    captured_env.extend(co.env)
+                op = MagicMock()
+                op.operation.name = "fake-op"
+                return op
 
-        run_job_calls: list = []
-        mock_run_client = MagicMock()
-        mock_run_client.run_job.side_effect = lambda r: run_job_calls.append(r)
         mock_run_module = MagicMock()
-        mock_run_module.JobsClient.return_value = mock_run_client
-        monkeypatch.setattr(google.cloud, "run_v2", mock_run_module, raising=False)
+        mock_run_module.JobsClient.return_value = FakeClient()
 
+        monkeypatch.setattr(google.cloud, "run_v2", mock_run_module, raising=False)
         monkeypatch.setattr(
             compute_cloud_run,
             "CLOUD_RUN_JOB_NAME",
@@ -10618,16 +10611,20 @@ class TestLaunchAgentCloudRunJob:
             vm_id="vm-002",
             task_id="task-002",
             payload_uri=None,
-            secret_version_name="projects/p/secrets/s/versions/1",
+            secret_version_name=None,
             task_type="research",
         )
 
-        assert result is False, "must return False when Secret Manager fetch fails"
-        assert run_job_calls == [], "run_job must NOT be called when secret fetch fails"
+        assert result is True, "must return True when no secret is needed"
+        env_dict = {e.name: e.value for e in captured_env}
+        assert "AGENT_SECRET_VERSION" not in env_dict, (
+            "AGENT_SECRET_VERSION must not be injected when secret_version_name is None"
+        )
 
     @pytest.mark.asyncio
-    async def test_injects_llm_env_vars_anthropic_api_key(self, monkeypatch):
-        """LLM credential and settings env vars are injected for anthropic/api_key."""
+    async def test_injects_llm_settings_not_plaintext_creds(self, monkeypatch):
+        """LLM identifier and settings env vars are injected, but plaintext
+        credentials like ANTHROPIC_API_KEY are never included as env overrides."""
         import google.cloud.run_v2 as run_v2_mod
         from app.compute_cloud_run import launch_agent_cloud_run_job
         import app.compute_cloud_run as ccr_mod
@@ -10638,8 +10635,6 @@ class TestLaunchAgentCloudRunJob:
         monkeypatch.setattr("app.compute_manifest.ANTHROPIC_API_KEY", "sk-ant-test123")
         # Ensure not LOCAL_MODE
         monkeypatch.setattr("app.compute.LOCAL_MODE", False)
-        # Prevent real GCP Secret Manager call — no ADC in CI.
-        monkeypatch.setattr(ccr_mod, "_fetch_agent_secret_token", lambda v: "fake-token")
 
         submitted_env: list = []
 
@@ -10671,8 +10666,9 @@ class TestLaunchAgentCloudRunJob:
         assert env_dict.get("AUTH_MODE") == "api_key", (
             f"AUTH_MODE missing; got {env_dict}"
         )
-        assert env_dict.get("ANTHROPIC_API_KEY") == "sk-ant-test123", (
-            f"ANTHROPIC_API_KEY missing; got {env_dict}"
+        # ANTHROPIC_API_KEY must NOT be injected as plaintext
+        assert "ANTHROPIC_API_KEY" not in env_dict, (
+            f"ANTHROPIC_API_KEY must not be plaintext in env overrides; got {env_dict}"
         )
         assert "LLM_SETTINGS" in env_dict, (
             f"LLM_SETTINGS missing from env overrides; got {env_dict}"
@@ -10680,7 +10676,7 @@ class TestLaunchAgentCloudRunJob:
         assert "LLM_CLI_TRANSLATION" in env_dict, (
             f"LLM_CLI_TRANSLATION missing from env overrides; got {env_dict}"
         )
-        # AGENT_SECRET_VERSION must still be present for the token fetch path
+        # AGENT_SECRET_VERSION must be present so agent can fetch the actual API key
         assert env_dict.get("AGENT_SECRET_VERSION") == "projects/p/secrets/s/versions/1"
 
     @pytest.mark.asyncio
@@ -10784,8 +10780,8 @@ class TestLaunchAgentCloudRunJob:
         assert env_dict.get("PROVIDER") == "gemini"
 
     @pytest.mark.asyncio
-    async def test_no_llm_params_no_llm_env(self, monkeypatch):
-        """Without LLM params only the six baseline env vars are injected."""
+    async def test_no_llm_params_only_baseline_env(self, monkeypatch):
+        """Without LLM params, only baseline env vars are injected (no plaintext creds)."""
         import google.cloud.run_v2 as run_v2_mod
         from app.compute_cloud_run import launch_agent_cloud_run_job
         import app.compute_cloud_run as ccr_mod
@@ -10794,8 +10790,6 @@ class TestLaunchAgentCloudRunJob:
             ccr_mod, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent"
         )
         monkeypatch.setattr("app.compute.LOCAL_MODE", False)
-        # Prevent real GCP Secret Manager call — no ADC in CI.
-        monkeypatch.setattr(ccr_mod, "_fetch_agent_secret_token", lambda v: "fake-token")
 
         submitted_env: list = []
 
@@ -10826,11 +10820,13 @@ class TestLaunchAgentCloudRunJob:
             "CLOUD_RUN_JOB",
             "PAYLOAD_URI",
             "AGENT_SECRET_VERSION",
-            "AGENT_SECRET_TOKEN",
         }
         assert set(env_dict.keys()) == baseline_keys, (
             f"Expected only baseline env keys without LLM params; got {set(env_dict.keys())}"
         )
+        # Ensure no plaintext secrets are injected
+        assert "AGENT_SECRET_TOKEN" not in env_dict
+        assert "ANTHROPIC_API_KEY" not in env_dict
 
     @pytest.mark.asyncio
     async def test_local_mode_returns_true_without_api_call(self, monkeypatch):
