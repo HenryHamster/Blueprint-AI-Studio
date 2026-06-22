@@ -1540,13 +1540,13 @@ _METRICS_TOKEN = os.getenv("METRICS_TOKEN", "")
 async def prometheus_metrics(request: Request):
     """Prometheus-compatible metrics endpoint (text/plain exposition format).
 
-    Returns 403 Forbidden if METRICS_TOKEN is unset OR if ?token=<value> doesn't match.
-    This is fail-closed by design: the orchestrator is publicly routable, so the endpoint
-    must refuse unauthenticated access to avoid exposing operational metrics on the internet.
+    Unauthenticated by default. If METRICS_TOKEN env var is set, requires
+    ?token=<value> query param matching that value (403 otherwise).
     """
-    token = request.query_params.get("token", "")
-    if not _METRICS_TOKEN or not hmac.compare_digest(token, _METRICS_TOKEN):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    if _METRICS_TOKEN:
+        token = request.query_params.get("token", "")
+        if not hmac.compare_digest(token, _METRICS_TOKEN):
+            return JSONResponse(status_code=403, content={"error": "forbidden"})
 
     cycle_age: float | None = None
     if _orch._orchestrator_last_cycle:
