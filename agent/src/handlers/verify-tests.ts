@@ -1077,7 +1077,7 @@ export async function handleVerifyTests(
       result = {
         detected: true,
         passed,
-        tests: runners.map(r => ({
+        tests: activeRunners.map(r => ({
           name: r.label,
           status: passed ? 'pass' : 'fail',
           message: passed ? '' : message,

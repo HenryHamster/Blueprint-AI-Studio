@@ -1141,4 +1141,19 @@ describe('handleVerifyTests — diff-aware runner filtering', () => {
 
     expect(runnersUsed()).toEqual([AGENT_RUNNER.label, BACKEND_RUNNER.label]);
   });
+
+  it('MERGE_TEST_RESULT.tests contains only activeRunners, not skipped-by-path runners', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([AGENT_RUNNER, BACKEND_RUNNER, FRONTEND_RUNNER]);
+    mockDiff(['agent/src/handlers/foo.ts']);
+
+    await handleVerifyTests('df4', payload, {}, 'tok', 'o', 'r', null, { value: '' });
+
+    const calls = vi.mocked(persistAndPostStatus).mock.calls;
+    const lastPost = calls[calls.length - 1][1];
+    const verdict = JSON.parse(lastPost.logs as string) as { tests: Array<{ name: string }> };
+    const testNames = verdict.tests.map(t => t.name);
+    expect(testNames).toEqual([AGENT_RUNNER.label]);
+    expect(testNames).not.toContain(BACKEND_RUNNER.label);
+    expect(testNames).not.toContain(FRONTEND_RUNNER.label);
+  });
 });
