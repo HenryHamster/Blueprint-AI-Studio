@@ -215,24 +215,13 @@ export async function fetchVmImageIdentity(): Promise<{ image_name: string | nul
   }
 }
 
-// LLM credential env var names the agent resolves from the Secret Manager
-// manifest — must match the LLM-credential subset of _SECRET_ENV_KEYS in
-// compute_cloud_run.py (AGENT_SECRET_TOKEN handled separately as AGENT_TOKEN).
-const _CREDENTIAL_ENV_KEYS = [
-  'CLAUDE_CODE_OAUTH_TOKEN',
-  'ANTHROPIC_API_KEY',
-  'OPENAI_API_KEY',
-  'CODEX_API_KEY',
-  'GEMINI_API_KEY',
-] as const;
-
 /**
  * When running in Cloud Run Job mode the backend does not inject the agent JWT
  * or LLM credential values as plaintext env-var overrides (they would be
  * visible in Cloud Audit Logs and run.executions.get responses). Instead the
  * backend passes AGENT_SECRET_VERSION — a Secret Manager version URI — and
  * this function fetches the manifest at that version, then populates
- * AGENT_TOKEN and any missing LLM credential env vars from it.
+ * AGENT_TOKEN, all non-identity env vars, and any file credentials from it.
  *
  * Throws on any failure so the caller can surface a pre-claim heartbeat before
  * exiting.
@@ -285,18 +274,25 @@ export async function resolveCredentialsFromSecretVersion(
     throw new Error(`resolveCredentialsFromSecretVersion: failed to fetch secret: ${msg}`);
   }
 
-  // 3. Populate AGENT_TOKEN and LLM credential env vars from the manifest.
-  const manifest = JSON.parse(manifestJson) as { env?: Record<string, string> };
+  // 3. Populate AGENT_TOKEN, all non-identity env vars, and file credentials from the manifest.
+  const manifest = JSON.parse(manifestJson) as {
+    env?: Record<string, string>;
+    files?: Array<{ path: string; content: string; mode?: string | number }>;
+  };
   const env = manifest.env ?? {};
   if (!AGENT_TOKEN && env['AGENT_SECRET_TOKEN']) {
     AGENT_TOKEN = env['AGENT_SECRET_TOKEN'];
     process.env['AGENT_SECRET_TOKEN'] = env['AGENT_SECRET_TOKEN'];
     apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
   }
-  for (const key of _CREDENTIAL_ENV_KEYS) {
-    if (env[key] && !process.env[key]) {
-      process.env[key] = env[key];
+  for (const [key, value] of Object.entries(env)) {
+    if (!IDENTITY_ENV_KEYS.has(key) && value && !process.env[key]) {
+      process.env[key] = value;
     }
+  }
+  for (const file of manifest.files ?? []) {
+    ensureParentDirectorySync(file.path);
+    writePrivateFileSync(file.path, file.content, parseSecretFileMode(file.mode));
   }
 }
 

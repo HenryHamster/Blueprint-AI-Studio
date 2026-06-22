@@ -6998,6 +6998,13 @@ describe('resolveCredentialsFromSecretVersion', () => {
     delete process.env['OPENAI_API_KEY'];
     delete process.env['CODEX_API_KEY'];
     delete process.env['GEMINI_API_KEY'];
+    delete process.env['GOOGLE_APPLICATION_CREDENTIALS'];
+    delete process.env['GOOGLE_CLOUD_PROJECT'];
+    delete process.env['GOOGLE_CLOUD_LOCATION'];
+    delete process.env['CODEX_HOME'];
+    delete process.env['GEMINI_CLI_TRUST_WORKSPACE'];
+    vi.mocked(fs.writeFileSync).mockClear();
+    vi.mocked(fs.mkdirSync).mockClear();
   });
 
   function makeManifestFetch(manifest: Record<string, unknown>): ReturnType<typeof makeFetchMock> {
@@ -7092,5 +7099,38 @@ describe('resolveCredentialsFromSecretVersion', () => {
     await expect(
       resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1'),
     ).rejects.toThrow('failed to fetch secret');
+  });
+
+  it('resolveCredentialsFromSecretVersion writes files to disk and sets file-path env vars', async () => {
+    const fetchMock = makeManifestFetch({
+      env: {
+        AGENT_SECRET_TOKEN: 'tok',
+        GOOGLE_APPLICATION_CREDENTIALS: '/tmp/test-sa.json',
+        GOOGLE_CLOUD_PROJECT: 'my-project',
+      },
+      files: [
+        { path: '/tmp/test-sa.json', content: '{"type":"service_account"}', mode: '0600' },
+      ],
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1');
+
+    // File-path env vars must be set from manifest.env
+    expect(process.env['GOOGLE_APPLICATION_CREDENTIALS']).toBe('/tmp/test-sa.json');
+    expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('my-project');
+
+    // File must have been written to disk with correct content and mode
+    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
+      '/tmp/test-sa.json',
+      '{"type":"service_account"}',
+      { encoding: 'utf-8', mode: 0o600 },
+    );
+
+    // Parent directory must have been created
+    expect(vi.mocked(fs.mkdirSync)).toHaveBeenCalledWith(
+      '/tmp',
+      { recursive: true, mode: 0o700 },
+    );
   });
 });
