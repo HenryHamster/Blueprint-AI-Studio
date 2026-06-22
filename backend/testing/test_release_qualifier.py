@@ -6025,6 +6025,11 @@ async def test_run_qualification_blocked_without_blind_merge_grade(db_session, m
     from app import blind_merge_grade as bmg
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Must set a non-empty goal so the empty-goal early-exit does NOT fire —
+    # this test exercises the fail-closed path when the grader is unavailable.
+    version.goal = "deliver user analytics dashboard"
+    db_session.add(version)
+    await db_session.commit()
     candidate = "dead" * 10  # 40-char placeholder SHA
 
     mocker.patch(
@@ -6063,6 +6068,38 @@ async def test_run_qualification_blocked_without_blind_merge_grade(db_session, m
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_empty_goal_skips_blind_merge_grade(db_session, mocker):
+    """When version.goal is empty/None the blind-merge-grade gate is a no-op PASS.
+
+    compute_blind_merge_grade must NOT be called (it returns None for empty goals,
+    which would wedge the version in blocked_no_merge_grade forever).  The
+    qualification should proceed to spawning the audit child.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # version.goal defaults to None — do NOT set it, that is the point of the test.
+    candidate = "cafe" * 10  # 40-char placeholder SHA
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    grade_mock = mocker.patch(
+        "app.release_qualifier.compute_blind_merge_grade",
+        new=AsyncMock(return_value=None),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # The gate must NOT fire for an empty goal — grader never called.
+    grade_mock.assert_not_awaited()
+    # Qualification proceeds past the gate (spawns or records a non-blocked status).
+    assert result["status"] != "blocked_no_merge_grade", (
+        "empty-goal version must not be wedged by the blind-merge-grade gate"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_persists_blind_merge_grade_and_spawns(
     db_session, mocker
 ):
@@ -6073,6 +6110,9 @@ async def test_run_qualification_persists_blind_merge_grade_and_spawns(
     from app import blind_merge_grade as bmg
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.goal = "deliver cost-reduction VM substrate change"
+    db_session.add(version)
+    await db_session.commit()
     candidate = "beef" * 10
 
     mocker.patch(

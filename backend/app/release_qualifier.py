@@ -1378,6 +1378,16 @@ async def run_qualification(
             "candidate_sha": candidate_sha,
             "graded_at": _utcnow().isoformat(),
         }
+    elif not (version.goal or "").strip():
+        # No version goal text — the gate is a no-op PASS (nothing to grade
+        # the merged diffs against).  Mirrors the comment at the finalize
+        # half: "version.goal empty/unset → gate is a no-op PASS".
+        blind_grade = {
+            "status": "skipped",
+            "reason": "no version goal",
+            "candidate_sha": candidate_sha,
+            "graded_at": _utcnow().isoformat(),
+        }
     elif blind_merge_grade_satisfied(version, candidate_sha):
         # A usable grade for this exact SHA is already persisted — reuse it
         # (e.g. a prior cycle computed it and its children have since

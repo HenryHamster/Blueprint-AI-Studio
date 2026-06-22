@@ -3664,6 +3664,9 @@ async def _check_and_trigger_rollup(
                                                 parent, target_branch
                                             ),
                                         )
+                                        _propagate_landed_to_rollup_children(
+                                            completed_children, session
+                                        )
                                     if _rp_terminal:
                                         parent.latest_status_message = (
                                             f"All {completed_count} subtasks merged, "
@@ -3930,6 +3933,9 @@ async def _check_and_trigger_rollup(
                                                 hotfix_lane=_promotion_target_rollup_allowed(
                                                     parent, target_branch
                                                 ),
+                                            )
+                                            _propagate_landed_to_rollup_children(
+                                                completed_children, session
                                             )
                                         if _esc_terminal:
                                             parent.latest_status_message = (
