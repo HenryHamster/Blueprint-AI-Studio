@@ -19072,3 +19072,123 @@ class TestPostCommitPendingField:
         resp = await client.get(f"/api/admin/tasks/{task.id}")
         assert resp.status_code == 200, resp.text
         assert resp.json()["post_commit_pending"] is False
+
+
+class TestPoolAccountMutationsRequireAdmin:
+    """Mutation endpoints on /max-plan-accounts must reject non-admin callers."""
+
+    @pytest.mark.asyncio
+    async def test_post_max_plan_accounts_requires_admin(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.post("/api/admin/max-plan-accounts", json={})
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_delete_max_plan_account_requires_admin(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.delete(
+                    "/api/admin/max-plan-accounts/00000000-0000-0000-0000-000000000001"
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_patch_max_plan_account_requires_admin(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.patch(
+                    "/api/admin/max-plan-accounts/00000000-0000-0000-0000-000000000001",
+                    json={},
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_reset_rate_limits_requires_admin(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/admin/max-plan-accounts/00000000-0000-0000-0000-000000000001/reset-rate-limits"
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_clear_regression_quarantine_requires_admin(
+        self, override_get_session
+    ):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/admin/max-plan-accounts/00000000-0000-0000-0000-000000000001/regression-quarantine/clear",
+                    params={"provider": "anthropic", "model": "claude-opus-4-8"},
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_refresh_models_requires_admin(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/admin/max-plan-accounts/00000000-0000-0000-0000-000000000001/refresh-models"
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)

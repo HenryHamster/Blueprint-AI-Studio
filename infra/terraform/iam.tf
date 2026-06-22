@@ -108,17 +108,22 @@ resource "google_project_iam_member" "agent_log_writer" {
   member  = "serviceAccount:${google_service_account.agent_sa.email}"
 }
 
-# Grant Agent SA project-wide secretAccessor so agent VMs can read their
-# per-agent credential secrets (agent-creds-{vm_instance_id}) at boot.
-# This avoids requiring orchestrator to call get/setIamPolicy on each secret
-# at provisioning time, which would demand secretmanager.admin — the role
-# we intentionally narrowed. Trade-off: agent_sa can technically read any
-# project secret, but agent VMs are ephemeral and short-lived, and the
-# secret names are opaque per-VM identifiers, so the blast radius is bounded.
+# Grant Agent SA secretAccessor scoped to agent-creds-* secrets only.
+# The IAM condition restricts access to secrets whose name contains
+# "secrets/agent-creds-" (all per-agent credential secrets created by
+# _store_agent_secret in compute.py follow the pattern agent-creds-{vm_instance_id}).
+# A compromised agent VM cannot read DB passwords, JWT signing keys,
+# GitHub tokens, or any other project secret outside the agent-creds-* family.
 resource "google_project_iam_member" "agent_secret_accessor" {
   project = var.project_id
   role    = "roles/secretmanager.secretAccessor"
   member  = "serviceAccount:${google_service_account.agent_sa.email}"
+
+  condition {
+    title       = "AgentCredsOnly"
+    description = "Restrict agent SA to agent-creds-* secrets only"
+    expression  = "resource.name.extract('secrets/{secret}').startsWith('agent-creds-')"
+  }
 }
 
 # Grant Orchestrator SA permission to attach the Agent SA to new VMs
@@ -182,6 +187,12 @@ resource "google_project_iam_member" "agent_job_secret_accessor" {
   project = var.project_id
   role    = "roles/secretmanager.secretAccessor"
   member  = "serviceAccount:${google_service_account.agent_job_sa.email}"
+
+  condition {
+    title       = "AgentJobBootSecretsOnly"
+    description = "Restrict Cloud Run Job SA to boot secrets and per-agent agent-creds-* secrets"
+    expression  = "resource.name.extract('secrets/{secret}') in ['DATABASE_URL', 'AGENT_JWT_SECRET', 'WS_TICKET_SECRET', 'GITHUB_APP_ID', 'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'GITHUB_PRIVATE_KEY', 'GITHUB_WEBHOOK_SECRET', 'ADMIN_API_KEY'] || resource.name.extract('secrets/{secret}').startsWith('agent-creds-')"
+  }
 }
 
 resource "google_project_iam_member" "agent_job_log_writer" {

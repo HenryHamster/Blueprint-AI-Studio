@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { jaccardSimilarity } from './utils/diff-detection.js';
 import {
@@ -6917,7 +6917,7 @@ describe('cloneWithRetry', () => {
     // force_refresh token endpoint returns a fresh token.
     const fetchMock = makeFetchMock().mockResolvedValue({
       ok: true,
-      json: async () => ({ data: { token: 'ghs_FRESH_TOKEN', owner: 'org', repo: 'repo' } }),
+      json: () => Promise.resolve({ data: { token: 'ghs_FRESH_TOKEN', owner: 'org', repo: 'repo' } }),
     });
     vi.stubGlobal('fetch', fetchMock);
 
@@ -6970,7 +6970,7 @@ describe('cloneWithRetry', () => {
 
     const fetchMock = makeFetchMock().mockResolvedValue({
       ok: true,
-      json: async () => ({ data: { token: 'ghs_SHOULD_NOT_BE_FETCHED' } }),
+      json: () => Promise.resolve({ data: { token: 'ghs_SHOULD_NOT_BE_FETCHED' } }),
     });
     vi.stubGlobal('fetch', fetchMock);
 
@@ -6984,5 +6984,113 @@ describe('cloneWithRetry', () => {
 
     // The token endpoint must NOT have been called for a network error.
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── resolveCredentialsFromSecretVersion ───────────────────────────────────────
+describe('resolveCredentialsFromSecretVersion', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    _setAgentTokenForTesting('');
+    delete process.env['AGENT_SECRET_TOKEN'];
+    delete process.env['ANTHROPIC_API_KEY'];
+    delete process.env['CLAUDE_CODE_OAUTH_TOKEN'];
+    delete process.env['OPENAI_API_KEY'];
+    delete process.env['CODEX_API_KEY'];
+    delete process.env['GEMINI_API_KEY'];
+  });
+
+  function makeManifestFetch(manifest: Record<string, unknown>): ReturnType<typeof makeFetchMock> {
+    const manifestBase64 = Buffer.from(JSON.stringify(manifest)).toString('base64');
+    return makeFetchMock().mockImplementation((url: unknown) => {
+      const urlStr = String(url);
+      if (urlStr.includes('metadata.google.internal')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ access_token: 'gcp-test-token' }) });
+      }
+      if (urlStr.includes('secretmanager.googleapis.com')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ payload: { data: manifestBase64 } }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+  }
+
+  it('populates getAgentToken() and apiHeaders[X-Agent-Token] from Secret Manager manifest', async () => {
+    const expectedToken = 'test-agent-jwt-from-secret-manager';
+    const fetchMock = makeManifestFetch({ env: { AGENT_SECRET_TOKEN: expectedToken } });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1');
+
+    // AGENT_TOKEN must be populated from the manifest
+    expect(getAgentToken()).toBe(expectedToken);
+
+    // apiHeaders['X-Agent-Token'] must also be populated so apiPost sends the token
+    await apiPost('/api/test-token-header', {}, 1);
+    const postCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/api/test-token-header'));
+    expect(postCall).toBeDefined();
+    const postHeaders = (defined(postCall)[1] as RequestInit).headers as Record<string, string>;
+    expect(postHeaders['X-Agent-Token']).toBe(expectedToken);
+  });
+
+  it('populates LLM credential env vars from the manifest', async () => {
+    const fetchMock = makeManifestFetch({
+      env: {
+        AGENT_SECRET_TOKEN: 'test-token',
+        ANTHROPIC_API_KEY: 'sk-ant-test-key',
+        CLAUDE_CODE_OAUTH_TOKEN: 'test-oauth-token',
+      },
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1');
+
+    expect(process.env['ANTHROPIC_API_KEY']).toBe('sk-ant-test-key');
+    expect(process.env['CLAUDE_CODE_OAUTH_TOKEN']).toBe('test-oauth-token');
+  });
+
+  it('does not overwrite an already-set LLM credential env var', async () => {
+    process.env['ANTHROPIC_API_KEY'] = 'already-set-key';
+    const fetchMock = makeManifestFetch({
+      env: {
+        AGENT_SECRET_TOKEN: 'test-token',
+        ANTHROPIC_API_KEY: 'manifest-key-should-not-win',
+      },
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1');
+
+    expect(process.env['ANTHROPIC_API_KEY']).toBe('already-set-key');
+  });
+
+  it('throws when the metadata token fetch returns a non-2xx status', async () => {
+    const fetchMock = makeFetchMock().mockImplementation((url: unknown) => {
+      if (String(url).includes('metadata.google.internal')) {
+        return Promise.resolve({ ok: false, status: 403 });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1'),
+    ).rejects.toThrow('failed to get GCP access token');
+  });
+
+  it('throws when the Secret Manager :access call returns a non-2xx status', async () => {
+    const fetchMock = makeFetchMock().mockImplementation((url: unknown) => {
+      if (String(url).includes('metadata.google.internal')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ access_token: 'gcp-test-token' }) });
+      }
+      if (String(url).includes('secretmanager.googleapis.com')) {
+        return Promise.resolve({ ok: false, status: 403 });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1'),
+    ).rejects.toThrow('failed to fetch secret');
   });
 });

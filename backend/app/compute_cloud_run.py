@@ -18,7 +18,6 @@ All sentinels start with ``"cloud-run-"`` so callers can check with a prefix tes
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 
@@ -45,6 +44,20 @@ _HEAVY_TASK_TYPES = frozenset({"verify_tests", "smoketest", "compute_experiment"
 _TIMEOUT_SECONDS_STANDARD = 4 * 3600  # 4h
 _TIMEOUT_SECONDS_HEAVY = 4 * 3600  # same, override per type if needed
 
+# LLM credential env var names that must never appear as plaintext RunJobRequest
+# override values. The agent resolves these from the Secret Manager manifest
+# referenced by AGENT_SECRET_VERSION at startup.
+_SECRET_ENV_KEYS = frozenset(
+    {
+        "AGENT_SECRET_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "GEMINI_API_KEY",
+    }
+)
+
 
 def is_cloud_run_task(vm_machine_type: str | None) -> bool:
     """Return True when the task's vm_machine_type sentinel indicates Cloud Run."""
@@ -60,19 +73,6 @@ def _resolve_machine_type(task_type: str) -> str:
         if task_type in _HEAVY_TASK_TYPES
         else CLOUD_RUN_MACHINE_TYPE_STANDARD
     )
-
-
-def _fetch_agent_secret_token(secret_version_name: str) -> str:
-    """Fetch the agent JWT from a Secret Manager manifest version.
-
-    Raises on any error so the caller can treat fetch failures as hard errors.
-    """
-    from google.cloud import secretmanager  # type: ignore[import]
-
-    client = secretmanager.SecretManagerServiceClient()
-    response = client.access_secret_version(request={"name": secret_version_name})
-    manifest = json.loads(response.payload.data.decode("utf-8"))
-    return manifest["env"]["AGENT_SECRET_TOKEN"]
 
 
 async def launch_agent_cloud_run_job(
@@ -156,28 +156,17 @@ async def launch_agent_cloud_run_job(
     if payload_uri:
         env_overrides.append({"name": "PAYLOAD_URI", "value": payload_uri})
     if secret_version_name:
+        # Pass the Secret Manager version URI so the agent can resolve the JWT
+        # and LLM credentials from it at startup — no plaintext secret values
+        # in the RunJobRequest (which persists in Cloud Audit Logs and
+        # run.executions.get responses).
         env_overrides.append(
             {"name": "AGENT_SECRET_VERSION", "value": secret_version_name}
         )
-        # The agent reads AGENT_SECRET_TOKEN (raw JWT), not AGENT_SECRET_VERSION.
-        # Fetch the manifest from Secret Manager and inject the token directly.
-        try:
-            agent_secret_token = _fetch_agent_secret_token(secret_version_name)
-            env_overrides.append(
-                {"name": "AGENT_SECRET_TOKEN", "value": agent_secret_token}
-            )
-        except Exception as exc:
-            logger.error(
-                "[CLOUD-RUN] Failed to fetch AGENT_SECRET_TOKEN from Secret Manager "
-                "for task %s (version=%s): %s",
-                task_id,
-                secret_version_name,
-                exc,
-                exc_info=True,
-            )
-            return False
 
-    # Build LLM env overrides from provider materials when LLM params are present.
+    # Build non-secret LLM identifier overrides when LLM params are present.
+    # Credential values (oauth_token, API keys) are intentionally excluded —
+    # the agent reads them from the Secret Manager manifest via AGENT_SECRET_VERSION.
     # File-based credentials (e.g. GOOGLE_APPLICATION_CREDENTIALS=/opt/...) cannot
     # be carried as env var overrides — skip any value that is a file path.
     if provider is not None or oauth_token is not None or provider_settings is not None:
@@ -208,6 +197,9 @@ async def launch_agent_cloud_run_job(
                 materials=materials,
             )
             for k, v in llm_env.items():
+                # Never pass credential values as plaintext overrides.
+                if k in _SECRET_ENV_KEYS:
+                    continue
                 # Skip file-path credential values — Cloud Run env overrides
                 # cannot carry file contents and the file won't exist in the container.
                 if isinstance(v, str) and v.startswith("/"):

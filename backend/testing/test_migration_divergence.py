@@ -878,6 +878,79 @@ async def test_premerge_guard_blocks_pre_pr_rename_on_integration_branch(mocker)
 
 
 @pytest.mark.asyncio
+async def test_merge_guard_allows_authorized_divergence_blocks_unauthorized(mocker):
+    """The merge-time full-branch check applies the same authorized-divergence
+    filter as the qual-time guard.
+
+    Allowed path — integration already carries the authorized 0143 renumber
+    (committed in a prior PR, NOT this one): 0143=add_compute_job_persistence,
+    0144=vm_contact_last_tool_use. A new PR adding an unrelated 0145 migration
+    must NOT be blocked by the full-branch check against the deployed promotion
+    target (which still has 0143=vm_contact_last_tool_use). The divergence is
+    authorized and must be silently passed.
+
+    Blocked path — an UNAUTHORIZED divergence (0142 renamed to a different
+    identity on the integration branch, unknown to AUTHORIZED_DIVERGENCES) still
+    hard-blocks regardless of the authorized 0143 divergence co-existing on the
+    same branch.
+    """
+    # Integration already carries the 0143 authorized renumber from a prior PR.
+    integration_with_authorized = [
+        "0142_parent.py",
+        "0143_add_compute_job_persistence.py",
+        "0144_vm_contact_last_tool_use.py",
+    ]
+    # Deployed main still has 0143 = vm_contact_last_tool_use (authorized divergence).
+    promotion_files = ["0142_parent.py", "0143_vm_contact_last_tool_use.py"]
+    # The current PR only adds an unrelated new migration anchored to 0144.
+    new_path = f"{_VERSIONS_DIR}/0145_brand_new.py"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_migration_file(new_path, "0145", "0144")]),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            integration=integration_with_authorized,
+            promotion=promotion_files,
+        ),
+    )
+    # The authorized 0143 divergence must NOT block a new unrelated PR.
+    assert await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    ) == ("ok", None)
+
+    # Unauthorized divergence (0142 renamed to a different identity on integration)
+    # must still hard-block even when the authorized 0143 divergence is also present.
+    unauthorized_path = f"{_VERSIONS_DIR}/0145_second_new.py"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[_migration_file(unauthorized_path, "0145", "0144")]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            integration=[
+                "0142_renamed_to_something_else.py",  # unauthorized rename
+                "0143_add_compute_job_persistence.py",
+                "0144_vm_contact_last_tool_use.py",
+            ],
+            promotion=[
+                "0142_parent.py",  # deployed has 0142 = parent (different identity)
+                "0143_vm_contact_last_tool_use.py",
+            ],
+        ),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert "0142" in reason
+
+
+@pytest.mark.asyncio
 async def test_premerge_guard_blocks_inplace_edit_of_deployed_migration(mocker):
     """Defect class 2 (v17 regression): a PR that MODIFIES (not renames) a
     migration already on the deployed promotion target. The file keeps its name

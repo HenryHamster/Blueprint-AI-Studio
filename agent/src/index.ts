@@ -215,6 +215,91 @@ export async function fetchVmImageIdentity(): Promise<{ image_name: string | nul
   }
 }
 
+// LLM credential env var names the agent resolves from the Secret Manager
+// manifest — must match the LLM-credential subset of _SECRET_ENV_KEYS in
+// compute_cloud_run.py (AGENT_SECRET_TOKEN handled separately as AGENT_TOKEN).
+const _CREDENTIAL_ENV_KEYS = [
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'CODEX_API_KEY',
+  'GEMINI_API_KEY',
+] as const;
+
+/**
+ * When running in Cloud Run Job mode the backend does not inject the agent JWT
+ * or LLM credential values as plaintext env-var overrides (they would be
+ * visible in Cloud Audit Logs and run.executions.get responses). Instead the
+ * backend passes AGENT_SECRET_VERSION — a Secret Manager version URI — and
+ * this function fetches the manifest at that version, then populates
+ * AGENT_TOKEN and any missing LLM credential env vars from it.
+ *
+ * Throws on any failure so the caller can surface a pre-claim heartbeat before
+ * exiting.
+ */
+export async function resolveCredentialsFromSecretVersion(
+  secretVersionName: string,
+): Promise<void> {
+  // 1. Obtain a GCP access token from the instance metadata service.
+  const tokenController = new AbortController();
+  const tokenTimer = setTimeout(() => { tokenController.abort(); }, 5000);
+  let accessToken: string;
+  try {
+    const tokenRes = await fetch(
+      'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+      { headers: { 'Metadata-Flavor': 'Google' }, signal: tokenController.signal },
+    );
+    clearTimeout(tokenTimer);
+    if (!tokenRes.ok) {
+      throw new Error(`metadata token fetch failed: HTTP ${tokenRes.status}`);
+    }
+    const tokenData = await tokenRes.json() as { access_token: string };
+    accessToken = tokenData.access_token;
+  } catch (err) {
+    clearTimeout(tokenTimer);
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`resolveCredentialsFromSecretVersion: failed to get GCP access token: ${msg}`);
+  }
+
+  // 2. Access the secret version via the Secret Manager REST API.
+  const smController = new AbortController();
+  const smTimer = setTimeout(() => { smController.abort(); }, 10000);
+  let manifestJson: string;
+  try {
+    const smRes = await fetch(
+      `https://secretmanager.googleapis.com/v1/${secretVersionName}:access`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: smController.signal,
+      },
+    );
+    clearTimeout(smTimer);
+    if (!smRes.ok) {
+      throw new Error(`Secret Manager access failed: HTTP ${smRes.status}`);
+    }
+    const smData = await smRes.json() as { payload: { data: string } };
+    manifestJson = Buffer.from(smData.payload.data, 'base64').toString('utf-8');
+  } catch (err) {
+    clearTimeout(smTimer);
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`resolveCredentialsFromSecretVersion: failed to fetch secret: ${msg}`);
+  }
+
+  // 3. Populate AGENT_TOKEN and LLM credential env vars from the manifest.
+  const manifest = JSON.parse(manifestJson) as { env?: Record<string, string> };
+  const env = manifest.env ?? {};
+  if (!AGENT_TOKEN && env['AGENT_SECRET_TOKEN']) {
+    AGENT_TOKEN = env['AGENT_SECRET_TOKEN'];
+    process.env['AGENT_SECRET_TOKEN'] = env['AGENT_SECRET_TOKEN'];
+    apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
+  }
+  for (const key of _CREDENTIAL_ENV_KEYS) {
+    if (env[key] && !process.env[key]) {
+      process.env[key] = env[key];
+    }
+  }
+}
+
 /** Read the baked agent-runtime fingerprint from the well-known path written
  *  by the packer provisioner. Returns null in local dev / test environments
  *  where the file is absent so callers can distinguish "no fingerprint" from
@@ -3029,6 +3114,14 @@ export async function main() {
   // now gone) and never on never-existed (accounts without the optional
   // claude_config_json boot healthy VMs that never have ~/.claude.json).
   captureBootProviderConfigPresence();
+
+  // When running as a Cloud Run Job the backend does not inject AGENT_SECRET_TOKEN
+  // or LLM credential values as plaintext env-var overrides to avoid exposing them
+  // in Cloud Audit Logs and run.executions.get. Instead AGENT_SECRET_VERSION is
+  // passed and we fetch the manifest here to obtain both the JWT and LLM creds.
+  if (isJobMode && !AGENT_TOKEN && process.env['AGENT_SECRET_VERSION']) {
+    await resolveCredentialsFromSecretVersion(process.env['AGENT_SECRET_VERSION']);
+  }
 
   if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
 

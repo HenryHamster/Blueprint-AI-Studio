@@ -322,17 +322,25 @@ async def _validate_rollup_migration_chain(
         # promotion target catches it: a shared revision id mapping to a
         # different migration, or a migration that moved revision ids, is a
         # deploy-fatal divergence regardless of which PR introduced it.
-        full_branch_divergences = find_content_divergent_revisions(
+        # Authorized divergences (recorded in AUTHORIZED_DIVERGENCES and handled
+        # by the deploy-time reconciliation) are filtered out — they are already
+        # safe and must not block new PRs on an integration branch that carries
+        # the known renumber, mirroring the qual-time guard's behavior.
+        full_branch_records = find_content_divergence_records(
             promotion_filenames, existing_filenames
         )
-        if full_branch_divergences:
+        unauthorized_full_branch = [
+            r for r in full_branch_records if not _divergence_record_is_authorized(r)
+        ]
+        if unauthorized_full_branch:
             return (
                 "block",
                 f"Alembic revision-identity divergence between the full integration "
                 f"branch '{target_branch}' and the deployed promotion target "
                 f"'{promotion_target}' (a pre-PR renumber/reuse on the integration "
                 f"branch would skip or mishandle a migration the live DB already "
-                f"applied): " + "; ".join(full_branch_divergences),
+                f"applied): "
+                + "; ".join(r["message"] for r in unauthorized_full_branch),
             )
 
         promotion_divergences = find_content_divergent_revisions(

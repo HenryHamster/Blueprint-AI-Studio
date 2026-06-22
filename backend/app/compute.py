@@ -1691,10 +1691,10 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
         }
     )
 
-    # Agent SA has project-level secretAccessor (granted via Terraform
-    # google_project_iam_member.agent_secret_accessor in infra/terraform/iam.tf).
-    # No runtime get/setIamPolicy calls needed — orchestrator does not hold
-    # secretmanager.admin and those calls would fail with PermissionDenied.
+    # Agent SA holds secretAccessor scoped to agent-creds-* secrets only (via
+    # IAM condition on google_project_iam_member.agent_secret_accessor in
+    # infra/terraform/iam.tf). No runtime get/setIamPolicy calls needed —
+    # orchestrator does not hold secretmanager.admin.
 
     # E15: verify the version is actually accessible before handing it off
     # to provisioning. Without this, transient Secret Manager replication
@@ -1981,7 +1981,7 @@ async def _provision_gcp(
     # Security note: cloud-platform is the ONLY OAuth2 scope that covers Secret Manager.
     # There is no narrower secretmanager-specific scope. The actual security boundary is
     # the agent SA's IAM bindings (see infra/terraform/iam.tf):
-    #   - secretAccessor project-wide (Terraform-managed; lets VMs read agent-creds-* secrets)
+    #   - secretAccessor scoped to agent-creds-* secrets only (IAM condition in iam.tf)
     #   - objectViewer on the artifact bucket only
     #   - logWriter for Stackdriver logs
     service_account.scopes = [
