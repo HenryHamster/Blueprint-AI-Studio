@@ -452,6 +452,32 @@ async function attachDeclaredBuildProbe(
 // same constant). Each runs ONCE under a bounded timeout, no retries.
 const MAX_DOCUMENTED_COMMAND_RUNS = MAX_DOCUMENTED_COMMANDS;
 
+// Filter detected runners to only those in directories touched by the PR diff.
+// Root runners (cwd == workspace root) always run. Falls back to all runners
+// when diff is null (unavailable) or when every runner would be filtered out.
+function filterRunnersByDiff(
+  runners: TestRunner[],
+  diff: PrDiff | null,
+  ws: WebSocket | null,
+): TestRunner[] {
+  if (!diff || diff.changedFiles.length === 0) return runners;
+  const changedDirs = new Set(diff.changedFiles.map(f => f.split('/')[0]));
+  // Use the env var directly so this works correctly even when the module-level
+  // WORKSPACE constant has been overridden in test environments.
+  const wsRoot = process.env.AGENT_WORKSPACE || WORKSPACE;
+  const filtered = runners.filter(r => {
+    const relDir = r.cwd.startsWith(wsRoot + '/') ? r.cwd.slice(wsRoot.length + 1) : '';
+    // Root runners (path '') always run; directory runners run only when touched.
+    return relDir === '' || changedDirs.has(relDir.split('/')[0]);
+  });
+  if (filtered.length === 0) return runners;
+  const skipped = runners.filter(r => !filtered.includes(r));
+  if (skipped.length > 0) {
+    sendLog(ws, `Diff-aware runner filter: skipping ${skipped.map(r => r.label).join(', ')} (no files changed in their directories).\n`);
+  }
+  return filtered;
+}
+
 // Compute the PR head's changed files + added lines against its base ONCE, so
 // both diff-aware probes (documented-command + newly-disabled-tests) share a
 // single pair of `git diff` passes. Three-dot diff uses the merge-base, so only
@@ -953,6 +979,10 @@ export async function handleVerifyTests(
   const runners = detectTestRunners(buildConfig);
 
   let result: VerifyTestsResult;
+  // earlyPrDiff is set only on the detected-suite path (where we need it to
+  // filter runners). On the no-suite path it stays null and the shared diff
+  // computation at the bottom of the function covers both probes.
+  let earlyPrDiff: PrDiff | null = null;
   if (runners.length === 0) {
     // No resolvable test_cmd — the backend will fall back. This is a SUCCESS:
     // an absent-tests repo must still progress through the merge gate.
@@ -966,13 +996,17 @@ export async function handleVerifyTests(
       noTestsReason: 'no_suite',
     });
   } else {
-    sendLog(ws, `Detected test runner(s): ${runners.map(r => r.label).join(', ')}\n`);
+    // Compute the PR diff early so we can filter runners to only the directories
+    // touched by this PR. Fall back to all runners when the diff is unavailable.
+    earlyPrDiff = await computePrDiff(ws, baseBranch);
+    const activeRunners = filterRunnersByDiff(runners, earlyPrDiff, ws);
+    sendLog(ws, `Detected test runner(s): ${activeRunners.map(r => r.label).join(', ')}\n`);
     statusRef.value = 'Running detected test suite...';
     // Single no-fix run: maxFixAttempts 0 means testFixLoop runs each runner
     // once and returns a verdict without ever invoking Claude to repair code.
     const loop = await runVerifyLoop(
       ws, statusRef, model, effort, buildConfig,
-      undefined,
+      activeRunners,
       'detected suite',
     );
 
@@ -1071,7 +1105,7 @@ export async function handleVerifyTests(
   // PR diff is computed ONCE and shared by both probes. Each is additive: when
   // the diff introduces nothing relevant, or the base ref is unavailable, the
   // field is simply absent and the verdict is unchanged.
-  const prDiff = await computePrDiff(ws, baseBranch);
+  const prDiff = earlyPrDiff ?? await computePrDiff(ws, baseBranch);
   result = await attachDocumentedCommandsProbe(ws, result, prDiff);
   result = attachDisabledTests(ws, result, prDiff);
   // Declared acceptance-test probe: when the implementation task promised a named
