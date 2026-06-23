@@ -13858,11 +13858,14 @@ async def test_spawn_retirement_memos_creates_knowledge_document(db_session):
 
 
 @pytest.mark.asyncio
-async def test_post_promotion_focus_rewrite_refreshes_auto_derived_version_goal(
-    db_session, mocker
-):
-    """After a strategic focus rewrite, the open version goal follows current_focus
-    for auto-derived goals and is preserved for operator-edited goals."""
+async def test_strategic_cycle_does_not_refresh_version_goal(db_session, mocker):
+    """Strategic cycles must NOT update version.goal when current_focus changes.
+
+    version.goal is frozen at version-open; it is NOT auto-refreshed during
+    strategic cycles even for auto-derived goals. This prevents the goal from
+    becoming an operational status log as current_focus evolves across cycles.
+    Operator-edited goals are still never clobbered (independent guard).
+    """
     import json
     from unittest.mock import AsyncMock
 
@@ -13910,7 +13913,12 @@ async def test_post_promotion_focus_rewrite_refreshes_auto_derived_version_goal(
     logs = json.dumps(
         {
             "problem_model": {
-                "intent": {"current_focus": "new v8 build mission"},
+                "intent": {
+                    "current_focus": (
+                        "v8 re-qualifying at HEAD abc123. "
+                        "All v8 deliverables confirmed complete."
+                    )
+                },
                 "revision": 2,
             }
         }
@@ -13919,13 +13927,15 @@ async def test_post_promotion_focus_rewrite_refreshes_auto_derived_version_goal(
     await _handle_strategic_completion(task, logs, db_session)
     await db_session.refresh(version)
 
-    # Auto-derived goal must now reflect the new strategic focus.
-    assert version.goal == "new v8 build mission", (
-        f"Expected 'new v8 build mission', got {version.goal!r}"
+    # version.goal must stay frozen at the value set when the version opened —
+    # NOT overwritten with the strategic cycle's status-log current_focus.
+    assert version.goal == "old v7 focus", (
+        f"version.goal was mutated by a strategic cycle; got {version.goal!r}. "
+        "Strategic cycles must not call refresh_open_version_goal_if_auto_derived."
     )
     assert version.goal_editor_info is None
 
-    # === Operator-edited goal must not be clobbered ===
+    # === Operator-edited goal must not be clobbered either ===
     project2 = Project(
         name="FocusSyncProtected",
         user_id="u2",
@@ -13981,6 +13991,101 @@ async def test_post_promotion_focus_rewrite_refreshes_auto_derived_version_goal(
         f"Operator goal must not be clobbered; got {version2.goal!r}"
     )
     assert version2.goal_editor_info == "[operator:op@example.com]"
+
+
+@pytest.mark.asyncio
+async def test_set_problem_model_api_does_not_refresh_version_goal(client, db_session):
+    """set_problem_model API op must NOT refresh version.goal when current_focus changes.
+
+    The strategist's PRIMARY write path is /api/agent/strategic with
+    op=set_problem_model (strategic.ts -> strategic-helpers.ts:58). This is the
+    route the freeze-at-open fix must actually protect. The goal must remain
+    frozen at the value set when the version opened.
+    """
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import release_version as rv
+    from app import strategic_cycle
+
+    project = Project(
+        name="GoalFreezeAPITest",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={
+            "intent": {"current_focus": "initial focus at version open"},
+            "revision": 1,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Open a version with auto-derived goal (no goal_editor_info).
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal="initial focus at version open"
+    )
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal == "initial focus at version open"
+    assert version.goal_editor_info is None
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-goal-freeze",
+        payloads=[
+            {
+                "type": "strategic_review",
+                "prompt": "review",
+                "vision": {"revision": 1},
+            }
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-goal-freeze", task_type="strategic_review")
+
+    # The strategist writes a new current_focus that looks like a status log.
+    # The API op must NOT propagate this into version.goal.
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {
+                    "current_focus": (
+                        "v1 re-qualifying at HEAD abc123. All v1 deliverables confirmed "
+                        "complete: design-system done, font-size migration done."
+                    )
+                },
+                "capabilities": [],
+                "gaps": [],
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "set_problem_model"
+
+    # The problem_model write must have gone through (current_focus updated).
+    await db_session.refresh(project)
+    new_focus = (project.problem_model or {}).get("intent", {}).get("current_focus", "")
+    assert "re-qualifying" in new_focus, f"problem_model not updated; got {new_focus!r}"
+
+    # But version.goal must remain frozen — NOT overwritten with the status-log focus.
+    await db_session.refresh(version)
+    assert version.goal == "initial focus at version open", (
+        f"version.goal was mutated by set_problem_model API op; got {version.goal!r}. "
+        "The strategic-cycle API path must not call refresh_open_version_goal_if_auto_derived."
+    )
+    assert version.goal_editor_info is None
 
 
 # ── _compute_model_gc_telemetry ───────────────────────────────────────────────

@@ -2248,25 +2248,6 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
-        # Refresh the open version goal if it is still auto-derived so the
-        # operator-facing Version Lifecycle Goal follows the new strategic focus.
-        # Best-effort: runs after the commit so a failure cannot roll back the
-        # problem_model write.  Uses its own mini-transaction (BEGIN … COMMIT)
-        # via the session's autobegin semantics.
-        try:
-            from app import release_version as _rv
-
-            _new_focus = (new_pm_raw.get("intent") or {}).get("current_focus")
-            await _rv.refresh_open_version_goal_if_auto_derived(
-                session, project.id, _new_focus
-            )
-            await session.commit()
-        except Exception:
-            logger.exception(
-                "[STRATEGIC API] Failed to refresh open version goal after "
-                "problem_model update (non-fatal)"
-            )
-            await session.rollback()
         await _emit_updated(
             STRATEGIC_KIND_PROBLEM_MODEL,
             problem_model_changed=True,
