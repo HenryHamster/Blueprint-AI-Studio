@@ -24,6 +24,14 @@ resource "google_artifact_registry_repository" "orchestrator_repo" {
       older_than = "604800s" # 7 days
     }
   }
+  cleanup_policy {
+    id     = "delete-old-tagged"
+    action = "DELETE"
+    condition {
+      tag_state  = "TAGGED"
+      older_than = "7776000s" # 90 days; KEEP keep-recent-tagged runs first and protects the 5 most recent
+    }
+  }
 }
 
 # Artifact Registry for Custom Agent VM OS Images (if using Packer/Docker to build them)
@@ -49,6 +57,14 @@ resource "google_artifact_registry_repository" "agent_images_repo" {
     condition {
       tag_state  = "UNTAGGED"
       older_than = "604800s" # 7 days
+    }
+  }
+  cleanup_policy {
+    id     = "delete-old-tagged"
+    action = "DELETE"
+    condition {
+      tag_state  = "TAGGED"
+      older_than = "7776000s" # 90 days; KEEP keep-recent-tagged runs first and protects the 3 most recent
     }
   }
 }
