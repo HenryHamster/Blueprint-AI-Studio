@@ -6,6 +6,56 @@ import types
 import pytest
 
 
+def _make_fake_gcp_harness():
+    """Return (fake_run_v2, fake_duration_pb2, captured_overrides_list)."""
+    captured: list[dict] = []
+
+    class _FakeEnvVar:
+        def __init__(self, name: str, value: str) -> None:
+            self.name = name
+            self.value = value
+
+    class _FakeContainerOverride:
+        def __init__(self, env: list) -> None:
+            self.env = env
+
+    class _FakeOverrides:
+        def __init__(self, *, task_count, timeout, container_overrides):
+            for co in container_overrides:
+                for ev in co.env:
+                    captured.append({"name": ev.name, "value": ev.value})
+
+    class _FakeOperation:
+        class operation:
+            name = "op/test"
+
+    class _FakeJobsClient:
+        def run_job(self, request):
+            return _FakeOperation()
+
+    class _FakeRunJobRequest:
+        Overrides = _FakeOverrides
+        Overrides.ContainerOverride = _FakeContainerOverride
+
+        def __init__(self, name: str, overrides):
+            pass
+
+    fake_run_v2 = types.ModuleType("google.cloud.run_v2")
+    fake_run_v2.JobsClient = _FakeJobsClient  # type: ignore[attr-defined]
+    fake_run_v2.RunJobRequest = _FakeRunJobRequest  # type: ignore[attr-defined]
+    fake_run_v2.EnvVar = _FakeEnvVar  # type: ignore[attr-defined]
+
+    fake_duration_pb2 = types.ModuleType("google.protobuf.duration_pb2")
+
+    class _FakeDuration:
+        def __init__(self, seconds: int) -> None:
+            self.seconds = seconds
+
+    fake_duration_pb2.Duration = _FakeDuration  # type: ignore[attr-defined]
+
+    return fake_run_v2, fake_duration_pb2, captured
+
+
 def test_build_duration_raises_on_missing_protobuf(monkeypatch):
     """_build_duration must raise ImportError when google.protobuf is absent."""
     # Remove google.protobuf from sys.modules so the lazy import fails
@@ -68,6 +118,7 @@ def test_no_plaintext_credentials_in_env_overrides(monkeypatch):
     class _FakeRunJobRequest:
         Overrides = _FakeOverrides
         Overrides.ContainerOverride = _FakeContainerOverride
+
         def __init__(self, name: str, overrides):
             pass
 
@@ -205,6 +256,7 @@ def test_file_path_cred_skipped_in_overrides_but_delivered_via_manifest(monkeypa
     class _FakeRunJobRequest:
         Overrides = _FakeOverrides
         Overrides.ContainerOverride = _FakeContainerOverride
+
         def __init__(self, name: str, overrides):
             pass
 
@@ -295,3 +347,137 @@ def test_file_path_cred_skipped_in_overrides_but_delivered_via_manifest(monkeypa
     # Non-secret LLM identifiers should still be present
     assert override_dict.get("PROVIDER") == "google"
     assert override_dict.get("AUTH_MODE") == "service_account"
+
+
+def test_real_provider_secret_values_never_appear_as_plaintext_overrides(monkeypatch):
+    """Integration guard: real provider materials (no compute_manifest stub) through
+    launch_agent_cloud_run_job for each provider x auth_mode with a sentinel secret.
+    Asserts the sentinel never appears as a plaintext override value.
+    Also includes a hostile synthetic case with an unknown credential key not in
+    _SECRET_ENV_KEYS — this case must FAIL against the old fail-open code and PASS
+    after the fail-closed value guard is added.
+    """
+    import app.compute_cloud_run as ccr
+
+    fake_run_v2, fake_duration_pb2, captured = _make_fake_gcp_harness()
+
+    import google.cloud as _google_cloud  # noqa: PLC0415
+
+    monkeypatch.setattr(_google_cloud, "run_v2", fake_run_v2, raising=False)
+    monkeypatch.setitem(sys.modules, "google.cloud.run_v2", fake_run_v2)
+    monkeypatch.setitem(sys.modules, "google.protobuf.duration_pb2", fake_duration_pb2)
+    monkeypatch.setattr(ccr, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent")
+
+    fake_compute = types.ModuleType("app.compute")
+    fake_compute.LOCAL_MODE = False  # type: ignore[attr-defined]
+    fake_compute.ORCHESTRATOR_URL = "https://orch.example.com"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "app.compute", fake_compute)
+
+    # Import the REAL compute_manifest module so _resolve_provider_materials and
+    # _apply_llm_env run for real (no stub). This exercises the actual provider path.
+    import app.compute_manifest as cm_module  # noqa: PLC0415
+
+    def run_case(**kwargs) -> list[dict]:
+        captured.clear()
+        result = asyncio.get_event_loop().run_until_complete(
+            ccr.launch_agent_cloud_run_job(
+                vm_id="cr-vm-integ",
+                task_id="task-integ-test",
+                payload_uri="gs://bucket/payload.json",
+                secret_version_name="projects/p/secrets/agent-creds-xyz/versions/1",
+                task_type="research",
+                **kwargs,
+            )
+        )
+        assert result is True, f"launch_agent_cloud_run_job returned False for {kwargs}"
+        return list(captured)
+
+    # Case 1: anthropic / oauth — sentinel is the oauth token
+    s1 = "SENTINEL-OAUTH-ANTHROPIC-TOKEN-abc123def456xyz"
+    ov1 = run_case(oauth_token=s1, provider="anthropic", auth_mode="oauth")
+    values1 = {e["value"] for e in ov1}
+    names1 = {e["name"] for e in ov1}
+    assert s1 not in values1, "anthropic/oauth sentinel leaked as plaintext override"
+    assert "AGENT_SECRET_VERSION" in names1
+    assert "PROVIDER" in names1
+    assert "AUTH_MODE" in names1
+
+    # Case 2: anthropic / api_key — sentinel injected via module attribute
+    s2 = "SENTINEL-APIKEY-ANTHROPIC-sk-ant-def456abc789xyz"
+    monkeypatch.setattr(cm_module, "ANTHROPIC_API_KEY", s2)
+    ov2 = run_case(provider="anthropic", auth_mode="api_key")
+    values2 = {e["value"] for e in ov2}
+    assert s2 not in values2, "anthropic/api_key sentinel leaked as plaintext override"
+
+    # Case 3: openai / api_key — sentinel is the API key
+    s3 = "sk-SENTINEL-OPENAI-APIKEY-xyz789ghijklmnop"
+    ov3 = run_case(oauth_token=s3, provider="openai", auth_mode="api_key")
+    values3 = {e["value"] for e in ov3}
+    assert s3 not in values3, "openai/api_key sentinel leaked as plaintext override"
+
+    # Case 4: openai / oauth — sentinel is buried in auth.json; secret goes to file
+    s4 = "SENTINEL-CODEX-OAUTH-ACCESS-TOKEN-abc123xyz789"
+    auth_json4 = f'{{"tokens": {{"access_token": "{s4}"}}}}'
+    ov4 = run_case(oauth_token=auth_json4, provider="openai", auth_mode="oauth")
+    values4 = {e["value"] for e in ov4}
+    assert s4 not in values4, "openai/oauth sentinel leaked as plaintext override"
+
+    # Case 5: gemini / api_key — sentinel is the API key
+    s5 = "AIzaSENTINEL-GEMINI-APIKEY-xyz123abc456def789"
+    ov5 = run_case(oauth_token=s5, provider="gemini", auth_mode="api_key")
+    values5 = {e["value"] for e in ov5}
+    assert s5 not in values5, "gemini/api_key sentinel leaked as plaintext override"
+
+    # Case 6: gemini / service_account — secret goes to file; no plaintext in env
+    s6 = "SENTINEL-SA-PRIVATE-KEY-xyz789abc123def456"
+    sa_json6 = (
+        '{"type":"service_account",'
+        '"client_email":"test@proj.iam.gserviceaccount.com",'
+        f'"private_key":"{s6}"}}'
+    )
+    ov6 = run_case(
+        oauth_token=sa_json6,
+        provider="gemini",
+        auth_mode="service_account",
+        provider_metadata={"project": "test-project", "location": "us-central1"},
+    )
+    values6 = {e["value"] for e in ov6}
+    assert s6 not in values6, (
+        "gemini/service_account sentinel leaked as plaintext override"
+    )
+
+    # --- Hostile / synthetic case ---
+    # Monkeypatch _resolve_provider_materials so the resolved materials.secret_env
+    # contains a brand-new key NOT in _SECRET_ENV_KEYS. The value-based fail-closed
+    # guard must suppress it even though the key has never been seen before.
+    s_hostile = "SENTINEL-FUTURE-CRED-KEY-xyz789abc123def456ghi"
+    from app.compute_manifest import (  # noqa: PLC0415
+        _ProviderMaterials,
+        _resolve_provider_materials as _real_resolve,
+    )
+
+    def _hostile_resolve(**kwargs):
+        real = _real_resolve(**kwargs)
+        augmented = dict(real.secret_env)
+        # FUTURE_PROVIDER_CREDENTIAL_KEY is intentionally absent from _SECRET_ENV_KEYS
+        augmented["FUTURE_PROVIDER_CREDENTIAL_KEY"] = s_hostile
+        return _ProviderMaterials(
+            provider_name=real.provider_name,
+            auth_mode_value=real.auth_mode_value,
+            files=real.files,
+            cli_translation=real.cli_translation,
+            secret_env=augmented,
+        )
+
+    monkeypatch.setattr(cm_module, "_resolve_provider_materials", _hostile_resolve)
+    ov_h = run_case(
+        oauth_token="SENTINEL-OAUTH-FOR-HOSTILE-CASE-anthropic-abc123",
+        provider="anthropic",
+        auth_mode="oauth",
+    )
+    values_h = {e["value"] for e in ov_h}
+    assert s_hostile not in values_h, (
+        f"Fail-closed value guard failed: FUTURE_PROVIDER_CREDENTIAL_KEY={s_hostile!r} "
+        "appeared as a plaintext override — a credential key unknown to _SECRET_ENV_KEYS "
+        "was not suppressed by the value-based guard"
+    )
