@@ -389,12 +389,14 @@ async def agent_fetch_efficiency_snapshot(
         AXIS_VM_REUSE_RATE,
         FORMAT_COMPLIANCE_KEY,
         _AXIS_WINDOW_DAYS,
-        _compact_llm_cost_attribution,
         _compute_cost_per_merged_pr,
-        _compute_llm_cost_per_merged_pr,
         _compute_vm_reuse_rate,
         _load_recent_tasks,
         compute_panel_review_effectiveness,
+    )
+    from app.llm_cost_attribution import (  # noqa: PLC0415
+        _compact_llm_cost_attribution,
+        _compute_llm_cost_per_merged_pr,
     )
     from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
 

@@ -84,7 +84,7 @@ from app.admin_task_mutations import (
     modify_task_apply,
 )
 from app.task_blocked import strip_fresh_attempt_context
-from app.efficiency_snapshot import _task_llm_cost as _calc_task_llm_cost
+from app.llm_cost_attribution import _task_llm_cost as _calc_task_llm_cost
 from app.time_utils import clear_retry_after
 from app.routers.admin_operator_triggers import (  # noqa: F401
     _record_failure_result,

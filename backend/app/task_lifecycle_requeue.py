@@ -648,7 +648,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # against the attempt's provider/model so multi-model chains are correct.
         # Unpriced combos contribute $0 rather than blocking the requeue.
         try:
-            from app.efficiency_snapshot import _task_llm_cost
+            from app.llm_cost_attribution import _task_llm_cost
 
             _attempt_llm_cost, _ = _task_llm_cost(child)
             if _attempt_llm_cost > 0.0:

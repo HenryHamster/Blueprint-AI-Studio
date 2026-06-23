@@ -81,6 +81,13 @@ describe('StatusToneBadge', () => {
     expect(el.className).toContain('rounded');
     expect(el.className).toContain('border');
   });
+
+  it('uses text-ui-sm font token (not undefined text-label)', () => {
+    const { getByText } = render(<StatusToneBadge tone="positive" label="Check" />);
+    const el = getByText('Check');
+    expect(el.className).toContain('text-ui-sm');
+    expect(el.className).not.toContain('text-label');
+  });
 });
 
 describe('VerdictBadge', () => {

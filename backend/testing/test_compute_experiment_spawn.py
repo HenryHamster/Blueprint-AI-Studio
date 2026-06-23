@@ -1171,3 +1171,101 @@ async def test_sweep_aggregate_includes_failed_arm_results(
     assert "arm-crash" in prompt
     # Failure framing because one arm failed
     assert "diagnose" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# Plan-decomposed compute_experiment spend-gate
+# ---------------------------------------------------------------------------
+
+
+async def _setup_plan_with_compute_experiment(
+    db_session, mocker, spend_cap_usd: float, threshold_usd: float = 0.0
+):
+    """Create project + plan task and return (task, project) ready for _handle_plan_completion."""
+    from app.plan_completion import _handle_plan_completion
+    from app.shared_state import runtime_config
+
+    runtime_config["compute_experiment_spend_threshold_usd"] = threshold_usd
+
+    project = Project(name="PlanSpendGateTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Run the benchmark",
+                    "prompt": "measure baseline",
+                    "type": "compute_experiment",
+                    "command": "python bench.py",
+                    "spend_cap_usd": spend_cap_usd,
+                    "deadline_seconds": 600,
+                    "smoke_sample": _VALID_SMOKE,
+                }
+            ]
+        }
+    )
+
+    task = Task(
+        project_id=project.id,
+        title="Plan: spend gate test",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "do things", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=task,
+    )
+    mocker.patch("app.plan_completion.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    await _handle_plan_completion(task, plan_logs, db_session)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_plan_compute_experiment_above_threshold_requires_approval(
+    db_session, mocker
+):
+    """Plan-decomposed compute_experiment with spend_cap above threshold is held for approval."""
+    task = await _setup_plan_with_compute_experiment(
+        db_session, mocker, spend_cap_usd=10.0, threshold_usd=5.0
+    )
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child.first_payload["type"] == "compute_experiment"
+    assert child.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_plan_compute_experiment_below_threshold_no_approval(db_session, mocker):
+    """Plan-decomposed compute_experiment with spend_cap at or below threshold launches without approval."""
+    task = await _setup_plan_with_compute_experiment(
+        db_session, mocker, spend_cap_usd=3.0, threshold_usd=5.0
+    )
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child.first_payload["type"] == "compute_experiment"
+    assert child.requires_approval is False

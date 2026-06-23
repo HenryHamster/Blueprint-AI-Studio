@@ -45,7 +45,7 @@ export function Badge({
 
 type VerdictTone = Parameters<typeof verdictToneBadgeClass>[0];
 
-const BADGE_BASE = 'inline-flex items-center text-label font-medium border px-1.5 py-0.5 rounded';
+const BADGE_BASE = 'inline-flex items-center text-ui-sm font-medium border px-1.5 py-0.5 rounded';
 
 /** A badge chip styled by semantic tone. */
 export function StatusToneBadge({ tone, label }: { tone: VerdictTone; label: string }) {

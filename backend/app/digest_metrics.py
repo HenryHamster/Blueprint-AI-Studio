@@ -3122,7 +3122,7 @@ def compute_digest_cost_economics(
     # LLM-dollar companions: total LLM spend, LLM share of combined (VM+LLM) spend,
     # and median LLM cost per merged PR. Uses the same pricing helpers as the
     # efficiency snapshot and llm-cost-breakdown endpoint so all figures reconcile.
-    from app.efficiency_snapshot import _task_llm_cost
+    from app.llm_cost_attribution import _task_llm_cost
 
     _total_llm_cost_raw = 0.0
     _merged_llm_costs: list[float] = []
@@ -3842,7 +3842,7 @@ def compute_retry_analytics(
       retry_success_rate_by_class, retry_wasted_rate.
     """
     from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
-    from app.efficiency_snapshot import _task_llm_cost
+    from app.llm_cost_attribution import _task_llm_cost
 
     _retry_overhead_cost = 0.0
     _retry_overhead_llm_cost = 0.0

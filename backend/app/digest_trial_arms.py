@@ -318,7 +318,7 @@ async def compute_trial_arm_cost_delta(
     (negative means the WITH arm is cheaper).  Fields are ``None`` when an arm
     has no tasks or no priced token data.
     """
-    from app.efficiency_snapshot import (
+    from app.llm_cost_attribution import (
         LLM_TOKEN_PRICING,
     )  # avoid circular at module load
 
