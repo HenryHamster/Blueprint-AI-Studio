@@ -1,6 +1,9 @@
 import { useState, useRef, useReducer, useCallback } from 'react';
 
+export type PrimaryTab = 'home' | 'board' | 'directions' | 'settings';
+
 export function useUIState() {
+  const [activeTab, setActiveTab] = useState<PrimaryTab>('home');
   // Panel visibility
   const [showResearchBrowser, setShowResearchBrowser] = useState(false);
   const [showKnowledgeBrowser, setShowKnowledgeBrowser] = useState(false);
@@ -111,6 +114,7 @@ export function useUIState() {
   } | null>(null);
 
   return {
+    activeTab, setActiveTab,
     showResearchBrowser, setShowResearchBrowser,
     showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,

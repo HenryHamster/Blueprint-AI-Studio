@@ -12,7 +12,6 @@ import TaskStreamPanel from './components/TaskStreamPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
 import { KnowledgeBrowser } from './components/KnowledgeBrowser';
 import { PipelineView } from './components/PipelineView';
-import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL } from './api';
 import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen, fetchBackendLastSeen, resolveLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
@@ -25,10 +24,12 @@ import { NewProjectModal } from './components/NewProjectModal';
 import { HeaderBar } from './components/HeaderBar';
 import type { SectionId } from './components/SettingsDropdown';
 import { TaskLaunchFAB } from './components/TaskLaunchFAB';
-import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { DashboardHome } from './components/DashboardHome';
+import { ConsoleHome } from './components/ConsoleHome';
+import { ProjectSwitcherDropdown } from './components/ProjectSwitcherDropdown';
+import type { PrimaryTab } from './hooks/useUIState';
 import { BulkActionBar } from './components/BulkActionBar';
 import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
@@ -466,10 +467,26 @@ export default function App() {
 
   const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
 
+  const [showAnalytics, setShowAnalytics] = useState(false);
+
+  // activeTab drives the primary nav; 'home' renders ConsoleHome, 'board' renders
+  // the kanban/pipeline views, 'directions' renders DirectionsPanel in page mode.
+  const activeTab: PrimaryTab = s.activeTab;
+  const handleTabChange = (tab: PrimaryTab) => {
+    if (tab === 'settings') {
+      s.handleToggleSettings();
+      return;
+    }
+    s.setActiveTab(tab);
+    if (tab === 'board' && s.viewMode === 'home') {
+      s.setViewMode('kanban');
+    }
+  };
+
   // Catch-Up, Pipeline Health, Pipeline Regressions, and VM Fleet are
   // home-dashboard furniture; on every other view they pushed the actual
   // content below the fold.
-  const onDashboardHome = s.viewMode === 'home' && !s.showArchive && !s.showUserManagement && !s.showMessages;
+  const onDashboardHome = activeTab === 'home' && !s.showArchive && !s.showUserManagement && !s.showMessages;
 
   if (s.authLoading) {
     return (
@@ -557,7 +574,11 @@ export default function App() {
         onUpdateSoundOnComplete={s.setSoundOnComplete}
         notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
         onUpdateNotifyOnHighSignalMessage={s.setNotifyOnHighSignalMessage}
-        onSetViewMode={s.setViewMode}
+        onSetViewMode={(mode) => {
+          s.setViewMode(mode);
+          if (mode === 'home') s.setActiveTab('home');
+          else s.setActiveTab('board');
+        }}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
         showKnowledgeBrowser={s.showKnowledgeBrowser}
@@ -571,7 +592,7 @@ export default function App() {
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={s.needsAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
-        onShowDirections={() => s.setShowDirections(true)}
+        onShowDirections={() => s.setActiveTab('directions')}
         onSignOut={() => signOut(auth)}
         userEmail={s.user.email || ''}
         wsRef={s.wsRef}
@@ -744,61 +765,41 @@ export default function App() {
         pipelineThrottle={s.pipelineThrottle}
       />
 
-      <ProjectDashboard
-        projects={s.projects}
-        tasks={s.tasks}
-        dataStale={s.projectsFetchError != null}
-        selectedProjectId={s.selectedProjectId}
-        onSelectProject={s.setSelectedProjectId}
-        userRole={s.userRole}
-        onNewProject={() => setShowNewProjectModal(true)}
-        onOpenSetupGuide={(projectId) => setSetupProjectId(projectId)}
-        onNavigateToTask={(taskId) => {
-          const target = s.tasks.find(t => t.id === taskId);
-          if (target) {
-            s.handleViewLogs(target);
-          } else {
-            fetchTask(taskId).then(s.handleViewLogs).catch(() => {
-              s.addToast('Could not load task — it may have been deleted', 'error');
-            });
-          }
-        }}
-        onLaunchCompute={() => {
-          s.setComputeExperiment(defaultComputeExperimentForm());
-          s.openPrefilledTaskModal({ taskType: 'compute_experiment', title: '', prompt: '' });
-        }}
-        onProjectDeleted={(projectId) => {
-          if (s.selectedProjectId === projectId) s.setSelectedProjectId(null);
-          void s.fetchProjects(true);
-        }}
-        onProjectReset={() => {
-          // The project row survives; its tasks were wiped. Refetch both so
-          // the dashboard reflects the cleared task history and new status.
-          void s.fetchProjects(true);
-          void s.fetchTasks();
-        }}
-        onProjectCancelled={() => {
-          // Cancel is terminal for the project and its active tasks. Refetch
-          // both views so the CANCELLED badge and task list update immediately.
-          void s.fetchProjects(true);
-          void s.fetchTasks();
-        }}
-        onProjectPaused={() => {
-          // Pause is a reversible flag on the project row; refetch so the
-          // dashboard reflects the new paused state (pill + menu label).
-          void s.fetchProjects(true);
-        }}
-        onProjectArchived={(projectId) => {
-          // Archived projects drop out of the active list; clear any selection
-          // pointing at the now-hidden project and refetch the active set.
-          if (s.selectedProjectId === projectId) s.setSelectedProjectId(null);
-          void s.fetchProjects(true);
-        }}
-        onProjectUnarchived={() => {
-          // The project reappears in the active list — refetch it back in.
-          void s.fetchProjects(true);
-        }}
-      />
+      {/* Primary nav: project switcher + tab strip */}
+      <div className="flex items-center gap-3 shrink-0 border-b border-neutral-800/60 pb-1 mb-1">
+        <ProjectSwitcherDropdown
+          projects={s.projects}
+          selectedProjectId={s.selectedProjectId}
+          onSelectProject={s.setSelectedProjectId}
+        />
+        <nav className="flex items-center gap-0.5 flex-1">
+          {(['home', 'board', 'directions', 'settings'] as const).map(tab => {
+            const isActive = tab === 'settings' ? s.showSettings : activeTab === tab;
+            const label = tab.charAt(0).toUpperCase() + tab.slice(1);
+            return (
+              <button
+                key={tab}
+                onClick={() => handleTabChange(tab)}
+                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                  isActive
+                    ? 'bg-neutral-800 text-neutral-100'
+                    : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
+                }`}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </nav>
+        {/* eslint-disable-next-line viewport/min-touch-target */}
+        <button
+          onClick={() => setShowNewProjectModal(true)}
+          className="text-xs text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
+          title="New project"
+        >
+          + Project
+        </button>
+      </div>
 
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
         const projectId = s.selectedProjectId;
@@ -898,9 +899,57 @@ export default function App() {
           setArchiveSortOrder={s.setArchiveSortOrder}
           onPurgeArchive={s.handlePurgeArchive}
         />
+      ) : activeTab === 'directions' ? (
+        <ErrorBoundary level="panel">
+          <DirectionsPanel
+            pageMode
+            addToast={s.addToast}
+            selectedProjectId={s.selectedProjectId}
+            projects={s.projects}
+            fetchDirectionsRef={s.fetchDirectionsRef}
+            strategistActive={s.strategistActive}
+            cycleProgress={s.cycleProgress}
+            onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
+            onNavigateToTask={(taskId) => {
+              const target = s.tasks.find(t => t.id === taskId);
+              if (target) s.handleViewLogs(target);
+              else fetchTask(taskId).then(s.handleViewLogs).catch(() => { s.addToast('Could not load task — it may have been deleted', 'error'); });
+            }}
+          />
+        </ErrorBoundary>
+      ) : activeTab === 'home' ? (
+        <ErrorBoundary level="panel">
+          <ConsoleHome
+            selectedProjectId={s.selectedProjectId}
+            scopedActiveCount={s.scopedActiveCount}
+            scopedQueuedCount={s.scopedQueuedCount}
+            globalActiveCount={s.globalActiveCount}
+            globalQueuedCount={s.globalQueuedCount}
+            tasks={s.tasks}
+            onViewTask={s.handleViewLogs}
+            onShowAnalytics={() => setShowAnalytics(true)}
+          />
+        </ErrorBoundary>
       ) : (
         <>
-          {s.viewMode !== 'home' && <div className="flex items-center gap-2 shrink-0 mb-1 flex-wrap">
+          {/* Board view mode sub-tabs */}
+          <div className="flex items-center gap-1 shrink-0 mb-1">
+            {(['kanban', 'pipeline'] as const).map(mode => (
+              <button
+                key={mode}
+                onClick={() => s.setViewMode(mode)}
+                className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                  s.viewMode === mode
+                    ? 'bg-neutral-800 text-neutral-100'
+                    : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
+                }`}
+              >
+                {mode.charAt(0).toUpperCase() + mode.slice(1)}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0 mb-1 flex-wrap">
             <SearchFilterBar
               searchQuery={s.searchQuery}
               onSearchChange={s.setSearchQuery}
@@ -965,18 +1014,16 @@ export default function App() {
             )}
             <div className="flex-1" />
             <span className="text-xs text-neutral-500">{filteredTasks.length} of {s.tasks.length}</span>
-          </div>}
+          </div>
 
           {/* Named saved filter views */}
-          {s.viewMode !== 'home' && (
-            <BoardSavedViewsBar
-              key={`${s.user?.email ?? 'anon'}:${s.selectedProjectId ?? 'none'}`}
-              userId={s.user?.email}
-              projectId={s.selectedProjectId}
-              current={boardFilterSnapshot}
-              onApply={applyBoardView}
-            />
-          )}
+          <BoardSavedViewsBar
+            key={`${s.user?.email ?? 'anon'}:${s.selectedProjectId ?? 'none'}`}
+            userId={s.user?.email}
+            projectId={s.selectedProjectId}
+            current={boardFilterSnapshot}
+            onApply={applyBoardView}
+          />
 
           {/* Quick-filter preset buttons */}
           <QuickFilterPresets
@@ -1001,9 +1048,7 @@ export default function App() {
             setSearchQuery={s.setSearchQuery}
           />
 
-          {s.viewMode === 'home' ? (
-            <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} globalActiveCount={s.globalActiveCount} globalQueuedCount={s.globalQueuedCount} scopedActiveCount={s.scopedActiveCount} scopedQueuedCount={s.scopedQueuedCount} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })} userRole={s.userRole} /></ErrorBoundary>
-          ) : s.viewMode === 'kanban' ? (
+          {s.viewMode === 'kanban' ? (
             <ErrorBoundary level="panel">
             <KanbanBoard
               tasks={filteredTasks}
@@ -1072,7 +1117,7 @@ export default function App() {
             </ErrorBoundary>
           ) : null}
 
-          {s.viewMode !== 'home' && <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />}
+          <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />
         </>
       )}
 
@@ -1231,27 +1276,21 @@ export default function App() {
         />
       )}
 
-      {s.showDirections && (
-        <DirectionsPanel
-          onClose={() => s.setShowDirections(false)}
-          addToast={s.addToast}
-          selectedProjectId={s.selectedProjectId}
-          projects={s.projects}
-          fetchDirectionsRef={s.fetchDirectionsRef}
-          strategistActive={s.strategistActive}
-          cycleProgress={s.cycleProgress}
-          onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
-          onNavigateToTask={(taskId) => {
-            const target = s.tasks.find(t => t.id === taskId);
-            if (target) {
-              s.handleViewLogs(target);
-            } else {
-              fetchTask(taskId).then(s.handleViewLogs).catch(() => {
-                s.addToast('Could not load task — it may have been deleted', 'error');
-              });
-            }
-          }}
-        />
+      {showAnalytics && (
+        <div className="fixed inset-0 z-[60] bg-black/60 flex items-start justify-center overflow-y-auto p-4" onClick={(e) => { if (e.target === e.currentTarget) setShowAnalytics(false); }}>
+          <div className="relative w-full max-w-6xl bg-neutral-950 rounded-xl border border-neutral-800 shadow-2xl my-8">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-neutral-800">
+              <h2 className="text-sm font-semibold text-neutral-200">Detailed Analytics</h2>
+              {/* eslint-disable-next-line viewport/min-touch-target */}
+              <button onClick={() => setShowAnalytics(false)} className="text-neutral-500 hover:text-neutral-300 transition-colors text-xs px-2 py-1">Close</button>
+            </div>
+            <div className="p-4">
+              <ErrorBoundary level="panel">
+                <DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} globalActiveCount={s.globalActiveCount} globalQueuedCount={s.globalQueuedCount} scopedActiveCount={s.scopedActiveCount} scopedQueuedCount={s.scopedQueuedCount} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })} userRole={s.userRole} />
+              </ErrorBoundary>
+            </div>
+          </div>
+        </div>
       )}
 
       {s.selectionMode && s.selectedTaskIds.size > 0 && (

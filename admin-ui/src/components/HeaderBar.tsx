@@ -410,32 +410,6 @@ export function HeaderBar(props: HeaderBarProps) {
       {/* Right: buttons */}
       <div className="flex items-center gap-1.5 ml-auto">
         <div className="hidden md:flex items-center gap-1">
-          <div className="flex items-center rounded-md overflow-hidden">
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-            <button
-              onClick={() => onSetViewMode('home')}
-              className={`p-2 text-xs transition-colors ${viewMode === 'home' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
-              title="Dashboard home"
-            >
-              <LayoutDashboard className="w-4 h-4" />
-            </button>
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-            <button
-              onClick={() => onSetViewMode('kanban')}
-              className={`p-2 text-xs transition-colors ${viewMode === 'kanban' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
-              title="Kanban view"
-            >
-              <LayoutGrid className="w-4 h-4" />
-            </button>
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-            <button
-              onClick={() => onSetViewMode('pipeline')}
-              className={`p-2 text-xs transition-colors ${viewMode === 'pipeline' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
-              title="Pipeline view"
-            >
-              <Network className="w-4 h-4" />
-            </button>
-          </div>
           {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
           <button
             onClick={onShowDirections}

@@ -86,6 +86,7 @@ export function useAppState() {
   } = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, selectedProjectId });
 
   const {
+    activeTab, setActiveTab,
     showResearchBrowser, setShowResearchBrowser,
     showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
@@ -398,7 +399,7 @@ export function useAppState() {
         if (showActivityFeed) { setShowActivityFeed(false); return; }
         if (showMessages) { setShowMessages(false); return; }
         if (showArchive) { setShowArchive(false); return; }
-        if (showDirections) { setShowDirections(false); return; }
+        if (activeTab === 'directions') { setActiveTab('home'); return; }
         if (showMetrics) { setShowMetrics(false); return; }
         if (showSettings) { setShowSettings(false); return; }
         return;
@@ -408,7 +409,7 @@ export function useAppState() {
 
       switch (e.key) {
         case 'n':
-          if (!showNewTaskModal && !logTask && !showResearchBrowser && !showDirections && !showSettings) {
+          if (!showNewTaskModal && !logTask && !showResearchBrowser && activeTab !== 'directions' && !showSettings) {
             openNewTaskModal();
           }
           break;
@@ -427,7 +428,7 @@ export function useAppState() {
                 },
               });
             }
-          } else if (!showNewTaskModal && !logTask && !showResearchBrowser && !showDirections && !showSettings) {
+          } else if (!showNewTaskModal && !logTask && !showResearchBrowser && activeTab !== 'directions' && !showSettings) {
             fetchTasks();
           }
           break;
@@ -454,15 +455,17 @@ export function useAppState() {
           break;
         case '1':
           setViewMode('kanban');
+          setActiveTab('board');
           break;
         case '2':
           setViewMode('pipeline');
+          setActiveTab('board');
           break;
         case '3':
-          setViewMode('home');
+          setActiveTab('home');
           break;
         case 'd':
-          setShowDirections(prev => !prev);
+          setActiveTab('directions');
           break;
         case 's':
           setShowSettings(prev => !prev);
@@ -472,7 +475,7 @@ export function useAppState() {
           break;
         case 'a':
         case 'A':
-          if (!showNewTaskModal && !logTask && !showResearchBrowser && !showDirections && !showSettings) {
+          if (!showNewTaskModal && !logTask && !showResearchBrowser && activeTab !== 'directions' && !showSettings) {
             setShowArchive(!showArchive);
           }
           break;
@@ -481,7 +484,7 @@ export function useAppState() {
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, showDirections, showMetrics, showSettings, showArchive, selectionMode, selectedTaskIds, tasks]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, activeTab, showMetrics, showSettings, showArchive, selectionMode, selectedTaskIds, tasks]);
 
   // ── Cross-domain glue handlers ────────────────────────────────────────────
 
@@ -654,6 +657,8 @@ export function useAppState() {
     handleRestartOrchestrator,
     // GitHub
     githubAccount, connectGitHub,
+    // Primary tab navigation
+    activeTab, setActiveTab,
     // Directions
     showDirections, setShowDirections,
     fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion,
