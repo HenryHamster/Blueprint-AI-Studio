@@ -2791,6 +2791,17 @@ class TestPurgeArchive:
         body = resp.json()
         assert body["deleted_count"] >= 1
 
+        # The endpoint runs on its OWN session (separate from this test's
+        # ``db_session``) and commits the detach UPDATE + parent DELETE there.
+        # This test's ``db_session`` still holds the ``parent``/``child`` ORM
+        # instances it created in its identity map, and because the harness uses
+        # ``expire_on_commit=False`` their attributes are NOT auto-expired. A
+        # plain re-``select()`` would return those cached instances unchanged
+        # (identity-map hit), masking the committed change — even ``expire_all()``
+        # is insufficient here. Expunge the identity map so the re-queries below
+        # materialize fresh objects from the rows the endpoint actually committed.
+        db_session.expunge_all()
+
         # Archived parent is gone
         gone = (
             (await db_session.execute(select(Task).where(Task.id == parent_id)))
@@ -2800,7 +2811,6 @@ class TestPurgeArchive:
         assert gone is None
 
         # Live child survives with its lineage detached
-        await db_session.expire_all()
         surviving = (
             (await db_session.execute(select(Task).where(Task.id == child_id)))
             .scalars()

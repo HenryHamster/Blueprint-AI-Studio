@@ -198,8 +198,8 @@ describe('ResearchBrowser evidence panel', () => {
     await user.click(screen.getByText('Finding A'));
     const verdictPill = screen.getByText('Pass');
     expect(verdictPill).toBeInTheDocument();
-    // Humanized label + positive (emerald) tone, not the raw token or always-cyan.
-    expect(verdictPill.className).toContain('emerald');
+    // Humanized label + positive (status-success) tone, not the raw token or always-cyan.
+    expect(verdictPill.className).toContain('status-success');
     expect(verdictPill.className).not.toContain('cyan');
     expect(screen.getByText(/full suite green/)).toBeInTheDocument();
   });
@@ -226,7 +226,7 @@ describe('ResearchBrowser evidence panel', () => {
     await user.click(screen.getByText('Finding B'));
     const verdictPill = screen.getByText('Request Changes');
     expect(verdictPill).toBeInTheDocument();
-    expect(verdictPill.className).toContain('red');
+    expect(verdictPill.className).toContain('status-blocking');
     expect(screen.queryByText('request_changes')).not.toBeInTheDocument();
   });
 });

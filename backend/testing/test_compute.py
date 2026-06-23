@@ -10994,7 +10994,7 @@ async def test_create_compute_job_allows_matching_hardware_policy(db_session):
 # Compute-experiment preflight endpoint and at-launch hardware policy gate
 # ---------------------------------------------------------------------------
 
-_PREFLIGHT_TEST_USER_ID = "preflight-test-user"
+_PREFLIGHT_TEST_USER_ID = "test-user-123"
 
 
 async def _make_preflight_project(
@@ -11186,7 +11186,7 @@ class TestComputeExperimentLaunchPolicyGate:
             headers=self._headers(),
         )
         assert resp.status_code == 422, resp.text
-        detail = resp.json()["detail"]
+        detail = resp.json()["error"]["message"]
         assert detail["error"] == "project_hardware_policy_violated"
         assert "L4" in detail["message"]
         assert detail["requested"] == "L4"
