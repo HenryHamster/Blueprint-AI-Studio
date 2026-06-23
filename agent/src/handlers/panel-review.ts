@@ -663,9 +663,39 @@ export async function handlePanelReview(
     // Read every lens verdict file; fail closed if ANY lens is missing or
     // unusable. All four launched together, so unlike the serial path there is
     // no short-circuit — we still must require all four to be usable.
-    for (const lens of PANEL_REVIEW_LENSES) {
+    for (const [index, lens] of PANEL_REVIEW_LENSES.entries()) {
       const rawLensVerdict = readHandlerOutput(taskId, panelReviewLensOutputType(lens.id), ws);
-      const normalizedLens = normalizeLensVerdict(rawLensVerdict, lens.id);
+      let normalizedLens = normalizeLensVerdict(rawLensVerdict, lens.id);
+
+      if (!normalizedLens) {
+        // Clean exit but unusable verdict — attempt one structured-output repair before
+        // failing the whole panel. repairStructuredOutput records the format miss and
+        // repair attempt telemetry, then reopens once with a focused continuation prompt.
+        const outputPath = `/tmp/${panelReviewLensOutputType(lens.id)}_${taskId}.json`;
+        const repairResult = await repairStructuredOutput<Record<string, unknown>>({
+          mode: 'object',
+          requiredKeys: ['verdict', 'summary'],
+          first: { exitCode, allOutput, lastResultText },
+          reopenPrompt: `Your previous ${lens.label} lens pass exited cleanly but the verdict at ${outputPath} was missing or had an invalid schema (required: "verdict": "APPROVE|REQUEST_CHANGES" and a non-empty "summary").\n\nOutput ONLY the following JSON (no markdown fences, no commentary) and also write it to ${outputPath}:\n{"verdict":"APPROVE|REQUEST_CHANGES","summary":"<your synthesis>","issues":[]}`,
+          ws,
+          statusRef,
+          model,
+          effort,
+          disallowedTools,
+          retryStatus: `Panel review lens ${index + 1}/${PANEL_REVIEW_LENSES.length}: repairing '${lens.id}' verdict...`,
+          schemaLabel: 'panel_review_lens',
+        });
+        // Try normalizing the value extracted from text output, then re-read the file
+        // (the repair pass may have rewritten it).
+        if (repairResult.value !== null) {
+          normalizedLens = normalizeLensVerdict(repairResult.value, lens.id);
+        }
+        if (!normalizedLens) {
+          const repairedRaw = readHandlerOutput(taskId, panelReviewLensOutputType(lens.id), ws);
+          normalizedLens = normalizeLensVerdict(repairedRaw, lens.id);
+        }
+      }
+
       if (!normalizedLens) {
         await failPanelClosed(
           `lens '${lens.id}' produced no usable verdict`,
