@@ -7684,3 +7684,139 @@ async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
         LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY
     )
     assert marker == "healthy"
+
+
+def test_llm_cost_attribution_strategic_cycle_cost_per_event():
+    """llm_cost_attribution block includes strategic_cycle_cost_per_event with
+    cycle_count, total_usd, and per_event_usd when StrategicCycle rows exist.
+
+    Uses two tasks tied to the same cycle (design_doc_update + strategic_review)
+    and one unrelated create task. Verifies the aggregation is isolated to the
+    strategic-cycle types and the per_event_usd is total / cycle_count.
+    """
+    import uuid
+
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING, _compact_llm_cost_attribution
+
+    project_id = uuid.uuid4()
+    cycle_id = str(uuid.uuid4())
+
+    # design_doc_update (phase 1) — 1000 input + 200 output sonnet tokens
+    phase1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": False},
+        payloads=[{"type": "design_doc_update"}],
+        strategic_cycle_id=cycle_id,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 3,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # strategic_review (phase 2) — 500 input + 100 output sonnet tokens
+    phase2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": False},
+        payloads=[{"type": "strategic_review"}],
+        strategic_cycle_id=cycle_id,
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+            "llm_call_count": 2,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Unrelated create task (should NOT appear in strategic_cycle_cost_per_event)
+    unrelated = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 8,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    result = _compact_llm_cost_attribution([phase1, phase2, unrelated])
+    sc = result["strategic_cycle_cost_per_event"]
+
+    assert sc is not None, (
+        "strategic_cycle_cost_per_event must be non-None when cycles exist"
+    )
+    assert sc["cycle_count"] == 1
+    # 1500 input + 300 output at claude-sonnet-4-6 rates (3e-6 in, 15e-6 out)
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_usd = round(1500 * input_rate + 300 * output_rate, 6)
+    assert sc["total_usd"] == pytest.approx(expected_usd)
+    assert sc["per_event_usd"] == pytest.approx(expected_usd / 1)
+
+
+def test_llm_cost_attribution_no_strategic_cycle_cost_when_no_cycles():
+    """strategic_cycle_cost_per_event is None when no strategic cycle tasks exist."""
+    import uuid
+
+    from app.efficiency_snapshot import _compact_llm_cost_attribution
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 4,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    result = _compact_llm_cost_attribution([task])
+    assert result["strategic_cycle_cost_per_event"] is None
+
+
+def test_llm_cost_attribution_strategic_cycle_counts_distinct_cycles():
+    """strategic_cycle_cost_per_event.cycle_count reflects distinct cycle IDs."""
+    import uuid
+
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING, _compact_llm_cost_attribution
+
+    project_id = uuid.uuid4()
+    cycle_a = str(uuid.uuid4())
+    cycle_b = str(uuid.uuid4())
+
+    def _sr_task(cycle_id: str) -> object:
+        return make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            payloads=[{"type": "strategic_review"}],
+            strategic_cycle_id=cycle_id,
+            api_call_summary={
+                "total_input_tokens": 400,
+                "total_output_tokens": 80,
+                "llm_call_count": 2,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+
+    result = _compact_llm_cost_attribution([_sr_task(cycle_a), _sr_task(cycle_b)])
+    sc = result["strategic_cycle_cost_per_event"]
+
+    assert sc is not None
+    assert sc["cycle_count"] == 2
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_total = round(2 * (400 * input_rate + 80 * output_rate), 6)
+    assert sc["total_usd"] == pytest.approx(expected_total)
+    assert sc["per_event_usd"] == pytest.approx(expected_total / 2)

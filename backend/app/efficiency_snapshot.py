@@ -371,6 +371,9 @@ async def _load_recent_tasks(
                 # triggering an async lazy-load (used by compute_llm_cost_by_task_type
                 # and compute_effort_model_efficiency when called from this path).
                 Task.payloads,
+                # strategic_cycle_id: required for strategic_cycle_cost_per_event
+                # aggregation in _compact_llm_cost_attribution.
+                Task.strategic_cycle_id,
                 raiseload=True,
             )
         )
@@ -2581,6 +2584,32 @@ def _compact_llm_cost_attribution(
         self_repair_burn_share = (
             round(repair_attempts / total_llm_calls, 4) if total_llm_calls > 0 else None
         )
+
+    # Strategic-cycle cost per event: aggregate LLM cost of design_doc_update
+    # and strategic_review tasks, grouped by distinct strategic_cycle_id.
+    # Operators use this to distinguish "tasks are more expensive per merge"
+    # from "strategic cycles are running more often or with larger contexts".
+    _STRATEGIC_CYCLE_TYPES = {"design_doc_update", "strategic_review"}
+    strategic_tasks = [
+        t
+        for t in tasks
+        if (t.first_payload or {}).get("type") in _STRATEGIC_CYCLE_TYPES
+    ]
+    cycle_ids = {t.strategic_cycle_id for t in strategic_tasks if t.strategic_cycle_id}
+    cycle_count = len(cycle_ids)
+    total_strategic_usd = round(sum(_task_llm_cost(t)[0] for t in strategic_tasks), 6)
+    strategic_cycle_cost_per_event: Dict[str, Any] | None = (
+        {
+            "cycle_count": cycle_count,
+            "total_usd": total_strategic_usd,
+            "per_event_usd": round(total_strategic_usd / cycle_count, 6)
+            if cycle_count > 0
+            else None,
+        }
+        if cycle_count > 0
+        else None
+    )
+
     return {
         "by_model": by_model,
         "by_task_type": by_task_type,
@@ -2589,6 +2618,7 @@ def _compact_llm_cost_attribution(
         "unpriced_coverage": breakdown["totals"].get("unpriced_coverage_fraction"),
         SELF_REPAIR_BURN_SHARE_KEY: self_repair_burn_share,
         "qualification_infra_usd": qualification_infra_usd,
+        "strategic_cycle_cost_per_event": strategic_cycle_cost_per_event,
     }
 
 
