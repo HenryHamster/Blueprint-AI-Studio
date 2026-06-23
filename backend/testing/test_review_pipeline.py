@@ -6546,6 +6546,100 @@ async def test_spawn_pipeline_supersedes_stale_task_with_agent_timeout(
 
 
 @pytest.mark.asyncio
+async def test_supersession_deletes_vm(db_session, mocker):
+    """When a stale task is superseded, its VM must be deleted after the spawn
+    commits."""
+    from datetime import timedelta
+    from app.review_pipeline import PIPELINE_TASK_STALE_MINUTES, _utcnow
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mock_ensure_vm_deleted = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+    )
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Stale in-flight review with VM and no heartbeat for > threshold.
+    stale_started = _utcnow() - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES + 5)
+    stale_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 802,
+                "branch": "feat/vm-test",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        started_at=stale_started,
+        last_heartbeat=None,
+        vm_instance_id="agent-vm-test-stale-123",
+    )
+    db_session.add(stale_review)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 802,
+                "branch": "feat/vm-test",
+                "base_branch": "main",
+                "prompt": "Build X",
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(stale_review)
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=802,
+        branch="feat/vm-test",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    # Verify the stale task was superseded
+    await db_session.refresh(stale_review)
+    assert stale_review.status == TaskStatus.CANCELLED
+
+    # Verify _ensure_vm_deleted was called for the stale task's VM
+    mock_ensure_vm_deleted.assert_called()
+    calls = mock_ensure_vm_deleted.call_args_list
+    vm_call_found = False
+    for call in calls:
+        args, kwargs = call
+        if args[0] == "agent-vm-test-stale-123":
+            vm_call_found = True
+            assert "reason" in kwargs
+            assert "superseded_stale_task" in kwargs["reason"]
+            break
+    assert vm_call_found, "VM deletion should be called for superseded task"
+
+
+@pytest.mark.asyncio
 async def test_spawn_fix_cancels_in_flight_review_with_agent_timeout(
     db_session, mocker
 ):
@@ -6904,6 +6998,130 @@ async def test_supersede_churn_halts_after_limit(db_session, mocker):
         .get("review_loop_terminal_outcome", {})
         .get("detail")
     )
+
+
+@pytest.mark.asyncio
+async def test_churn_halt_deletes_inflight_task_vms(db_session, mocker):
+    """When supersession churn halts the pipeline, in-flight tasks' VMs
+    must be deleted after the spawn commits.
+
+    Both the stale review and the stale fix accumulate the churn count to the
+    limit.  The churn-halt then fires, and vm_lifecycle._ensure_vm_deleted
+    is called for every vm_instance_id collected during the stale supersessions.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.review_pipeline._REVIEW_SUPERSEDE_CHURN_LIMIT", 2)
+    # Capture the mock so we can assert on calls after the churn-halt fires.
+    mock_ensure_vm_deleted = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    stale_started = _utcnow_for_test() - timedelta(
+        minutes=PIPELINE_TASK_STALE_MINUTES + 5
+    )
+    stale_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 901,
+                "branch": "feat/churn-vm",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        started_at=stale_started,
+        vm_instance_id="agent-vm-stale-review-901",
+    )
+    db_session.add(stale_review)
+
+    # A fix task that is also stale (old heartbeat), so it is superseded in
+    # the same first-loop pass.  That drives the churn count from 1 to 2
+    # (== limit), triggering the halt, and its VM must be cleaned up.
+    inflight_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 901,
+                "branch": "feat/churn-vm",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        started_at=stale_started,
+        vm_instance_id="agent-vm-inflight-fix-901",
+    )
+    db_session.add(inflight_fix)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 901,
+                "branch": "feat/churn-vm",
+                "base_branch": "main",
+                "prompt": "Build X",
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(stale_review)
+    await db_session.refresh(inflight_fix)
+    await db_session.refresh(source_task)
+
+    # Both stale tasks are superseded in the first loop (count 0→1→2 == limit),
+    # then the churn-halt fires and both VMs are deleted after commit.
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=901,
+        branch="feat/churn-vm",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    # Churn halt returns (None, False)
+    assert result is None
+    assert created is False
+
+    # Both stale tasks were superseded (cancelled) by the pipeline.
+    await db_session.refresh(stale_review)
+    assert stale_review.status == TaskStatus.CANCELLED
+
+    await db_session.refresh(inflight_fix)
+    assert inflight_fix.status == TaskStatus.CANCELLED
+
+    # Both VMs must have been deleted after the commit — regardless of
+    # whether they were collected via stale-supersession or churn-halt
+    # cancellation, _ensure_vm_deleted must fire for each.
+    deleted_vm_ids = {call.args[0] for call in mock_ensure_vm_deleted.call_args_list}
+    assert "agent-vm-stale-review-901" in deleted_vm_ids
+    assert "agent-vm-inflight-fix-901" in deleted_vm_ids
 
 
 @pytest.mark.asyncio
