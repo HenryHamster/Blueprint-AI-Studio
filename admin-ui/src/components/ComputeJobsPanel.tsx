@@ -129,7 +129,16 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
   const [analysisDocs, setAnalysisDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
+  const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
   const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const toggleDocExpanded = useCallback((key: string) => {
+    setExpandedDocIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }, []);
 
   const load = useCallback(
     async (signal?: AbortSignal) => {
@@ -480,6 +489,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               {(() => {
                 const doc = knowledgeDocs[job.id];
                 if (!doc) return null;
+                const docKey = `knowledge-${job.id}`;
+                const expanded = expandedDocIds.has(docKey);
                 return (
                   <div
                     className="mt-1.5 rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1.5 text-ui-sm"
@@ -487,10 +498,22 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   >
                     <div className="flex items-start gap-1.5">
                       <FileText className="w-3 h-3 shrink-0 mt-0.5 text-sky-300" />
-                      <div className="min-w-0">
-                        <div className="font-semibold text-sky-200 break-words">{doc.title}</div>
-                        {doc.summary && (
-                          <div className="mt-0.5 text-sky-300/80 break-words whitespace-pre-wrap">{doc.summary}</div>
+                      <div className="min-w-0 flex-1">
+                        <button
+                          type="button"
+                          onClick={() => toggleDocExpanded(docKey)}
+                          className="font-semibold text-sky-200 break-words text-left w-full hover:text-sky-100"
+                          data-testid="compute-knowledge-doc-toggle"
+                        >
+                          {doc.title}
+                        </button>
+                        {!expanded && doc.summary && (
+                          <div className="mt-0.5 text-sky-300/80 break-words whitespace-pre-wrap line-clamp-3">{doc.summary}</div>
+                        )}
+                        {expanded && (
+                          <div className="mt-0.5 text-sky-300/80 break-words whitespace-pre-wrap" data-testid="compute-knowledge-doc-body">
+                            {doc.body ?? doc.summary}
+                          </div>
                         )}
                       </div>
                     </div>
@@ -515,6 +538,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               {(() => {
                 const doc = analysisDocs[job.id];
                 if (!doc) return null;
+                const docKey = `analysis-${job.id}`;
+                const expanded = expandedDocIds.has(docKey);
                 return (
                   <div
                     className="mt-1.5 rounded border border-violet-500/30 bg-violet-500/10 px-2 py-1.5 text-ui-sm"
@@ -522,14 +547,26 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   >
                     <div className="flex items-start gap-1.5">
                       <FileText className="w-3 h-3 shrink-0 mt-0.5 text-violet-300" />
-                      <div className="min-w-0">
-                        <div className="font-semibold text-violet-200 break-words">{doc.title}</div>
-                        {doc.summary && (
-                          <div className="mt-0.5 text-violet-300/80 break-words whitespace-pre-wrap">{doc.summary}</div>
+                      <div className="min-w-0 flex-1">
+                        <button
+                          type="button"
+                          onClick={() => toggleDocExpanded(docKey)}
+                          className="font-semibold text-violet-200 break-words text-left w-full hover:text-violet-100"
+                          data-testid="compute-analysis-doc-toggle"
+                        >
+                          {doc.title}
+                        </button>
+                        {!expanded && doc.summary && (
+                          <div className="mt-0.5 text-violet-300/80 break-words whitespace-pre-wrap line-clamp-3">{doc.summary}</div>
                         )}
-                        {doc.body && !doc.summary && (
+                        {!expanded && !doc.summary && doc.body && (
                           <div className="mt-0.5 text-violet-300/80 break-words line-clamp-4 whitespace-pre-wrap">
                             {doc.body.slice(0, 400)}{doc.body.length > 400 ? '…' : ''}
+                          </div>
+                        )}
+                        {expanded && (
+                          <div className="mt-0.5 text-violet-300/80 break-words whitespace-pre-wrap" data-testid="compute-analysis-doc-body">
+                            {doc.body ?? doc.summary}
                           </div>
                         )}
                       </div>

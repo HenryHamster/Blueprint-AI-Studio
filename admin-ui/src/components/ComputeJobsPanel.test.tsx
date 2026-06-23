@@ -738,6 +738,69 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-durable-1');
   });
 
+  test('knowledge doc card is interactive: clicking the title toggles the full body', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      knowledge_document_id: 'doc-expand-1',
+    });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchKnowledgeDocument.mockResolvedValue({
+      id: 'doc-expand-1',
+      title: 'Knowledge: full analysis write-up',
+      summary: 'Short preview summary.',
+      body: '# Full Document Body\n\nThis is the complete analysis with all the details that were previously inaccessible to the operator.',
+      tags: [],
+      source_citations: [],
+      source_task_id: 'task-1',
+      created_at: null,
+      updated_at: null,
+      forward_quality_verdict: null,
+    });
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Initially collapsed — full body not shown
+    await findByTestId('compute-knowledge-doc-toggle');
+    expect(queryByTestId('compute-knowledge-doc-body')).toBeNull();
+    // Click to expand
+    const toggle = await findByTestId('compute-knowledge-doc-toggle');
+    await act(async () => { toggle.click(); });
+    // Full body is now visible
+    const body = await findByTestId('compute-knowledge-doc-body');
+    expect(body.textContent).toContain('This is the complete analysis with all the details');
+  });
+
+  test('analysis doc card is interactive: clicking the title toggles the full body', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    analyzeComputeJob.mockResolvedValue({ status: 'upgraded', knowledge_document_id: 'doc-analysis-expand' });
+    fetchKnowledgeDocument.mockResolvedValue({
+      id: 'doc-analysis-expand',
+      title: 'Analysis: LLM grounded write-up',
+      summary: 'Truncated preview.',
+      body: '# Full Analysis\n\nThe complete LLM-grounded analysis body that the operator needs to read.',
+      tags: [],
+      source_citations: [],
+      source_task_id: 'task-1',
+      created_at: null,
+      updated_at: null,
+      forward_quality_verdict: null,
+    });
+    const { findByRole, findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const button = await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { button.click(); });
+    // Doc card appears after analysis completes
+    await findByTestId('compute-analysis-doc');
+    // Initially collapsed — full body not shown
+    expect(queryByTestId('compute-analysis-doc-body')).toBeNull();
+    // Click to expand
+    const toggle = await findByTestId('compute-analysis-doc-toggle');
+    await act(async () => { toggle.click(); });
+    // Full body is now visible
+    const body = await findByTestId('compute-analysis-doc-body');
+    expect(body.textContent).toContain('The complete LLM-grounded analysis body');
+  });
+
   test('terminal job with hypothesis and experiment shows experiment identity block', async () => {
     fetchComputeJobs.mockResolvedValue([
       makeJob({

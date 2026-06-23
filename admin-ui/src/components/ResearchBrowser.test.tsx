@@ -598,6 +598,71 @@ describe('ResearchBrowser BLOCKED/PARKED outcome styling', () => {
   });
 });
 
+describe('ResearchBrowser quality card interactivity', () => {
+  it('grade filter narrows the listed findings to the selected grade', async () => {
+    const user = userEvent.setup();
+    vi.mocked(fetchRecentFindings).mockResolvedValueOnce({
+      findings: [
+        { task_id: 't1', title: 'High finding', type: 'bug', scope: 'small', priority: 'high', actionability_grade: 'HIGH', direction_id: null, researched_at: null },
+        { task_id: 't2', title: 'Low finding', type: 'observation', scope: 'small', priority: 'low', actionability_grade: 'LOW', direction_id: null, researched_at: null },
+      ],
+      grade_distribution: { HIGH: 1, MEDIUM: 0, LOW: 1 },
+      grade_distribution_pct: { HIGH: 50, MEDIUM: 0, LOW: 50 },
+      total: 2,
+    });
+    render(
+      <ResearchBrowser tasks={[]} selectedProjectId="proj-1" onClose={() => {}} />,
+    );
+    await waitFor(() => expect(screen.getByText('Research quality')).toBeInTheDocument());
+
+    // Both findings visible initially
+    expect(screen.getByText('High finding')).toBeInTheDocument();
+    expect(screen.getByText('Low finding')).toBeInTheDocument();
+
+    // Click the HIGH grade filter button
+    await user.click(screen.getByRole('button', { name: /HIGH/ }));
+
+    // Only HIGH finding visible; LOW hidden
+    expect(screen.getByText('High finding')).toBeInTheDocument();
+    expect(screen.queryByText('Low finding')).not.toBeInTheDocument();
+
+    // Clicking again clears the filter
+    await user.click(screen.getByRole('button', { name: /HIGH/ }));
+    expect(screen.getByText('Low finding')).toBeInTheDocument();
+  });
+
+  it('clicking a quality card row expands that finding\'s detail in the main list', async () => {
+    const user = userEvent.setup();
+    const finding = makeFinding({ title: 'Actionable finding', description: 'important detail here' });
+    const researchTask = makeResearchTask([finding]);
+    vi.mocked(fetchRecentFindings).mockResolvedValueOnce({
+      findings: [
+        { task_id: 'research-1', title: 'Actionable finding', type: 'bug', scope: 'small', priority: 'high', actionability_grade: 'HIGH', direction_id: null, researched_at: null },
+      ],
+      grade_distribution: { HIGH: 1, MEDIUM: 0, LOW: 0 },
+      grade_distribution_pct: { HIGH: 100, MEDIUM: 0, LOW: 0 },
+      total: 1,
+    });
+    render(
+      <ResearchBrowser
+        tasks={[researchTask]}
+        selectedProjectId="proj-1"
+        onClose={() => {}}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText('Research quality')).toBeInTheDocument());
+
+    // Description not visible yet
+    expect(screen.queryByText('important detail here')).not.toBeInTheDocument();
+
+    // Click the finding row in the quality card
+    await user.click(screen.getByRole('button', { name: /Actionable finding/ }));
+
+    // Finding detail (description) is now expanded
+    await waitFor(() => expect(screen.getByText('important detail here')).toBeInTheDocument());
+  });
+});
+
 describe('ResearchBrowser researchFeed prop', () => {
   it('uses researchFeed findings instead of tasks prop when provided', () => {
     const taskFinding = makeFinding({ title: 'From tasks prop' });

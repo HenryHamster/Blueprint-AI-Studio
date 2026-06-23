@@ -286,6 +286,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
   const [directionFilter, setDirectionFilter] = useState<string | null>(initialDirectionId ?? null);
   const [recentFindings, setRecentFindings] = useState<RecentFindingsResponse | null>(null);
   const [qualityCardCollapsed, setQualityCardCollapsed] = useState(false);
+  const [gradeFilter, setGradeFilter] = useState<'HIGH' | 'MEDIUM' | 'LOW' | null>(null);
 
   // Fetch recent findings with actionability grades for the quality card
   useEffect(() => {
@@ -593,28 +594,70 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                       )}
                     </div>
                     <div className="flex gap-4 text-ui-sm">
-                      <span className="text-emerald-400">{recentFindings.grade_distribution.HIGH} HIGH ({recentFindings.grade_distribution_pct.HIGH}%)</span>
-                      <span className="text-amber-400">{recentFindings.grade_distribution.MEDIUM} MED ({recentFindings.grade_distribution_pct.MEDIUM}%)</span>
-                      <span className="text-neutral-500">{recentFindings.grade_distribution.LOW} LOW ({recentFindings.grade_distribution_pct.LOW}%)</span>
+                      {/* reason: grade filter toggle chips; data-viewport-allow-small-target for sub-44px compact rows */}
+                      <button
+                        data-viewport-allow-small-target
+                        onClick={() => setGradeFilter(g => g === 'HIGH' ? null : 'HIGH')}
+                        className={`transition-colors ${gradeFilter === 'HIGH' ? 'text-emerald-300 underline' : 'text-emerald-400 hover:text-emerald-300'}`}
+                        aria-pressed={gradeFilter === 'HIGH'}
+                      >{recentFindings.grade_distribution.HIGH} HIGH ({recentFindings.grade_distribution_pct.HIGH}%)</button>
+                      <button
+                        data-viewport-allow-small-target
+                        onClick={() => setGradeFilter(g => g === 'MEDIUM' ? null : 'MEDIUM')}
+                        className={`transition-colors ${gradeFilter === 'MEDIUM' ? 'text-amber-300 underline' : 'text-amber-400 hover:text-amber-300'}`}
+                        aria-pressed={gradeFilter === 'MEDIUM'}
+                      >{recentFindings.grade_distribution.MEDIUM} MED ({recentFindings.grade_distribution_pct.MEDIUM}%)</button>
+                      <button
+                        data-viewport-allow-small-target
+                        onClick={() => setGradeFilter(g => g === 'LOW' ? null : 'LOW')}
+                        className={`transition-colors ${gradeFilter === 'LOW' ? 'text-neutral-300 underline' : 'text-neutral-500 hover:text-neutral-400'}`}
+                        aria-pressed={gradeFilter === 'LOW'}
+                      >{recentFindings.grade_distribution.LOW} LOW ({recentFindings.grade_distribution_pct.LOW}%)</button>
                     </div>
                   </div>
                   {/* Recent findings list */}
                   <div className="space-y-1">
-                    {recentFindings.findings.slice(0, 10).map((f, i) => (
-                      <div key={i} className="flex items-center gap-2 text-ui-md">
-                        <span className={`shrink-0 px-1.5 py-0.5 rounded text-ui-xs font-medium ${
-                          f.actionability_grade === 'HIGH' ? 'bg-emerald-500/20 text-emerald-400' :
-                          f.actionability_grade === 'LOW' ? 'bg-neutral-700 text-neutral-500' :
-                          'bg-amber-500/20 text-amber-400'
-                        }`}>
-                          {f.actionability_grade}
-                        </span>
-                        <span className="text-neutral-300 truncate">{f.title}</span>
-                        {f.researched_at && (
-                          <span className="text-neutral-600 shrink-0 ml-auto">{relativeDate(f.researched_at)}</span>
-                        )}
-                      </div>
-                    ))}
+                    {(gradeFilter ? recentFindings.findings.filter(f => f.actionability_grade === gradeFilter) : recentFindings.findings).slice(0, 10).map((f, i) => {
+                      const handleFindingClick = () => {
+                        // Find the matching EnrichedFinding in the grouped list and expand it
+                        for (const group of groups) {
+                          const match = group.findings.find(ef => ef.taskId === f.task_id && ef.finding.title === f.title);
+                          if (match) {
+                            const fKey = `${match.taskId}-${match.findingIndex}`;
+                            setExpandedFinding(fKey);
+                            const groupKey = match.finding.direction_id || '_undirected';
+                            setExpandedGroups(prev => {
+                              const next = new Set(prev ?? effectiveExpanded);
+                              next.add(groupKey);
+                              return next;
+                            });
+                            if (directionFilter && directionFilter !== (match.finding.direction_id ?? null)) {
+                              setDirectionFilter(null);
+                            }
+                            break;
+                          }
+                        }
+                      };
+                      return (
+                        <button
+                          key={i}
+                          onClick={handleFindingClick}
+                          className="w-full flex items-center gap-2 text-ui-md text-left hover:bg-neutral-800/30 px-1.5 py-1 rounded transition-colors min-h-[44px]"
+                        >
+                          <span className={`shrink-0 px-1.5 py-0.5 rounded text-ui-xs font-medium ${
+                            f.actionability_grade === 'HIGH' ? 'bg-emerald-500/20 text-emerald-400' :
+                            f.actionability_grade === 'LOW' ? 'bg-neutral-700 text-neutral-500' :
+                            'bg-amber-500/20 text-amber-400'
+                          }`}>
+                            {f.actionability_grade}
+                          </span>
+                          <span className="text-neutral-300 truncate">{f.title}</span>
+                          {f.researched_at && (
+                            <span className="text-neutral-600 shrink-0 ml-auto">{relativeDate(f.researched_at)}</span>
+                          )}
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
               )}
