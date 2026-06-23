@@ -414,7 +414,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
               const isCurrent = i === currentStepIndex;
               return (
                 <div key={s} className="flex items-center gap-2">
-                  <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold transition-colors ${
+                  <div className={`w-5 h-5 rounded-full flex items-center justify-center text-ui-sm font-bold transition-colors ${
                     isCompleted
                       ? 'bg-emerald-600 text-white'
                       : isCurrent
@@ -423,7 +423,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   }`}>
                     {isCompleted ? <CheckCircle className="w-3 h-3" /> : i + 1}
                   </div>
-                  <span className={`text-[11px] transition-colors ${isCurrent ? 'text-neutral-200' : `hidden sm:inline ${isCompleted ? 'text-neutral-400' : 'text-neutral-600'}`}`}>
+                  <span className={`text-ui-md transition-colors ${isCurrent ? 'text-neutral-200' : `hidden sm:inline ${isCompleted ? 'text-neutral-400' : 'text-neutral-600'}`}`}>
                     {STEP_LABELS[s]}
                   </span>
                   {i < stepKeys.length - 1 && <span className="text-neutral-700 text-xs mx-1">›</span>}
@@ -436,7 +436,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
           {step === 'repo' && (
             <div>
               <div className="mb-4">
-                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">
                   GitHub Repository
                 </label>
 
@@ -477,7 +477,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                             }`}
                           >
                             <span className="text-xs font-mono text-neutral-200">{r.full_name}</span>
-                            <span className="text-[10px] text-neutral-500 ml-2 shrink-0 flex items-center gap-1">
+                            <span className="text-ui-sm text-neutral-500 ml-2 shrink-0 flex items-center gap-1">
                               <GitBranch className="w-3 h-3" />
                               {r.default_branch}
                             </span>
@@ -486,7 +486,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                       )}
                     </div>
                     {repoInput && parsed && !repoError && (
-                      <p className="text-[10px] text-emerald-500 mb-1 flex items-center gap-1">
+                      <p className="text-ui-sm text-emerald-500 mb-1 flex items-center gap-1">
                         <CheckCircle className="w-3 h-3" />
                         Selected: {parsed.owner}/{parsed.repo}
                       </p>
@@ -494,7 +494,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     <button
                       type="button"
                       onClick={() => { setUseManualRepo(true); setRepoInput(''); setRepoFilter(''); setPreviewDefaultBranch(''); }}
-                      className="min-h-[44px] flex items-center text-[10px] text-neutral-500 hover:text-neutral-300 underline transition-colors"
+                      className="min-h-[44px] flex items-center text-ui-sm text-neutral-500 hover:text-neutral-300 underline transition-colors"
                     >
                       Enter manually
                     </button>
@@ -502,7 +502,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 ) : (
                   <div>
                     {repoFetchError && !useManualRepo && (
-                      <p className="text-[10px] text-amber-500 mb-1">{repoFetchError}</p>
+                      <p className="text-ui-sm text-amber-500 mb-1">{repoFetchError}</p>
                     )}
                     <input
                       type="text"
@@ -519,7 +519,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                       <button
                         type="button"
                         onClick={() => { setUseManualRepo(false); setRepoInput(''); }}
-                        className="min-h-[44px] flex items-center text-[10px] text-neutral-500 hover:text-neutral-300 underline transition-colors"
+                        className="min-h-[44px] flex items-center text-ui-sm text-neutral-500 hover:text-neutral-300 underline transition-colors"
                       >
                         Pick from list
                       </button>
@@ -527,9 +527,9 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   </div>
                 )}
 
-                {repoError && <p className="text-[10px] text-red-500 mt-1">{repoError}</p>}
+                {repoError && <p className="text-ui-sm text-red-500 mt-1">{repoError}</p>}
                 {!repoLoading && useManualRepo && parsed && !repoError && (
-                  <p className="text-[10px] text-emerald-500 mt-1 flex items-center gap-1">
+                  <p className="text-ui-sm text-emerald-500 mt-1 flex items-center gap-1">
                     <GitBranch className="w-3 h-3" />
                     {parsed.owner}/{parsed.repo}
                   </p>
@@ -537,7 +537,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
               </div>
 
               <div className="mb-6">
-                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">
                   Project Name{' '}
                   <span className="text-neutral-600 font-normal normal-case tracking-normal">(optional)</span>
                 </label>
@@ -551,7 +551,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
               </div>
 
               <div className="mb-4">
-                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">
                   Goal{' '}
                   <span className="text-neutral-600 font-normal normal-case tracking-normal">(optional)</span>
                 </label>
@@ -562,24 +562,24 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   placeholder="What do you want Blueprint to achieve on this repo?"
                   className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 resize-none"
                 />
-                <p className="text-[9px] text-neutral-600 mt-1">
+                <p className="text-ui-xs text-neutral-600 mt-1">
                   Seeds the project's strategic intent so the first cycle reasons from your goal. Leave blank to skip.
                 </p>
               </div>
 
               <div className="mb-6">
                 <div className="mb-2">
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">
                     Initial Steering{' '}
                     <span className="text-neutral-600 font-normal normal-case tracking-normal">(optional)</span>
                   </label>
-                  <p className="text-[9px] text-neutral-600 mt-1">
+                  <p className="text-ui-xs text-neutral-600 mt-1">
                     Capture project context and hard constraints so the first cycle starts with the right shape.
                   </p>
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <label className="block">
-                    <span className="block text-[10px] text-neutral-500 mb-1">Project type</span>
+                    <span className="block text-ui-sm text-neutral-500 mb-1">Project type</span>
                     <input
                       type="text"
                       value={projectType}
@@ -589,7 +589,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     />
                   </label>
                   <label className="block">
-                    <span className="block text-[10px] text-neutral-500 mb-1">Team</span>
+                    <span className="block text-ui-sm text-neutral-500 mb-1">Team</span>
                     <input
                       type="text"
                       value={team}
@@ -599,7 +599,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     />
                   </label>
                   <label className="block">
-                    <span className="block text-[10px] text-neutral-500 mb-1">Users</span>
+                    <span className="block text-ui-sm text-neutral-500 mb-1">Users</span>
                     <input
                       type="text"
                       value={users}
@@ -609,7 +609,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     />
                   </label>
                   <label className="block">
-                    <span className="block text-[10px] text-neutral-500 mb-1">Deploy cadence</span>
+                    <span className="block text-ui-sm text-neutral-500 mb-1">Deploy cadence</span>
                     <input
                       type="text"
                       value={deployCadence}
@@ -620,7 +620,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   </label>
                 </div>
                 <label className="block mt-3">
-                  <span className="block text-[10px] text-neutral-500 mb-1">Notes</span>
+                  <span className="block text-ui-sm text-neutral-500 mb-1">Notes</span>
                   <textarea
                     value={notes}
                     onChange={e => setNotes(e.target.value)}
@@ -631,8 +631,8 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 </label>
                 <div className="mt-4">
                   <div className="mb-2">
-                    <span className="block text-[10px] font-semibold text-neutral-400 uppercase tracking-wider">Constraints</span>
-                    <p className="text-[9px] text-neutral-600 mt-1">
+                    <span className="block text-ui-sm font-semibold text-neutral-400 uppercase tracking-wider">Constraints</span>
+                    <p className="text-ui-xs text-neutral-600 mt-1">
                       Hard rules and preferences the agent must respect. One per line.
                     </p>
                   </div>
@@ -697,7 +697,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   <span className="text-xs font-mono text-neutral-200">{parsed.owner}/{parsed.repo}</span>
                 </div>
                 {projectName.trim() && (
-                  <div className="text-[11px] text-neutral-500 mt-1">
+                  <div className="text-ui-md text-neutral-500 mt-1">
                     Name: <span className="text-neutral-400">{projectName.trim()}</span>
                   </div>
                 )}
@@ -705,26 +705,26 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
 
               {effectiveDefaultBranch && (
                 <div className="mb-4">
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">
                     Branch Configuration
                   </label>
                   <div className="space-y-2">
-                    <div className="flex items-center gap-2 text-[10px]">
+                    <div className="flex items-center gap-2 text-ui-sm">
                       <span className="text-neutral-500 w-28 shrink-0">Integration</span>
                       <span className="font-mono text-neutral-300">{effectiveDefaultBranch}</span>
                       <span className="text-neutral-600">(auto-detected)</span>
                     </div>
                     <div className="flex items-start gap-2">
-                      <span className="text-[10px] text-neutral-500 w-28 shrink-0 pt-2">Promotion target</span>
+                      <span className="text-ui-sm text-neutral-500 w-28 shrink-0 pt-2">Promotion target</span>
                       <div className="flex-1">
                         <input
                           type="text"
                           value={promotionTargetInput}
                           onChange={e => setPromotionTargetInput(e.target.value)}
                           placeholder={`${effectiveDefaultBranch} (same as integration)`}
-                          className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[10px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                          className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
                         />
-                        <p className="text-[9px] text-neutral-600 mt-1">
+                        <p className="text-ui-xs text-neutral-600 mt-1">
                           Leave blank to use the same as integration. Set a different branch for LTS workflows (e.g. <span className="font-mono">main</span> when integration is <span className="font-mono">automain</span>).
                         </p>
                       </div>
@@ -748,14 +748,14 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 <div className="mb-4 p-3 bg-neutral-950 rounded-lg border border-neutral-800">
                   <div className="flex items-center justify-between gap-2 mb-3">
                     <div>
-                      <div className="text-[11px] font-semibold text-neutral-300 uppercase tracking-wider">
+                      <div className="text-ui-md font-semibold text-neutral-300 uppercase tracking-wider">
                         Merge-gate draft
                       </div>
-                      <div className="text-[10px] text-neutral-500 mt-1">
+                      <div className="text-ui-sm text-neutral-500 mt-1">
                         Edit the detected config before creating the project.
                       </div>
                     </div>
-                    <label className="inline-flex items-center gap-2 text-[10px] text-neutral-400">
+                    <label className="inline-flex items-center gap-2 text-ui-sm text-neutral-400">
                       <input
                         type="checkbox"
                         checked={buildConfigDraft.requires_ci_checks !== false}
@@ -770,7 +770,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   </div>
 
                   <div className="space-y-3">
-                    <div className="text-[10px] text-neutral-500">
+                    <div className="text-ui-sm text-neutral-500">
                       {buildConfigDraft.has_ci === false ? 'No CI detected. Turn off required CI checks or add a real test command.' : 'Detected build config can be adjusted here before creation.'}
                     </div>
 
@@ -779,13 +779,13 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                         {(buildConfigDraft.directories ?? []).map((directory, index) => (
                           <div key={index} className="rounded border border-neutral-800 bg-neutral-900/70 p-3">
                             <div className="mb-2 flex items-center justify-between gap-2">
-                              <div className="text-[10px] font-mono text-neutral-400">
+                              <div className="text-ui-sm font-mono text-neutral-400">
                                 Directory {index + 1}
                               </div>
                               <button
                                 type="button"
                                 onClick={() => removeDraftDirectory(index)}
-                                className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded border border-neutral-800 px-2 text-[10px] text-neutral-500 hover:text-rose-400 hover:bg-neutral-800/60 transition-colors"
+                                className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded border border-neutral-800 px-2 text-ui-sm text-neutral-500 hover:text-rose-400 hover:bg-neutral-800/60 transition-colors"
                                 aria-label={`Remove directory ${index + 1}`}
                               >
                                 <X className="w-3.5 h-3.5" />
@@ -793,20 +793,20 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                             </div>
                             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                               <label className="block">
-                                <span className="block text-[10px] text-neutral-500 mb-1">Path</span>
+                                <span className="block text-ui-sm text-neutral-500 mb-1">Path</span>
                                 <input
                                   type="text"
                                   value={directory.path ?? ''}
                                   onChange={e => updateDraftDirectory(index, 'path', e.target.value)}
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
                                 />
                               </label>
                               <label className="block">
-                                <span className="block text-[10px] text-neutral-500 mb-1">Type</span>
+                                <span className="block text-ui-sm text-neutral-500 mb-1">Type</span>
                                 <select
                                   value={directory.type ?? 'other'}
                                   onChange={e => updateDraftDirectory(index, 'type', e.target.value)}
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md focus:outline-none focus:ring-1 focus:ring-neutral-700"
                                 >
                                   <option value="python">python</option>
                                   <option value="node">node</option>
@@ -816,40 +816,40 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                                 </select>
                               </label>
                               <label className="block sm:col-span-2">
-                                <span className="block text-[10px] text-neutral-500 mb-1">Test command</span>
+                                <span className="block text-ui-sm text-neutral-500 mb-1">Test command</span>
                                 <input
                                   type="text"
                                   value={directory.test_cmd ?? ''}
                                   onChange={e => updateDraftDirectory(index, 'test_cmd', e.target.value)}
                                   placeholder="Leave blank to keep the merge gate unverified"
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
                                 />
                               </label>
                               <label className="block">
-                                <span className="block text-[10px] text-neutral-500 mb-1">Lint command</span>
+                                <span className="block text-ui-sm text-neutral-500 mb-1">Lint command</span>
                                 <input
                                   type="text"
                                   value={directory.lint_cmd ?? ''}
                                   onChange={e => updateDraftDirectory(index, 'lint_cmd', e.target.value)}
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
                                 />
                               </label>
                               <label className="block">
-                                <span className="block text-[10px] text-neutral-500 mb-1">Build command</span>
+                                <span className="block text-ui-sm text-neutral-500 mb-1">Build command</span>
                                 <input
                                   type="text"
                                   value={directory.build_cmd ?? ''}
                                   onChange={e => updateDraftDirectory(index, 'build_cmd', e.target.value)}
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
                                 />
                               </label>
                               <label className="block sm:col-span-2">
-                                <span className="block text-[10px] text-neutral-500 mb-1">Install command</span>
+                                <span className="block text-ui-sm text-neutral-500 mb-1">Install command</span>
                                 <input
                                   type="text"
                                   value={directory.install_cmd ?? ''}
                                   onChange={e => updateDraftDirectory(index, 'install_cmd', e.target.value)}
-                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-ui-md font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
                                 />
                               </label>
                             </div>
@@ -857,7 +857,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                         ))}
                       </div>
                     ) : (
-                      <div className="text-[10px] text-neutral-500">
+                      <div className="text-ui-sm text-neutral-500">
                         No directories detected yet. Add one below if you want the no-CI gate to run tests.
                       </div>
                     )}
@@ -937,7 +937,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     {setupProject ? `${setupProject.owner}/${setupProject.repo}` : `${parsed?.owner}/${parsed?.repo}`}
                   </span>
                   {detectedDefaultBranch && (
-                    <span className="ml-auto text-[10px] text-neutral-500 flex items-center gap-1 shrink-0">
+                    <span className="ml-auto text-ui-sm text-neutral-500 flex items-center gap-1 shrink-0">
                       default: <span className="font-mono text-neutral-400">{detectedDefaultBranch}</span>
                     </span>
                   )}
@@ -949,11 +949,11 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 <div className="mb-4">
                   <div className="flex items-center gap-1.5 mb-2">
                     <Wrench className="w-3 h-3 text-neutral-500" />
-                    <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
+                    <span className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">
                       Build Config Detected
                     </span>
                     {detectedConfig.language && (
-                      <span className="ml-auto px-1.5 py-0.5 bg-blue-500/10 text-blue-400 rounded text-[10px] font-mono border border-blue-500/20">
+                      <span className="ml-auto px-1.5 py-0.5 bg-blue-500/10 text-blue-400 rounded text-ui-sm font-mono border border-blue-500/20">
                         {detectedConfig.language}
                       </span>
                     )}
@@ -962,14 +962,14 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     <div className="space-y-1.5">
                       {detectedConfig.directories.map((dir, i) => (
                         <div key={i} className="p-2 bg-neutral-950 rounded border border-neutral-800">
-                          <div className="text-[11px] font-mono text-neutral-300 mb-1">{dir.path}</div>
+                          <div className="text-ui-md font-mono text-neutral-300 mb-1">{dir.path}</div>
                           {(['install_cmd', 'lint_cmd', 'build_cmd', 'test_cmd'] as const).map(cmd =>
                             dir[cmd] ? (
                               <div key={cmd} className="flex items-baseline gap-2 mb-0.5">
-                                <span className="text-[10px] text-neutral-600 w-14 shrink-0">
+                                <span className="text-ui-sm text-neutral-600 w-14 shrink-0">
                                   {cmd.replace('_cmd', '')}:
                                 </span>
-                                <code className="text-[10px] font-mono text-neutral-400">{dir[cmd]}</code>
+                                <code className="text-ui-sm font-mono text-neutral-400">{dir[cmd]}</code>
                               </div>
                             ) : null
                           )}
@@ -986,7 +986,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   {detectedConfig.has_ci === true && (
                     <div
                       data-testid="ci-status-banner"
-                      className="mt-2 flex items-start gap-2 text-[11px] text-emerald-400 bg-emerald-950/30 border border-emerald-900/50 rounded-lg px-3 py-2"
+                      className="mt-2 flex items-start gap-2 text-ui-md text-emerald-400 bg-emerald-950/30 border border-emerald-900/50 rounded-lg px-3 py-2"
                     >
                       <CheckCircle className="w-3.5 h-3.5 shrink-0 mt-px" />
                       <span>
@@ -998,7 +998,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   {detectedConfig.has_ci === false && (
                     <div
                       data-testid="ci-status-banner"
-                      className="mt-2 flex items-start gap-2 text-[11px] text-amber-400 bg-amber-950/30 border border-amber-900/50 rounded-lg px-3 py-2"
+                      className="mt-2 flex items-start gap-2 text-ui-md text-amber-400 bg-amber-950/30 border border-amber-900/50 rounded-lg px-3 py-2"
                     >
                       <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
                       <span>
@@ -1030,7 +1030,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
 
               {/* Feature toggles */}
               <div className="mb-4">
-                <div className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+                <div className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">
                   Automation Features
                 </div>
                 {featureConfigLoading ? (
@@ -1047,7 +1047,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                           <Zap className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                           <div className="min-w-0">
                             <div className="text-xs font-medium text-neutral-200">Auto-Remediation</div>
-                            <div className="text-[10px] text-neutral-500 mt-0.5">
+                            <div className="text-ui-sm text-neutral-500 mt-0.5">
                               Auto-fix CI failures on the default branch
                             </div>
                           </div>
@@ -1073,9 +1073,9 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                           <Tag className="w-3.5 h-3.5 text-purple-400 shrink-0" />
                           <div className="min-w-0">
                             <div className="text-xs font-medium text-neutral-200">Issue-to-Implementation</div>
-                            <div className="text-[10px] text-neutral-500 mt-0.5">
+                            <div className="text-ui-sm text-neutral-500 mt-0.5">
                               Label an issue{' '}
-                              <code className="font-mono text-[9px] bg-neutral-700 px-1 py-0.5 rounded">
+                              <code className="font-mono text-ui-xs bg-neutral-700 px-1 py-0.5 rounded">
                                 {issueImplementationConfig?.trigger_label ?? 'auto:implement'}
                               </code>
                               {' '}to spawn a task
@@ -1101,10 +1101,10 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
 
               {/* Next steps */}
               <div className="mb-5 p-3 bg-blue-500/5 rounded-lg border border-blue-500/15">
-                <div className="text-[11px] font-semibold text-blue-400 uppercase tracking-wider mb-2">
+                <div className="text-ui-md font-semibold text-blue-400 uppercase tracking-wider mb-2">
                   What happens next
                 </div>
-                <ul className="space-y-1.5 text-[11px] text-neutral-400">
+                <ul className="space-y-1.5 text-ui-md text-neutral-400">
                   <li className="flex items-start gap-2">
                     <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
                     <span>Open a PR and Blueprint will automatically review it in the Checks tab</span>
@@ -1118,7 +1118,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   {issueImplementationConfig?.enabled && (
                     <li className="flex items-start gap-2">
                       <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
-                      <span>Label a GitHub issue <code className="font-mono text-[9px] bg-neutral-700 px-1 py-0.5 rounded">{issueImplementationConfig.trigger_label}</code> to automatically spawn an implementation task</span>
+                      <span>Label a GitHub issue <code className="font-mono text-ui-xs bg-neutral-700 px-1 py-0.5 rounded">{issueImplementationConfig.trigger_label}</code> to automatically spawn an implementation task</span>
                     </li>
                   )}
                   <li className="flex items-start gap-2">

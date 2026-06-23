@@ -250,7 +250,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
   if (loading) {
     return (
       <section>
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Remediation Funnel</h2>
+        <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Remediation Funnel</h2>
         <div className="animate-pulse bg-neutral-800/60 rounded h-24 w-full" />
       </section>
     );
@@ -335,25 +335,25 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
   return (
     <section>
       <div className="flex flex-wrap items-center gap-2 mb-2 min-w-0">
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Remediation Funnel</h2>
+        <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest">Remediation Funnel</h2>
         {active > 0 && (
-          <span className="text-[10px] text-amber-400" title="Investigations currently in flight">
+          <span className="text-ui-sm text-amber-400" title="Investigations currently in flight">
             {active} active
           </span>
         )}
         {avgHours != null && (
-          <span className="text-[10px] text-neutral-500" title="Average time from investigation spawn to remediation merge">
+          <span className="text-ui-sm text-neutral-500" title="Average time from investigation spawn to remediation merge">
             ~{avgHours.toFixed(1)}h avg time to remediation
           </span>
         )}
         {remFailed > 0 && (
-          <span className="text-[10px] text-red-400" title="Remediations that failed">
+          <span className="text-ui-sm text-red-400" title="Remediations that failed">
             {remFailed} failed
           </span>
         )}
         {fixesHeld > 0 && (
           <span
-            className="text-[10px] text-emerald-400"
+            className="text-ui-sm text-emerald-400"
             title="Merged remediations whose error fingerprint did not recur during the 30-day monitoring window"
           >
             {fixesHeld} held
@@ -367,7 +367,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
               setInvestigationsOpen(true);
               setTimeout(() => firstOverdueRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
             }}
-            className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-400 border-amber-500/30 hover:bg-amber-500/30 transition-colors"
+            className="text-ui-sm font-semibold px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-400 border-amber-500/30 hover:bg-amber-500/30 transition-colors"
             title={`${overdueCount} investigation${overdueCount > 1 ? 's' : ''} running longer than ${OVERDUE_HOURS}h`}
           >
             {overdueCount} overdue
@@ -383,7 +383,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           ? ` on systems ${systemIds.join(', ')}`
           : '';
         return (
-          <div className="mb-2 text-[10px]">
+          <div className="mb-2 text-ui-sm">
             <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-400 border-amber-500/30">
               {deferred.length} {deferred.length === 1 ? 'case' : 'cases'} audit-deferred{sysLabel}
             </span>
@@ -399,12 +399,12 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
             return (
               <div key={s.key} className="flex items-center gap-1 shrink-0">
                 {i > 0 && (
-                  <span className="text-[10px] font-mono text-neutral-500" title={`${s.count} / ${s.prev} = ${conv}%`}>
+                  <span className="text-ui-sm font-mono text-neutral-500" title={`${s.count} / ${s.prev} = ${conv}%`}>
                     &rarr; {conv}%
                   </span>
                 )}
                 <div className="min-w-[86px] px-2 py-1.5 rounded border border-neutral-700 bg-neutral-800/40 text-center">
-                  <div className="text-[9px] uppercase tracking-wide text-neutral-500">{s.label}</div>
+                  <div className="text-ui-xs uppercase tracking-wide text-neutral-500">{s.label}</div>
                   <div className="text-sm font-bold text-neutral-100">{s.count}</div>
                 </div>
               </div>
@@ -427,7 +427,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           : null;
         return (
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 mb-2">
-          <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">By failure class</div>
+          <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">By failure class</div>
           {/* Mobile: stacked cards, one per failure class */}
           <div className="md:hidden space-y-2">
             {classKeys.map(cls => {
@@ -448,10 +448,10 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                   title={isBottleneck ? 'Lowest merge rate among classes with ≥2 remediations (bottleneck)' : undefined}
                 >
                   <div className="flex items-center justify-between mb-1.5">
-                    <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border ${classBadge(cls)}`}>{cls}</span>
-                    {isBottleneck && <span className="text-[9px] text-red-400 font-semibold">bottleneck</span>}
+                    <span className={`text-ui-xs font-semibold px-1.5 py-0.5 rounded border ${classBadge(cls)}`}>{cls}</span>
+                    {isBottleneck && <span className="text-ui-xs text-red-400 font-semibold">bottleneck</span>}
                   </div>
-                  <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[11px]">
+                  <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-ui-md">
                     <span className="text-neutral-600">Spawned</span>
                     <span className="font-mono text-neutral-300 text-right">{s}</span>
                     <span className="text-neutral-600">Completed</span>
@@ -479,7 +479,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           </div>
           {/* Desktop: table grid layout */}
           <div className="hidden md:block space-y-1">
-            <div className="grid grid-cols-[minmax(110px,1fr)_repeat(8,minmax(44px,1fr))] gap-2 text-[9px] uppercase tracking-wide text-neutral-600">
+            <div className="grid grid-cols-[minmax(110px,1fr)_repeat(8,minmax(44px,1fr))] gap-2 text-ui-xs uppercase tracking-wide text-neutral-600">
               <span>Class</span>
               <span className="text-right">Spawned</span>
               <span className="text-right">Completed</span>
@@ -504,10 +504,10 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
               return (
                 <div
                   key={cls}
-                  className={`grid grid-cols-[minmax(110px,1fr)_repeat(8,minmax(44px,1fr))] gap-2 text-[11px] items-center ${isBottleneck ? 'border-l-2 border-red-500/60 bg-red-500/5 pl-1 rounded-sm' : ''}`}
+                  className={`grid grid-cols-[minmax(110px,1fr)_repeat(8,minmax(44px,1fr))] gap-2 text-ui-md items-center ${isBottleneck ? 'border-l-2 border-red-500/60 bg-red-500/5 pl-1 rounded-sm' : ''}`}
                   title={isBottleneck ? 'Lowest merge rate among classes with ≥2 remediations (bottleneck)' : undefined}
                 >
-                  <span className={`inline-flex justify-center text-[9px] font-semibold px-1.5 py-0.5 rounded border ${classBadge(cls)}`}>
+                  <span className={`inline-flex justify-center text-ui-xs font-semibold px-1.5 py-0.5 rounded border ${classBadge(cls)}`}>
                     {cls}
                   </span>
                   <span className="text-right font-mono text-neutral-300">{s}</span>
@@ -534,16 +534,16 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
         {(dropOff.length > 0 || structuralFilterPassRate != null || reuseTotal > 0) && (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
-            <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">Diagnosis drop-off</div>
+            <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">Diagnosis drop-off</div>
             {structuralFilterPassRate != null && (
-              <div className="flex justify-between text-[11px] text-neutral-400 mb-1">
+              <div className="flex justify-between text-ui-md text-neutral-400 mb-1">
                 <span>structural filter pass</span>
                 <span className="font-mono text-neutral-200">{structuralFilterPassRate}%</span>
               </div>
             )}
             {reuseTotal > 0 && (
               <div
-                className="flex justify-between text-[11px] text-neutral-400 mb-1"
+                className="flex justify-between text-ui-md text-neutral-400 mb-1"
                 title="Merge rate of auto-remediations that reused a prior diagnosis"
               >
                 <span>diagnosis reuse</span>
@@ -555,7 +555,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
             )}
             <div className="space-y-0.5">
               {dropOff.map(([reason, count]) => (
-                <div key={reason} className="flex justify-between text-[11px] text-neutral-400">
+                <div key={reason} className="flex justify-between text-ui-md text-neutral-400">
                   <span>{DROP_OFF_LABELS[reason] ?? reason}</span>
                   <span className="font-mono text-neutral-300">{count}</span>
                 </div>
@@ -566,7 +566,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
 
         {confDist.length > 0 && (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
-            <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">Confidence distribution</div>
+            <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">Confidence distribution</div>
             <div className="space-y-0.5">
               {confDist
                 .sort((a, b) => {
@@ -575,7 +575,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                   return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
                 })
                 .map(([conf, count]) => (
-                  <div key={conf} className="flex justify-between text-[11px] text-neutral-400">
+                  <div key={conf} className="flex justify-between text-ui-md text-neutral-400">
                     <span>{conf}</span>
                     <span className="font-mono text-neutral-300">{count}</span>
                   </div>
@@ -586,12 +586,12 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
 
         {ciSpawned > 0 && (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
-            <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">CI auto-remediation</div>
-            <div className="flex justify-between text-[11px] text-neutral-400 mb-1">
+            <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">CI auto-remediation</div>
+            <div className="flex justify-between text-ui-md text-neutral-400 mb-1">
               <span>spawned</span>
               <span className="font-mono text-neutral-200">{ciSpawned}</span>
             </div>
-            <div className="flex justify-between text-[11px] text-neutral-400 mb-1">
+            <div className="flex justify-between text-ui-md text-neutral-400 mb-1">
               <span>merged / failed</span>
               <span>
                 <span className="font-mono text-emerald-400">{ciMerged}</span>
@@ -605,7 +605,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
             {ciTypeEntries.length > 0 && (
               <div className="mt-1.5 pt-1.5 border-t border-neutral-800/60 space-y-0.5">
                 {ciTypeEntries.map(([type, v]) => (
-                  <div key={type} className="flex justify-between text-[10px] text-neutral-500">
+                  <div key={type} className="flex justify-between text-ui-sm text-neutral-500">
                     <span className="truncate pr-2">{type}</span>
                     <span className="font-mono">
                       <span className="text-neutral-400">{v.spawned ?? 0}</span>
@@ -623,12 +623,12 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
 
         {rrSpawned > 0 && (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
-            <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">Residual remediation</div>
-            <div className="flex justify-between text-[11px] text-neutral-400 mb-1">
+            <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">Residual remediation</div>
+            <div className="flex justify-between text-ui-md text-neutral-400 mb-1">
               <span>spawned</span>
               <span className="font-mono text-neutral-200">{rrSpawned}</span>
             </div>
-            <div className="flex justify-between text-[11px] text-neutral-400 mb-1">
+            <div className="flex justify-between text-ui-md text-neutral-400 mb-1">
               <span>merged / failed</span>
               <span>
                 <span className="font-mono text-emerald-400">{rrMerged}</span>
@@ -640,7 +640,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
               </span>
             </div>
             {rrRemediating > 0 && (
-              <div className="flex justify-between text-[11px] text-neutral-400">
+              <div className="flex justify-between text-ui-md text-neutral-400">
                 <span>remediating</span>
                 <span className="font-mono text-amber-400">{rrRemediating}</span>
               </div>
@@ -650,14 +650,14 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
 
         {successByConf.length > 0 && (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
-            <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">Success by confidence</div>
+            <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">Success by confidence</div>
             <div className="space-y-0.5">
               {successByConf.map(([conf, { merged, failed }]) => {
                 const total = merged + failed;
                 const rate = pct(merged, total);
                 const rateColor = rate >= 60 ? 'text-emerald-400' : rate >= 30 ? 'text-amber-400' : 'text-red-400';
                 return (
-                  <div key={conf} className="flex justify-between text-[11px] text-neutral-400">
+                  <div key={conf} className="flex justify-between text-ui-md text-neutral-400">
                     <span>{conf}</span>
                     <span>
                       <span className="font-mono text-neutral-300">{merged}/{total}</span>{' '}
@@ -684,29 +684,29 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
               className="w-full flex items-center justify-between px-3 py-2 text-left"
               aria-expanded={investigationsOpen}
             >
-              <span className="text-[10px] text-neutral-500 uppercase tracking-wide">
+              <span className="text-ui-sm text-neutral-500 uppercase tracking-wide">
                 Recent Investigations ({recent.length}{activeDetails.length > 0 ? ` · ${activeDetails.length} active` : ''})
               </span>
-              <span className="text-[10px] text-neutral-500">{investigationsOpen ? '▾' : '▸'}</span>
+              <span className="text-ui-sm text-neutral-500">{investigationsOpen ? '▾' : '▸'}</span>
             </button>
             {investigationsOpen && (
               <div className="px-3 pb-3 space-y-2">
                 {recent.length > 0 && (
                   <div className="space-y-1">
                     {recent.map(inv => (
-                      <div key={inv.task_id} className="flex items-start gap-2 text-[11px]">
-                        <span className={`shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded border ${confidenceBadge(inv.confidence)}`}>
+                      <div key={inv.task_id} className="flex items-start gap-2 text-ui-md">
+                        <span className={`shrink-0 text-ui-xs font-semibold px-1.5 py-0.5 rounded border ${confidenceBadge(inv.confidence)}`}>
                           {inv.confidence ?? 'unknown'}
                         </span>
                         {inv.severity && (
-                          <span className="shrink-0 text-[9px] text-neutral-500 uppercase tracking-wide pt-0.5">
+                          <span className="shrink-0 text-ui-xs text-neutral-500 uppercase tracking-wide pt-0.5">
                             {inv.severity}
                           </span>
                         )}
                         <span className="flex-1 text-neutral-300 leading-snug">
                           {truncate(inv.summary ?? '(no summary)', 80)}
                         </span>
-                        <span className="shrink-0 text-[10px] text-neutral-500 pt-0.5" title={inv.completed_at ?? ''}>
+                        <span className="shrink-0 text-ui-sm text-neutral-500 pt-0.5" title={inv.completed_at ?? ''}>
                           {relativeTime(inv.completed_at)}
                         </span>
                       </div>
@@ -715,13 +715,13 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                 )}
                 {activeDetails.length > 0 && (
                   <div>
-                    <div className="text-[9px] uppercase tracking-wide text-neutral-600 mb-1">Active</div>
+                    <div className="text-ui-xs uppercase tracking-wide text-neutral-600 mb-1">Active</div>
                     <div className="space-y-0.5">
                       {activeDetails.map((a, idx) => {
                         const overdue = (a.elapsed_hours ?? 0) > OVERDUE_HOURS;
                         const isFirstOverdue = overdue && activeDetails.slice(0, idx).every(b => (b.elapsed_hours ?? 0) <= OVERDUE_HOURS);
                         return (
-                          <div key={a.task_id} ref={isFirstOverdue ? firstOverdueRef : undefined} className="flex justify-between text-[11px]">
+                          <div key={a.task_id} ref={isFirstOverdue ? firstOverdueRef : undefined} className="flex justify-between text-ui-md">
                             <span className="font-mono text-neutral-400 truncate">
                               {a.direction_id ?? '(no direction)'}
                             </span>
@@ -756,10 +756,10 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
               className="w-full flex items-center justify-between px-3 py-2 text-left"
               aria-expanded={residualsOpen}
             >
-              <span className="text-[10px] text-amber-500/80 uppercase tracking-wide">
+              <span className="text-ui-sm text-amber-500/80 uppercase tracking-wide">
                 Unclassified CODE_ERROR patterns — {residuals.top_residuals.length} clusters · {residuals.total_code_error_count} occurrences (last {residuals.window_hours}h)
               </span>
-              <span className="text-[10px] text-neutral-500">{residualsOpen ? '▾' : '▸'}</span>
+              <span className="text-ui-sm text-neutral-500">{residualsOpen ? '▾' : '▸'}</span>
             </button>
             {residualsOpen && (
               <div className="px-3 pb-3 space-y-2">
@@ -769,7 +769,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                       data-viewport-allow-small-target
                       type="button"
                       onClick={() => setShowIgnored(v => !v)}
-                      className="text-[10px] text-neutral-500 hover:text-neutral-300 underline underline-offset-2"
+                      className="text-ui-sm text-neutral-500 hover:text-neutral-300 underline underline-offset-2"
                     >
                       {showIgnored ? `Hide ignored (${apiIgnoredCount})` : `Show ignored (${apiIgnoredCount})`}
                     </button>
@@ -787,12 +787,12 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                   if (isIgnored && undoFp) {
                     return (
                       <div key={r.fingerprint} className="border border-neutral-800/40 rounded p-2 flex items-center justify-between gap-2">
-                        <span className="text-[11px] text-neutral-500 italic">Ignored</span>
+                        <span className="text-ui-md text-neutral-500 italic">Ignored</span>
                         <button
                           data-viewport-allow-small-target
                           type="button"
                           onClick={() => handleUndo(r.fingerprint)}
-                          className="text-[10px] text-amber-400 hover:text-amber-300 underline underline-offset-2"
+                          className="text-ui-sm text-amber-400 hover:text-amber-300 underline underline-offset-2"
                         >
                           Undo
                         </button>
@@ -804,36 +804,36 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                   return (
                     <div key={r.fingerprint} className="border border-neutral-800/40 rounded p-2">
                       <div className="flex items-center gap-2 mb-1">
-                        <span className="font-mono text-[10px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded shrink-0">
+                        <span className="font-mono text-ui-sm bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded shrink-0">
                           {r.count}×
                         </span>
-                        <span className="text-[10px] text-neutral-500 shrink-0">{relativeTime(r.most_recent_at)}</span>
+                        <span className="text-ui-sm text-neutral-500 shrink-0">{relativeTime(r.most_recent_at)}</span>
                         {(() => {
                           const effectiveR = isUnsuspended ? { ...r, case_status: 'ACTIVE', consecutive_failure_count: 0 } : r;
                           const label = caseStatusLabel(effectiveR);
                           if (!label) return null;
                           const style = CASE_STATUS_STYLES[effectiveR.case_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
                           return (
-                            <span className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${style}`}>
+                            <span className={`font-mono text-ui-xs font-semibold px-1.5 py-0.5 rounded border shrink-0 ${style}`}>
                               {label}
                             </span>
                           );
                         })()}
                         {(r.audit_defer_count ?? 0) > 0 && (
                           <span
-                            className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${(r.audit_defer_count ?? 0) >= 3 ? 'bg-violet-500/30 text-violet-300 border-violet-500/50' : 'bg-violet-500/15 text-violet-400 border-violet-500/30'}`}
+                            className={`font-mono text-ui-xs font-semibold px-1.5 py-0.5 rounded border shrink-0 ${(r.audit_defer_count ?? 0) >= 3 ? 'bg-violet-500/30 text-violet-300 border-violet-500/50' : 'bg-violet-500/15 text-violet-400 border-violet-500/30'}`}
                             title={`Auto-remediation is held until${r.audit_deferred_system_id ? ` system ${r.audit_deferred_system_id}` : ' the named system'} completes its audit`}
                           >
                             DEFERRED ×{r.audit_defer_count}{r.audit_deferred_system_id ? ` · ${r.audit_deferred_system_id}` : ''}
                           </span>
                         )}
-                        <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
+                        <span className="font-mono text-ui-xs text-neutral-600 truncate flex-1">{r.fingerprint}</span>
                         {canUnsuspend && (
                           <button
                             data-viewport-allow-small-target
                             type="button"
                             onClick={() => handleUnsuspend(r)}
-                            className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-orange-700/60 text-orange-400 hover:text-orange-200 hover:border-orange-500 transition-colors"
+                            className="shrink-0 text-ui-sm px-1.5 py-0.5 rounded border border-orange-700/60 text-orange-400 hover:text-orange-200 hover:border-orange-500 transition-colors"
                             aria-label={`Unsuspend fingerprint ${r.fingerprint}`}
                           >
                             Unsuspend
@@ -844,7 +844,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                             data-viewport-allow-small-target
                             type="button"
                             onClick={() => handleIgnore(r)}
-                            className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-neutral-700 text-neutral-500 hover:text-neutral-300 hover:border-neutral-500 transition-colors"
+                            className="shrink-0 text-ui-sm px-1.5 py-0.5 rounded border border-neutral-700 text-neutral-500 hover:text-neutral-300 hover:border-neutral-500 transition-colors"
                             aria-label={`Ignore fingerprint ${r.fingerprint}`}
                           >
                             Ignore
@@ -852,14 +852,14 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                         )}
                       </div>
                       {unsuspendError && (
-                        <div className="text-[10px] text-red-400 mb-1">Failed to unsuspend: {unsuspendError}</div>
+                        <div className="text-ui-sm text-red-400 mb-1">Failed to unsuspend: {unsuspendError}</div>
                       )}
                       {ignoreError && (
-                        <div className="text-[10px] text-red-400 mb-1">Failed to ignore: {ignoreError}</div>
+                        <div className="text-ui-sm text-red-400 mb-1">Failed to ignore: {ignoreError}</div>
                       )}
-                      <div className="text-[11px] text-neutral-400 leading-snug mb-1.5">{truncate(r.sample_message, 140)}</div>
+                      <div className="text-ui-md text-neutral-400 leading-snug mb-1.5">{truncate(r.sample_message, 140)}</div>
                       {(r.audit_defer_count ?? 0) > 0 && (
-                        <div className="text-[10px] text-violet-400/70 mb-1.5">
+                        <div className="text-ui-sm text-violet-400/70 mb-1.5">
                           held by audit{r.audit_deferred_system_id ? ` on ${r.audit_deferred_system_id}` : ''} — spawning paused until audit completes
                         </div>
                       )}
@@ -869,7 +869,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                             key={id}
                             type="button"
                             onClick={() => onViewTask?.(id)}
-                            className="font-mono text-[9px] text-neutral-500 hover:text-neutral-300 underline underline-offset-2 cursor-pointer"
+                            className="font-mono text-ui-xs text-neutral-500 hover:text-neutral-300 underline underline-offset-2 cursor-pointer"
                           >
                             {id.slice(0, 8)}
                           </button>

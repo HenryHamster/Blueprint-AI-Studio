@@ -7,9 +7,14 @@ import { defineConfig, globalIgnores } from 'eslint/config'
 import noFixedWidthOverflow from './eslint-rules/no-fixed-width-overflow.js'
 import minTouchTarget from './eslint-rules/min-touch-target.js'
 import noOversizedFile from './eslint-rules/no-oversized-file.js'
+import noArbitraryFontSize from './eslint-rules/no-arbitrary-font-size.js'
 
 const viewportPlugin = {
-  rules: { 'no-fixed-width': noFixedWidthOverflow, 'min-touch-target': minTouchTarget },
+  rules: {
+    'no-fixed-width': noFixedWidthOverflow,
+    'min-touch-target': minTouchTarget,
+    'no-arbitrary-font-size': noArbitraryFontSize,
+  },
 }
 const sizePlugin = { rules: { 'no-oversized-file': noOversizedFile } }
 
@@ -33,6 +38,7 @@ export default defineConfig([
       'no-console': ['warn', { allow: ['warn', 'error'] }],
       'viewport/no-fixed-width': 'error',
       'viewport/min-touch-target': 'error',
+      'viewport/no-arbitrary-font-size': 'warn',
       'size/no-oversized-file': 'error',
     },
   },

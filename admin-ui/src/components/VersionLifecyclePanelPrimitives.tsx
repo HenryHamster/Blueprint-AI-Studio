@@ -56,7 +56,7 @@ export function PostPromotionOutcomeBadge({
       <span
         data-testid="post-promotion-outcome-badge"
         data-outcome="serving_confirmed"
-        className="font-mono text-[9px] px-1 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+        className="font-mono text-ui-xs px-1 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
         title={outcomeAt ? `serving confirmed ${timeAgo(outcomeAt)}` : 'serving confirmed post-promotion'}
       >
         ✓ serving
@@ -68,7 +68,7 @@ export function PostPromotionOutcomeBadge({
       <span
         data-testid="post-promotion-outcome-badge"
         data-outcome="deploy_failed"
-        className="font-mono text-[9px] px-1 py-0.5 rounded border bg-red-500/10 border-red-500/40 text-red-400"
+        className="font-mono text-ui-xs px-1 py-0.5 rounded border bg-red-500/10 border-red-500/40 text-red-400"
         title={outcomeAt ? `deploy failed ${timeAgo(outcomeAt)}` : 'deploy failed post-promotion'}
       >
         ⚠ deploy failed
@@ -79,7 +79,7 @@ export function PostPromotionOutcomeBadge({
     <span
       data-testid="post-promotion-outcome-badge"
       data-outcome="awaiting"
-      className="font-mono text-[9px] px-1 py-0.5 rounded border bg-amber-500/10 border-amber-500/30 text-amber-400"
+      className="font-mono text-ui-xs px-1 py-0.5 rounded border bg-amber-500/10 border-amber-500/30 text-amber-400"
       title="post-promotion outcome not yet recorded"
     >
       awaiting outcome
@@ -91,7 +91,7 @@ export function OutOfBandPromotionBadge({ oob }: { oob: OutOfBandPromotion }) {
   return (
     <span
       data-testid="out-of-band-promotion-badge"
-      className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-violet-500/10 border-violet-500/30 text-violet-400"
+      className="inline-flex items-center gap-1 text-ui-sm font-semibold px-1.5 py-0.5 rounded border bg-violet-500/10 border-violet-500/30 text-violet-400"
       title={`Promoted out-of-band (operator override) recorded ${oob.recorded_at}`}
     >
       ⚑ promoted out-of-band (operator override)
@@ -117,7 +117,7 @@ export function PromotionPolicyBadge({
   if (!source) return null;
   const style = POLICY_SOURCE_STYLE[source] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700';
   return (
-    <div className="flex flex-wrap items-start gap-x-2 gap-y-0.5 text-[10px]">
+    <div className="flex flex-wrap items-start gap-x-2 gap-y-0.5 text-ui-sm">
       <span className="text-neutral-500 uppercase tracking-wide">Policy source</span>
       <span
         data-testid="promotion-policy-source"
@@ -140,12 +140,12 @@ export function PromotionPolicyBadge({
 }
 
 export function QualSummary({ q }: { q: VersionQualification | null }) {
-  if (!q || q.confidence == null) return <span className="text-neutral-500 text-[10px]">—</span>;
+  if (!q || q.confidence == null) return <span className="text-neutral-500 text-ui-sm">—</span>;
   const conf = `${Math.round(q.confidence * 100)}%`;
   const thr = q.threshold != null ? `/${Math.round(q.threshold * 100)}%` : '';
   const status = q.status ?? 'unknown';
   return (
-    <span className={`font-mono text-[10px] ${QUAL_VERDICT_COLOR[status] ?? 'text-neutral-400'}`}>
+    <span className={`font-mono text-ui-sm ${QUAL_VERDICT_COLOR[status] ?? 'text-neutral-400'}`}>
       {conf}{thr} {status.replace(/_/g, '-')}
     </span>
   );
@@ -161,7 +161,7 @@ const CI_STATE_STYLE: Record<string, string> = {
 export function CiBadge({ ci }: { ci: CiResolution }) {
   const color = CI_STATE_STYLE[ci.state] ?? 'text-neutral-500';
   return (
-    <span className={`font-mono text-[9px] ${color}`} title={ci.detail}>
+    <span className={`font-mono text-ui-xs ${color}`} title={ci.detail}>
       ci:{ci.state}{ci.resolved_sha ? ` @${ci.resolved_sha.slice(0, 7)}` : ''}
     </span>
   );
@@ -183,7 +183,7 @@ export function ManagedCheckWaitSnapshotDetails({
   return (
     <div
       data-testid="promotion-check-wait-snapshot"
-      className="text-[10px] text-neutral-400 border border-neutral-800 bg-neutral-950/40 rounded px-2 py-1 space-y-1"
+      className="text-ui-sm text-neutral-400 border border-neutral-800 bg-neutral-950/40 rounded px-2 py-1 space-y-1"
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <span className={`font-mono ${color}`}>ci:{snapshot.state}</span>
@@ -202,7 +202,7 @@ export function ManagedCheckWaitSnapshotDetails({
             return (
               <span
                 key={`${check.name}-${index}`}
-                className="font-mono text-[9px] px-1 py-0.5 rounded border border-neutral-800 bg-neutral-900 text-neutral-300"
+                className="font-mono text-ui-xs px-1 py-0.5 rounded border border-neutral-800 bg-neutral-900 text-neutral-300"
                 title={`${check.name}: ${status}`}
               >
                 {check.name}: {status}
@@ -210,7 +210,7 @@ export function ManagedCheckWaitSnapshotDetails({
             );
           })}
           {snapshot.truncated && (
-            <span className="font-mono text-[9px] px-1 py-0.5 rounded border border-neutral-800 text-neutral-500">
+            <span className="font-mono text-ui-xs px-1 py-0.5 rounded border border-neutral-800 text-neutral-500">
               +{Math.max(0, totalChecks - checks.length)} more
             </span>
           )}
@@ -381,7 +381,7 @@ export function ServingStatusBadge({
       <span
         data-testid="serving-status-badge"
         data-serving-status="serving_confirmed"
-        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+        className="inline-flex items-center gap-1 text-ui-sm font-semibold px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
         title="The promoted commit is confirmed serving in production."
       >
         ✓ serving confirmed
@@ -395,7 +395,7 @@ export function ServingStatusBadge({
       <span
         data-testid="serving-status-badge"
         data-serving-status="deploy_failed"
-        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-red-500/10 border-red-500/40 text-red-400"
+        className="inline-flex items-center gap-1 text-ui-sm font-semibold px-1.5 py-0.5 rounded border bg-red-500/10 border-red-500/40 text-red-400"
         title={deployFailureReason ?? 'The promoted deploy never confirmed serving in production.'}
       >
         ⚠ deploy failed — NOT serving
@@ -410,7 +410,7 @@ export function ServingStatusBadge({
       <span
         data-testid="serving-status-badge"
         data-serving-status="confirmation_timed_out"
-        className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/40 text-amber-400"
+        className="inline-flex items-center gap-1 text-ui-sm font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/40 text-amber-400"
         title={
           deployFailureReason
             ? `Promoted, but serving confirmation timed out (${deployFailureReason}). No active deploy failure was observed — the promoted commit just could not be confirmed serving in time. Verify serving; it auto-recovers if later observed live.`
@@ -441,7 +441,7 @@ export function ServingStatusBadge({
         data-testid="serving-status-badge"
         data-serving-status="unconfirmed"
         data-deploy-window-overdue={deployConfirmDeadline ? String(overdue) : undefined}
-        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
+        className={`inline-flex items-center gap-1 text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${
           overdue
             ? 'bg-red-500/10 border-red-500/40 text-red-400'
             : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
@@ -506,7 +506,7 @@ export function ArtifactEvidenceList({
             data-testid="artifact-evidence-row"
             data-artifact-kind={a.artifact_kind}
             data-artifact-status={a.serving_status ?? 'none'}
-            className="flex flex-wrap items-center gap-1.5 text-[9px]"
+            className="flex flex-wrap items-center gap-1.5 text-ui-xs"
           >
             <span className="font-mono text-neutral-400">{a.artifact_kind}</span>
             {a.required && <span className="text-neutral-600 uppercase tracking-wide">required</span>}
@@ -545,12 +545,12 @@ export function AuditProvenance({
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       {audit.candidate_sha && (
-        <span className="text-[10px] text-neutral-500 font-mono" title={audit.candidate_sha}>
+        <span className="text-ui-sm text-neutral-500 font-mono" title={audit.candidate_sha}>
           @{audit.candidate_sha.slice(0, 7)}
         </span>
       )}
       {audit.created_at && (
-        <span className="text-[10px] text-neutral-600">ran {timeAgo(audit.created_at)}</span>
+        <span className="text-ui-sm text-neutral-600">ran {timeAgo(audit.created_at)}</span>
       )}
     </div>
   );
@@ -562,7 +562,7 @@ export function AuditFindingsList({ audit }: { audit: LatestAudit }) {
     return (
       <div className="space-y-0.5">
         <AuditProvenance audit={audit} />
-        <span className={`text-[10px] px-1.5 py-0.5 rounded border ${className}`}>
+        <span className={`text-ui-sm px-1.5 py-0.5 rounded border ${className}`}>
           {label}
         </span>
       </div>
@@ -573,7 +573,7 @@ export function AuditFindingsList({ audit }: { audit: LatestAudit }) {
     return (
       <div className="space-y-0.5">
         <AuditProvenance audit={audit} />
-        <span className="text-[10px] text-neutral-500 italic">audit: no findings</span>
+        <span className="text-ui-sm text-neutral-500 italic">audit: no findings</span>
       </div>
     );
   }
@@ -584,10 +584,10 @@ export function AuditFindingsList({ audit }: { audit: LatestAudit }) {
   });
   return (
     <div className="space-y-0.5">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Audit Findings</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide">Audit Findings</p>
       <AuditProvenance audit={audit} />
       {sorted.map((f, i) => (
-        <div key={i} className={`flex items-start gap-1.5 text-[10px] px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
+        <div key={i} className={`flex items-start gap-1.5 text-ui-sm px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
           <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
           <span className="min-w-0 break-words">{f.summary}</span>
         </div>
@@ -610,12 +610,12 @@ export function HistoricalAuditContext({
   const auditedShort = audit.candidate_sha ? `@${audit.candidate_sha.slice(0, 7)}` : null;
   return (
     <div data-testid="historical-audit-context" className="space-y-0.5">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Historical Audit Context</p>
-      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide">Historical Audit Context</p>
+      <span className="text-ui-sm px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
         no current audit for this candidate
       </span>
       {activeCandidateSha ? (
-        <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+        <div className="flex flex-wrap items-center gap-1.5 text-ui-sm">
           <span className="text-neutral-400">active</span>
           <span className="font-mono text-neutral-300" title={activeCandidateSha}>
             @{activeCandidateSha.slice(0, 7)}
@@ -641,24 +641,24 @@ export function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
   const hasDivergence = rec.score_delta != null && rec.score_delta >= 0.1;
   return (
     <div className="flex flex-wrap gap-1.5 items-center pt-0.5">
-      <span className="text-[10px] text-neutral-600 shrink-0">reconciliation:</span>
+      <span className="text-ui-sm text-neutral-600 shrink-0">reconciliation:</span>
       {rec.model_reported_score != null && (
-        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+        <span className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
           model {Math.round(rec.model_reported_score * 100)}%
         </span>
       )}
       {rec.findings_derived_score != null && (
-        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+        <span className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
           findings {Math.round(rec.findings_derived_score * 100)}%
         </span>
       )}
       {rec.score_delta != null && (
-        <span className={`text-[10px] px-1.5 py-0.5 rounded border font-mono ${hasDivergence ? 'bg-amber-950/40 text-amber-400 border-amber-900/50' : 'bg-neutral-800 text-neutral-500 border-neutral-700'}`}>
+        <span className={`text-ui-sm px-1.5 py-0.5 rounded border font-mono ${hasDivergence ? 'bg-amber-950/40 text-amber-400 border-amber-900/50' : 'bg-neutral-800 text-neutral-500 border-neutral-700'}`}>
           δ {Math.round(rec.score_delta * 100)}%
         </span>
       )}
       {rec.excluded_findings_count > 0 && (
-        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-500 border border-amber-900/50">
+        <span className="text-ui-sm px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-500 border border-amber-900/50">
           {rec.excluded_findings_count} finding{rec.excluded_findings_count !== 1 ? 's' : ''} excluded
         </span>
       )}
@@ -704,7 +704,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="migration-safety"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
         title={q.migration_safety_detail ?? undefined}
       >
         migration {q.migration_safety ?? 'unknown'}
@@ -715,7 +715,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="migration-apply-safety"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700"
         title={q.migration_apply_safety_detail ?? undefined}
       >
         apply {q.migration_apply_safety ?? 'unknown'}
@@ -726,7 +726,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="audit-findings"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-sky-500/10 text-sky-300 border-sky-500/20"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-sky-500/10 text-sky-300 border-sky-500/20"
         title={findings.map((f) => `${f.severity}: ${f.summary}`).join(' | ')}
       >
         {findings.length} audit finding{findings.length !== 1 ? 's' : ''}
@@ -737,7 +737,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="excluded-audit-findings"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-500 border-neutral-700"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-500 border-neutral-700"
         title={excludedFindings.map((f) => `${f.severity}: ${f.summary}`).join(' | ')}
       >
         {excludedFindings.length} excluded audit finding{excludedFindings.length !== 1 ? 's' : ''}
@@ -750,7 +750,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
       <span
         key="challenger-refuted-findings"
         data-testid="challenger-refuted-findings"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-violet-500/10 text-violet-300 border-violet-500/20"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-violet-500/10 text-violet-300 border-violet-500/20"
         title={challengerRefuted.map((f) => `${f.severity}: ${f.summary} — ${f.challenger_reason}`).join(' | ')}
       >
         {challengerRefuted.length} challenger false positive{challengerRefuted.length !== 1 ? 's' : ''}
@@ -761,7 +761,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="test-erosion-detail"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700 break-all"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700 break-all"
         title={formatCompactDetail(q.test_erosion_detail)}
       >
         erosion {formatCompactDetail(q.test_erosion_detail)}
@@ -772,7 +772,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="smoketest-detail"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700 break-all"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-400 border-neutral-700 break-all"
         title={formatCompactDetail(q.smoketest_detail)}
       >
         smoke {formatCompactDetail(q.smoketest_detail)}
@@ -783,7 +783,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="promotion-pr-url"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-500 border-neutral-700"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-neutral-800 text-neutral-500 border-neutral-700"
         title={q.promotion_pr_url}
       >
         promotion PR
@@ -794,7 +794,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="promotion-conflict"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20"
         title={q.promotion_error_detail ?? 'promotion conflict'}
       >
         promotion conflict
@@ -804,7 +804,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     chips.push(
       <span
         key="promotion-error-detail"
-        className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20"
+        className="text-ui-sm px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20"
         title={q.promotion_error_detail}
       >
         {q.promotion_error_detail}
@@ -828,7 +828,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
       <span
         key="theme-delivery"
         data-testid="theme-delivery-chip"
-        className={`text-[10px] px-1.5 py-0.5 rounded border ${colorClass}`}
+        className={`text-ui-sm px-1.5 py-0.5 rounded border ${colorClass}`}
         title={gapSentence ?? td.state ?? undefined}
       >
         theme {td.state ?? 'unknown'}{gradeLabel}
@@ -851,7 +851,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
       <span
         key="goal-alignment"
         data-testid="goal-alignment-chip"
-        className={`text-[10px] px-1.5 py-0.5 rounded border ${colorClass}`}
+        className={`text-ui-sm px-1.5 py-0.5 rounded border ${colorClass}`}
         title={ga.biggest_gap ?? ga.state ?? undefined}
       >
         goal {ga.state ?? 'unknown'}{gradeLabel}
@@ -873,7 +873,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
       <span
         key="blind-merge-grade"
         data-testid="blind-merge-grade-chip"
-        className={`text-[10px] px-1.5 py-0.5 rounded border ${colorClass}`}
+        className={`text-ui-sm px-1.5 py-0.5 rounded border ${colorClass}`}
         title={bmg.biggest_gap ?? verdict ?? undefined}
       >
         merge {verdict ?? 'unknown'}
@@ -901,12 +901,12 @@ export function PromotionReadinessSummary({ readiness }: { readiness: PromotionR
   if (isHistoricalCalibration) {
     return (
       <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
-        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-neutral-500/10 border-neutral-500/30 text-neutral-400" title={reason}>
+        <span className="text-ui-sm font-semibold px-1.5 py-0.5 rounded border bg-neutral-500/10 border-neutral-500/30 text-neutral-400" title={reason}>
           pre-go-live dry-run calibration (historical)
         </span>
-        <p className="text-[10px] text-neutral-500 line-clamp-2">{reason}</p>
+        <p className="text-ui-sm text-neutral-500 line-clamp-2">{reason}</p>
         {verdicts_evaluated > 0 && (
-          <p className="text-[9px] text-neutral-600">
+          <p className="text-ui-xs text-neutral-600">
             {verdicts_evaluated} pre-go-live dry-run{verdicts_evaluated !== 1 ? 's' : ''} · {consecutive_clean_passes} clean streak (frozen)
           </p>
         )}
@@ -921,37 +921,37 @@ export function PromotionReadinessSummary({ readiness }: { readiness: PromotionR
     <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
       <div className="flex flex-wrap items-center gap-2">
         <span
-          className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}
+          className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}
           title={explanatoryCaveat}
         >
           {ready ? 'self-approval streak clears thresholds' : 'not ready'}
         </span>
         {verdicts_evaluated > 0 && (
-          <span className="text-[10px] text-neutral-500">{verdicts_evaluated} dry-run{verdicts_evaluated !== 1 ? 's' : ''}</span>
+          <span className="text-ui-sm text-neutral-500">{verdicts_evaluated} dry-run{verdicts_evaluated !== 1 ? 's' : ''}</span>
         )}
         {verdicts_evaluated > 0 && (
-          <span className="text-[10px] text-neutral-500" title={explanatoryCaveat}>{Math.round(would_promote_rate * 100)}% self-approval rate</span>
+          <span className="text-ui-sm text-neutral-500" title={explanatoryCaveat}>{Math.round(would_promote_rate * 100)}% self-approval rate</span>
         )}
         {hasValidatedPrecision && (
           <span
-            className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+            className="text-ui-sm font-semibold px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
             title={`validated qualifier precision from ${resolved_outcome_sample} resolved promotion outcomes`}
           >
             {Math.round(validated_precision * 100)}% validated precision ({resolved_outcome_sample} resolved)
           </span>
         )}
         {consecutive_clean_passes > 0 && (
-          <span className="text-[10px] text-neutral-500">{consecutive_clean_passes} clean streak</span>
+          <span className="text-ui-sm text-neutral-500">{consecutive_clean_passes} clean streak</span>
         )}
       </div>
       {ready && (
-        <p className="text-[9px] text-neutral-600 italic">{explanatoryCaveat}</p>
+        <p className="text-ui-xs text-neutral-600 italic">{explanatoryCaveat}</p>
       )}
       {!ready && reason && (
-        <p className="text-[10px] text-neutral-400 line-clamp-2">{reason}</p>
+        <p className="text-ui-sm text-neutral-400 line-clamp-2">{reason}</p>
       )}
       {hasBlockers && (
-        <p className="text-[10px] text-red-400 truncate">
+        <p className="text-ui-sm text-red-400 truncate">
           recurring: {Object.entries(recurring_blockers).map(([k, n]) => `${k}×${n}`).join(', ')}
         </p>
       )}
@@ -970,17 +970,17 @@ export function PinnedServingVersionCallout({ version }: { version: RecentVersio
       className="flex flex-col gap-0.5 px-2 py-1.5 rounded border bg-emerald-500/10 border-emerald-500/30"
     >
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="text-[10px] font-semibold text-emerald-400">✓ currently serving</span>
-        <span className="text-[10px] font-mono text-emerald-300">v{version.version_number}</span>
+        <span className="text-ui-sm font-semibold text-emerald-400">✓ currently serving</span>
+        <span className="text-ui-sm font-mono text-emerald-300">v{version.version_number}</span>
         {mergedCount != null && (
-          <span className="text-[10px] text-emerald-600">{mergedCount} merged</span>
+          <span className="text-ui-sm text-emerald-600">{mergedCount} merged</span>
         )}
         {promotedAt && (
-          <span className="text-[10px] text-emerald-700">promoted {timeAgo(promotedAt)}</span>
+          <span className="text-ui-sm text-emerald-700">promoted {timeAgo(promotedAt)}</span>
         )}
       </div>
       {version.highlights?.headline && (
-        <p className="text-[10px] text-emerald-300/80 italic">{version.highlights.headline}</p>
+        <p className="text-ui-sm text-emerald-300/80 italic">{version.highlights.headline}</p>
       )}
     </div>
   );
@@ -990,12 +990,12 @@ export function StagedDirectionsSummary({ staged }: { staged: StagedDirection[] 
   if (!staged.length) return null;
   return (
     <div data-testid="staged-directions">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">
         Staged for next version ({staged.length})
       </p>
       <div className="space-y-0.5">
         {staged.map((s, i) => (
-          <div key={s.id ?? i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] pl-2 border-l-2 border-neutral-700/40">
+          <div key={s.id ?? i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-ui-sm pl-2 border-l-2 border-neutral-700/40">
             {s.staged_for_version != null && (
               <span className="font-mono text-neutral-500 shrink-0">→v{s.staged_for_version}</span>
             )}
@@ -1031,7 +1031,7 @@ export function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: St
   return (
     <div
       data-testid="cut-consequences"
-      className="text-[10px] text-neutral-300 bg-amber-950/30 border border-amber-900/40 rounded px-2 py-1 space-y-1"
+      className="text-ui-sm text-neutral-300 bg-amber-950/30 border border-amber-900/40 rounded px-2 py-1 space-y-1"
     >
       <p className="text-amber-400 font-semibold">Cutting v{cv.version_number} now will:</p>
       {activating.length > 0 ? (
@@ -1082,27 +1082,27 @@ export function ChallengedVsUnchallengedSummary({ telemetry }: { telemetry: Chal
   const bothInsufficient = challenged.insufficient_sample && unchallenged.insufficient_sample;
   return (
     <div data-testid="challenged-vs-unchallenged" className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Audit Challenge Impact ({total_verdicts} verdicts)</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide">Audit Challenge Impact ({total_verdicts} verdicts)</p>
       {bothInsufficient ? (
-        <span className="text-[10px] text-neutral-600 italic">not enough data yet (need ≥3 per cohort)</span>
+        <span className="text-ui-sm text-neutral-600 italic">not enough data yet (need ≥3 per cohort)</span>
       ) : (
         <div className="flex flex-wrap gap-x-4 gap-y-1">
           {([{ label: 'challenged', s: challenged }, { label: 'unchallenged', s: unchallenged }] as const).map(({ label, s }) => (
             <div key={label} className="space-y-0.5">
-              <span className="text-[10px] text-neutral-500">{label} ({s.sample_size})</span>
+              <span className="text-ui-sm text-neutral-500">{label} ({s.sample_size})</span>
               {s.insufficient_sample ? (
-                <span className="text-[10px] text-neutral-600 italic"> — insufficient</span>
+                <span className="text-ui-sm text-neutral-600 italic"> — insufficient</span>
               ) : (
                 <div className="flex flex-wrap gap-1">
-                  <span className="text-[10px] px-1 py-0 rounded bg-neutral-800 border border-neutral-700 text-neutral-400" title="exclusion rate — fraction of verdicts with audit findings excluded for lacking verification">excl {pct(s.exclusion_rate ?? 0)}</span>
+                  <span className="text-ui-sm px-1 py-0 rounded bg-neutral-800 border border-neutral-700 text-neutral-400" title="exclusion rate — fraction of verdicts with audit findings excluded for lacking verification">excl {pct(s.exclusion_rate ?? 0)}</span>
                   {s.disagreement_rate != null && (
-                    <span className={`text-[10px] px-1 py-0 rounded border ${(s.disagreement_rate ?? 0) > 0.2 ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-neutral-800 border-neutral-700 text-neutral-400'}`} title="challenger disagreement rate — fraction where the challenger did not fully agree">disagree {pct(s.disagreement_rate)}</span>
+                    <span className={`text-ui-sm px-1 py-0 rounded border ${(s.disagreement_rate ?? 0) > 0.2 ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-neutral-800 border-neutral-700 text-neutral-400'}`} title="challenger disagreement rate — fraction where the challenger did not fully agree">disagree {pct(s.disagreement_rate)}</span>
                   )}
                   {s.wrong_decision_rate != null && (
-                    <span className={`text-[10px] px-1 py-0 rounded border ${s.wrong_decision_rate > 0 ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'}`} title={`post-promotion wrong decision rate over ${s.wrong_decision_resolved_sample ?? 0} resolved promotions`}>wrong {pct(s.wrong_decision_rate)}</span>
+                    <span className={`text-ui-sm px-1 py-0 rounded border ${s.wrong_decision_rate > 0 ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'}`} title={`post-promotion wrong decision rate over ${s.wrong_decision_resolved_sample ?? 0} resolved promotions`}>wrong {pct(s.wrong_decision_rate)}</span>
                   )}
                   {s.challenge_refuted_rate != null && (
-                    <span className={`text-[10px] px-1 py-0 rounded border ${(s.challenge_refuted_rate ?? 0) > 0 ? 'bg-violet-500/10 border-violet-500/30 text-violet-400' : 'bg-neutral-800 border-neutral-700 text-neutral-400'}`} title={`challenger-refuted false positive rate — fraction of verdicts where the adversarial challenger explicitly refuted findings as false positives (${s.challenge_refuted_count ?? 0} total refuted findings)`}>refuted {pct(s.challenge_refuted_rate)}</span>
+                    <span className={`text-ui-sm px-1 py-0 rounded border ${(s.challenge_refuted_rate ?? 0) > 0 ? 'bg-violet-500/10 border-violet-500/30 text-violet-400' : 'bg-neutral-800 border-neutral-700 text-neutral-400'}`} title={`challenger-refuted false positive rate — fraction of verdicts where the adversarial challenger explicitly refuted findings as false positives (${s.challenge_refuted_count ?? 0} total refuted findings)`}>refuted {pct(s.challenge_refuted_rate)}</span>
                   )}
                 </div>
               )}
@@ -1137,7 +1137,7 @@ export function VersionHighlightsLine({
       ? `${Math.round(highlights.qualification_threshold * 100)}%`
       : null;
   return (
-    <div className="space-y-0.5 text-[10px]" data-testid="version-headline">
+    <div className="space-y-0.5 text-ui-sm" data-testid="version-headline">
       <p className="text-neutral-300 italic">{highlights.headline}</p>
       <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-neutral-400">
         <span>{highlights.merged_count} merged</span>
@@ -1166,11 +1166,11 @@ export function VersionHistorySummary({ versionId }: { versionId: string }) {
     return () => { cancelled = true; };
   }, [versionId]);
 
-  if (loading) return <p className="text-[10px] text-neutral-500 pl-2">Loading…</p>;
-  if (error || !summary) return <p className="text-[10px] text-red-400 pl-2">Failed to load summary</p>;
+  if (loading) return <p className="text-ui-sm text-neutral-500 pl-2">Loading…</p>;
+  if (error || !summary) return <p className="text-ui-sm text-red-400 pl-2">Failed to load summary</p>;
 
   return (
-    <div className="mt-1 pl-2 border-l-2 border-neutral-700/40 space-y-0.5 text-[10px]">
+    <div className="mt-1 pl-2 border-l-2 border-neutral-700/40 space-y-0.5 text-ui-sm">
       <VersionHighlightsLine highlights={summary.highlights} phase={summary.phase} status={summary.status} />
       <VersionSummaryPanel tasksMerged={summary.tasks_merged} acceptanceAggregate={summary.acceptance_aggregate} />
     </div>
@@ -1207,7 +1207,7 @@ export function VersionLifecycleRefreshBanner({
           <p className={`font-semibold ${stale ? '' : 'text-red-200'}`}>
             {stale ? 'Version lifecycle data may be stale' : 'Version lifecycle unavailable'}
           </p>
-          <p className={`text-[11px] ${detailClass}`}>
+          <p className={`text-ui-md ${detailClass}`}>
             {message}{stale && lastSuccessfulRefreshAt ? `; last successful refresh ${timeAgo(lastSuccessfulRefreshAt)}` : ''}
           </p>
         </div>
@@ -1215,7 +1215,7 @@ export function VersionLifecycleRefreshBanner({
           type="button"
           onClick={onRefresh}
           disabled={refreshing || !canRetry}
-          className={`min-h-[44px] rounded border px-2 py-1 text-[11px] disabled:cursor-not-allowed disabled:opacity-50 ${buttonClass}`}
+          className={`min-h-[44px] rounded border px-2 py-1 text-ui-md disabled:cursor-not-allowed disabled:opacity-50 ${buttonClass}`}
         >
           {refreshing ? 'Retrying...' : 'Retry'}
         </button>
