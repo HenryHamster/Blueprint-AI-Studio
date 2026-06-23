@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from 'react';
 import { Copy, Check, ChevronDown, ChevronRight } from 'lucide-react';
 import type { Task } from '../types/task';
+import { taskStatusTextColor } from '../utils/taskStatus';
 
 export function CopyableId({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
@@ -85,9 +86,8 @@ export function Sparkline({ values }: { values: number[] }) {
   );
 }
 
-const DEP_STATUS_COLORS: Record<string, string> = { COMPLETED: 'text-emerald-400', IN_PROGRESS: 'text-amber-400', FAILED: 'text-red-400', CANCELLED: 'text-neutral-500', EVALUATING: 'text-blue-400', PROVISIONING: 'text-blue-400', QUEUED: 'text-neutral-400', BLOCKED: 'text-amber-400', PARKED: 'text-purple-400' };
 export function DependencyItem({ dep, depTask, hasCycle, onNavigateToTask }: { dep: string; depTask?: Task; hasCycle?: boolean; onNavigateToTask?: (id: string) => void }) {
-  const statusColor = depTask ? (DEP_STATUS_COLORS[depTask.status] ?? 'text-neutral-400') : '';
+  const statusColor = depTask ? taskStatusTextColor(depTask.status) : '';
   const label = depTask ? (depTask.title.length > 40 ? depTask.title.slice(0, 40) + '…' : depTask.title) : null;
   return (
     <div className="font-mono text-sm text-neutral-300 flex items-center gap-1.5 flex-wrap">

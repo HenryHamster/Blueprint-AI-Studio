@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
 import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, ShieldCheck, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText, Copy, Check } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
+import { taskStatusBadgeClasses } from '../utils/taskStatus';
 import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
@@ -480,18 +481,18 @@ export function ResearchFindings({ findings }: { findings: ResearchFinding[] }) 
 }
 
 export function StatusBadge({ status }: { status: TaskStatus }) {
-  const configs: Partial<Record<TaskStatus, { bg: string; text: string; icon: typeof Activity; label: string; spin?: boolean }>> = {
-    PROVISIONING: { bg: 'bg-sky-500/5 border-sky-500/10', text: 'text-sky-400/70', icon: Activity, label: 'Provisioning…', spin: true },
-    EVALUATING: { bg: 'bg-indigo-500/5 border-indigo-500/10', text: 'text-indigo-400/70', icon: Clock, label: 'Evaluating' },
-    BLOCKED: { bg: 'bg-amber-500/10 border-amber-500/30', text: 'text-amber-400', icon: ShieldAlert, label: 'Blocked' },
-    CANCELLED: { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-500', icon: X, label: 'Cancelled' },
+  const configs: Partial<Record<TaskStatus, { icon: typeof Activity; label: string; spin?: boolean }>> = {
+    PROVISIONING: { icon: Activity, label: 'Provisioning…', spin: true },
+    EVALUATING:   { icon: Clock,    label: 'Evaluating' },
+    BLOCKED:      { icon: ShieldAlert, label: 'Blocked' },
+    CANCELLED:    { icon: X,        label: 'Cancelled' },
   };
   const cfg = configs[status];
   if (!cfg) return null;
   const Icon = cfg.icon;
   return (
     <span
-      className={`group/status inline-flex items-center gap-0 hover:gap-1 ${cfg.bg} ${cfg.text} border text-[10px] uppercase tracking-wider p-1 hover:px-2 hover:py-0.5 rounded font-semibold whitespace-nowrap transition-all duration-150`}
+      className={`group/status inline-flex items-center gap-0 hover:gap-1 ${taskStatusBadgeClasses(status)} text-[10px] uppercase tracking-wider p-1 hover:px-2 hover:py-0.5 rounded font-semibold whitespace-nowrap transition-all duration-150`}
       title={cfg.label}
     >
       <Icon className={`w-3 h-3 shrink-0 ${cfg.spin ? 'animate-spin' : ''}`} />

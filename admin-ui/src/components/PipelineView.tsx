@@ -5,21 +5,10 @@ import { TASK_TYPE_STYLES, useElapsedTime, getHeartbeatStatus } from './TaskCard
 import { parseTimestamp } from '../utils/time';
 import { getSidecarBackref, deriveSidecarBadge, SIDECAR_TONE_CLASSES, type SidecarBadge } from '../utils/sidecarTasks';
 import { buildForest, type TreeNode } from './PipelineView.utils';
+import { taskStatusDotColor } from '../utils/taskStatus';
 
 const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
 const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'CANCELLED'];
-
-const STATUS_COLORS: Record<string, string> = {
-  COMPLETED: 'bg-emerald-500',
-  IN_PROGRESS: 'bg-yellow-500',
-  PROVISIONING: 'bg-sky-700/50',
-  EVALUATING: 'bg-indigo-600/50',
-  FAILED: 'bg-red-500',
-  CANCELLED: 'bg-neutral-600',
-  QUEUED: 'bg-neutral-500',
-  BLOCKED: 'bg-amber-500',
-  PARKED: 'bg-purple-600/50',
-};
 
 type FilterType = 'All' | 'Active' | 'Blocked' | 'Failed' | 'Needs Review';
 
@@ -56,7 +45,7 @@ interface PipelineViewProps {
 function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveParent, activeFilter, blockingCount, sidecarBadges, isSidecar, isSidecarFallback }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void; onUnarchiveParent?: (parentTaskId: string) => void; activeFilter: FilterType; blockingCount?: number; sidecarBadges?: SidecarBadge[]; isSidecar?: boolean; isSidecarFallback?: boolean }) {
   const style = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
   const Icon = style?.icon;
-  const statusColor = STATUS_COLORS[task.status] || 'bg-neutral-500';
+  const statusColor = taskStatusDotColor(task.status);
   const isRunning = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
   const heartbeat = isRunning && task.last_heartbeat ? getHeartbeatStatus(task.last_heartbeat) : null;
 
@@ -592,14 +581,14 @@ function RootGroup({
       {/* Progress bar */}
       {(() => {
         const segments = [
-          { count: queuedInGroup, color: 'bg-neutral-700' },
-          { count: parkedInGroup, color: 'bg-purple-600/50' },
-          { count: blockedInGroup, color: 'bg-amber-500' },
-          { count: provisioningInGroup, color: 'bg-sky-700/50' },
-          { count: inProgressInGroup, color: 'bg-yellow-500' },
-          { count: evaluatingInGroup, color: 'bg-indigo-600/50' },
-          { count: failedInGroup, color: 'bg-red-500' },
-          { count: completedInGroup, color: 'bg-emerald-500' },
+          { count: queuedInGroup, color: taskStatusDotColor('QUEUED') },
+          { count: parkedInGroup, color: taskStatusDotColor('PARKED') },
+          { count: blockedInGroup, color: taskStatusDotColor('BLOCKED') },
+          { count: provisioningInGroup, color: taskStatusDotColor('PROVISIONING') },
+          { count: inProgressInGroup, color: taskStatusDotColor('IN_PROGRESS') },
+          { count: evaluatingInGroup, color: taskStatusDotColor('EVALUATING') },
+          { count: failedInGroup, color: taskStatusDotColor('FAILED') },
+          { count: completedInGroup, color: taskStatusDotColor('COMPLETED') },
         ].filter(s => s.count > 0);
         return (
           <div className="flex w-full h-1 rounded-full overflow-hidden mt-2">
