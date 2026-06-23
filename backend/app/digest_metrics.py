@@ -81,6 +81,7 @@ from app.digest_trial_arms import (  # noqa: F401
     _json_truthy,
     compute_trial_arm_accumulation,
     compute_trial_arm_accrual,
+    compute_trial_arm_cost_delta,
 )
 
 # Outer-loop convergence helpers (PR-chain grouping, escalation-alert parsing,

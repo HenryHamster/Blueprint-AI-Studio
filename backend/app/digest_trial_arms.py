@@ -14,7 +14,7 @@ import uuid  # referenced in the string type annotations below
 from datetime import timedelta
 from typing import Dict, Any
 
-from sqlalchemy import and_, case, func
+from sqlalchemy import Integer, and_, case, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -64,7 +64,7 @@ async def compute_trial_arm_accumulation(
 
     Returns a dict with cumulative ``with_n``, ``without_n``, ``with_succ``,
     ``without_succ``, ``with_rate``, ``without_rate`` and ``lift``
-    (with-arm rate − without-arm rate), where rates are ``None`` for an empty arm.
+    (with-arm rate - without-arm rate), where rates are ``None`` for an empty arm.
     """
     _assign_key = assignment_key if assignment_key else context_key
     _has_assignment = _assign_key != context_key
@@ -299,3 +299,118 @@ async def compute_trial_arm_accrual(
             without_7d += cnt
 
     return {"with_7d": with_7d, "without_7d": without_7d, "window_days": window_days}
+
+
+async def compute_trial_arm_cost_delta(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID | None",
+    context_key: str,
+    assignment_key: "str | None" = None,
+) -> Dict[str, Any]:
+    """Per-arm average LLM cost delta (with - without) over the trial's whole life.
+
+    Groups terminal tasks by (arm, provider, model), sums banked + current-attempt
+    tokens, applies LLM_TOKEN_PRICING, and returns per-arm averages and their delta.
+
+    Returns ``{"with_avg_cost_usd": float|None, "without_avg_cost_usd": float|None,
+    "cost_delta": float|None}`` where ``cost_delta = with_avg - without_avg``
+    (negative means the WITH arm is cheaper).  Fields are ``None`` when an arm
+    has no tasks or no priced token data.
+    """
+    from app.efficiency_snapshot import (
+        LLM_TOKEN_PRICING,
+    )  # avoid circular at module load
+
+    _assign_key = assignment_key if assignment_key else context_key
+    _has_assignment = _assign_key != context_key
+
+    if resolve_dialect_name(session) == "sqlite":
+        _primary_expr = func.json_extract(Task.context, f"$.{_assign_key}")
+        _fallback_expr = func.json_extract(Task.context, f"$.{context_key}")
+        arm_expr = (
+            func.coalesce(_primary_expr, _fallback_expr)
+            if _has_assignment
+            else _primary_expr
+        )
+        input_tokens_expr = func.coalesce(
+            func.cast(
+                func.json_extract(Task.api_call_summary, "$.total_input_tokens"),
+                Integer,
+            ),
+            0,
+        ) + func.coalesce(Task.llm_input_tokens_banked_db, 0)
+        output_tokens_expr = func.coalesce(
+            func.cast(
+                func.json_extract(Task.api_call_summary, "$.total_output_tokens"),
+                Integer,
+            ),
+            0,
+        ) + func.coalesce(Task.llm_output_tokens_banked_db, 0)
+    else:
+        _primary_expr = Task.context[_assign_key].astext
+        _fallback_expr = Task.context[context_key].astext
+        arm_expr = (
+            func.coalesce(_primary_expr, _fallback_expr)
+            if _has_assignment
+            else _primary_expr
+        )
+        input_tokens_expr = func.coalesce(
+            func.cast(Task.api_call_summary["total_input_tokens"].astext, Integer), 0
+        ) + func.coalesce(Task.llm_input_tokens_banked_db, 0)
+        output_tokens_expr = func.coalesce(
+            func.cast(Task.api_call_summary["total_output_tokens"].astext, Integer), 0
+        ) + func.coalesce(Task.llm_output_tokens_banked_db, 0)
+
+    filters = [
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        arm_expr.is_not(None),
+    ]
+    if project_id is not None:
+        filters.append(Task.project_id == project_id)
+
+    stmt = (
+        select(
+            arm_expr,
+            Task.provider,
+            Task.model,
+            func.sum(input_tokens_expr),
+            func.sum(output_tokens_expr),
+            func.count(),
+        )
+        .where(*filters)
+        .group_by(arm_expr, Task.provider, Task.model)
+    )
+    rows = (await session.execute(stmt)).all()
+
+    with_cost = with_n = 0.0
+    without_cost = without_n = 0.0
+    for arm_val, provider, model, in_tok, out_tok, cnt in rows:
+        cnt = int(cnt)
+        in_tok = int(in_tok or 0)
+        out_tok = int(out_tok or 0)
+        cost = 0.0
+        if provider and model:
+            pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
+            if pricing:
+                in_rate, out_rate = pricing
+                cost = in_tok * in_rate + out_tok * out_rate
+        if _json_truthy(arm_val):
+            with_cost += cost
+            with_n += cnt
+        else:
+            without_cost += cost
+            without_n += cnt
+
+    with_avg = round(with_cost / with_n, 6) if with_n > 0 else None
+    without_avg = round(without_cost / without_n, 6) if without_n > 0 else None
+    cost_delta = (
+        round(with_avg - without_avg, 6)
+        if with_avg is not None and without_avg is not None
+        else None
+    )
+    return {
+        "with_avg_cost_usd": with_avg,
+        "without_avg_cost_usd": without_avg,
+        "cost_delta": cost_delta,
+    }

@@ -67,6 +67,7 @@ from app.digest_metrics import (
     compute_dependency_health_signals,
     compute_trial_arm_accumulation,
     compute_trial_arm_accrual,
+    compute_trial_arm_cost_delta,
     compute_park_wake_health,
     compute_merge_gate_fleet_health,
     compute_digest_cost_economics,
@@ -1678,6 +1679,12 @@ async def _compute_digest(
                 context_key=_td["context_key"],
                 assignment_key=_td.get("assignment_key"),
             )
+            _cost = await compute_trial_arm_cost_delta(
+                session,
+                project_id=project_id,
+                context_key=_td["context_key"],
+                assignment_key=_td.get("assignment_key"),
+            )
             _verdict_entry = evaluate_trial_verdict(
                 lift=_accum["lift"],
                 n_with=_accum["with_n"],
@@ -1688,6 +1695,7 @@ async def _compute_digest(
                 accumulation_basis="cumulative_terminal_arm_tasks",
                 arm_composition=_accum.get("arm_composition"),
                 receipt_only_trial=(_td.get("assignment_key") is None),
+                per_arm_cost=_cost,
             )
             _pending_trial_verdicts.append((_cap, _verdict_entry))
 

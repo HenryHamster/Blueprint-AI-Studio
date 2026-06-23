@@ -17,6 +17,7 @@ transition. The old entry is replaced, not appended.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, TypedDict
 
@@ -41,6 +42,12 @@ _DEFAULT_FUTILITY_MIN_DELIVERY_RATE = 0.50
 # can manufacture a false null/negative verdict for a capability that was never
 # cleanly suppressed.
 _DEFAULT_FUTILITY_MAX_HOLDBACK_CONTAMINATION_RATE = 0.20
+# Significance gate: minimum z-score (|lift| / SE) required before issuing a
+# durable adopt or reject verdict.  Uses a conservative SE estimate assuming
+# p=0.5 (maximum binomial variance).  None disables the gate (opt-in per trial).
+# At n=30 per arm, a +0.05 lift yields z≈0.39 — well below 1.65 — so a trial
+# using this threshold cannot adopt on sampling noise alone.
+_DEFAULT_MIN_SIGNIFICANCE_Z: float | None = None
 
 
 def _default_config() -> dict[str, Any]:
@@ -51,6 +58,7 @@ def _default_config() -> dict[str, Any]:
         "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
         "futility_min_delivery_rate": _DEFAULT_FUTILITY_MIN_DELIVERY_RATE,
         "futility_max_holdback_contamination_rate": _DEFAULT_FUTILITY_MAX_HOLDBACK_CONTAMINATION_RATE,
+        "min_significance_z": _DEFAULT_MIN_SIGNIFICANCE_Z,
     }
 
 
@@ -100,7 +108,9 @@ LANE_PILOT_CHECKPOINT_RECEIPT_KEY = "_review_fix_checkpoint"
 
 _DECIDED_VERDICTS = frozenset({"adopt", "reject", "no_effect", "ADOPT", "KILL"})
 _CONTINUE_VERDICTS = frozenset({"continue-trial", "CONTINUE"})
-_SUFFICIENT_DATA_CONTINUE_REASONS = frozenset({"ambiguous_lift", "receipt_only_trial"})
+_SUFFICIENT_DATA_CONTINUE_REASONS = frozenset(
+    {"ambiguous_lift", "receipt_only_trial", "insignificant_lift"}
+)
 
 
 class LanePilotAggregates(TypedDict, total=False):
@@ -438,6 +448,7 @@ def evaluate_trial_verdict(
     accumulation_basis: str | None = None,
     arm_composition: dict | None = None,
     receipt_only_trial: bool = False,
+    per_arm_cost: dict | None = None,
 ) -> dict[str, Any]:
     """Return a verdict dict for a capability trial based on measured lift and sample sizes.
 
@@ -507,6 +518,8 @@ def evaluate_trial_verdict(
         entry["evaluated_at"] = evaluated_at
     if arm_composition is not None:
         entry["arm_composition"] = arm_composition
+    if per_arm_cost is not None:
+        entry["per_arm_cost"] = per_arm_cost
 
     if lift is None or n_with < min_n or n_without < min_n:
         entry["verdict"] = "continue-trial"
@@ -544,6 +557,23 @@ def evaluate_trial_verdict(
         else:
             verdict = "continue-trial"
             verdict_reason = "ambiguous_lift"
+
+    # Significance gate: a durable adopt/reject verdict requires the measured lift
+    # to exceed the noise floor implied by arm sample sizes.  Uses a conservative
+    # SE estimate with p=0.5 (maximum binomial variance); trial operators can
+    # lower or disable the threshold via config["min_significance_z"].
+    # no_effect (futility bound) is intentionally excluded — it is a structural
+    # bound, not a precision claim.
+    min_significance_z = cfg.get("min_significance_z")
+    if (
+        verdict in ("adopt", "reject")
+        and min_significance_z is not None
+        and lift is not None
+    ):
+        se = math.sqrt(0.25 * (1.0 / n_with + 1.0 / n_without))
+        if se > 0 and abs(lift) / se < float(min_significance_z):
+            verdict = "continue-trial"
+            verdict_reason = "insignificant_lift"
 
     # Receipt-only guard: trials with no assignment key accumulate only receipt
     # context — the arms are structurally confounded and must never produce a

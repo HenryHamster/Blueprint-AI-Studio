@@ -374,6 +374,137 @@ class TestEvaluateTrialVerdict:
         holdback = get_effective_holdback_fraction(verdicts, "repo_map", 0.1)
         assert holdback == 1.0
 
+    # ── significance gate ─────────────────────────────────────────────────────
+
+    def test_insignificant_lift_at_min_n_stays_continue_trial(self):
+        """Acceptance test: lift exactly at adopt threshold is not significant at min_n.
+
+        At n=30 per arm, +5% lift yields z≈0.39 (SE≈0.129 with p=0.5 worst case).
+        With min_significance_z=1.65 the gate must hold the verdict at continue-trial
+        so the system cannot durably adopt on sampling noise.
+        """
+        entry = evaluate_trial_verdict(
+            lift=0.05,
+            n_with=30,
+            n_without=30,
+            config={
+                "min_n_per_arm": 30,
+                "adopt_lift": 0.05,
+                "reject_lift": -0.03,
+                "min_significance_z": 1.65,
+            },
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insignificant_lift"
+
+    def test_significant_lift_at_large_n_adopts(self):
+        # At n=600 per arm, +5% lift yields z≈2.74 > 1.65 — gate passes, adopt fires.
+        entry = evaluate_trial_verdict(
+            lift=0.05,
+            n_with=600,
+            n_without=600,
+            config={
+                "min_n_per_arm": 30,
+                "adopt_lift": 0.05,
+                "reject_lift": -0.03,
+                "min_significance_z": 1.65,
+            },
+        )
+        assert entry["verdict"] == "adopt"
+        assert entry["verdict_reason"] == "sufficient_data"
+
+    def test_significance_gate_disabled_by_default(self):
+        # Without min_significance_z in config, small-n adopt still fires (backward-compat).
+        entry = evaluate_trial_verdict(
+            lift=0.05,
+            n_with=30,
+            n_without=30,
+            config=self._cfg(),
+        )
+        assert entry["verdict"] == "adopt"
+
+    def test_significance_gate_blocks_reject_too(self):
+        # A negative lift at min_n that is not statistically significant must also be held.
+        entry = evaluate_trial_verdict(
+            lift=-0.03,
+            n_with=30,
+            n_without=30,
+            config={
+                "min_n_per_arm": 30,
+                "adopt_lift": 0.05,
+                "reject_lift": -0.03,
+                "min_significance_z": 1.65,
+            },
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["verdict_reason"] == "insignificant_lift"
+
+    def test_significance_gate_does_not_affect_no_effect(self):
+        # Futility bound (no_effect) is structural, not a precision claim — gate must not fire.
+        entry = evaluate_trial_verdict(
+            lift=0.02,
+            n_with=90,
+            n_without=90,
+            config={
+                "min_n_per_arm": 30,
+                "adopt_lift": 0.05,
+                "reject_lift": -0.03,
+                "min_significance_z": 1.65,
+            },
+        )
+        assert entry["verdict"] == "no_effect"
+        assert entry["verdict_reason"] == "futility_bound_reached"
+
+    # ── per_arm_cost ──────────────────────────────────────────────────────────
+
+    def test_verdict_entry_surfaces_per_arm_cost_delta(self):
+        """per_arm_cost dict is included verbatim in the verdict entry for an adopt verdict."""
+        per_arm_cost = {
+            "with_avg_cost_usd": 0.12,
+            "without_avg_cost_usd": 0.10,
+            "cost_delta": 0.02,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.10,
+            n_with=50,
+            n_without=50,
+            config=self._cfg(),
+            evaluated_at="2026-06-23T00:00:00",
+            per_arm_cost=per_arm_cost,
+        )
+        assert entry["verdict"] == "adopt"
+        assert "per_arm_cost" in entry
+        assert entry["per_arm_cost"]["cost_delta"] == pytest.approx(0.02)
+        assert entry["per_arm_cost"]["with_avg_cost_usd"] == pytest.approx(0.12)
+        assert entry["per_arm_cost"]["without_avg_cost_usd"] == pytest.approx(0.10)
+
+    def test_verdict_entry_per_arm_cost_none_when_not_provided(self):
+        """per_arm_cost is absent from the entry when not passed in."""
+        entry = evaluate_trial_verdict(
+            lift=0.10,
+            n_with=50,
+            n_without=50,
+            config=self._cfg(),
+        )
+        assert "per_arm_cost" not in entry
+
+    def test_verdict_entry_per_arm_cost_present_on_continue_trial(self):
+        """per_arm_cost is surfaced even when the verdict is continue-trial (early cost signal)."""
+        per_arm_cost = {
+            "with_avg_cost_usd": 0.08,
+            "without_avg_cost_usd": 0.09,
+            "cost_delta": -0.01,
+        }
+        entry = evaluate_trial_verdict(
+            lift=None,
+            n_with=5,
+            n_without=5,
+            config=self._cfg(),
+            per_arm_cost=per_arm_cost,
+        )
+        assert entry["verdict"] == "continue-trial"
+        assert entry["per_arm_cost"]["cost_delta"] == pytest.approx(-0.01)
+
 
 # ── record_trial_verdict ─────────────────────────────────────────────────────
 
