@@ -2551,3 +2551,75 @@ async def test_analyze_transient_llm_error_stamps_recoverable_cause(
     # Still measured-only: a recoverable failure must not earn acceptance credit.
     assert verdict.get("analysis_mode") == "deterministic"
     assert verdict.get("knowledge_acceptance_evidence") is False
+
+
+# ── fetch_direction_knowledge_index ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fetch_direction_knowledge_index_groups_by_direction_id(db_session):
+    """fetch_direction_knowledge_index returns per-direction lists, newest-first,
+    and excludes directions with no documents."""
+    from app.knowledge_query import fetch_direction_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="FDK1")
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Dir A doc 1",
+        direction_id="d-aaa",
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Dir A doc 2",
+        direction_id="d-aaa",
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="Dir B doc 1",
+        direction_id="d-bbb",
+    )
+
+    result = await fetch_direction_knowledge_index(
+        db_session, project.id, ["d-aaa", "d-bbb", "d-ccc"]
+    )
+    assert set(result.keys()) == {"d-aaa", "d-bbb"}
+    assert len(result["d-aaa"]) == 2
+    assert len(result["d-bbb"]) == 1
+    assert "d-ccc" not in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_direction_knowledge_index_caps_per_direction(db_session):
+    """No more than _DIRECTION_KNOWLEDGE_CAP entries per direction."""
+    from app.knowledge_query import fetch_direction_knowledge_index, _DIRECTION_KNOWLEDGE_CAP
+
+    project, task = await _make_web_research_task(db_session, project_name="FDK2")
+    for i in range(_DIRECTION_KNOWLEDGE_CAP + 3):
+        await _make_knowledge_doc(
+            db_session,
+            project_id=project.id,
+            source_task_id=task.id,
+            title=f"Doc {i}",
+            direction_id="d-overflow",
+        )
+
+    result = await fetch_direction_knowledge_index(
+        db_session, project.id, ["d-overflow"]
+    )
+    assert len(result["d-overflow"]) == _DIRECTION_KNOWLEDGE_CAP
+
+
+@pytest.mark.asyncio
+async def test_fetch_direction_knowledge_index_empty_direction_list(db_session):
+    """Empty direction_ids returns empty dict without querying DB."""
+    from app.knowledge_query import fetch_direction_knowledge_index
+
+    project, _ = await _make_web_research_task(db_session, project_name="FDK3")
+    result = await fetch_direction_knowledge_index(db_session, project.id, [])
+    assert result == {}

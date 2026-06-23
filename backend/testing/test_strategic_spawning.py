@@ -13379,3 +13379,54 @@ def test_summarize_efficiency_snapshot_empty_returns_empty():
 
     assert _summarize_efficiency_snapshot({}) == {}
     assert _summarize_efficiency_snapshot(None) == {}  # type: ignore[arg-type]
+
+
+# ── direction-linked knowledge in strategist payload ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_strategist_context_surfaces_direction_linked_knowledge(db_session):
+    """strategic_review outcome_evaluation surfaces direction_knowledge for
+    directions that have linked knowledge documents."""
+    direction_id = "d-linked-knowledge"
+    project = _make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "text": "Direction with linked knowledge",
+                "priority": "high",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+    await _seed_knowledge_doc(
+        db_session,
+        project,
+        title="Auth research findings",
+        direction_id=direction_id,
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+
+    outcome_eval = payload["outcome_evaluation"]
+    direction_outcomes = outcome_eval["directions"]
+    matched = next((d for d in direction_outcomes if d["id"] == direction_id), None)
+    assert matched is not None, f"direction {direction_id!r} not in outcome_evaluation"
+    assert "direction_knowledge" in matched, (
+        "direction_knowledge missing from direction outcome — linked knowledge not surfaced"
+    )
+    assert matched["direction_knowledge"][0]["title"] == "Auth research findings"

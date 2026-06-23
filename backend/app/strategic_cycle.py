@@ -232,6 +232,8 @@ async def mark_phase2_completed(
     vision_updated: bool = False,
     memos_available: int = 0,
     memos_cited: int = 0,
+    knowledge_available: int = 0,
+    knowledge_cited: int = 0,
     extra_metadata: Optional[Mapping[str, Any]] = None,
 ) -> Optional[StrategicCycle]:
     """Phase 2 task reached a terminal status with parsed output. Records
@@ -242,6 +244,10 @@ async def mark_phase2_completed(
     agent as citable context; ``memos_cited`` is the count whose task_ids
     appeared in the agent's output. Both are stored in cycle_metadata so
     operators can verify the direction success criterion (≥1 cited per cycle).
+
+    ``knowledge_available`` is the number of knowledge documents in the index
+    fed to the agent; ``knowledge_cited`` is the count whose IDs appeared in
+    the agent's cited set (via the cite_knowledge API op).
     """
     cycle = await get(session, cycle_id)
     if cycle is None:
@@ -257,6 +263,8 @@ async def mark_phase2_completed(
     new_meta = dict(cycle.cycle_metadata or {})
     new_meta["memos_available"] = memos_available
     new_meta["memos_cited"] = memos_cited
+    new_meta["knowledge_available"] = knowledge_available
+    new_meta["knowledge_cited"] = knowledge_cited
     if extra_metadata:
         new_meta.update(extra_metadata)
     cycle.cycle_metadata = new_meta
@@ -315,7 +323,8 @@ async def query_recent_memo_citations(
         payload0 = (t.payloads or [{}])[0] if isinstance(t.payloads, list) else {}
         source_finding = (
             payload0.get("source_finding")
-            if isinstance(payload0, dict) and isinstance(payload0.get("source_finding"), dict)
+            if isinstance(payload0, dict)
+            and isinstance(payload0.get("source_finding"), dict)
             else {}
         )
         context = t.context if isinstance(t.context, dict) else {}
@@ -337,10 +346,14 @@ async def query_recent_memo_citations(
         }
         # Enriched fields — additive, all optional. Consumers that read only
         # task_id/summary_excerpt are unaffected.
-        reasoning_kind = payload0.get("reasoning_kind") if isinstance(payload0, dict) else None
+        reasoning_kind = (
+            payload0.get("reasoning_kind") if isinstance(payload0, dict) else None
+        )
         if reasoning_kind:
             entry["reasoning_kind"] = str(reasoning_kind)
-        direction_id = payload0.get("direction_id") if isinstance(payload0, dict) else None
+        direction_id = (
+            payload0.get("direction_id") if isinstance(payload0, dict) else None
+        )
         if direction_id:
             entry["direction_id"] = str(direction_id)
         if isinstance(memo, dict):
@@ -394,7 +407,9 @@ async def query_recent_memo_citations(
                 entry["final_metrics_excerpt"] = final_metrics_excerpt
         else:
             rationale_excerpt = _compact_text(
-                source_finding.get("rationale") if isinstance(source_finding, dict) else None
+                source_finding.get("rationale")
+                if isinstance(source_finding, dict)
+                else None
             )
             if rationale_excerpt:
                 entry["rationale_excerpt"] = rationale_excerpt

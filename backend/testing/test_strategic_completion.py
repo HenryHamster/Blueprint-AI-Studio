@@ -4698,6 +4698,58 @@ async def test_cite_memos_does_not_set_api_called(client, db_session):
 
 
 @pytest.mark.asyncio
+async def test_cite_knowledge_stores_ids_without_api_called(client, db_session):
+    """cite_knowledge persists cited IDs but must NOT flip _strategic_api_called.
+
+    Mirrors the cite_memos rationale: this op is auto-invoked by the thinker
+    pass so it must not mask a no-op executor cycle as a success.
+    """
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="CK-HTTP", vm="vm-ck")
+    token = create_agent_token(str(task.id), "vm-ck", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "cite_knowledge",
+            "data": {"cited_knowledge_ids": ["doc-aaa", "doc-bbb"]},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "cite_knowledge"
+    assert body["count"] == 2
+
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_cited_knowledge_ids") == [
+        "doc-aaa",
+        "doc-bbb",
+    ]
+    assert (task.context or {}).get("_strategic_api_called") is not True
+
+
+@pytest.mark.asyncio
+async def test_cite_knowledge_rejects_missing_field(client, db_session):
+    """cite_knowledge returns 400 when cited_knowledge_ids is absent or not a list."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="CK-Bad", vm="vm-ck-bad")
+    token = create_agent_token(str(task.id), "vm-ck-bad", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "cite_knowledge",
+            "data": {"wrong_field": ["doc-1"]},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
 async def test_set_strategic_challenge_stores_record_without_api_called(
     client, db_session
 ):
@@ -10110,6 +10162,86 @@ async def test_memos_cited_filters_to_available_only(db_session, mocker):
     )
     assert meta.get("memos_cited") == 1, (
         f"memos_cited should be 1 (only memo_id intersects available set), got {meta.get('memos_cited')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cycle_records_knowledge_citation_counts(db_session, mocker):
+    """A completed strategic cycle records knowledge_available and knowledge_cited counts.
+
+    knowledge_available == number of KnowledgeDocument rows in the project;
+    knowledge_cited == count of IDs in task.context["_strategic_cited_knowledge_ids"]
+    that intersect the available index (API path — reliable structured output).
+    """
+    from unittest.mock import AsyncMock
+    from app.models import KnowledgeDocument, TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from app import strategic_cycle
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="KnowledgeCount",
+        user_id="u-knowledge",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A source task is required as a FK for KnowledgeDocument.
+    source_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "web_research", "topic": "Architecture patterns"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    knowledge_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task.id,
+        title="Architecture patterns overview",
+        summary="Summary of architecture patterns.",
+        body="Full body.",
+    )
+    db_session.add(knowledge_doc)
+    await db_session.commit()
+    await db_session.refresh(knowledge_doc)
+
+    doc_id = str(knowledge_doc.id)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={
+            "_strategic_vision_set": True,
+            "strategic_cycle_id": cycle.id,
+            "_strategic_cited_knowledge_ids": [doc_id],
+        },
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    await _handle_strategic_completion(sr_task, "", db_session)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert meta.get("knowledge_available") == 1, (
+        f"knowledge_available should be 1 (one knowledge doc), got {meta.get('knowledge_available')}"
+    )
+    assert meta.get("knowledge_cited") == 1, (
+        f"knowledge_cited should be 1 (doc_id in _strategic_cited_knowledge_ids), got {meta.get('knowledge_cited')}"
     )
 
 

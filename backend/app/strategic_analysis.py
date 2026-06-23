@@ -203,6 +203,7 @@ def _build_outcome_evaluation(
     project,
     cycle_history: list | None = None,
     findings_by_direction: dict | None = None,
+    knowledge_by_direction: dict | None = None,
 ) -> dict:
     """Build a planned-vs-actual assessment for the strategic agent.
 
@@ -298,9 +299,7 @@ def _build_outcome_evaluation(
             failed_approaches = parsed.get("failed", [])
 
         total_prs = raw_merged + rejected
-        acceptance_rate = (
-            round(raw_merged / total_prs, 3) if total_prs > 0 else None
-        )
+        acceptance_rate = round(raw_merged / total_prs, 3) if total_prs > 0 else None
         # avg_time_to_merge_hours: average of per-cycle values where present
         merge_time_values = [
             h["avg_time_to_merge_hours"]
@@ -419,6 +418,10 @@ def _build_outcome_evaluation(
             live_rows = findings_by_direction.get(d.get("id") or "", [])
             if live_rows:
                 outcome["recent_findings"] = live_rows[:5]
+        if knowledge_by_direction is not None:
+            dir_knowledge = knowledge_by_direction.get(d.get("id") or "", [])
+            if dir_knowledge:
+                outcome["direction_knowledge"] = dir_knowledge[:5]
         # Include lifetime totals for context
         lifetime_cycles = len(history) + (agg.get("total_cycles") or 0)
         lifetime_merged = sum(h.get("prs_merged", 0) for h in history) + (
@@ -746,7 +749,9 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
         return sum(
             int(h.get("generalized_successes", h.get("prs_merged", 0)) or 0)
             for h in history
-        ) + int(agg.get("total_generalized_successes") or agg.get("total_prs_merged") or 0)
+        ) + int(
+            agg.get("total_generalized_successes") or agg.get("total_prs_merged") or 0
+        )
 
     quality_scores = [
         round(_compute_direction_quality_score(d), 3) for d in directions if d.get("id")
@@ -852,7 +857,9 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
     # differs from decision_accuracy_rate (i.e. non-code successes exist).
     if generalized_successes_count != successes:
         result["created_generalized_successful"] = generalized_successes_count
-        result["generalized_decision_accuracy_rate"] = generalized_decision_accuracy_rate
+        result["generalized_decision_accuracy_rate"] = (
+            generalized_decision_accuracy_rate
+        )
     if retired_breakdown:
         result["retired"] = retired_breakdown
         result["retired_accuracy_rate"] = retired_accuracy_rate
@@ -899,7 +906,9 @@ def _build_strategic_effectiveness(
         return sum(
             int(h.get("generalized_successes", h.get("prs_merged", 0)) or 0)
             for h in history
-        ) + int(agg.get("total_generalized_successes") or agg.get("total_prs_merged") or 0)
+        ) + int(
+            agg.get("total_generalized_successes") or agg.get("total_prs_merged") or 0
+        )
 
     recent = completed[-5:]
     cycle_metrics: list = []

@@ -2430,6 +2430,8 @@ class Alert(SQLModel, table=True):
 # knowing the exact key strings.
 CYCLE_META_MEMOS_AVAILABLE = "memos_available"
 CYCLE_META_MEMOS_CITED = "memos_cited"
+CYCLE_META_KNOWLEDGE_AVAILABLE = "knowledge_available"
+CYCLE_META_KNOWLEDGE_CITED = "knowledge_cited"
 
 
 class StrategicCycle(SQLModel, table=True):

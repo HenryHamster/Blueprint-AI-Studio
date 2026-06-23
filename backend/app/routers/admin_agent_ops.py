@@ -2678,6 +2678,39 @@ async def strategic_operation(
         )
         return _resp({"status": "ok", "op": "cite_memos", "count": len(cited_ids)})
 
+    elif payload.op == "cite_knowledge":
+        # Store the knowledge document IDs the strategist cited in its analysis.
+        # Mirrors cite_memos: the completion handler reads this to count
+        # knowledge_cited reliably.  data must be {"cited_knowledge_ids": [...]}.
+        if not isinstance(data, dict) or not isinstance(
+            data.get("cited_knowledge_ids"), list
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail='cite_knowledge: data must be {"cited_knowledge_ids": [...]}',
+            )
+        raw_ids = data["cited_knowledge_ids"]
+        cited_ids = [
+            str(i).strip()[:64]
+            for i in raw_ids
+            if isinstance(i, str) and str(i).strip()
+        ]
+        ctx = task.context or {}
+        # NOTE: deliberately do NOT set _strategic_api_called here — mirrors the
+        # cite_memos rationale: this op is auto-invoked before the executor pass
+        # and must not mask a no-op cycle as a success.
+        task.context = {
+            **ctx,
+            "_strategic_cited_knowledge_ids": cited_ids,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] Stored {len(cited_ids)} cited knowledge id(s) for task {task.id}"
+        )
+        return _resp({"status": "ok", "op": "cite_knowledge", "count": len(cited_ids)})
+
     elif payload.op == "set_strategic_challenge":
         # Store the independent adversarial SECOND OPINION over the strategist's
         # own self-produced judgments (evidence_progress ratings, retirement

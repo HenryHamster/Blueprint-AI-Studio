@@ -25,7 +25,7 @@ from app.direction_outcomes import (
     verified_merged_count,
 )
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
-from app.knowledge_query import build_knowledge_index
+from app.knowledge_query import build_knowledge_index, fetch_direction_knowledge_index
 from app.models import (
     Task,
     Project,
@@ -5948,6 +5948,14 @@ async def _spawn_strategic_review(
     # design output) so the strategist knows what knowledge already exists and
     # can fetch full bodies on demand — included only when documents exist.
     _knowledge_index = await build_knowledge_index(session, project.id)
+    _active_direction_ids = [
+        d.get("id")
+        for d in (project.directions or [])
+        if d.get("status") in ("active", "expired", "paused") and d.get("id")
+    ]
+    _knowledge_by_direction = await fetch_direction_knowledge_index(
+        session, project.id, _active_direction_ids
+    )
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -6010,7 +6018,11 @@ async def _spawn_strategic_review(
                 if (_staged_directions := _build_staged_directions_summary(project))
                 else {}
             ),
-            "outcome_evaluation": _build_outcome_evaluation(project, cycle_history),
+            "outcome_evaluation": _build_outcome_evaluation(
+                project,
+                cycle_history,
+                knowledge_by_direction=_knowledge_by_direction or None,
+            ),
             "recent_interventions": recent_interventions,
             "prediction_calibration_factor": calibration_factor,
             "prediction_calibration_note": calibration_note,
