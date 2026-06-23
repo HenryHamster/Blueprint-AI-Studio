@@ -14556,3 +14556,74 @@ async def test_explicit_prereq_genuine_cross_tree_inherits_base(db_session, mock
     assert (dep.first_payload or {}).get("base_branch") == "main", (
         "explicit genuine cross-tree code-dep must inherit foundation base_branch"
     )
+
+
+@_pytest.mark.asyncio
+async def test_genuine_cross_tree_none_base_branch_is_noop(db_session, mocker):
+    """When the foundation's payload has no base_branch, _maybe_inherit_base
+    must return early and NOT overwrite the dependent's own base_branch with
+    None or an empty string.
+
+    This guards against silent removal of the guard added in a8181941.
+    """
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-xbase-none-base"
+    )
+
+    # Foundation with NO base_branch in its payload (key absent entirely).
+    existing_foundation = _Task(
+        project_id=_project.id,
+        title="Build notification core",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        payloads=[{"type": "create"}],  # no base_branch key
+        context={"related_files": ["backend/app/notifications.py"]},
+    )
+    db_session.add(existing_foundation)
+    await db_session.commit()
+    await db_session.refresh(existing_foundation)
+
+    # Finding declares the foundation explicitly by task ID with file overlap
+    # (genuine code-dep) — but since foundation has no base_branch, the guard
+    # must fire and leave the dependent's own base_branch intact.
+    finding = _make_finding(
+        title="Add notification endpoint", direction_id=direction["id"]
+    )
+    finding["prerequisite"] = {"kind": "task", "ref": str(existing_foundation.id)}
+    finding["related_files"] = ["backend/app/notifications.py"]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    dep_children = [c for c in children if "notification" in c.title.lower()]
+    assert len(dep_children) == 1, "dependent finding must spawn as a child task"
+    dep = dep_children[0]
+    assert str(existing_foundation.id) in (dep.depends_on or []), (
+        "dependent must be wired to the foundation even when base_branch is absent"
+    )
+    dep_base = (dep.first_payload or {}).get("base_branch")
+    assert dep_base is not None, (
+        "_maybe_inherit_base must not overwrite dependent base_branch with None "
+        "when foundation has no base_branch"
+    )
+    assert dep_base != "", (
+        "_maybe_inherit_base must not overwrite dependent base_branch with empty "
+        "string when foundation has no base_branch"
+    )
