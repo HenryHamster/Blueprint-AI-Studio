@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Network, Compass, Microscope, BookOpen, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare } from 'lucide-react';
+import { Activity, Compass, Microscope, BookOpen, Archive, Plus, MoreHorizontal, Settings, MessageSquare, Bell } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
@@ -34,6 +34,10 @@ export interface HeaderBarProps {
   openMessageCount: number;
   newSinceLastVisitCount?: number;
   needsAttentionCount?: number;
+  alertCount?: number;
+  alertMaxSeverity?: 'ERROR' | 'WARNING' | 'INFO' | null;
+  showAlertsPopover?: boolean;
+  onToggleAlertsPopover?: () => void;
   onOpenNewTaskModal: () => void;
   onShowDirections: () => void;
   onSignOut: () => void;
@@ -582,6 +586,28 @@ export function HeaderBar(props: HeaderBarProps) {
 
         {/* More secondary buttons — desktop only */}
         <div className="hidden md:flex items-center gap-1">
+          {/* Alerts badge — only shown when there are active alerts */}
+          {(props.alertCount ?? 0) > 0 && (
+            /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
+            <button
+              onClick={props.onToggleAlertsPopover}
+              className={`p-2 rounded-md text-xs transition-colors flex items-center gap-1 ${
+                props.showAlertsPopover
+                  ? (props.alertMaxSeverity === 'ERROR' ? 'text-red-400 bg-red-500/10'
+                    : props.alertMaxSeverity === 'WARNING' ? 'text-amber-400 bg-amber-500/10'
+                    : 'text-blue-400 bg-blue-500/10')
+                  : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
+              }`}
+              title={`${props.alertCount} alert${(props.alertCount ?? 0) > 1 ? 's' : ''}`}
+            >
+              <span className={`w-2 h-2 rounded-full ${
+                props.alertMaxSeverity === 'ERROR' ? 'bg-red-500' :
+                props.alertMaxSeverity === 'WARNING' ? 'bg-amber-500' : 'bg-blue-500'
+              }`} />
+              <Bell className="w-3.5 h-3.5" />
+              <span>{props.alertCount}</span>
+            </button>
+          )}
           {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
           <button
             onClick={onToggleArchive}
@@ -598,7 +624,7 @@ export function HeaderBar(props: HeaderBarProps) {
             className={`p-2 rounded-md text-xs transition-colors relative flex items-center ${
               showMessages ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
             }`}
-            title="Messages"
+            title="Compose message"
           >
             <MessageSquare className="w-4 h-4" />
             {props.openMessageCount > 0 && (
@@ -625,31 +651,6 @@ export function HeaderBar(props: HeaderBarProps) {
               </button>
             </>
           )}
-          {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-          <button
-            onClick={onToggleResearchBrowser}
-            className={`p-2 rounded-md text-xs transition-colors relative flex items-center ${
-              showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
-            }`}
-            title="Research Findings"
-          >
-            <Microscope className="w-4 h-4" />
-            {pendingFindingsCount > 0 && (
-              <span className="ml-0.5 bg-cyan-500 text-black text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
-                {pendingFindingsCount}
-              </span>
-            )}
-          </button>
-          {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-          <button
-            onClick={onToggleKnowledgeBrowser}
-            className={`p-2 rounded-md text-xs transition-colors flex items-center ${
-              showKnowledgeBrowser ? 'text-violet-400 bg-violet-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
-            }`}
-            title="Knowledge Library"
-          >
-            <BookOpen className="w-4 h-4" />
-          </button>
         </div>
 
         {/* Mobile-only autonomy control — full MetricsBar is desktop-only, but autonomy on/off must be reachable on mobile */}
@@ -672,27 +673,6 @@ export function HeaderBar(props: HeaderBarProps) {
           </button>
           {showMobileMenu && (
             <div className="absolute right-0 top-full mt-2 w-56 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-2 z-50">
-              <button
-                onClick={() => { onSetViewMode('home'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${viewMode === 'home' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-              >
-                <LayoutDashboard className="w-4 h-4 shrink-0" />
-                <span>Dashboard</span>
-              </button>
-              <button
-                onClick={() => { onSetViewMode('kanban'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${viewMode === 'kanban' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-              >
-                <LayoutGrid className="w-4 h-4 shrink-0" />
-                <span>Kanban view</span>
-              </button>
-              <button
-                onClick={() => { onSetViewMode('pipeline'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${viewMode === 'pipeline' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-              >
-                <Network className="w-4 h-4 shrink-0" />
-                <span>Pipeline view</span>
-              </button>
               <button
                 onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
                 className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}

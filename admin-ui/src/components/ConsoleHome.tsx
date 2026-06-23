@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { AlertTriangle, BarChart2, Clock, ExternalLink } from 'lucide-react';
+import { AlertTriangle, BarChart2, Clock, ExternalLink, Layers } from 'lucide-react';
 import { useDashboardDigest } from '../hooks/useDashboardDigest';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { fetchFleetUtilization } from '../api';
@@ -18,6 +18,7 @@ interface ConsoleHomeProps {
   tasks: Task[];
   onViewTask: (task: Task) => void;
   onShowAnalytics: () => void;
+  onOpenFleet?: () => void;
 }
 
 function NeedsAttentionSection({
@@ -74,6 +75,7 @@ export function ConsoleHome({
   tasks,
   onViewTask,
   onShowAnalytics,
+  onOpenFleet,
 }: ConsoleHomeProps) {
   const pageActiveCount = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
   const pageQueuedCount = tasks.filter(t => t.status === 'QUEUED').length;
@@ -132,8 +134,21 @@ export function ConsoleHome({
         onViewTask={handleViewTaskById}
       />
 
-      {/* Fleet summary strip */}
-      <FleetCapacityCard data={fleetData} loading={fleetLoading} />
+      {/* Fleet summary strip — click to open full fleet detail drawer */}
+      <div className="relative group">
+        <FleetCapacityCard data={fleetData} loading={fleetLoading} />
+        {onOpenFleet && (
+          // eslint-disable-next-line viewport/min-touch-target
+          <button
+            onClick={onOpenFleet}
+            className="absolute top-2 right-2 flex items-center gap-1 text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors px-2 py-1 rounded bg-neutral-900/80 border border-neutral-800/60 opacity-0 group-hover:opacity-100"
+            title="View full fleet details"
+          >
+            <Layers className="w-3 h-3" />
+            Details
+          </button>
+        )}
+      </div>
 
       {/* Analytics link */}
       <div className="flex justify-end pt-1">

@@ -1,6 +1,6 @@
 import { useMemo, useRef, useEffect, useState, useCallback } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { Activity, AlertCircle, LayoutList, CheckSquare } from 'lucide-react';
+import { Activity, AlertCircle, LayoutList, CheckSquare, Microscope, BookOpen } from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
 import { ConfirmDialog } from './components/ConfirmDialog';
@@ -18,12 +18,13 @@ import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen, fetchBac
 import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
-import { AlertsBanner } from './components/AlertsBanner';
+import { AlertsPopover } from './components/AlertsPopover';
+import { ComposeDrawer } from './components/ComposeDrawer';
+import { FleetDetailDrawer } from './components/FleetDetailDrawer';
 import { NewTaskModal } from './components/NewTaskModal';
 import { NewProjectModal } from './components/NewProjectModal';
 import { HeaderBar } from './components/HeaderBar';
 import type { SectionId } from './components/SettingsDropdown';
-import { TaskLaunchFAB } from './components/TaskLaunchFAB';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { DashboardHome } from './components/DashboardHome';
@@ -48,7 +49,6 @@ import type { Task } from './components/TaskCard';
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
-import { WarmVmPanel } from './components/WarmVmPanel';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 
@@ -403,6 +403,30 @@ export default function App() {
     return alerts.filter(a => !dismissedZoneAlertIds.has(a.id));
   }, [s.zoneHealth, dismissedZoneAlertIds]);
 
+  const combinedAlerts = useMemo(() => [...zoneHealthAlerts, ...s.alerts], [zoneHealthAlerts, s.alerts]);
+  const alertMaxSeverity: 'ERROR' | 'WARNING' | 'INFO' | null = combinedAlerts.some(a => a.severity === 'ERROR') ? 'ERROR'
+    : combinedAlerts.some(a => a.severity === 'WARNING') ? 'WARNING'
+    : combinedAlerts.length > 0 ? 'INFO' : null;
+
+  const pendingFindingsCount = useMemo(() => {
+    const implemented = new Set<string>();
+    for (const t of s.tasks) {
+      const ctx = t.context as Record<string, unknown> | undefined;
+      if (ctx?.research_task_id && ctx?.finding_index !== undefined) {
+        implemented.add(`${ctx.research_task_id}-${ctx.finding_index}`);
+      }
+    }
+    let count = 0;
+    for (const t of s.tasks) {
+      if (t.task_type !== 'research' || t.status !== 'COMPLETED' || !t.research_findings) continue;
+      const arr = Array.isArray(t.research_findings) ? t.research_findings : [];
+      arr.forEach((_: unknown, i: number) => {
+        if (!implemented.has(`${t.id}-${i}`)) count++;
+      });
+    }
+    return count;
+  }, [s.tasks]);
+
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
 
@@ -482,11 +506,6 @@ export default function App() {
       s.setViewMode('kanban');
     }
   };
-
-  // Catch-Up, Pipeline Health, Pipeline Regressions, and VM Fleet are
-  // home-dashboard furniture; on every other view they pushed the actual
-  // content below the fold.
-  const onDashboardHome = activeTab === 'home' && !s.showArchive && !s.showUserManagement && !s.showMessages;
 
   if (s.authLoading) {
     return (
@@ -585,8 +604,15 @@ export default function App() {
         onToggleKnowledgeBrowser={() => s.setShowKnowledgeBrowser(prev => !prev)}
         showArchive={s.showArchive}
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
-        showMessages={s.showMessages}
-        onToggleMessages={() => s.setShowMessages(prev => !prev)}
+        showMessages={s.showMessages || s.showComposeDrawer}
+        onToggleMessages={() => {
+          if (s.showMessages) { s.setShowMessages(false); }
+          else { s.setShowComposeDrawer(prev => !prev); }
+        }}
+        alertCount={combinedAlerts.length}
+        alertMaxSeverity={alertMaxSeverity}
+        showAlertsPopover={s.showAlertsPopover}
+        onToggleAlertsPopover={() => s.setShowAlertsPopover(prev => !prev)}
         onOpenActivityFeed={() => setShowActivityFeed(true)}
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
@@ -817,26 +843,7 @@ export default function App() {
 
       <VersionMismatchBanner />
 
-      <AlertsBanner
-        alerts={[...zoneHealthAlerts, ...s.alerts]}
-        onDismiss={(id) => {
-          if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
-          else s.dismissAlert(id);
-        }}
-        onDismissAll={() => {
-          setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
-          s.dismissAllAlerts();
-        }}
-        onViewTask={handleViewTask}
-        projectId={s.selectedProjectId ?? undefined}
-        onSpawnSrInvestigation={s.selectedProjectId ? handleSpawnSrInvestigation : undefined}
-        activeInvestigationTaskIds={srInvestigationTaskIds}
-      />
-
-
       {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
-
-      {onDashboardHome && <WarmVmPanel onViewTask={handleViewTask} projects={s.projects} />}
 
 
       {s.error && (
@@ -928,11 +935,12 @@ export default function App() {
             tasks={s.tasks}
             onViewTask={s.handleViewLogs}
             onShowAnalytics={() => setShowAnalytics(true)}
+            onOpenFleet={() => s.setShowFleetDetail(true)}
           />
         </ErrorBoundary>
       ) : (
         <>
-          {/* Board view mode sub-tabs */}
+          {/* Board view mode sub-tabs + Research/Knowledge toolbar buttons */}
           <div className="flex items-center gap-1 shrink-0 mb-1">
             {(['kanban', 'pipeline'] as const).map(mode => (
               <button
@@ -947,6 +955,34 @@ export default function App() {
                 {mode.charAt(0).toUpperCase() + mode.slice(1)}
               </button>
             ))}
+            <div className="flex-1" />
+            {/* eslint-disable-next-line viewport/min-touch-target */}
+            <button
+              onClick={() => s.setShowResearchBrowser(prev => !prev)}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors relative ${
+                s.showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
+              }`}
+              title="Research Findings"
+            >
+              <Microscope className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Research</span>
+              {pendingFindingsCount > 0 && (
+                <span className="ml-0.5 bg-cyan-500 text-black text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
+                  {pendingFindingsCount}
+                </span>
+              )}
+            </button>
+            {/* eslint-disable-next-line viewport/min-touch-target */}
+            <button
+              onClick={() => s.setShowKnowledgeBrowser(prev => !prev)}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${
+                s.showKnowledgeBrowser ? 'text-violet-400 bg-violet-500/10' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
+              }`}
+              title="Knowledge Library"
+            >
+              <BookOpen className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Knowledge</span>
+            </button>
           </div>
 
           <div className="flex items-center gap-2 shrink-0 mb-1 flex-wrap">
@@ -1323,10 +1359,46 @@ export default function App() {
 
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
 
-      <TaskLaunchFAB
-        onClick={s.openNewTaskModal}
-        visible={!s.showNewTaskModal && !s.logTask && !showNewProjectModal && !s.showMessages}
-      />
+      {s.showAlertsPopover && combinedAlerts.length > 0 && (
+        <AlertsPopover
+          alerts={combinedAlerts}
+          onDismiss={(id) => {
+            if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
+            else s.dismissAlert(id);
+          }}
+          onDismissAll={() => {
+            setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
+            s.dismissAllAlerts();
+          }}
+          onViewTask={handleViewTask}
+          projectId={s.selectedProjectId ?? undefined}
+          onSpawnSrInvestigation={s.selectedProjectId ? handleSpawnSrInvestigation : undefined}
+          activeInvestigationTaskIds={srInvestigationTaskIds}
+          onClose={() => s.setShowAlertsPopover(false)}
+        />
+      )}
+
+      {s.showComposeDrawer && (
+        <ComposeDrawer
+          projectId={s.selectedProjectId}
+          userEmail={s.user?.email ?? ''}
+          onOpenFullPanel={() => {
+            s.setShowComposeDrawer(false);
+            s.setShowMessages(true);
+          }}
+          onClose={() => s.setShowComposeDrawer(false)}
+          addToast={s.addToast}
+          strategistActive={s.strategistActive}
+        />
+      )}
+
+      {s.showFleetDetail && (
+        <FleetDetailDrawer
+          onClose={() => s.setShowFleetDetail(false)}
+          onViewTask={handleViewTask}
+          projects={s.projects}
+        />
+      )}
 
       {s.confirmDialog && (
         <ConfirmDialog

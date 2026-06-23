@@ -91,6 +91,9 @@ export function useAppState() {
     showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     showMessages, setShowMessages,
+    showComposeDrawer, setShowComposeDrawer,
+    showFleetDetail, setShowFleetDetail,
+    showAlertsPopover, setShowAlertsPopover,
     showSettings, setShowSettings,
     showDirections, setShowDirections,
     showMetrics, setShowMetrics,
@@ -588,6 +591,9 @@ export function useAppState() {
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     // Messages
     showMessages, setShowMessages,
+    showComposeDrawer, setShowComposeDrawer,
+    showFleetDetail, setShowFleetDetail,
+    showAlertsPopover, setShowAlertsPopover,
     // New task modal
     showNewTaskModal, setShowNewTaskModal,
     newTaskRepo, newTaskBranch, newTaskTitle, newTaskPrompt, newTaskType,
