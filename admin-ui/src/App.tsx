@@ -896,6 +896,7 @@ export default function App() {
           onUnarchiveTask={s.handleUnarchiveTask}
           archiveSortOrder={s.archiveSortOrder}
           setArchiveSortOrder={s.setArchiveSortOrder}
+          onPurgeArchive={s.handlePurgeArchive}
         />
       ) : (
         <>

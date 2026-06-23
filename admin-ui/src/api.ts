@@ -2655,6 +2655,18 @@ export async function fetchArchivedProjects(
   return Array.isArray(data?.items) ? data.items : [];
 }
 
+export async function purgeArchive(olderThanDays?: number): Promise<{ deleted_count: number; has_more: boolean }> {
+  const body: Record<string, number> = {};
+  if (olderThanDays !== undefined) body.older_than_days = olderThanDays;
+  const res = await apiFetch('/api/admin/tasks/purge-archive', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Failed to purge archive: ${res.status}`);
+  return res.json();
+}
+
 export interface NullBranchConfigEntry {
   id: string;
   name: string;

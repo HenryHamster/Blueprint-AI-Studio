@@ -2601,6 +2601,215 @@ class TestArchiveProject:
         assert archived.id not in ids
 
 
+class TestPurgeArchive:
+    """POST /api/admin/tasks/purge-archive permanently deletes archived tasks."""
+
+    @pytest.mark.asyncio
+    async def test_purge_deletes_archived_tasks(self, client: AsyncClient, db_session):
+        """Purging the archive permanently removes archived tasks."""
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+        task = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["deleted_count"] >= 1
+
+        # Task must no longer exist in the database
+        result = await db_session.execute(select(Task).where(Task.id == task_id))
+        assert result.scalars().first() is None
+
+    @pytest.mark.asyncio
+    async def test_purge_only_removes_archived_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """Purge must not touch live (non-archived) tasks."""
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+        live = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=False
+        )
+        archived = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(live)
+        db_session.add(archived)
+        await db_session.commit()
+        live_id, archived_id = live.id, archived.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200
+
+        # Live task survives
+        live_row = (
+            (await db_session.execute(select(Task).where(Task.id == live_id)))
+            .scalars()
+            .first()
+        )
+        assert live_row is not None
+
+        # Archived task is gone
+        gone = (
+            (await db_session.execute(select(Task).where(Task.id == archived_id)))
+            .scalars()
+            .first()
+        )
+        assert gone is None
+
+    @pytest.mark.asyncio
+    async def test_purge_older_than_days_filter(self, client: AsyncClient, db_session):
+        """older_than_days skips recently archived tasks."""
+        from testing.factories import make_task
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        old_ts = _utcnow() - timedelta(days=60)
+        recent_ts = _utcnow() - timedelta(days=1)
+
+        old = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            archived=True,
+            created_at=old_ts,
+        )
+        recent = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            archived=True,
+            created_at=recent_ts,
+        )
+        db_session.add(old)
+        db_session.add(recent)
+        await db_session.commit()
+        old_id, recent_id = old.id, recent.id
+
+        resp = await client.post(
+            "/api/admin/tasks/purge-archive", json={"older_than_days": 30}
+        )
+        assert resp.status_code == 200
+
+        # Old task deleted, recent task survives
+        assert (
+            await db_session.execute(select(Task).where(Task.id == old_id))
+        ).scalars().first() is None
+        assert (
+            await db_session.execute(select(Task).where(Task.id == recent_id))
+        ).scalars().first() is not None
+
+    @pytest.mark.asyncio
+    async def test_purge_returns_zero_when_nothing_to_delete(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns deleted_count=0 when no archived tasks exist."""
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200
+        assert resp.json()["deleted_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_purge_rejects_invalid_older_than_days(
+        self, client: AsyncClient, db_session
+    ):
+        """older_than_days=0 is rejected with 400."""
+        resp = await client.post(
+            "/api/admin/tasks/purge-archive", json={"older_than_days": 0}
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_purge_does_not_delete_other_users_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """Purge is scoped to the caller's projects only."""
+        from testing.factories import make_task
+
+        foreign = Project(name="foreign-project", user_id="other-user-999")
+        db_session.add(foreign)
+        await db_session.commit()
+        await db_session.refresh(foreign)
+
+        task = make_task(
+            project_id=foreign.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200
+
+        # Foreign project's archived task must survive
+        row = (
+            (await db_session.execute(select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+        assert row is not None
+
+
+    @pytest.mark.asyncio
+    async def test_purge_detaches_surviving_child_from_archived_parent(
+        self, client: AsyncClient, db_session
+    ):
+        """Purging an archived parent with a surviving child must succeed.
+
+        The self-referential FK (task.parent_task_id -> task.id) uses NO ACTION,
+        so deleting a parent while a live child still references it raises
+        IntegrityError and rolls back the whole purge.  The fix nulls out
+        parent_task_id on surviving tasks before the DELETE.
+        """
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+
+        # Archived parent — eligible for purge
+        parent = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(parent)
+        await db_session.flush()
+
+        # Live child referencing the archived parent — must NOT be deleted
+        child = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=False
+        )
+        child.parent_task_id = parent.id
+        db_session.add(child)
+        await db_session.commit()
+        parent_id, child_id = parent.id, child.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["deleted_count"] >= 1
+
+        # Archived parent is gone
+        gone = (
+            (await db_session.execute(select(Task).where(Task.id == parent_id)))
+            .scalars()
+            .first()
+        )
+        assert gone is None
+
+        # Live child survives with its lineage detached
+        await db_session.expire_all()
+        surviving = (
+            (await db_session.execute(select(Task).where(Task.id == child_id)))
+            .scalars()
+            .first()
+        )
+        assert surviving is not None
+        assert surviving.parent_task_id is None
+
+
 class TestResetProjectStateHelper:
     def test_reset_project_state_clears_only_target(self):
         """reset_project_state pops one project's keys, leaves others intact."""

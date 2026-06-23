@@ -51,6 +51,7 @@ export function useAppState() {
     archiveDateRange, setArchiveDateRange,
     archiveTotalTasks, fetchArchiveTasks,
     archiveSortOrder, setArchiveSortOrder,
+    handlePurgeArchive,
   } = useArchive(addToast);
 
   // ── Shared refs (cross-domain glue owned by the facade) ──────────────────
@@ -666,6 +667,7 @@ export function useAppState() {
     archiveDateRange, setArchiveDateRange,
     archiveTotalTasks, fetchArchiveTasks,
     archiveSortOrder, setArchiveSortOrder,
+    handlePurgeArchive,
     // Misc
     lastVisitTimestamp,
     lastRefresh, wsRef,

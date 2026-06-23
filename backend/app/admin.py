@@ -20,7 +20,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import func, update, case
+from sqlalchemy import func, update, case, delete
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
@@ -621,6 +621,69 @@ async def bulk_archive_tasks(
     )
     await session.commit()
     return {"archived_count": len(lockable_ids), "has_more": len(lockable_ids) == 5000}
+
+
+class PurgeArchiveRequest(BaseModel):
+    older_than_days: int | None = (
+        None  # if set, only purge tasks older than this many days
+    )
+
+
+@router.post("/tasks/purge-archive")
+async def purge_archive_tasks(
+    request: PurgeArchiveRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Permanently delete archived tasks for the caller's projects.
+
+    Only tasks with ``archived=True`` are eligible — live/active tasks are
+    never touched. An optional ``older_than_days`` filter restricts deletion to
+    tasks created more than that many days ago, providing a safety window for
+    recently archived items. Up to 5000 tasks are deleted per call; callers
+    should repeat until ``deleted_count`` is zero if they need to drain a large
+    archive.
+    """
+    user_project_ids = _user_project_ids(current_user["user_id"])
+
+    where_clauses = [
+        Task.archived.is_(True),
+        Task.project_id.in_(user_project_ids),
+    ]
+    if request.older_than_days is not None:
+        if request.older_than_days < 1:
+            raise HTTPException(
+                status_code=400, detail="older_than_days must be at least 1"
+            )
+        cutoff = _utcnow() - timedelta(days=request.older_than_days)
+        where_clauses.append(Task.created_at < cutoff)
+
+    # Fetch up to 5000 IDs to delete in one batch. SKIP LOCKED avoids racing
+    # the orchestrator on tasks that happen to be transitioning (rare but safe).
+    select_stmt = (
+        select(Task.id)
+        .where(*where_clauses)
+        .limit(5000)
+        .with_for_update(skip_locked=True)
+    )
+    ids_to_delete = (await session.execute(select_stmt)).scalars().all()
+    if not ids_to_delete:
+        return {"deleted_count": 0, "has_more": False}
+
+    # Detach any surviving tasks whose parent_task_id points into the delete
+    # batch. The FK (task.parent_task_id -> task.id) was created with NO ACTION
+    # so the DB-level check fires at statement end — a live child referencing a
+    # to-be-deleted parent causes IntegrityError and rolls back the whole purge.
+    # Nulling it out preserves the live child while allowing the parent to be
+    # removed. We must NOT cascade-delete non-archived children.
+    await session.execute(
+        update(Task)
+        .where(Task.parent_task_id.in_(ids_to_delete))
+        .values(parent_task_id=None)
+    )
+    await session.execute(delete(Task).where(Task.id.in_(ids_to_delete)))
+    await session.commit()
+    return {"deleted_count": len(ids_to_delete), "has_more": len(ids_to_delete) == 5000}
 
 
 class BulkActionRequest(BaseModel):
