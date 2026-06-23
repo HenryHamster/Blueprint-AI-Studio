@@ -85,14 +85,22 @@ export interface RepairStructuredOutputResult<T> {
   retry: RunResult | null;
 }
 
+// Maximum characters of prior-output context to carry into the reopen prompt.
+// Enough to cover a few paragraphs of reasoning without bloating the context window.
+const MAX_PRIOR_OUTPUT_CHARS = 4000;
+
 // Composes a re-ask prompt that leads with a reason-specific preamble so the
-// agent knows exactly what was wrong, then appends the caller's schema
-// restatement. When missReason is null (shouldn't happen on the repair path but
-// defensive), returns the caller's prompt unchanged.
+// agent knows exactly what was wrong, appends a bounded tail of the first-pass
+// output as reformatting context, then appends the caller's schema restatement.
+// Including the prior output means recovery is a reformat rather than a cold
+// re-derivation (the first pass is often ~90s Opus work). When missReason is
+// null (shouldn't happen on the repair path but defensive), the prior context
+// is still included when non-empty so the caller's prompt gets full context.
 function buildMissAwarePrompt(
   missReason: FormatMissReason | null,
   requiredKeys: string[],
   callerPrompt: string,
+  priorOutput: string,
 ): string {
   let preamble: string;
   switch (missReason) {
@@ -116,7 +124,15 @@ function buildMissAwarePrompt(
       preamble = 'Your previous response parsed as JSON, but the array elements\' field values did not match the required schema — the shape did not match what was expected. Fix the field values to conform to the required format.';
       break;
     default:
+      if (priorOutput) {
+        const bounded = priorOutput.slice(-MAX_PRIOR_OUTPUT_CHARS);
+        return `[Prior output]\n${bounded}\n[End prior output]\n\n${callerPrompt}`;
+      }
       return callerPrompt;
+  }
+  if (priorOutput) {
+    const bounded = priorOutput.slice(-MAX_PRIOR_OUTPUT_CHARS);
+    return `${preamble}\n\n[Prior output]\n${bounded}\n[End prior output]\n\n${callerPrompt}`;
   }
   return `${preamble}\n\n${callerPrompt}`;
 }
@@ -207,7 +223,8 @@ export async function repairStructuredOutput<T = unknown>(
     sendLog(ws, `[INFO] First structured-output attempt produced no parseable ${mode} (allOutput=${(first.allOutput || '').length}b, lastResultText=${(first.lastResultText || '').length}b). Reopening with focused continuation.\n`);
     if (retryStatus) statusRef.value = retryStatus;
 
-    const missAwarePrompt = buildMissAwarePrompt(firstAttempt.missReason, requiredKeys, reopenPrompt);
+    const priorOutput = first.lastResultText || first.allOutput || '';
+    const missAwarePrompt = buildMissAwarePrompt(firstAttempt.missReason, requiredKeys, reopenPrompt, priorOutput);
     const tokensBefore = getLlmTelemetry();
     const retryRun = await runClaudeCode(
       missAwarePrompt, ws, statusRef, model, effort, disallowedTools,

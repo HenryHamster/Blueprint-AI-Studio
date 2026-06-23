@@ -589,6 +589,52 @@ describe('repairStructuredOutput', () => {
     expect(snap.format_repair_miss_by_reason).toEqual({});
   });
 
+  it('carries the first pass output into the reopen prompt as bounded context', async () => {
+    // Simulates a merge-grade first pass: the agent produced reasoning prose but
+    // never emitted the required JSON keys. The reopen must include that prior
+    // output so the agent can reformat rather than re-derive from scratch.
+    const firstPassOutput = [
+      'I reviewed the PR and found that the changes address the stated goal.',
+      'The implementation follows existing patterns in the codebase.',
+      'Overall assessment: the merge looks safe with only minor concerns.',
+    ].join('\n');
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, lastResultText: firstPassOutput, allOutput: '' })),
+    );
+
+    const sentPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The first pass output must appear verbatim in the reopen prompt.
+    expect(sentPrompt).toContain(firstPassOutput);
+    // The caller's schema restatement must still be present.
+    expect(sentPrompt).toContain(REOPEN_PROMPT);
+    // The miss-aware preamble must also be present.
+    expect(sentPrompt).toContain('missing required keys');
+  });
+
+  it('truncates prior output to the bounded tail when first pass output exceeds the limit', async () => {
+    // 4001-char first pass — reopen prompt must carry only the last 4000 chars.
+    const longOutput = 'x'.repeat(4001);
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, lastResultText: longOutput, allOutput: '' })),
+    );
+
+    const sentPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The leading character must be trimmed; the tail (last 4000 x's) must survive.
+    expect(sentPrompt).not.toContain('x'.repeat(4001));
+    expect(sentPrompt).toContain('x'.repeat(4000));
+    expect(sentPrompt).toContain(REOPEN_PROMPT);
+  });
+
   it('does NOT record infra failure when reopen exitCode is zero but output is unparseable', async () => {
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: 'still no json', lastResultText: 'nope',
