@@ -11,8 +11,10 @@ import {
   computeJobTerminalLabel,
   computeJobRpcDiagnostic,
   computeJobSpent,
+  computeJobRuntimeSec,
   fmtUsd,
   fmtCountdown,
+  fmtDuration,
 } from './ComputeJobsPanel.utils';
 
 const POLL_INTERVAL_MS = 10_000;
@@ -211,6 +213,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                     {job.backend}
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
                     {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
+                    {job.launch_contract?.provisioning_model ? ` · ${job.launch_contract.provisioning_model}` : ''}
                   </div>
                   {(() => {
                     const evidence = asLiveReleaseEvidence(job.polling_metadata?.live_release_evidence);
@@ -244,6 +247,38 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                 </div>
               </div>
 
+              {(() => {
+                if (active) return null;
+                const runtimeSec = computeJobRuntimeSec(job);
+                const deadlineSec = job.launch_contract?.requested_deadline_seconds;
+                const costRate =
+                  runtimeSec != null && runtimeSec > 0 && job.final_cost_usd != null
+                    ? job.final_cost_usd / (runtimeSec / 3600)
+                    : null;
+                if (runtimeSec === null && costRate === null) return null;
+                return (
+                  <div
+                    className="mb-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-neutral-400 font-mono"
+                    data-testid="compute-result-story"
+                  >
+                    {runtimeSec !== null && (
+                      <span>
+                        <span className="text-neutral-500">ran</span>{' '}
+                        {fmtDuration(runtimeSec)}
+                        {typeof deadlineSec === 'number' && (
+                          <span className="text-neutral-500"> / {fmtDuration(deadlineSec)} budget</span>
+                        )}
+                      </span>
+                    )}
+                    {costRate !== null && (
+                      <span>
+                        <span className="text-neutral-500">rate</span>{' '}
+                        {fmtUsd(costRate)}/hr
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-1.5 text-[10px] text-neutral-400 font-mono min-w-0">
                   <Clock className="w-3 h-3 shrink-0" />

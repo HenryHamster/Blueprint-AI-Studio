@@ -1,5 +1,6 @@
 import type { ComputeJob, ComputeRpcDiagnostic } from '../api';
 import { parseTimestamp } from '../utils/time';
+export { formatDurationSec as fmtDuration } from '../utils/time';
 
 const ACTIVE_STATUSES: ReadonlySet<ComputeJob['status']> = new Set([
   'QUEUED',
@@ -67,4 +68,14 @@ export function computeJobRpcDiagnostic(job: ComputeJob): ComputeRpcDiagnostic |
 export function computeJobSpent(job: ComputeJob): number {
   if (isComputeJobActive(job)) return job.accrued_cost_usd ?? 0;
   return job.final_cost_usd ?? job.accrued_cost_usd ?? 0;
+}
+
+/** Actual wall-clock runtime in seconds for a job that has both timestamps.
+ *  Returns null when either timestamp is absent or unparseable. */
+export function computeJobRuntimeSec(job: ComputeJob): number | null {
+  if (!job.started_at || !job.completed_at) return null;
+  const start = parseTimestamp(job.started_at).getTime();
+  const end = parseTimestamp(job.completed_at).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end) || end <= start) return null;
+  return Math.round((end - start) / 1000);
 }

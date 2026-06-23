@@ -690,6 +690,25 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           </div>
         </div>
       )}
+      {data.llm_cost_attribution && data.llm_cost_attribution.by_failure_class.length > 0 && (
+        <div data-testid="llm-cost-by-outcome-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+          <div className="flex justify-between items-center gap-4 mb-2">
+            <span className="text-neutral-400">LLM cost by terminal outcome</span>
+            <span className="text-neutral-500 font-mono">${data.llm_cost_attribution.total_llm_usd.toFixed(2)} total</span>
+          </div>
+          <div className="space-y-1">
+            {data.llm_cost_attribution.by_failure_class.map((row) => (
+              <div key={row.failure_class} className="flex items-center justify-between gap-3 text-[10px]">
+                <span className={row.failure_class === 'MERGED' ? 'text-emerald-400/80' : 'text-neutral-500'}>{row.failure_class}</span>
+                <div className="flex items-center gap-2 font-mono">
+                  <span className={row.failure_class === 'MERGED' ? 'text-emerald-400' : 'text-neutral-400'}>${row.total_cost_usd.toFixed(2)}</span>
+                  <span className="text-neutral-600">· {row.task_count}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {data.format_compliance && (
         <div data-testid="format-compliance-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
           <div className="flex justify-between items-center gap-4">

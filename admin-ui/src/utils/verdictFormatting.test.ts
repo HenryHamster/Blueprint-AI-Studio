@@ -5,18 +5,18 @@ import {
 } from './verdictFormatting';
 
 describe('formatVerdict', () => {
-  it('maps panel_review approve to a positive (emerald) badge with a human label', () => {
+  it('maps panel_review approve to a positive (success) badge with a human label', () => {
     const { label, tone } = formatVerdict('approve');
     expect(label).toBe('Approve');
     expect(tone).toBe('positive');
-    expect(verdictToneBadgeClass(tone)).toContain('emerald');
+    expect(verdictToneBadgeClass(tone)).toContain('status-success');
   });
 
-  it('maps panel_review request_changes to a blocking (red) badge with a human label', () => {
+  it('maps panel_review request_changes to a blocking badge with a human label', () => {
     const { label, tone } = formatVerdict('request_changes');
     expect(label).toBe('Request Changes');
     expect(tone).toBe('blocking');
-    expect(verdictToneBadgeClass(tone)).toContain('red');
+    expect(verdictToneBadgeClass(tone)).toContain('status-blocking');
   });
 
   it('is case-insensitive (REQUEST_CHANGES never leaks the raw token)', () => {
@@ -49,15 +49,15 @@ describe('formatVerdict', () => {
 describe('verdictTone / badge classes', () => {
   it('selects neutral styling for undetected', () => {
     expect(formatVerdict('undetected').tone).toBe('neutral');
-    expect(verdictToneBadgeClass(formatVerdict('undetected').tone)).toContain('neutral');
+    expect(verdictToneBadgeClass(formatVerdict('undetected').tone)).toContain('status-neutral');
   });
 
-  it('selects info (cyan) styling for unknown tokens', () => {
-    expect(verdictToneBadgeClass(formatVerdict('something_else').tone)).toContain('cyan');
+  it('selects info (blue) styling for unknown tokens', () => {
+    expect(verdictToneBadgeClass(formatVerdict('something_else').tone)).toContain('status-info');
   });
 
-  it('verdictToneBadgeClass reuses the canonical class strings', () => {
-    expect(verdictToneBadgeClass('positive')).toBe('bg-emerald-900/40 text-emerald-300 border-emerald-800/40');
-    expect(verdictToneBadgeClass('blocking')).toBe('bg-red-900/40 text-red-300 border-red-800/40');
+  it('verdictToneBadgeClass delegates to the canonical token-backed mapper', () => {
+    expect(verdictToneBadgeClass('positive')).toBe('bg-status-success/15 text-status-success border border-status-success/20');
+    expect(verdictToneBadgeClass('blocking')).toBe('bg-status-blocking/15 text-status-blocking border border-status-blocking/20');
   });
 });

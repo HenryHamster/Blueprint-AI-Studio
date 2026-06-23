@@ -537,6 +537,56 @@ describe('MetricsDashboard', () => {
     }
   });
 
+  it('renders llm cost by terminal outcome block when llm_cost_attribution is present', async () => {
+    const original = apiFetch.getMockImplementation();
+    if (!original) throw new Error('apiFetch mock implementation missing');
+    apiFetch.mockImplementation(async (url: string) => {
+      if (url.includes('/efficiency-axes')) {
+        return new Response(JSON.stringify({
+          axes: { cost_per_merged_pr: { current: 45.2, baseline: 50.0, drift_pct: -9.6, history: [] } },
+          baseline_captured_at: '2026-05-01T00:00:00Z',
+          last_snapshot_at: '2026-05-08T00:00:00Z',
+          llm_cost_attribution: {
+            total_llm_usd: 3.45,
+            by_failure_class: [
+              { failure_class: 'MERGED', task_count: 12, total_cost_usd: 2.10 },
+              { failure_class: 'CODE_ERROR', task_count: 4, total_cost_usd: 0.85 },
+              { failure_class: 'AGENT_TIMEOUT', task_count: 2, total_cost_usd: 0.50 },
+            ],
+          },
+        }), { status: 200 });
+      }
+      return original(url);
+    });
+
+    try {
+      render(
+        <MetricsDashboard
+          metricsHistory={[]}
+          cumulativeCost={0}
+          cumulativeVmHours={0}
+          maxConcurrentVMs={4}
+          tasks={[]}
+          metricsWindow="6h"
+          onWindowChange={vi.fn()}
+          projectId="project-1"
+        />,
+      );
+      await act(async () => { await Promise.resolve(); });
+
+      const block = screen.getByTestId('llm-cost-by-outcome-block');
+      expect(block).toHaveTextContent('LLM cost by terminal outcome');
+      expect(block).toHaveTextContent('$3.45 total');
+      expect(block).toHaveTextContent('MERGED');
+      expect(block).toHaveTextContent('$2.10');
+      expect(block).toHaveTextContent('CODE_ERROR');
+      expect(block).toHaveTextContent('$0.85');
+      expect(block).toHaveTextContent('AGENT_TIMEOUT');
+    } finally {
+      apiFetch.mockImplementation(original);
+    }
+  });
+
   it('omits the origin breakdown when the axes response lacks it', async () => {
     const original = apiFetch.getMockImplementation();
     if (!original) throw new Error('apiFetch mock implementation missing');

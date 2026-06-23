@@ -4,6 +4,7 @@ Verifies the argparse tree parses (every subcommand exposes --help), that the
 module imports cleanly, and that --json emits valid JSON for a read command —
 all with blueprint_api.api mocked so no network/credentials are needed.
 """
+import argparse
 import io
 import json
 import os
@@ -152,6 +153,35 @@ def test_module_builds_full_parser():
     """The full parser tree constructs without error."""
     parser = blueprint.build_parser()
     assert parser.prog == "blueprint"
+
+
+def test_envelope_registered_once():
+    """The 'envelope' subcommand is registered exactly once in the parser."""
+    parser = blueprint.build_parser()
+    # Get the subparsers action which contains all top-level subcommands
+    subparsers_action = None
+    for action in parser._subparsers._group_actions:
+        if isinstance(action, argparse._SubParsersAction):
+            subparsers_action = action
+            break
+
+    assert subparsers_action is not None, "No subparsers found in parser"
+
+    # Count how many times 'envelope' appears in the subcommand choices
+    choices = subparsers_action.choices
+    envelope_count = sum(1 for choice in choices.keys() if choice == 'envelope')
+
+    # Verify envelope is registered exactly once
+    assert envelope_count == 1, (
+        f"Expected 'envelope' to be registered exactly once, but found {envelope_count} "
+        f"registrations. Available subcommands: {sorted(choices.keys())}"
+    )
+
+    # Verify the envelope parser is configured correctly
+    assert 'envelope' in choices, "'envelope' not found in subcommand choices"
+    envelope_parser = choices['envelope']
+    assert envelope_parser is not None
+    assert envelope_parser.prog == 'blueprint envelope'
 
 
 # ── --json produces valid JSON for a read command ───────────────────────────

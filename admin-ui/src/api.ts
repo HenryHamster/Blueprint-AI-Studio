@@ -1478,6 +1478,17 @@ export interface VmCostAttributionTrendEntry {
   total_vm_usd: number | null;
 }
 
+export interface LlmCostByFailureClassEntry {
+  failure_class: string;
+  task_count: number;
+  total_cost_usd: number;
+}
+
+export interface LlmCostAttribution {
+  by_failure_class: LlmCostByFailureClassEntry[];
+  total_llm_usd: number;
+}
+
 export interface EfficiencyAxesResponse {
   axes: Record<string, EfficiencyAxis>;
   baseline_captured_at: string | null;
@@ -1518,6 +1529,9 @@ export interface EfficiencyAxesResponse {
   // by task type; each entry mirrors FormatComplianceByTypeEntry. Optional/null
   // for older snapshots.
   format_compliance_by_type?: Record<string, FormatComplianceByTypeEntry> | null;
+  // LLM cost attribution from the latest snapshot: per-terminal-outcome
+  // (MERGED vs each failure class) breakdown. Null on older snapshots.
+  llm_cost_attribution?: LlmCostAttribution | null;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {

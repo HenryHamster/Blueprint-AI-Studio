@@ -6,7 +6,9 @@ import {
   isComputeJobActive,
   computeJobTerminalLabel,
   computeJobRpcDiagnostic,
+  computeJobRuntimeSec,
   fmtCountdown,
+  fmtDuration,
 } from './ComputeJobsPanel.utils';
 import type { ComputeRpcDiagnostic } from '../api';
 
@@ -107,6 +109,21 @@ describe('ComputeJobsPanel helpers', () => {
     expect(fmtCountdown(new Date(now + 90_000).toISOString(), now)).toBe('1m 30s');
     expect(fmtCountdown(new Date(now - 1000).toISOString(), now)).toBe('expired');
     expect(fmtCountdown(null, now)).toBe('—');
+  });
+
+  test('fmtDuration formats seconds, minutes, and hours', () => {
+    expect(fmtDuration(45)).toBe('45s');
+    expect(fmtDuration(90)).toBe('1m 30s');
+    expect(fmtDuration(3600)).toBe('1h');
+    expect(fmtDuration(3660)).toBe('1h 1m');
+  });
+
+  test('computeJobRuntimeSec returns elapsed seconds between started_at and completed_at', () => {
+    const start = new Date('2026-06-23T10:00:00Z');
+    const end = new Date('2026-06-23T10:05:23Z');
+    expect(computeJobRuntimeSec(makeJob({ started_at: start.toISOString(), completed_at: end.toISOString() }))).toBe(323);
+    expect(computeJobRuntimeSec(makeJob({ started_at: null, completed_at: end.toISOString() }))).toBeNull();
+    expect(computeJobRuntimeSec(makeJob({ started_at: start.toISOString(), completed_at: null }))).toBeNull();
   });
 });
 
@@ -569,6 +586,64 @@ describe('ComputeJobsPanel render + kill', () => {
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('compute-exit-code')).toBeNull();
+  });
+
+  test('terminal job with timestamps shows result story: runtime, deadline, cost rate', async () => {
+    const start = new Date('2026-06-23T10:00:00Z');
+    const end = new Date('2026-06-23T10:05:00Z'); // 300s runtime
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        started_at: start.toISOString(),
+        completed_at: end.toISOString(),
+        final_cost_usd: 0.20, // $0.20 in 300s => $2.40/hr
+        launch_contract: { requested_deadline_seconds: 600, provisioning_model: 'SPOT' },
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const story = await findByTestId('compute-result-story');
+    expect(story.textContent).toContain('5m');
+    expect(story.textContent).toContain('10m');
+    expect(story.textContent).toContain('budget');
+    expect(story.textContent).toContain('$2.40/hr');
+  });
+
+  test('terminal job without timestamps shows no result story block', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        started_at: null,
+        completed_at: null,
+        final_cost_usd: 1.0,
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-result-story')).toBeNull();
+  });
+
+  test('active job does not show result story block', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        started_at: new Date('2026-06-23T10:00:00Z').toISOString(),
+        completed_at: null,
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-result-story')).toBeNull();
+  });
+
+  test('provisioning model appears in the machine info subtitle', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({ launch_contract: { provisioning_model: 'SPOT', requested_deadline_seconds: 300 } }),
+    ]);
+    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const subtitle = await findByText((t) => t.includes('SPOT'));
+    expect(subtitle.textContent).toContain('gcp_compute_engine');
+    expect(subtitle.textContent).toContain('SPOT');
   });
 
   test('launch action calls onLaunchCompute from the empty compute workbench', async () => {
