@@ -1,10 +1,10 @@
 name: Terraform Infrastructure
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'infra/terraform/**'
+  # NOTE: the push-to-main trigger was removed (2026-06-23). The apply step in
+  # this workflow is disabled (apply is run manually / locally), so a push run
+  # only re-ran `terraform plan` post-merge — redundant with the pull_request
+  # plan that already runs and comments on the PR. Plan on PR; apply by hand.
   pull_request:
     paths:
       - 'infra/terraform/**'
