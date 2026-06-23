@@ -1,9 +1,31 @@
-import { afterEach, describe, test } from 'vitest';
+import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { SettingsSectionRouter, type SettingsSectionRouterProps } from './SettingsSectionRouter';
 import type { SectionId } from './SettingsDropdown';
 import { expectNoOverflowAt } from '../test/viewport';
+
+// Sections rendered by this router (e.g. 'deploy' → MergeGradeGateSettings,
+// 'orchestrator' → SettingsOrchestratorSection) fire apiFetch calls on mount.
+// Without this stub, those promises escape as unhandled rejections and fail the
+// whole viewport browser-mode job even though every individual test passes.
+// This mirrors the pattern used in AutonomousStatus.viewport.test.tsx and other
+// composed viewport tests that render components with async mount effects.
+vi.mock('../api', async () => {
+  const actual = await vi.importActual<typeof import('../api')>('../api');
+  return {
+    ...actual,
+    apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
+    fetchEvergreenFillSettings: vi.fn(async () => ({
+      evergreen_fill_mode: 'off',
+      evergreen_fill_interval_minutes: 15,
+      evergreen_fill_util_threshold: 0.5,
+      evergreen_fill_min_free_slots: 2,
+      evergreen_fill_max_active: 1,
+      evergreen_fill_daily_cap: 3,
+    })),
+  };
+});
 
 /**
  * Builds a complete prop set for {@link SettingsSectionRouter} with neutral
