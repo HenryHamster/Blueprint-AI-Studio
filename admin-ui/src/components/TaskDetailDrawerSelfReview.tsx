@@ -24,14 +24,6 @@ interface EdgeConsidered {
   blind_spot?: string;
 }
 
-interface VisualVerification {
-  passed: boolean;
-  pairs_inspected?: number;
-  pairs_changed?: number;
-  note?: string;
-  caught_visual_issue?: boolean;
-}
-
 interface SelfReviewOutcome {
   verdict?: string;
   fixes_applied?: boolean;
@@ -41,7 +33,6 @@ interface SelfReviewOutcome {
   edges_considered?: EdgeConsidered[];
   fix_iteration?: number;
   _filtered_blind_spots_count?: number;
-  visual_verification?: VisualVerification;
 }
 
 // Cross-reference: backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES
@@ -292,39 +283,6 @@ export function SelfReviewPanel({ task }: { task: Task }) {
                         {edge.blind_spot && <p className="text-amber-400/70 mt-0.5 break-words">blind spot: {edge.blind_spot}</p>}
                       </div>
                     ))}
-                  </div>
-                </div>
-              )}
-
-              {outcome.visual_verification && (
-                <div>
-                  <p className="text-xs text-neutral-400 font-medium mb-1.5">Visual verification</p>
-                  <div className="rounded border border-neutral-700 px-2.5 py-2 space-y-1.5">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
-                        outcome.visual_verification.passed
-                          ? 'bg-emerald-950/30 border-emerald-800/40 text-emerald-400'
-                          : 'bg-red-950/30 border-red-800/40 text-red-400'
-                      }`}>
-                        {outcome.visual_verification.passed ? '✓ pass' : '✗ fail'}
-                      </span>
-                      {outcome.visual_verification.pairs_inspected !== undefined && (
-                        <span className="text-xs text-neutral-400">
-                          {outcome.visual_verification.pairs_inspected} pair{outcome.visual_verification.pairs_inspected !== 1 ? 's' : ''} inspected
-                          {outcome.visual_verification.pairs_changed !== undefined && (
-                            <span className="text-neutral-500">, {outcome.visual_verification.pairs_changed} changed</span>
-                          )}
-                        </span>
-                      )}
-                    </div>
-                    {outcome.visual_verification.note && (
-                      <p className="text-xs text-neutral-400 break-words">{outcome.visual_verification.note}</p>
-                    )}
-                    {outcome.visual_verification.caught_visual_issue && (
-                      <div className="rounded border bg-amber-950/40 border-amber-800/40 px-2 py-1.5">
-                        <p className="text-xs text-amber-400 font-semibold">Visual issue caught — defect found by inspection that assertion gates missed</p>
-                      </div>
-                    )}
                   </div>
                 </div>
               )}

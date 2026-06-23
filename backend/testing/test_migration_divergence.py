@@ -11,6 +11,7 @@ import pytest
 
 from app.migration_chain import (
     find_content_divergent_revisions,
+    find_deployed_migration_content_edits,
     plan_integration_side_renumber,
 )
 from app.release_scoring import compute_composite
@@ -454,6 +455,13 @@ def _files(*paths: str) -> list[dict]:
     return [{"filename": p, "status": "added"} for p in paths]
 
 
+def _modified_migration_file(path: str, revision: str, down_revision: str) -> dict:
+    """Create a pr_files entry for a MODIFIED (not added) migration file."""
+    src = _migration_source(revision, down_revision)
+    body = "".join(f"+{line}\n" for line in src.splitlines())
+    return {"filename": path, "status": "modified", "patch": f"@@ -0,0 +1,7 @@\n{body}"}
+
+
 def _added_migration_diff(path: str, revision: str, down_revision: str) -> str:
     """A unified diff that adds a single parseable migration file."""
     body = "".join(
@@ -540,7 +548,13 @@ async def test_premerge_guard_passes_integration_ahead_of_promotion_target(mocke
         new=_versions_by_branch(
             # Integration is well ahead of the deployed target (0144..0150 exist
             # only on integration — legitimate ahead-ness, not a collision).
-            integration=[f"{n:04d}_step.py" for n in range(141, 151)],
+            # Shared revisions (0142, 0143) carry the SAME identity on both
+            # branches; only brand-new ids differ.
+            integration=[
+                "0142_parent.py",
+                "0143_vm_contact_last_tool_use.py",
+                *[f"{n:04d}_step.py" for n in range(144, 151)],
+            ],
             promotion=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
         ),
     )
@@ -614,7 +628,13 @@ async def test_premerge_guard_empty_diff_falls_back_and_passes_clean(mocker):
     mocker.patch(
         "app.github.list_versions_at_ref",
         new=_versions_by_branch(
-            integration=[f"{n:04d}_step.py" for n in range(141, 151)],
+            # Integration carries the same shared migrations as promotion (no
+            # identity divergence on shared revisions) plus brand-new ids above.
+            integration=[
+                "0142_parent.py",
+                "0143_vm_contact_last_tool_use.py",
+                *[f"{n:04d}_step.py" for n in range(144, 151)],
+            ],
             promotion=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
         ),
     )
@@ -678,3 +698,287 @@ async def test_premerge_guard_empty_diff_defers_when_pr_head_sha_missing(mocker)
     )
     assert status == "defer"
     assert "head SHA" in reason
+
+
+# ===========================================================================
+# find_deployed_migration_content_edits — content-immutability check for the
+# in-place-edit class: same filename on deployed and candidate, different body.
+# Filename-only detectors (find_content_divergent_revisions) are blind to this.
+# ===========================================================================
+
+
+def test_content_edit_of_deployed_migration_is_flagged():
+    """In-place body edit is detected: same basename, different content."""
+    base = {"0309_computejob_heartbeat.py": _migration_source("0309", "0308")}
+    head = {
+        "0309_computejob_heartbeat.py": _migration_source("0309", "0308")
+        + "# tampered\n"
+    }
+    out = find_deployed_migration_content_edits(base, head)
+    assert len(out) == 1
+    assert "0309_computejob_heartbeat" in out[0]
+    assert "in-place" in out[0] or "immutable" in out[0]
+
+
+def test_content_identical_migration_is_not_flagged():
+    """Same content on both sides is clean — no false positive."""
+    src = _migration_source("0309", "0308")
+    base = {"0309_computejob_heartbeat.py": src}
+    head = {"0309_computejob_heartbeat.py": src}
+    assert find_deployed_migration_content_edits(base, head) == []
+
+
+def test_content_edit_whitespace_normalised():
+    """Trailing-whitespace differences do not trigger a false positive."""
+    src = _migration_source("0309", "0308")
+    base = {"0309_heartbeat.py": src}
+    head = {"0309_heartbeat.py": src.replace("pass", "pass  ")}  # trailing space
+    assert find_deployed_migration_content_edits(base, head) == []
+
+
+def test_content_edit_key_by_basename():
+    """Full paths and basenames are normalised by basename for comparison."""
+    src = _migration_source("0309", "0308")
+    modified = src + "# extra\n"
+    base = {"backend/alembic/versions/0309_heartbeat.py": src}
+    head = {"0309_heartbeat.py": modified}
+    out = find_deployed_migration_content_edits(base, head)
+    assert len(out) == 1
+
+
+# ===========================================================================
+# Named regression pins for the v17 defect classes.
+# ===========================================================================
+
+
+def test_v17_defect_class_reused():
+    """v17 regression pin — reused-revision class: deployed main has
+    0309 == computejob_heartbeat; automain reused 0309 for performance_indexes.
+    find_content_divergent_revisions must flag this before a merge."""
+    main = ["0309_computejob_heartbeat.py"]
+    automain = ["0309_performance_indexes.py"]
+    out = find_content_divergent_revisions(main, automain)
+    assert len(out) >= 1
+    assert any("0309" in d for d in out)
+    assert any("computejob_heartbeat" in d and "performance_indexes" in d for d in out)
+
+
+def test_v17_defect_class_renumbered():
+    """v17 regression pin — renumber class: computejob_heartbeat moved from
+    revision 0309 (main) to 0330 (automain). find_content_divergent_revisions
+    must flag the identity-under-different-id divergence."""
+    main = ["0309_computejob_heartbeat.py"]
+    automain = ["0330_computejob_heartbeat.py"]
+    out = find_content_divergent_revisions(main, automain)
+    assert len(out) >= 1
+    assert any("computejob_heartbeat" in d for d in out)
+    assert any("0309" in d and "0330" in d for d in out)
+
+
+def test_v17_defect_class_in_place_edit():
+    """v17 regression pin — in-place-edit class: a migration file with the same
+    name as a deployed one but a modified body. find_deployed_migration_content_edits
+    must flag this; the filename-only detector is blind to it."""
+    deployed = _migration_source("0309", "0308")
+    tampered = deployed + "# in-place tamper\n"
+    base = {"0309_computejob_heartbeat.py": deployed}
+    head = {"0309_computejob_heartbeat.py": tampered}
+    out = find_deployed_migration_content_edits(base, head)
+    assert len(out) >= 1
+    assert any("0309_computejob_heartbeat" in m for m in out)
+
+
+# ===========================================================================
+# _validate_rollup_migration_chain — v17 defect class integration tests.
+# Covers both tamper classes that birthed the deploy-fatal Alembic defect:
+#   1. Pre-PR rename/renumber on the integration branch (invisible to PR-diff
+#      checks because the tampered migration is not in the PR's added files).
+#   2. In-place edit of a deployed migration (caught by file-status check).
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_in_place_edit_of_deployed_migration_body_is_blocked(mocker):
+    """In-place-edit class: a migration whose filename matches a deployed
+    promotion-target file but whose body differs from what was applied is
+    BLOCKED. The filename-only reuse/renumber detector is blind to this class
+    (same filename → same revision id and description → no filename divergence).
+
+    Scenario: main has 0330_computejob_heartbeat.py applied; a PR on automain
+    adds a file with the same name but a modified body. The file-status check
+    catches the modification and blocks the merge."""
+    basename = "0330_computejob_heartbeat.py"
+    path = f"{_VERSIONS_DIR}/{basename}"
+
+    deployed_src = _migration_source("0330", "0329")
+    pr_src = deployed_src + "# in-place tamper\n"
+
+    patch_body = "".join(f"+{line}\n" for line in pr_src.splitlines())
+    pr_file = {
+        "filename": path,
+        "status": "modified",
+        "patch": f"@@ -1,7 +1,8 @@\n{patch_body}",
+    }
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[pr_file]))
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            # automain has 0329 as head; 0330 not present yet → no collision
+            integration=["0328_parent.py", "0329_other.py"],
+            # main has 0330 already applied
+            promotion=[
+                "0328_parent.py",
+                "0329_other.py",
+                "0330_computejob_heartbeat.py",
+            ],
+        ),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert "0330_computejob_heartbeat" in reason
+    assert "in-place" in reason or "immutable" in reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_blocks_pre_pr_rename_on_integration_branch(mocker):
+    """Defect class 1 (v17 regression): a rename already on the integration
+    branch — committed in a PRIOR PR, not the one being evaluated — is invisible
+    to the PR-diff checks that only compare added files. The full-branch check
+    must catch it: revision 0138 maps to 'old_name' on the deployed target but
+    to 'new_name' on integration; the current PR only adds an unrelated 0140
+    and touches no 0138 file at all."""
+    path = f"{_VERSIONS_DIR}/0140_unrelated.py"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_migration_file(path, "0140", "0139")]),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            # Integration already carries the renamed 0138; the current PR adds
+            # an unrelated 0140 and never touches 0138.
+            integration=[
+                "0137_cascade.py",
+                "0138_new_name.py",
+                "0139_something.py",
+            ],
+            # Deployed main still has 0138 under the original identity.
+            promotion=["0137_cascade.py", "0138_old_name.py"],
+        ),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert "0138" in reason
+    assert "pre-PR" in reason or "integration branch" in reason
+    assert "new_name" in reason or "old_name" in reason
+
+
+@pytest.mark.asyncio
+async def test_merge_guard_allows_authorized_divergence_blocks_unauthorized(mocker):
+    """The merge-time full-branch check applies the same authorized-divergence
+    filter as the qual-time guard.
+
+    Allowed path — integration already carries the authorized 0143 renumber
+    (committed in a prior PR, NOT this one): 0143=add_compute_job_persistence,
+    0144=vm_contact_last_tool_use. A new PR adding an unrelated 0145 migration
+    must NOT be blocked by the full-branch check against the deployed promotion
+    target (which still has 0143=vm_contact_last_tool_use). The divergence is
+    authorized and must be silently passed.
+
+    Blocked path — an UNAUTHORIZED divergence (0142 renamed to a different
+    identity on the integration branch, unknown to AUTHORIZED_DIVERGENCES) still
+    hard-blocks regardless of the authorized 0143 divergence co-existing on the
+    same branch.
+    """
+    # Integration already carries the 0143 authorized renumber from a prior PR.
+    integration_with_authorized = [
+        "0142_parent.py",
+        "0143_add_compute_job_persistence.py",
+        "0144_vm_contact_last_tool_use.py",
+    ]
+    # Deployed main still has 0143 = vm_contact_last_tool_use (authorized divergence).
+    promotion_files = ["0142_parent.py", "0143_vm_contact_last_tool_use.py"]
+    # The current PR only adds an unrelated new migration anchored to 0144.
+    new_path = f"{_VERSIONS_DIR}/0145_brand_new.py"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_migration_file(new_path, "0145", "0144")]),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            integration=integration_with_authorized,
+            promotion=promotion_files,
+        ),
+    )
+    # The authorized 0143 divergence must NOT block a new unrelated PR.
+    assert await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    ) == ("ok", None)
+
+    # Unauthorized divergence (0142 renamed to a different identity on integration)
+    # must still hard-block even when the authorized 0143 divergence is also present.
+    unauthorized_path = f"{_VERSIONS_DIR}/0145_second_new.py"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[_migration_file(unauthorized_path, "0145", "0144")]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            integration=[
+                "0142_renamed_to_something_else.py",  # unauthorized rename
+                "0143_add_compute_job_persistence.py",
+                "0144_vm_contact_last_tool_use.py",
+            ],
+            promotion=[
+                "0142_parent.py",  # deployed has 0142 = parent (different identity)
+                "0143_vm_contact_last_tool_use.py",
+            ],
+        ),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert "0142" in reason
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_blocks_inplace_edit_of_deployed_migration(mocker):
+    """Defect class 2 (v17 regression): a PR that MODIFIES (not renames) a
+    migration already on the deployed promotion target. The file keeps its name
+    so filename-identity checks see no divergence; only the file-status check
+    catches it. The deployed DB has already applied this revision — changing the
+    file content is silently ignored at deploy time (Alembic considers it applied)
+    while the actual schema change is never applied."""
+    # The modified migration exists on main but NOT on automain (e.g. a hotfix
+    # not yet back-merged); only the new defect-class-2 check detects this.
+    modified_path = f"{_VERSIONS_DIR}/0143_vm_contact_last_tool_use.py"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[_modified_migration_file(modified_path, "0143", "0142")]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            # Automain does not yet have 0143 (hotfix not back-merged).
+            integration=["0141_x.py", "0142_parent.py"],
+            # Deployed main carries 0143 as vm_contact_last_tool_use.
+            promotion=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
+        ),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert "0143_vm_contact_last_tool_use.py" in reason
+    assert "immutable" in reason or "deployed" in reason

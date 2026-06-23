@@ -54,6 +54,7 @@ from app.compute import (
     any_zone_available,
     soonest_zone_recovery,
 )
+from app.compute_cloud_run import is_cloud_run_task
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import (
     record_pipeline_event,
@@ -223,10 +224,53 @@ _TRANSIENT_5XX_PATTERNS = frozenset(
 _BATCH = 5000
 
 
+def _build_active_scan_stmt():
+    """Return the column-projected SELECT for the reaper's 60s active-task scan.
+
+    Excludes ``plan_output`` (heavy JSONB, never read on the reap path).
+    Retains ``status_log``/``context``/``payloads`` because the Task event
+    listeners and ``_heartbeat_stale_cutoff`` require them (MissingGreenlet
+    under async sessions if absent).  ``raiseload=True`` catches future
+    accidental full-row loads during development.
+    """
+    return (
+        select(Task)
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.last_heartbeat,
+                Task.last_tool_use_at,
+                Task.started_at,
+                Task.created_at,
+                Task.vm_instance_id,
+                Task.vm_provisioned_at,
+                Task.project_id,
+                Task.parent_task_id,
+                Task.latest_status_message,
+                Task.attempt_count,
+                Task.context,
+                Task.payloads,
+                Task.status_log,
+                Task.retry_after_until,
+                Task.previous_error_fingerprint,
+                Task.requeue_in_flight,
+                Task.description,
+                raiseload=True,
+            )
+        )
+        .where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+        .limit(_BATCH)
+    )
+
+
 from app.retry_prompt import _copy_analysis_artifacts_to_previous  # noqa: E402, F401, RUF100
 
 
-from app.reaper_evaluating_sweeps import sweep_evaluating_parents
+from app.reaper_evaluating_sweeps import (
+    sweep_evaluating_parents,
+    sweep_orphaned_direction_provider_tasks,
+)
 from app.reaper_sweeps import (
     sweep_queued_age_alerts,
     sweep_stalled_strategic_cycles,
@@ -247,6 +291,7 @@ from app.reaper_sweeps import (
     sweep_resolve_stale_open_bug_messages,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
+    sweep_orphaned_cross_base_children,
     _sweep_strategic_cycle_starvation,
 )
 
@@ -365,39 +410,7 @@ async def reaper_service():
                 # latest_status_message, vm_instance_id, last_heartbeat, started_at,
                 # context, payloads, attempt_count downstream.
                 # Audit R3-W2 (H7): cap per-tick fetch at _BATCH rows.
-                stmt = (
-                    select(Task)
-                    .options(
-                        load_only(
-                            Task.id,
-                            Task.status,
-                            Task.last_heartbeat,
-                            Task.last_tool_use_at,
-                            Task.started_at,
-                            Task.created_at,
-                            Task.vm_instance_id,
-                            Task.vm_provisioned_at,
-                            Task.project_id,
-                            Task.parent_task_id,
-                            Task.latest_status_message,
-                            Task.attempt_count,
-                            Task.context,
-                            Task.payloads,
-                            Task.status_log,
-                            Task.retry_after_until,
-                            Task.previous_error_fingerprint,
-                            Task.requeue_in_flight,
-                            Task.description,
-                            raiseload=True,
-                        )
-                    )
-                    .where(
-                        Task.status.in_(
-                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                        )
-                    )
-                    .limit(_BATCH)
-                )
+                stmt = _build_active_scan_stmt()
                 active_tasks = (await session.execute(stmt)).scalars().all()
                 if len(active_tasks) >= _BATCH:
                     logger.warning(
@@ -886,7 +899,9 @@ async def reaper_service():
                                 # idempotent, so re-collecting on a later cycle (if the
                                 # orphan re-qualifies before its row is cleaned up) is
                                 # harmless.
-                                if task.vm_instance_id:
+                                if task.vm_instance_id and not is_cloud_run_task(
+                                    task.vm_machine_type
+                                ):
                                     _reaper_old_vms[str(task.id)] = task.vm_instance_id
                                 _orphan_reap_crash_streaks.pop(str(task_id), None)
                                 continue
@@ -1002,7 +1017,9 @@ async def reaper_service():
                         )
 
                         # Capture old VM ID before any overwrite — deletion happens after commit
-                        if fresh_task.vm_instance_id:
+                        if fresh_task.vm_instance_id and not is_cloud_run_task(
+                            fresh_task.vm_machine_type
+                        ):
                             _reaper_old_vms[str(task.id)] = fresh_task.vm_instance_id
 
                         # Read-only inputs to the I/O block + branch decisions below.
@@ -1227,6 +1244,8 @@ async def reaper_service():
                             da_ctx.pop("failure_class", None)
                             da_ctx.pop("dead_auth_matched_pattern", None)
                             task.context = da_ctx
+                            # Keep the promoted column in sync (D2 over-fetch fix).
+                            task.llm_account_id = None
                             clear_retry_after(task)
                             session.add(task)
                             await broadcast_to_project(
@@ -1271,6 +1290,8 @@ async def reaper_service():
                             # don't carry provision budget into the next dispatch.
                             rl_ctx.pop("provision_failures", None)
                             task.context = rl_ctx
+                            # Keep the promoted column in sync (D2 over-fetch fix).
+                            task.llm_account_id = None
                             clear_retry_after(task)
                             persist_authoritative_verdict(task, RATE_LIMIT)
                             session.add(task)
@@ -2332,6 +2353,13 @@ async def reaper_service():
                     landed_cb=_mark_landed_parent_dependents,
                 )
 
+                # Step 3.5: Cancel EVALUATING provider tasks whose direction closed.
+                # Research/refactor tasks that provided for a now-retired direction
+                # hold no VM but sit EVALUATING forever — auto-cancel them so they
+                # don't accumulate as invisible orphans.
+                _mark_reaper_progress()
+                await sweep_orphaned_direction_provider_tasks(session)
+
                 # Step 5: Infrastructure recovery sweep + hold maintenance.
                 # Delegates to reaper_infra_recovery for resurrection (5),
                 # infra hold clearance (5a), orphan hold sweep (5c),
@@ -2723,6 +2751,32 @@ async def reaper_service():
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()
+
+                # Step 20: Orphaned cross-base children converge guard — cancel
+                # QUEUED children whose parent direction is COMPLETED and whose
+                # cross-base genuine code-dependency is permanently stranded (dep
+                # COMPLETED but confirmed NOT to be an ancestor of integration).
+                # Conservative: only fires when STRANDED_LANDING_REASON_KEY is
+                # explicitly set on the dep; legitimately-waiting children
+                # (dep not yet stranded) are left untouched.
+                _mark_reaper_progress()
+                try:
+                    _cross_base_cancelled = await sweep_orphaned_cross_base_children(
+                        session
+                    )
+                    if _cross_base_cancelled:
+                        logger.info(
+                            f"[REAPER] Step 20: cancelled {_cross_base_cancelled} "
+                            "orphaned cross-base child task(s)"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Orphaned cross-base children sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
             consecutive_errors = 0
             if _reaper_halt_state.get("_in_probe"):
                 _probe_failures = _reaper_halt_state.get("half_open_failures", 0)

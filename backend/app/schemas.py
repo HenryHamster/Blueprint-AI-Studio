@@ -404,6 +404,7 @@ class HeartbeatRequest(BaseModel):
     # don't emit these leave Task.format_compliance_summary NULL. format_miss_by_reason
     # maps each extraction-layer reason class to a count of unparseable final outputs.
     format_miss_by_reason: Dict[str, int] | None = None
+    format_repair_miss_by_reason: Dict[str, int] | None = None
     format_error_total: int | None = Field(None, ge=0)
     format_repair_attempts: int | None = Field(None, ge=0)
     format_repair_successes: int | None = Field(None, ge=0)
@@ -426,6 +427,7 @@ class HeartbeatRequest(BaseModel):
     format_repair_output_tokens: int | None = Field(None, ge=0)
     format_repair_input_tokens_by_schema: Dict[str, int] | None = None
     format_repair_output_tokens_by_schema: Dict[str, int] | None = None
+    format_repair_miss_by_schema: Dict[str, int] | None = None
     # Count of viewport screenshots forwarded into agent prompts this task.
     # Backwards-compatible: older agents omit this field; treated as 0.
     viewport_screenshot_forwarded_count: int | None = Field(None, ge=0)

@@ -4083,6 +4083,12 @@ async def test_compute_experiment_finding_propagates_live_proof_contract(
                     },
                     "live_release_proof_marker": "research-live-proof",
                     "requires_live_release": True,
+                    "smoke_sample": {
+                        "exit_code": 0,
+                        "startup_ok": True,
+                        "metric_captured": True,
+                        "timed_out": False,
+                    },
                 }
             ],
         )
@@ -10510,7 +10516,7 @@ async def test_residual_fingerprint_remediation_spawns_task(
     ]
     assert len(create_tasks) == 1
     t = create_tasks[0]
-    assert t.context["auto_remediation"] is True
+    assert t.auto_remediation is True
     assert sample_msg in t.first_payload["prompt"]
     assert t.context["spawned_by"] == "residual_fingerprint_remediation"
     assert t.context["error_fingerprint"] == fp
@@ -11484,7 +11490,7 @@ async def test_viewport_regression_remediation_spawns_task(
     ]
     assert len(create_tasks) == 1
     t = create_tasks[0]
-    assert t.context["auto_remediation"] is True
+    assert t.auto_remediation is True
     assert t.context["spawned_by"] == "viewport_regression_remediation"
     assert t.context["viewport_fingerprint"] == fp
     assert t.context["component"] == "MyComponent"

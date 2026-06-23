@@ -1373,6 +1373,17 @@ export interface EfficiencyDriftAxis {
   history?: EfficiencyHistoryPoint[];
 }
 
+export interface FormatComplianceBySchemaEntry {
+  format_miss: number;
+  repair_attempts: number;
+  repair_successes: number;
+  repair_infra_failures: number;
+  repair_miss: number;
+  repair_input_tokens: number;
+  repair_output_tokens: number;
+  self_repair_success_rate: number | null;
+}
+
 export interface FormatComplianceResponse {
   format_compliance_rate: EfficiencyDriftAxis;
   self_repair_success_rate: EfficiencyDriftAxis;
@@ -1381,6 +1392,7 @@ export interface FormatComplianceResponse {
   format_error_total: number | null;
   repair_attempts: number | null;
   repair_successes: number | null;
+  by_schema?: Record<string, FormatComplianceBySchemaEntry> | null;
 }
 
 export interface FormatComplianceByTypeEntry {
@@ -1658,6 +1670,19 @@ export interface ThemeDeliveryCert {
   net_loc?: number | null;
   directional_contradiction?: boolean | null;
   state?: string | null;
+  shortfalls?: Array<{ criterion: string; why: string; evidence?: Record<string, unknown> }> | null;
+}
+
+export interface GoalAlignment {
+  assessed_grade?: number | null;
+  state?: string | null;  // 'aligned' | 'shortfall' | 'not_applicable'
+  biggest_gap?: string | null;
+  reasoning_summary?: string | null;
+}
+
+export interface BlindMergeGrade {
+  coverage_verdict?: string | null;  // 'covers' | 'partial' | 'misses'
+  biggest_gap?: string | null;
 }
 
 export interface AuditFinding {
@@ -1729,6 +1754,8 @@ export interface VersionQualification {
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
   theme_delivery?: ThemeDeliveryCert | null;
+  goal_alignment?: GoalAlignment | null;
+  blind_merge_grade?: BlindMergeGrade | null;
 }
 
 /** Single resolved serving block — the canonical answer to "is this version live?"
@@ -2309,6 +2336,8 @@ export interface QualificationVerdictRecord {
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
   theme_delivery?: ThemeDeliveryCert | null;
+  goal_alignment?: GoalAlignment | null;
+  blind_merge_grade?: BlindMergeGrade | null;
 }
 
 export interface QualificationVerdictsInfraContext {
@@ -3483,40 +3512,6 @@ export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSet
   }
 }
 
-export interface VisualPilotShotEntry {
-  name: string;
-  magnitude?: number;
-}
-
-export interface VisualPilotCaughtEntry {
-  task_id: string;
-  task_title: string;
-  note: string | null;
-  created_at: string;
-  viewport_shot_names: string[];
-  viewport_shot_entries?: VisualPilotShotEntry[];
-}
-
-export interface VisualPilotStatus {
-  project_id: string;
-  admin_task_count: number;
-  entry_count: number;
-  malformed_count: number;
-  pairs_inspected: number;
-  pairs_changed: number;
-  infra_total: number;
-  infra_rate: number;
-  days_elapsed: number;
-  caught_count: number;
-  caught: VisualPilotCaughtEntry[];
-  thresholds: {
-    target_admin_tasks: number;
-    target_days: number;
-    early_pause_infra_rate: number;
-  };
-  generated_at: string;
-}
-
 export async function declareCapabilityVerdict(
   projectId: string,
   capName: string,
@@ -3534,18 +3529,3 @@ export async function declareCapabilityVerdict(
   if (!res.ok) throw new Error(`Failed to declare capability verdict: ${res.status}`);
 }
 
-export async function fetchVisualPilotStatus(
-  projectId: string,
-  signal?: AbortSignal,
-): Promise<VisualPilotStatus> {
-  const params = new URLSearchParams({ project_id: projectId });
-  const res = await apiFetch(
-    `/api/admin/visual-pilot-status?${params.toString()}`,
-    undefined,
-    2,
-    30000,
-    signal,
-  );
-  if (!res.ok) throw new Error(`Failed to fetch visual pilot status: ${res.status}`);
-  return res.json();
-}

@@ -59,10 +59,38 @@ async def _sweep_stranded_sidecar_sources() -> None:
         async with services.AsyncSessionLocal() as session:
             result = await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.context,
+                        raiseload=True,
+                    )
+                )
                 .where(Task.status == TaskStatus.EVALUATING)
                 .limit(_SIDECAR_SWEEP_MAX_PER_CYCLE)
             )
             evaluating = result.scalars().all()
+
+            # Pre-collect sidecar UUIDs so we can batch-load them in one
+            # query instead of issuing a session.get per source task (N+1).
+            _sidecar_uuids_to_fetch: list = []
+            for _src in evaluating:
+                _ctx = _src.context or {}
+                for _key in _AWAITING_SIDECAR_KEYS:
+                    _ref = _ctx.get(_key)
+                    if not _ref or _ref is True:
+                        continue
+                    try:
+                        _sidecar_uuids_to_fetch.append(_uuid.UUID(str(_ref)))
+                    except (ValueError, TypeError):
+                        continue
+            sidecars_by_id: dict = {}
+            if _sidecar_uuids_to_fetch:
+                _sidecar_rows = await session.execute(
+                    select(Task).where(Task.id.in_(_sidecar_uuids_to_fetch))
+                )
+                sidecars_by_id = {s.id: s for s in _sidecar_rows.scalars().all()}
 
             resolved = 0
             for source in evaluating:
@@ -75,7 +103,7 @@ async def _sweep_stranded_sidecar_sources() -> None:
                         sidecar_uuid = _uuid.UUID(str(ref))
                     except (ValueError, TypeError):
                         continue
-                    sidecar = await session.get(Task, sidecar_uuid)
+                    sidecar = sidecars_by_id.get(sidecar_uuid)
                     if sidecar is None or sidecar.status not in _TERMINAL:
                         continue
                     logger.warning(
@@ -95,7 +123,6 @@ async def _sweep_stranded_sidecar_sources() -> None:
                             sidecar.id,
                             source.id,
                         )
-                    break  # one sidecar per source per sweep pass
             if resolved:
                 logger.info(
                     "[SIDECAR-RECOVERY] Resolved %d stranded source task(s)", resolved
@@ -136,6 +163,31 @@ async def _sweep_stranded_sidecar_sources() -> None:
                 )
             )
             terminal_sources = pending_result.scalars().all()
+
+            # Batch-load terminal-source sidecars to avoid N+1 queries.
+            _terminal_sidecar_uuids_to_fetch: list = []
+            for source in terminal_sources:
+                ctx = source.context or {}
+                marker = ctx.get(_SIDECAR_VERDICT_APPLICATION_PENDING_KEY)
+                if not isinstance(marker, dict):
+                    continue
+                sidecar_ref = marker.get("sidecar_task_id")
+                try:
+                    _terminal_sidecar_uuids_to_fetch.append(
+                        _uuid.UUID(str(sidecar_ref))
+                    )
+                except (ValueError, TypeError):
+                    continue
+
+            terminal_sidecars_by_id: dict = {}
+            if _terminal_sidecar_uuids_to_fetch:
+                _terminal_sidecar_rows = await session.execute(
+                    select(Task).where(Task.id.in_(_terminal_sidecar_uuids_to_fetch))
+                )
+                terminal_sidecars_by_id = {
+                    s.id: s for s in _terminal_sidecar_rows.scalars().all()
+                }
+
             retried = 0
             for source in terminal_sources:
                 ctx = source.context or {}
@@ -147,7 +199,7 @@ async def _sweep_stranded_sidecar_sources() -> None:
                     sidecar_uuid = _uuid.UUID(str(sidecar_ref))
                 except (ValueError, TypeError):
                     continue
-                sidecar = await session.get(Task, sidecar_uuid)
+                sidecar = terminal_sidecars_by_id.get(sidecar_uuid)
                 if sidecar is None or sidecar.status not in {
                     TaskStatus.COMPLETED,
                     TaskStatus.FAILED,

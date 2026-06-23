@@ -17,7 +17,7 @@ from sqlalchemy import text as _text
 from sqlmodel import select
 
 import app.shared_state as _shared_state
-from app.database import AsyncSessionLocal, init_db
+from app.database import AsyncSessionLocal, engine, init_db
 from app.models import (
     AllowedUser,
     Alert,
@@ -29,6 +29,24 @@ from app.time_utils import _utcnow
 # Session-scoped advisory lock ID for background-leader election.
 # Stored as signed int64 (PostgreSQL bigint) via two's-complement conversion.
 _BACKGROUND_LOCK_ID: int = ctypes.c_int64(0xB1EB1EB1EB1EB1EB).value
+
+# pg_locks records a single-bigint advisory lock as three columns: classid =
+# high 32 bits of the key, objid = low 32 bits, objsubid = 1. The *unsigned*
+# 64-bit key (0xB1EB…) exceeds bigint's max, so the stale-leader reaper matches
+# on the two unsigned 32-bit halves rather than reconstructing the whole key.
+_BACKGROUND_LOCK_CLASSID: int = (_BACKGROUND_LOCK_ID & 0xFFFFFFFFFFFFFFFF) >> 32
+_BACKGROUND_LOCK_OBJID: int = _BACKGROUND_LOCK_ID & 0xFFFFFFFF
+
+# Stale-leader reap threshold. A live leader re-asserts the advisory lock every
+# LEADER_KEEPALIVE_SECONDS (default 30s; see lifespan), so its lock-holding
+# backend's pg_stat_activity.state_change is never older than one interval. A
+# holder older than this has missed several keepalives — it is a leader that was
+# SIGKILLed mid-wedge (graceful lock release never ran) or whose event loop is
+# hung — so the non-leader watchdog reaps it and leadership recovers in one
+# probe cycle instead of waiting on Postgres' passive TCP death detection
+# (minutes), or, for a committed-idle wedged process, never. Default 3x the
+# keepalive interval so a live leader is provably never reaped.
+_LEADER_STALE_REAP_SECONDS: float = float(os.getenv("LEADER_STALE_REAP_SECONDS", "90"))
 
 # Background-service crash-episode escalation. When a single named background
 # service crashes >= _BACKGROUND_CRASH_EPISODE_THRESHOLD times inside
@@ -87,21 +105,24 @@ async def _emit_crash_episode_alert(
     created = 0
     async with session_factory() as ep_session:
         ep_project_ids = (await ep_session.execute(select(Project.id))).scalars().all()
-        for project_id in ep_project_ids:
-            existing_ep = (
-                (
-                    await ep_session.execute(
-                        select(Alert).where(
-                            Alert.project_id == project_id,
-                            Alert.title == episode_title,
-                            Alert.dismissed_at.is_(None),
-                        )
+        if not ep_project_ids:
+            return 0
+        existing_alerts = (
+            (
+                await ep_session.execute(
+                    select(Alert.project_id).where(
+                        Alert.project_id.in_(ep_project_ids),
+                        Alert.title == episode_title,
+                        Alert.dismissed_at.is_(None),
                     )
                 )
-                .scalars()
-                .first()
             )
-            if existing_ep:
+            .scalars()
+            .all()
+        )
+        alerted_project_ids = set(existing_alerts)
+        for project_id in ep_project_ids:
+            if project_id in alerted_project_ids:
                 continue
             ep_session.add(
                 Alert(
@@ -170,16 +191,16 @@ async def _seed_initial_admin():
                 )
 
 
-async def _leader_lock_keepalive_tick(leader_session) -> str:
+async def _leader_lock_keepalive_tick(leader_conn) -> str:
     """Run one leader-lock keepalive iteration and report the outcome.
 
-    The background-leader advisory lock is SESSION-scoped: it lives on
-    ``leader_session``'s connection for the whole process lifetime. If that
-    connection dies (network blip, Cloud SQL failover, idle TCP reaped, an
+    The background-leader advisory lock is SESSION-scoped: it lives on the
+    pinned ``leader_conn`` AsyncConnection for the whole process lifetime. If
+    that connection dies (network blip, Cloud SQL failover, idle TCP reaped, an
     ``idle_in_transaction``/statement timeout), Postgres releases the lock and a
     peer's non-leader watchdog grabs it — which forces this instance into the
     "prior leader died" respawn loop. This tick keeps the connection warm and,
-    on failure, tries to re-acquire the lock on a fresh pooled connection.
+    on failure, tries to re-acquire the lock on the same connection.
 
     Always COMMITs after touching the session so the connection is left merely
     *idle* (lock still held) rather than *idle in transaction* — the latter is
@@ -187,8 +208,8 @@ async def _leader_lock_keepalive_tick(leader_session) -> str:
 
     Returns one of:
       * ``"held"``       — ping succeeded, the lock is still held;
-      * ``"reacquired"`` — ping failed but the lock was re-acquired on a fresh
-        connection (a transient blip, no peer took over);
+      * ``"reacquired"`` — ping failed but the lock was re-acquired on the same
+        connection after rollback (a transient blip, no peer took over);
       * ``"lost"``       — ping failed and a peer now owns the lock;
       * ``"error"``      — ping failed and the re-acquire attempt also errored.
 
@@ -197,8 +218,8 @@ async def _leader_lock_keepalive_tick(leader_session) -> str:
     leadership. Kept module-level (not a closure) so it is unit-testable.
     """
     try:
-        await leader_session.execute(_text("SELECT 1"))
-        await leader_session.commit()
+        await leader_conn.execute(_text("SELECT 1"))
+        await leader_conn.commit()
         return "held"
     except Exception as ka_exc:  # any failure here means the connection is suspect
         logger.warning(
@@ -206,27 +227,91 @@ async def _leader_lock_keepalive_tick(leader_session) -> str:
             ka_exc,
         )
     # Ping failed → the connection (and the session-scoped lock) is likely gone.
-    # Reset the session so the next execute checks out a fresh pooled connection.
+    # Best-effort rollback to reset transaction state before re-acquire attempt.
     try:
-        await leader_session.rollback()
-    except Exception as rb_exc:  # best-effort session reset
+        await leader_conn.rollback()
+    except Exception as rb_exc:  # best-effort connection reset
         logger.debug("[MONITOR] keepalive rollback no-op: %s", rb_exc)
     try:
         reacquired = bool(
             (
-                await leader_session.execute(
+                await leader_conn.execute(
                     _text("SELECT pg_try_advisory_lock(:lock_id)"),
                     {"lock_id": _BACKGROUND_LOCK_ID},
                 )
             ).scalar()
         )
-        await leader_session.commit()
+        await leader_conn.commit()
     except Exception as reacq_exc:
         # Operational (DB unreachable), not a code fault — the message plus the
         # caller's hard-exit are the signal; a full traceback is just noise.
         logger.error("[MONITOR] Leader-lock re-acquire failed: %s", reacq_exc)  # noqa: TRY400
         return "error"
     return "reacquired" if reacquired else "lost"
+
+
+async def _reap_stale_leader_lock_holder(
+    probe_session, stale_secs: float = _LEADER_STALE_REAP_SECONDS
+) -> int:
+    """Forcibly free the background-leader lock from a dead/wedged holder.
+
+    Called from the non-leader watchdog ONLY after a ``pg_try_advisory_lock``
+    probe fails (the lock is held by a peer). Finds the backend holding THIS
+    advisory lock (matched on the exact key) whose last activity
+    (``pg_stat_activity.state_change``) is older than ``stale_secs`` — i.e. it
+    has missed several keepalive ticks and is dead or wedged — and
+    ``pg_terminate_backend``s it. Terminating the connection makes Postgres
+    release the SESSION-scoped lock immediately, instead of the watchdog waiting
+    on passive TCP death detection (minutes) or, for a committed-idle connection
+    on a still-alive-but-hung process, forever.
+
+    Returns the number of backends terminated (0 when the holder is live or the
+    lock is genuinely free). Safe by construction: a live leader's holder always
+    has a fresh ``state_change`` (it re-asserts every LEADER_KEEPALIVE_SECONDS)
+    and ``stale_secs`` defaults to 3x that, so an active leader is never reaped.
+    Kept module-level (not a closure) so it is unit-testable in isolation.
+    """
+    pids = (
+        (
+            await probe_session.execute(
+                _text(
+                    "SELECT a.pid FROM pg_locks l "
+                    "JOIN pg_stat_activity a ON a.pid = l.pid "
+                    "WHERE l.locktype = 'advisory' AND l.objsubid = 1 "
+                    "AND l.classid::bigint = :classid AND l.objid::bigint = :objid "
+                    "AND l.granted AND a.pid <> pg_backend_pid() "
+                    "AND a.state_change < now() - (:stale_secs * interval '1 second')"
+                ),
+                {
+                    "classid": _BACKGROUND_LOCK_CLASSID,
+                    "objid": _BACKGROUND_LOCK_OBJID,
+                    "stale_secs": stale_secs,
+                },
+            )
+        )
+        .scalars()
+        .all()
+    )
+    reaped = 0
+    for pid in pids:
+        terminated = bool(
+            (
+                await probe_session.execute(
+                    _text("SELECT pg_terminate_backend(:pid)"), {"pid": pid}
+                )
+            ).scalar()
+        )
+        if terminated:
+            reaped += 1
+            logger.warning(
+                "[MONITOR] Reaped stale background-leader lock-holder pid=%s "
+                "(idle/wedged > %.0fs); session-scoped advisory lock released — "
+                "this watchdog will take over leadership on re-probe.",
+                pid,
+                stale_secs,
+            )
+    await probe_session.commit()
+    return reaped
 
 
 def _log_startup_deploy_identity() -> None:
@@ -348,28 +433,39 @@ async def lifespan(app):
 
     # --- Leader election via pg_try_advisory_lock (session-scoped) ---
     # Only one Cloud Run instance should run the leader-only background services.
-    # We hold a dedicated session open for the entire lifespan; the lock is released
-    # automatically when the session/connection closes at shutdown.
-    leader_session = AsyncSessionLocal()
-    await leader_session.__aenter__()
+    # We hold a raw AsyncConnection (not an AsyncSession) open for the entire
+    # lifespan so the lock-holding database backend PID is STABLE across keepalive
+    # commits. AsyncSession.commit() returns the underlying connection back to the
+    # pool, meaning the next execute may run on a DIFFERENT connection — leaving the
+    # lock-holding connection idle and vulnerable to _reap_stale_leader_lock_holder
+    # terminating it as "stale" (false positive). AsyncConnection keeps the
+    # connection checked out until close(), so commit() never changes the PID.
+    leader_conn = None
     try:
-        _result = await leader_session.execute(
+        leader_conn = await engine.connect()
+        _result = await leader_conn.execute(
             _text("SELECT pg_try_advisory_lock(:lock_id)"),
             {"lock_id": _BACKGROUND_LOCK_ID},
         )
         is_leader = bool(_result.scalar())
     except Exception:
         # Non-Postgres dialect (SQLite in tests) — default to leader so all
-        # services start normally; close the dummy session immediately.
+        # services start normally; close the dummy connection immediately.
         is_leader = True
-        await leader_session.aclose()
-        leader_session = None
+        try:
+            await leader_conn.close()
+        except Exception as _conn_close_exc:
+            logger.debug(
+                "[STARTUP] Leader connection close (non-Postgres) no-op: %s",
+                _conn_close_exc,
+            )
+        leader_conn = None
 
-    if leader_session is not None:
+    if leader_conn is not None:
         # pg_try_advisory_lock is SESSION-scoped (not the _xact_ variant), so the
         # lock is held until the connection closes — it SURVIVES a COMMIT. Commit
         # now to close the transaction the SELECT auto-opened. Otherwise
-        # leader_session sits *idle in transaction* for the whole process
+        # leader_conn sits *idle in transaction* for the whole process
         # lifetime and Postgres' ``idle_in_transaction_session_timeout`` (60s, set
         # in database.py) terminates the connection — silently releasing the
         # advisory lock and triggering the "prior leader died" respawn loop. A
@@ -378,16 +474,27 @@ async def lifespan(app):
         # below on the leader) keeps the connection warm and recovers the lock if
         # the connection is ever dropped anyway.
         try:
-            await leader_session.commit()
+            await leader_conn.commit()
         except Exception as _lock_commit_exc:  # keepalive recovers a bad connection
             logger.warning(
-                "[STARTUP] Leader lock-session commit failed (continuing): %s",
+                "[STARTUP] Leader lock-connection commit failed (continuing): %s",
                 _lock_commit_exc,
             )
 
     _shared_state.is_leader = is_leader
 
     if not is_leader:
+        # Release the lock-acquisition connection immediately — we did not win the
+        # lock, so this connection is unused. Leaving it open would permanently hold
+        # one connection from the pool for this instance's entire lifetime.
+        if leader_conn is not None:
+            try:
+                await leader_conn.close()
+            except Exception as _nl_conn_exc:
+                logger.debug(
+                    "[STARTUP] Non-leader: leader_conn close: %s", _nl_conn_exc
+                )
+            leader_conn = None
         logger.info(
             "[STARTUP] Not background-leader; skipping leader-only services (serving HTTP only)"
         )
@@ -518,6 +625,27 @@ async def lifespan(app):
                                     )
                                 ).scalar()
                             )
+                            # The first probe failed → the lock is held. If a
+                            # stale (dead/wedged) leader still holds it and never
+                            # released, reap it and retry the probe in THIS cycle
+                            # so leadership recovers in one watchdog interval
+                            # instead of waiting on Postgres' passive TCP death
+                            # detection (minutes) — or, for a committed-idle
+                            # wedged process, never.
+                            if (
+                                not _probe_acquired
+                                and await _reap_stale_leader_lock_holder(_probe_session)
+                            ):
+                                _probe_acquired = bool(
+                                    (
+                                        await _probe_session.execute(
+                                            _text(
+                                                "SELECT pg_try_advisory_lock(:lock_id)"
+                                            ),
+                                            {"lock_id": _BACKGROUND_LOCK_ID},
+                                        )
+                                    ).scalar()
+                                )
                             if _probe_acquired:
                                 # Release before exiting so the respawned
                                 # process (or a peer that probes during our
@@ -688,6 +816,7 @@ async def lifespan(app):
         from app.efficiency_snapshot import (
             SNAPSHOT_INTERVAL_SECONDS,
             maybe_alert_pool_payoff_transition,
+            maybe_alert_self_repair_burn_share,
             maybe_alert_unpriced_models_coverage,
             maybe_write_daily_snapshot,
         )
@@ -764,6 +893,29 @@ async def lifespan(app):
                                 "error=%s",
                                 project_id,
                                 unpriced_exc,
+                            )
+                        # Self-repair burn-share alert: same hourly tick, edge-
+                        # triggered, so elevated repair token overhead pages the
+                        # operator instead of silently degrading efficiency. Best-
+                        # effort — isolated try/except + commit.
+                        try:
+                            repair_fired = await maybe_alert_self_repair_burn_share(
+                                scan_session, project_id
+                            )
+                            await scan_session.commit()
+                            if repair_fired:
+                                logger.info(
+                                    "[EFFICIENCY_SNAPSHOT] project=%s "
+                                    "self-repair-burn-share alert fired",
+                                    project_id,
+                                )
+                        except Exception as repair_exc:
+                            await scan_session.rollback()
+                            logger.warning(
+                                "[EFFICIENCY_SNAPSHOT] project=%s "
+                                "self-repair-burn-share alert error=%s",
+                                project_id,
+                                repair_exc,
                             )
             except asyncio.CancelledError:
                 raise
@@ -1235,7 +1387,7 @@ async def lifespan(app):
     async def _leader_lock_keepalive():
         while True:
             await asyncio.sleep(_LEADER_KEEPALIVE_SECONDS)
-            outcome = await _leader_lock_keepalive_tick(leader_session)
+            outcome = await _leader_lock_keepalive_tick(leader_conn)
             if outcome in ("lost", "error"):
                 logger.warning(
                     "[MONITOR] Leader advisory lock %s; hard-exiting so Cloud Run "
@@ -1246,7 +1398,7 @@ async def lifespan(app):
 
     leader_keepalive_task = (
         asyncio.create_task(_leader_lock_keepalive())
-        if leader_session is not None
+        if leader_conn is not None
         else None
     )
 
@@ -1305,13 +1457,13 @@ async def lifespan(app):
     from app.redis_client import close_redis
 
     await close_redis()
-    # Release the session-scoped advisory lock by closing the dedicated session.
-    if leader_session is not None:
+    # Release the connection-scoped advisory lock by closing the dedicated connection.
+    if leader_conn is not None:
         try:
-            await leader_session.aclose()
+            await leader_conn.close()
         except Exception as _close_exc:
             logger.warning(
-                "[LIFESPAN] Failed to close leader session on shutdown: %s",
+                "[LIFESPAN] Failed to close leader connection on shutdown: %s",
                 _close_exc,
             )
     # Gracefully dispose the main query pool so a Cloud Run drain (SIGTERM)
@@ -1327,5 +1479,5 @@ async def lifespan(app):
         logger.warning(
             "[SHUTDOWN] engine.dispose() exceeded 5s grace — abandoning pool"
         )
-    except Exception as _disp_exc:  # noqa: BLE001 — shutdown best-effort
+    except Exception as _disp_exc:
         logger.warning("[SHUTDOWN] engine.dispose() failed: %s", _disp_exc)

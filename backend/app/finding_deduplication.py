@@ -774,6 +774,27 @@ def _norm_claim_set(raw: object) -> frozenset:
     )
 
 
+def _finding_declares_dependency(finding: dict) -> bool:
+    """True when a finding declares it builds on a prerequisite foundation.
+
+    A dependent finding — one carrying a non-empty ``depends_on_indices`` or a
+    normalized ``_prerequisite`` ({kind, ref}) — legitimately shares a code
+    region with the foundation it depends on; that file overlap is the SIGNAL of
+    a genuine cross-tree code-dep (it drives base_branch inheritance), not
+    evidence of duplication. Such findings must therefore be exempt from the
+    region-identity dedup stage, which would otherwise drop the dependent for
+    "sharing a code region with" its own prerequisite and strand the cross-tree
+    wiring. Exact-hash and evidence-overlap stages still apply, so a dependent
+    that is a true duplicate of prior work is still caught.
+    """
+    deps = finding.get("depends_on_indices")
+    if isinstance(deps, (list, tuple)) and any(
+        isinstance(d, int) for d in deps
+    ):
+        return True
+    return bool(finding.get("_prerequisite"))
+
+
 def _jaccard_overlap(set_a: set, set_b: set) -> float:
     """Calculate Jaccard similarity between two sets.
 
@@ -895,6 +916,12 @@ def deduplicate_findings(
         fhash = finding_hash(title, description)
         finding_dir_id = finding.get("direction_id") or parent_dir_id
         finding_task_type = _dedup_spawn_task_type(finding)
+        # A finding that declares a dependency on a foundation legitimately
+        # shares a code region with that prerequisite — that overlap is what
+        # marks it a genuine cross-tree code-dep (it drives base inheritance),
+        # not a duplicate. Exempt it from region-identity dedup so it survives
+        # to the cross-tree wiring path; exact-hash / evidence stages still run.
+        declares_dependency = _finding_declares_dependency(finding)
 
         if fhash in recent_finding_hashes:
             out = failed_hashes.get(fhash, "prior")
@@ -911,8 +938,12 @@ def deduplicate_findings(
             )
             continue
 
-        matched_title = _find_overlap_match(
-            finding, finding_dir_id, existing_tasks_with_dirs, finding_task_type
+        matched_title = (
+            None
+            if declares_dependency
+            else _find_overlap_match(
+                finding, finding_dir_id, existing_tasks_with_dirs, finding_task_type
+            )
         )
         if matched_title is not None:
             logger.warning(
@@ -930,7 +961,7 @@ def deduplicate_findings(
             )
             continue
 
-        if recent_terminal_findings:
+        if recent_terminal_findings and not declares_dependency:
             matched_title = _find_overlap_match(
                 finding, finding_dir_id, recent_terminal_findings, finding_task_type
             )

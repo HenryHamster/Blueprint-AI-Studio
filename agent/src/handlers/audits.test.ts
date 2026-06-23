@@ -112,6 +112,7 @@ import {
 import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
+import { READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-abc123';
@@ -206,6 +207,10 @@ describe('handleSecurityAudit — JSON extraction fallback', () => {
     expect(call.artifact_type).toBe('SECURITY_REPORT');
     expect(call.logs).toBe(JSON.stringify(repaired));
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const reopenPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(reopenPrompt).toContain('Output ONLY the JSON array now');
+    expect(reopenPrompt).not.toContain('/tmp/');
+    expect(reopenPrompt).not.toContain(READ_ONLY_BASH_WRITE_NOTE);
     expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
     expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
   });
@@ -306,6 +311,10 @@ describe('handleSelfAudit — findings ingestion', () => {
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('SELF_AUDIT_REPORT');
     expect(stored.findings[0].system_id).toBe('sys-z');
+    const reopenPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(reopenPrompt).toContain('Output ONLY the JSON object now');
+    expect(reopenPrompt).not.toContain('/tmp/');
+    expect(reopenPrompt).not.toContain(READ_ONLY_BASH_WRITE_NOTE);
     expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
     expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
   });
@@ -635,7 +644,8 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     expect(stored.findings).toEqual([]);
     expect(stored.computed_test_erosion).toBeDefined();
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(runClaudeCode).mock.calls[1][0]).toContain('Return ONLY the JSON object');
+    expect(vi.mocked(runClaudeCode).mock.calls[1][0]).toContain('Output ONLY the JSON object now');
+    expect(vi.mocked(runClaudeCode).mock.calls[1][0]).not.toContain('/tmp/');
     expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
     expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
   });
@@ -952,5 +962,103 @@ describe('handleReleaseAudit — JSON schema field name contract', () => {
     const match = prompt.match(/```json\s*([\s\S]*?)```/);
     const block = match ? match[1] : prompt;
     expect(block).not.toContain('"level"');
+  });
+});
+
+// ── READ_ONLY_BASH_WRITE_NOTE — prompt inclusion guards ──────────────────────
+// Each read-only audit handler must instruct the agent to use Bash to write its
+// /tmp output file because Write/Edit tools are disabled. These tests assert the
+// shared note appears in the main prompt for each handler, preventing silent
+// regression when prompts are refactored.
+describe('read-only audit handlers — Bash write note present in prompt', () => {
+  const CANDIDATE_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(git).mockReturnValue('');
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  it('handleSecurityAudit prompt contains READ_ONLY_BASH_WRITE_NOTE', async () => {
+    await handleSecurityAudit(TASK_ID, { base_branch: 'main' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
+  });
+
+  it('handleSelfAudit prompt contains READ_ONLY_BASH_WRITE_NOTE', async () => {
+    await handleSelfAudit(TASK_ID, { base_branch: 'main' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
+  });
+
+  it('handleReleaseAudit prompt contains READ_ONLY_BASH_WRITE_NOTE', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 1,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      findings: [],
+    });
+    await handleReleaseAudit(
+      TASK_ID, { base_branch: 'main', candidate_sha: CANDIDATE_SHA },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
+  });
+});
+
+// ── audit handlers use distinct schema labels ─────────────────────────────────
+describe('audit handlers use distinct schema labels', () => {
+  const CANDIDATE_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('handleSecurityAudit passes security_audit schema label on repair', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const repaired = [{ title: 'XSS', severity: 'high', fix_prompt: 'Escape output' }];
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'not json', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(repaired) });
+
+    await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(recordFormatRepairAttempt).toHaveBeenCalledWith('security_audit');
+  });
+
+  it('handleSelfAudit passes self_audit schema label on repair', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const repaired = [{ system_id: 'sys-z', score: 60, recommended_mode: 'fundamentals' }];
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'not json', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(repaired) });
+
+    await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(recordFormatRepairAttempt).toHaveBeenCalledWith('self_audit');
+  });
+
+  it('handleReleaseAudit passes release_audit schema label on repair', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') return '';
+      if (Array.isArray(a) && a[0] === 'diff') return '+ expect(value).toBe(true)\n';
+      return Buffer.from('');
+    });
+    const repaired = {
+      audit_score: 0.91,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      findings: [],
+    };
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'not json', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(repaired) });
+
+    await handleReleaseAudit(TASK_ID, { base_branch: 'main', candidate_sha: CANDIDATE_SHA }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(recordFormatRepairAttempt).toHaveBeenCalledWith('release_audit');
   });
 });

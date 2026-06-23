@@ -895,6 +895,15 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             </span>
           );
         })() : null}
+        {task.status === 'COMPLETED' && task.post_commit_pending && (
+          <span
+            className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/20 text-amber-400"
+            title="Post-commit side effects (PR submission, child spawns, merge) are queued and have not fired yet"
+          >
+            <Clock className="w-3 h-3 mr-1 shrink-0" />
+            Effects pending
+          </span>
+        )}
       </div>
 
       {isActive && heartbeat.text.startsWith('Stale') && (

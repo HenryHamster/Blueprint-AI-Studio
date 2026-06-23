@@ -1,3 +1,19 @@
+/**
+ * Memo task handler — terminal reasoning artifact (no repo, no PR).
+ *
+ * Memo tasks emit a structured reasoning artifact (summary, reasoning, citations,
+ * tags) without cloning a repo, making edits, or creating a PR. Used by the
+ * orchestrator to document strategic decisions (e.g., direction retirement),
+ * intermediate analysis, or findings that future tasks can cite.
+ *
+ * The agent receives context (reasoning_kind, source_finding, direction, etc.)
+ * and outputs a JSON object with required keys: summary, reasoning, citations,
+ * and tags. If the JSON is malformed, a bounded one-shot continuation repair
+ * re-opens the task to fix the format.
+ *
+ * Memos are persisted as Artifacts (ArtifactType.MEMO) for later reference.
+ */
+
 import type WebSocket from 'ws';
 import {
   strVal, sanitize, sendLog, persistAndPostStatus, runClaudeCode,

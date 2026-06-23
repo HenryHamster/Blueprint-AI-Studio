@@ -5928,8 +5928,11 @@ async def test_clear_residual_fingerprints_requires_auth(
     unauthenticated_client: AsyncClient,
 ):
     """Clear endpoint requires admin auth."""
+    csrf_token = "test-csrf-token"
     response = await unauthenticated_client.post(
-        "/api/admin/residual-fingerprints/clear"
+        "/api/admin/residual-fingerprints/clear",
+        cookies={"csrf_token": csrf_token},
+        headers={"X-CSRF-Token": csrf_token},
     )
     assert response.status_code in (401, 403)
 
@@ -5975,9 +5978,12 @@ async def test_ignore_residual_case_idempotent(client: AsyncClient, db_session):
 @pytest.mark.asyncio
 async def test_ignore_residual_case_requires_auth(unauthenticated_client: AsyncClient):
     """Ignore endpoint requires admin auth."""
+    csrf_token = "test-csrf-token"
     response = await unauthenticated_client.post(
         "/api/admin/residual-cases/some-fp/ignore",
         params={"project_id": "00000000-0000-0000-0000-000000000000"},
+        cookies={"csrf_token": csrf_token},
+        headers={"X-CSRF-Token": csrf_token},
     )
     assert response.status_code in (401, 403)
 
@@ -6056,9 +6062,12 @@ async def test_unignore_residual_case_requires_auth(
     unauthenticated_client: AsyncClient,
 ):
     """Unignore endpoint requires admin auth."""
+    csrf_token = "test-csrf-token"
     response = await unauthenticated_client.post(
         "/api/admin/residual-cases/some-fp/unignore",
         params={"project_id": "00000000-0000-0000-0000-000000000000"},
+        cookies={"csrf_token": csrf_token},
+        headers={"X-CSRF-Token": csrf_token},
     )
     assert response.status_code in (401, 403)
 
@@ -6212,9 +6221,12 @@ async def test_unsuspend_residual_case_requires_auth(
     unauthenticated_client: AsyncClient,
 ):
     """Unsuspend endpoint requires admin auth."""
+    csrf_token = "test-csrf-token"
     response = await unauthenticated_client.post(
         "/api/admin/residual-cases/some-fp/unsuspend",
         params={"project_id": "00000000-0000-0000-0000-000000000000"},
+        cookies={"csrf_token": csrf_token},
+        headers={"X-CSRF-Token": csrf_token},
     )
     assert response.status_code in (401, 403)
 

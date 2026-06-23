@@ -2146,7 +2146,9 @@ async def test_rollup_review_spawn_none_pr_closed_unmerged_does_not_fail_parent(
 
     # Use automerge deps but override get_pull_request to report a large PR
     # (additions > 100) so the large-rollup → review path is taken.
-    mock_merge, _ = _mock_automerge_deps(mocker, pr_files=_files("backend/app/models.py"))
+    mock_merge, _ = _mock_automerge_deps(
+        mocker, pr_files=_files("backend/app/models.py")
+    )
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
@@ -2187,3 +2189,534 @@ async def test_rollup_review_spawn_none_pr_closed_unmerged_does_not_fail_parent(
         "parent must not be FAILED when review spawn returns None due to PR closed without merge"
     )
     assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_landed_rollup_propagates_signal_to_carried_children(cleanup_db, mocker):
+    """When a rollup PR targeting the integration branch is detected as already
+    merged, all COMPLETED children whose code merged into the staging branch
+    (pr_merged=True but landed_on_integration=False) receive the landed signal so
+    cross-base dependents waiting on has_landed_signal(child) can unblock.
+
+    Proof for acceptance evidence: a cross-base dependent of a child carried in a
+    landed rollup becomes eligible only after the rollup lands — the child's
+    landed_on_integration transitions from False to True on rollup completion.
+    """
+    from app.rollup_management import _check_and_trigger_rollup
+    from app.landed_signal import has_landed_signal
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+    # Existing-PR check returns merged=True → triggers "already merged" landing path
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "state": "closed"},
+    )
+    # verify_rollup_merge_landed is called when target_branch == integration_branch;
+    # return "landed" so _landed=True and the propagation fires.
+    mocker.patch(
+        "app.rollup_management.verify_rollup_merge_landed",
+        new_callable=AsyncMock,
+        return_value="landed",
+    )
+
+    # Project with a named integration branch so _classify_merged_rollup_landing
+    # returns _landed=True when target_branch matches.
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    # Parent targets "main" directly — not an intermediate staging branch.
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db, project.id, extra_context={"parent_base": "main"}
+    )
+
+    # Children that merged into the rollup's staging branch but whose
+    # landed_on_integration is explicitly False (the _non_merge_unblock_reason
+    # marker recorded by mark_unblocked_non_merge when a child's PR merged into
+    # a staging branch, not directly onto integration).
+    child1 = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    child2 = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+
+    await _check_and_trigger_rollup(child1, cleanup_db)
+
+    await cleanup_db.refresh(child1)
+    await cleanup_db.refresh(child2)
+
+    # Both children must now carry the landed signal — the key predicate that
+    # orchestrator_health._check_candidate_task_deps reads to unblock cross-base
+    # dependents (has_landed_signal reads context["landed_on_integration"]).
+    assert has_landed_signal(child1), (
+        "child1 must have landed signal after rollup lands on integration branch"
+    )
+    assert has_landed_signal(child2), (
+        "child2 must have landed signal after rollup lands on integration branch"
+    )
+    assert (child1.context or {}).get("landed_on_integration") is True
+    assert (child2.context or {}).get("landed_on_integration") is True
+    # The staging-branch non-merge marker must be cleared so the child is
+    # recognized as a genuine integration landing by all callers.
+    assert "_non_merge_unblock_reason" not in (child1.context or {})
+    assert "_non_merge_unblock_reason" not in (child2.context or {})
+
+
+@pytest.mark.asyncio
+async def test_propagate_skips_force_dropped_children(cleanup_db, mocker):
+    """_propagate_landed_to_rollup_children must NOT stamp landed_on_integration
+    on force-dropped children (rollup_no_pr_artifact, malformed_pr_url,
+    review_respawn_cap).  These children carry pr_merged=True but were never
+    genuinely merged; stamping them erases the force-drop evidence.
+    """
+    from app.rollup_management import _propagate_landed_to_rollup_children
+    from app.landed_signal import has_landed_signal
+
+    project = await _make_project(cleanup_db)
+
+    force_drop_reasons = [
+        "rollup_no_pr_artifact",
+        "malformed_pr_url",
+        "review_respawn_cap",
+    ]
+    children = []
+    for reason in force_drop_reasons:
+        child = await _make_task(
+            cleanup_db,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "pr_merged": True,
+                "landed_on_integration": False,
+                "_non_merge_unblock_reason": reason,
+            },
+        )
+        children.append(child)
+
+    _propagate_landed_to_rollup_children(children, cleanup_db)
+
+    for child, reason in zip(children, force_drop_reasons):
+        assert not has_landed_signal(child), (
+            f"force-dropped child ({reason}) must not receive landed signal"
+        )
+        assert (child.context or {}).get("landed_on_integration") is False, (
+            f"force-dropped child ({reason}) must retain landed_on_integration=False"
+        )
+        assert (child.context or {}).get("_non_merge_unblock_reason") == reason, (
+            f"force-dropped child ({reason}) must retain _non_merge_unblock_reason"
+        )
+
+
+def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
+    """Mock setup for the re-poll-resolves-to-dirty path.
+
+    get_pull_request side_effect:
+      1. existing-PR validation (open, not merged)
+      2. diff-size fetch (small PR)
+      3. initial state after failed merge (empty or unknown — triggers repoll)
+      4. re-poll result (dirty — should trigger fix spawn, not deferral)
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "merge conflict"},
+    )
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"merged": False, "state": "open"},
+            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},
+            {"mergeable_state": initial_state, "head": {"sha": "deadbeef"}},
+            {"mergeable_state": "dirty", "head": {"sha": "deadbeef"}},
+        ],
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+    # Skip the asyncio sleep in the repoll loop so tests don't block.
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+
+
+@pytest.mark.asyncio
+async def test_repoll_resolves_empty_to_dirty_spawns_fix_in_same_sweep(
+    cleanup_db, mocker
+):
+    """When mergeable_state starts 'empty' and re-poll resolves to 'dirty',
+    the conflict-fix spawn must fire in the SAME sweep — deferral counters
+    must NOT be incremented.
+
+    Regression guard for the bug where `elif _ms != 'dirty':` trapped the
+    re-poll result inside the deferral block, causing an unconditional return
+    before the fix-spawn path was reached.
+    """
+    _mock_repoll_resolves_to_dirty(mocker, initial_state="empty")
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="fix-task-id"), None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # Fix task must be spawned in this sweep, not deferred.
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "fix"
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    # Deferral counter must NOT have been incremented — confirms we bypassed
+    # the deferral block rather than falling through after incrementing.
+    assert (parent.context or {}).get("_merge_deferred_count") is None
+
+
+@pytest.mark.asyncio
+async def test_repoll_resolves_unknown_to_dirty_spawns_fix_in_same_sweep(
+    cleanup_db, mocker
+):
+    """Same as test_repoll_resolves_empty_to_dirty but starting from 'unknown'.
+
+    Both 'empty' and 'unknown' enter the repoll sub-loop; both must fall
+    through to the conflict-fix spawn when the repoll resolves to 'dirty'.
+    """
+    _mock_repoll_resolves_to_dirty(mocker, initial_state="unknown")
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="fix-task-id"), None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "fix"
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("_merge_deferred_count") is None
+
+
+def _mock_repoll_or_escalation_landing_deps(mocker, *, get_pr_side_effect, merge_side_effect):
+    """Common mock setup for the repoll_merge and escalation_merge success paths.
+
+    Both paths share the same upstream deps (auth, GitHub I/O, housekeeping)
+    and differ only in the get_pull_request / merge_pull_request sequences.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+    )
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
+    mocker.patch("app.github.list_versions_at_ref", new_callable=AsyncMock, return_value=[])
+    mocker.patch("app.github.is_ancestor_of", new_callable=AsyncMock, return_value=False)
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        side_effect=merge_side_effect,
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=get_pr_side_effect,
+    )
+    # Landing classification: both paths call _classify_merged_rollup_landing
+    # which calls verify_rollup_merge_landed when target == integration branch.
+    mocker.patch(
+        "app.rollup_management.verify_rollup_merge_landed",
+        new_callable=AsyncMock,
+        return_value="landed",
+    )
+    # Post-merge housekeeping deps (wrapped in try/except in production, but
+    # mocked here for determinism and to avoid real I/O).
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mocker.patch(
+        "app.github.get_pull_request_diff", new_callable=AsyncMock, return_value=""
+    )
+    mocker.patch(
+        "app.viewport_coverage.update_viewport_coverage_snapshot_from_diff",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._nudge_sibling_rollup_prs", new_callable=AsyncMock
+    )
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+
+@pytest.mark.asyncio
+async def test_repoll_merge_propagates_landed_to_rollup_children(cleanup_db, mocker):
+    """When a rollup PR's initial merge returns empty mergeability and the
+    re-poll loop resolves to 'clean', triggering a successful inline merge,
+    _propagate_landed_to_rollup_children must fire on the repoll_merge success
+    branch (rollup_management.py:3667) so staging-only carried children receive
+    the landed_on_integration signal.
+
+    Regression guard for the twice-misapplied fix: propagation was initially
+    added to the wrong paths (existing_pr_merged/zero_diff_close/auto_merge_success)
+    before being correctly placed at the repoll_merge branch in #11301/#11302.
+    """
+    from app.rollup_management import _check_and_trigger_rollup
+    from app.landed_signal import has_landed_signal
+
+    _mock_repoll_or_escalation_landing_deps(
+        mocker,
+        # get_pull_request calls: (1) validation, (2) diff-size, (3) post-merge
+        # state check returns 'empty' → enters repoll loop, (4) repoll 1 returns
+        # 'clean' → inline merge fires.
+        get_pr_side_effect=[
+            {"merged": False, "state": "open"},
+            {"additions": 5, "deletions": 2, "merged": False, "state": "open"},
+            {"mergeable_state": "empty", "head": {"sha": "deadbeef"}},
+            {"mergeable_state": "clean", "head": {"sha": "deadbeef"}},
+        ],
+        # merge_pull_request calls: (1) initial attempt fails, (2) repoll merge succeeds.
+        merge_side_effect=[
+            {"merged": False, "message": "merge conflict"},
+            {"merged": True, "sha": "abc123"},
+        ],
+    )
+
+    # Set integration_branch to the same staging branch used as parent_base so
+    # that BOTH conditions are satisfied simultaneously:
+    #   (a) is_target_intermediate=True  → auto-merge path (repoll loop active)
+    #   (b) target_branch == integration_branch → _rp_landed=True → propagation fires
+    # This mirrors a multi-hop chain where the rollup lands on the "final"
+    # staging branch configured as the project's integration branch.
+    project = await _make_project(
+        cleanup_db, integration_branch="research/conflict-base"
+    )
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    # Children merged into the staging branch but not yet landed on integration.
+    child1 = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    child2 = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+
+    await _check_and_trigger_rollup(child1, cleanup_db)
+
+    await cleanup_db.refresh(child1)
+    await cleanup_db.refresh(child2)
+
+    assert has_landed_signal(child1), (
+        "child1 must receive landed signal via repoll_merge propagation"
+    )
+    assert has_landed_signal(child2), (
+        "child2 must receive landed signal via repoll_merge propagation"
+    )
+    assert (child1.context or {}).get("landed_on_integration") is True
+    assert (child2.context or {}).get("landed_on_integration") is True
+    assert "_non_merge_unblock_reason" not in (child1.context or {})
+    assert "_non_merge_unblock_reason" not in (child2.context or {})
+
+
+@pytest.mark.asyncio
+async def test_escalation_merge_propagates_landed_to_rollup_children(cleanup_db, mocker):
+    """When a rollup PR persists in 'empty' mergeability across the repoll loop
+    AND enough deferrals have accumulated to trigger the fast-escalation path,
+    a successful escalation merge must call _propagate_landed_to_rollup_children
+    at rollup_management.py:3937 so carried staging-only children receive the
+    landed_on_integration signal.
+
+    Regression guard for the twice-misapplied fix: same as the repoll_merge
+    guard — the escalation_merge path was one of the two paths that received
+    the propagation call only in the correct re-land.
+
+    Setup: parent carries _merge_deferred_count=4 and _merge_deferred_state='empty'
+    so that after this sweep deferred_count=5 == alert_threshold(5), which triggers
+    the fast-escalation attempt. The repoll loop exhausts (all 3 re-polls stay
+    'empty') so _repoll_merged=False and control falls through to escalation.
+    """
+    from app.rollup_management import _check_and_trigger_rollup
+    from app.landed_signal import has_landed_signal
+
+    _mock_repoll_or_escalation_landing_deps(
+        mocker,
+        # get_pull_request calls: (1) validation, (2) diff-size, (3) post-merge
+        # state returns 'empty' → repoll loop, (4-6) all three repoll attempts
+        # still return 'empty' → loop exhausts, falls to deferral/escalation.
+        get_pr_side_effect=[
+            {"merged": False, "state": "open"},
+            {"additions": 5, "deletions": 2, "merged": False, "state": "open"},
+            {"mergeable_state": "empty", "head": {"sha": "deadbeef"}},
+            {"mergeable_state": "empty", "head": {"sha": "deadbeef"}},
+            {"mergeable_state": "empty", "head": {"sha": "deadbeef"}},
+            {"mergeable_state": "empty", "head": {"sha": "deadbeef"}},
+        ],
+        # merge_pull_request calls: (1) initial attempt fails, (2) escalation succeeds.
+        merge_side_effect=[
+            {"merged": False, "message": "merge conflict"},
+            {"merged": True, "sha": "abc123"},
+        ],
+    )
+
+    # Same project/branch setup as the repoll_merge test: integration_branch
+    # matches parent_base so is_target_intermediate=True (enters auto-merge path)
+    # AND _esc_landed=True (propagation fires).
+    project = await _make_project(
+        cleanup_db, integration_branch="research/conflict-base"
+    )
+    # Pre-seed deferred count so escalation fires this sweep:
+    # deferred_count = (_merge_deferred_count + 1) when prev_state matches = 4+1 = 5
+    # alert_threshold for _fast_escalate ('empty') defaults to 5 → 5 >= 5 triggers.
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db,
+        project.id,
+        extra_context={
+            "_merge_deferred_count": 4,
+            "_merge_deferred_state": "empty",
+        },
+    )
+    # Children merged into the staging branch but not yet landed on integration.
+    child1 = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    child2 = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+
+    await _check_and_trigger_rollup(child1, cleanup_db)
+
+    await cleanup_db.refresh(child1)
+    await cleanup_db.refresh(child2)
+
+    assert has_landed_signal(child1), (
+        "child1 must receive landed signal via escalation_merge propagation"
+    )
+    assert has_landed_signal(child2), (
+        "child2 must receive landed signal via escalation_merge propagation"
+    )
+    assert (child1.context or {}).get("landed_on_integration") is True
+    assert (child2.context or {}).get("landed_on_integration") is True
+    assert "_non_merge_unblock_reason" not in (child1.context or {})
+    assert "_non_merge_unblock_reason" not in (child2.context or {})

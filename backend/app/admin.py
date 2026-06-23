@@ -81,6 +81,7 @@ from app.admin_task_mutations import (
     modify_task_apply,
 )
 from app.task_blocked import strip_fresh_attempt_context
+from app.efficiency_snapshot import _task_llm_cost as _calc_task_llm_cost
 from app.time_utils import clear_retry_after
 from app.routers.admin_operator_triggers import (  # noqa: F401
     _record_failure_result,
@@ -478,6 +479,7 @@ async def get_all_tasks(
             else None,
             "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(t),
             "fix_loop_summary": _fix_loop_summary(t.fix_loop_history),
+            "post_commit_pending": t.post_commit_pending,
         }
         result_list.append(task_dict)
 
@@ -1058,6 +1060,14 @@ async def bulk_action_tasks(
     }
 
 
+def _task_llm_cost_fields(task: Task) -> dict:
+    llm_cost, any_unpriced = _calc_task_llm_cost(task)
+    return {
+        "task_llm_cost_usd": round(llm_cost, 6) if llm_cost else None,
+        "task_llm_cost_any_unpriced": any_unpriced,
+    }
+
+
 @router.get("/tasks/{task_id}")
 async def get_task(
     task_id: str,
@@ -1111,7 +1121,7 @@ async def get_task(
             research_findings = a.logs[:100000]  # raw logs; resolved below
         if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs:
             try:
-                parsed = json.loads(a.logs[:100000])
+                parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
                 if isinstance(parsed, dict):
                     merge_test_result = parsed
             except (json.JSONDecodeError, AttributeError):
@@ -1136,11 +1146,14 @@ async def get_task(
         for h in all_history
     ]
 
-    # Fetch child task IDs
+    # Fetch child task IDs (capped at 1000 to bound memory for high-fan-out parents)
+    _CHILD_ID_LIMIT = 1000
     child_ids_result = await session.execute(
-        select(Task.id).where(Task.parent_task_id == tid)
+        select(Task.id).where(Task.parent_task_id == tid).limit(_CHILD_ID_LIMIT + 1)
     )
-    child_task_ids = [str(row) for row in child_ids_result.scalars().all()]
+    _raw_child_ids = child_ids_result.scalars().all()
+    child_task_ids_truncated = len(_raw_child_ids) > _CHILD_ID_LIMIT
+    child_task_ids = [str(row) for row in _raw_child_ids[:_CHILD_ID_LIMIT]]
 
     wake_registration_result = await session.execute(
         select(TaskWakeRegistration)
@@ -1220,8 +1233,11 @@ async def get_task(
         ),
         "history": history,
         "child_task_ids": child_task_ids,
+        "child_task_ids_truncated": child_task_ids_truncated,
         "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(task),
         "api_call_summary": task.api_call_summary,
+        **_task_llm_cost_fields(task),
+        "post_commit_pending": task.post_commit_pending,
     }
 
 
@@ -1927,7 +1943,7 @@ async def create_compute_experiment_task(
         if val is not None:
             launch_contract[opt_key] = val
 
-    ok, reason = _validate_compute_launch_contract(launch_contract)
+    ok, reason = _validate_compute_launch_contract(launch_contract, require_smoke=False)
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
 

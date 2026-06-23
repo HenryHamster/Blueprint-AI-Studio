@@ -215,6 +215,87 @@ export async function fetchVmImageIdentity(): Promise<{ image_name: string | nul
   }
 }
 
+/**
+ * When running in Cloud Run Job mode the backend does not inject the agent JWT
+ * or LLM credential values as plaintext env-var overrides (they would be
+ * visible in Cloud Audit Logs and run.executions.get responses). Instead the
+ * backend passes AGENT_SECRET_VERSION — a Secret Manager version URI — and
+ * this function fetches the manifest at that version, then populates
+ * AGENT_TOKEN, all non-identity env vars, and any file credentials from it.
+ *
+ * Throws on any failure so the caller can surface a pre-claim heartbeat before
+ * exiting.
+ */
+export async function resolveCredentialsFromSecretVersion(
+  secretVersionName: string,
+): Promise<void> {
+  // 1. Obtain a GCP access token from the instance metadata service.
+  const tokenController = new AbortController();
+  const tokenTimer = setTimeout(() => { tokenController.abort(); }, 5000);
+  let accessToken: string;
+  try {
+    const tokenRes = await fetch(
+      'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+      { headers: { 'Metadata-Flavor': 'Google' }, signal: tokenController.signal },
+    );
+    clearTimeout(tokenTimer);
+    if (!tokenRes.ok) {
+      throw new Error(`metadata token fetch failed: HTTP ${tokenRes.status}`);
+    }
+    const tokenData = await tokenRes.json() as { access_token: string };
+    accessToken = tokenData.access_token;
+  } catch (err) {
+    clearTimeout(tokenTimer);
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`resolveCredentialsFromSecretVersion: failed to get GCP access token: ${msg}`);
+  }
+
+  // 2. Access the secret version via the Secret Manager REST API.
+  const smController = new AbortController();
+  const smTimer = setTimeout(() => { smController.abort(); }, 10000);
+  let manifestJson: string;
+  try {
+    const smRes = await fetch(
+      `https://secretmanager.googleapis.com/v1/${secretVersionName}:access`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: smController.signal,
+      },
+    );
+    clearTimeout(smTimer);
+    if (!smRes.ok) {
+      throw new Error(`Secret Manager access failed: HTTP ${smRes.status}`);
+    }
+    const smData = await smRes.json() as { payload: { data: string } };
+    manifestJson = Buffer.from(smData.payload.data, 'base64').toString('utf-8');
+  } catch (err) {
+    clearTimeout(smTimer);
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`resolveCredentialsFromSecretVersion: failed to fetch secret: ${msg}`);
+  }
+
+  // 3. Populate AGENT_TOKEN, all non-identity env vars, and file credentials from the manifest.
+  const manifest = JSON.parse(manifestJson) as {
+    env?: Record<string, string>;
+    files?: Array<{ path: string; content: string; mode?: string | number }>;
+  };
+  const env = manifest.env ?? {};
+  if (!AGENT_TOKEN && env['AGENT_SECRET_TOKEN']) {
+    AGENT_TOKEN = env['AGENT_SECRET_TOKEN'];
+    process.env['AGENT_SECRET_TOKEN'] = env['AGENT_SECRET_TOKEN'];
+    apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
+  }
+  for (const [key, value] of Object.entries(env)) {
+    if (!IDENTITY_ENV_KEYS.has(key) && value && !process.env[key]) {
+      process.env[key] = value;
+    }
+  }
+  for (const file of manifest.files ?? []) {
+    ensureParentDirectorySync(file.path);
+    writePrivateFileSync(file.path, file.content, parseSecretFileMode(file.mode));
+  }
+}
+
 /** Read the baked agent-runtime fingerprint from the well-known path written
  *  by the packer provisioner. Returns null in local dev / test environments
  *  where the file is absent so callers can distinguish "no fingerprint" from
@@ -1661,6 +1742,10 @@ let firstToolUseAt: number | null = null; // @per-role
 // pollForNextRole on a warm VM, false on the initial cold-start role.
 let isWarmStart = false; // @per-role
 
+// True when the agent is running in Cloud Run Job mode (CLOUD_RUN_JOB=1).
+// Set at startup from the env var injected by compute_cloud_run.py.
+let isJobMode = false;
+
 export function recordToolUse(toolName: string, input: unknown): void {
   if (firstToolUseAt === null) {
     firstToolUseAt = Date.now();
@@ -1699,6 +1784,16 @@ export function _setWarmStartForTesting(value: boolean): void {
 /** Test-only: read the warm-start flag. */
 export function _getWarmStartForTesting(): boolean {
   return isWarmStart;
+}
+
+/** Test-only: read the job-mode flag. */
+export function _getJobModeForTesting(): boolean {
+  return isJobMode;
+}
+
+/** Test-only: set the job-mode flag. */
+export function _setJobModeForTesting(value: boolean): void {
+  isJobMode = value;
 }
 
 /** Test-only: set the baked agent-runtime fingerprint used in heartbeats. */
@@ -3000,6 +3095,10 @@ export async function main() {
   startEventLoopLagMonitor();
   installExitMarkers();
 
+  // Detect Cloud Run Job execution mode from the CLOUD_RUN_JOB sentinel
+  // injected by compute_cloud_run.py. Used for job-mode behavioral branching.
+  isJobMode = process.env.CLOUD_RUN_JOB === '1';
+
   log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
   log(`Registered handlers (${Object.keys(handlers).length}): ${Object.keys(handlers).join(', ')}`);
   log(`Agent source: ${import.meta.url}`);
@@ -3011,6 +3110,14 @@ export async function main() {
   // now gone) and never on never-existed (accounts without the optional
   // claude_config_json boot healthy VMs that never have ~/.claude.json).
   captureBootProviderConfigPresence();
+
+  // When running as a Cloud Run Job the backend does not inject AGENT_SECRET_TOKEN
+  // or LLM credential values as plaintext env-var overrides to avoid exposing them
+  // in Cloud Audit Logs and run.executions.get. Instead AGENT_SECRET_VERSION is
+  // passed and we fetch the manifest here to obtain both the JWT and LLM creds.
+  if (isJobMode && !AGENT_TOKEN && process.env['AGENT_SECRET_VERSION']) {
+    await resolveCredentialsFromSecretVersion(process.env['AGENT_SECRET_VERSION']);
+  }
 
   if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
 
@@ -3048,6 +3155,9 @@ export async function main() {
   // so the backend heartbeat endpoint accepts this task_id before claim runs.
   const PRE_CLAIM_TASK_ID = process.env.TASK_ID || '';
   const poolMode = process.env.BLUEPRINT_POOL_MODE === '1';
+  // Cloud Run Job containers run exactly one task per execution — no warm
+  // continuity poll, no heartbeat idle window between roles.
+  const jobMode = process.env.CLOUD_RUN_JOB === '1';
 
   // Report a pre-claim failure via the existing heartbeat endpoint. The backend's
   // /api/agent/heartbeat accepts PROVISIONING-status tasks, so this turns silent
@@ -3197,6 +3307,13 @@ export async function main() {
       lastTaskId = claimResult.taskId;
       lastPrNumber = claimResult.prNumber;
       lastBaseBranch = claimResult.baseBranch;
+
+      // Cloud Run Job executions run exactly one task — skip warm-continuity
+      // poll entirely (no multi-role warm VM; container exits after this role).
+      if (jobMode) {
+        log('[job-mode] Cloud Run Job — skipping warm-continuity poll, single-role execution complete');
+        break;
+      }
 
       // After a successful role completion, poll for a warm next role. The
       // backend decides whether this is an ordinary warm claim or a PARK

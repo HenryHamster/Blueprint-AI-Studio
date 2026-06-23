@@ -554,6 +554,8 @@ async def _compute_account_health_summary(
                             *_mp_predicates,
                         ),
                     )
+                    .order_by(Task.updated_at.desc())
+                    .limit(1000)
                 )
             )
             .scalars()
@@ -689,7 +691,7 @@ async def add_max_plan_account(
     request: Request,
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
     cache: DigestCache = Depends(get_digest_cache),
 ):
     """Add an LLM account record.
@@ -867,7 +869,7 @@ async def remove_max_plan_account(
     account_id: str,
     force: bool = Query(False),
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
     cache: DigestCache = Depends(get_digest_cache),
 ):
     from app.max_plan_pool import _account_by_id, _max_plan_pool_lock, _max_plan_pools
@@ -887,7 +889,7 @@ async def remove_max_plan_account(
                 Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]),
                 or_(
                     Task.account_id == account_id,
-                    Task.context["llm_account_id"].as_string() == account_id,
+                    Task.llm_account_id == account_id,
                     Task.context["max_plan_account_id"].as_string() == account_id,
                 ),
             )
@@ -995,7 +997,7 @@ async def update_max_plan_account(
     account_id: str,
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
     cache: DigestCache = Depends(get_digest_cache),
 ):
     from app.max_plan_pool import _account_by_id, _max_plan_pool_lock
@@ -1188,7 +1190,7 @@ async def update_max_plan_account(
 async def reset_account_rate_limits(
     account_id: str,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
     cache: DigestCache = Depends(get_digest_cache),
 ):
     """Clear all rate-limit state (disabled_models) for a Max plan account."""
@@ -1242,7 +1244,7 @@ async def clear_account_model_regression_quarantine(
     provider: str = Query(..., description="provider name (e.g. anthropic)"),
     model: str = Query(..., description="exact model name (e.g. claude-opus-4-8)"),
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
     cache: DigestCache = Depends(get_digest_cache),
 ):
     """Manual override: clear a kind='regression' disabled_models entry for
@@ -1303,7 +1305,7 @@ async def refresh_account_model_availability(
     request: Request,
     account_id: str,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
     cache: DigestCache = Depends(get_digest_cache),
 ):
     """Probe the provider's list-models endpoint for this account and cache

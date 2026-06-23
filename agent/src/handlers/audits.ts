@@ -1,3 +1,23 @@
+/**
+ * Audit handlers — security, self-audit, and release audit task implementations.
+ *
+ * Provides three handler types:
+ *
+ * - **handleSecurityAudit**: Scans code for security vulnerabilities (injection,
+ *   auth flaws, etc.) and emits a structured verdict with findings and fix recommendations.
+ *
+ * - **handleSelfAudit**: Evaluates system maturity and operational readiness,
+ *   producing a maturity assessment and operating mode recommendations.
+ *
+ * - **handleReleaseAudit**: Examines release-candidate diffs for risky changes,
+ *   migration issues, breaking changes, and deployment blockers. Spawns a child
+ *   release_audit_challenge task for adversarial verification. Used in the
+ *   qualify→promote gate to block unsafe releases.
+ *
+ * All audit handlers are structured-output producers that emit JSON verdicts
+ * persisted as Artifacts and embedded in task context for downstream consumers.
+ */
+
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
@@ -10,7 +30,7 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { describeJsonExtractionResult, extractJsonArrayDetailed } from '../json-extract.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
-  PARALLEL_AUDIT_GUIDANCE,
+  PARALLEL_AUDIT_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
 } from '../prompt.js';
@@ -163,7 +183,7 @@ Rules:
 - Each finding must have a concrete, actionable fix_prompt
 - Limit to 20 findings maximum, prioritized by severity
 - For findings without a specific line number, use 0
-- IMPORTANT: Write your findings JSON array to /tmp/security_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
+- IMPORTANT: Write your findings JSON array to /tmp/security_findings_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 - Also output the same JSON array as the final output in your logs.${designDocAdvertisement(task)}`;
 
   const secBuildConfig = resolveBuildConfig(task);
@@ -183,10 +203,10 @@ Rules:
     const repaired = await repairStructuredOutput<unknown[]>({
       mode: 'array',
       requiredKeys: ['severity'],
-      schemaLabel: 'audit',
+      schemaLabel: 'security_audit',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior security audit response did not end with a parseable JSON findings array.
-Return ONLY the JSON array for /tmp/security_findings_${taskId}.json. Each finding object must include at least "severity" plus title, description, file_path, line_number, and fix_prompt. Use [] if there are no findings. No markdown, prose, or code fences.`,
+Output ONLY the JSON array now — each finding must include at least "severity" plus title, description, file_path, line_number, and fix_prompt. Use [] if there are no findings. No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,
@@ -318,7 +338,7 @@ Rules:
 - recommended_mode MUST be one of: audit, fundamentals, ship, pause
 - Limit findings to ${maxSystems} systems unless focus_systems was provided (then use all focus_systems)
 - Each finding must cite at least one evidence file from the actual repo
-- IMPORTANT: Write the JSON object to /tmp/self_audit_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
+- IMPORTANT: Write the JSON object to /tmp/self_audit_findings_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
 - Also output the same JSON object as the final output in your logs.${designDocAdvertisement(task)}`;
 
   const buildConfig = resolveBuildConfig(task);
@@ -342,10 +362,10 @@ Rules:
     const objRepair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['findings', 'system_id'],
-      schemaLabel: 'audit',
+      schemaLabel: 'self_audit',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior self-audit response did not end with a parseable JSON object.
-Return ONLY the JSON object for /tmp/self_audit_findings_${taskId}.json with top-level "findings": [...] and each finding carrying "system_id", score, components, top_issues, recommended_mode, and evidence. No markdown, prose, or code fences.`,
+Output ONLY the JSON object now — with top-level "findings": [...] and each finding carrying "system_id", score, components, top_issues, recommended_mode, and evidence. No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,
@@ -599,6 +619,13 @@ export async function handleReleaseAudit(
   const retryContext = buildRetryContext(task);
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
+  const versionGoal = typeof payload.version_goal === 'string' && payload.version_goal.length > 0
+    ? payload.version_goal
+    : null;
+  const versionGoalSection = versionGoal
+    ? `\n## Version Goal\n\n${versionGoal}\n\nIn addition to the standard quality checks below, assess whether this diff plausibly delivers the version's strategic goal stated above. Add a \`goal_alignment\` object to your JSON output with:\n- \`state\` (string): one of \`"aligned"\` (diff plausibly delivers the goal), \`"shortfall"\` (diff falls short), or \`"not_applicable"\` (goal cannot be assessed from this diff).\n- \`assessed_grade\` (float 0.0–1.0): degree of alignment (1.0 = fully aligned, 0.0 = no alignment).\n- \`biggest_gap\` (string or null): one sentence describing the most significant gap if state is \`"shortfall"\`; null otherwise.\n- \`reasoning_summary\` (string): 1–3 sentences explaining the assessment, citing specific files or patterns from the diff.\n\nThis is an ADDITIONAL field alongside the required \`audit_score\`, \`test_erosion\`, and \`findings\` fields — it does not replace them.\n\n`
+    : '';
+
   const releaseAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}You are a release audit agent. You have been cloned onto \`${baseBranch}\` — the last known-good LTS branch — and your job is to review the incoming diff range \`${diffRange}\` against \`${baseBranch}\`'s standards. \`${candidateSha}\` is the PINNED release candidate commit (a snapshot of the integration branch); it has already been fetched into this clone, so the diff range resolves.
 
 IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge the incoming changes by \`${baseBranch}\`'s standards, NOT by the new code's standards. This asymmetry is the entire point of the audit.
@@ -618,7 +645,7 @@ IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge th
    - Architecture drift (patterns inconsistent with the existing codebase conventions)
    - Test coverage gaps for new behavior
    - Documentation / comment accuracy
-
+${versionGoalSection}
 4. **Score and emit results.** Write your findings as a JSON object to \`/tmp/release_audit_report_${taskId}.json\` with EXACTLY this structure:
 
 \`\`\`json
@@ -629,6 +656,13 @@ IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge th
     "assertion_delta": 12,
     "test_count_delta": 3
   },
+  "deleted_test_file_classifications": [
+    {
+      "path": "testing/test_foo.py",
+      "classification": "dead_code_removal",
+      "rationale": "The subject module foo.py was also removed in this diff (see \`D testing/test_foo.py\` and \`D app/foo.py\`); no live callers remain."
+    }
+  ],
   "findings": [
     {
       "severity": "high",
@@ -645,6 +679,11 @@ Field semantics:
 - \`test_erosion.deleted_test_files\`: list of test file paths deleted in the diff. An empty list is good.
 - \`test_erosion.assertion_delta\`: integer — positive means more assertions added than removed (good), negative means erosion.
 - \`test_erosion.test_count_delta\`: integer — positive means more tests added than removed (good), negative means erosion.
+- \`deleted_test_file_classifications\`: classify EACH file in \`test_erosion.deleted_test_files\`. One object per deleted test file with \`path\` (the exact path string from \`deleted_test_files\`), \`classification\` (\`dead_code_removal\` | \`genuine_erosion\`), and \`rationale\` (one sentence citing the diff evidence you read). Classification rules:
+  - \`dead_code_removal\`: the test file's subject code (the module/function/component it exercised) is ALSO deleted in this same diff (a \`D\` line in \`git diff --name-status\`), OR there are zero remaining callers/imports of that subject anywhere in the candidate. Requires affirmative evidence — read the diff and confirm the subject is also gone before using this classification.
+  - \`genuine_erosion\`: the subject code is demonstrably STILL PRESENT and unchanged, and the test file was removed specifically to stop failing tests from blocking a build. This is the rare exception and requires clear evidence — read the diff and confirm the subject is present and unchanged before using it.
+  - The gate is **fail-closed**: every deleted test file MUST carry an explicit \`dead_code_removal\` classification to pass. \`genuine_erosion\`, absent (no classification provided), or ambiguous classifications all hard-block promotion — \`dead_code_removal\` is the only non-blocking outcome. When uncertain, read the full candidate file list in the repository to determine whether the subject still exists — do NOT default to \`dead_code_removal\` without evidence.
+  - When \`deleted_test_files\` is empty, emit \`[]\` (or omit the field).
 - \`findings\`: each entry has \`severity\` (critical|high|medium|low), \`summary\` (one sentence), \`file\` (file path or empty string if cross-cutting), and \`verification_note\` (required for high/medium/critical — cite the specific file and line you read and why the issue is real, ≥ 20 non-whitespace characters). Findings at severity high/medium/critical WITHOUT a substantive \`verification_note\` are silently excluded from the score — they do not deduct points. Drop or downgrade to low/info any finding you cannot substantiate.
 
 Rules:
@@ -652,7 +691,7 @@ Rules:
 - IMPORTANT — substantiation required: Before recording any finding at severity high, medium, or critical, read the relevant unchanged files in the full repository (not just the diff) to check for existing mitigations (guards, exception handlers, per-request checks, hardcoded constants at the call site). Record what you read and why the issue is real in \`verification_note\`. A hardcoded constant reaching a sink is NOT injection. A per-request DB check is NOT a replay gap. A comparison that is exception-guarded is NOT a TypeError. Only record the finding if you can substantiate it after reading the whole-repo context.
 - Authorized Alembic revision-identity divergences are owned by a separate deterministic gate, NOT the audit. If the diff renumbers or reuses an Alembic revision id that is an authorized, reconciled divergence (e.g. the \`0143\` back-merge: the old \`0143\` migration replaced by a new \`0143\` plus a renumbered \`0144\`), do NOT raise a finding for the revision-identity/renumber itself — the qualifier's migration-identity gate evaluates it and deploy-time reconciliation handles it. You SHOULD still flag genuinely broken migration BODIES (bad DDL, missing/incorrect downgrade, destructive re-apply, data-loss risk) on those same files.
 - If \`git diff ${diffRange}\` produces no output (empty diff), set \`audit_score: 1.0\`, \`findings: []\`, and note it in a single low-severity finding.
-- IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_report_${taskId}.json\` — no markdown, no code fences, no extra text.
+- IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_report_${taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} — no markdown, no code fences, no extra text.
 - Also output the same JSON object as the final output in your logs.
 - Do NOT modify any files in the repository.${designDocAdvertisement(task)}`;
 
@@ -674,11 +713,16 @@ Rules:
     audit_score?: number;
     test_erosion?: { deleted_test_files?: unknown[]; assertion_delta?: number; test_count_delta?: number };
     computed_test_erosion?: { deleted_test_files: string[]; assertion_delta: number; test_count_delta: number };
+    deleted_test_file_classifications?: { path: string; classification: string; rationale: string }[];
     findings?: unknown[];
   } | null;
 
   // Inject computed_test_erosion into the artifact so the backend can use it
   // as the authoritative signal rather than the LLM's self-reported test_erosion.
+  // deleted_test_file_classifications (the per-file dead_code_removal /
+  // genuine_erosion disposition) is carried through verbatim from the parsed
+  // handler output so it reaches release_scoring._score_audit, which retired the
+  // hardcoded AUTHORIZED_TEST_DELETIONS allowlist in favour of this signal.
   const enrichedOutput = handlerOutput !== null && computedTestErosion !== null
     ? { ...handlerOutput, computed_test_erosion: computedTestErosion }
     : handlerOutput;
@@ -691,10 +735,10 @@ Rules:
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['audit_score', 'findings'],
-      schemaLabel: 'audit',
+      schemaLabel: 'release_audit',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior release audit response did not end with a parseable JSON report object.
-Return ONLY the JSON object for /tmp/release_audit_report_${taskId}.json with top-level "audit_score", "test_erosion", and "findings". Each finding must include "severity", "summary", "file", and "verification_note". No markdown, prose, or code fences.`,
+Output ONLY the JSON object now — with top-level "audit_score", "test_erosion", and "findings". Each finding must include "severity", "summary", "file", and "verification_note". No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,

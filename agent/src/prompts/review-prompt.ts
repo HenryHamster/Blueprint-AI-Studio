@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import type { BuildConfig } from '../index.js';
 import {
-  PARALLEL_REVIEW_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
+  PARALLEL_REVIEW_GUIDANCE, DEFAULT_TOOL_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE,
   buildScopedLintOneliner, detectLinterKind,
 } from '../prompt.js';
 
@@ -204,8 +204,11 @@ Use these definitions when assigning severity to issues. Severity affects how th
   - Redundant else after a return statement`;
 }
 
-export function buildReviewVerdictInstructions(taskId: string): string {
-  return `After your review, output EXACTLY ONE of the following JSON blocks as the last line of your response. There are only two valid verdicts — no third option exists.
+export function buildReviewVerdictInstructions(taskId: string, opts?: { repairContext?: boolean }): string {
+  const opening = opts?.repairContext
+    ? `Your review analysis is complete above. Based on that analysis, output EXACTLY ONE of the following JSON blocks as the last line of your response. There are only two valid verdicts — no third option exists.`
+    : `After your review, output EXACTLY ONE of the following JSON blocks as the last line of your response. There are only two valid verdicts — no third option exists.`;
+  return `${opening}
 
 **APPROVE** — the change is ready to merge as-is. Use this when the code is correct, the tests cover the behavior, and nothing blocks shipping. Optional polish notes belong in \`feedback\` as non-blocking observations; they do NOT disqualify APPROVE.
 {"verdict": "APPROVE", "feedback": "What you verified and why it's ready to merge. Include any non-blocking polish notes here."}
@@ -225,7 +228,7 @@ For each issue in the \`issues\` array:
 - \`line\`: line number in the file (optional — omit if not applicable)
 - Issues without \`file\`/\`line\` are still valid and will be included in the review body summary
 
-IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
+IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 }
 
 export function buildRollupReviewGuidance(

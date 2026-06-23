@@ -34,6 +34,7 @@ from typing import Any, Deque, Dict, List
 
 from sqlalchemy import func as safunc
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.models import (
@@ -988,14 +989,31 @@ async def check_evergreen_fill() -> None:
             # re-evaluated on each iteration without an extra DB round-trip.
             tick_spawned = 0
 
+            # Drop heavy JSONB columns that are never read on this path
+            # (vision, running_update, problem_model, self_reflection_log, …).
+            # Needed: id, directions (parked_proof_waiting), build_config (spend
+            # ceiling), integration_branch / is_self_repo / github_repo /
+            # promotion_target (branch resolver).
+            _project_cols = load_only(
+                Project.id,
+                Project.directions,
+                Project.build_config,
+                Project.integration_branch,
+                Project.is_self_repo,
+                Project.github_repo,
+                Project.promotion_target,
+                raiseload=True,
+            )
             projects = (
                 (
                     await session.execute(
-                        select(Project).where(
+                        select(Project)
+                        .where(
                             Project.autonomous_enabled.is_(True),
                             Project.paused.is_(False),
                             Project.not_archived(),
                         )
+                        .options(_project_cols)
                     )
                 )
                 .scalars()

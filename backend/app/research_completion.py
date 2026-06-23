@@ -5255,6 +5255,39 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
         return True
 
+    def _maybe_inherit_base(
+        dependent: Task,
+        foundation: Task,
+        *,
+        finding_title: str,
+    ) -> None:
+        """When *foundation* is a genuine cross-tree code-dep, update *dependent*'s
+        base_branch to match so the pair is same-base from birth and avoids the
+        cross-base landed-signal wait path entirely."""
+        if not dependent.payloads:
+            return
+        from app.orchestrator_health import (
+            _same_base_branch,
+            is_genuine_code_dependency,
+        )
+
+        if is_genuine_code_dependency(dependent, foundation) and not _same_base_branch(
+            dependent, foundation
+        ):
+            foundation_base = (foundation.first_payload or {}).get("base_branch")
+            if foundation_base is None:
+                return
+            dependent.payloads[0]["base_branch"] = foundation_base
+            flag_modified(dependent, "payloads")
+            session.add(dependent)
+            logger.info(
+                "[RESEARCH] Finding '%s' cross-tree genuine code-dep: set "
+                "base_branch to %r (foundation %s)",
+                finding_title,
+                foundation_base,
+                str(foundation.id),
+            )
+
     for ci, ct in enumerate(child_tasks):
         fi = finding_indices[ci]
         finding_title = findings[fi].get("title", f"#{fi}")
@@ -5339,12 +5372,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 lineage_need, _prereq_candidates
             )
             if existing_foundation is not None and existing_foundation.id != ct.id:
-                _wire_prerequisite_edge(
+                _wired = _wire_prerequisite_edge(
                     ct,
                     existing_foundation,
                     finding_title=finding_title,
                     prereq_label=f"task:{missing_hash}",
                 )
+                if _wired:
+                    _maybe_inherit_base(
+                        ct, existing_foundation, finding_title=finding_title
+                    )
                 continue
             # The named sibling survived parsing into `findings` but was dropped
             # from the SPAWN set by deduplicate_findings — it duplicates work that
@@ -5405,12 +5442,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if prereq:
             foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
             if foundation is not None and foundation.id != ct.id:
-                _wire_prerequisite_edge(
+                _wired = _wire_prerequisite_edge(
                     ct,
                     foundation,
                     finding_title=finding_title,
                     prereq_label=f"{prereq.get('kind')}:{prereq.get('ref')}",
                 )
+                if _wired:
+                    _maybe_inherit_base(ct, foundation, finding_title=finding_title)
             elif foundation is None:
                 # Unresolved explicit prerequisite: a finding declared an explicit
                 # {kind, ref} foundation it must build on, but no in-flight or

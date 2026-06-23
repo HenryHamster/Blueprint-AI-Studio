@@ -43,7 +43,7 @@ router = APIRouter(
 )
 
 
-class EnrollBacklogItemRequest(BaseModel):
+class _EnrollBacklogItemRequest(BaseModel):
     project_id: uuid.UUID
     finding_key: str
     title: str
@@ -73,7 +73,7 @@ def _serialize_item(item) -> Dict[str, Any]:
 
 @router.post("/backlog")
 async def enroll_item(
-    payload: EnrollBacklogItemRequest,
+    payload: _EnrollBacklogItemRequest,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ) -> Dict[str, Any]:

@@ -4545,8 +4545,6 @@ async def test_sweep_lane_pilot_kill_verdict_applies_kill(db_session, pilot_on, 
         "warm_resume_fraction": None,
         "checkpoint_fraction": None,
         "lane_fix_tasks_sampled": 0,
-        "lane_visual": {},
-        "control_visual": {},
     }
 
     mocker.patch(

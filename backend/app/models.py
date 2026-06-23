@@ -40,7 +40,10 @@ import uuid
 from datetime import datetime, timezone
 from app.capability_registry import derive_provider_marker
 from app.time_utils import _utcnow
-from app.vm_cost_rates import get_vm_rate_per_second
+from app.vm_cost_rates import (
+    get_cloud_run_rate_for_machine_type,
+    get_vm_rate_per_second,
+)
 
 
 class NaiveUTCDateTime(TypeDecorator):
@@ -227,6 +230,15 @@ class ArtifactType(str, Enum):
     # Like MERGE_TEST_RESULT, the column is a plain String so no migration is
     # needed.
     RELEASE_AUDIT_CHALLENGE = "RELEASE_AUDIT_CHALLENGE"
+    # Blind goal-coverage grade from the release_merge_grade handler: an
+    # uninvested agent grades the merged DIFFS of a release version against the
+    # frozen version.goal — BLIND to the strategist's running_update narrative —
+    # and emits {covers_goal, coverage_score, biggest_gap}. Consumed as a hard
+    # gate in _finalize_qualification (compute_composite blocker
+    # ``merge_grade_goal_coverage``): a candidate whose merged diffs do not
+    # advance the goal cannot promote. Like MERGE_TEST_RESULT the artifact column
+    # is a plain String so no migration is needed for the ArtifactType itself.
+    RELEASE_MERGE_GRADE = "RELEASE_MERGE_GRADE"
     MEMO = "MEMO"
     # Verdict from the verify_tests agent handler: the repo's detected test
     # suite run on a PR head, consulted by the no-CI merge gate. ArtifactType is
@@ -933,6 +945,21 @@ class Task(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
 
+    # Promoted from Task.context JSONB (D2 over-fetch fix, dir d-57436105).
+    # The orchestrator Max-Plan reconcile loop runs every cycle (~30s) and
+    # previously issued ``select(Task.context)`` over all PROVISIONING/IN_PROGRESS
+    # tasks purely to read this one scalar (``ctx['llm_account_id']`` /
+    # legacy ``ctx['max_plan_account_id']``), TOAST-fetching the entire
+    # multi-MB context blob of every active task each cycle. Promoting it to a
+    # dedicated indexed column lets the reconcile loop project just this scalar.
+    # Mirrors the heartbeat-hot promotions above (last_metrics_json /
+    # heartbeat_count). The context keys are STILL written alongside this column
+    # (see max_plan_pool.apply_task_llm_runtime_context) so in-flight rows and
+    # rollbacks stay safe; this column is the preferred read path via
+    # get_task_llm_account_id, with the context lookup as fallback.
+    # Index declared explicitly in __table_args__ (ix_task_llm_account_id).
+    llm_account_id: str | None = Field(default=None)
+
     # Per-task fix-loop telemetry. Shape:
     #   {"lint": [FixLoopAttempt, ...], "test": [...], "check": [...]}
     # Each FixLoopAttempt is a loose dict validated at the ingest boundary by
@@ -1256,6 +1283,9 @@ class Task(SQLModel, table=True):
         ),
         Index("ix_task_context_gin", "context", postgresql_using="gin"),
         Index("ix_task_depends_on_gin", "depends_on", postgresql_using="gin"),
+        # D2 over-fetch fix (d-57436105): the Max-Plan reconcile loop counts
+        # active tasks per llm_account_id every ~30s; index the promoted column.
+        Index("ix_task_llm_account_id", "llm_account_id"),
         Index("ix_task_provider_created_at", "provider", "created_at"),
         Index("ix_task_account_id_created_at", "account_id", "created_at"),
         Index(
@@ -1566,6 +1596,8 @@ def get_task_current_attempt_vm_cost_usd(
         return 0.0
 
     machine_type = task.__dict__.get("vm_machine_type")
+    if machine_type and machine_type.startswith("cloud-run-"):
+        return runtime_seconds * get_cloud_run_rate_for_machine_type(machine_type)
     return runtime_seconds * get_vm_rate_per_second(
         machine_type=machine_type, spot=task.vm_spot
     )
@@ -2290,8 +2322,9 @@ def _stamp_task_provider_floor(mapper, connection, target: Task):
 @event.listens_for(Task.status, "set")
 def _on_status_set(target: Task, value, oldvalue, initiator):
     if value and isinstance(oldvalue, str) and value != oldvalue:
+        now = _utcnow()
         entry = {
-            "t": _utcnow().isoformat(),
+            "t": now.isoformat(),
             "msg": f"Status changed: {oldvalue} → {value}",
         }
         try:
@@ -2301,6 +2334,18 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
             # the expired-attribute / dead-connection rationale.
             logger.debug(
                 "[MODELS] _on_status_set: skipped status_log append (%s)",
+                e,
+            )
+        # Explicitly stamp updated_at so any transition path that leaves the
+        # column null (e.g. a load_only fetch that never loaded the column, or
+        # a code path that bypassed onupdate) is self-healing.  The reaper
+        # staleness sweep filters on updated_at < cutoff, so a null value makes
+        # the task invisible to the sweep and it orphans forever.
+        try:
+            target.updated_at = now
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "[MODELS] _on_status_set: skipped updated_at stamp (%s)",
                 e,
             )
         task_id = str(target.id)
@@ -2375,6 +2420,8 @@ class Alert(SQLModel, table=True):
     __table_args__ = (
         Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),
         Index("ix_alert_project_id_dismissed", "project_id", "dismissed_at"),
+        Index("ix_alert_severity", "severity"),
+        Index("ix_alert_project_severity", "project_id", "severity"),
     )
 
 
@@ -2534,7 +2581,7 @@ class OrchestratorErrorAck(SQLModel, table=True):
     key: str = Field(primary_key=True, max_length=255)
     acknowledged_at: datetime = Field(
         default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=False),
+        sa_column=Column(NaiveUTCDateTime, nullable=False, index=True),
     )
     acknowledged_by: str = Field(default="")
 
@@ -2690,6 +2737,8 @@ class ProjectMessage(SQLModel, table=True):
             postgresql_where=text("idempotency_key IS NOT NULL"),
             sqlite_where=text("idempotency_key IS NOT NULL"),
         ),
+        Index("ix_projectmessage_created_at", "created_at"),
+        Index("ix_projectmessage_project_created_at", "project_id", "created_at"),
     )
 
 
@@ -4071,6 +4120,50 @@ class QualificationVerdict(SQLModel, table=True):
     # assessed_grade, directional_contradiction, criteria, shortfalls, ...}
     # Nullable: existing verdict rows carry no theme_delivery data.
     theme_delivery: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Goal-alignment grade: {covered, rationale, ...}
+    # Nullable: existing verdict rows carry no goal_alignment data.
+    goal_alignment: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Blind merge-grade certificate: {candidate_sha, coverage_verdict,
+    # biggest_gap, model, pr_count, graded_at}.
+    # Nullable: existing verdict rows carry no blind merge-grade data.
+    blind_merge_grade: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # --- Blind merge-grade goal-coverage gate (dir d-c0fe439f) --------------
+    # An uninvested release_merge_grade agent grades the merged DIFFS against
+    # the frozen version.goal (BLIND to running_update) and emits a goal-coverage
+    # verdict.  These NULLABLE columns durably retain that verdict alongside the
+    # other per-attempt evidence so a re-qualification overwrite of
+    # last_qualification does not drop it.  All nullable with safe server
+    # defaults so pre-existing verdict rows (written before this gate) stay
+    # readable / backward-compatible.
+    #   merge_grade_status: "pass" | "fail" | "not_applicable" (empty goal).
+    #   merge_grade_coverage: goal-coverage score in [0,1] (NULL when ungraded).
+    #   merge_grade_biggest_gap: one-sentence biggest thing not done toward goal.
+    #   merge_grade_detail: the raw graded artifact (covers_goal, scores, etc.).
+    merge_grade_status: str | None = Field(
+        default=None,
+        sa_column=Column(String(16), nullable=True),
+    )
+    merge_grade_coverage: float | None = Field(
+        default=None,
+        sa_column=Column(Float, nullable=True),
+    )
+    merge_grade_biggest_gap: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+    merge_grade_detail: Any | None = Field(
         default=None,
         sa_column=Column(JSONB, nullable=True),
     )

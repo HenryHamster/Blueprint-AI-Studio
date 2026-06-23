@@ -1611,7 +1611,12 @@ async def _maybe_release_safeguard_gate(
                     )
 
                     _sg_ok, _sg_reason = await enforce_premerge_migration_guard(
-                        gh_token, owner, repo, int(pr_num), _sg_base
+                        gh_token,
+                        owner,
+                        repo,
+                        int(pr_num),
+                        _sg_base,
+                        promotion_target=get_project_promotion_target(_sg_project),
                     )
                 if not _sg_ok:
                     logger.warning(

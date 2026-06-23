@@ -86,7 +86,7 @@ def _clear_direction_reactivation_state(direction: dict) -> None:
     direction["remediation_attempts"] = 0
 
 
-class DirectionPayload(BaseModel):
+class _DirectionPayload(BaseModel):
     text: str = Field(..., min_length=1, max_length=DIRECTION_TEXT_MAX)
     priority: str = Field(default="medium", pattern=r"^(high|medium|low)$")
     paths: List[str] | None = None
@@ -301,7 +301,7 @@ async def get_directions(
 @router.post("/projects/{project_id}/directions")
 async def add_direction(
     project_id: uuid.UUID,
-    payload: DirectionPayload,
+    payload: _DirectionPayload,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1344,7 +1344,7 @@ async def trigger_strategic_cycle(
 # ── Messages ─────────────────────────────────────────────────────────────
 
 
-class CreateMessage(BaseModel):
+class _CreateMessage(BaseModel):
     content: str
     message_type: str = "NOTE"  # NOTE, FEEDBACK, BUG_REPORT, QUESTION, BLOCKER
     # Client-generated idempotency key. When supplied, a repeat send (double
@@ -1357,7 +1357,7 @@ class CreateMessage(BaseModel):
 @router.post("/projects/{project_id}/messages")
 async def create_message(
     project_id: str,
-    payload: CreateMessage,
+    payload: _CreateMessage,
     session: AsyncSession = Depends(get_session),
     user: dict = Depends(get_current_user),
 ):

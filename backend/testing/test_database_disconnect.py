@@ -13,6 +13,7 @@ connection.invalidate() call + counter behavior.
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi.testclient import TestClient
 
 import app.database as db_module
 from app.database import (
@@ -347,3 +348,61 @@ async def test_dispose_engine_swallows_dispose_failure(monkeypatch):
     monkeypatch.setattr(db_module._LazyEngine, "_engine", fake_engine)
     await dispose_engine()  # must not raise
     fake_engine.dispose.assert_awaited_once()
+
+
+# ── /metrics endpoint auth tests ───────────────────────────────────────────
+
+
+def test_metrics_endpoint_unauthenticated_when_token_unset(monkeypatch):
+    """When METRICS_TOKEN is unset, /metrics returns 200 without token auth.
+    Regression guard for #11217 that regressed to fail-closed (403)."""
+    # Import here to avoid circular imports at module level
+    import app.main as main_module
+
+    # Monkeypatch _METRICS_TOKEN to empty string (unset)
+    monkeypatch.setattr(main_module, "_METRICS_TOKEN", "")
+
+    from app.main import app
+    client = TestClient(app)
+
+    # Without token, should return 200
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert "blueprint_tasks_queued" in response.text
+
+
+def test_metrics_endpoint_requires_token_when_set(monkeypatch):
+    """When METRICS_TOKEN is set, /metrics requires matching token or returns 403."""
+    import app.main as main_module
+
+    test_token = "test-secure-token-12345"
+    monkeypatch.setattr(main_module, "_METRICS_TOKEN", test_token)
+
+    from app.main import app
+    client = TestClient(app)
+
+    # Without token, should return 403
+    response = client.get("/metrics")
+    assert response.status_code == 403
+    assert response.json() == {"error": "forbidden"}
+
+    # With wrong token, should return 403
+    response = client.get("/metrics?token=wrong-token")
+    assert response.status_code == 403
+    assert response.json() == {"error": "forbidden"}
+
+
+def test_metrics_endpoint_accepts_correct_token(monkeypatch):
+    """When METRICS_TOKEN is set and correct token is provided, /metrics returns 200."""
+    import app.main as main_module
+
+    test_token = "test-secure-token-12345"
+    monkeypatch.setattr(main_module, "_METRICS_TOKEN", test_token)
+
+    from app.main import app
+    client = TestClient(app)
+
+    # With correct token, should return 200
+    response = client.get(f"/metrics?token={test_token}")
+    assert response.status_code == 200
+    assert "blueprint_tasks_queued" in response.text

@@ -1,5 +1,22 @@
 import fs from 'fs';
 import { execSync } from 'child_process';
+/**
+ * Web research handler — search-first knowledge document production.
+ *
+ * Performs web searches on a research question, fetches and summarizes sources,
+ * and produces a structured knowledge document with findings, citations, and
+ * confidence levels. Unlike the tactical research handler (which analyzes an
+ * existing codebase), web-research begins with external web sources and
+ * synthesizes conclusions from them.
+ *
+ * Payloads specify research_question, number of sources to fetch, and optional
+ * scope constraints (time window, domains). The handler uses web search APIs,
+ * fetches full pages, extracts key information, and stores the result as a
+ * KnowledgeDocument artifact that other tasks can cite via ./fetch knowledge.
+ *
+ * This task type does not clone a repo or produce a PR; it is artifact-first.
+ */
+
 import type WebSocket from 'ws';
 import {
   strVal, sanitize, sendLog, readHandlerOutput,

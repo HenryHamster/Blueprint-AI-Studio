@@ -1300,6 +1300,8 @@ def _pin_task_to_pool_vm(
             auth_mode=run_auth_mode,
             model=run_model,
         )
+        # Keep the promoted column in sync with context (D2 over-fetch fix).
+        task.llm_account_id = run_account
     new_ctx["warm_target_vm_id"] = member.vm_instance_id
     new_ctx[WARM_POOL_PIN_KEY] = True
     deadline = member.lease_expires_at or (

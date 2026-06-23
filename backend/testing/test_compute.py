@@ -2,7 +2,6 @@
 Tests for app/compute.py
 
 Covers:
-- _store_agent_secret IAM policy ETag retry + idempotency.
 - Zone success-rate tracking (rolling window, zone ordering, reset, summary).
 - Compute-job VM heartbeat endpoint and provisioning-timeout guard.
 """
@@ -22,7 +21,6 @@ import uuid
 
 import pytest
 import pytest_asyncio
-from google.api_core.exceptions import Aborted
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -63,78 +61,6 @@ from app.models import (
 )
 
 
-class _FakeBinding:
-    """Mimics the subset of policy_pb2.Binding used by the idempotency check."""
-
-    def __init__(self, role: str, members):
-        self.role = role
-        self.members = list(members)
-
-
-class _FakePolicy:
-    """Mimics the subset of the IAM policy proto used by _store_agent_secret."""
-
-    def __init__(self, bindings=None):
-        self.bindings = list(bindings or [])
-
-
-def _make_client(
-    existing_policy_bindings=None,
-    set_iam_side_effects=None,
-    payload: bytes | None = None,
-):
-    """Build a MagicMock SecretManagerServiceClient with sensible defaults.
-
-    - create_secret returns an object whose .name looks like a real secret resource
-    - add_secret_version returns an object whose .name looks like a version resource
-    - get_iam_policy returns a fresh _FakePolicy with the given bindings on every call
-    - set_iam_policy applies set_iam_side_effects in order (e.g. Aborted exceptions)
-    - access_secret_version (audit E15: post-create verification) returns the
-      payload that was supplied via ``payload=`` so the verify branch sees a
-      match. Tests that don't pass payload= will get an empty bytes payload
-      and trip the verification mismatch — which is the correct behavior to
-      cover the failure path.
-    """
-    client = MagicMock()
-    secret_obj = MagicMock()
-    secret_obj.name = "projects/test-proj/secrets/agent-creds-vm123"
-    client.create_secret.return_value = secret_obj
-
-    version_obj = MagicMock()
-    version_obj.name = "projects/test-proj/secrets/agent-creds-vm123/versions/1"
-    client.add_secret_version.return_value = version_obj
-
-    # get_iam_policy returns a fresh policy each call so retries re-read it
-    client.get_iam_policy.side_effect = lambda request: _FakePolicy(
-        bindings=[
-            _FakeBinding(b.role, b.members) for b in (existing_policy_bindings or [])
-        ]
-    )
-
-    if set_iam_side_effects is not None:
-        client.set_iam_policy.side_effect = set_iam_side_effects
-
-    # E15 verification path: read-back must match what was written.
-    verify_obj = MagicMock()
-    verify_obj.payload.data = payload if payload is not None else b""
-    client.access_secret_version.return_value = verify_obj
-
-    return client
-
-
-@pytest.fixture()
-def patched_client():
-    """Patch the secretmanager client factory inside _store_agent_secret.
-
-    The real imports happen lazily inside the function, so we patch the module
-    that gets imported at call time.
-    """
-    with patch("google.cloud.secretmanager.SecretManagerServiceClient") as factory:
-        client = _make_client()
-        factory.return_value = client
-        yield client
-
-
 @pytest_asyncio.fixture()
 async def gcp_cleanup_db(mocker):
     """Isolated DB for _cleanup_gcp revalidation tests."""
@@ -161,88 +87,6 @@ async def gcp_cleanup_db(mocker):
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.drop_all)
     await engine.dispose()
-
-
-class TestStoreAgentSecretIamRetry:
-    """Retry + idempotency tests for _store_agent_secret IAM policy handling."""
-
-    def test_retries_on_aborted_and_succeeds(self, monkeypatch):
-        """set_iam_policy raises Aborted twice then succeeds; function returns version name.
-
-        Expects the get/set read-modify-write loop to be retried with a fresh
-        get_iam_policy each iteration (ETag-correct behavior).
-        """
-        # Don't actually sleep during retries
-        monkeypatch.setattr(compute.time, "sleep", lambda _s: None)
-
-        # First two set_iam_policy calls raise Aborted, third succeeds.
-        side_effects = [
-            Aborted("etag mismatch 1"),
-            Aborted("etag mismatch 2"),
-            None,
-        ]
-        payload = '{"token": "abc"}'
-        client = _make_client(
-            set_iam_side_effects=side_effects, payload=payload.encode("utf-8")
-        )
-
-        with patch(
-            "google.cloud.secretmanager.SecretManagerServiceClient", return_value=client
-        ):
-            result = compute._store_agent_secret("vm123", payload)
-
-        assert result == "projects/test-proj/secrets/agent-creds-vm123/versions/1"
-        assert client.set_iam_policy.call_count == 3
-        # Each retry must re-read the policy to get a fresh ETag
-        assert client.get_iam_policy.call_count == 3
-
-    def test_idempotent_skip_when_sa_already_bound(self):
-        """If the agent SA is already bound for secretAccessor, skip set_iam_policy.
-
-        Prevents duplicate bindings when a secret is reused (e.g. AlreadyExists
-        catch at the top of the function).
-        """
-        agent_member = f"serviceAccount:{compute.AGENT_SERVICE_ACCOUNT_EMAIL}"
-        existing = [
-            _FakeBinding(
-                role="roles/secretmanager.secretAccessor",
-                members=[agent_member],
-            ),
-        ]
-        payload = '{"token": "abc"}'
-        client = _make_client(
-            existing_policy_bindings=existing, payload=payload.encode("utf-8")
-        )
-
-        with patch(
-            "google.cloud.secretmanager.SecretManagerServiceClient", return_value=client
-        ):
-            result = compute._store_agent_secret("vm123", payload)
-
-        assert result == "projects/test-proj/secrets/agent-creds-vm123/versions/1"
-        # Policy was read once to check the binding, then skipped.
-        assert client.get_iam_policy.call_count == 1
-        assert client.set_iam_policy.call_count == 0
-
-    def test_aborted_exhausts_retries_and_raises(self, monkeypatch):
-        """If Aborted fires max_retries (5) times, the final attempt re-raises Aborted."""
-        monkeypatch.setattr(compute.time, "sleep", lambda _s: None)
-
-        # Supply one more than max_retries (5) to prove we never exceed.
-        side_effects = [Aborted(f"etag mismatch {i}") for i in range(6)]
-        client = _make_client(set_iam_side_effects=side_effects)
-
-        with (
-            patch(
-                "google.cloud.secretmanager.SecretManagerServiceClient",
-                return_value=client,
-            ),
-            pytest.raises(Aborted),
-        ):
-            compute._store_agent_secret("vm123", '{"token": "abc"}')
-
-        assert client.set_iam_policy.call_count == 5
-        assert client.get_iam_policy.call_count == 5
 
 
 class _FleetSourceFakeSession:
@@ -9494,6 +9338,79 @@ def test_gcp_startup_script_no_clone_without_token():
     assert "git clone" not in script
 
 
+def test_gcp_startup_script_classifies_clone_failure_with_typed_reason():
+    """A clone failure must be ATTRIBUTABLE: stderr is captured (not discarded),
+    classified into auth/ratelimit/network/timeout, token-scrubbed, and folded into
+    the bundle — and the serial console only ever sees `repo_clone_failed:<class>`,
+    never the captured stderr text (which can echo the tokened URL)."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 -m pkg.eval",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        repo_clone={"owner": "octo", "repo": "demo", "ref": "main"},
+        repo_token="ghs_FAKETOKEN1234567890",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # stderr is captured to a file, NOT discarded to /dev/null.
+    assert "2>/tmp/blueprint_clone.err" in script
+    assert "git clone --depth 1 --branch main" in script
+    # The failure is classified into a typed bucket; ratelimit is distinguished
+    # from auth so a drained GitHub quota is separable from a bad/expired token.
+    assert "CLONE_CLASS=ratelimit" in script
+    assert "CLONE_CLASS=auth" in script
+    assert "CLONE_CLASS=network" in script
+    assert "CLONE_CLASS=timeout" in script
+    # The typed reason flows to BOTH the serial marker and the durable record.
+    assert (
+        f"{compute_backends_module._SERIAL_REASON_PREFIX}repo_clone_failed:$CLONE_CLASS"
+        in script
+    )
+    assert "FAILED 1 repo_clone_failed:$CLONE_CLASS" in script
+    # The captured stderr is token-scrubbed before it lands in the durable bundle.
+    assert "x-access-token:REDACTED@" in script
+    # ...and the scrubbed file is copied into the artifact dir so it ships in the
+    # GCS bundle for full post-hoc diagnosis.
+    assert "cp /tmp/blueprint_clone.err" in script
+    assert "/clone.err" in script
+    # The captured stderr is never echoed to the serial console (only the typed
+    # reason is) — guard against a `cat`/`echo` of the raw file leaking the token.
+    assert "cat /tmp/blueprint_clone.err" not in script
+
+
+def test_gcp_startup_script_writes_boot_beacon_before_command():
+    """A boot beacon (provisional FAILED record) is written BEFORE the clone and
+    command so an ungraceful mid-run VM death still uploads a durable terminal.json
+    — turning the blind 'no marker, no bundle' FAILURE into an attributable one.
+    Every later phase overwrites it with the true outcome."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 -m pkg.eval",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        repo_clone={"owner": "octo", "repo": "demo", "ref": "main"},
+        repo_token="ghs_FAKETOKEN1234567890",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "FAILED 1 vm_terminated_before_completion" in script
+    # The beacon is armed only AFTER the EXIT trap (so a death always uploads it)
+    # and BEFORE the command actually runs (so a mid-command death is covered).
+    # Anchor command_idx on the INVOCATION, not the near-top base64 decode line
+    # `... > /tmp/blueprint_command_runner.py` (which `index` would match first).
+    trap_idx = script.index("trap upload_artifacts EXIT")
+    beacon_idx = script.index("vm_terminated_before_completion")
+    command_idx = script.index("python3 /tmp/blueprint_command_runner.py")
+    assert trap_idx < beacon_idx < command_idx
+
+
 async def test_attach_repo_clone_sets_repo_and_token(db_session, monkeypatch):
     """_attach_repo_clone resolves owner/repo + ref (from base_branch) + a token."""
     project = Project(
@@ -10569,3 +10486,384 @@ async def test_launch_lro_timeout_skipped_when_vm_heartbeated(db_session, monkey
     assert job.status == ComputeJobStatus.RUNNING, (
         f"job must remain RUNNING after heartbeat-guarded LRO timeout; got {job.status}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cloud Run Job launch — AGENT_SECRET_TOKEN + LLM env injection tests
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchAgentCloudRunJob:
+    """Tests for compute_cloud_run.launch_agent_cloud_run_job."""
+
+    @pytest.mark.asyncio
+    async def test_launch_injects_agent_secret_version(self, monkeypatch):
+        """When secret_version_name is provided, AGENT_SECRET_VERSION must be
+        passed as an env var so the agent can fetch secrets at startup.
+        Plaintext credentials are never injected as env overrides.
+        """
+        from app import compute as _compute_module
+        from app import compute_cloud_run
+
+        # Disable LOCAL_MODE so the function proceeds past the early-return guard.
+        monkeypatch.setattr(_compute_module, "LOCAL_MODE", False)
+
+        # Capture env vars passed to run_job.
+        captured_env: list[tuple[str, str]] = []
+
+        class FakeEnvVar:
+            def __init__(self, name, value):
+                self.name = name
+                self.value = value
+
+        class FakeContainerOverride:
+            def __init__(self, env=None):
+                self.env = env or []
+
+        class FakeOverrides:
+            ContainerOverride = FakeContainerOverride
+
+            def __init__(self, task_count=1, timeout=None, container_overrides=None):
+                self.task_count = task_count
+                self.timeout = timeout
+                self.container_overrides = container_overrides or []
+
+        class FakeRunJobRequest:
+            Overrides = FakeOverrides
+
+            def __init__(self, name, overrides):
+                self.name = name
+                self.overrides = overrides
+
+        def fake_run_job(request):
+            for co in request.overrides.container_overrides:
+                for env_var in co.env:
+                    captured_env.append((env_var.name, env_var.value))
+            op = MagicMock()
+            op.operation.name = "operations/fake"
+            return op
+
+        mock_run_client = MagicMock()
+        mock_run_client.run_job.side_effect = fake_run_job
+
+        mock_run_module = MagicMock()
+        mock_run_module.JobsClient.return_value = mock_run_client
+        mock_run_module.RunJobRequest = FakeRunJobRequest
+        mock_run_module.EnvVar = FakeEnvVar
+
+        import google.cloud
+
+        monkeypatch.setattr(google.cloud, "run_v2", mock_run_module, raising=False)
+        monkeypatch.setattr(
+            compute_cloud_run,
+            "CLOUD_RUN_JOB_NAME",
+            "projects/p/locations/us/jobs/agent",
+        )
+
+        result = await compute_cloud_run.launch_agent_cloud_run_job(
+            vm_id="vm-001",
+            task_id="task-001",
+            payload_uri="gs://bucket/payload.json",
+            secret_version_name="projects/p/secrets/s/versions/1",
+            task_type="research",
+        )
+
+        assert result is True
+        env_dict = dict(captured_env)
+        assert "AGENT_SECRET_VERSION" in env_dict, (
+            f"AGENT_SECRET_VERSION must be injected; got env keys: {list(env_dict)}"
+        )
+        assert env_dict["AGENT_SECRET_VERSION"] == "projects/p/secrets/s/versions/1"
+        # Plaintext secrets must never be injected
+        assert "AGENT_SECRET_TOKEN" not in env_dict
+        assert "ANTHROPIC_API_KEY" not in env_dict
+
+    @pytest.mark.asyncio
+    async def test_no_secret_version_when_not_provided(self, monkeypatch):
+        """When secret_version_name is None, AGENT_SECRET_VERSION is not injected."""
+        import google.cloud
+        from app import compute as _compute_module
+        from app import compute_cloud_run
+
+        monkeypatch.setattr(_compute_module, "LOCAL_MODE", False)
+
+        captured_env: list = []
+
+        class FakeClient:
+            def run_job(self, *, request):
+                for co in request.overrides.container_overrides:
+                    captured_env.extend(co.env)
+                op = MagicMock()
+                op.operation.name = "fake-op"
+                return op
+
+        mock_run_module = MagicMock()
+        mock_run_module.JobsClient.return_value = FakeClient()
+
+        monkeypatch.setattr(google.cloud, "run_v2", mock_run_module, raising=False)
+        monkeypatch.setattr(
+            compute_cloud_run,
+            "CLOUD_RUN_JOB_NAME",
+            "projects/p/locations/us/jobs/agent",
+        )
+
+        result = await compute_cloud_run.launch_agent_cloud_run_job(
+            vm_id="vm-002",
+            task_id="task-002",
+            payload_uri=None,
+            secret_version_name=None,
+            task_type="research",
+        )
+
+        assert result is True, "must return True when no secret is needed"
+        env_dict = {e.name: e.value for e in captured_env}
+        assert "AGENT_SECRET_VERSION" not in env_dict, (
+            "AGENT_SECRET_VERSION must not be injected when secret_version_name is None"
+        )
+
+    @pytest.mark.asyncio
+    async def test_injects_llm_settings_not_plaintext_creds(self, monkeypatch):
+        """LLM identifier and settings env vars are injected, but plaintext
+        credentials like ANTHROPIC_API_KEY are never included as env overrides."""
+        import google.cloud.run_v2 as run_v2_mod
+        from app.compute_cloud_run import launch_agent_cloud_run_job
+        import app.compute_cloud_run as ccr_mod
+
+        monkeypatch.setattr(
+            ccr_mod, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent"
+        )
+        monkeypatch.setattr("app.compute_manifest.ANTHROPIC_API_KEY", "sk-ant-test123")
+        # Ensure not LOCAL_MODE
+        monkeypatch.setattr("app.compute.LOCAL_MODE", False)
+
+        submitted_env: list = []
+
+        class FakeClient:
+            def run_job(self, *, request):
+                for co in request.overrides.container_overrides:
+                    submitted_env.extend(co.env)
+                op = MagicMock()
+                op.operation.name = "fake-op"
+                return op
+
+        with patch.object(run_v2_mod, "JobsClient", return_value=FakeClient()):
+            result = await launch_agent_cloud_run_job(
+                vm_id="cr-vm-1",
+                task_id="task-abc",
+                payload_uri=None,
+                secret_version_name="projects/p/secrets/s/versions/1",
+                task_type="research",
+                provider="anthropic",
+                auth_mode="api_key",
+                provider_settings={},
+            )
+
+        assert result is True
+        env_dict = {e.name: e.value for e in submitted_env}
+        assert env_dict.get("PROVIDER") == "anthropic", (
+            f"PROVIDER missing from env overrides; got {env_dict}"
+        )
+        assert env_dict.get("AUTH_MODE") == "api_key", (
+            f"AUTH_MODE missing; got {env_dict}"
+        )
+        # ANTHROPIC_API_KEY must NOT be injected as plaintext
+        assert "ANTHROPIC_API_KEY" not in env_dict, (
+            f"ANTHROPIC_API_KEY must not be plaintext in env overrides; got {env_dict}"
+        )
+        assert "LLM_SETTINGS" in env_dict, (
+            f"LLM_SETTINGS missing from env overrides; got {env_dict}"
+        )
+        assert "LLM_CLI_TRANSLATION" in env_dict, (
+            f"LLM_CLI_TRANSLATION missing from env overrides; got {env_dict}"
+        )
+        # AGENT_SECRET_VERSION must be present so agent can fetch the actual API key
+        assert env_dict.get("AGENT_SECRET_VERSION") == "projects/p/secrets/s/versions/1"
+
+    @pytest.mark.asyncio
+    async def test_oauth_token_not_plaintext_delivered_via_manifest(self, monkeypatch):
+        """OAuth auth must NOT inject CLAUDE_CODE_OAUTH_TOKEN as a plaintext env
+        override. The token is delivered via the Secret Manager manifest the agent
+        resolves from AGENT_SECRET_VERSION at startup (secure-design contract)."""
+        import google.cloud.run_v2 as run_v2_mod
+        from app.compute_cloud_run import launch_agent_cloud_run_job
+        import app.compute_cloud_run as ccr_mod
+
+        monkeypatch.setattr(
+            ccr_mod, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent"
+        )
+        monkeypatch.setattr("app.compute.LOCAL_MODE", False)
+
+        submitted_env: list = []
+
+        class FakeClient:
+            def run_job(self, *, request):
+                for co in request.overrides.container_overrides:
+                    submitted_env.extend(co.env)
+                op = MagicMock()
+                op.operation.name = "fake-op"
+                return op
+
+        with patch.object(run_v2_mod, "JobsClient", return_value=FakeClient()):
+            result = await launch_agent_cloud_run_job(
+                vm_id="cr-vm-2",
+                task_id="task-def",
+                payload_uri=None,
+                secret_version_name="projects/p/secrets/s/versions/1",
+                task_type="research",
+                oauth_token="sk-ant-oauth-tok",
+                provider="anthropic",
+                auth_mode="oauth",
+                provider_settings={},
+            )
+
+        assert result is True
+        env_dict = {e.name: e.value for e in submitted_env}
+        assert env_dict.get("PROVIDER") == "anthropic"
+        assert env_dict.get("AUTH_MODE") == "oauth"
+        # The OAuth token (and its raw value) must NEVER be a plaintext override —
+        # it is delivered via the Secret Manager manifest, not the RunJobRequest.
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env_dict, (
+            f"CLAUDE_CODE_OAUTH_TOKEN must not be a plaintext override; got {env_dict}"
+        )
+        assert "sk-ant-oauth-tok" not in set(env_dict.values()), (
+            f"Raw OAuth token value must not appear in any env override; got {env_dict}"
+        )
+        # AGENT_SECRET_VERSION must be present so the agent can resolve the token.
+        assert env_dict.get("AGENT_SECRET_VERSION") == "projects/p/secrets/s/versions/1"
+
+    @pytest.mark.asyncio
+    async def test_skips_file_path_credentials(self, monkeypatch):
+        """File-path credential env vars (value starts with '/') are not injected."""
+        import google.cloud.run_v2 as run_v2_mod
+        from app.compute_cloud_run import launch_agent_cloud_run_job
+        from app.compute_manifest import _ProviderMaterials
+        import app.compute_cloud_run as ccr_mod
+
+        monkeypatch.setattr(
+            ccr_mod, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent"
+        )
+        monkeypatch.setattr("app.compute.LOCAL_MODE", False)
+
+        submitted_env: list = []
+
+        class FakeClient:
+            def run_job(self, *, request):
+                for co in request.overrides.container_overrides:
+                    submitted_env.extend(co.env)
+                op = MagicMock()
+                op.operation.name = "fake-op"
+                return op
+
+        # Patch _resolve_provider_materials to return a Gemini-style file-path credential
+        fake_materials = _ProviderMaterials(
+            provider_name="gemini",
+            auth_mode_value="service_account",
+            files=[],
+            cli_translation=None,
+            secret_env={"GOOGLE_APPLICATION_CREDENTIALS": "/opt/agent/gemini/sa.json"},
+        )
+        with (
+            patch.object(run_v2_mod, "JobsClient", return_value=FakeClient()),
+            patch(
+                "app.compute_manifest._resolve_provider_materials",
+                return_value=fake_materials,
+            ),
+        ):
+            result = await launch_agent_cloud_run_job(
+                vm_id="cr-vm-3",
+                task_id="task-ghi",
+                payload_uri=None,
+                secret_version_name=None,
+                task_type="research",
+                provider="gemini",
+                auth_mode="service_account",
+                provider_settings={},
+            )
+
+        assert result is True
+        env_dict = {e.name: e.value for e in submitted_env}
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in env_dict, (
+            "File-path credential must not appear in Cloud Run env overrides; "
+            f"got {env_dict}"
+        )
+        assert env_dict.get("PROVIDER") == "gemini"
+
+    @pytest.mark.asyncio
+    async def test_no_llm_params_only_baseline_env(self, monkeypatch):
+        """Without LLM params, only baseline env vars are injected (no plaintext creds)."""
+        import google.cloud.run_v2 as run_v2_mod
+        from app.compute_cloud_run import launch_agent_cloud_run_job
+        import app.compute_cloud_run as ccr_mod
+
+        monkeypatch.setattr(
+            ccr_mod, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent"
+        )
+        monkeypatch.setattr("app.compute.LOCAL_MODE", False)
+
+        submitted_env: list = []
+
+        class FakeClient:
+            def run_job(self, *, request):
+                for co in request.overrides.container_overrides:
+                    submitted_env.extend(co.env)
+                op = MagicMock()
+                op.operation.name = "fake-op"
+                return op
+
+        with patch.object(run_v2_mod, "JobsClient", return_value=FakeClient()):
+            result = await launch_agent_cloud_run_job(
+                vm_id="cr-vm-4",
+                task_id="task-jkl",
+                payload_uri="gs://bucket/payload.json",
+                secret_version_name="projects/p/secrets/s/versions/1",
+                task_type="research",
+                # No LLM params
+            )
+
+        assert result is True
+        env_dict = {e.name: e.value for e in submitted_env}
+        baseline_keys = {
+            "VM_INSTANCE_ID",
+            "TASK_ID",
+            "ORCHESTRATOR_URL",
+            "CLOUD_RUN_JOB",
+            "PAYLOAD_URI",
+            "AGENT_SECRET_VERSION",
+        }
+        assert set(env_dict.keys()) == baseline_keys, (
+            f"Expected only baseline env keys without LLM params; got {set(env_dict.keys())}"
+        )
+        # Ensure no plaintext secrets are injected
+        assert "AGENT_SECRET_TOKEN" not in env_dict
+        assert "ANTHROPIC_API_KEY" not in env_dict
+
+    @pytest.mark.asyncio
+    async def test_local_mode_returns_true_without_api_call(self, monkeypatch):
+        """LOCAL_MODE skips the Cloud Run API entirely and returns True."""
+        import google.cloud.run_v2 as run_v2_mod
+        from app.compute_cloud_run import launch_agent_cloud_run_job
+        import app.compute_cloud_run as ccr_mod
+
+        monkeypatch.setattr(
+            ccr_mod, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent"
+        )
+        monkeypatch.setattr("app.compute.LOCAL_MODE", True)
+
+        api_called = []
+
+        class FakeClient:
+            def run_job(self, *, request):
+                api_called.append(True)
+                return MagicMock()
+
+        with patch.object(run_v2_mod, "JobsClient", return_value=FakeClient()):
+            result = await launch_agent_cloud_run_job(
+                vm_id="cr-local",
+                task_id="task-local",
+                payload_uri=None,
+                secret_version_name=None,
+                task_type="research",
+            )
+
+        assert result is True
+        assert not api_called, "Cloud Run API must not be called in LOCAL_MODE"

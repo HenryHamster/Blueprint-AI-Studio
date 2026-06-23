@@ -585,6 +585,51 @@ Independently re-examines release-audit findings and emits per-finding verdicts 
 
 ---
 
+## Release Merge Grade Handler
+
+### `handleReleaseMergeGrade` (merge-grade.ts)
+
+**Task type:** `release_merge_grade`
+
+Grade whether the merged release diff satisfies the version goal. An independent agent evaluates goal coverage without knowledge of strategic progress narrative.
+
+**Input payload:**
+```json
+{
+  "candidate_sha": "string",        // Exact commit to grade (pinned)
+  "goal": "string",                 // Version goal statement to evaluate against
+  "base_branch": "string"           // Base branch for diff context
+}
+```
+
+**Output artifact:**
+```json
+{
+  "artifact_type": "RELEASE_MERGE_GRADE",
+  "graded_candidate_sha": "<40-hex>",
+  "covers_goal": true,
+  "coverage_score": 0.7,
+  "biggest_gap": "Authentication flow incomplete — token refresh not implemented",
+  "rationale": "PR merges core auth structure but defers token rotation to next sprint"
+}
+```
+
+**Output fields:**
+- `covers_goal` — Boolean: true if merged diff fully satisfies the stated goal
+- `coverage_score` — Float [0.0, 1.0]: degree of goal satisfaction (1.0 = complete)
+- `biggest_gap` — String: single most critical thing still unmet toward the goal (required, non-empty)
+- `rationale` — String: brief justification for the score
+
+**Workflow:**
+1. Clone repo at pinned `candidate_sha` (remains fixed even if release advances)
+2. Provision audit helpers and design-doc context for framing
+3. Run Claude Code instructed to grade merged diff against stated goal, blind to narrative
+4. Emit structured `RELEASE_MERGE_GRADE` artifact with coverage verdict
+
+**Contract:** The output shape is a stable contract consumed by the release qualifier's blind merge-diff gate (`release_qualifier.py`). Field names must not change without updating the consumer.
+
+---
+
 ## Design Doc Handler
 
 ### `handleDesignDocUpdate` (design-doc.ts)

@@ -180,6 +180,7 @@ async def get_null_branch_config_diagnostics(
                     | (Project.promotion_target.is_(None))
                 )
                 .order_by(Project.created_at.asc())
+                .limit(200)
             )
         )
         .scalars()
@@ -247,7 +248,15 @@ async def _compute_health_overview(
                 Task.created_at >= prev_window_start,
                 Task.archived.is_(False),
             )
-            .options(load_only(Task.id, Task.status, Task.created_at, Task.status_log, raiseload=True))
+            .options(
+                load_only(
+                    Task.id,
+                    Task.status,
+                    Task.created_at,
+                    Task.status_log,
+                    raiseload=True,
+                )
+            )
             .limit(_XP_LIMIT)
         )
         xp_tasks = xp_result.scalars().all()
@@ -819,7 +828,8 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 Task.started_at,
                 Task.project_id,
                 Task.status_log,
-            raiseload=True,)
+                raiseload=True,
+            )
         )
         .limit(_WARM_VM_SCAN_LIMIT)
     )
@@ -866,7 +876,8 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 Task.payloads,
                 Task.project_id,
                 Task.status_log,
-            raiseload=True,)
+                raiseload=True,
+            )
         )
         .limit(_WARM_VM_SCAN_LIMIT)
     )
@@ -899,7 +910,8 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 Task.status,
                 Task.title,
                 Task.status_log,
-            raiseload=True,)
+                raiseload=True,
+            )
         )
         .order_by(Task.last_heartbeat.desc())
         .limit(_WARM_VM_SCAN_LIMIT)

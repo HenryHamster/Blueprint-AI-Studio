@@ -1,11 +1,14 @@
 """Alembic migration-chain validation used by rollup auto-merge."""
 
+import os
+
 import app.github as github
 from app.migration_chain import (
     _filename_revision_prefix,
     build_migration_chain,
     find_content_divergence_records,
     find_content_divergent_revisions,
+    find_deployed_migration_content_edits,
     find_filename_revision_mismatches,
     find_heads,
     plan_integration_side_renumber,
@@ -285,6 +288,61 @@ async def _validate_rollup_migration_chain(
                 f"to validate cross-branch Alembic revision identity: "
                 f"{type(e).__name__}: {e}",
             )
+
+        # Defect class 2: in-place edit of a deployed migration.
+        # Any PR file with status "modified" whose basename exists on the
+        # promotion target is a deploy-fatal tamper: Alembic considers it
+        # already-applied and skips the schema change silently. The
+        # filename-identity detector is blind to this class because the file
+        # keeps its name (and therefore its revision prefix + description),
+        # so only the file-status check can catch it.
+        promotion_basenames = set(promotion_filenames)
+        modified_deployed = [
+            f["filename"]
+            for f in files
+            if f.get("status") == "modified"
+            and _touches_alembic_versions(f.get("filename", ""))
+            and f["filename"].rsplit("/", 1)[-1] in promotion_basenames
+        ]
+        if modified_deployed:
+            return (
+                "block",
+                f"PR modifies deployed migration(s) present on promotion target "
+                f"'{promotion_target}' (deployed migrations are immutable — they "
+                f"have already been applied to the production DB and cannot be "
+                f"changed in-place): " + ", ".join(sorted(modified_deployed)),
+            )
+
+        # Defect class 1: pre-PR rename/renumber on the FULL integration branch.
+        # The PR-diff checks above compare only the PR's added/modified files
+        # against the promotion target; a rename committed BEFORE this PR
+        # (e.g. a back-merge renumber that reused a revision id the deployed DB
+        # already applied) leaves no trace in the PR diff and is invisible to
+        # those checks. Comparing the FULL integration branch against the
+        # promotion target catches it: a shared revision id mapping to a
+        # different migration, or a migration that moved revision ids, is a
+        # deploy-fatal divergence regardless of which PR introduced it.
+        # Authorized divergences (recorded in AUTHORIZED_DIVERGENCES and handled
+        # by the deploy-time reconciliation) are filtered out — they are already
+        # safe and must not block new PRs on an integration branch that carries
+        # the known renumber, mirroring the qual-time guard's behavior.
+        full_branch_records = find_content_divergence_records(
+            promotion_filenames, existing_filenames
+        )
+        unauthorized_full_branch = [
+            r for r in full_branch_records if not _divergence_record_is_authorized(r)
+        ]
+        if unauthorized_full_branch:
+            return (
+                "block",
+                f"Alembic revision-identity divergence between the full integration "
+                f"branch '{target_branch}' and the deployed promotion target "
+                f"'{promotion_target}' (a pre-PR renumber/reuse on the integration "
+                f"branch would skip or mishandle a migration the live DB already "
+                f"applied): "
+                + "; ".join(r["message"] for r in unauthorized_full_branch),
+            )
+
         promotion_divergences = find_content_divergent_revisions(
             promotion_filenames, list(added_sources.keys())
         )
@@ -297,6 +355,59 @@ async def _validate_rollup_migration_chain(
                 f"to a different migration; it would be silently skipped at "
                 f"deploy): " + "; ".join(promotion_divergences),
             )
+
+        # Content-immutability guard against the deployed promotion target.
+        # find_content_divergent_revisions above is filename-only (reuse/renumber
+        # class). An in-place body edit — same filename on both refs but different
+        # content — is invisible to that check. Here we fetch any migration whose
+        # basename appears on the promotion target from that ref and compare bodies
+        # directly; a diff means a deployed-immutable migration's body was changed,
+        # which corrupts any live database that already applied the original.
+        promotion_basenames = {os.path.basename(fn) for fn in promotion_filenames}
+        shared_sources = {
+            path: src
+            for path, src in added_sources.items()
+            if os.path.basename(path) in promotion_basenames
+        }
+        if shared_sources:
+            deployed_sources: dict[str, str] = {}
+            for path in shared_sources:
+                basename = os.path.basename(path)
+                full_path = f"{_ALEMBIC_VERSIONS_DIR}/{basename}"
+                try:
+                    text = await github.get_file_text_at_ref(
+                        full_path,
+                        token=gh_token,
+                        owner=owner,
+                        repo=repo,
+                        ref=promotion_target,
+                    )
+                except Exception as e:
+                    return (
+                        "defer",
+                        f"could not fetch migration '{basename}' from promotion "
+                        f"target '{promotion_target}' for content-immutability "
+                        f"check: {type(e).__name__}: {e}",
+                    )
+                if not text:
+                    return (
+                        "defer",
+                        f"empty response fetching migration '{basename}' from "
+                        f"promotion target '{promotion_target}' — deferring "
+                        f"content-immutability check",
+                    )
+                deployed_sources[basename] = text
+
+            content_edits = find_deployed_migration_content_edits(
+                deployed_sources, shared_sources
+            )
+            if content_edits:
+                return (
+                    "block",
+                    f"deployed migration body modified in-place on promotion target "
+                    f"'{promotion_target}' — deployed migrations are immutable once "
+                    f"applied: " + "; ".join(content_edits),
+                )
     return ("ok", None)
 
 

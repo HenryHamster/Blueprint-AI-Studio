@@ -96,6 +96,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "autonomous_direction_cooldown_minutes",
         "autonomous_periodic_tasks",
         "autonomous_research_interval_minutes",
+        "cloud_run_task_type_allowlist",
         "evergreen_fill_mode",
         "evergreen_fill_interval_minutes",
         "evergreen_fill_util_threshold",
@@ -144,6 +145,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "direction_saturation_refractory_minutes",
         "promotion_enabled",
         "promotion_enabled_by_project",
+        "merge_grade_block_threshold",
         "promotion_threshold",
         "promotion_weights",
         "park_and_retarget_enabled",
@@ -466,6 +468,9 @@ async def get_settings(
             ).items()
         },
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
+        "merge_grade_block_threshold": float(
+            _runtime_config.get("merge_grade_block_threshold", 0.0) or 0.0
+        ),
         "no_ci_test_gate_enabled": bool(
             _runtime_config.get("no_ci_test_gate_enabled", True)
         ),
@@ -647,6 +652,9 @@ async def get_settings(
         )
         > 0,
         "max_plan_accounts": max_plan_accounts,
+        "cloud_run_task_type_allowlist": sorted(
+            _runtime_config.get("cloud_run_task_type_allowlist") or []
+        ),
     }
 
 
@@ -1066,6 +1074,19 @@ async def _apply_settings(
         _runtime_config["promotion_weights"] = {
             wk: round(cleaned_weights[wk], 4) for wk in _PROMOTION_WEIGHT_KEYS
         }
+    if "merge_grade_block_threshold" in payload:
+        try:
+            val = float(payload["merge_grade_block_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400, detail="merge_grade_block_threshold must be a number"
+            )
+        if not (0.0 <= val <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="merge_grade_block_threshold must be between 0.0 and 1.0",
+            )
+        _runtime_config["merge_grade_block_threshold"] = round(val, 4)
     if "evaluating_fail_hours" in payload:
         try:
             val = int(payload["evaluating_fail_hours"])
@@ -1267,6 +1288,38 @@ async def _apply_settings(
                 detail="warm_pool_cross_provider_retarget_enabled must be a boolean",
             )
         _runtime_config["warm_pool_cross_provider_retarget_enabled"] = val
+    if "cloud_run_task_type_allowlist" in payload:
+        from app.task_capabilities import READ_ONLY_TASK_TYPES
+
+        raw = payload["cloud_run_task_type_allowlist"]
+        # Accept a JSON list or comma-separated string of task type names.
+        # An empty allowlist disables Cloud Run routing (default behavior).
+        if isinstance(raw, str):
+            raw = [t.strip() for t in raw.split(",") if t.strip()]
+        if not isinstance(raw, list):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "cloud_run_task_type_allowlist must be a list of task type names "
+                    "(or a comma-separated string)"
+                ),
+            )
+        if not all(isinstance(t, str) for t in raw):
+            raise HTTPException(
+                status_code=400,
+                detail="cloud_run_task_type_allowlist entries must be strings",
+            )
+        invalid = [t for t in raw if t not in READ_ONLY_TASK_TYPES]
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"cloud_run_task_type_allowlist contains write/unknown task types: "
+                    f"{sorted(invalid)} — only read-only task types are eligible for "
+                    f"Cloud Run routing. Valid types: {sorted(READ_ONLY_TASK_TYPES)}"
+                ),
+            )
+        _runtime_config["cloud_run_task_type_allowlist"] = sorted(set(raw))
     if "warm_pool_project_allowlist" in payload:
         raw = payload["warm_pool_project_allowlist"]
         # Accept a JSON list, a comma-separated string, or a single id — the
@@ -2935,6 +2988,37 @@ async def _apply_settings(
                     "diagnostics_after_edit_enabled": bool(
                         _runtime_config.get("diagnostics_after_edit_enabled", True)
                     ),
+                    "evergreen_fill_mode": str(
+                        _runtime_config.get("evergreen_fill_mode", "off")
+                    ),
+                    "evergreen_fill_interval_minutes": int(
+                        _runtime_config.get("evergreen_fill_interval_minutes", 15)
+                    ),
+                    "evergreen_fill_util_threshold": float(
+                        _runtime_config.get("evergreen_fill_util_threshold", 0.5)
+                    ),
+                    "evergreen_fill_min_free_slots": int(
+                        _runtime_config.get("evergreen_fill_min_free_slots", 2)
+                    ),
+                    "evergreen_fill_max_active": int(
+                        _runtime_config.get("evergreen_fill_max_active", 1)
+                    ),
+                    "evergreen_fill_daily_cap": int(
+                        _runtime_config.get("evergreen_fill_daily_cap", 3)
+                    ),
+                    "evergreen_fill_deferred_memo_enrollment": bool(
+                        _runtime_config.get(
+                            "evergreen_fill_deferred_memo_enrollment", False
+                        )
+                    ),
+                    # Persist the Cloud Run task-type allowlist so an operator
+                    # configuration survives a Cloud Run restart. runtime_config_state.
+                    # sync_* reads this key back on boot; without it the in-memory
+                    # allowlist reverts to [] (no Cloud Run routing) and the configured
+                    # types are lost.
+                    "cloud_run_task_type_allowlist": sorted(
+                        _runtime_config.get("cloud_run_task_type_allowlist") or []
+                    ),
                 }
                 if "direction_refractory_minutes" not in _runtime_config:
                     runtime_config_json.pop("direction_refractory_minutes", None)
@@ -3357,9 +3441,7 @@ async def repair_state(
         all_children = (
             (
                 await session.execute(
-                    select(Task)
-                    .where(Task.parent_task_id.in_(parent_ids))
-                    .limit(5000)
+                    select(Task).where(Task.parent_task_id.in_(parent_ids)).limit(5000)
                 )
             )
             .scalars()

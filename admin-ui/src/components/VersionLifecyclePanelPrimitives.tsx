@@ -1,19 +1,24 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useState, useEffect } from 'react';
 import type { JSX } from 'react';
+import { LineChart, Line, ResponsiveContainer } from 'recharts';
 import { fetchVersionSummary } from '../api';
 import type {
   AgentServingShasResponse,
   AuditFinding,
   AuditReconciliation,
+  BlindMergeGrade,
   ChallengerRefutedFinding,
   CiResolution,
   CurrentVersion,
+  GoalAlignment,
   LatestAudit,
   OutOfBandPromotion,
+  QualificationVerdictRecord,
   ReleaseArtifactEvidence,
   RecentVersion,
   StagedDirection,
+  ThemeDeliveryCert,
   VersionQualification,
   VersionSummaryHighlights,
   VersionSummaryResponse,
@@ -674,6 +679,9 @@ export type DurableQualificationEvidence = {
   promotion_pr_url?: string | null;
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
+  theme_delivery?: ThemeDeliveryCert | null;
+  goal_alignment?: GoalAlignment | null;
+  blind_merge_grade?: BlindMergeGrade | null;
 };
 
 function formatCompactDetail(value: unknown): string {
@@ -800,6 +808,75 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
         title={q.promotion_error_detail}
       >
         {q.promotion_error_detail}
+      </span>,
+    );
+  }
+
+  if (q.theme_delivery && q.theme_delivery.state !== 'not_applicable') {
+    const td = q.theme_delivery;
+    const isCertified = td.state === 'certified';
+    const isShortfall = td.state === 'shortfall' || td.state === 'blocked';
+    const colorClass = isCertified
+      ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
+      : isShortfall
+        ? 'bg-amber-500/10 text-amber-300 border-amber-500/20'
+        : 'bg-neutral-800 text-neutral-400 border-neutral-700';
+    const gradeLabel =
+      td.assessed_grade != null ? ` ${Math.round(td.assessed_grade * 100)}%` : '';
+    const gapSentence = td.shortfalls?.[0]?.why ?? null;
+    chips.push(
+      <span
+        key="theme-delivery"
+        data-testid="theme-delivery-chip"
+        className={`text-[10px] px-1.5 py-0.5 rounded border ${colorClass}`}
+        title={gapSentence ?? td.state ?? undefined}
+      >
+        theme {td.state ?? 'unknown'}{gradeLabel}
+      </span>,
+    );
+  }
+
+  if (q.goal_alignment && q.goal_alignment.state !== 'not_applicable') {
+    const ga = q.goal_alignment;
+    const isAligned = ga.state === 'aligned';
+    const isShortfall = ga.state === 'shortfall';
+    const colorClass = isAligned
+      ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
+      : isShortfall
+        ? 'bg-amber-500/10 text-amber-300 border-amber-500/20'
+        : 'bg-neutral-800 text-neutral-400 border-neutral-700';
+    const gradeLabel =
+      ga.assessed_grade != null ? ` ${Math.round(ga.assessed_grade * 100)}%` : '';
+    chips.push(
+      <span
+        key="goal-alignment"
+        data-testid="goal-alignment-chip"
+        className={`text-[10px] px-1.5 py-0.5 rounded border ${colorClass}`}
+        title={ga.biggest_gap ?? ga.state ?? undefined}
+      >
+        goal {ga.state ?? 'unknown'}{gradeLabel}
+      </span>,
+    );
+  }
+
+  if (q.blind_merge_grade) {
+    const bmg = q.blind_merge_grade;
+    const verdict = bmg.coverage_verdict;
+    const isCovers = verdict === 'covers';
+    const isMisses = verdict === 'misses';
+    const colorClass = isCovers
+      ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
+      : isMisses
+        ? 'bg-red-500/10 text-red-400 border-red-500/20'
+        : 'bg-amber-500/10 text-amber-300 border-amber-500/20';
+    chips.push(
+      <span
+        key="blind-merge-grade"
+        data-testid="blind-merge-grade-chip"
+        className={`text-[10px] px-1.5 py-0.5 rounded border ${colorClass}`}
+        title={bmg.biggest_gap ?? verdict ?? undefined}
+      >
+        merge {verdict ?? 'unknown'}
       </span>,
     );
   }
@@ -1143,6 +1220,33 @@ export function VersionLifecycleRefreshBanner({
           {refreshing ? 'Retrying...' : 'Retry'}
         </button>
       </div>
+    </div>
+  );
+}
+
+export function ConfidenceSparkline({ verdicts }: { verdicts: QualificationVerdictRecord[] }) {
+  const points = verdicts
+    .slice()
+    .reverse()
+    .filter(v => v.confidence != null)
+    .map((v, i) => ({ i, v: Math.round((v.confidence as number) * 100), promote: v.would_promote }));
+
+  if (points.length < 2) return null;
+
+  const promotedCount = points.filter(p => p.promote).length;
+  const color = promotedCount >= points.length / 2 ? '#10b981' : '#f59e0b';
+
+  return (
+    <div
+      data-testid="confidence-sparkline"
+      style={{ height: 28 }}
+      title={`Confidence trend over last ${points.length} verdicts (oldest → newest)`}
+    >
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={points} margin={{ top: 2, right: 0, left: 0, bottom: 2 }}>
+          <Line dataKey="v" stroke={color} dot={false} strokeWidth={1.5} isAnimationActive={false} />
+        </LineChart>
+      </ResponsiveContainer>
     </div>
   );
 }

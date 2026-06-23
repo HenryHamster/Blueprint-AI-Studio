@@ -1,9 +1,13 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DeploySection } from './SettingsDeploySection';
 import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 import type { DeployState } from '../types/settings';
+
+vi.mock('../api', () => ({
+  apiFetch: vi.fn(async () => new Response(JSON.stringify({ merge_grade_block_threshold: 0.5 }), { status: 200 })),
+}));
 
 const noop = async () => {};
 

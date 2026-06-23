@@ -23,7 +23,6 @@ from datetime import datetime, timedelta
 from sqlmodel import select
 
 import app.shared_state as _shared_state
-from app import services
 from app.models import (
     Task,
     TaskStatus,
@@ -436,6 +435,7 @@ def _ci_backstop_timeout_reason(
     was_escalated: bool,
     review_summary: dict | None,
     review_loop: dict,
+    parent_ctx: dict | None = None,
 ) -> str:
     """Compose the EVALUATING-timeout reason string for a CI-waiting parent.
 
@@ -466,6 +466,25 @@ def _ci_backstop_timeout_reason(
         last_merge_msg = review_loop.get("merge_last_error") or review_loop.get(
             "last_merge_msg"
         )
+        # Rollup parents write merge-gate state to parent.context directly
+        # (_merge_deferred_*), not to review_loop. Surface those signals when
+        # review_loop has no merge diagnostics so the backstop message names
+        # the actual blocker instead of always showing "merge_attempts=0".
+        if (
+            parent_ctx is not None
+            and mergeable_state is None
+            and merge_in_progress_resets == 0
+        ):
+            _deferred_state = parent_ctx.get("_merge_deferred_state")
+            _deferred_count = parent_ctx.get("_merge_deferred_count", 0)
+            _total_deferrals = parent_ctx.get("_merge_total_deferrals", 0)
+            if _deferred_state:
+                return (
+                    f"CI green and review approved but rollup merge deferred: "
+                    f"mergeable_state={_deferred_state}, "
+                    f"deferred_count={_deferred_count}, "
+                    f"total_deferrals={_total_deferrals}"
+                )
         return (
             f"CI green and review approved but merge blocked: "
             f"mergeable_state={mergeable_state}, "
@@ -624,6 +643,7 @@ async def _verify_ci_before_backstop(
     Returns True iff CI had genuinely concluded and was handled (the caller must
     then skip the kill); False to fall through to the existing timeout path.
     """
+    from app import services
     from app.routers.agent import get_github_token_for_task
     from app.github_checks import get_check_runs_cached
     from app.ci_completion import handle_ci_completion
@@ -838,6 +858,7 @@ async def _heal_direction_outcomes_best_effort(task_id, *, label: str) -> None:
     best-effort — a failure here must not poison the sweep. Mirrors the sibling
     ``_pr_state_check_pending`` recovery path (see the merge-refresh block above).
     """
+    from app import services
     from app.direction_outcomes import refresh_direction_outcomes_after_merge
 
     try:

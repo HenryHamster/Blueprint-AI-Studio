@@ -1,5 +1,7 @@
 """Focused tests for review-fix lane-pilot cost attribution."""
 
+import uuid
+
 import pytest
 from datetime import timedelta
 from sqlalchemy import select
@@ -925,134 +927,6 @@ async def test_checkpoint_fraction_from_fix_task_context(db_session):
 
 
 @pytest.mark.asyncio
-async def test_lane_pilot_aggregates_include_visual_verification_by_arm(db_session):
-    """lane_visual and control_visual aggregate visual-verification stats per arm.
-
-    A lane-arm task that touches admin-ui and records a visual_verification entry
-    must appear in lane_visual but not control_visual.  A control-arm task without
-    admin-ui files must not inflate either arm's admin_task_count.
-    """
-    import json
-
-    project = await _make_project(db_session, is_self_repo=True)
-
-    # Lane-arm task: touches admin-ui, records a visual_verification block with
-    # one infra failure to exercise the infra_rate signal as well.
-    lane_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
-        context={
-            LANE_PILOT_ASSIGNMENT_KEY: "lane",
-            "_pr_changed_files": ["admin-ui/src/components/Foo.tsx"],
-            "_self_review_outcome": json.dumps(
-                {
-                    "verdict": "pass",
-                    "visual_verification": {
-                        "passed": True,
-                        "pairs_inspected": 2,
-                        "pairs_changed": 1,
-                        "caught_visual_issue": False,
-                        "infra_failures": [],
-                    },
-                }
-            ),
-        },
-        estimated_cost_usd=1.0,
-    )
-
-    # Control-arm task: does not touch admin-ui, no visual_verification block.
-    control_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
-        context={
-            LANE_PILOT_ASSIGNMENT_KEY: "control",
-            "_pr_changed_files": ["backend/app/models.py"],
-        },
-        estimated_cost_usd=0.8,
-    )
-
-    db_session.add_all([lane_task, control_task])
-    await db_session.commit()
-
-    agg = await compute_lane_pilot_aggregates(db_session, project.id)
-
-    assert "lane_visual" in agg, "lane_visual key must be present in aggregates"
-    assert "control_visual" in agg, "control_visual key must be present in aggregates"
-
-    # Lane arm: one admin-ui task with a visual_verification entry.
-    assert agg["lane_visual"]["admin_task_count"] == 1
-    assert agg["lane_visual"]["entry_count"] == 1
-    assert agg["lane_visual"]["pairs_inspected"] == 2
-    assert agg["lane_visual"]["pairs_changed"] == 1
-    assert agg["lane_visual"]["caught_count"] == 0
-
-    # Control arm: no admin-ui files touched → zero admin tasks.
-    assert agg["control_visual"]["admin_task_count"] == 0
-    assert agg["control_visual"]["entry_count"] == 0
-
-
-@pytest.mark.asyncio
-async def test_lane_pilot_aggregates_visual_infra_failure_counted_per_arm(db_session):
-    """infra_total and infra_rate are correctly computed in lane_visual.
-
-    A lane-arm task with VIEWPORT_GATE_INFRA_UNAVAILABLE in its visual_verification
-    entry must show infra_total >= 1 and infra_rate > 0 in lane_visual; control_visual
-    must remain at zero since no control task has a visual_verification block.
-    """
-    import json
-
-    from app.visual_verification_audit import VISUAL_INFRA_SENTINEL
-
-    project = await _make_project(db_session, is_self_repo=True)
-
-    lane_infra_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
-        context={
-            LANE_PILOT_ASSIGNMENT_KEY: "lane",
-            "_pr_changed_files": ["admin-ui/src/components/Bar.tsx"],
-            "_self_review_outcome": json.dumps(
-                {
-                    "verdict": "pass",
-                    "visual_verification": {
-                        "passed": False,
-                        "pairs_inspected": 0,
-                        "pairs_changed": 0,
-                        "caught_visual_issue": False,
-                        "issue": f"{VISUAL_INFRA_SENTINEL}: chromium missing",
-                    },
-                }
-            ),
-        },
-        estimated_cost_usd=1.2,
-    )
-
-    control_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "fix", "prompt": "fix", "base_branch": "main"}],
-        context={
-            LANE_PILOT_ASSIGNMENT_KEY: "control",
-            "_pr_changed_files": ["backend/app/schemas.py"],
-        },
-        estimated_cost_usd=0.9,
-    )
-
-    db_session.add_all([lane_infra_task, control_task])
-    await db_session.commit()
-
-    agg = await compute_lane_pilot_aggregates(db_session, project.id)
-
-    assert agg["lane_visual"]["infra_total"] >= 1
-    assert agg["lane_visual"]["infra_rate"] > 0
-    assert agg["control_visual"]["infra_total"] == 0
-    assert agg["control_visual"]["infra_rate"] == 0.0
-
-
-@pytest.mark.asyncio
 async def test_lane_relay_comparison_splits_fix_phase(db_session):
     """compute_lane_arm_time_medians reports fix_active_seconds and review_active_seconds
     independently, so review-side noise cannot mask fix-side improvements."""
@@ -1380,3 +1254,133 @@ def test_lane_baseline_trend_returns_none_when_fewer_than_two():
         waste_task_count=0,
     )
     assert compute_lane_baseline_trend([single]) is None
+
+
+@pytest.mark.asyncio
+async def test_emit_lane_event_message_dedupe_is_db_bounded(db_session):
+    """emit_lane_event_message uses a DB-side dedupe filter (LIMIT 1), not a full scan.
+
+    Verifies:
+    1. A message is inserted on first call.
+    2. A duplicate is NOT inserted on a second call with the same dedupe_key.
+    3. A different dedupe_key does get its own message.
+    """
+    from sqlalchemy import select as sa_select
+
+    from app.models import MessageType, ProjectMessage
+    from app.review_fix_lane_pilot import emit_lane_event_message
+    from testing.factories import make_project
+
+    project = make_project(is_self_repo=True)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    lane_id = uuid.uuid4()
+
+    # First call: should insert one message.
+    await emit_lane_event_message(
+        db_session, project.id, lane_id, "test_event", "detail A"
+    )
+    await db_session.commit()
+
+    msgs = (
+        (
+            await db_session.execute(
+                sa_select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs) == 1
+    assert msgs[0].message_type == MessageType.NOTE
+    assert msgs[0].context["dedupe_key"] == f"lane_test_event_{lane_id}"
+
+    # Second call with same args: dedupe should prevent a second insert.
+    await emit_lane_event_message(
+        db_session, project.id, lane_id, "test_event", "detail A again"
+    )
+    await db_session.commit()
+
+    msgs2 = (
+        (
+            await db_session.execute(
+                sa_select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs2) == 1, "duplicate insert must be suppressed by DB-side dedupe"
+
+    # Different event type: a new message should be inserted.
+    await emit_lane_event_message(
+        db_session, project.id, lane_id, "other_event", "detail B"
+    )
+    await db_session.commit()
+
+    msgs3 = (
+        (
+            await db_session.execute(
+                sa_select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs3) == 2, "distinct dedupe_key must produce a separate message"
+
+
+@pytest.mark.asyncio
+async def test_raise_gate_integrity_alert_dedupe_is_db_bounded(db_session):
+    """raise_gate_integrity_alert uses a DB-side dedupe filter (LIMIT 1), not a full scan.
+
+    Verifies:
+    1. A BLOCKER message is inserted on first call.
+    2. A duplicate is NOT inserted on a second call.
+    """
+    from sqlalchemy import select as sa_select
+
+    from app.models import MessageType, ProjectMessage
+    from app.review_fix_lane_pilot import raise_gate_integrity_alert
+    from testing.factories import make_project
+
+    project = make_project(is_self_repo=True)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First call: should insert one BLOCKER message.
+    await raise_gate_integrity_alert(db_session, project.id, "gate integrity broken")
+    await db_session.commit()
+
+    msgs = (
+        (
+            await db_session.execute(
+                sa_select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs) == 1
+    assert msgs[0].message_type == MessageType.BLOCKER
+    assert msgs[0].context["dedupe_key"] == "review_fix_lane_gate_integrity_violation"
+
+    # Second call: dedupe must suppress the second insert.
+    await raise_gate_integrity_alert(
+        db_session, project.id, "gate integrity broken again"
+    )
+    await db_session.commit()
+
+    msgs2 = (
+        (
+            await db_session.execute(
+                sa_select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs2) == 1, "duplicate BLOCKER must be suppressed by DB-side dedupe"

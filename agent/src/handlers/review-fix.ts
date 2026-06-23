@@ -1,5 +1,21 @@
 import fs from 'fs';
 import { execFileSync } from 'child_process';
+/**
+ * Review and fix handlers — code review and iterative repair.
+ *
+ * - **handleReview**: Comments on an open PR's code diff. Checks out the PR
+ *   branch, analyzes changes, and posts review comments via GitHub API (no local
+ *   changes or new commit). Useful for human-in-the-loop workflows.
+ *
+ * - **handleFix**: Repairs code issues identified in a prior review or analysis.
+ *   Checks out the PR branch, makes fixes, commits, and pushes updates to the
+ *   same PR. Implements feedback from parent review tasks or self-improvement loops.
+ *
+ * These handlers form the review→fix cycle: a review task identifies issues,
+ * then downstream fix tasks address them. Fix tasks can loop: the fix handler
+ * may run tests, analyze failures, iterate, and re-push until COMPLETED.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
@@ -7,7 +23,7 @@ import {
   runClaudeCode, sendHeartbeatSync, setCurrentPromptFingerprint,
   extractPytestSelectorsFromOutput,
   snapshotToolTrace, extractInvestigatedFiles,
-  resolveBaseBranch,
+  resolveBaseBranch, getAgentToken,
 } from '../index.js';
 import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -495,8 +511,7 @@ export async function handleReview(
   // Download viewport screenshots captured by the implementer for visual review.
   // The payload carries `viewport_shot_entries` (list of {name, storage_uri} dicts)
   // and `viewport_source_task_id` (the create/fix task that uploaded them).
-  // We fetch each PNG via the admin no-auth 302-redirect endpoint so we never need
-  // a cross-task JWT — this is the same path used by PR body screenshot links.
+  // The agent JWT authenticates cross-task access within the same project.
   const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
   const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
   const reviewProjectMetaEarly = task.project_metadata as Record<string, unknown> | undefined;
@@ -510,6 +525,7 @@ export async function handleReview(
       orchestratorUrl: reviewOrchestratorUrl,
       projectId: reviewProjectIdEarly,
       sourceTaskId: viewportSourceTaskId,
+      agentToken: getAgentToken(),
       onError: (name) => { sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`); },
     });
     if (downloadedShotPaths.length > 0) {
@@ -798,7 +814,7 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
       mode: 'object',
       requiredKeys: ['verdict'],
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: buildReviewVerdictInstructions(taskId),
+      reopenPrompt: buildReviewVerdictInstructions(taskId, { repairContext: true }),
       ws,
       statusRef,
       model,
@@ -882,8 +898,7 @@ export async function handleFix(
   // Download viewport screenshots captured by the implementer for visual context.
   // The payload carries `viewport_shot_entries` (list of {name, storage_uri} dicts)
   // and `viewport_source_task_id` (the create/fix task that uploaded them).
-  // We fetch each PNG via the admin no-auth 302-redirect endpoint so we never need
-  // a cross-task JWT — this is the same path used by PR body screenshot links.
+  // The agent JWT authenticates cross-task access within the same project.
   const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
   const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
   const fixViewportProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
@@ -897,6 +912,7 @@ export async function handleFix(
       orchestratorUrl: fixViewportOrchestratorUrl,
       projectId: fixViewportProjectId,
       sourceTaskId: viewportSourceTaskId,
+      agentToken: getAgentToken(),
       onError: (name) => { sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`); },
     });
     if (downloadedFixShotPaths.length > 0) {

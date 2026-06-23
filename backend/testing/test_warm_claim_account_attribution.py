@@ -224,3 +224,51 @@ async def test_vm_boot_account_identity_skips_unattributed_returns_older(db_sess
     )
     assert identity["account_id"] == BOOT_ACCOUNT_ID
     assert identity["provider"] == "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_backlog_reuse_sets_llm_account_id_column(
+    client: AsyncClient, db_session, mocker
+):
+    """Warm-claim finalize sets task.llm_account_id column, not just context JSONB.
+
+    Without this, the reconcile loop (which now reads the scalar column) would
+    see NULL for warm-reused tasks and miscount Max Plan concurrency.
+    """
+    mocker.patch(
+        "app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+    from test_warm_backlog_reuse import _FlagGuard
+
+    async with _PoolAccount(active_tasks=0):
+        with _FlagGuard(backlog=True):
+            project = await _make_project(db_session, name="Column Attr")
+            vm_id = "agent-vm-attr-col"
+            prior = await _make_task(
+                db_session,
+                project.id,
+                status=TaskStatus.COMPLETED,
+                vm_instance_id=vm_id,
+                context=_boot_ctx(),
+            )
+            backlog = await _make_task(db_session, project.id)
+
+            token = create_agent_token(
+                str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+            )
+            resp = await client.post(
+                "/api/agent/next-role",
+                json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+                headers={"x-agent-token": token},
+            )
+            assert resp.status_code == 200, resp.text
+
+            db_session.expire(backlog)
+            await db_session.refresh(backlog)
+            # The scalar column must be set so reconcile reads it without JSONB.
+            assert backlog.llm_account_id == BOOT_ACCOUNT_ID, (
+                "task.llm_account_id column not set on warm claim — reconcile "
+                "loop will undercount concurrency for this account"
+            )
+            # JSONB path also populated for backward-compat.
+            assert (backlog.context or {}).get("llm_account_id") == BOOT_ACCOUNT_ID

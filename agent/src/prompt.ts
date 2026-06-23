@@ -238,6 +238,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'web_research',     // Uses web-research.ts bespoke prompt assembly (web-first knowledge doc)
   'design',           // Uses design.ts bespoke prompt assembly (codebase-grounded design doc)
   'release_audit_challenge', // Uses audit-challenge.ts bespoke prompt assembly (advisory second opinion)
+  'release_merge_grade', // Uses merge-grade.ts bespoke prompt assembly (blind goal-coverage grader)
   'repo_bootstrap',          // Uses specialized.ts bespoke prompt assembly (external-repo first-cycle bootstrap)
 ]);
 
@@ -295,6 +296,15 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
 }
 
 export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. Use ./symbols <name> to find where a function or class is defined (returns file path, line, and kind). If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
+
+// Shared parenthetical for every read-only handler that instructs the agent to
+// write a /tmp output file. The Write/Edit tools are stripped for read-only
+// tasks (configureAgentPermissions returns them in the disallowed list), so the
+// agent must use Bash (e.g. `cat << 'EOF' > /tmp/...` or `echo '...' > /tmp/...`)
+// to create the file. Without this note the agent reaches for the disabled Write
+// tool, the call silently no-ops, no output file lands, and the unparseable
+// final message is booked as a format miss and wasted repair reopen.
+export const READ_ONLY_BASH_WRITE_NOTE = '(use Bash to write the file — the Write/Edit tools are disabled for this read-only task)';
 
 // Adaptive parallel-subagent guidance for rollup PRs touching multiple
 // modules. Only inject when shouldFanOutReview() AND the per-project
@@ -406,26 +416,13 @@ or any other piece of project infrastructure.
 export const PRIOR_ATTEMPT_DIVERGENCE = `
 ## If You're Retrying — Try A Different Angle
 
-If your task context indicates this is a fix iteration or a remediation
-of a previously-failed attempt, **the same approach won't work twice**.
-
-Before writing code: ask yourself what the previous attempt assumed
-about the root cause. If it tried "edit source X to make test Y pass"
-and failed, consider:
-- Maybe Y is meant to fail unless the test config is bumped (size guardrail, etc.)
-- Maybe X isn't the right file — the test is actually validating Z
-- Maybe the failure is in a place the previous attempt never read
+If your task context indicates this is a fix iteration, **the same approach won't work twice**. Before writing code, ask yourself what the previous attempt assumed about the root cause.
 
 Common wrong-direction patterns to avoid on retry:
-1. **Re-running the same lint fix that already failed** — output won't change
-2. **Adding more code when the previous attempt's lint failure was "file too long"** — the answer is bump the limit, not condense the diff
-3. **Refactoring the source when the test is asking you to update test config** — read the assertion message, follow its remediation literally
-4. **Making the test pass by weakening assertions** — that's not allowed; either the source needs to be different or the test/policy needs to change
+1. **Don't repeat the same fix** — it won't change the outcome. If a lint fix failed, re-running it produces the same failure. If "file too long" was the error, bump the limit—don't condense the diff.
+2. **Read the assertion message and follow it literally** — if it asks you to update test config, a migration, or infrastructure, do exactly that. Don't refactor the source to make the test pass; either the source needs changing or the policy needs to.
 
-The diagnosis system fingerprints failures and stores them as
-\`ResidualRemediationCase\`. If your task includes prior_diagnosis or
-diagnosis_root_cause in its context, that is your hint about what
-**previously didn't work** — pivot away from that, do not repeat it.
+The diagnosis system fingerprints failures as \`ResidualRemediationCase\`. If your task includes prior_diagnosis or diagnosis_root_cause in context, that indicates what **previously didn't work** — pivot away from it.
 `;
 
 // Per-task SIZE-specific guidance — kept distinct from READ_THE_FAILURE_MESSAGE
@@ -1015,11 +1012,10 @@ const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks 
   \`npm run test:run\` suite.
 - \`./check test\` — same plus a **lightweight standalone backend test
   pass** (3 invariant files, ~30s). This VM is 8 GB; the FULL Docker
-  + Postgres pytest suite OOMs here (production 2026-05-05: tasks
-  53ef061b, b150b4d6, b15b6813 all died at exit 137 during this gate).
-  CI runs the full suite on the PR after \`./pr open\`, so this local
-  gate is just a smoke check — file-size guardrails, security regs,
-  pipeline invariants. **For full suite runs use
+  + Postgres pytest suite OOMs (exit 137) here. CI runs the full suite
+  on the PR after \`./pr open\`, so this local gate is just a smoke
+  check — file-size guardrails, security regs, pipeline invariants.
+  **For full suite runs use
   \`bash scripts/test-backend.sh --standalone --no-postgres\`** — calling
   \`scripts/test-backend.sh\` with no test-file argument runs the full
   suite and OOMs. Specific test files are fine with default Postgres:
@@ -1102,10 +1098,6 @@ paths, DTO fields, shared types. grep the other side(s) for matching definitions
 \`passed: false\` with \`"major"\` for URL/route mismatches, \`"minor"\` for
 type-name drift. If not cross-system: \`"issue": "diff does not cross system boundaries"\`.
 
-**Visual-verification (optional; admin-ui/src/components only):** Record a
-TOP-LEVEL \`visual_verification\` object with \`passed\`, \`pairs_inspected\`,
-\`pairs_changed\`, \`note\`, \`caught_visual_issue\`.
-
 **Regressing-category reasoning (required for Self-Review Blind Spots categories):**
 For every regressing category, add a \`"reasoning"\` field describing what you inspected
 and the evidence supporting the call. Required for BOTH pass and fail outcomes.
@@ -1118,9 +1110,9 @@ needs a concrete evidence anchor in \`reasoning\`: a file:line reference
 (\`path/to/file.ts:42\`), a backtick-quoted code snippet (≥10 chars), or a named
 test file. Lower-stakes categories (style-conventions, documentation, performance,
 architecture) do not require an anchor.
-For \`scope-drift\`: Trigger A — cite diff stats vs. threshold (lines/files).
-Trigger B — cite file-set check vs. related_files. PASS without evidence anchor
-on high-stakes = unsubstantiated → downgrade to FAIL.
+For \`scope-drift\`: cite Trigger A diff stats (lines/files) and the Trigger B
+file-set check vs. related_files. PASS without an anchor on high-stakes =
+unsubstantiated → downgrade to FAIL.
 
 \`fixes_applied: true\` = you caught and fixed issues. File MUST exist for
 code-change tasks (may be degraded \`{"verdict":"unknown"}\`).
@@ -1252,16 +1244,11 @@ export const PLAYBOOK_GUIDANCE = `
 The playbook is shared, mutable knowledge across all agents in this project — more like a forum than an append-only log. Use \`./playbook set <key> <value>\` to save reusable knowledge OR overwrite an existing entry, and \`./playbook get\` to review. If an existing entry led you astray, overwrite it with corrected guidance so the next agent benefits from the latest version.
 
 **When to save (trigger conditions):**
-- After fixing a lint, build, or test error: save the root cause pattern and fix
-- After discovering a non-obvious configuration, path, or workaround: save it
-- After wasting time on a wrong approach: save what didn't work and why
-- After finding an undocumented dependency between modules: save the relationship
-- After learning that a test requires special setup: save the setup steps
-- After successfully running build/test commands: save the exact commands that work, especially non-obvious ones (custom scripts, required flags, env vars)
-- After setting up a new repo environment: save version requirements, virtualenv steps, database setup, or prerequisites not documented in README/CLAUDE.md
-- After learning repo-specific test patterns: save fixture conventions, mock helpers, or test utilities unique to this codebase
-- After identifying key architectural patterns: save the pattern (e.g., "all API handlers use X decorator", "DB models follow Y convention") so future agents write consistent code
-- After discovering undocumented linting or formatting rules: save the rule and how to fix violations
+- After fixing a lint, build, or test error, or discovering undocumented linting rules: save the root cause pattern and fix
+- After discovering non-obvious configuration, paths, workarounds, or wasting time on a wrong approach: save what you found and why
+- After successfully running build/test commands or setting up a new repo environment: save the exact commands, required flags, and any version/setup prerequisites not in README/CLAUDE.md
+- After learning repo-specific test setup, fixtures, or patterns: save the setup steps and mock helpers unique to this codebase
+- After finding undocumented module dependencies or key architectural patterns: save the relationship or pattern so future agents write consistent code
 
 **What NOT to save:**
 - Anything already in CLAUDE.md (check first)

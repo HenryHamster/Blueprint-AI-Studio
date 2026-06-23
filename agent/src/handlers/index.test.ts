@@ -107,8 +107,8 @@ describe('handlers registry', () => {
   // for registered types with no bespoke handler (see the contract-driven
   // dispatch suite below). The count still documents the bespoke set so a
   // dropped/duplicated bespoke entry is caught.
-  it('has exactly 27 bespoke handler entries', () => {
-    expect(Object.keys(handlers)).toHaveLength(27);
+  it('has exactly 28 bespoke handler entries', () => {
+    expect(Object.keys(handlers)).toHaveLength(28);
   });
 
   it.each(EXPECTED_TYPES)('contains bespoke handler for task type "%s"', (taskType) => {
@@ -400,13 +400,14 @@ const TASK_CLASS_MAP = {
   docs:              'code-change',
   qa:                'code-change',
   deps:              'code-change',
-  // Read-only / investigative (12): analysis only, must not push code
+  // Read-only / investigative (14): analysis only, must not push code
   review:            'read-only',
   panel_review:      'read-only',
   security_audit:    'read-only',
   self_audit:        'read-only',
   release_audit:     'read-only',
   release_audit_challenge: 'read-only',
+  release_merge_grade: 'read-only',
   smoketest:         'read-only',
   debug:             'read-only',
   perf:              'read-only',
@@ -438,11 +439,11 @@ describe('task type class classification — cross-cutting invariants', () => {
     }
   });
 
-  it('class distribution is 7 code-change + 13 read-only + 7 research = 27 total', () => {
+  it('class distribution is 7 code-change + 14 read-only + 7 research = 28 total', () => {
     const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
     for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
     expect(counts['code-change']).toBe(7);
-    expect(counts['read-only']).toBe(13);
+    expect(counts['read-only']).toBe(14);
     expect(counts['research']).toBe(7);
   });
 

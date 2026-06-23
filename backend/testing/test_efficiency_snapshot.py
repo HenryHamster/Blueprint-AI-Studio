@@ -31,7 +31,9 @@ from app.efficiency_snapshot import (
     SELF_REPAIR_MIN_ATTEMPTS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
     _PROMPT_STATIC_CONST_NAMES,
+    _PROMPT_STATIC_PLAIN_CONST_NAMES,
     _compute_checkpoint_loss_rate,
+    _extract_ts_plain_string_length,
     _extract_ts_template_literal_length,
     _compute_cold_start_breakdown_p50,
     _compute_lane_cost_per_merged_pr,
@@ -3063,8 +3065,10 @@ from sqlmodel import select as _sql_select  # noqa: E402
 
 from app.efficiency_snapshot import (  # noqa: E402
     LAST_ALERTED_PAYOFF_KEY,
+    LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY,
     POOL_PAYOFF_PROVEN_MIN_WARM_STARTS,
     maybe_alert_pool_payoff_transition,
+    maybe_alert_self_repair_burn_share,
 )
 from app.models import Alert, AlertSeverity  # noqa: E402
 from app.shared_state import runtime_config as _runtime_config  # noqa: E402
@@ -4098,13 +4102,20 @@ def test_axis_llm_cost_constant_value():
 
 def test_code_change_prompt_static_bytes():
     """AXIS_PROMPT_STATIC_BYTES is registered in ALL_AXES and AXIS_CONSUMERS, and
-    _compute_prompt_static_bytes() returns a positive integer within the guard
-    threshold when agent/src/prompt.ts is available.
+    _compute_prompt_static_bytes() returns a value within a meaningful range when
+    agent/src/prompt.ts is available.
 
     This is the acceptance test for the prompt_static_bytes gauge (d-22af1f55):
     it exercises the production parsing logic against the live prompt.ts source,
     so a PR that grows the static prompt budget past PROMPT_STATIC_BYTES_THRESHOLD
     will fail here before reaching production.
+
+    Baseline (post-v16, 2026-06-20): ~16 420 bytes across all measured constants.
+    The 2026-06-19 compute experiment measured ~34 997 bytes; subsequent v16
+    reductions (SHARED_LIFECYCLE_REMAINDER -75% in PR #10960, SIZE_GUARDRAIL_GUIDANCE
+    -53% in PR #10956) brought the total to the current baseline.  The lower-bound
+    guard below catches catastrophic regressions such as a constant being silently
+    dropped from _PROMPT_STATIC_CONST_NAMES / _PROMPT_STATIC_PLAIN_CONST_NAMES.
     """
     assert AXIS_PROMPT_STATIC_BYTES in ALL_AXES, (
         f"{AXIS_PROMPT_STATIC_BYTES!r} must be in ALL_AXES"
@@ -4123,12 +4134,56 @@ def test_code_change_prompt_static_bytes():
         pytest.skip("agent/src/prompt.ts not available in this environment")
 
     assert isinstance(result, int), f"Expected int, got {type(result)!r}"
-    assert result > 0, f"prompt_static_bytes must be positive, got {result}"
+    assert result > 8_000, (
+        f"prompt_static_bytes={result} is below the expected lower bound (8 000 bytes). "
+        "A constant may have been removed from _PROMPT_STATIC_CONST_NAMES or "
+        "_PROMPT_STATIC_PLAIN_CONST_NAMES, or the prompt sections shrank dramatically. "
+        f"Post-v16 baseline: ~16 420 bytes. Investigate before lowering this bound."
+    )
     assert result <= PROMPT_STATIC_BYTES_THRESHOLD, (
         f"prompt_static_bytes={result} exceeds PROMPT_STATIC_BYTES_THRESHOLD="
         f"{PROMPT_STATIC_BYTES_THRESHOLD}. A recent change grew the static prompt "
         "budget past the guard. Either revert the growth or raise the threshold "
         "with justification in efficiency_snapshot.py."
+    )
+
+
+def test_playbook_guidance_trigger_bullets_condensed():
+    """PLAYBOOK_GUIDANCE must use at most 5 trigger-condition bullets.
+
+    PR #11033 condensed the 10 original bullets to 5 by merging overlapping
+    categories (error-fixes + linting rules; workarounds + wrong-approaches;
+    build-commands + env-setup; test-setup + test-patterns; module-deps +
+    architecture). This test guards against re-expansion.
+    """
+    import os
+
+    prompt_ts = os.path.join(
+        os.path.dirname(__file__), "..", "..", "agent", "src", "prompt.ts"
+    )
+    prompt_ts = os.path.normpath(prompt_ts)
+    if not os.path.exists(prompt_ts):
+        pytest.skip("agent/src/prompt.ts not available in this environment")
+
+    with open(prompt_ts, encoding="utf-8") as fh:
+        src = fh.read()
+
+    # Extract the PLAYBOOK_GUIDANCE template literal body
+    marker = "**When to save (trigger conditions):**"
+    start = src.find(marker)
+    assert start != -1, (
+        "PLAYBOOK_GUIDANCE trigger conditions section not found in prompt.ts"
+    )
+    end_marker = "\n\n**What NOT to save:**"
+    end = src.find(end_marker, start)
+    assert end != -1, "'What NOT to save' section not found after trigger conditions"
+
+    trigger_section = src[start:end]
+    bullet_count = trigger_section.count("\n- ")
+    assert bullet_count <= 5, (
+        f"PLAYBOOK_GUIDANCE has {bullet_count} trigger bullets (max 5). "
+        "Consolidate overlapping categories rather than expanding the list. "
+        "See PR #11033 for the canonical 5-bullet grouping."
     )
 
 
@@ -4357,6 +4412,38 @@ def test_compute_llm_cost_by_task_type():
     # Verify merged task is counted correctly
     assert create_row["merged_count"] == 1
     assert create_row["verified_merged_count"] == 1
+
+
+def test_compact_llm_cost_attribution():
+    """mean_input_tokens_per_call is stored in each by_task_type row of the
+    compact attribution block under a real merge-test verdict."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 600,
+            "llm_call_count": 6,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    from app.efficiency_snapshot import _compact_llm_cost_attribution
+
+    result = _compact_llm_cost_attribution([task])
+    by_type = {r["task_type"]: r for r in result["by_task_type"]}
+
+    assert "create" in by_type
+    create_row = by_type["create"]
+    assert create_row["mean_input_tokens_per_call"] == 500  # 3000 / 6
+    assert create_row["cost_usd"] > 0
 
 
 @pytest.mark.asyncio
@@ -6589,6 +6676,73 @@ async def test_self_repair_drift_suppressed_below_min_attempts(db_session):
     )
 
 
+@pytest.mark.asyncio
+async def test_read_baseline_by_schema_passthrough(db_session):
+    """read_baseline_with_drift forwards by_schema from the persisted snapshot.
+
+    When a snapshot's format_compliance block contains a by_schema dict,
+    read_baseline_with_drift must include it in the returned format_compliance
+    block so operators can see per-schema format-miss rankings.
+    """
+    by_schema_fixture = {
+        "thinker": {
+            "format_miss": 3,
+            "repair_attempts": 3,
+            "repair_successes": 2,
+            "repair_infra_failures": 0,
+            "repair_miss": 1,
+            "repair_input_tokens": 1200,
+            "repair_output_tokens": 400,
+            "self_repair_success_rate": 0.667,
+        },
+        "security_audit": {
+            "format_miss": 1,
+            "repair_attempts": 1,
+            "repair_successes": 1,
+            "repair_infra_failures": 0,
+            "repair_miss": 0,
+            "repair_input_tokens": 300,
+            "repair_output_tokens": 100,
+            "self_repair_success_rate": 1.0,
+        },
+    }
+    baseline_fc = {
+        FORMAT_COMPLIANCE_KEY: {
+            "format_compliance_rate": 0.85,
+            SELF_REPAIR_SUCCESS_RATE_KEY: 0.75,
+            "repair_attempts": 4,
+            "repair_successes": 3,
+            "tasks_measured": 10,
+            "well_formed_tasks": 8,
+            "format_error_total": 4,
+            "by_schema": by_schema_fixture,
+        }
+    }
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {"captured_at": "2026-01-01T00:00:00", **baseline_fc},
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00", **baseline_fc}],
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    fc = drift[FORMAT_COMPLIANCE_KEY]
+
+    assert "by_schema" in fc, (
+        "by_schema must be forwarded in the format_compliance block"
+    )
+    assert fc["by_schema"] == by_schema_fixture, (
+        "by_schema contents must match the persisted snapshot value"
+    )
+    assert fc["by_schema"]["thinker"]["format_miss"] == 3
+    assert fc["by_schema"]["security_audit"]["self_repair_success_rate"] == 1.0
+
+
 # ---------------------------------------------------------------------------
 # Panel review effectiveness tests
 # ---------------------------------------------------------------------------
@@ -7171,16 +7325,25 @@ def test_extract_ts_template_literal_length_unterminated_returns_none():
 
 
 def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
-    """When all _PROMPT_STATIC_CONST_NAMES are found in prompt.ts the result
-    is a positive integer equal to the sum of their body lengths."""
+    """When all template-literal and plain-string constants are found the result
+    is a positive integer equal to the sum of all their body lengths."""
     from unittest.mock import mock_open, patch
 
-    # Build a synthetic prompt.ts that defines every required constant.
-    bodies = {name: f"body of {name} " * 5 for name in _PROMPT_STATIC_CONST_NAMES}
+    # Build a synthetic prompt.ts with all template-literal constants.
+    tl_bodies = {name: f"body of {name} " * 5 for name in _PROMPT_STATIC_CONST_NAMES}
     synthetic_src = "\n".join(
-        f"const {name} = `{body}`;" for name, body in bodies.items()
+        f"const {name} = `{body}`;" for name, body in tl_bodies.items()
     )
-    expected_total = sum(len(b) for b in bodies.values())
+    # Append plain-string constants.
+    ps_bodies = {
+        name: f"plain body of {name} " * 3 for name in _PROMPT_STATIC_PLAIN_CONST_NAMES
+    }
+    synthetic_src += "\n" + "\n".join(
+        f"const {name} = '{body}';" for name, body in ps_bodies.items()
+    )
+    expected_total = sum(len(b) for b in tl_bodies.values()) + sum(
+        len(b) for b in ps_bodies.values()
+    )
 
     import app.efficiency_snapshot as es_mod
 
@@ -7199,10 +7362,14 @@ def test_compute_prompt_static_bytes_missing_constant_returns_none():
     """Returns None when any one of _PROMPT_STATIC_CONST_NAMES is absent."""
     from unittest.mock import mock_open, patch
 
-    # Omit the last constant from the synthetic source.
+    # Omit the last template-literal constant from the synthetic source.
     present_names = _PROMPT_STATIC_CONST_NAMES[:-1]
     synthetic_src = "\n".join(
         f"const {name} = `body of {name}`;" for name in present_names
+    )
+    # Include all plain-string constants so the failure is from the template-literal gap.
+    synthetic_src += "\n" + "\n".join(
+        f"const {name} = 'plain body';" for name in _PROMPT_STATIC_PLAIN_CONST_NAMES
     )
 
     import app.efficiency_snapshot as es_mod
@@ -7215,6 +7382,46 @@ def test_compute_prompt_static_bytes_missing_constant_returns_none():
         result = _compute_prompt_static_bytes()
 
     assert result is None
+
+
+def test_compute_prompt_static_bytes_missing_plain_constant_returns_none():
+    """Returns None when any plain-string constant in _PROMPT_STATIC_PLAIN_CONST_NAMES
+    is absent from the source."""
+    from unittest.mock import mock_open, patch
+
+    # Include all template-literal constants but omit plain-string ones.
+    synthetic_src = "\n".join(
+        f"const {name} = `body of {name}`;" for name in _PROMPT_STATIC_CONST_NAMES
+    )
+
+    import app.efficiency_snapshot as es_mod
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", return_value=True),
+        patch("builtins.open", mock_open(read_data=synthetic_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result is None
+
+
+def test_extract_ts_plain_string_length_single_quote():
+    """_extract_ts_plain_string_length extracts the body of a single-quoted constant."""
+    src = "const MY_CONST = 'hello world';"
+    assert _extract_ts_plain_string_length(src, "MY_CONST") == len("hello world")
+
+
+def test_extract_ts_plain_string_length_double_quote():
+    """_extract_ts_plain_string_length extracts the body of a double-quoted constant."""
+    src = 'const MY_CONST = "hello world";'
+    assert _extract_ts_plain_string_length(src, "MY_CONST") == len("hello world")
+
+
+def test_extract_ts_plain_string_length_missing_returns_none():
+    """_extract_ts_plain_string_length returns None when the constant is absent."""
+    src = "const OTHER = 'value';"
+    assert _extract_ts_plain_string_length(src, "MY_CONST") is None
 
 
 def test_compute_prompt_static_bytes_no_agent_src_returns_none():
@@ -7295,3 +7502,125 @@ async def test_self_repair_burn_share_zero_clean_attempts_suppresses_drift(db_se
     # clean_attempts = repair_attempts - infra_failures = 3 - 3 = 0 < SELF_REPAIR_MIN_ATTEMPTS
     # → drift suppressed
     assert sr_axis.get("drift_pct") is None
+
+
+async def _self_repair_burn_share_alerts(db_session, project_id):
+    """Fetch self-repair burn-share alerts for a project."""
+    stmt = _sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title.contains("Self-repair token overhead"),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
+    """Alert fires when self_repair_burn_share exceeds threshold.
+
+    Verify that:
+    1. An alert fires when repair burn-share crosses above the threshold
+    2. The alert contains the numeric values (current burn share, threshold)
+    3. A second call at the same level dedupes (one alert only)
+    4. Recovery below threshold re-arms the alert
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    # Create a project with merged tasks. Repair burn-share is:
+    # (repair_input_tokens + repair_output_tokens) / (total_input + total_output)
+    # We'll create tasks such that burn-share exceeds the 0.20 (20%) threshold.
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with high repair overhead: 3000 repair tokens out of 10000 total = 30%
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 7000,
+            "total_output_tokens": 3000,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 5,
+            "format_repair_attempts": 5,
+            "format_repair_successes": 3,
+            "format_repair_infra_failures": 0,
+            "format_repair_input_tokens": 2000,  # repair tokens contribute to burn_share
+            "format_repair_output_tokens": 1000,  # total repair = 3000 tokens
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # First alert: burn-share at 30%, exceeds 20% threshold
+    fired = await maybe_alert_self_repair_burn_share(db_session, project.id)
+    assert fired is True
+
+    alerts = await _self_repair_burn_share_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "Self-repair token overhead" in alerts[0].title
+    # The message should contain percentages for operator context
+    assert "30.0%" in alerts[0].message  # current burn share
+    assert "20.0%" in alerts[0].message  # threshold
+
+    # Verify the marker was set to "elevated"
+    await db_session.refresh(project)
+    marker = project.design_doc.get(DESIGN_DOC_KEY, {}).get(
+        LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY
+    )
+    assert marker == "elevated"
+
+    # Second alert at same level: deduped (one alert only)
+    fired2 = await maybe_alert_self_repair_burn_share(db_session, project.id)
+    assert fired2 is None  # no new alert fired
+
+    alerts = await _self_repair_burn_share_alerts(db_session, project.id)
+    assert len(alerts) == 1  # still only one alert
+
+    # Now simulate recovery: replace task with one that has lower burn-share
+    # New burn-share: 500 repair tokens out of 10000 total = 5% (below 20%)
+    stmt = _sql_select(type(task)).where(type(task).id == task.id)
+    old_task = (await db_session.execute(stmt)).scalar_one_or_none()
+    if old_task:
+        await db_session.delete(old_task)
+    await db_session.commit()
+
+    task_recovered = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 9000,
+            "total_output_tokens": 1000,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 1,
+            "format_repair_attempts": 1,
+            "format_repair_successes": 1,
+            "format_repair_infra_failures": 0,
+            "format_repair_input_tokens": 300,
+            "format_repair_output_tokens": 200,
+        },
+    )
+    db_session.add(task_recovered)
+    await db_session.commit()
+
+    # Alert should not fire while below threshold
+    fired3 = await maybe_alert_self_repair_burn_share(db_session, project.id)
+    assert fired3 is None  # marker advanced to "healthy", no alert
+
+    # Verify the marker was set to "healthy"
+    await db_session.refresh(project)
+    marker = project.design_doc.get(DESIGN_DOC_KEY, {}).get(
+        LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY
+    )
+    assert marker == "healthy"

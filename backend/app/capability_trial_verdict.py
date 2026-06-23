@@ -684,6 +684,32 @@ def record_trial_verdict(
         )
 
 
+async def _check_open_message_exists(
+    session: Any,
+    project_id: Any,
+    dedupe_key: str,
+) -> bool:
+    """Check if an open ProjectMessage with the given dedupe_key exists.
+
+    Returns True if a matching open message is found, False otherwise.
+    Uses a bounded select(id).limit(1) query for efficiency.
+    """
+    from sqlalchemy import select
+
+    from app.models import ProjectMessage
+
+    result = await session.execute(
+        select(ProjectMessage.id)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.status == "open",
+            ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
+        )
+        .limit(1)
+    )
+    return result.scalar() is not None
+
+
 async def raise_capability_verdict_notice(
     session: Any,
     project_id: Any,
@@ -698,27 +724,10 @@ async def raise_capability_verdict_notice(
     fires a new notice while repeated re-evaluations of the same standing decided
     verdict are silent.
     """
-    from sqlalchemy import select
-
     from app.models import MessageType, ProjectMessage
 
     dedupe_key = f"capability_verdict_decided_{cap_name}_{new_verdict}"
-    existing = (
-        (
-            await session.execute(
-                select(ProjectMessage)
-                .where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.status == "open",
-                )
-                .limit(200)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    already = any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing)
-    if already:
+    if await _check_open_message_exists(session, project_id, dedupe_key):
         return
 
     lift = entry.get("lift")
@@ -1015,26 +1024,10 @@ async def raise_stalled_trial_notice(
     ``min_n``, the recent accrual rates, the current ``holdback_fraction``, and the
     ``alternative_projections`` map of concrete options the operator can act on.
     """
-    from sqlalchemy import select
-
     from app.models import MessageType, ProjectMessage
 
     dedupe_key = f"capability_trial_stalled_{cap_name}"
-    existing = (
-        (
-            await session.execute(
-                select(ProjectMessage)
-                .where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.status == "open",
-                )
-                .limit(200)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    if any((m.context or {}).get("dedupe_key") == dedupe_key for m in existing):
+    if await _check_open_message_exists(session, project_id, dedupe_key):
         return
 
     accrual = entry.get("accrual_projection") or {}
@@ -1162,27 +1155,10 @@ async def raise_ambiguous_lift_escalation_notice(
     Deduplicated on ``cap_name`` so repeated digest re-evaluations of the same
     long-dwelling trial emit exactly ONE open notice per capability.
     """
-    from sqlalchemy import select
-
     from app.models import MessageType, ProjectMessage
 
     dedupe_key = f"capability_trial_ambiguous_lift_escalation_{cap_name}"
-    existing = (
-        (
-            await session.execute(
-                select(ProjectMessage)
-                .where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.status == "open",
-                    ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
-                )
-                .limit(200)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if existing:
+    if await _check_open_message_exists(session, project_id, dedupe_key):
         return
 
     since_str = entry.get("ambiguous_lift_since")

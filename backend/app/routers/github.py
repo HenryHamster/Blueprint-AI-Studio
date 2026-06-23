@@ -71,7 +71,7 @@ async def _load_tasks_for_artifacts(
     return {task.id: task for task in task_rows}
 
 
-class GitHubPATInstallRequest(BaseModel):
+class _GitHubPATInstallRequest(BaseModel):
     pat: str = Field(..., min_length=10)
 
 
@@ -79,7 +79,7 @@ class GitHubPATInstallRequest(BaseModel):
 @limiter.limit("5/minute")
 async def register_github_pat(
     request: Request,
-    req: GitHubPATInstallRequest,
+    req: _GitHubPATInstallRequest,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):

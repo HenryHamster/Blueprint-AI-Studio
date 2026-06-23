@@ -168,3 +168,238 @@ resource "google_cloud_run_service_iam_member" "public_access" {
   role     = "roles/run.invoker"
   member   = "allUsers"
 }
+
+# Dedicated service account for Cloud Run Job executions. Read-only LLM agent tasks only.
+resource "google_service_account" "agent_job_sa" {
+  account_id   = "agent-job-sa"
+  display_name = "Agent Cloud Run Job Service Account"
+  description  = "Dedicated SA for Cloud Run Job executions. Read-only LLM agent tasks only."
+}
+
+# ==============================================================================
+# Cloud Run Job — lightweight execution path for read-only / non-merging tasks
+# ==============================================================================
+# Routes the ~20 LLM-only / non-merge task types (research, strategic, design,
+# memo, review, panel_review, audit, web_research, ...) off a dedicated
+# e2-standard-2 GCE VM and onto a scale-to-zero Cloud Run Job execution. The
+# agent container image is reused verbatim — the only execution-environment
+# differences are: run-to-completion (no inbound $PORT), billed per 100ms, and
+# per-execution env overrides injected by the orchestrator's `run_job` call
+# (see backend/app/compute_cloud_run.launch_agent_cloud_run_job).
+#
+# DARK BY DEFAULT: the backend dispatch path is gated behind an empty
+# `cloud_run_task_type_allowlist` runtime setting. Applying this resource alone
+# changes no task routing — operators must (1) build/push the agent image to
+# this job, (2) set CLOUD_RUN_JOB_NAME in cloudbuild.yaml, and (3) populate the
+# allowlist. See docs/cloud-run-jobs-activation.md for the full action list.
+#
+# The job MUST be named exactly "blueprint-agent-job" so that the documented
+# CLOUD_RUN_JOB_NAME value
+#   projects/<project>/locations/us-central1/jobs/blueprint-agent-job
+# resolves what compute_cloud_run.py dispatches against.
+
+resource "google_cloud_run_v2_job" "blueprint_agent_job" {
+  name     = "blueprint-agent-job"
+  location = var.region
+
+  labels = {
+    app        = "blueprint-agent"
+    managed-by = "terraform"
+  }
+
+  template {
+    # taskTimeout = 4h, matching _TIMEOUT_SECONDS_STANDARD in
+    # compute_cloud_run.py and the GCE reaper TTL. A stuck execution is reaped
+    # before it accumulates meaningful cost. The orchestrator overrides this
+    # per-execution for heavier task types via RunJobRequest.Overrides.timeout.
+    task_count = 1
+
+    template {
+      service_account = google_service_account.agent_job_sa.email
+
+      # Run-to-completion: a failed execution is surfaced to the orchestrator
+      # via the agent's own status reporting, not retried by Cloud Run, so a
+      # crash does not silently double-dispatch the task.
+      max_retries = 0
+      timeout     = "14400s"
+
+      containers {
+        # Placeholder image. No CI builds the agent container into this job
+        # yet — building/pushing blueprint-agent-job from agent/src is an
+        # operator action (see docs/cloud-run-jobs-activation.md). The
+        # ignore_changes below keeps terraform from reverting that push.
+        image = "us-docker.pkg.dev/cloudrun/container/hello"
+
+        # Tier A3 default sizing: 1 vCPU / 2 GiB. Zero-checkout (Tier A1) types
+        # could run at 1 GiB — a follow-on tuning, not blocking activation.
+        resources {
+          limits = {
+            memory = "2Gi"
+            cpu    = "1000m"
+          }
+        }
+
+        # Base environment — mirrors the orchestrator service's non-secret env.
+        # Per-execution values (TASK_ID, VM_INSTANCE_ID, PAYLOAD_URI,
+        # AGENT_SECRET_VERSION, CLOUD_RUN_JOB) are injected as container
+        # overrides by launch_agent_cloud_run_job and are NOT declared here.
+        env {
+          name  = "GCP_PROJECT_ID"
+          value = var.project_id
+        }
+        env {
+          name  = "GCP_ZONE"
+          value = var.zone
+        }
+        env {
+          name  = "VPC_NETWORK"
+          value = google_compute_network.agent_vpc.name
+        }
+        env {
+          name  = "VPC_SUBNET"
+          value = google_compute_subnetwork.agent_subnet.name
+        }
+        env {
+          name  = "AGENT_SERVICE_ACCOUNT_EMAIL"
+          value = google_service_account.agent_sa.email
+        }
+        env {
+          name  = "ARTIFACT_BUCKET_NAME"
+          value = google_storage_bucket.artifacts.name
+        }
+        env {
+          name  = "ORCHESTRATOR_URL"
+          value = var.orchestrator_url
+        }
+      }
+
+      # Direct VPC egress (NOT a vpc_access_connector) — mirrors the
+      # orchestrator service so the Job reaches the private Cloud SQL instance,
+      # GitHub, and LLM APIs over the same network path.
+      vpc_access {
+        network_interfaces {
+          network    = google_compute_network.agent_vpc.name
+          subnetwork = google_compute_subnetwork.agent_subnet.name
+        }
+        egress = "ALL_TRAFFIC"
+      }
+    }
+  }
+
+  # Operators build & push the real agent image out-of-band; do not let
+  # terraform revert it back to the placeholder on the next apply.
+  lifecycle {
+    ignore_changes = [
+      template[0].template[0].containers[0].image,
+    ]
+  }
+}
+
+# Grant the orchestrator SA least-privilege permissions to trigger executions
+# of the Job with container env overrides. roles/run.jobsExecutorWithOverrides
+# is the narrowest predefined role covering run.jobs.run and
+# run.jobs.runWithOverrides — required because compute_cloud_run.py calls
+# client.run_job with RunJobRequest.Overrides. The former broad
+# roles/run.developer is replaced by this single narrower predefined role.
+resource "google_cloud_run_v2_job_iam_member" "orchestrator_runs_agent_job" {
+  location = google_cloud_run_v2_job.blueprint_agent_job.location
+  project  = google_cloud_run_v2_job.blueprint_agent_job.project
+  name     = google_cloud_run_v2_job.blueprint_agent_job.name
+  role     = "roles/run.jobsExecutorWithOverrides"
+  member   = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}
+
+# ==============================================================================
+# Cloud Armor — rate limiting and adaptive DDoS protection
+# ==============================================================================
+# The orchestrator Cloud Run service is publicly accessible (allUsers invoker)
+# for GitHub webhooks and agent callbacks. Cloud Armor sits in front of the
+# service via a Global HTTPS Load Balancer with a Serverless NEG backend to
+# enforce per-IP rate limits and Adaptive Protection layer-7 DDoS defense.
+#
+# Traffic path (after adding a Global LB frontend — see outputs.tf for the
+# load balancer IP once created):
+#   Internet → Global HTTPS LB → Cloud Armor policy → orchestrator NEG → Cloud Run
+
+# Cloud Armor security policy: rate-limit (1 000 req/min per source IP) and
+# Adaptive Protection (automatic layer-7 DDoS anomaly detection and rule proposals).
+resource "google_compute_security_policy" "orchestrator" {
+  name        = "orchestrator-security-policy"
+  description = "Rate-limit and adaptive-protection policy for the Blueprint orchestrator"
+
+  # Adaptive Protection continuously learns normal traffic patterns and proposes
+  # WAF rules to block anomalous surges without manual intervention.
+  adaptive_protection_config {
+    layer_7_ddos_defense_config {
+      enable = true
+    }
+  }
+
+  # Rate-limit: throttle any single source IP to 1 000 requests per minute.
+  # Traffic within the threshold is allowed; excess receives HTTP 429.
+  rule {
+    action      = "throttle"
+    priority    = 1000
+    description = "Rate-limit: 1000 req/min per source IP"
+
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+
+    rate_limit_options {
+      conform_action = "allow"
+      exceed_action  = "deny(429)"
+
+      rate_limit_threshold {
+        count        = 1000
+        interval_sec = 60
+      }
+
+      enforce_on_key = "IP"
+    }
+  }
+
+  # Default rule: allow all traffic not matched by a higher-priority rule.
+  rule {
+    action      = "allow"
+    priority    = 2147483647
+    description = "Default allow"
+
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+  }
+}
+
+# Serverless NEG — points the global backend service at the Cloud Run orchestrator
+# so Cloud Armor can inspect and throttle inbound requests before they reach it.
+resource "google_compute_region_network_endpoint_group" "orchestrator" {
+  name                  = "orchestrator-serverless-neg"
+  network_endpoint_type = "SERVERLESS"
+  region                = var.region
+
+  cloud_run {
+    service = google_cloud_run_v2_service.orchestrator.name
+  }
+}
+
+# Global backend service — wires the Cloud Armor policy to the serverless NEG.
+# A Global HTTPS Load Balancer frontend (URL map + target proxy + forwarding
+# rule) is the operator action needed to route external traffic through this
+# backend and enforce the policy end-to-end.
+resource "google_compute_backend_service" "orchestrator" {
+  name                  = "orchestrator-backend"
+  description           = "Backend for Blueprint orchestrator Cloud Run service with Cloud Armor"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  security_policy       = google_compute_security_policy.orchestrator.id
+
+  backend {
+    group = google_compute_region_network_endpoint_group.orchestrator.id
+  }
+}

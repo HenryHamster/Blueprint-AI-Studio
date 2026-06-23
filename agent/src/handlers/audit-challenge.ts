@@ -1,4 +1,17 @@
 import { execFileSync } from 'child_process';
+/**
+ * Release audit challenge handler — independent re-examination of audit findings.
+ *
+ * Spawned during the release qualification gate to independently verify release-audit
+ * findings. Takes the parent audit's payload (base_branch, diff_range, candidate_sha)
+ * and produces a structured verdict (issues found, severity assessments, recommended
+ * actions) that can affirm or challenge the parent audit's conclusions.
+ *
+ * Used for adversarial review: if the parent audit missed critical issues or
+ * over-flagged benign changes, the challenge handler surfaces those disagreements.
+ * Verdicts are persisted on ReleaseVersion.last_qualification for merge-gating logic.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
@@ -7,7 +20,7 @@ import {
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import {
-  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
+  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   computePromptFingerprint, type PlaybookEntry,
@@ -371,6 +384,13 @@ export async function handleReleaseAuditChallenge(
   const primaryFindings = parsePrimaryFindings(payload);
   const primaryFindingsSection = formatPrimaryFindingsSection(primaryFindings);
 
+  const versionGoal = typeof payload.version_goal === 'string' && payload.version_goal.length > 0
+    ? payload.version_goal
+    : null;
+  const versionGoalSection = versionGoal
+    ? `\n## Version Goal\n\n${versionGoal}\n\nThis is the strategic objective the version aimed to deliver. As optional metadata (does NOT affect the \`verdicts\` structure), you may add a \`goal_alignment\` object to your JSON output if you disagree with or wish to amend the primary audit's assessment. Use the same canonical schema:\n- \`state\` (string): one of \`"aligned"\`, \`"shortfall"\`, or \`"not_applicable"\`.\n- \`assessed_grade\` (float 0.0–1.0): degree of alignment.\n- \`biggest_gap\` (string or null): one sentence on the most significant gap if state is \`"shortfall"\`; null otherwise.\n- \`reasoning_summary\` (string): 1–3 sentences explaining your assessment.\n\nOmit \`goal_alignment\` entirely if the primary audit did not include it or you have no meaningful disagreement.\n\n`
+    : '';
+
   const challengePrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}You are a release-audit CHALLENGER — an independent, adversarial second opinion. A primary release-audit agent already reviewed the diff range \`${diffRange}\` and produced findings. Your job is NOT to repeat that audit, but to skeptically RE-JUDGE its higher-severity findings against the real code. \`${candidateSha}\` is the PINNED release candidate commit; it has already been fetched into this clone on \`${baseBranch}\`, so the diff range resolves.
 
 ## Your task
@@ -381,7 +401,7 @@ export async function handleReleaseAuditChallenge(
    - \`confirmed\` — you independently reproduced the issue against the real code; it is a genuine problem.
    - \`refuted_false_positive\` — you investigated and the issue does NOT hold (e.g. a hardcoded constant reaching a sink is not injection; a per-request DB check is not a replay gap; an exception-guarded comparison is not a TypeError).
    - \`uncertain\` — you could not confidently confirm or refute it from the available code.
-
+${versionGoalSection}
 3. **Emit results.** Write your verdicts as a JSON object to \`/tmp/release_audit_challenge_${taskId}.json\` with EXACTLY this structure:
 
 \`\`\`json
@@ -408,7 +428,7 @@ Field semantics:
 Rules:
 - Only judge findings the primary scoring would weigh — severity ${CHALLENGE_SEVERITIES_REQUIRING_VERDICT.join('/')}. Low/info findings do NOT need a verdict; omit them.
 - Read the actual code before each verdict — do NOT speculate.
-- IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_challenge_${taskId}.json\` — no markdown, no code fences, no extra text.
+- IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_challenge_${taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} — no markdown, no code fences, no extra text.
 - Also output the same JSON object as the final output in your logs.
 - Do NOT modify any files in the repository.${designDocAdvertisement(task)}`;
 
@@ -431,9 +451,9 @@ Rules:
     logs = sanitize(JSON.stringify(normalizeChallengeOutput(handlerOutput, candidateSha, primaryFindings)));
   } else {
     const reopenPrompt = primaryFindings.length > 0
-      ? `${primaryFindingsSection}Your prior release audit challenge response did not end with a parseable JSON verdict object.\nReturn ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`
+      ? `${primaryFindingsSection}Your prior release audit challenge response did not end with a parseable JSON verdict object.\nOutput ONLY the JSON object now — with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, no code fences, no prose.`
       : `Your prior release audit challenge response did not end with a parseable JSON verdict object.
-Return ONLY the JSON object for /tmp/release_audit_challenge_${taskId}.json with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, prose, or code fences.`;
+Output ONLY the JSON object now — with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, no code fences, no prose.`;
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['challenged_candidate_sha', 'verdicts'],

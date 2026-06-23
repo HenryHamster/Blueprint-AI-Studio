@@ -119,10 +119,7 @@ def _merge_context_with_hotfix_non_landing(
 
     promotion_target = get_project_promotion_target(project)
     integration_branch = get_project_integration_branch(project)
-    if (
-        landed_branch == promotion_target
-        and landed_branch != integration_branch
-    ):
+    if landed_branch == promotion_target and landed_branch != integration_branch:
         mark_unblocked_non_merge(
             task,
             reason="merged_pr_non_integration_branch",
@@ -245,10 +242,7 @@ async def _apply_status_mutation(
 
     parent_vm_id_for_bg: str | None = None
     parent_acct_id_for_bg: str | None = None
-    if (
-        new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED)
-        and task.vm_instance_id
-    ):
+    if new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED) and task.vm_instance_id:
         parent_vm_id_for_bg = task.vm_instance_id
         parent_acct_id_for_bg = (task.context or {}).get("max_plan_account_id")
 
@@ -465,7 +459,12 @@ async def _handle_rollup_pr_approval(
         from app.rollup_migration_validation import enforce_premerge_migration_guard
 
         _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
-            gh_token, owner, repo, rollup_pr_number, base_branch
+            gh_token,
+            owner,
+            repo,
+            rollup_pr_number,
+            base_branch,
+            promotion_target=_promotion_target,
         )
         if not _ok_to_merge:
             detail = (
@@ -500,9 +499,7 @@ async def _handle_rollup_pr_approval(
                 source="admin_task_mutations.rollup_pr_approval",
             )
             task.status = (
-                TaskStatus.COMPLETED
-                if terminal_rollup_merge
-                else TaskStatus.EVALUATING
+                TaskStatus.COMPLETED if terminal_rollup_merge else TaskStatus.EVALUATING
             )
             # The hotfix lane is intentionally allowed to merge to the promotion
             # target (see _promotion_target_merge_allowed). When it does, the
@@ -718,18 +715,13 @@ async def _handle_task_pr_approval(
         raise HTTPException(status_code=409, detail=detail)
 
     if ctx.get("touched_critical"):
-        await _merge_critical_pr(
-            task, ctx, pr_number, branch, session, changes
-        )
+        await _merge_critical_pr(task, ctx, pr_number, branch, session, changes)
     else:
         await _spawn_review_for_approved_task(
             task, task_payload, pr_number, branch, base_branch, session, changes
         )
 
-    if (
-        "status" in payload
-        and TaskStatus(payload["status"]) == TaskStatus.QUEUED
-    ):
+    if "status" in payload and TaskStatus(payload["status"]) == TaskStatus.QUEUED:
         task.status = TaskStatus.COMPLETED
         changes["status"] = TaskStatus.COMPLETED
 
@@ -758,9 +750,17 @@ async def _merge_critical_pr(
         # validate the combined chain before merging and refuse with a 409 on a
         # block-or-defer verdict rather than wedging the branch.
         from app.rollup_migration_validation import enforce_premerge_migration_guard
+        from app.shared_state import (
+            get_project_promotion_target as _get_project_promotion_target,
+        )
 
         _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
-            gh_token, owner, repo, pr_number, base_branch
+            gh_token,
+            owner,
+            repo,
+            pr_number,
+            base_branch,
+            promotion_target=_get_project_promotion_target(_project),
         )
         if not _ok_to_merge:
             detail = (
@@ -820,7 +820,9 @@ async def _merge_critical_pr(
             )
         else:
             changes["merge_error"] = merge_result.get("message", "unknown")
-            task.latest_status_message = f"Approved but merge failed: {merge_result.get('message', 'unknown')}"
+            task.latest_status_message = (
+                f"Approved but merge failed: {merge_result.get('message', 'unknown')}"
+            )
             logger.error(
                 f"[ADMIN] Approved merge of PR #{pr_number} failed: {merge_result.get('message')}"
             )
@@ -888,9 +890,7 @@ async def _spawn_review_for_approved_task(
         task.status = TaskStatus.FAILED
         if task.vm_provisioned_at:
             task.vm_stopped_at = _utcnow()
-        task.latest_status_message = (
-            "Iteration cap reached — no follow-on task spawned"
-        )
+        task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
         from app.failure_classification import persist_failure_category
 
         persist_failure_category(task, "AGENT_TIMEOUT")
@@ -972,9 +972,7 @@ async def _apply_depends_on_mutation(
     if "depends_on" not in payload:
         return
 
-    new_deps = (
-        payload["depends_on"] if isinstance(payload["depends_on"], list) else []
-    )
+    new_deps = payload["depends_on"] if isinstance(payload["depends_on"], list) else []
     if new_deps:
         try:
             dep_uuids = [uuid.UUID(d) for d in new_deps]
@@ -1039,9 +1037,9 @@ async def _apply_depends_on_mutation(
             dep_task = dep_tasks_by_id[dep_id]
             if not _same_base_branch(task, dep_task):
                 task_base = (task.first_payload or {}).get("base_branch") or "(default)"
-                dep_base = (
-                    (dep_task.first_payload or {}).get("base_branch") or "(default)"
-                )
+                dep_base = (dep_task.first_payload or {}).get(
+                    "base_branch"
+                ) or "(default)"
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -1144,7 +1142,9 @@ async def modify_task_apply(
     """
     changes: Dict[str, Any] = {}
 
-    await _apply_status_mutation(task, payload, background_tasks, session, force_kill, changes)
+    await _apply_status_mutation(
+        task, payload, background_tasks, session, force_kill, changes
+    )
     await _apply_approval_mutation(task, payload, session, changes)
     await _apply_simple_mutations(task, payload, changes)
     await _apply_depends_on_mutation(task, payload, session, changes)

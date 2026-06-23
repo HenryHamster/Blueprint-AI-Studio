@@ -24,6 +24,7 @@ import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
 import { handleReleaseAuditChallenge } from './audit-challenge.js';
+import { handleReleaseMergeGrade } from './merge-grade.js';
 import { handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestigate, handleRepoBootstrap } from './specialized.js';
 import { handleDesignDocUpdate } from './design-doc.js';
 import { handleMemo } from './memo.js';
@@ -82,6 +83,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   strategic_review: handleStrategic,
   release_audit: handleReleaseAudit,
   release_audit_challenge: handleReleaseAuditChallenge,
+  release_merge_grade: handleReleaseMergeGrade,
   memo: handleMemo,
   verify_tests: handleVerifyTests,
   compute_experiment: handleComputeExperiment,

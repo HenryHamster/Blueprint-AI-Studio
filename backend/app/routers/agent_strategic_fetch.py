@@ -196,7 +196,9 @@ async def agent_fetch_message(
     project = await _resolve_agent_project(project_id, token, session)
     msg = await resolve_message_ref(session, project.id, ref)
     message_type = msg.message_type
-    type_value = message_type.value if hasattr(message_type, "value") else str(message_type)
+    type_value = (
+        message_type.value if hasattr(message_type, "value") else str(message_type)
+    )
     return {
         "status": "success",
         "data": {
@@ -305,13 +307,18 @@ async def agent_fetch_qualification(
     if verdict is not None:
         return {
             "candidate_sha": verdict.candidate_sha,
-            "finalized_at": verdict.finalized_at.isoformat() if verdict.finalized_at else None,
+            "finalized_at": verdict.finalized_at.isoformat()
+            if verdict.finalized_at
+            else None,
             "status": verdict.terminal_status,
             "confidence": verdict.confidence,
             "sub_scores": verdict.sub_scores,
             "findings": get_latest_qualification_audit_findings(open_row, verdict),
             "excluded_findings": verdict.excluded_audit_findings or [],
-            "challenger_refuted_findings": verdict.challenger_refuted_audit_findings or [],
+            "challenger_refuted_findings": verdict.challenger_refuted_audit_findings
+            or [],
+            "theme_delivery": verdict.theme_delivery,
+            "goal_alignment": verdict.goal_alignment,
             "source": "qualification_verdict",
             **requalification_extra,
         }
@@ -325,9 +332,82 @@ async def agent_fetch_qualification(
         "sub_scores": qual.get("sub_scores"),
         "findings": get_latest_qualification_audit_findings(open_row),
         "excluded_findings": qual.get("excluded_audit_findings") or [],
-        "challenger_refuted_findings": qual.get("challenger_refuted_audit_findings") or [],
+        "challenger_refuted_findings": qual.get("challenger_refuted_audit_findings")
+        or [],
+        "theme_delivery": qual.get("theme_delivery"),
+        "goal_alignment": qual.get("goal_alignment"),
         "source": "last_qualification",
         **requalification_extra,
+    }
+
+
+@router.get("/projects/{project_id}/vm-cost")
+@limiter.limit("60/minute")
+async def agent_fetch_vm_cost(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return per-task-type VM cost breakdown (cost, task count, merge count,
+    merge-yield) over the last 7 days. Reuses compute_vm_cost_by_task_type from
+    efficiency_snapshot so the numbers match the operator dashboard exactly.
+    Read-only; cross-project access returns 404."""
+    from app.efficiency_snapshot import (  # noqa: PLC0415
+        _AXIS_WINDOW_DAYS,
+        _load_recent_tasks,
+        compute_vm_cost_by_task_type,
+    )
+
+    await _resolve_agent_project(project_id, token, session)
+    tasks = await _load_recent_tasks(session, project_id)
+    by_task_type = compute_vm_cost_by_task_type(tasks)
+    return {
+        "status": "success",
+        "data": {
+            "by_task_type": by_task_type,
+            "window_days": _AXIS_WINDOW_DAYS,
+        },
+    }
+
+
+@router.get("/projects/{project_id}/efficiency-snapshot")
+@limiter.limit("60/minute")
+async def agent_fetch_efficiency_snapshot(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return the current efficiency snapshot for the project: cost_per_merged_pr,
+    vm_reuse_rate, llm_cost_per_merged_pr, format_compliance, and window metadata.
+    Reuses the same compute path as the operator dashboard so numbers are consistent.
+    Read-only; cross-project access returns 404."""
+    from app.efficiency_snapshot import (  # noqa: PLC0415
+        AXIS_COST_PER_MERGED_PR,
+        AXIS_LLM_COST_PER_MERGED_PR,
+        AXIS_VM_REUSE_RATE,
+        FORMAT_COMPLIANCE_KEY,
+        _AXIS_WINDOW_DAYS,
+        _compute_cost_per_merged_pr,
+        _compute_llm_cost_per_merged_pr,
+        _compute_vm_reuse_rate,
+        _load_recent_tasks,
+    )
+    from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
+
+    await _resolve_agent_project(project_id, token, session)
+    tasks = await _load_recent_tasks(session, project_id)
+    format_compliance = compute_format_compliance_metrics(tasks)
+    return {
+        "status": "success",
+        "data": {
+            AXIS_COST_PER_MERGED_PR: _compute_cost_per_merged_pr(tasks),
+            AXIS_VM_REUSE_RATE: _compute_vm_reuse_rate(tasks),
+            AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
+            FORMAT_COMPLIANCE_KEY: format_compliance,
+            "window_days": _AXIS_WINDOW_DAYS,
+        },
     }
 
 

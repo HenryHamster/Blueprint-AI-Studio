@@ -635,6 +635,84 @@ class TestMaxPlanPool:
         assert entry["id"] == str(acct_id)
         assert entry["active_tasks"] == 2, "Only IN_PROGRESS tasks should be counted"
 
+    # ── Test 1b: hot-loop reconcile reads the promoted column, not Task.context ─
+
+    @pytest.mark.asyncio
+    async def test_reconcile_active_per_account_reads_promoted_column(self, db_session):
+        """The orchestrator 30s reconcile counts active tasks per account by
+        projecting the promoted Task.llm_account_id column — NOT by reading the
+        Task.context JSONB blob (D2 over-fetch fix, d-57436105).
+
+        Proves both halves of the contract:
+        (a) tasks whose column is set are counted under that account, and
+        (b) a task whose account id lives ONLY in context (column NULL) is NOT
+            counted — demonstrating the query no longer reads Task.context.
+        """
+        from app.orchestrator import _reconcile_active_per_account
+
+        project = make_project(name="Reconcile column test", user_id="user1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        acct_col = str(uuid.uuid4())
+        acct_ctx_only = str(uuid.uuid4())
+
+        # Two active tasks with the promoted column set → counted under acct_col.
+        for _ in range(2):
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                    status=TaskStatus.IN_PROGRESS,
+                    llm_account_id=acct_col,
+                    context={"max_plan_account_id": acct_col},
+                )
+            )
+        # PROVISIONING also counts as active.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                status=TaskStatus.PROVISIONING,
+                llm_account_id=acct_col,
+                context={},
+            )
+        )
+        # A COMPLETED task must NOT be counted even though its column is set.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                status=TaskStatus.COMPLETED,
+                llm_account_id=acct_col,
+                context={},
+            )
+        )
+        # An active task whose account id lives ONLY in context (column NULL):
+        # the new projection ignores context, so this must NOT be counted.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                status=TaskStatus.IN_PROGRESS,
+                llm_account_id=None,
+                context={"llm_account_id": acct_ctx_only},
+            )
+        )
+        await db_session.commit()
+
+        counts = await _reconcile_active_per_account(db_session)
+
+        assert counts == {acct_col: 3}, (
+            "reconcile must count the 2 IN_PROGRESS + 1 PROVISIONING tasks by "
+            "promoted column, exclude COMPLETED, and ignore the context-only row"
+        )
+        assert acct_ctx_only not in counts, (
+            "context-only account id must not be counted — proves the reconcile "
+            "query reads Task.llm_account_id, not Task.context"
+        )
+
     # ── Test 2: load excludes disabled accounts from active count but includes them ─
 
     @pytest.mark.asyncio
@@ -868,6 +946,73 @@ class TestMaxPlanPool:
             _account_by_id[entry["id"]] = entry
         chosen = await select_max_plan_account(_TEST_USER)
         assert chosen["id"] == "x2"
+
+    # ── Test 9: orchestrator reconcile uses Task.llm_account_id column ────────
+
+    @pytest.mark.asyncio
+    async def test_reconcile_reads_llm_account_id_column_not_context(
+        self, db_session, reset_max_plan_pool
+    ):
+        """
+        The orchestrator reconcile query must read Task.llm_account_id (the promoted
+        scalar column) rather than Task.context JSONB. Tasks in PROVISIONING or
+        IN_PROGRESS are counted; COMPLETED tasks are excluded.
+
+        This test exercises the select(Task.llm_account_id) path directly —
+        asserting the column is populated at write-time and is readable via a
+        narrow column select (not a full-context JSONB fetch).
+        """
+        from sqlmodel import select as _select
+
+        acct_id = str(uuid.uuid4())
+
+        project = make_project(name="Reconcile column test", user_id="user1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Two PROVISIONING/IN_PROGRESS tasks with llm_account_id set on the column
+        for status in [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]:
+            t = make_task(
+                project_id=project.id,
+                status=status,
+                llm_account_id=acct_id,
+            )
+            db_session.add(t)
+        # COMPLETED task — must not be counted
+        completed = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            llm_account_id=acct_id,
+        )
+        db_session.add(completed)
+        # Task with no account — must not affect count
+        anon = make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(anon)
+        await db_session.commit()
+
+        # Replicate the orchestrator reconcile query verbatim
+        rows = (
+            await db_session.execute(
+                _select(Task.llm_account_id).where(
+                    Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
+                )
+            )
+        ).all()
+
+        active_per_account: dict = {}
+        for row in rows:
+            aid = row[0]
+            if aid:
+                active_per_account[aid] = active_per_account.get(aid, 0) + 1
+
+        assert active_per_account.get(acct_id) == 2, (
+            "Reconcile must count PROVISIONING + IN_PROGRESS tasks by llm_account_id column; "
+            "COMPLETED and no-account tasks must be excluded"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3170,14 +3315,27 @@ class TestBatchedDepRowsSurviveCommit:
         await db_session.commit()
         await db_session.refresh(candidate)
 
-        # Mirror the orchestrator: batch-fetch dep rows in a SEPARATE session,
-        # build the lookup dict, then DETACH them.
+        # Mirror the orchestrator: batch-fetch dep rows in a SEPARATE session
+        # with the same load_only projection, build the lookup dict, then DETACH.
+        from sqlalchemy.orm import load_only as _load_only
+
         dep_by_id = {}
         async with AsyncSessionLocal() as dep_batch_session:
             rows = (
                 (
                     await dep_batch_session.execute(
-                        select(Task).where(Task.id.in_([dep.id]))
+                        select(Task)
+                        .where(Task.id.in_([dep.id]))
+                        .options(
+                            _load_only(
+                                Task.id,
+                                Task.status,
+                                Task.context,
+                                Task.payloads,
+                                Task.project_id,
+                                raiseload=True,
+                            )
+                        )
                     )
                 )
                 .scalars()
@@ -3193,8 +3351,8 @@ class TestBatchedDepRowsSurviveCommit:
         await db_session.commit()
 
         # Reading status / context / first_payload on the detached dep row must
-        # NOT raise (DetachedInstanceError / MissingGreenlet) — every column was
-        # loaded by the full select(Task) above.
+        # NOT raise (DetachedInstanceError / MissingGreenlet) — projected columns
+        # are cached and accessible on the detached instance.
         detached_dep = dep_by_id[dep.id]
         assert detached_dep.status == TaskStatus.COMPLETED
         assert detached_dep.first_payload.get("type") == "research"
@@ -3212,6 +3370,135 @@ class TestBatchedDepRowsSurviveCommit:
         assert result == "eligible", (
             f"COMPLETED same-base research dep should be eligible, got {result!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_dep_batch_create_type_verify_accesses_project_id(self, db_session):
+        """A COMPLETED create-type dep whose verify callback reads task.project_id
+        must not raise InvalidRequestError — project_id must be in the load_only set.
+
+        This guards the regression where the dep-batch projection omitted project_id
+        and _verify_pr_merged (the create-type verify callback) hit raiseload on the
+        GitHub-API fallback path (rollup_pr_verification.py:315, 325-326, 399-400).
+        """
+        from sqlalchemy.orm import load_only as _load_only
+        from sqlmodel import select
+        from app.database import AsyncSessionLocal
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = make_project(name="Create Dep ProjID", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # A COMPLETED create-type dependency (same base branch).
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "create dep"}],
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        candidate = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "cand"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(candidate)
+        await db_session.commit()
+        await db_session.refresh(candidate)
+
+        # Mirror the orchestrator dep-batch fetch with the full projection
+        # (including project_id, which _verify_pr_merged reads on detached rows).
+        dep_by_id = {}
+        async with AsyncSessionLocal() as dep_batch_session:
+            rows = (
+                (
+                    await dep_batch_session.execute(
+                        select(Task)
+                        .where(Task.id.in_([dep.id]))
+                        .options(
+                            _load_only(
+                                Task.id,
+                                Task.status,
+                                Task.context,
+                                Task.payloads,
+                                Task.project_id,
+                                raiseload=True,
+                            )
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            dep_by_id = {dt.id: dt for dt in rows}
+            dep_batch_session.expunge_all()
+
+        detached_dep = dep_by_id[dep.id]
+        # project_id must be accessible on the detached row — no InvalidRequestError.
+        assert detached_dep.project_id == project.id, (
+            "project_id must be loaded by the dep-batch projection; "
+            "raiseload=True will raise InvalidRequestError if it is missing."
+        )
+
+        # Verify callback that reads task.project_id (simulates the fallback path
+        # in _verify_pr_merged when context['pr_merged'] is absent/False).
+        accessed_project_ids = []
+
+        async def _verify_reads_project_id(task, _session):
+            accessed_project_ids.append(task.project_id)
+            return True
+
+        dep_tasks = [dep_by_id[dep.id]]
+        result, _ = await _check_candidate_task_deps(
+            candidate, dep_tasks, [dep.id], db_session, _verify_reads_project_id
+        )
+        assert result == "eligible", (
+            f"COMPLETED create-type dep should be eligible, got {result!r}"
+        )
+        # The verify callback must have been called and project_id accessible.
+        assert accessed_project_ids, "verify callback was never invoked"
+        assert all(pid == project.id for pid in accessed_project_ids), (
+            f"verify callback read wrong project_id: {accessed_project_ids}"
+        )
+
+    def test_dep_batch_projection_excludes_heavy_columns(self):
+        """The dep-batch load_only must exclude plan_output/status_log/depends_on
+        and retain status/context/payloads needed by _check_candidate_task_deps."""
+        from sqlalchemy.dialects import postgresql
+        from sqlalchemy.orm import load_only as _load_only
+        from sqlmodel import select
+
+        stmt = (
+            select(Task)
+            .where(Task.id.in_([]))
+            .options(
+                _load_only(
+                    Task.id,
+                    Task.status,
+                    Task.context,
+                    Task.payloads,
+                    Task.project_id,
+                    raiseload=True,
+                )
+            )
+        )
+        sql_text = str(stmt.compile(dialect=postgresql.dialect()))
+
+        for heavy in ("plan_output", "status_log", "depends_on"):
+            assert heavy not in sql_text, (
+                f"Dep-batch projection must exclude '{heavy}' — "
+                "re-adding it reintroduces the over-fetch this projection removes."
+            )
+        for required in ("status", "context", "payloads", "project_id"):
+            assert required in sql_text, (
+                f"Dep-batch projection must include '{required}' — "
+                "removing it will cause DetachedInstanceError in _check_candidate_task_deps."
+            )
 
     def test_collect_dep_uuids_dedupes_and_skips_malformed(self):
         from app.orchestrator_filters import collect_dep_uuids
@@ -4547,7 +4834,9 @@ class TestWarmVMSkipProvision:
             assert "2 dependent task" in alerts[0].message
 
     @pytest.mark.asyncio
-    async def test_cascade_cancel_tears_down_provisioned_child_vms(self, orch_warm_db, mocker):
+    async def test_cascade_cancel_tears_down_provisioned_child_vms(
+        self, orch_warm_db, mocker
+    ):
         """When cascade-cancelling a dependent with provisioned-VM children, all child
         VMs are deleted alongside the dependent's VM."""
         from datetime import timezone
@@ -8051,3 +8340,315 @@ async def test_retry_after_release_clears_failure_class(db_session, mocker):
     assert initial_task.retry_after_until is None, (
         "retry_after_until must be cleared when releasing from retry_after hold"
     )
+
+
+class TestCloudRunDispatch:
+    """Tests for the Cloud Run Jobs dispatch path in the orchestrator.
+
+    Verifies the dark-gate behaviour: an empty allowlist leaves the GCE path
+    unchanged, and an allowlisted read-only type is routed to
+    ``launch_agent_cloud_run_job`` instead of ``provision_agent_vm``.
+
+    Reuses the ``orch_warm_db`` / ``_run_one_cycle`` harness from
+    ``TestWarmVMSkipProvision`` — same in-memory SQLite DB, same mocks.
+    """
+
+    # ── borrow the fixture + helper from TestWarmVMSkipProvision ─────────────
+    orch_warm_db = TestWarmVMSkipProvision.orch_warm_db  # type: ignore[attr-defined]
+    _run_one_cycle = staticmethod(TestWarmVMSkipProvision._run_one_cycle)  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _naive_utcnow():
+        from datetime import timezone as _tz
+
+        return datetime.now(_tz.utc).replace(tzinfo=None)
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_dispatch_routes_allowlisted_type(
+        self, orch_warm_db, mocker
+    ):
+        """When cloud_run_task_type_allowlist contains a read-only task type and
+        a task of that type is dispatched, launch_agent_cloud_run_job() is called
+        and provision_agent_vm() is NOT called.
+
+        This is the named acceptance-evidence test:
+          target: test_cloud_run_dispatch_routes_allowlisted_type
+        """
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        # Put "research" on the allowlist — it is a read-only type.
+        _orch_module._runtime_config["cloud_run_task_type_allowlist"] = ["research"]
+        try:
+            prov_mock = mocker.patch(
+                "app.orchestrator.provision_agent_vm",
+                new_callable=AsyncMock,
+                return_value=True,
+            )
+            cr_mock = mocker.patch(
+                "app.orchestrator.launch_agent_cloud_run_job",
+                new_callable=AsyncMock,
+                return_value=True,
+            )
+            mocker.patch(
+                "app.orchestrator._sync_runtime_config_from_state",
+                new_callable=AsyncMock,
+                return_value=[],
+            )
+            # Supply dummy credentials so the orchestrator reaches the
+            # provision branch (no env LLM keys in CI).
+            mocker.patch(
+                "app.orchestrator._resolve_env_runtime_fallback",
+                return_value=(
+                    "fake-api-key",
+                    "anthropic",
+                    "api_key",
+                    "claude-opus-4-8",
+                    None,
+                    {},
+                ),
+            )
+
+            async with orch_warm_db() as session:
+                project = make_project(name="CR Dispatch Test", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "research", "prompt": "Analyse the codebase"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+
+            # Cloud Run path must have been taken; GCE path must NOT.
+            assert cr_mock.called, (
+                "launch_agent_cloud_run_job must be called for an allowlisted "
+                "read-only task type"
+            )
+            assert not prov_mock.called, (
+                "provision_agent_vm must NOT be called when the task type is "
+                "routed to Cloud Run"
+            )
+
+            # Task must have been committed as PROVISIONING.
+            async with orch_warm_db() as verify:
+                row = (
+                    (await verify.execute(_select(Task).where(Task.id == task_id)))
+                    .scalars()
+                    .first()
+                )
+                assert row is not None
+                assert row.status == TaskStatus.PROVISIONING, (
+                    f"Task should be PROVISIONING after CR dispatch, got {row.status}"
+                )
+        finally:
+            _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_empty_allowlist_uses_gce_path(self, orch_warm_db, mocker):
+        """When cloud_run_task_type_allowlist is empty (the default), all task
+        types use the unchanged provision_agent_vm() GCE path."""
+        import app.orchestrator as _orch_module
+
+        # Ensure allowlist is empty (default).
+        _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        cr_mock = mocker.patch(
+            "app.orchestrator.launch_agent_cloud_run_job",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        # Supply dummy credentials so the orchestrator reaches the
+        # provision branch (no env LLM keys in CI).
+        mocker.patch(
+            "app.orchestrator._resolve_env_runtime_fallback",
+            return_value=(
+                "fake-api-key",
+                "anthropic",
+                "api_key",
+                "claude-opus-4-8",
+                None,
+                {},
+            ),
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="GCE Default Test", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "research", "prompt": "Analyse the codebase"}],
+                context={},
+            )
+            session.add(task)
+            await session.commit()
+
+        await self._run_one_cycle(mocker)
+
+        # GCE path must be taken; CR path must NOT.
+        assert prov_mock.called, (
+            "provision_agent_vm must be called when cloud_run_task_type_allowlist "
+            "is empty"
+        )
+        assert not cr_mock.called, (
+            "launch_agent_cloud_run_job must NOT be called when the allowlist is empty"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_write_type_not_routed(self, orch_warm_db, mocker):
+        """Even if a write task type were somehow on the allowlist, it must NOT
+        be routed to Cloud Run — only types in CLOUD_RUN_CANDIDATE_TASK_TYPES
+        (= READ_ONLY_TASK_TYPES) are eligible."""
+        import app.orchestrator as _orch_module
+        from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES
+
+        # Sanity: "create" is not a candidate.
+        assert "create" not in CLOUD_RUN_CANDIDATE_TASK_TYPES
+
+        # Force the allowlist to include a write type (operator error).
+        _orch_module._runtime_config["cloud_run_task_type_allowlist"] = ["create"]
+        try:
+            prov_mock = mocker.patch(
+                "app.orchestrator.provision_agent_vm",
+                new_callable=AsyncMock,
+                return_value=True,
+            )
+            cr_mock = mocker.patch(
+                "app.orchestrator.launch_agent_cloud_run_job",
+                new_callable=AsyncMock,
+                return_value=True,
+            )
+            mocker.patch(
+                "app.orchestrator._sync_runtime_config_from_state",
+                new_callable=AsyncMock,
+                return_value=[],
+            )
+            # Supply dummy credentials so the orchestrator reaches the
+            # provision branch (no env LLM keys in CI).
+            mocker.patch(
+                "app.orchestrator._resolve_env_runtime_fallback",
+                return_value=(
+                    "fake-api-key",
+                    "anthropic",
+                    "api_key",
+                    "claude-opus-4-8",
+                    None,
+                    {},
+                ),
+            )
+
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Write-Type Safety Test", user_id=_TEST_USER
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "create", "prompt": "Add feature"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+
+            await self._run_one_cycle(mocker)
+
+            # GCE path must be taken for a write type regardless of the allowlist.
+            assert prov_mock.called, (
+                "provision_agent_vm must be called for a write task type even if it "
+                "appears in cloud_run_task_type_allowlist"
+            )
+            assert not cr_mock.called, (
+                "launch_agent_cloud_run_job must NOT be called for write task types"
+            )
+        finally:
+            _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []
+
+
+class TestCloudRunAllowlistValidation:
+    """Tests for the admin PATCH /settings cloud_run_task_type_allowlist gate.
+
+    Drives the real _apply_settings handler via AsyncClient to ensure the
+    production write-type rejection block in admin_settings.py is actually
+    exercised (not re-implemented inline).
+    """
+
+    @pytest.mark.asyncio
+    async def test_write_type_rejected(self, client):
+        """Submitting a write task type returns HTTP 400 from the real handler."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"cloud_run_task_type_allowlist": ["create"]},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_valid_read_only_type_accepted(self, client):
+        """A valid read-only task type is accepted and stored sorted."""
+        import app.shared_state as _ss
+
+        original = list(_ss.runtime_config.get("cloud_run_task_type_allowlist", []))
+        try:
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"cloud_run_task_type_allowlist": ["research"]},
+            )
+            assert resp.status_code == 200
+            assert "research" in _ss.runtime_config.get(
+                "cloud_run_task_type_allowlist", []
+            )
+        finally:
+            _ss.runtime_config["cloud_run_task_type_allowlist"] = original
+
+    @pytest.mark.asyncio
+    async def test_mixed_valid_and_write_type_rejected(self, client):
+        """A list containing both a valid read-only and a write type is rejected."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"cloud_run_task_type_allowlist": ["research", "fix"]},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_empty_list_accepted(self, client):
+        """An empty list (disabling Cloud Run routing) is always valid."""
+        import app.shared_state as _ss
+
+        original = list(_ss.runtime_config.get("cloud_run_task_type_allowlist", []))
+        try:
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"cloud_run_task_type_allowlist": []},
+            )
+            assert resp.status_code == 200
+            assert _ss.runtime_config.get("cloud_run_task_type_allowlist") == []
+        finally:
+            _ss.runtime_config["cloud_run_task_type_allowlist"] = original

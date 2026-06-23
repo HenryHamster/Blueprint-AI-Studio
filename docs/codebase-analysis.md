@@ -33,7 +33,7 @@ Blueprint is an **autonomous Claude Code launcher platform** that manages the co
 │  - Clone repo + run Claude Code CLI                              │
 │  - Heartbeat mechanism & log streaming                           │
 │  - Git workflow (branch creation, PR submission)                 │
-│  - 27 bespoke task handlers (create, refactor, plan, research, …) │
+│  - 28 bespoke task handlers (create, refactor, plan, research, …) │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -91,8 +91,8 @@ Orchestrator → Admin UI (real-time log streaming)
   Secrets are redacted before broadcast.
 
 Internal background services (asyncio tasks, crash-monitored):
-  orchestrator_worker  — 10 s polling loop
-  reaper               — 30 s orphan detection
+  orchestrator_worker  — 15 s polling loop (configurable via ORCHESTRATOR_HARD_WATCHDOG_POLL_SECONDS)
+  reaper               — ~60 s cycle with exponential backoff on errors
   gcp_cleanup          — 300 s VM reconciliation
   deployment_monitor   — Cloud Run health observer
   background_monitor   — crash-and-restart supervisor
@@ -196,14 +196,15 @@ QUEUED
 - Deletes any VM with no matching `PROVISIONING`/`IN_PROGRESS` task record.
 - Caches live VM count for concurrency checks.
 
-### Task handlers (17 types)
+### Task handlers (28 types)
 
 | Category | Handlers |
 |---|---|
-| Standard | `create`, `refactor`, `docs`, `qa`, `deps` |
-| Review/fix | `review`, `fix` |
-| Plan/research | `plan` (decompose → spawn subtasks), `research` (report generation) |
-| Specialized | `security_audit`, `migrate`, `smoketest`, `debug`, `perf`, `investigate`, `design_doc_update` |
+| Core | `create`, `refactor`, `docs`, `qa`, `deps`, `migrate`, `debug`, `perf`, `investigate` |
+| Review/Fix | `review`, `panel_review`, `fix`, `release_audit`, `release_audit_challenge`, `release_merge_grade` |
+| Planning & Research | `plan`, `research`, `web_research`, `strategic_review`, `design_doc_update` |
+| Auditing & Testing | `security_audit`, `smoketest`, `verify_tests`, `self_audit` |
+| Structured Output | `memo`, `compute_experiment`, `repo_bootstrap`, `design` |
 
 **Plan decomposition flow:**
 1. Clone repo; run Claude Code with decomposition prompt.
@@ -327,7 +328,7 @@ bash scripts/test-backend.sh --standalone
 Orchestrator assigns `vm_instance_id` to a task *before* the VM boots, then JWT is scoped to that `task_id`. Prevents race conditions where multiple VMs claim the same task.
 
 ### Flexible JSONB payloads
-`Task.payloads` is a list of dicts (one per execution); no schema enforced at the ORM layer. Accessed uniformly via `task.first_payload`. Supports 17 handler types without schema migrations.
+`Task.payloads` is a list of dicts (one per execution); no schema enforced at the ORM layer. Accessed uniformly via `task.first_payload`. Supports 28 handler types without schema migrations.
 
 ### Monolithic single-file agent
 `agent/src/index.ts` (~8 000 LOC) intentionally keeps all state in one process per VM. Handlers are modular functions imported from `handlers/`. Simplifies state sharing and VM lifecycle.

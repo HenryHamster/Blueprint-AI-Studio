@@ -30,7 +30,7 @@ re-exports them with `# noqa: F401` for back-compat — new code should import f
 TASK_PRIORITY_MAP = {"high": 100, "medium": 50, "low": 0}
 ```
 
-**Schema revision:** Always matches the latest Alembic migration (currently `0131`).
+**Schema revision:** Always matches the latest Alembic migration (currently `0330`).
 
 ---
 
@@ -136,7 +136,7 @@ Main coordination loop. Implements:
 - **Circuit breaker** — Halts new tasks if a project exceeds failure threshold
 
 **Key functions:**
-- `orchestrator_worker()` — Main polling loop (runs every 10s); also drives
+- `orchestrator_worker()` — Main polling loop (runs every 15s, configurable via `ORCHESTRATOR_HARD_WATCHDOG_POLL_SECONDS`); also drives
   autonomous-research spawning by calling `_check_idle_research()` each cycle
 - `_lock_provisioning_task_for_vm()` — Locks an existing PROVISIONING task to a VM
   before handing it to the agent (the provisioning flow is spread across

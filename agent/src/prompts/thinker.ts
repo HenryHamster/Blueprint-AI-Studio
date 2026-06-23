@@ -2,7 +2,7 @@ import fs from 'fs';
 import { createHash } from 'crypto';
 import type WebSocket from 'ws';
 import { sendLog, runClaudeCode, persistAndPostStatus } from '../index.js';
-import { PLAYBOOK_GUIDANCE, DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
+import { PLAYBOOK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 import { extractJsonObjectDetailed } from '../json-extract.js';
 import { repairStructuredOutput } from '../handlers/structured-output-repair.js';
 import type { RepairStructuredOutputResult } from '../handlers/structured-output-repair.js';
@@ -308,13 +308,13 @@ Each direction in the "Direction outcomes" section above lists its cumulative co
 **Weight evidence by verification basis.** A direction may carry a \`recent_findings_verification_basis\` distribution (counts of \`code_verified\` / \`path_verified\` / \`pattern_inferred\` / \`deduced\` findings). This records HOW each finding's claim was established, not whether it is implementable. Weight your \`evidence_progress\` read accordingly: a direction whose recent findings are predominantly \`code_verified\`/\`path_verified\` warrants higher confidence that its claimed progress is real than one whose findings are predominantly \`pattern_inferred\`/\`deduced\`. This is purely a WEIGHTING signal, NOT a gate — inferred findings remain valid and are often correct; a heavily-inferred direction is not stalled merely for being inferred.
 
 ## 4. Running update document (for the user)
-Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
+Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` ${READ_ONLY_BASH_WRITE_NOTE} (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
 
 ## 5. Self-reflection (optional)
 Only if something this cycle was hard in a way worth remembering. Fields: what_was_hard, missing_context, proposed_self_improvement. Empty is fine. Don't fill with platitudes.
 
 ## 6. Problem model (update — non-destructive merge)
-Write your problem_model update as JSON to \`/tmp/problem_model_${p.taskId}.json\` (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). The backend MERGES the agent-owned collections (\`capabilities\`, \`gaps\`, \`friction\`, \`pending_user_confirmation\`) rather than replacing them: entries upsert by stable key (\`capabilities\` by name; the rest by id), **entries you omit are preserved**, and per-gap \`history\`/\`past_moves\` union. So you do NOT need to reconstruct every gap/capability from memory — emit the ones you're changing plus enough to stay coherent. If a section was trimmed or dropped from your payload (see "Context not shipped" above), write just the parts you're changing and trust the rest is retained, or \`./fetch problem-model\` first to read the full current state.
+Write your problem_model update as JSON to \`/tmp/problem_model_${p.taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). The backend MERGES the agent-owned collections (\`capabilities\`, \`gaps\`, \`friction\`, \`pending_user_confirmation\`) rather than replacing them: entries upsert by stable key (\`capabilities\` by name; the rest by id), **entries you omit are preserved**, and per-gap \`history\`/\`past_moves\` union. So you do NOT need to reconstruct every gap/capability from memory — emit the ones you're changing plus enough to stay coherent. If a section was trimmed or dropped from your payload (see "Context not shipped" above), write just the parts you're changing and trust the rest is retained, or \`./fetch problem-model\` first to read the full current state.
 
 Normally your **whole** problem_model is shipped inline this cycle — full gaps, capabilities, and friction — so you edit it directly. Only in the exceptional case where the full model cannot fit the byte budget does it arrive floored/skeletonized (recoverable siblings yield first, so this is rare). **If** that happened — look for the \`_agent_view_floor_applied\` marker, which means gap \`description\`/\`evidence\` were stripped and capabilities/friction were reduced to \`name\`+\`status\` — **echo that marker back verbatim** in your update file. The backend uses it to know which fields you never actually saw, so editing and resubmitting a skeleton entry (e.g. bumping a gap's \`priority\` or a capability's \`status\`) won't blank the durable \`description\`, \`notes\`, \`source\`, etc. you couldn't see. Without the marker echoed, a blank field is treated as a deliberate clear. When the marker is absent (the normal case), the model you see is complete — edit freely.
 
@@ -343,7 +343,7 @@ Source = {type (user_message|friction_promotion|agent_observation|self_reflectio
 
 When describing changes in prose, be precise: "opening gap g-strategic-mem (from user_message msg-42)", "retiring direction d-auth-middleware (gap g-auth closed by merged PR #82)".
 
-Before finishing, write /tmp/research_progress_${p.taskId}.md — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
+Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
 
 ${PLAYBOOK_GUIDANCE}
 
@@ -392,18 +392,35 @@ export async function runThinkerWithGate(
   }
 
   let problemModelParseable = false;
-  try {
-    const problemModelProbe = extractJsonObjectDetailed(analysisText, 'intent');
-    if (problemModelProbe.ok) {
+
+  // First, check if the file was already written to disk (authoritative source).
+  if (fs.existsSync(problemModelPath)) {
+    try {
+      const fileContent = fs.readFileSync(problemModelPath, 'utf8');
+      JSON.parse(fileContent);
       problemModelParseable = true;
-      try {
-        fs.writeFileSync(problemModelPath, `${JSON.stringify(problemModelProbe.value, null, 2)}\n`);
-      } catch (e) {
-        sendLog(ws, `[WARNING] Parsed strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
-      }
+      sendLog(ws, `[INFO] Problem model file exists on disk and is valid JSON; skipping repair reopen.\n`);
+    } catch (e) {
+      sendLog(ws, `[WARNING] Problem model file exists but is invalid JSON: ${String(e)}\n`);
+      problemModelParseable = false;
     }
-  } catch {
-    problemModelParseable = false;
+  }
+
+  // If file doesn't exist or is invalid, try parsing from stdout.
+  if (!problemModelParseable) {
+    try {
+      const problemModelProbe = extractJsonObjectDetailed(analysisText, 'intent');
+      if (problemModelProbe.ok) {
+        problemModelParseable = true;
+        try {
+          fs.writeFileSync(problemModelPath, `${JSON.stringify(problemModelProbe.value, null, 2)}\n`);
+        } catch (e) {
+          sendLog(ws, `[WARNING] Parsed strategic problem-model JSON but failed to write ${problemModelPath}: ${String(e)}\n`);
+        }
+      }
+    } catch {
+      problemModelParseable = false;
+    }
   }
 
   let problemModelRepair: RepairStructuredOutputResult<Record<string, unknown>> | null = null;
@@ -457,8 +474,8 @@ export async function runThinkerWithGate(
         'Do NOT use placeholder or template values. Extract the real content from the analysis below.',
         'CRITICAL: Do NOT blank operator-owned fields. If intent.purpose, intent.user_purpose, or constraints appear in the prior analysis with real content, preserve them exactly — do not substitute schema template text, "...", or empty values.',
         `Write the JSON for ${problemModelPath}.`,
-        'Schema reminder (use this for structure only — fill with REAL values from the analysis, not these placeholders):',
-        '{"intent":{"purpose":"<from analysis>","current_focus":"<from analysis>","user_purpose":"<from analysis>"},"context":{},"constraints":[],"capabilities":[],"gaps":[],"archived_gaps":[],"friction":[],"pending_user_confirmation":[],"revision_log":[],"rejected_agent_edits":[]}',
+        'Schema reminder (use this for structure only — the EXAMPLE values below show the shape; fill with REAL values extracted from the analysis above):',
+        '{"intent":{"purpose":"Build an automated billing system for SaaS subscriptions","current_focus":"Implementing the invoice generation pipeline","user_purpose":"Reduce manual billing overhead and prevent revenue leakage"},"context":{},"constraints":[],"capabilities":[],"gaps":[],"archived_gaps":[],"friction":[],"pending_user_confirmation":[],"revision_log":[],"rejected_agent_edits":[]}',
         '',
         '===== YOUR PREVIOUS ANALYSIS OUTPUT (verbatim) =====',
         priorAnalysis,

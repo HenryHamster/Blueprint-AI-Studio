@@ -2,7 +2,7 @@ import { useMemo, useState, useEffect, useCallback, useRef } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
-import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry, type ChallengerSampleRateRecommendation } from '../api';
+import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry, type FormatComplianceBySchemaEntry, type ChallengerSampleRateRecommendation } from '../api';
 import { LaneDiagPanel } from './LaneDiagPanel';
 import { WarmStartOriginRow } from './WarmStartOriginRow';
 import { usePoller } from '../hooks/usePoller';
@@ -52,9 +52,15 @@ const TOOLTIP_STYLE = {
   labelStyle: { color: '#a3a3a3' },
 };
 
-const formatCostPerHr = (value: unknown): [string, string] => [(value as number).toFixed(2) + ' $/hr', 'VM Cost/Hr'];
+const formatCostPerHr = (value: unknown): [string, string] => {
+  if (value === null || value === undefined) return ['—', 'VM Cost/Hr'];
+  return [(value as number).toFixed(2) + ' $/hr', 'VM Cost/Hr'];
+};
 const formatActiveVMs = (value: unknown): [string, string] => [String(value) + ' VMs', 'Active VMs'];
-const formatFailureRate = (value: unknown): [string, string] => [(value as number).toFixed(1) + '%', 'Failure Rate'];
+const formatFailureRate = (value: unknown): [string, string] => {
+  if (value === null || value === undefined) return ['—', 'Failure Rate'];
+  return [(value as number).toFixed(1) + '%', 'Failure Rate'];
+};
 const makeLabelFormatter = (windowMs: number) => (ts: unknown) => formatTime(Number(ts), windowMs);
 const METRICS_EXPORT_FIELDS = ['timestamp', 'activeVMs', 'costPerHr', 'completedCount', 'failedCount'] as const;
 
@@ -274,6 +280,15 @@ interface TaskCostBreakdownResponse {
   task_type_breakdown: TaskCostBreakdownEntry[];
   direction_breakdown: DirectionCostBreakdownEntry[];
   top_tasks: TopCostTask[];
+}
+
+interface SpendBurnRateResponse {
+  project_id: string | null;
+  window_days: number;
+  window_cost_usd: number;
+  task_count: number;
+  daily_spend_usd: number;
+  monthly_forecast_usd: number;
 }
 
 interface DigestLatencyStats {
@@ -641,7 +656,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             <span className="text-neutral-500 font-mono">${data.vm_cost_attribution.total_vm_usd.toFixed(2)} total</span>
           </div>
           {data.vm_cost_attribution_trend && data.vm_cost_attribution_trend.length >= 2 && (() => {
-            const trendPoints = data.vm_cost_attribution_trend!
+            const trendPoints = data.vm_cost_attribution_trend
               .filter((e): e is typeof e & { total_vm_usd: number } => e.total_vm_usd != null)
               .map(e => ({ v: e.total_vm_usd }));
             if (trendPoints.length < 2) return null;
@@ -722,6 +737,27 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
               </div>
             </div>
           )}
+          {data.format_compliance?.by_schema && Object.keys(data.format_compliance.by_schema).length > 0 && (
+            <div data-testid="format-compliance-by-schema-block" className="mt-2 pt-2 border-t border-neutral-700/50">
+              <div className="text-[10px] text-neutral-500 mb-1 uppercase tracking-wide">By schema</div>
+              <div className="space-y-0.5">
+                {Object.entries(data.format_compliance.by_schema).sort(([, a]: [string, FormatComplianceBySchemaEntry], [, b]: [string, FormatComplianceBySchemaEntry]) => (b.format_miss ?? 0) - (a.format_miss ?? 0)).map(([schema, entry]: [string, FormatComplianceBySchemaEntry]) => (
+                  <div key={schema} className="flex items-center justify-between gap-3 text-[10px]">
+                    <span className="text-neutral-500">{schema}</span>
+                    <div className="flex items-center gap-2 text-neutral-400 font-mono">
+                      {entry.format_miss > 0 && (
+                        <span className="text-red-400/70">{entry.format_miss} miss</span>
+                      )}
+                      <span className="text-neutral-600">· {entry.repair_attempts} repair</span>
+                      {entry.self_repair_success_rate != null && (
+                        <span>{(entry.self_repair_success_rate * 100).toFixed(0)}% ok</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
       {data.agent_timeout_rate && (
@@ -748,6 +784,55 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function SpendBurnRateWidget({ projectId }: { projectId?: string }) {
+  const [data, setData] = useState<SpendBurnRateResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    setLoading(true);
+    setError(null);
+    setData(null);
+
+    (async () => {
+      try {
+        const params = new URLSearchParams({ window_days: '7' });
+        if (projectId) params.set('project_id', projectId);
+        const result = await apiFetch(`/api/admin/spend-burn-rate?${params}`);
+        if (!result.ok) throw new Error(`Failed to fetch spend burn rate: ${result.status}`);
+        if (mounted) setData(await result.json());
+      } catch (err) {
+        if (mounted) setError(err instanceof Error ? err.message : 'Unknown error');
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    })();
+
+    return () => { mounted = false; };
+  }, [projectId]);
+
+  if (loading) return <div className="flex items-center justify-center h-16 text-neutral-500 text-xs">Loading burn rate…</div>;
+  if (error) return <div className="flex items-center justify-center h-16 text-red-400 text-xs">{error}</div>;
+  if (!data) return null;
+
+  return (
+    <div data-testid="spend-burn-rate-widget" className="flex flex-wrap gap-6 items-end">
+      <div>
+        <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Daily spend (7d avg)</div>
+        <div className="text-2xl font-mono text-neutral-100">${data.daily_spend_usd.toFixed(2)}<span className="text-sm text-neutral-400">/day</span></div>
+      </div>
+      <div>
+        <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Monthly forecast</div>
+        <div className="text-2xl font-mono text-emerald-400">${data.monthly_forecast_usd.toFixed(2)}<span className="text-sm text-neutral-400">/mo</span></div>
+      </div>
+      <div className="text-[10px] text-neutral-500 font-mono ml-auto self-end">
+        {data.task_count} tasks · ${data.window_cost_usd.toFixed(2)} over {data.window_days}d
+      </div>
     </div>
   );
 }
@@ -1045,6 +1130,12 @@ export default function MetricsDashboard({
         <div className={cardClass}>
           <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">Failure Rate</div>
           <FailureRateChart points={metricsHistory} windowMs={windowMs} />
+        </div>
+
+        {/* Spend burn rate widget — full width */}
+        <div className={`${cardClass} sm:col-span-2`}>
+          <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-3">Spend Burn Rate</div>
+          <SpendBurnRateWidget projectId={projectId} />
         </div>
 
         {/* Cost breakdown widget — full width */}

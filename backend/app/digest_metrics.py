@@ -413,12 +413,15 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
     repair_infra_failures = 0
     repair_input_tokens = 0
     repair_output_tokens = 0
+    miss_by_reason: defaultdict[str, int] = defaultdict(int)
+    repair_miss_by_reason: defaultdict[str, int] = defaultdict(int)
     miss_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_attempts_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_successes_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_infra_failures_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_input_tokens_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_output_tokens_by_schema: defaultdict[str, int] = defaultdict(int)
+    repair_miss_by_schema: defaultdict[str, int] = defaultdict(int)
     for t in tasks:
         summary = getattr(t, "format_compliance_summary", None)
         if not isinstance(summary, dict):
@@ -438,6 +441,12 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         repair_output_tokens += ot
         if e == 0:
             well_formed += 1
+        for reason, count in (summary.get("format_miss_by_reason") or {}).items():
+            miss_by_reason[str(reason)] += int(count)
+        for reason, count in (
+            summary.get("format_repair_miss_by_reason") or {}
+        ).items():
+            repair_miss_by_reason[str(reason)] += int(count)
         for schema, count in (summary.get("format_miss_by_schema") or {}).items():
             miss_by_schema[str(schema)] += int(count)
         for schema, count in (
@@ -460,6 +469,10 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
             summary.get("format_repair_output_tokens_by_schema") or {}
         ).items():
             repair_output_tokens_by_schema[str(schema)] += int(count)
+        for schema, count in (
+            summary.get("format_repair_miss_by_schema") or {}
+        ).items():
+            repair_miss_by_schema[str(schema)] += int(count)
     all_schemas = (
         set(miss_by_schema)
         | set(repair_attempts_by_schema)
@@ -467,18 +480,28 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         | set(repair_infra_failures_by_schema)
         | set(repair_input_tokens_by_schema)
         | set(repair_output_tokens_by_schema)
+        | set(repair_miss_by_schema)
     )
-    by_schema = {
-        schema: {
+
+    def _schema_entry(schema: str) -> dict:
+        attempts = repair_attempts_by_schema.get(schema, 0)
+        successes = repair_successes_by_schema.get(schema, 0)
+        infra = repair_infra_failures_by_schema.get(schema, 0)
+        clean = attempts - infra
+        return {
             "format_miss": miss_by_schema.get(schema, 0),
-            "repair_attempts": repair_attempts_by_schema.get(schema, 0),
-            "repair_successes": repair_successes_by_schema.get(schema, 0),
-            "repair_infra_failures": repair_infra_failures_by_schema.get(schema, 0),
+            "repair_attempts": attempts,
+            "repair_successes": successes,
+            "repair_infra_failures": infra,
+            "repair_miss": repair_miss_by_schema.get(schema, 0),
             "repair_input_tokens": repair_input_tokens_by_schema.get(schema, 0),
             "repair_output_tokens": repair_output_tokens_by_schema.get(schema, 0),
+            "self_repair_success_rate": round(successes / clean, 3)
+            if clean > 0
+            else None,
         }
-        for schema in sorted(all_schemas)
-    }
+
+    by_schema = {schema: _schema_entry(schema) for schema in sorted(all_schemas)}
     # Exclude crashed reopens (infra failures) from the denominator so the rate
     # reflects genuine format repair quality, not infra noise.  For historical
     # tasks that predate infra-failure reporting, repair_infra_failures == 0 and
@@ -525,6 +548,8 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         if clean_attempts > 0
         else None,
         "by_schema": by_schema,
+        "format_miss_by_reason": dict(miss_by_reason),
+        "format_repair_miss_by_reason": dict(repair_miss_by_reason),
     }
 
 

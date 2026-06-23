@@ -52,7 +52,7 @@ router = APIRouter(
 # ── Pydantic Models ───────────────────────────────────────────────────────────
 
 
-class MessageCreate(BaseModel):
+class _MessageCreate(BaseModel):
     project_id: str
     message_type: str = "NOTE"
     content: str
@@ -63,38 +63,38 @@ class MessageCreate(BaseModel):
     idempotency_key: Optional[str] = None
 
 
-class MessageResolve(BaseModel):
+class _MessageResolve(BaseModel):
     resolution: Optional[str] = None
 
 
-class LastSeenUpdate(BaseModel):
+class _LastSeenUpdate(BaseModel):
     project_id: str
     timestamp: int  # Unix ms epoch
 
 
-class NoisePrefUpdate(BaseModel):
+class _NoisePrefUpdate(BaseModel):
     project_id: str
     prefs: Dict[str, Any] = Field(default_factory=dict)
 
 
-class SavedViewsUpdate(BaseModel):
+class _SavedViewsUpdate(BaseModel):
     project_id: str
     saved_views: List[Dict[str, Any]] = Field(default_factory=list)
 
 
-class TempMutesUpdate(BaseModel):
+class _TempMutesUpdate(BaseModel):
     project_id: str
     temp_mutes: Dict[str, int] = Field(
         default_factory=dict
     )  # event_type -> expiry ms epoch
 
 
-class MuteWindowUpdate(BaseModel):
+class _MuteWindowUpdate(BaseModel):
     project_id: str
     expires_at: Optional[int] = None  # ms epoch; None clears the mute window
 
 
-class AdminPlaybookSet(BaseModel):
+class _AdminPlaybookSet(BaseModel):
     key: str = Field(
         ..., description="Playbook key: alphanumeric + hyphens, max 50 chars"
     )
@@ -474,7 +474,7 @@ async def list_messages(
 
 @router.post("/messages")
 async def create_message(
-    payload: MessageCreate,
+    payload: _MessageCreate,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -639,7 +639,7 @@ async def create_message(
 @router.patch("/messages/{message_id}")
 async def resolve_message(
     message_id: uuid.UUID,
-    payload: MessageResolve,
+    payload: _MessageResolve,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -743,7 +743,7 @@ async def get_messages_last_seen(
 
 @router.put("/messages/last-seen")
 async def put_messages_last_seen(
-    payload: LastSeenUpdate,
+    payload: _LastSeenUpdate,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -813,7 +813,7 @@ async def get_messages_noise_prefs(
 
 @router.put("/messages/noise-prefs")
 async def put_messages_noise_prefs(
-    payload: NoisePrefUpdate,
+    payload: _NoisePrefUpdate,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -894,7 +894,7 @@ async def get_messages_saved_views(
 
 @router.put("/messages/saved-views")
 async def put_messages_saved_views(
-    payload: SavedViewsUpdate,
+    payload: _SavedViewsUpdate,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -964,7 +964,7 @@ async def get_messages_temp_mutes(
 
 @router.put("/messages/temp-mutes")
 async def put_messages_temp_mutes(
-    payload: TempMutesUpdate,
+    payload: _TempMutesUpdate,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1040,7 +1040,7 @@ async def get_messages_mute_window(
 
 @router.put("/messages/mute-window")
 async def put_messages_mute_window(
-    payload: MuteWindowUpdate,
+    payload: _MuteWindowUpdate,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1106,7 +1106,7 @@ async def get_last_visit_timestamp(
 
 @router.put("/last-visit-timestamp")
 async def put_last_visit_timestamp(
-    payload: LastSeenUpdate,
+    payload: _LastSeenUpdate,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1239,7 +1239,7 @@ async def admin_playbook_list(
 async def admin_playbook_set(
     request: Request,
     project_id: uuid.UUID,
-    payload: AdminPlaybookSet,
+    payload: _AdminPlaybookSet,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):

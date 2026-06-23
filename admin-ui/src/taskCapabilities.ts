@@ -2,7 +2,7 @@ import { createContext, createElement, useContext, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import type { TaskCapabilityContract, TaskCapabilityContractEntry } from './types/settings';
 
-const TASK_CAPABILITIES = [
+export const TASK_CAPABILITIES = [
   {
     id: 'create',
     label: 'Create',

@@ -25,13 +25,27 @@ resource "google_project_iam_member" "orchestrator_secret_accessor" {
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
-# Grant Orchestrator SA permissions to create, update IAM on, list, and delete
-# runtime-managed secrets. Runtime paths in backend/app/compute.py and
-# backend/app/secrets_manager.py provision per-agent credentials and user token
-# secrets dynamically, so secretVersionAdder is insufficient here.
+# Grant Orchestrator SA permission to add new versions to existing secrets.
+# Runtime paths: backend/app/compute.py (_store_agent_secret) and
+# backend/app/secrets_manager.py (store_user_secret) call add_secret_version
+# to write per-agent credentials and user token secrets dynamically.
+resource "google_project_iam_member" "orchestrator_secret_version_adder" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretVersionAdder"
+  member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}
+
+# Grant Orchestrator SA permission to create new secret resources.
+# Runtime paths: backend/app/compute.py (_store_agent_secret) and
+# backend/app/secrets_manager.py (store_user_secret) call create_secret
+# to provision per-agent credential secrets and user token secrets dynamically.
+# Excludes secretmanager.admin: delete calls are best-effort (logged on failure,
+# not fatal) and per-agent IAM grants (secretAccessor on agent-creds-* secrets
+# for agent VMs) should be managed via google_secret_manager_secret_iam_member
+# bindings per secret rather than project-wide IAM-management authority.
 resource "google_project_iam_member" "orchestrator_secret_creator" {
   project = var.project_id
-  role    = "roles/secretmanager.admin"
+  role    = "roles/secretmanager.secretCreator"
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
@@ -49,7 +63,29 @@ resource "google_project_iam_member" "orchestrator_run_viewer" {
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
-# Grant Orchestrator SA permissions to sign blobs (for GCS signed URLs)
+# Grant Orchestrator SA self-impersonation for GCS signed URL signing.
+#
+# This self-referential binding lets orchestrator_sa call
+# iamcredentials.generateIdToken / signBlob on itself, which is required by
+# the storage.generate_signed_url() calls in backend/app/storage.py
+# (e.g. the viewport-shot and artifact download-URL endpoints).
+#
+# SCOPE: orchestrator Cloud Run *service* ONLY.
+# The binding is on orchestrator_sa.name and is consumed exclusively by the
+# Cloud Run service whose service_account = orchestrator_sa.email. It is NOT
+# a project-wide permission and does NOT propagate to other identities.
+#
+# EXPLICITLY EXCLUDED — agent_job_sa:
+# The Cloud Run Job runs as agent_job_sa (a separate dedicated SA created for
+# job executions). agent_job_sa MUST NOT receive roles/iam.serviceAccountTokenCreator
+# — job executions are read-only LLM workloads (research, audit, review) that
+# never need to sign GCS URLs. Adding tokenCreator to agent_job_sa would let a
+# compromised job execution mint arbitrary credentials on its own SA — an
+# unnecessary privilege escalation vector.
+# When adding IAM bindings for agent_job_sa, verify no tokenCreator role is
+# included. The two permitted bindings are:
+#   roles/secretmanager.secretAccessor  (read long-lived secrets at boot)
+#   roles/logging.logWriter             (write execution logs)
 resource "google_service_account_iam_member" "orchestrator_sa_token_creator" {
   service_account_id = google_service_account.orchestrator_sa.name
   role               = "roles/iam.serviceAccountTokenCreator"
@@ -70,6 +106,24 @@ resource "google_project_iam_member" "agent_log_writer" {
   project = var.project_id
   role    = "roles/logging.logWriter"
   member  = "serviceAccount:${google_service_account.agent_sa.email}"
+}
+
+# Grant Agent SA secretAccessor scoped to agent-creds-* secrets only.
+# The IAM condition restricts access to secrets whose name contains
+# "secrets/agent-creds-" (all per-agent credential secrets created by
+# _store_agent_secret in compute.py follow the pattern agent-creds-{vm_instance_id}).
+# A compromised agent VM cannot read DB passwords, JWT signing keys,
+# GitHub tokens, or any other project secret outside the agent-creds-* family.
+resource "google_project_iam_member" "agent_secret_accessor" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.agent_sa.email}"
+
+  condition {
+    title       = "AgentCredsOnly"
+    description = "Restrict agent SA to agent-creds-* secrets only"
+    expression  = "resource.name.extract('secrets/{secret}').startsWith('agent-creds-')"
+  }
 }
 
 # Grant Orchestrator SA permission to attach the Agent SA to new VMs
@@ -125,6 +179,27 @@ resource "google_service_account" "migrator_sa" {
 # migrator_alloydb_password_access binding removed when alloydb.tf was
 # archived. Migrator-sa retains its Cloud SQL password binding below for
 # the existing migration script's reverse direction (see archive/README.md).
+
+# ------------------------------------------------------------------------------
+# Agent Cloud Run Job Service Account IAM
+# ------------------------------------------------------------------------------
+resource "google_project_iam_member" "agent_job_secret_accessor" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.agent_job_sa.email}"
+
+  condition {
+    title       = "AgentJobSecretsOnly"
+    description = "Restrict Cloud Run Job SA to agent-creds-* secrets only"
+    expression  = "resource.name.extract('secrets/{secret}').startsWith('agent-creds-')"
+  }
+}
+
+resource "google_project_iam_member" "agent_job_log_writer" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.agent_job_sa.email}"
+}
 
 resource "google_secret_manager_secret_iam_member" "migrator_cloud_sql_password_access" {
   count     = var.use_cloud_sql ? 1 : 0

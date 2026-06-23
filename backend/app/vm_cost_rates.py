@@ -64,6 +64,11 @@ def get_vm_rate_per_second(
 
         machine_type = MACHINE_TYPE
 
+    # Cloud Run sentinel machine types use a different rate table; spot has no
+    # meaning for Cloud Run (there is no spot/preemptible concept there).
+    if machine_type and machine_type.startswith("cloud-run-"):
+        return get_cloud_run_rate_for_machine_type(machine_type)
+
     _, hourly_rate = _resolve_rate_entry(machine_type)
     selected_rate = hourly_rate[1] if spot else hourly_rate[0]
     return selected_rate / 3600
@@ -277,6 +282,52 @@ def resolve_compute_machine_type(
     if spec is not None:
         return spec.machine_type
     return DEFAULT_MACHINE_TYPE
+
+
+# ---------------------------------------------------------------------------
+# Cloud Run Jobs cost rates (separate from VM_COST_RATES so supported_machine_types()
+# and is_supported_machine_type() are unaffected).
+#
+# Approximate us-central1 list prices (2025):
+#   CPU: $0.000024/vCPU-s (on-demand)
+#   Memory: $0.0000025/GiB-s (on-demand)
+# ---------------------------------------------------------------------------
+
+# (cpu_count, memory_gib) for each Cloud Run machine type sentinel.
+_CLOUD_RUN_SHAPES: dict[str, tuple[float, float]] = {
+    "cloud-run-1vcpu-2gib": (1.0, 2.0),
+    "cloud-run-2vcpu-4gib": (2.0, 4.0),
+}
+
+_CLOUD_RUN_CPU_RATE_PER_VCPU_SECOND = 0.000024  # USD/vCPU-s
+_CLOUD_RUN_MEM_RATE_PER_GIB_SECOND = 0.0000025  # USD/GiB-s
+
+
+def get_cloud_run_rate_per_second(
+    cpu_count: float = 1.0, memory_gib: float = 2.0
+) -> float:
+    """Return the per-second Cloud Run Jobs cost for the given shape.
+
+    Args:
+        cpu_count: Number of vCPUs allocated to the execution.
+        memory_gib: Memory allocated in GiB.
+
+    Returns:
+        Rate in USD/second.
+    """
+    return (
+        cpu_count * _CLOUD_RUN_CPU_RATE_PER_VCPU_SECOND
+        + memory_gib * _CLOUD_RUN_MEM_RATE_PER_GIB_SECOND
+    )
+
+
+def get_cloud_run_rate_for_machine_type(machine_type: str) -> float:
+    """Return the per-second Cloud Run cost for a known sentinel machine type.
+
+    Falls back to the standard 1vCPU/2GiB shape for unknown sentinels.
+    """
+    cpu, mem = _CLOUD_RUN_SHAPES.get(machine_type, (1.0, 2.0))
+    return get_cloud_run_rate_per_second(cpu, mem)
 
 
 def get_compute_rate_per_second(

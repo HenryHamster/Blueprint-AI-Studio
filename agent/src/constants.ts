@@ -301,7 +301,7 @@ export const MEDIUM_ANALYSIS_PLAN_FILE_LIMIT = 10;
 // Prevents unbounded growth from large pre-implementation analysis results.
 // When truncation fires, a clearly-marked notice is appended and a warning is
 // sent via sendLog so the agent knows the plan was cut.
-export const ANALYSIS_CONTEXT_CHAR_CAP = 32_000;
+export const ANALYSIS_CONTEXT_CHAR_CAP = 16_000;
 
 // Mid-stream stall detection: if a tool_use event is in-flight for longer
 // than this WITHOUT EMITTING ANY SUB-PROGRESS (no further stream-json event of

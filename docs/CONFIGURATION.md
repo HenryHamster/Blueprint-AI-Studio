@@ -112,7 +112,7 @@ These variables are optional and have sensible defaults.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `METRICS_TOKEN` | string | — | Optional token to protect `/metrics` endpoint (if set, requests need `?token=<value>`) |
+| `METRICS_TOKEN` | string | — | Bearer token to protect `/metrics` endpoint. When set, requests must include `?token=<value>` matching this value; when unset, `/metrics` returns 403 (fail-closed security design) |
 | `LOG_LEVEL` | string | `INFO` | Python logging level (DEBUG, INFO, WARNING, ERROR) |
 | `ENABLE_PROFILING` | boolean | `false` | Enable Python profiling (use sparingly; performance impact) |
 

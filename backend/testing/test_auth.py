@@ -414,3 +414,39 @@ class TestGetMetricsReader:
         assert result["role"] == "metrics_reader"
         assert result["sub"] == "acceptance-task-001"
         assert result["vm_instance_id"] == "acceptance-vm-001"
+
+
+class TestValidateJwtSecret:
+    def test_32_byte_secret_passes(self):
+        from app.auth import _validate_jwt_secret
+
+        _validate_jwt_secret("a" * 32, "TEST_SECRET")  # must not raise
+
+    def test_exactly_32_bytes_passes(self):
+        from app.auth import _validate_jwt_secret
+
+        _validate_jwt_secret("x" * 32, "TEST_SECRET")
+
+    def test_short_secret_raises_value_error(self):
+        from app.auth import _validate_jwt_secret
+
+        with pytest.raises(ValueError, match="JWT secret must be at least 32 bytes"):
+            _validate_jwt_secret("short", "AGENT_JWT_SECRET")
+
+    def test_31_byte_secret_raises(self):
+        from app.auth import _validate_jwt_secret
+
+        with pytest.raises(ValueError, match="JWT secret must be at least 32 bytes"):
+            _validate_jwt_secret("a" * 31, "AGENT_JWT_SECRET")
+
+    def test_multibyte_chars_counted_by_bytes_not_chars(self):
+        from app.auth import _validate_jwt_secret
+
+        # 16 × 2-byte chars = 32 bytes — must pass
+        _validate_jwt_secret("é" * 16, "TEST_SECRET")
+
+    def test_error_message_includes_env_var_name(self):
+        from app.auth import _validate_jwt_secret
+
+        with pytest.raises(ValueError, match="WS_TICKET_SECRET"):
+            _validate_jwt_secret("tooshort", "WS_TICKET_SECRET")

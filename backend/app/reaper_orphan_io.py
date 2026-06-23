@@ -19,6 +19,7 @@ from app.compute import (
     get_vm_zone,
     get_vm_status,
 )
+from app.compute_cloud_run import is_cloud_run_task
 from app.reaper_orphan_classify import _task_has_open_pr
 
 logger = logging.getLogger(__name__)
@@ -294,7 +295,7 @@ async def _run_orphan_io(
     io_serial_log: str | None = None
     io_prov_zone: str | None = None
     io_provision_err: str | None = None
-    if is_provision_failure:
+    if is_provision_failure and not is_cloud_run_task(fresh_task.vm_machine_type):
         # Resolve zone (in-memory cache + persisted fallback). The two
         # values prov_zone and provision_err are stable post-fail;
         # reading them while unlocked is safe — no peer mutates them.

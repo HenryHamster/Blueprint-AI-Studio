@@ -1821,21 +1821,58 @@ async def _spawn_pipeline_task(
         )
 
     supersede_churn_count = _review_supersede_churn_count(orig_task)
+    # Tracks whether the immediately-preceding task was a no-op fix (deliverable
+    # already present, zero new commits).  Used below to extend the churn-halt
+    # condition so that consecutive no-op fixes trip the halt just as stale
+    # supersessions do.
+    _source_noop_fix = False
+    _source_is_fix = source_task.first_payload.get("type") == "fix"
     if source_task.status in (
         TaskStatus.COMPLETED,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
     ) and task_counts_toward_review_cap(source_task):
-        supersede_churn_count = 0
-        if orig_task is not None:
-            from sqlalchemy.orm.attributes import flag_modified
+        # Only fix-type source tasks affect the churn counter.  Review tasks
+        # completing with REQUEST_CHANGES are neutral — they do not represent
+        # effective progress and must NOT reset a counter that a no-op fix just
+        # incremented.  Without this gate, every review→fix cycle resets the
+        # counter and the halt never accumulates.
+        if _source_is_fix:
+            # A no-op fix (./done --already-done; deliverable already present, no new
+            # commits) is NOT effective progress.  Do not reset the churn counter —
+            # count it toward the halt instead, so a streak of no-op fixes terminates
+            # the loop rather than keeping it alive indefinitely.
+            _source_noop_fix = bool((source_task.context or {}).get("no_op_reason"))
+            if _source_noop_fix:
+                if orig_task is not None:
+                    from sqlalchemy.orm.attributes import flag_modified
 
-            orig_ctx = dict(orig_task.context or {})
-            orig_ctx.pop(_REVIEW_SUPERSEDE_CHURN_LAST_KEY, None)
-            orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = 0
-            orig_task.context = orig_ctx
-            flag_modified(orig_task, "context")
-            session.add(orig_task)
+                    orig_ctx = dict(orig_task.context or {})
+                    supersede_churn_count = (
+                        int(orig_ctx.get(_REVIEW_SUPERSEDE_CHURN_COUNT_KEY, 0) or 0) + 1
+                    )
+                    orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = supersede_churn_count
+                    orig_task.context = orig_ctx
+                    flag_modified(orig_task, "context")
+                    session.add(orig_task)
+                    logger.info(
+                        f"[PIPELINE] No-op fix detected for PR #{pr_number} "
+                        f"(no_op_reason set) — incrementing churn count to "
+                        f"{supersede_churn_count} (not resetting)"
+                    )
+            else:
+                # Fix with real commits: genuine progress, reset churn counter.
+                supersede_churn_count = 0
+                if orig_task is not None:
+                    from sqlalchemy.orm.attributes import flag_modified
+
+                    orig_ctx = dict(orig_task.context or {})
+                    orig_ctx.pop(_REVIEW_SUPERSEDE_CHURN_LAST_KEY, None)
+                    orig_ctx[_REVIEW_SUPERSEDE_CHURN_COUNT_KEY] = 0
+                    orig_task.context = orig_ctx
+                    flag_modified(orig_task, "context")
+                    session.add(orig_task)
+        # else: source is a review task — leave churn counter unchanged.
 
     # Dedup guard for active pipeline tasks on this PR/chain. The match axes are
     # (pr_number, chain, task_type, liveness):
@@ -2063,7 +2100,7 @@ async def _spawn_pipeline_task(
         or _REVIEW_SUPERSEDE_CHURN_LIMIT
     )
     if (
-        superseded_stale_task
+        (superseded_stale_task or _source_noop_fix)
         and orig_task is not None
         and supersede_churn_count >= churn_limit
     ):
@@ -2073,13 +2110,20 @@ async def _spawn_pipeline_task(
         churn_last = supersede_churn_last_snapshot or (orig_task.context or {}).get(
             _REVIEW_SUPERSEDE_CHURN_LAST_KEY
         )
-        detail = (
-            "Supersession churn reached the bound after "
-            f"{supersede_churn_count} consecutive superseded task(s) with no "
-            "counted run in between."
-        )
-        if churn_last:
-            detail += f" Last superseded task: {churn_last}."
+        if _source_noop_fix:
+            detail = (
+                "No-op fix churn reached the bound after "
+                f"{supersede_churn_count} consecutive no-op fix(es) with no "
+                "effective commit progress (deliverable already present)."
+            )
+        else:
+            detail = (
+                "Supersession churn reached the bound after "
+                f"{supersede_churn_count} consecutive superseded task(s) with no "
+                "counted run in between."
+            )
+            if churn_last:
+                detail += f" Last superseded task: {churn_last}."
         if _runtime_config.get("require_approval_gates", True):
             orig_task.requires_approval = True
         orig_task.latest_status_message = (
@@ -2090,7 +2134,9 @@ async def _spawn_pipeline_task(
         _set_review_loop_terminal_outcome(
             orig_task,
             kind="supersession_churn_halt",
-            reason="supersession-churn",
+            reason="noop_fix_already_satisfied"
+            if _source_noop_fix
+            else "supersession-churn",
             pr_number=pr_number,
             iterations=supersede_churn_count,
             detail=detail,
@@ -2102,6 +2148,42 @@ async def _spawn_pipeline_task(
         orig_task.context = orig_ctx
         flag_modified(orig_task, "context")
         session.add(orig_task)
+        # Cancel any remaining in-flight review/fix tasks on this PR chain so
+        # they don't fail later with "PR closed without being merged" / BRANCH_GONE.
+        from app.failure_classification import (
+            AGENT_TIMEOUT,
+            persist_failure_category,
+        )
+
+        for _inflight in active_pipeline:
+            if _inflight.id == source_task.id:
+                continue
+            if _inflight.status not in _PIPELINE_ACTIVE_STATUSES:
+                continue
+            _inflight_payload = _inflight.first_payload
+            _inflight_type = _inflight_payload.get("type")
+            _inflight_orig = _inflight_payload.get("original_task_id") or ""
+            if _inflight_payload.get("pr_number") != pr_number:
+                continue
+            if _inflight_type not in ("review", "fix"):
+                continue
+            if not is_rollup_source and _inflight_orig != resolved_original_id:
+                continue
+            _inflight_ctx = dict(_inflight.context or {})
+            _inflight_ctx["failure_detail"] = "cancelled_by_churn_halt"
+            _inflight.context = _inflight_ctx
+            _inflight.status = TaskStatus.CANCELLED
+            _inflight.latest_status_message = (
+                f"Cancelled: review/fix loop terminated (churn halt) "
+                f"for PR #{pr_number}"
+            )
+            persist_failure_category(_inflight, AGENT_TIMEOUT)
+            flag_modified(_inflight, "context")
+            session.add(_inflight)
+            logger.info(
+                f"[PIPELINE] Cancelled in-flight {_inflight_type} task {_inflight.id} "
+                f"for PR #{pr_number} (churn halt)"
+            )
         try:
             await _maybe_create_escalation_alert(
                 orig_task,

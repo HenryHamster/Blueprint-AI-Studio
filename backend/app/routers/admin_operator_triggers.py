@@ -13,7 +13,7 @@ from sqlalchemy import func as _func
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from typing import List
+from typing import List, Literal
 import uuid
 import logging
 import time
@@ -78,9 +78,7 @@ async def _clear_manual_rollup_create_claim(
     if ctx.get("rollup_pr_number") or ctx.get("rollup_pr_creating_at") != claim_ts:
         return task
 
-    task.context = {
-        k: v for k, v in ctx.items() if k != "rollup_pr_creating_at"
-    }
+    task.context = {k: v for k, v in ctx.items() if k != "rollup_pr_creating_at"}
     session.add(task)
     await session.commit()
     return task
@@ -113,7 +111,7 @@ def _record_failure_result(task: Task, failure_class: str) -> None:
         logger.exception(f"[ADMIN] Failed to record failure result for task {task.id}")
 
 
-class SelfAuditRequest(BaseModel):
+class _SelfAuditRequest(BaseModel):
     """Optional body for POST /projects/{project_id}/self-audit.
 
     Both fields are optional — when omitted, the agent picks up to ``max_systems``
@@ -127,7 +125,7 @@ class SelfAuditRequest(BaseModel):
 @router.post("/projects/{project_id}/self-audit")
 async def trigger_self_audit(
     project_id: uuid.UUID,
-    body: SelfAuditRequest | None = None,
+    body: _SelfAuditRequest | None = None,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -218,13 +216,17 @@ async def trigger_self_audit(
         # and return it instead of raising an error — coalesce onto the in-flight audit.
         await session.rollback()
         existing = (
-            await session.execute(
-                select(Task).where(
-                    Task.idempotency_key == idempotency_key,
-                    Task.status.in_(active_statuses),
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.idempotency_key == idempotency_key,
+                        Task.status.in_(active_statuses),
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if existing is None:
             raise HTTPException(
                 status_code=409,
@@ -434,8 +436,10 @@ async def clear_wave_deps(
     foundation_map: dict[str, Task] = {}
     if foundation_ids:
         frows = (
-            await session.execute(select(Task).where(Task.id.in_(foundation_ids)))
-        ).scalars().all()
+            (await session.execute(select(Task).where(Task.id.in_(foundation_ids))))
+            .scalars()
+            .all()
+        )
         foundation_map = {str(f.id): f for f in frows}
 
     cleared = 0
@@ -575,9 +579,10 @@ async def trigger_rollup(
     # defer. A claim older than the TTL is stale (peer crashed mid-create) and
     # falls through so creation is never wedged.
     _claim_ts = ctx.get("rollup_pr_creating_at")
-    if isinstance(_claim_ts, (int, float)) and (
-        time.time() - _claim_ts
-    ) < _ROLLUP_PR_CREATE_CLAIM_TTL_S:
+    if (
+        isinstance(_claim_ts, (int, float))
+        and (time.time() - _claim_ts) < _ROLLUP_PR_CREATE_CLAIM_TTL_S
+    ):
         raise HTTPException(
             status_code=409,
             detail=(
@@ -613,9 +618,7 @@ async def trigger_rollup(
     # claim and defers instead of POSTing a duplicate rollup PR.
     claim_ts = time.time()
     task.context = {**ctx, "rollup_pr_creating_at": claim_ts}
-    pre_create_snapshot = await _release_parent_lock(
-        task, session, context_dirty=True
-    )
+    pre_create_snapshot = await _release_parent_lock(task, session, context_dirty=True)
 
     try:
         pr_result = await create_pull_request(
@@ -747,8 +750,17 @@ async def trigger_rollup(
         # (or an operator can reconcile) rather than wedging the branch.
         from app.rollup_migration_validation import enforce_premerge_migration_guard
 
+        from app.shared_state import (
+            get_project_promotion_target as _get_project_promotion_target,
+        )
+
         _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
-            gh_token, owner, repo, rollup_pr_number, target_branch
+            gh_token,
+            owner,
+            repo,
+            rollup_pr_number,
+            target_branch,
+            promotion_target=_get_project_promotion_target(_project),
         )
         if not _ok_to_merge:
             task.context = {
@@ -783,9 +795,7 @@ async def trigger_rollup(
                 source="admin_operator_triggers.rollup_auto_merge",
             )
             task.status = (
-                TaskStatus.COMPLETED
-                if terminal_rollup_merge
-                else TaskStatus.EVALUATING
+                TaskStatus.COMPLETED if terminal_rollup_merge else TaskStatus.EVALUATING
             )
             task.context = {
                 **ctx,
@@ -947,6 +957,86 @@ async def cancel_strategic_refresh_endpoint(
     cleared = await cancel_strategic_refresh(session, project_id)
     await session.commit()
     return {"cleared": cleared}
+
+
+class _RecordFindingResolutionBody(BaseModel):
+    """Body for POST /projects/{project_id}/finding-resolution."""
+
+    finding_key: str = Field(..., min_length=1, max_length=64)
+    release_version_id: uuid.UUID
+    state: Literal["resolved", "stale"]
+    severity: str | None = Field(default=None, max_length=32)
+    note: str | None = Field(default=None, max_length=2000)
+    resolving_ref: str | None = Field(default=None, max_length=200)
+    verified_against_sha: str | None = Field(default=None, max_length=200)
+
+
+@router.post("/projects/{project_id}/finding-resolution")
+async def record_finding_resolution(
+    project_id: uuid.UUID,
+    body: _RecordFindingResolutionBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Manually write a resolution-ledger entry for a carried audit finding.
+
+    Members and above can record a ``resolved`` or ``stale`` entry for a
+    ``(finding_key, release_version_id)`` pair without requiring an agent token.
+    Intended as the operator override when the automated sweep fails or a
+    one-time manual resolution is needed to unblock re-qualification.
+
+    Returns the upserted ``AuditFindingResolution`` row as a dict.
+    """
+    from app.models import ReleaseVersion
+    from app.release_readiness import apply_finding_resolution
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    # Validate that the release_version_id belongs to this project.
+    rv = (
+        (
+            await session.execute(
+                select(ReleaseVersion).where(
+                    ReleaseVersion.id == body.release_version_id,
+                    ReleaseVersion.project_id == project_id,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if rv is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Release version not found for this project.",
+        )
+
+    row = await apply_finding_resolution(
+        session,
+        project_id,
+        body.release_version_id,
+        body.finding_key,
+        body.state,
+        severity=body.severity,
+        note=body.note,
+        resolving_ref=body.resolving_ref,
+        verified_against_sha=body.verified_against_sha,
+    )
+    await session.commit()
+    await session.refresh(row)
+    return {
+        "id": str(row.id),
+        "project_id": str(row.project_id),
+        "release_version_id": str(row.release_version_id),
+        "finding_key": row.finding_key,
+        "state": row.state,
+        "severity": row.severity,
+        "note": row.note,
+        "resolving_ref": row.resolving_ref,
+        "verified_against_sha": row.verified_against_sha,
+    }
 
 
 @router.get("/projects/{project_id}/findings")

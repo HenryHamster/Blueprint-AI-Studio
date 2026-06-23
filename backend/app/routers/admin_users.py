@@ -21,7 +21,7 @@ router = APIRouter(
 # ── Pydantic Models ───────────────────────────────────────────────────────────
 
 
-class MemberCreate(BaseModel):
+class _MemberCreate(BaseModel):
     email: str
     role: str = "member"
 
@@ -33,7 +33,7 @@ class MemberCreate(BaseModel):
         return v
 
 
-class MemberUpdate(BaseModel):
+class _MemberUpdate(BaseModel):
     role: str
 
     @field_validator("role")
@@ -44,7 +44,7 @@ class MemberUpdate(BaseModel):
         return v
 
 
-class UserCreate(BaseModel):
+class _UserCreate(BaseModel):
     email: str
     role: str = "user"
 
@@ -64,7 +64,7 @@ class UserCreate(BaseModel):
         return v
 
 
-class UserUpdate(BaseModel):
+class _UserUpdate(BaseModel):
     role: str
 
     @field_validator("role")
@@ -124,7 +124,7 @@ async def list_project_members(
 @router.post("/projects/{project_id}/members", status_code=201)
 async def add_project_member(
     project_id: uuid.UUID,
-    payload: MemberCreate,
+    payload: _MemberCreate,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -186,7 +186,7 @@ async def add_project_member(
 async def update_project_member(
     project_id: uuid.UUID,
     member_id: uuid.UUID,
-    payload: MemberUpdate,
+    payload: _MemberUpdate,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -282,7 +282,7 @@ async def list_users(
 
 @router.post("/users", status_code=201)
 async def add_user(
-    payload: UserCreate,
+    payload: _UserCreate,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
@@ -313,7 +313,7 @@ async def add_user(
 @router.patch("/users/{user_id}")
 async def update_user(
     user_id: uuid.UUID,
-    payload: UserUpdate,
+    payload: _UserUpdate,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):

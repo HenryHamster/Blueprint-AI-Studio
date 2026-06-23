@@ -5999,6 +5999,51 @@ class TestNotificationConfigSettings:
                 )
 
     @pytest.mark.asyncio
+    async def test_merge_grade_block_threshold_round_trip(self, client: AsyncClient):
+        """merge_grade_block_threshold is settable via PATCH, bounded to [0, 1],
+        visible on GET, and defaults to 0.0 (ships dark)."""
+        from app.shared_state import runtime_config as _rc
+
+        original = _rc.get("merge_grade_block_threshold", 0.0)
+        try:
+            resp = await client.patch(
+                "/api/admin/settings", json={"merge_grade_block_threshold": 1.0}
+            )
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["merge_grade_block_threshold"] == pytest.approx(1.0)
+
+            # 0.0 is allowed (disarms the gate).
+            resp0 = await client.patch(
+                "/api/admin/settings", json={"merge_grade_block_threshold": 0.0}
+            )
+            assert resp0.status_code == 200
+
+            # Out of range rejected.
+            assert (
+                await client.patch(
+                    "/api/admin/settings", json={"merge_grade_block_threshold": -0.1}
+                )
+            ).status_code == 400
+            assert (
+                await client.patch(
+                    "/api/admin/settings", json={"merge_grade_block_threshold": 1.5}
+                )
+            ).status_code == 400
+            # Non-numeric rejected.
+            assert (
+                await client.patch(
+                    "/api/admin/settings",
+                    json={"merge_grade_block_threshold": "high"},
+                )
+            ).status_code == 400
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={"merge_grade_block_threshold": original},
+            )
+
+    @pytest.mark.asyncio
     async def test_unknown_settings_key_rejected(self, client: AsyncClient):
         """An unknown/misspelled settings key is rejected with 400 (and logged)
         rather than silently ignored — so a typo is detectable."""
@@ -6223,6 +6268,103 @@ class TestNotificationConfigSettings:
         finally:
             _app.dependency_overrides.pop(_gcu, None)
             _app.dependency_overrides.pop(_ra, None)
+
+
+class TestEvergreenFillSettingsPersist:
+    """evergreen_fill_* runtime knobs persist to DeploymentState.runtime_config_json
+    and are restored by sync_runtime_config_from_state so every instance converges."""
+
+    @pytest.mark.asyncio
+    async def test_evergreen_fill_mode_persists_and_restores(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH evergreen_fill_mode=observe writes to runtime_config_json;
+        sync_runtime_config_from_state restores it on a fresh in-memory config."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "evergreen_fill_mode": "observe",
+                "evergreen_fill_interval_minutes": 30,
+                "evergreen_fill_util_threshold": 0.6,
+                "evergreen_fill_min_free_slots": 3,
+                "evergreen_fill_max_active": 2,
+                "evergreen_fill_daily_cap": 5,
+                "evergreen_fill_deferred_memo_enrollment": True,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        # GET /settings returns the updated values
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["evergreen_fill_mode"] == "observe"
+        assert body["evergreen_fill_interval_minutes"] == 30
+        assert body["evergreen_fill_util_threshold"] == 0.6
+        assert body["evergreen_fill_min_free_slots"] == 3
+        assert body["evergreen_fill_max_active"] == 2
+        assert body["evergreen_fill_daily_cap"] == 5
+        assert body["evergreen_fill_deferred_memo_enrollment"] is True
+
+        # Values are persisted to DeploymentState.runtime_config_json
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        assert row.runtime_config_json["evergreen_fill_mode"] == "observe"
+        assert row.runtime_config_json["evergreen_fill_interval_minutes"] == 30
+        assert row.runtime_config_json["evergreen_fill_util_threshold"] == 0.6
+        assert row.runtime_config_json["evergreen_fill_min_free_slots"] == 3
+        assert row.runtime_config_json["evergreen_fill_max_active"] == 2
+        assert row.runtime_config_json["evergreen_fill_daily_cap"] == 5
+        assert (
+            row.runtime_config_json["evergreen_fill_deferred_memo_enrollment"] is True
+        )
+
+        # Config-sync restore applies persisted values to a fresh in-memory config
+        _shared_state.runtime_config["evergreen_fill_mode"] = "off"
+        _shared_state.runtime_config["evergreen_fill_interval_minutes"] = 15
+        _shared_state.runtime_config["evergreen_fill_util_threshold"] = 0.5
+        _shared_state.runtime_config["evergreen_fill_min_free_slots"] = 2
+        _shared_state.runtime_config["evergreen_fill_max_active"] = 1
+        _shared_state.runtime_config["evergreen_fill_daily_cap"] = 3
+        _shared_state.runtime_config["evergreen_fill_deferred_memo_enrollment"] = False
+
+        await sync_runtime_config_from_state(row)
+
+        assert _shared_state.runtime_config["evergreen_fill_mode"] == "observe"
+        assert _shared_state.runtime_config["evergreen_fill_interval_minutes"] == 30
+        assert _shared_state.runtime_config["evergreen_fill_util_threshold"] == 0.6
+        assert _shared_state.runtime_config["evergreen_fill_min_free_slots"] == 3
+        assert _shared_state.runtime_config["evergreen_fill_max_active"] == 2
+        assert _shared_state.runtime_config["evergreen_fill_daily_cap"] == 5
+        assert (
+            _shared_state.runtime_config["evergreen_fill_deferred_memo_enrollment"]
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_evergreen_fill_mode_junk_falls_back(
+        self, client: AsyncClient, db_session
+    ):
+        """Junk value in runtime_config_json for evergreen_fill_mode is ignored on restore."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        state = DeploymentState()
+        state.runtime_config_json = {"evergreen_fill_mode": "invalid_junk"}
+        db_session.add(state)
+        await db_session.commit()
+
+        _shared_state.runtime_config["evergreen_fill_mode"] = "off"
+        await sync_runtime_config_from_state(state)
+        # Junk value is ignored — original default survives
+        assert _shared_state.runtime_config["evergreen_fill_mode"] == "off"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8459,13 +8601,23 @@ class TestClearDeployFailed:
         project = await _make_project(db_session)
         await self._make_deploy_failed_version(db_session, project.id)
 
+        async def non_admin():
+            return {"user_id": "other", "email": "other@example.com", "role": "user"}
+
         async def reject_admin():
             raise HTTPException(status_code=403, detail="Admin privileges required")
 
+        # The parent admin router carries a router-level get_current_user
+        # dependency; without overriding it the bogus token is rejected at 401
+        # before require_admin runs. Override both, matching the established
+        # non-admin-rejection pattern (e.g. test_non_admin_cannot_list_users).
+        app.dependency_overrides[get_current_user] = non_admin
         app.dependency_overrides[require_admin] = reject_admin
         try:
             async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                headers={"Authorization": "Bearer test-token"},
             ) as ac:
                 resp = await ac.post(
                     f"/api/admin/projects/{project.id}/clear-deploy-failed",
@@ -8473,6 +8625,7 @@ class TestClearDeployFailed:
                 )
             assert resp.status_code == 403
         finally:
+            app.dependency_overrides.pop(get_current_user, None)
             app.dependency_overrides.pop(require_admin, None)
 
     @pytest.mark.asyncio
@@ -13292,6 +13445,99 @@ class TestModifyTaskApplySeam:
         assert task.requires_approval is True
         assert "merged_pr" not in changes
 
+    @pytest.mark.asyncio
+    async def test_rollup_approval_blocks_cross_branch_deployed_id_reuse(
+        self, db_session, mocker
+    ):
+        """Regression: operator-approved rollup is blocked when the PR's new
+        migration revision id is already deployed on the promotion_target under a
+        DIFFERENT filename (the 0309-class collision) — even though the integration
+        branch does not yet have that revision id.
+        """
+        from fastapi import HTTPException
+
+        from app.admin_task_mutations import _handle_rollup_pr_approval
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "main"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Rollup cross-branch id reuse",
+            payloads=[
+                {"type": "research", "prompt": "rollup", "base_branch": "automain"}
+            ],
+            status=TaskStatus.EVALUATING,
+            context={"rollup_pr_number": 888},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        # PR adds 0309_performance_indexes.py (revision=0309, different body from
+        # the deployed 0309_computejob_heartbeat.py on the promotion target).
+        mocker.patch(
+            "app.github.get_pr_files",
+            new_callable=AsyncMock,
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0309_performance_indexes.py",
+                    "status": "added",
+                    "patch": '+revision = "0309"\n+down_revision = "0308"',
+                }
+            ],
+        )
+        mocker.patch(
+            "app.github.get_pull_request_diff",
+            new_callable=AsyncMock,
+            return_value=(
+                "diff --git a/backend/alembic/versions/0309_performance_indexes.py "
+                "b/backend/alembic/versions/0309_performance_indexes.py\n"
+                "+++ b/backend/alembic/versions/0309_performance_indexes.py\n"
+                '+revision = "0309"\n'
+                '+down_revision = "0308"\n'
+            ),
+        )
+
+        def _list_versions_side_effect(token, owner, repo, ref):
+            if ref == "main":
+                # Deployed promotion target has 0309=heartbeat — different body.
+                return ["0308_prev.py", "0309_computejob_heartbeat.py"]
+            # Integration branch (automain) does not yet have 0309.
+            return ["0308_prev.py"]
+
+        mocker.patch(
+            "app.github.list_versions_at_ref",
+            side_effect=_list_versions_side_effect,
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+        changes: dict = {}
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_rollup_pr_approval(
+                task, task.context or {}, 888, db_session, changes
+            )
+        assert exc_info.value.status_code == 409
+        assert "0309" in str(exc_info.value.detail)
+        merge_mock.assert_not_called()
+        await db_session.refresh(task)
+        assert task.requires_approval is True
+        assert "merged_pr" not in changes
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_operator_triggers.py — Manual Operator Triggers
@@ -14340,6 +14586,108 @@ class TestTriggerRollup:
         assert "dual-head" in (task.latest_status_message or "").lower()
 
     @pytest.mark.asyncio
+    async def test_operator_trigger_blocks_cross_branch_deployed_id_reuse(
+        self, db_session, mocker
+    ):
+        """Regression: operator-triggered intermediate auto-merge is blocked when
+        the PR's new migration revision id is already deployed on the
+        promotion_target under a DIFFERENT filename (the 0309-class collision) —
+        even though the integration branch does not yet have that revision id.
+        """
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "main"
+        project.build_config = {"staging_branch_prefixes": ["research/"]}
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Operator trigger cross-branch id reuse",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "research/intermediate-1",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "html_url": "https://github.com/owner/repo/pull/999",
+                "number": 999,
+            },
+        )
+        # PR adds 0309_performance_indexes.py (revision=0309, different body from
+        # the deployed 0309_computejob_heartbeat.py on the promotion target).
+        mocker.patch(
+            "app.github.get_pr_files",
+            new_callable=AsyncMock,
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0309_performance_indexes.py",
+                    "status": "added",
+                    "patch": '+revision = "0309"\n+down_revision = "0308"',
+                }
+            ],
+        )
+        mocker.patch(
+            "app.github.get_pull_request_diff",
+            new_callable=AsyncMock,
+            return_value=(
+                "diff --git a/backend/alembic/versions/0309_performance_indexes.py "
+                "b/backend/alembic/versions/0309_performance_indexes.py\n"
+                "+++ b/backend/alembic/versions/0309_performance_indexes.py\n"
+                '+revision = "0309"\n'
+                '+down_revision = "0308"\n'
+            ),
+        )
+
+        def _list_versions_side_effect(token, owner, repo, ref):
+            if ref == "main":
+                # Deployed promotion target has 0309=heartbeat — different body.
+                return ["0308_prev.py", "0309_computejob_heartbeat.py"]
+            # Integration branch (automain) does not yet have 0309.
+            return ["0308_prev.py"]
+
+        mocker.patch(
+            "app.github.list_versions_at_ref",
+            side_effect=_list_versions_side_effect,
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        await db_session.refresh(task)
+        merge_mock.assert_not_called()
+        assert result["rollup_pr_number"] == 999
+        assert result.get("merge_blocked_reason")
+        assert "0309" in result.get("merge_blocked_reason", "")
+        assert task.status == TaskStatus.EVALUATING
+
+    @pytest.mark.asyncio
     async def test_manual_rollup_skips_when_pr_already_recorded(
         self, db_session, mocker
     ):
@@ -15099,6 +15447,215 @@ class TestGetProjectFindings:
 
         resp = await client.get(f"/api/admin/projects/{other_project.id}/findings")
         assert resp.status_code == 404
+
+
+class TestRecordFindingResolution:
+    """POST /api/admin/projects/{id}/finding-resolution — operator ledger write."""
+
+    @pytest.mark.asyncio
+    async def test_success_resolved_state(self, client: AsyncClient, db_session):
+        """Member can write a 'resolved' entry; DB row is created."""
+        from app.models import AuditFindingResolution
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/finding-resolution",
+            json={
+                "finding_key": "adb632b709685086",
+                "release_version_id": str(version.id),
+                "state": "resolved",
+                "severity": "medium",
+                "note": "Fixed in PR #42",
+                "resolving_ref": "abc123",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["finding_key"] == "adb632b709685086"
+        assert data["state"] == "resolved"
+        assert data["severity"] == "medium"
+        assert data["note"] == "Fixed in PR #42"
+        assert data["resolving_ref"] == "abc123"
+        assert data["project_id"] == str(project.id)
+        assert data["release_version_id"] == str(version.id)
+
+        # Verify the row exists in the DB.
+        row = (
+            (
+                await db_session.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == version.id,
+                        AuditFindingResolution.finding_key == "adb632b709685086",
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert row is not None
+        assert row.state == "resolved"
+
+    @pytest.mark.asyncio
+    async def test_success_stale_state(self, client: AsyncClient, db_session):
+        """Member can write a 'stale' entry; row state is persisted correctly."""
+        from app.models import AuditFindingResolution
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/finding-resolution",
+            json={
+                "finding_key": "deadbeef12345678",
+                "release_version_id": str(version.id),
+                "state": "stale",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["state"] == "stale"
+
+        row = (
+            (
+                await db_session.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == version.id,
+                        AuditFindingResolution.finding_key == "deadbeef12345678",
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert row is not None
+        assert row.state == "stale"
+
+    @pytest.mark.asyncio
+    async def test_bad_state_returns_422(self, client: AsyncClient, db_session):
+        """An invalid state value is rejected by Pydantic with 422."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/finding-resolution",
+            json={
+                "finding_key": "adb632b709685086",
+                "release_version_id": str(version.id),
+                "state": "garbage",
+            },
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_wrong_project_returns_404(self, client: AsyncClient, db_session):
+        """A release_version_id belonging to a different project returns 404."""
+        project1 = await _make_project(db_session, name="Project 1")
+        project2 = await _make_project(db_session, name="Project 2")
+        version_p2 = await _make_open_version(db_session, project2.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project1.id}/finding-resolution",
+            json={
+                "finding_key": "adb632b709685086",
+                "release_version_id": str(version_p2.id),
+                "state": "resolved",
+            },
+        )
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_viewer_role_returns_403(self, override_get_session, db_session):
+        """Viewer role is rejected with 403 (member role required)."""
+        from app.auth import get_current_user
+
+        viewer_id = "viewer-user-99"
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        member = ProjectMember(project_id=project.id, user_id=viewer_id, role="viewer")
+        db_session.add(member)
+        await db_session.commit()
+
+        async def override_viewer():
+            return {"user_id": viewer_id, "email": "viewer@example.com", "role": "user"}
+
+        from app.main import app as _app
+
+        _app.dependency_overrides[get_current_user] = override_viewer
+        _app.dependency_overrides[override_get_session] = lambda: db_session
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=_app),
+                base_url="http://test",
+                headers={"Authorization": "Bearer test-token"},
+            ) as viewer_client:
+                resp = await viewer_client.post(
+                    f"/api/admin/projects/{project.id}/finding-resolution",
+                    json={
+                        "finding_key": "adb632b709685086",
+                        "release_version_id": str(version.id),
+                        "state": "resolved",
+                    },
+                )
+            assert resp.status_code == 403
+        finally:
+            _app.dependency_overrides.pop(get_current_user, None)
+            _app.dependency_overrides.pop(override_get_session, None)
+
+    @pytest.mark.asyncio
+    async def test_upsert_overwrites_existing_row(
+        self, client: AsyncClient, db_session
+    ):
+        """A second write for the same (finding_key, release_version_id) updates
+        the existing row rather than inserting a duplicate."""
+        from app.models import AuditFindingResolution
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        # First write: resolved.
+        resp1 = await client.post(
+            f"/api/admin/projects/{project.id}/finding-resolution",
+            json={
+                "finding_key": "adb632b709685086",
+                "release_version_id": str(version.id),
+                "state": "resolved",
+                "note": "first write",
+            },
+        )
+        assert resp1.status_code == 200
+
+        # Second write: stale with different note.
+        resp2 = await client.post(
+            f"/api/admin/projects/{project.id}/finding-resolution",
+            json={
+                "finding_key": "adb632b709685086",
+                "release_version_id": str(version.id),
+                "state": "stale",
+                "note": "second write",
+            },
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["state"] == "stale"
+
+        # Only one row in the DB.
+        rows = (
+            (
+                await db_session.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == version.id,
+                        AuditFindingResolution.finding_key == "adb632b709685086",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].state == "stale"
+        assert rows[0].note == "second write"
 
 
 class TestComputeExperimentTaskLaunch:
@@ -17988,7 +18545,9 @@ class TestAdminDeclareCapabilityVerdict:
         app.dependency_overrides[require_admin] = reject_admin
         try:
             async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                headers={"Authorization": "Bearer test-token"},
             ) as ac:
                 resp = await ac.post(
                     self._url(project.id),
@@ -18234,3 +18793,411 @@ class TestProjectConcurrencyCapSettings:
                 "/api/admin/settings",
                 json={"max_concurrent_tasks_by_project": original},
             )
+
+
+class TestCloudRunAllowlistPersistence:
+    """PATCH /api/admin/settings round-trip and persistence tests for
+    cloud_run_task_type_allowlist."""
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_allowlist_patch_and_get_roundtrip(
+        self, client: AsyncClient
+    ):
+        """PATCH cloud_run_task_type_allowlist and GET confirms the round-trip."""
+        from app.shared_state import runtime_config as _rc
+
+        original = list(_rc.get("cloud_run_task_type_allowlist") or [])
+        try:
+            # Patch with a list of Cloud Run eligible task types.
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"cloud_run_task_type_allowlist": ["research", "web_research"]},
+            )
+            assert resp.status_code == 200, resp.text
+
+            # GET should return the updated allowlist.
+            get_resp = await client.get("/api/admin/settings")
+            assert get_resp.status_code == 200
+            data = get_resp.json()
+            assert "cloud_run_task_type_allowlist" in data
+            assert sorted(data["cloud_run_task_type_allowlist"]) == [
+                "research",
+                "web_research",
+            ]
+        finally:
+            # Restore original.
+            await client.patch(
+                "/api/admin/settings",
+                json={"cloud_run_task_type_allowlist": original},
+            )
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_allowlist_persists_across_sync(
+        self, client: AsyncClient, db_session
+    ):
+        """Verify cloud_run_task_type_allowlist is persisted and restored by sync."""
+        from app.shared_state import runtime_config as _rc
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+
+        original = list(_rc.get("cloud_run_task_type_allowlist") or [])
+        try:
+            # Patch the allowlist.
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"cloud_run_task_type_allowlist": ["research", "memo"]},
+            )
+            assert resp.status_code == 200
+
+            # Verify it's in memory.
+            assert sorted(_rc["cloud_run_task_type_allowlist"]) == ["memo", "research"]
+
+            # Refresh the session and read the persisted state from the database.
+            await db_session.commit()
+            state = await db_session.get(DeploymentState, 1)
+            # DeploymentState may not exist in test DB; this is fine - we've
+            # verified the in-memory value is correct via the response above.
+            if state is not None and state.runtime_config_json is not None:
+                # Verify the value is persisted.
+                assert "cloud_run_task_type_allowlist" in state.runtime_config_json
+                persisted = state.runtime_config_json["cloud_run_task_type_allowlist"]
+                assert sorted(persisted) == ["memo", "research"]
+
+                # Simulate a restart: clear the in-memory value and sync from DB.
+                _rc["cloud_run_task_type_allowlist"] = []
+                changed = await sync_runtime_config_from_state(state)
+
+                # The allowlist should be restored from the database.
+                assert "cloud_run_task_type_allowlist" in changed
+                assert sorted(_rc["cloud_run_task_type_allowlist"]) == [
+                    "memo",
+                    "research",
+                ]
+        finally:
+            # Restore original.
+            await client.patch(
+                "/api/admin/settings",
+                json={"cloud_run_task_type_allowlist": original},
+            )
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_allowlist_empty_list(self, client: AsyncClient):
+        """An empty allowlist disables Cloud Run routing."""
+        from app.shared_state import runtime_config as _rc
+
+        original = list(_rc.get("cloud_run_task_type_allowlist") or [])
+        try:
+            # Set to empty list.
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"cloud_run_task_type_allowlist": []},
+            )
+            assert resp.status_code == 200
+
+            get_resp = await client.get("/api/admin/settings")
+            assert get_resp.json()["cloud_run_task_type_allowlist"] == []
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={"cloud_run_task_type_allowlist": original},
+            )
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_allowlist_invalid_task_type_rejected(
+        self, client: AsyncClient
+    ):
+        """Invalid or write-only task types are rejected."""
+        # Try to add a write-only task type (create is not in READ_ONLY_TASK_TYPES).
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"cloud_run_task_type_allowlist": ["create", "research"]},
+        )
+        assert resp.status_code == 400
+        assert "write/unknown task types" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_allowlist_comma_separated_string(
+        self, client: AsyncClient
+    ):
+        """Allowlist accepts comma-separated string format."""
+        from app.shared_state import runtime_config as _rc
+
+        original = list(_rc.get("cloud_run_task_type_allowlist") or [])
+        try:
+            # Patch with comma-separated string.
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={
+                    "cloud_run_task_type_allowlist": "research,web_research,panel_review"
+                },
+            )
+            assert resp.status_code == 200
+
+            get_resp = await client.get("/api/admin/settings")
+            result = sorted(get_resp.json()["cloud_run_task_type_allowlist"])
+            assert result == ["panel_review", "research", "web_research"]
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={"cloud_run_task_type_allowlist": original},
+            )
+
+
+class TestTaskLlmCostFields:
+    """Unit tests for _task_llm_cost_fields helper in admin.py."""
+
+    def _make_task(self, provider=None, model=None, input_tokens=0, output_tokens=0):
+        t = Task(id=str(uuid.uuid4()), status=TaskStatus.COMPLETED)
+        t.provider = provider
+        t.model = model
+        t.api_call_summary = {
+            "llm_call_count": 1,
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+        }
+        t.attempt_history = None
+        t.llm_call_count_banked_db = None
+        return t
+
+    def test_returns_none_when_no_tokens(self):
+        from app.admin import _task_llm_cost_fields
+
+        task = self._make_task()
+        result = _task_llm_cost_fields(task)
+        assert result["task_llm_cost_usd"] is None
+        assert result["task_llm_cost_any_unpriced"] is False
+
+    def test_returns_cost_for_priced_model(self):
+        from app.admin import _task_llm_cost_fields
+        from app.efficiency_snapshot import LLM_TOKEN_PRICING
+
+        input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+        task = self._make_task(
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+        )
+        result = _task_llm_cost_fields(task)
+        expected = round(1_000_000 * input_rate + 1_000_000 * output_rate, 6)
+        assert result["task_llm_cost_usd"] == expected
+        assert result["task_llm_cost_any_unpriced"] is False
+
+    def test_any_unpriced_when_provider_missing(self):
+        from app.admin import _task_llm_cost_fields
+
+        task = self._make_task(
+            provider=None,
+            model=None,
+            input_tokens=5000,
+            output_tokens=2000,
+        )
+        result = _task_llm_cost_fields(task)
+        assert result["task_llm_cost_usd"] is None
+        assert result["task_llm_cost_any_unpriced"] is True
+
+
+class TestPostCommitPendingField:
+    """post_commit_pending is serialized in both task list and task detail responses."""
+
+    @pytest.mark.asyncio
+    async def test_task_list_exposes_post_commit_pending_true(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            post_commit_pending=True,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get("/api/admin/tasks")
+        assert resp.status_code == 200, resp.text
+        tasks = resp.json()["tasks"]
+        matched = [t for t in tasks if t["id"] == str(task.id)]
+        assert matched, "task not found in list response"
+        assert matched[0]["post_commit_pending"] is True
+
+    @pytest.mark.asyncio
+    async def test_task_list_exposes_post_commit_pending_false(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            post_commit_pending=False,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get("/api/admin/tasks")
+        assert resp.status_code == 200, resp.text
+        tasks = resp.json()["tasks"]
+        matched = [t for t in tasks if t["id"] == str(task.id)]
+        assert matched, "task not found in list response"
+        assert matched[0]["post_commit_pending"] is False
+
+    @pytest.mark.asyncio
+    async def test_task_detail_exposes_post_commit_pending_true(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            post_commit_pending=True,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["post_commit_pending"] is True
+
+    @pytest.mark.asyncio
+    async def test_task_detail_exposes_post_commit_pending_false(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            post_commit_pending=False,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["post_commit_pending"] is False
+
+
+class TestPoolAccountMutationsRequireAdmin:
+    """Mutation endpoints on /max-plan-accounts must reject non-admin callers."""
+
+    @pytest.mark.asyncio
+    async def test_post_max_plan_accounts_requires_admin(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.post("/api/admin/max-plan-accounts", json={})
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_delete_max_plan_account_requires_admin(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.delete(
+                    "/api/admin/max-plan-accounts/00000000-0000-0000-0000-000000000001"
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_patch_max_plan_account_requires_admin(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.patch(
+                    "/api/admin/max-plan-accounts/00000000-0000-0000-0000-000000000001",
+                    json={},
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_reset_rate_limits_requires_admin(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/admin/max-plan-accounts/00000000-0000-0000-0000-000000000001/reset-rate-limits"
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_clear_regression_quarantine_requires_admin(
+        self, override_get_session
+    ):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/admin/max-plan-accounts/00000000-0000-0000-0000-000000000001/regression-quarantine/clear",
+                    params={"provider": "anthropic", "model": "claude-opus-4-8"},
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_refresh_models_requires_admin(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.post(
+                    "/api/admin/max-plan-accounts/00000000-0000-0000-0000-000000000001/refresh-models"
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)

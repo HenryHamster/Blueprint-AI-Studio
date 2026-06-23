@@ -350,6 +350,14 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "promotion_conflict": qual.get("promotion_conflict"),
         "promotion_error_detail": qual.get("promotion_error_detail"),
         "theme_delivery": qual.get("theme_delivery"),
+        "goal_alignment": qual.get("goal_alignment"),
+        "blind_merge_grade": qual.get("blind_merge_grade"),
+        # Blind merge-grade goal-coverage verdict (dir d-c0fe439f): the operator
+        # sees the goal-coverage status, score, and the single biggest gap.
+        "merge_grade_status": qual.get("merge_grade_status"),
+        "merge_grade_coverage": qual.get("merge_grade_coverage"),
+        "merge_grade_biggest_gap": qual.get("merge_grade_biggest_gap"),
+        "merge_grade": qual.get("merge_grade"),
     }
 
 
@@ -425,6 +433,11 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "smoketest_detail": verdict.smoketest_detail,
         "audit_reconciliation": _vrecon_out,
         "audit_leg_proof": _v_audit_leg_proof,
+        # Blind merge-grade goal-coverage verdict (dir d-c0fe439f).
+        "merge_grade_status": verdict.merge_grade_status,
+        "merge_grade_coverage": verdict.merge_grade_coverage,
+        "merge_grade_biggest_gap": verdict.merge_grade_biggest_gap,
+        "merge_grade_detail": verdict.merge_grade_detail,
         "promotion_pr_url": verdict.promotion_pr_url,
         "promotion_conflict": verdict.promotion_conflict,
         "promotion_error_detail": verdict.promotion_error_detail,
@@ -442,6 +455,10 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "acceptance_aggregate": acceptance_aggregate,
         # Theme-delivery cert (additive; None on legacy rows predating migration 0305).
         "theme_delivery": verdict.theme_delivery,
+        # Goal-alignment cert (additive; None on legacy rows predating migration 0328).
+        "goal_alignment": verdict.goal_alignment,
+        # Blind merge-grade cert (additive; None on legacy rows predating migration 0327).
+        "blind_merge_grade": verdict.blind_merge_grade,
     }
 
 

@@ -35,6 +35,7 @@ class TaskType(str, Enum):
     self_audit = "self_audit"
     release_audit = "release_audit"
     release_audit_challenge = "release_audit_challenge"
+    release_merge_grade = "release_merge_grade"
     memo = "memo"
     verify_tests = "verify_tests"
     compute_experiment = "compute_experiment"
@@ -525,6 +526,24 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation="none",
     ),
     TaskCapability(
+        TaskType.release_merge_grade,
+        "Release Merge Grade",
+        "read_only",
+        description=(
+            "Blind goal-coverage grade: an uninvested agent grades the merged "
+            "diffs of a release version against the frozen version goal — blind "
+            "to the strategist running_update — and names the single biggest "
+            "thing not done toward the goal."
+        ),
+        run_shape="single_agent",
+        output_kind="verdict",
+        evaluation_strategy="review_only",
+        cost_ceiling_usd=4.0,
+        # No forward gate: the deterministic release qualifier consumes the
+        # merge-grade artifact directly as a hard promotion blocker.
+        evaluation="none",
+    ),
+    TaskCapability(
         TaskType.memo,
         "Memo",
         "read_only",
@@ -883,6 +902,14 @@ COMPUTE_SUBSTRATE_TASK_TYPES: frozenset[str] = frozenset(
     for capability in TASK_CAPABILITIES
     if capability.requires_compute and not capability.requires_code
 )
+# Canonical set of task types eligible for Cloud Run Jobs routing.
+# This is the static registry-derived set; intersection with the runtime
+# ``cloud_run_task_type_allowlist`` (default empty) determines which types are
+# actually routed to Cloud Run at dispatch time. All read-only types are
+# candidates — they never push a branch/PR, never need persistent disk, and
+# are the dominant idle-cost component. The intersection happens in
+# orchestrator.py; this set never imports runtime_config_state.
+CLOUD_RUN_CANDIDATE_TASK_TYPES: frozenset[str] = READ_ONLY_TASK_TYPES
 
 
 def runs_on_compute_substrate(task_type: str | TaskType | None) -> bool:

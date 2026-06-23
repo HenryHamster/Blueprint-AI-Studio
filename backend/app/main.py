@@ -24,11 +24,12 @@ from fastapi import (
     HTTPException,
     Request,
 )
-from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi.errors import RateLimitExceeded
+from app.csrf import CSRFMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from app.database import get_session, AsyncSessionLocal
@@ -93,7 +94,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0309"
+EXPECTED_SCHEMA_REVISION = "0330"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1289,12 +1290,14 @@ async def get_viewport_screenshot_download_url(
 ):
     """Signed download URL for a task-scoped viewport screenshot.
 
-    Three access paths:
-    - Agent JWT (x-agent-token header): validates token claims, returns JSON {"url": ...}.
+    Two access paths:
+    - Agent JWT (x-agent-token header): validates token project_id claim, returns JSON {"url": ...}.
+      Cross-task access is intentionally allowed within the same project so that review/fix
+      agents can download screenshots uploaded by the source implementer task.
     - Firebase-authenticated admin user: validates project access, returns JSON {"url": ...}.
-    - No token: returns a 302 redirect to the signed URL so operators can click
-      links from GitHub PR bodies without a bearer token. The signed URL itself
-      is the security boundary.
+
+    Unauthenticated requests are rejected with 401. Operators who need unauthenticated
+    access to screenshots should use GCS public object permissions on specific objects.
 
     The GCS object path mirrors what the agent uploads via
     POST /api/agent/viewport/screenshot-upload-url
@@ -1314,16 +1317,14 @@ async def get_viewport_screenshot_download_url(
         token_project_id = claims.get("project_id")
         if not token_task_id:
             raise HTTPException(status_code=403, detail="Agent token has no task scope")
-        if str(token_task_id) != str(task_id):
-            raise HTTPException(status_code=403, detail="Task mismatch")
+        # Project-scoped check only: review/fix agents need cross-task access to
+        # download screenshots from the source implementer task within the same project.
         if str(token_project_id) != str(project_id):
             raise HTTPException(status_code=403, detail="Project mismatch")
-        return_json = True
     elif current_user is not None:
         await _get_user_project(project_id, current_user["user_id"], session)
-        return_json = True
     else:
-        return_json = False
+        raise HTTPException(status_code=401, detail="Authentication required")
 
     _SAFE_NAME_RE = _re.compile(r"[^A-Za-z0-9._-]")
     safe_name = _SAFE_NAME_RE.sub("_", name)
@@ -1342,9 +1343,7 @@ async def get_viewport_screenshot_download_url(
         )
         raise HTTPException(status_code=503, detail="Artifact storage unavailable")
 
-    if return_json:
-        return {"url": url}
-    return RedirectResponse(url=url, status_code=302)
+    return {"url": url}
 
 
 @app.get(
@@ -1542,7 +1541,7 @@ async def prometheus_metrics(request: Request):
     """Prometheus-compatible metrics endpoint (text/plain exposition format).
 
     Unauthenticated by default. If METRICS_TOKEN env var is set, requires
-    ?token=<value> query param matching that value.
+    ?token=<value> query param matching that value (403 otherwise).
     """
     if _METRICS_TOKEN:
         token = request.query_params.get("token", "")
@@ -1839,6 +1838,8 @@ def _resolve_allowed_origins(env_value: str) -> list[str]:
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
 allowed_origins = _resolve_allowed_origins(allowed_origins_env)
 
+app.add_middleware(CSRFMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -1850,6 +1851,7 @@ app.add_middleware(
         "Accept",
         "Origin",
         "X-Requested-With",
+        "X-CSRF-Token",
     ],
 )
 

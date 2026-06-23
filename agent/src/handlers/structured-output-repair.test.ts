@@ -19,6 +19,7 @@ vi.mock('../telemetry.js', async (importOriginal) => {
   return {
     ...actual,
     recordFormatMiss: vi.fn(),
+    recordFormatRepairMiss: vi.fn(),
     recordFormatRepairAttempt: vi.fn(),
     recordFormatRepairSuccess: vi.fn(),
     recordFormatRepairInfraFailure: vi.fn(),
@@ -34,8 +35,9 @@ vi.mock('../telemetry.js', async (importOriginal) => {
 import { repairStructuredOutput, type RunResult } from './structured-output-repair.js';
 import { runClaudeCode } from '../index.js';
 import {
-  recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
+  recordFormatMiss, recordFormatRepairMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
   recordFormatRepairInfraFailure, recordFormatRepairTokens, getLlmTelemetry,
+  getFormatComplianceTelemetry, resetFormatComplianceTelemetry,
 } from '../telemetry.js';
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -424,10 +426,11 @@ describe('repairStructuredOutput', () => {
 
   // ── infra-failure classification (reopen exitCode !== 0) ─────────────────────
 
-  it('adopts valid output and records both infra failure and repair success when reopen exitCode is nonzero', async () => {
+  it('adopts valid output and records only infra failure (not success) when reopen exitCode is nonzero', async () => {
     // Reopen run exits non-zero (e.g. filesystem warning) but emits parseable
-    // output. The recovered value MUST be returned and repair success recorded —
-    // a non-zero exit does not invalidate valid structured output.
+    // output. The recovered value MUST be returned, but repair success must NOT
+    // be recorded. The backend formula excludes infra-failure attempts from the
+    // denominator; recording success here too would inflate the rate above 1.0.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 1, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
       codexTurnCompleted: false, stderrTail: 'process crashed',
@@ -442,10 +445,40 @@ describe('repairStructuredOutput', () => {
     expect(recordFormatRepairAttempt).toHaveBeenCalledTimes(1);
     expect(recordFormatRepairInfraFailure).toHaveBeenCalledTimes(1);
     expect(vi.mocked(recordFormatRepairInfraFailure).mock.calls[0]).toEqual(['design']);
-    // Value was valid — success is recorded even though exit was non-zero.
-    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
+    // Crash recovery must NOT increment the success counter.
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
     expect(res.value).toEqual({ summary: 'A concise summary.', reasoning: 'Detailed reasoning here.' });
     expect(res.retry?.exitCode).toBe(1);
+  });
+
+  it('crash-then-recover does not inflate self_repair_success_rate above 1.0', async () => {
+    // Simulate two tasks: one clean success (exitCode=0) and one crash-recover
+    // (exitCode=1 but valid output). The backend rate = successes / (attempts -
+    // infra_failures). With the fix: successes=1, attempts=2, infra_failures=1
+    // => rate = 1/(2-1) = 1.0, bounded. Without the fix: successes=2 => rate > 1.
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        // Task 1: clean reopen success
+        exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+        codexTurnCompleted: true, stderrTail: '',
+      })
+      .mockResolvedValueOnce({
+        // Task 2: crash but parseable output
+        exitCode: 1, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+        codexTurnCompleted: false, stderrTail: 'oom',
+      });
+
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json', lastResultText: '' })),
+    );
+    vi.clearAllMocks();
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json', lastResultText: '' })),
+    );
+
+    // Task 2: infra failure recorded, success NOT recorded
+    expect(recordFormatRepairInfraFailure).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
   });
 
   it('records only infra failure (not success) when reopen exitCode is nonzero and output is unparseable', async () => {
@@ -463,6 +496,97 @@ describe('repairStructuredOutput', () => {
     expect(recordFormatRepairSuccess).not.toHaveBeenCalled();
     expect(res.value).toBeNull();
     expect(res.retry?.exitCode).toBe(1);
+  });
+
+  // ── recordFormatRepairMiss: reopen failure reason tracking ────────────────────
+
+  it('records repair miss reason (missing_required_key) when reopen still yields no parseable value', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'still no json', lastResultText: 'nope',
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json first try', lastResultText: '' })),
+    );
+
+    expect(recordFormatRepairMiss).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairMiss).mock.calls[0][0]).toBe('missing_required_key');
+  });
+
+  it('records repair miss reason (parsed_object_schema_mismatch) when validateParsedValue rejects the retry value', async () => {
+    const parseableButRejected = JSON.stringify({ summary: 'ok', reasoning: 'ok' });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: parseableButRejected, lastResultText: parseableButRejected,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    await repairStructuredOutput({
+      ...baseOpts(makeFirst({ exitCode: 0, lastResultText: '', allOutput: 'no json' })),
+      validateParsedValue: () => ({
+        ok: false,
+        reason: 'parsed_object_schema_mismatch',
+        detail: 'sentinel rejection for test',
+      }),
+    });
+
+    expect(recordFormatRepairMiss).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordFormatRepairMiss).mock.calls[0][0]).toBe('parsed_object_schema_mismatch');
+  });
+
+  it('does NOT record repair miss when reopen succeeds', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    const res = await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json first try', lastResultText: '' })),
+    );
+
+    expect(recordFormatRepairSuccess).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairMiss).not.toHaveBeenCalled();
+    expect(res.value).not.toBeNull();
+  });
+
+  it('passes schemaLabel to recordFormatRepairMiss when reopen fails', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: 'still no json', lastResultText: 'nope',
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    await repairStructuredOutput({
+      ...baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json', lastResultText: '' })),
+      schemaLabel: 'thinker',
+    });
+
+    expect(vi.mocked(recordFormatRepairMiss).mock.calls[0]).toEqual(['missing_required_key', 'thinker']);
+  });
+
+  it('does NOT record repair miss on infra failure (exitCode !== 0) even when reopen output is unparseable', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 1, allOutput: '', lastResultText: '',
+      codexTurnCompleted: false, stderrTail: 'oom',
+    });
+
+    await repairStructuredOutput(
+      baseOpts(makeFirst({ exitCode: 0, allOutput: 'no json', lastResultText: '' })),
+    );
+
+    expect(recordFormatRepairInfraFailure).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairMiss).not.toHaveBeenCalled();
+  });
+
+  it('format_repair_miss_by_reason field is present in getFormatComplianceTelemetry snapshot', () => {
+    const snap = getFormatComplianceTelemetry();
+    expect(Object.prototype.hasOwnProperty.call(snap, 'format_repair_miss_by_reason')).toBe(true);
+    expect(typeof snap.format_repair_miss_by_reason).toBe('object');
+  });
+
+  it('resetFormatComplianceTelemetry clears format_repair_miss_by_reason', () => {
+    resetFormatComplianceTelemetry();
+    const snap = getFormatComplianceTelemetry();
+    expect(snap.format_repair_miss_by_reason).toEqual({});
   });
 
   it('does NOT record infra failure when reopen exitCode is zero but output is unparseable', async () => {

@@ -88,6 +88,26 @@ def test_compute_job_table_metadata_tracks_budgeted_compute_lifecycle():
     } <= index_names
 
 
+def test_task_llm_account_id_is_promoted_indexed_column():
+    """llm_account_id was promoted from Task.context JSONB to a dedicated,
+    indexed, nullable column so the orchestrator reconcile hot-loop can project
+    just this scalar instead of TOAST-fetching the full context blob
+    (D2 over-fetch fix, d-57436105)."""
+    table = Task.__table__
+
+    assert "llm_account_id" in table.columns
+    col = table.c.llm_account_id
+    assert col.nullable is True
+    # Indexed so the per-account active-task count scans the index, not the heap.
+    index_names = {idx.name for idx in table.indexes}
+    assert "ix_task_llm_account_id" in index_names
+    assert any(
+        list(idx.columns) == [col]
+        for idx in table.indexes
+        if idx.name == "ix_task_llm_account_id"
+    )
+
+
 def test_memo_stats_returns_zeros_when_metadata_empty():
     cycle = _make_cycle({})
     stats = cycle.memo_stats()

@@ -1,3 +1,20 @@
+/**
+ * Compute experiment handler — budgeted compute job provisioning and monitoring.
+ *
+ * Provisions a custom compute job (VM, container, or specialized hardware) with
+ * a specified budget and success criteria, monitors it to a terminal state
+ * (SUCCESS, FAILURE, TIMEOUT), and reports results. Compute jobs are durable
+ * resources that persist beyond a single task's lifetime; the handler polls
+ * backend ComputeJob endpoints until terminal state.
+ *
+ * Payload specifies compute_type (e.g., "vm", "gpu_job"), resource_config,
+ * setup_steps, run_command, and success_criteria (e.g., metric thresholds,
+ * exit codes). Used for data-intensive research, training runs, large-scale
+ * benchmarks, and other work that exceeds a single Claude Code task budget.
+ *
+ * Completes with COMPLETED/FAILED based on the compute job's terminal outcome.
+ */
+
 import type WebSocket from 'ws';
 import {
   strVal, sanitize, sendLog, persistAndPostStatus, apiPost,

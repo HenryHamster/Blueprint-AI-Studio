@@ -2178,7 +2178,16 @@ async def _process_post_commit(
                                 _dh_ok,
                                 _dh_reason,
                             ) = await enforce_premerge_migration_guard(
-                                gh_token, owner, repo, pr_number, base_branch
+                                gh_token,
+                                owner,
+                                repo,
+                                pr_number,
+                                base_branch,
+                                promotion_target=(
+                                    _shared_state.get_project_promotion_target(_project)
+                                    if _project is not None
+                                    else None
+                                ),
                             )
                             if not _dh_ok:
                                 logger.warning(
@@ -3415,12 +3424,22 @@ async def _process_post_commit(
                                                 enforce_premerge_migration_guard as _emg_pre,
                                             )
 
+                                            _pre_rollup_proj = await session.get(
+                                                Project, task.project_id
+                                            )
                                             _pre_rollup_mig_guard = await _emg_pre(
                                                 _pre_rollup_gh,
                                                 _pre_rollup_own,
                                                 _pre_rollup_rep,
                                                 _peek_pr_num,
                                                 _peek_base,
+                                                promotion_target=(
+                                                    _shared_state.get_project_promotion_target(
+                                                        _pre_rollup_proj
+                                                    )
+                                                    if _pre_rollup_proj is not None
+                                                    else None
+                                                ),
                                             )
                                     except Exception as _pre_exc:
                                         logger.debug(
@@ -3840,7 +3859,12 @@ async def _process_post_commit(
                                 _dh_ok,
                                 _dh_reason,
                             ) = await enforce_premerge_migration_guard(
-                                gh_token, owner, repo, pr_number, base_branch
+                                gh_token,
+                                owner,
+                                repo,
+                                pr_number,
+                                base_branch,
+                                promotion_target=_promotion_target,
                             )
                             if not _dh_ok:
                                 logger.warning(

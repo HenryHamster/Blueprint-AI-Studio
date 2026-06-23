@@ -3901,3 +3901,75 @@ def test_ci_backstop_reason_existing_branches_unaffected():
         review_loop={},
     )
     assert corrupt.startswith("ci_wait_started corrupt")
+
+
+def test_ci_backstop_reason_rollup_signals_surfaced_when_review_loop_empty():
+    """When both CI and review gates are open but review_loop has no merge
+    diagnostics (rollup parent path), _ci_backstop_timeout_reason should
+    surface the rollup-path signals from parent_ctx instead of the misleading
+    'merge_attempts=0' message."""
+    from app.services import _ci_backstop_timeout_reason
+
+    parent_ctx = {
+        "review_loop": {
+            "ci_wait_started": "2026-01-01T00:00:00",
+            "ci_passed": True,
+            "review_approved": True,
+        },
+        "_merge_deferred_state": "empty",
+        "_merge_deferred_count": 7,
+        "_merge_total_deferrals": 7,
+    }
+    review_loop = parent_ctx["review_loop"]
+
+    reason = _ci_backstop_timeout_reason(
+        ci_ws_val="2026-01-01T00:00:00",
+        ci_ws_valid=True,
+        ci_passed=True,
+        review_approved=True,
+        was_escalated=False,
+        review_summary=None,
+        review_loop=review_loop,
+        parent_ctx=parent_ctx,
+    )
+
+    assert "rollup merge deferred" in reason
+    assert "mergeable_state=empty" in reason
+    assert "deferred_count=7" in reason
+    assert "total_deferrals=7" in reason
+    # Must NOT report the misleading merge_attempts=0 message.
+    assert "merge_attempts=0" not in reason
+
+
+def test_ci_backstop_reason_rollup_signals_not_used_when_review_loop_has_state():
+    """When review_loop already has merge diagnostics (non-rollup path or a
+    rollup that wrote mergeable_state), parent_ctx signals must NOT override."""
+    from app.services import _ci_backstop_timeout_reason
+
+    review_loop = {
+        "ci_wait_started": "2026-01-01T00:00:00",
+        "ci_passed": True,
+        "review_approved": True,
+        "mergeable_state": "blocked",
+        "merge_in_progress_resets": 2,
+    }
+    parent_ctx = {
+        "_merge_deferred_state": "empty",
+        "_merge_deferred_count": 3,
+    }
+
+    reason = _ci_backstop_timeout_reason(
+        ci_ws_val="2026-01-01T00:00:00",
+        ci_ws_valid=True,
+        ci_passed=True,
+        review_approved=True,
+        was_escalated=False,
+        review_summary=None,
+        review_loop=review_loop,
+        parent_ctx=parent_ctx,
+    )
+
+    # review_loop state takes priority.
+    assert "mergeable_state=blocked" in reason
+    assert "merge_attempts=2" in reason
+    assert "rollup merge deferred" not in reason

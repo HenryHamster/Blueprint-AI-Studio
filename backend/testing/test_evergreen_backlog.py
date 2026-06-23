@@ -1477,3 +1477,56 @@ async def test_evergreen_fill_decision_retention_sweep_purges_only_stale_rows(
     assert len(remaining) == 3
     for row in remaining:
         assert row.ts >= (now - timedelta(days=retention_days))
+
+
+# --------------------------------------------------------------------------- #
+# Projection invariant — guards against re-adding heavy JSONB to fleet scan.
+# --------------------------------------------------------------------------- #
+
+
+def test_evergreen_fleet_scan_projection_excludes_heavy_columns():
+    """The check_evergreen_fill Project query must exclude vision and running_update.
+
+    These are the heaviest unused JSONB/Text columns on Project rows.
+    Re-adding them would reintroduce the over-fetch this projection removes.
+    """
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.orm import load_only
+    from sqlmodel import select
+    from app.models import Project
+
+    # Reconstruct the load_only options used in check_evergreen_fill.
+    _project_cols = load_only(
+        Project.id,
+        Project.directions,
+        Project.build_config,
+        Project.integration_branch,
+        Project.is_self_repo,
+        Project.github_repo,
+        Project.promotion_target,
+        raiseload=True,
+    )
+    stmt = (
+        select(Project)
+        .where(
+            Project.autonomous_enabled.is_(True),
+            Project.paused.is_(False),
+            Project.not_archived(),
+        )
+        .options(_project_cols)
+    )
+    sql_text = str(stmt.compile(dialect=postgresql.dialect()))
+
+    # Heavy columns that must NOT appear in the projected SELECT list.
+    for heavy in ("vision", "running_update", "problem_model", "self_reflection_log"):
+        assert heavy not in sql_text, (
+            f"Evergreen fleet-scan projection must exclude '{heavy}' — "
+            "re-adding it reintroduces the over-fetch this projection removes."
+        )
+
+    # Columns required by the downstream helpers.
+    for required in ("directions", "build_config", "integration_branch"):
+        assert required in sql_text, (
+            f"Evergreen fleet-scan projection must include '{required}' — "
+            "removing it will cause a raiseload error in the fill loop."
+        )

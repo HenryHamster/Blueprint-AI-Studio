@@ -4947,7 +4947,7 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
             "key": "systems/database",
             "value": {
                 "name": "Database",
-                "modules": ["backend/app/db.py", "backend/app/models.py"],
+                "modules": ["backend/app/database.py", "backend/app/models.py"],
             },
         },
         headers=headers,
@@ -4957,7 +4957,7 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
     await db_session.refresh(project)
     idx = project.design_doc["_file_to_system"]
     assert idx["backend/app/auth.py"] == "auth"
-    assert idx["backend/app/db.py"] == "database"
+    assert idx["backend/app/database.py"] == "database"
     # last-write-wins for shared file: database set second
     assert idx["backend/app/models.py"] == "database"
 
@@ -4988,7 +4988,7 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
     await db_session.refresh(project)
     idx = project.design_doc["_file_to_system"]
     assert "backend/app/auth.py" not in idx
-    assert idx["backend/app/db.py"] == "database"
+    assert idx["backend/app/database.py"] == "database"
 
 
 @pytest.mark.asyncio
@@ -19360,68 +19360,6 @@ async def test_viewport_screenshot_upload_url_cap_enforced(
     assert "cap" in resp.json()["error"]["message"].lower()
 
 
-@pytest.mark.asyncio
-async def test_viewport_shots_download_url(
-    unauthenticated_client: AsyncClient, db_session, mocker
-):
-    """Admin download endpoint redirects to a signed GCS URL (unauthenticated, 302)."""
-    project = Project(name="VP Shot Download Test", user_id="user-vpshot-dl-001")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    import uuid as _uuid
-
-    task_id = _uuid.uuid4()
-    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/signed-dl?X-Goog-Signature=xyz"
-
-    mocker.patch(
-        "app.storage.generate_download_signed_url",
-        new=AsyncMock(return_value=fake_url),
-    )
-
-    resp = await unauthenticated_client.get(
-        "/api/admin/viewport-shots/download-url",
-        params={
-            "project_id": str(project.id),
-            "task_id": str(task_id),
-            "name": "TaskCard-375-before",
-        },
-    )
-    assert resp.status_code == 302
-    assert resp.headers["location"] == fake_url
-
-
-@pytest.mark.asyncio
-async def test_viewport_shots_download_url_unauthenticated_succeeds(
-    unauthenticated_client: AsyncClient, db_session, mocker
-):
-    """Endpoint is public: no auth token required to follow a PR-body view link."""
-    project = Project(name="VP Shot Download Auth Test", user_id="user-vpshot-dl-002")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    import uuid as _uuid
-
-    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/public?X-Goog-Signature=pub"
-    mocker.patch(
-        "app.storage.generate_download_signed_url",
-        new=AsyncMock(return_value=fake_url),
-    )
-
-    resp = await unauthenticated_client.get(
-        "/api/admin/viewport-shots/download-url",
-        params={
-            "project_id": str(project.id),
-            "task_id": str(_uuid.uuid4()),
-            "name": "TaskCard-375-before",
-        },
-    )
-    assert resp.status_code == 302
-    assert resp.headers["location"] == fake_url
-
-
 # ---------------------------------------------------------------------------
 # Agent-token viewport download endpoints
 # ---------------------------------------------------------------------------
@@ -23534,10 +23472,14 @@ async def test_admin_viewport_shots_download_url_agent_token(
 
 
 @pytest.mark.asyncio
-async def test_admin_viewport_shots_download_url_agent_token_cross_task_rejected(
+async def test_admin_viewport_shots_download_url_agent_token_cross_task_allowed(
     client: AsyncClient, db_session, mocker
 ):
-    """Agent JWT scoped to task_a cannot download screenshots for task_b via the ADMIN endpoint."""
+    """Agent JWT scoped to task_a CAN download screenshots for task_b within the same project.
+
+    Cross-task access is intentionally permitted so that review/fix agents can fetch
+    screenshots uploaded by the source implementer task without needing a separate token.
+    """
     project = Project(
         name="Admin VP Shot DL Agent JWT Cross", user_id="user-admin-vp-shot-jwt-002"
     )
@@ -23562,7 +23504,15 @@ async def test_admin_viewport_shots_download_url_agent_token_cross_task_rejected
     await db_session.refresh(task_a)
     await db_session.refresh(task_b)
 
-    # Token is for task_a; request asks for task_b's screenshots
+    fake_url = (
+        "https://storage.googleapis.com/bucket/admin-vp-shot-dl-cross?X-Goog-Signature=cross"
+    )
+    mocker.patch(
+        "app.storage.generate_download_signed_url",
+        new=AsyncMock(return_value=fake_url),
+    )
+
+    # Token is for task_a; request asks for task_b's screenshots — same project, should be allowed
     token = create_agent_token(
         str(task_a.id), "vm-admin-vp-shot-jwt-cross-001", project_id=str(project.id)
     )
@@ -23575,19 +23525,64 @@ async def test_admin_viewport_shots_download_url_agent_token_cross_task_rejected
         },
         headers={"x-agent-token": token},
     )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_admin_viewport_shots_download_url_agent_token_cross_project_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """Agent JWT scoped to project_a is rejected when requesting screenshots from project_b."""
+    project_a = Project(
+        name="Admin VP Shot DL Agent JWT XProj A", user_id="user-admin-vp-shot-jwt-003"
+    )
+    project_b = Project(
+        name="Admin VP Shot DL Agent JWT XProj B", user_id="user-admin-vp-shot-jwt-004"
+    )
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(
+        project_id=project_a.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix a"}],
+        vm_instance_id="vm-admin-vp-shot-jwt-xproj-001",
+    )
+    task_b = Task(
+        project_id=project_b.id,
+        status="EVALUATING",
+        payloads=[{"type": "fix", "prompt": "fix b"}],
+        vm_instance_id="vm-admin-vp-shot-jwt-xproj-002",
+    )
+    db_session.add_all([task_a, task_b])
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # Token is for project_a/task_a; request asks for project_b/task_b — must be rejected
+    token = create_agent_token(
+        str(task_a.id), "vm-admin-vp-shot-jwt-xproj-001", project_id=str(project_a.id)
+    )
+    resp = await client.get(
+        "/api/admin/viewport-shots/download-url",
+        params={
+            "project_id": str(project_b.id),
+            "task_id": str(task_b.id),
+            "name": "HeroSection-1280-after",
+        },
+        headers={"x-agent-token": token},
+    )
     assert resp.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_admin_viewport_shots_download_url_no_auth_redirect(
+async def test_admin_viewport_shots_download_url_no_auth_rejected(
     unauthenticated_client: AsyncClient, db_session, mocker
 ):
-    """No-auth browser request gets a 302 redirect (operator clicking a PR-body link).
-
-    The endpoint intentionally returns a redirect for unauthenticated requests so
-    operators can follow links from GitHub PR bodies directly in their browser.
-    The JWT path (agent → JSON) is covered by test_admin_viewport_shots_download_url_agent_token.
-    """
+    """No-auth request is rejected with 401 — the unauthenticated redirect path was removed."""
     project = Project(
         name="Admin VP Shot No-Auth Test", user_id="user-admin-vp-shot-no-auth-001"
     )
@@ -23605,14 +23600,6 @@ async def test_admin_viewport_shots_download_url_no_auth_redirect(
     await db_session.commit()
     await db_session.refresh(task)
 
-    fake_url = "https://storage.googleapis.com/bucket/viewport-shots/test?X-Goog-Signature=fake"
-    mocker.patch(
-        "app.storage.generate_download_signed_url",
-        new=AsyncMock(return_value=fake_url),
-    )
-
-    # No authentication => 302 redirect (unauthenticated_client has no get_current_user_optional
-    # override, so the dependency returns None and return_json stays False)
     resp = await unauthenticated_client.get(
         "/api/admin/viewport-shots/download-url",
         params={
@@ -23621,8 +23608,7 @@ async def test_admin_viewport_shots_download_url_no_auth_redirect(
             "name": "TestPanel-375-before",
         },
     )
-    assert resp.status_code == 302
-    assert resp.headers["location"] == fake_url
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -23669,3 +23655,91 @@ async def test_admin_viewport_shots_download_url_firebase_user_returns_json(
     )
     assert resp.status_code == 200
     assert resp.json()["url"] == fake_url
+
+
+@pytest.mark.asyncio
+async def test_sr_analytics_sibling_isolation_after_rollback(
+    client: AsyncClient, db_session, mocker
+):
+    """A rollback in one SR-analytics call must not poison sibling calls.
+
+    Regression: when compute_review_effectiveness raised and triggered
+    session.rollback(), the shared high_iter_rows ORM objects were expired.
+    Sibling calls (compute_sr_false_attestation_trends, etc.) then accessed
+    expired attributes, hitting MissingGreenlet / raiseload=True failures.
+
+    With the fix (expunge before analytics block), the rows are detached before
+    any analytics call so rollbacks cannot expire their loaded attributes.
+    """
+    project = Project(name="SR Sibling Isolation", user_id="test-user-sr-sib")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # History task with identifiable context data the sibling call will read.
+    history_task = Task(
+        project_id=project.id,
+        title="Past create task",
+        payloads=[{"type": "create", "prompt": "Build something"}],
+        vm_instance_id="agent-vm-sr-sib-history",
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {
+                "check_results": {
+                    "regression_risk": {"passed": True, "severity": "major"},
+                }
+            }
+        },
+    )
+    db_session.add(history_task)
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Claim SR sibling test",
+        payloads=[{"type": "create", "prompt": "Create something"}],
+        vm_instance_id="agent-vm-sr-sib-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    # Patch the FIRST analytics function to raise, triggering session.rollback().
+    mocker.patch(
+        "app.review_learning.compute_review_effectiveness",
+        side_effect=RuntimeError("simulated first-analytics failure"),
+    )
+
+    # Capture the all_tasks argument received by a SIBLING analytics call.
+    captured_all_tasks: list = []
+
+    async def _capture_and_return(project_id, session, all_tasks):
+        captured_all_tasks.extend(all_tasks)
+        return None
+
+    mocker.patch(
+        "app.sr_analytics.compute_sr_false_attestation_trends",
+        side_effect=_capture_and_return,
+    )
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-sr-sib-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    # Sibling analytics must have been called with at least the history task.
+    assert len(captured_all_tasks) >= 1, (
+        "compute_sr_false_attestation_trends was never called — "
+        "sibling may have raised before reaching this point"
+    )
+
+    # All captured rows must have intact, readable attributes — not expired ORM
+    # objects that would raise on attribute access (MissingGreenlet / raiseload).
+    for t in captured_all_tasks:
+        ctx = t.context  # must not raise
+        fp = t.first_payload  # accesses t.payloads (load_only'd) — must not raise
+        assert isinstance(ctx, (dict, type(None))), (
+            f"context is not a dict/None after sibling rollback: {type(ctx)}"
+        )
+        assert isinstance(fp, dict), (
+            f"first_payload is not a dict after sibling rollback: {type(fp)}"
+        )

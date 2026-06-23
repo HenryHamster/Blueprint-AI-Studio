@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from dataclasses import dataclass
 from typing import Any
 
 from app.ci_resolution import (
@@ -25,109 +24,6 @@ from app.ci_resolution import (
 from app.migration_reconciliation import AUTHORIZED_DIVERGENCES
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class AuthorizedTestDeletion:
-    """A test-file deletion that the qualifier treats as non-erosion.
-
-    Each entry requires three documentation fields so the allowlist cannot be
-    widened silently — ``test_invariants.py::test_authorized_test_deletions_require_documentation``
-    enforces their presence in CI.
-    """
-
-    path_suffix: str  # file basename or path suffix matched against deleted test paths
-    co_deleted_subject: str  # the module/file/function co-deleted with this test
-    commit_ref: str  # commit SHA or ref where the deletion was made
-    rationale: str  # why this deletion is safe (non-erosion)
-
-
-# Authorized dead-code test deletions.  Mirrors the AUTHORIZED_DIVERGENCES
-# pattern in migration_reconciliation.py.  A deleted test file whose path ends
-# with any entry's path_suffix is excluded from the hard-blocker gate so a
-# clean dead-code removal does not veto a promotion.
-#
-# Entry criteria: the test file must have zero live callers / test subjects
-# remaining in the candidate (the code it exercised was also co-deleted), AND
-# the deletion must be explicitly authorized here so it cannot silently suppress
-# a genuine test-erosion signal.
-AUTHORIZED_TEST_DELETIONS: tuple[AuthorizedTestDeletion, ...] = (
-    AuthorizedTestDeletion(
-        path_suffix="viewportRegression.test.ts",
-        co_deleted_subject="viewportRegression.ts (parseViewportSubkey)",
-        commit_ref="3085d8d8",
-        rationale="parseViewportSubkey had zero production callers; test and subject co-deleted together.",
-    ),
-    # v17 "visual verification pilot" dark-feature cut.  The pilot's audit
-    # endpoint (/api/admin/visual-pilot-status) always reported 0 pairs
-    # inspected because the field it aggregated was never written by any code
-    # path — the feature was built but never wired to a writer.  The v17
-    # candidate (commit 7547d74) co-deletes both modules together with their
-    # tests; these two entries authorize the *test* deletions so the promotion
-    # gate does not veto a clean dead-code removal.  Authored on the candidate
-    # itself, but the qualifier reads this allowlist from DEPLOYED main, so the
-    # entries must live here for the candidate to qualify (mirrors the v14
-    # viewportRegression hotfix #10772).
-    AuthorizedTestDeletion(
-        path_suffix="test_visual_verification_audit.py",
-        co_deleted_subject="visual_verification_audit.py (aggregate_visual_pilot, VisualPilotAggregates)",
-        commit_ref="7547d74",
-        rationale="Dark feature cut: visual_verification_audit.py had zero live writers; the field it aggregated was never written by any code path, so 0 pairs inspected permanently. Entire module and its tests co-deleted.",
-    ),
-    AuthorizedTestDeletion(
-        path_suffix="VisualVerificationPilotPanel.viewport.test.tsx",
-        co_deleted_subject="VisualVerificationPilotPanel.tsx (VisualVerificationPilotPanel component)",
-        commit_ref="7547d74",
-        rationale="Dark feature cut: VisualVerificationPilotPanel consumed the always-zero /api/admin/visual-pilot-status endpoint. Component and its viewport tests co-deleted.",
-    ),
-)
-
-def _get_lifecycle_bounded_authorized_deletions() -> tuple[AuthorizedTestDeletion, ...]:
-    """Return only the currently-active AUTHORIZED_TEST_DELETIONS entries.
-
-    Entries are considered active only when their co-deleted subject code is
-    actually deleted from the working tree. If a subject file has been restored
-    (re-added to the repo), the entry is considered "spent" and must be removed
-    from the allowlist — otherwise it becomes a permanent gate-bypass hole.
-
-    This ensures that each entry has a finite lifecycle: it is active only while
-    the code it authorized for deletion remains deleted, and must be removed if
-    that code is ever restored or the circumstances change.
-    """
-    from pathlib import Path
-
-    # Anchor to the repo root (backend/app/release_scoring.py -> repo root is 3 levels up).
-    _repo_root = Path(__file__).parent.parent.parent
-
-    active: list[AuthorizedTestDeletion] = []
-    for entry in AUTHORIZED_TEST_DELETIONS:
-        # Parse the co_deleted_subject to find file paths mentioned.
-        # Expected format: "filename.ext (functionName)" or "filename.ext"
-        subject_str = entry.co_deleted_subject.strip()
-        # Extract the first token which is typically the filename.
-        file_part = subject_str.split()[0] if subject_str else ""
-
-        # Check if the subject file exists in the working tree. If it does,
-        # the entry is "spent" (the code came back) and should not be active.
-        if file_part:
-            # Search recursively in common top-level directories from the repo root
-            # so files nested in subdirectories (e.g. admin-ui/src/utils/foo.ts) are found.
-            found = any(
-                any((_repo_root / base_dir).rglob(file_part))
-                for base_dir in ("admin-ui", "backend", "agent")
-            )
-            if not found:
-                # Also check if file_part is a full relative path from repo root.
-                found = (_repo_root / file_part).exists()
-
-            # If none of the expected paths exist, the entry is active (code is deleted).
-            if not found:
-                active.append(entry)
-        else:
-            # Malformed entry, keep it for now (the documentation test will catch it)
-            active.append(entry)
-
-    return tuple(active)
 
 
 # Hardcoded fallback used when promotion_policy.yaml is missing, unreadable, or
@@ -152,6 +48,93 @@ def _clamp01(value: float) -> float:
     return v
 
 
+# Default coverage threshold used ONLY when the merge-grade artifact omits an
+# explicit ``covers_goal`` boolean but does report a numeric ``coverage_score``.
+# The agent's explicit boolean is authoritative when present.
+_MERGE_GRADE_COVERAGE_THRESHOLD = 0.5
+
+
+def evaluate_merge_grade(
+    goal: str | None,
+    artifact: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Normalise a blind merge-grade artifact into a goal-coverage verdict.
+
+    Pure / deterministic — the qualifier reads the ``RELEASE_MERGE_GRADE``
+    artifact and passes (goal, artifact) here.  Semantics:
+
+      * ``goal`` empty / unset → ``status="not_applicable"`` (nothing to grade
+        against).  The gate is a no-op PASS: ``blocked`` False.
+      * ``artifact`` not a usable dict, or carries neither an explicit
+        ``covers_goal`` bool nor a numeric ``coverage_score`` → ``status=
+        "unparseable"``.  The caller routes this to a HOLD (infra_failure) — a
+        required grade that produced no usable verdict must not silently pass.
+      * an explicit ``covers_goal`` bool is authoritative; otherwise a numeric
+        ``coverage_score`` is thresholded at ``_MERGE_GRADE_COVERAGE_THRESHOLD``.
+        ``covers_goal`` True → ``status="pass"``, ``blocked`` False; False →
+        ``status="fail"``, ``blocked`` True (the hard promotion blocker).
+
+    Returns ``{status, covers_goal, coverage, biggest_gap, blocked, detail}``.
+    ``status`` is one of ``pass`` | ``fail`` | ``not_applicable`` |
+    ``unparseable``.
+    """
+    goal_text = (goal or "").strip()
+    if not goal_text:
+        return {
+            "status": "not_applicable",
+            "covers_goal": None,
+            "coverage": None,
+            "biggest_gap": None,
+            "blocked": False,
+            "detail": None,
+        }
+    if not isinstance(artifact, dict):
+        return {
+            "status": "unparseable",
+            "covers_goal": None,
+            "coverage": None,
+            "biggest_gap": None,
+            "blocked": True,
+            "detail": None,
+        }
+
+    raw_covers = artifact.get("covers_goal")
+    raw_score = artifact.get("coverage_score")
+    coverage: float | None = None
+    if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool):
+        coverage = _clamp01(raw_score)
+
+    if isinstance(raw_covers, bool):
+        covers_goal = raw_covers
+    elif coverage is not None:
+        covers_goal = coverage >= _MERGE_GRADE_COVERAGE_THRESHOLD
+    else:
+        # Neither an explicit boolean nor a numeric score → no usable verdict.
+        return {
+            "status": "unparseable",
+            "covers_goal": None,
+            "coverage": coverage,
+            "biggest_gap": None,
+            "blocked": True,
+            "detail": artifact,
+        }
+
+    biggest_gap_raw = artifact.get("biggest_gap")
+    biggest_gap = (
+        str(biggest_gap_raw).strip()[:_FINDING_SUMMARY_MAX]
+        if biggest_gap_raw not in (None, "")
+        else None
+    )
+    return {
+        "status": "pass" if covers_goal else "fail",
+        "covers_goal": covers_goal,
+        "coverage": coverage,
+        "biggest_gap": biggest_gap,
+        "blocked": not covers_goal,
+        "detail": artifact,
+    }
+
+
 def compute_composite(
     ci_green: bool,
     audit_score: float,
@@ -165,6 +148,8 @@ def compute_composite(
     migration_collision: bool = False,
     migration_apply_blocked: bool = False,
     theme_delivery_blocked: bool = False,
+    merge_grade_blocked: bool = False,
+    merge_grade_misses: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -307,6 +292,16 @@ def compute_composite(
         # raised theme_block_threshold above 0.0 to arm hard-blocking.
         # Ships dark by default (threshold=0.0 never fires).
         blocker = "theme_delivery_shortfall"
+    elif merge_grade_misses:
+        # The armable-dark blind-grade gate: coverage_verdict == "misses" AND the
+        # operator has raised merge_grade_block_threshold above 0.0.  Distinct from
+        # the child-task gate (covers_goal == False) so operators see the right label.
+        blocker = "merge_grade_misses"
+    elif merge_grade_blocked:
+        # The child-task merge-grade gate: the uninvested agent graded the merged
+        # DIFFS against the frozen version.goal and found they do NOT advance the
+        # goal (covers_goal == False).
+        blocker = "merge_grade_goal_coverage"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.
@@ -481,7 +476,10 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
 
     Returns ``audit_score`` (None when report is absent/unusable) and a
     ``test_erosion_score`` in [0,1] where 1.0 == no erosion.  ``test_erosion``
-    is None — the hard-blocker sentinel — when the diff deleted a test file.
+    is None — the hard-blocker sentinel — when any deleted test file is classified as
+    ``genuine_erosion``, absent, or ambiguous (via ``report["deleted_test_file_classifications"]``).
+    The gate is fail-CLOSED: only an explicit ``dead_code_removal`` classification passes;
+    absent, ambiguous, or ``genuine_erosion`` classifications all hard-block.
     A net reduction in tests or assertions applies a graded penalty.
     """
     if not isinstance(report, dict):
@@ -559,22 +557,37 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
 
     deleted = erosion.get("deleted_test_files")
     if isinstance(deleted, list) and len(deleted) > 0:
-        # Exclude authorized dead-code deletions (anchored path-suffix match:
-        # requires a '/' before the suffix so that e.g. "evilFoo.test.ts"
-        # does not accidentally authorize "Foo.test.ts").
-        # Use only the lifecycle-bounded (currently-active) authorized deletions
-        # to prevent spent entries from becoming permanent gate-bypass holes.
-        active_deletions = _get_lifecycle_bounded_authorized_deletions()
-        unauthorized = [
-            f
-            for f in deleted
-            if not any(
-                str(f) == entry.path_suffix or str(f).endswith("/" + entry.path_suffix)
-                for entry in active_deletions
-            )
-        ]
-        if unauthorized:
-            # Hard blocker — any non-authorized deleted test file forces a non-promote.
+        # Per-file LLM classification replaces the old hardcoded
+        # AUTHORIZED_TEST_DELETIONS allowlist (which required a backend deploy to
+        # widen).  The release audit agent classifies each deterministically-
+        # detected deleted test file as either ``dead_code_removal`` (subject
+        # code co-deleted or zero remaining callers) or ``genuine_erosion`` (the
+        # subject is demonstrably still present and the test was removed to stop
+        # failing tests from blocking a build).
+        #
+        # Disposition is FAIL-CLOSED: every deleted test file must carry an
+        # explicit ``dead_code_removal`` classification to pass.  An absent,
+        # empty, or ambiguous classification blocks just like ``genuine_erosion``
+        # — the caller must provide a positive authorisation, not rely on silence.
+        # ``dead_code_removal`` is the only non-blocking outcome; all other
+        # values (including the empty string from a missing key) hard-block.
+        #
+        # The candidate-bound per-file classification path introduced in 84b965a9
+        # is preserved: the gate reads ``deleted_test_file_classifications`` from
+        # the audit report at scoring time, so the deadlock that afflicted the
+        # old AUTHORIZED_TEST_DELETIONS allowlist (which required a backend
+        # deploy to widen) cannot return.
+        classifications: dict[str, str] = {}
+        raw_cls = report.get("deleted_test_file_classifications")
+        if isinstance(raw_cls, list):
+            for item in raw_cls:
+                if isinstance(item, dict) and isinstance(item.get("path"), str):
+                    classifications[item["path"]] = str(item.get("classification", ""))
+        for f in deleted:
+            cls = classifications.get(str(f), "")
+            if cls == "dead_code_removal":
+                continue  # explicit non-erosion authorisation — allow
+            # genuine_erosion or absent/ambiguous — hard block
             return audit_score, None
 
     # Graded penalty for net assertion / test-count reduction.  Each negative

@@ -8,7 +8,7 @@ into its own router seam; behavior and contracts are unchanged.
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
@@ -874,6 +874,27 @@ async def test_agent_fetch_message_too_short_ref_fails_loudly(
 
 
 @pytest.mark.asyncio
+async def test_agent_fetch_message_non_hex_ref_returns_400(
+    client: AsyncClient, db_session
+):
+    """A ref with non-hex characters (wildcards, letters outside a-f) is rejected (400)."""
+    project, task = await _make_project_task(db_session)
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    # Test with a wildcard character '%' — must not be treated as a LIKE wildcard
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/deadbeef%",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 400, res.text
+    # Test with underscore wildcard '_'
+    res2 = await client.get(
+        f"/api/agent/projects/{project.id}/messages/deadbeef_",
+        headers={"x-agent-token": token},
+    )
+    assert res2.status_code == 400, res2.text
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_message_cross_project_not_found(
     client: AsyncClient, db_session
 ):
@@ -1440,6 +1461,96 @@ async def test_agent_fetch_qualification_rejects_cross_project(
     assert res.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_includes_goal_alignment(
+    client: AsyncClient, db_session
+):
+    """QualificationVerdict with goal_alignment set surfaces assessed_grade/state/biggest_gap."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qa-goal"
+    )
+
+    goal_alignment_data = {
+        "assessed_grade": 0.75,
+        "state": "shortfall",
+        "biggest_gap": "Auth improvements not addressed",
+        "reasoning_summary": "Three of five goal areas covered; auth work missing.",
+    }
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="aabbccdd" * 5,
+        confidence=0.8,
+        terminal_status="dry_run",
+        audit_findings=[],
+        goal_alignment=goal_alignment_data,
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(verdict)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "qualification_verdict"
+    ga = body["goal_alignment"]
+    assert ga is not None
+    assert ga["assessed_grade"] == pytest.approx(0.75)
+    assert ga["state"] == "shortfall"
+    assert ga["biggest_gap"] == "Auth improvements not addressed"
+    assert (
+        ga["reasoning_summary"]
+        == "Three of five goal areas covered; auth work missing."
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_goal_alignment_in_fallback(
+    client: AsyncClient, db_session
+):
+    """goal_alignment in last_qualification JSONB is surfaced on the fallback path."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qa-goal-fb"
+    )
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    version.last_qualification = {
+        "status": "not_promoted",
+        "confidence": 0.5,
+        "candidate_sha": "cafebabe" * 5,
+        "goal_alignment": {
+            "assessed_grade": 0.6,
+            "state": "shortfall",
+            "biggest_gap": "Performance work incomplete",
+            "reasoning_summary": "Goal partially met.",
+        },
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "last_qualification"
+    ga = body["goal_alignment"]
+    assert ga is not None
+    assert ga["assessed_grade"] == pytest.approx(0.6)
+    assert ga["biggest_gap"] == "Performance work incomplete"
+
+
 # ---------------------------------------------------------------------------
 # audit-finding-resolution endpoint tests
 # ---------------------------------------------------------------------------
@@ -1837,3 +1948,278 @@ async def test_audit_finding_resolution_rejects_stale_task_version(
         .first()
     )
     assert row is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_message_ref DB-side prefix filter tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_message_ref_python_side_filter_within_recent_window(
+    client: AsyncClient, db_session
+):
+    """resolve_message_ref fetches all project message IDs (no recency cap),
+    matches the prefix in Python, then loads the full row for any hit.
+
+    Strategy: create a target message and several non-target messages all with
+    the same 8-char hex prefix; the target is distinguishable by a longer
+    (24-char) prefix.  The target is found and the unique prefix resolves
+    unambiguously regardless of creation order.
+    """
+    import uuid as _uuid
+
+    project, task = await _make_project_task(db_session, vm="agent-vm-pyfilter")
+
+    base_ts = datetime(2026, 1, 1, 12, 0, 0)
+
+    # All messages share a common 8-hex prefix.
+    common_prefix = "bb000000"
+    # Create 10 non-target messages with a different suffix pattern.
+    for i in range(1, 11):
+        mid = _uuid.UUID(common_prefix + "0000" + "4000" + "8000" + f"{i:012x}")
+        msg = ProjectMessage(
+            id=mid,
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="non-target",
+            status="open",
+            created_at=base_ts + timedelta(seconds=i),
+        )
+        db_session.add(msg)
+
+    # Target message — arrives after all non-targets so it's in the recency window.
+    target_id = _uuid.UUID(common_prefix + "0000" + "4000" + "8000" + "ffffffffffff")
+    target_msg = ProjectMessage(
+        id=target_id,
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="agent",
+        content="the target",
+        status="open",
+        created_at=base_ts + timedelta(seconds=100),
+    )
+    db_session.add(target_msg)
+    await db_session.commit()
+    await db_session.refresh(target_msg)
+
+    # 24-char prefix uniquely identifies the target (non-targets end in 0…, target ends in f…).
+    target_ref = target_id.hex[:24]
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/{target_ref}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["id"] == str(target_id)
+    assert res.json()["data"]["content"] == "the target"
+
+
+@pytest.mark.asyncio
+async def test_resolve_message_ref_old_message_beyond_500_found(
+    client: AsyncClient, db_session
+):
+    """A message older than the 500 most-recent messages is correctly resolved.
+
+    The implementation fetches all project message IDs without a recency cap,
+    so a message whose created_at predates the 500 most-recent messages is still
+    matched and returned rather than returning 404.
+    """
+    import uuid as _uuid
+
+    project, task = await _make_project_task(db_session, vm="agent-vm-tail")
+
+    base_ts = datetime(2026, 1, 2, 0, 0, 0)
+
+    # Target message is the OLDEST in the project (created_at = base_ts).
+    target_prefix = "cc000000"
+    target_id = _uuid.UUID(target_prefix + "0000" + "4000" + "8000" + "aaaaaaaaaaaa")
+    target_msg = ProjectMessage(
+        id=target_id,
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="old target",
+        status="open",
+        created_at=base_ts,
+    )
+    db_session.add(target_msg)
+
+    # Create 500 newer messages with a distinct prefix so they don't collide.
+    filler_prefix = "dd000000"
+    for i in range(500):
+        mid = _uuid.UUID(filler_prefix + "0000" + "4000" + "8000" + f"{i:012x}")
+        msg = ProjectMessage(
+            id=mid,
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="filler",
+            status="open",
+            created_at=base_ts + timedelta(seconds=i + 1),
+        )
+        db_session.add(msg)
+
+    await db_session.commit()
+    await db_session.refresh(target_msg)
+
+    # The target is the oldest message but should still be resolved correctly.
+    target_ref = target_id.hex[:24]
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages/{target_ref}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["id"] == str(target_id)
+    assert res.json()["data"]["content"] == "old target"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_vm_cost_by_task_type(client: AsyncClient, db_session):
+    """Agent ./fetch vm-cost returns by-task-type VM cost/count/merge-yield rows
+    plus window metadata. Tasks of different types are bucketed; merged tasks
+    contribute to merged_count."""
+    from app.models import TaskStatus
+    from datetime import datetime, timezone
+
+    project = Project(name="VmCost Test", user_id="test-user-vmcost")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task that holds the agent token
+    token_task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-vmcost",
+    )
+    db_session.add(token_task)
+
+    # A completed create task (no merge signal)
+    create_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        updated_at=datetime.now(timezone.utc),
+        vm_provisioned_at=datetime.now(timezone.utc),
+        vm_stopped_at=datetime.now(timezone.utc),
+    )
+    db_session.add(create_task)
+
+    # A completed fix task with a merge signal
+    fix_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        updated_at=datetime.now(timezone.utc),
+        vm_provisioned_at=datetime.now(timezone.utc),
+        vm_stopped_at=datetime.now(timezone.utc),
+        context={"pr_merged": True},
+    )
+    db_session.add(fix_task)
+
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-vmcost")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/vm-cost",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+    assert "by_task_type" in data
+    assert "window_days" in data
+    assert data["window_days"] == 7
+    # Each row has the expected fields
+    rows = data["by_task_type"]
+    assert isinstance(rows, list)
+    task_types = {r["task_type"] for r in rows}
+    # The two non-token tasks have types "create" and "fix"
+    assert "create" in task_types or "fix" in task_types
+    for row in rows:
+        assert "task_count" in row
+        assert "merged_count" in row
+        assert "total_cost_usd" in row
+        assert "share_of_total_cost" in row
+        assert "cost_per_merge" in row
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_vm_cost_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch vm-cost for project B (404)."""
+    project_a = Project(name="VmCost A", user_id="test-user-vmca")
+    project_b = Project(name="VmCost B", user_id="test-user-vmcb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(
+        project_id=project_a.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-vmca",
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-vmca")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/vm-cost",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot(client: AsyncClient, db_session):
+    """Agent endpoint returns cost_per_merged_pr and vm_reuse_rate in data."""
+    project, task = await _make_project_task(db_session, vm="agent-vm-eff")
+    token = create_agent_token(str(task.id), "agent-vm-eff")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+    assert "cost_per_merged_pr" in data
+    assert "vm_reuse_rate" in data
+    assert "llm_cost_per_merged_pr" in data
+    assert "format_compliance" in data
+    assert data["window_days"] == 7
+
+
+@pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch efficiency-snapshot for project B (404)."""
+    project_a = Project(name="Eff A", user_id="test-user-effa")
+    project_b = Project(name="Eff B", user_id="test-user-effb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(
+        project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-effa"
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-effa")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404

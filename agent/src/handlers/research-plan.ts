@@ -1,5 +1,21 @@
 import fs from 'fs';
 import { execFileSync } from 'child_process';
+/**
+ * Research and planning handlers — exploratory analysis and implementation planning.
+ *
+ * - **handleResearch**: Analyze a codebase area (specified by focus, root, or file
+ *   list) and produce research findings. Clones repo, runs Claude Code analysis,
+ *   captures findings, and stores them as a ResearchFinding artifact.
+ *
+ * - **handlePlan**: Generate an implementation plan for a feature or refactor.
+ *   Clones repo, analyzes code structure, produces a structured plan with
+ *   milestones and file changes, stores as PlanFinding artifact. Does not edit code.
+ *
+ * These handlers are reconnaissance tasks: they gather information and produce
+ * structured analysis artifacts that downstream create/fix/refactor tasks consume.
+ * Research feeds strategic cycles; plans guide implementation tasks.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
@@ -16,7 +32,7 @@ import {
   extractJsonObjectDetailed,
 } from '../json-extract.js';
 import {
-  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, isGreenfieldRepo, verifyCloneDelivered, configureAgentPermissions,
+  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE, readClaudeMd, buildContextPrefix, buildFileTree, isGreenfieldRepo, verifyCloneDelivered, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
@@ -1596,15 +1612,15 @@ Rules:
 - Use effort=high only for complex architectural subtasks. Leave null for simple additive changes — the orchestrator resolves the model from provider routing.
 - scope: "small" for changes under ~100 lines across 1-3 files with clear, narrow scope, "medium" for changes spanning 3-8 files or 100-300 lines, or touching shared infrastructure, "large" for cross-component architectural changes, 300+ lines, or changes to auth/data models/core orchestration
 - The "type" field controls how the subtask is executed: "create" (default) for new features/additions, "refactor" for code quality improvements with no behavior change, "migrate" for database schema changes (Alembic migrations), "qa" for test-only PRs. The type field must be EXACTLY one of those values (or a knowledge-prerequisite type below). "fix" is NOT a valid subtask type — a bug-fixing subtask is type "create" even when its TITLE uses the "fix:" conventional-commit prefix (titles and types are independent; a plan child always starts from a fresh branch, which is what "create" means).
-- EMPIRICAL PREREQUISITE (optional, additive): besides the implementation subtypes above, a plan MAY emit a measurement prerequisite subtask of type="compute_experiment" when a later subtask should "measure this first, then act on the verdict". It does NOT produce a PR — it launches a budgeted, auto-torn-down compute job and persists a durable MEASURED VERDICT as knowledge. It carries a launch contract: "command" (the experiment to run), a positive "spend_cap_usd", a positive "deadline_seconds", and an OPTIONAL "success_criterion": {"metric", "operator", "threshold"}. A later implementation subtask consumes the verdict by naming this subtask's index in its depends_on_indices — it is handed the experiment's knowledge at launch. A MEASURED NEGATIVE result (success_criterion honestly missed) is still consumable evidence: the dependent still runs and acts on the verdict. Only a BROKEN run that produced no usable verdict cancels the dependent follow-on work.
+- EMPIRICAL PREREQUISITE (optional, additive): besides the implementation subtypes above, a plan MAY emit a measurement prerequisite subtask of type="compute_experiment" when a later subtask should "measure this first, then act on the verdict". It does NOT produce a PR — it launches a budgeted, auto-torn-down compute job and persists a durable MEASURED VERDICT as knowledge. It carries a launch contract: "command" (the experiment to run), a positive "spend_cap_usd", a positive "deadline_seconds", and an OPTIONAL "success_criterion": {"metric", "operator", "threshold"}. A later implementation subtask consumes the verdict by naming this subtask's index in its depends_on_indices — it is handed the experiment's knowledge at launch. A MEASURED NEGATIVE result (success_criterion honestly missed) is still consumable evidence: the dependent still runs and acts on the verdict. Only a BROKEN run that produced no usable verdict cancels the dependent follow-on work. REQUIRED: every compute_experiment subtask must include a "smoke_sample" field proving the command was tested on this VM before writing the plan. Run: BPRF=$(mktemp); timeout 30 bash -c "BLUEPRINT_RESULT_FILE=\\"$BPRF\\" <your command>" 2>/tmp/ce_smoke_err.txt; CE_EXIT=$?; then record {"exit_code":CE_EXIT,"startup_ok":true/false,"metric_captured":true/false,"timed_out":(CE_EXIT==124),"error_excerpt":"<stderr snippet>"}. Nothing beyond the repo itself is guaranteed; your smoke is proof. If startup_ok=false, fix or drop the subtask. If genuinely un-smokable (special hardware required), set smoke_sample={"unsmokable":true,"unsmokable_reason":"<why>"} for explicit operator review.
 - acceptance_evidence (OPTIONAL, additive — omit when you have nothing substantive to declare): the concrete evidence that will prove THIS subtask's claim true, carried forward to the implementing agent and the evaluation lane. Exactly one of four kinds: (1) {"kind": "named_test", "test_path": "tests/test_x.py", "test_id": "test_fn"} — a test exercising the changed seam (test_path must name a real test file; test_id optional, or embed inline as path::test_fn); (2) {"kind": "observable_behavior", "description": "..."} — a substantive (≥10 char, non-placeholder) description of a behavior that should be exercised; (3) {"kind": "downstream_artifact", "artifact_id": "..."} — an artifact a later task consumes; (4) {"kind": "visual", "component": "<UI component under test>", "viewport_width": <px, 1-4096>, "assertion_type": "<optional, e.g. overflow|text_truncation>"} — for FRONTEND-TOUCHING work (admin-ui components), proven by an uploaded viewport screenshot of that component captured at that width on a successful run. Declare it only for subtasks where the success condition is concrete; never invent a placeholder/always-true declaration (those are rejected).
 - prerequisite (OPTIONAL, default null): a FOUNDATION this subtask depends on that is built OUTSIDE this plan (another lane / an already-built capability). Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` or \`{"kind": "capability", "ref": "<capability-name>"}\`. For a capability ref, DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above so it resolves to whichever task advertises it (the matcher is EXACT). Use depends_on_indices — NOT prerequisite — to order subtasks WITHIN this plan; prerequisite is only for cross-lane/cross-plan foundations.
 - provides_capability (OPTIONAL, default null): a short kebab-case capability name THIS subtask advertises so another lane's prerequisite \`{"kind": "capability", "ref": "<name>"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability. ${CAPABILITY_DECLARATION_DOC}
 - ATOMIC SCHEMA RULE: a database schema change is ONE subtask, never split across dependent subtasks. If a subtask modifies SQLAlchemy/SQLModel models (backend/app/models.py) or adds/changes tables or columns, that SAME subtask must also generate the Alembic migration and bump the schema revision. Do NOT emit a separate dependent type="migrate" subtask for the migration of a model change in another subtask — splitting the model edit from its migration manufactures dead serialization and ships a model PR with no migration (which reviewers reject). Set the subtask's type="migrate" and include in its related_files the model file(s) (backend/app/models.py), the new Alembic file (backend/alembic/versions/...), and backend/app/main.py for EXPECTED_SCHEMA_REVISION. The migration agent will handle Alembic generation and the revision bump within that single subtask/PR. Only create a separate subtask when the other work is genuinely independent of the schema change — never to carry the migration for it.
 - If any subtask adds new user-facing functionality, consider whether a test subtask is needed. New API endpoints should have corresponding integration tests. New agent handlers should have at least one smoke test. Add a test subtask with depends_on_indices pointing to the implementation subtask.
 - If any subtask changes a public API interface (endpoint signatures, request/response shapes, TypeScript types exported to frontend), include explicit notes in the prompt about backward compatibility requirements.
-- IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
-- ALSO write /tmp/plan_progress_${taskId}.md — a concise markdown summary (under ~3000 chars) of your decomposition: which areas of the codebase you explored, the rationale for how you split the work, the file targets and key constraints per subtask, and any risks or open questions. This artifact is surfaced to retry agents if this task fails, so they can pick up without re-investigating.${planPromptSuffix}${planFirstTaskSection}${PLAYBOOK_GUIDANCE}
+- IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
+- ALSO write /tmp/plan_progress_${taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (under ~3000 chars) of your decomposition: which areas of the codebase you explored, the rationale for how you split the work, the file targets and key constraints per subtask, and any risks or open questions. This artifact is surfaced to retry agents if this task fails, so they can pick up without re-investigating.${planPromptSuffix}${planFirstTaskSection}${PLAYBOOK_GUIDANCE}
 
 ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 
@@ -2137,9 +2153,9 @@ When in doubt, keep the finding — false negatives (missing good work) are wors
 
 # OUTPUT FORMAT
 
-Write findings to /tmp/research_findings_${taskId}.json. Output the JSON array as the last thing in your response.
+Write findings to /tmp/research_findings_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE}. Output the JSON array as the last thing in your response.
 
-ALSO write /tmp/research_progress_${taskId}.md — a concise markdown summary (under ~3000 chars) of your investigation: which areas/directories you explored, which files you read, key observations and patterns discovered, and any remaining gaps or open questions. This is surfaced to retry agents if this task fails, so they can resume instead of re-investigating from scratch.
+ALSO write /tmp/research_progress_${taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (under ~3000 chars) of your investigation: which areas/directories you explored, which files you read, key observations and patterns discovered, and any remaining gaps or open questions. This is surfaced to retry agents if this task fails, so they can resume instead of re-investigating from scratch.
 
 ## Finding types
 
@@ -2169,6 +2185,22 @@ ALSO write /tmp/research_progress_${taskId}.md — a concise markdown summary (u
     measured. Put the launch fields either flat on the finding or nested under a
     \`compute_experiment\` object. Above a configured spend threshold the launch holds for operator
     approval; below it, it runs autonomously.
+    \`smoke_sample\` (REQUIRED on every compute_experiment finding): BEFORE writing this
+    finding to the output file, smoke-test the command using Bash to confirm it works on this VM.
+    Run a short/capped variant (≤30 seconds), for example:
+      BPRF=$(mktemp)
+      timeout 30 bash -c "BLUEPRINT_RESULT_FILE=\\"$BPRF\\" <your command>" 2>/tmp/ce_smoke_err.txt
+      CE_EXIT=$?
+    Check startup — did it start without ImportError/ModuleNotFoundError/FileNotFoundError?
+    Check metric — does $BPRF contain a JSON object with at least one numeric field?
+    Record the result as a \`smoke_sample\` field on the finding:
+      {"exit_code": CE_EXIT, "startup_ok": true/false, "metric_captured": true/false,
+       "timed_out": (CE_EXIT==124), "error_excerpt": "<first 200 chars of stderr if any>"}
+    If startup_ok=false: FIX the command or DROP the finding — nothing beyond the repo itself is guaranteed (no external services, network, secrets, or prior state); your smoke is proof.
+    A timeout (exit_code=124) with startup_ok=true is acceptable — slow first iteration is fine.
+    If the command genuinely cannot be smoked at all (requires hardware or resources unavailable
+    here): set smoke_sample={"unsmokable":true,"unsmokable_reason":"<why>"} and the finding will
+    be held explicitly for operator review rather than dispatching silently.
 
 **Sub-research** — spawns another research cycle (use sparingly):
   research
@@ -2221,6 +2253,7 @@ implementation findings. Add metadata alongside them when relevant.
   "direction_id": "d-xxx or null",
   "effort": "high|medium|low|null",
   "compute_experiment": {"command": "command run inside a clone of this repo at cwd, e.g. 'python3 -m pkg.eval --episodes 1000'", "spend_cap_usd": 5.0, "deadline_seconds": 1800, "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}, "accelerator": "T4"},
+  "smoke_sample": {"exit_code": 0, "startup_ok": true, "metric_captured": true, "timed_out": false, "error_excerpt": ""},
   "claims": ["short factual assertion backed by your investigation (omit when synthesizing)"],
   "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.py or pr#123 or msg_id", "excerpt": "optional short quote"}],
   "acceptance_evidence": {"kind": "test", "descriptor": "named test exercising the new seam end-to-end", "selector": "testing/test_foo.py::test_bar"}
@@ -2261,7 +2294,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
 - direction_note: add context to a direction (fields: direction_id, description max 2000 chars). Be honest about progress.
 - direction_proposal: propose a new standing direction (max 2 per cycle, held for user approval).
 - design_doc_observation: flag an architectural observation for the design document (fields: description, section). Use when you discover something about the system's architecture — module patterns, missing capabilities, structural risks. These are reviewed by the architecture agent, not acted on directly. Max 3 per cycle.
-- Optional: /tmp/research_insights_${taskId}.json with [{"summary": "<200 chars", "area": "path"}] for observations not worth implementing.`;
+- Optional: /tmp/research_insights_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with [{"summary": "<200 chars", "area": "path"}] for observations not worth implementing.`;
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running codebase research...';

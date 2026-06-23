@@ -3263,3 +3263,171 @@ async def test_resume_review_preserves_inflight_ci_fix_state(cleanup_db, mocker)
     assert review_loop.get("ci_passed") is False
     assert review_loop.get("ci_wait_started") == original_ci_wait_started
     assert (parent.context or {}).get("_is_rollup_review") is True
+
+
+# ── Tests for mergeable_state=None re-poll ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_empty_mergeability_repoll_resolves_and_merges(
+    cleanup_db, mocker
+):
+    """When mergeable_state is None/empty on initial refetch, the rollup path
+    re-polls up to N times. If it resolves to 'clean' before the budget is
+    exhausted, merge is retried in the same sweep and succeeds — no deferral,
+    no fix spawn."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+    )
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.is_ancestor_of", new_callable=AsyncMock, return_value=False
+    )
+    # get_pull_request calls:
+    #  1. existing-PR validation (resume path)
+    #  2. diff-size fetch
+    #  3. post-merge-failure refetch → mergeable_state=None (not yet computed)
+    #  4. re-poll 1 → still empty
+    #  5. re-poll 2 → "clean" (GitHub finished computing)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"merged": False, "state": "open"},
+            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},
+            {"mergeable_state": None, "head": {"sha": "deadbeef"}},
+            {"mergeable_state": None, "head": {"sha": "deadbeef"}},
+            {"mergeable_state": "clean", "head": {"sha": "deadbeef"}},
+        ],
+    )
+    # merge_pull_request calls:
+    #  1. initial merge attempt → fails (triggers the re-poll path)
+    #  2. re-poll merge retry → succeeds
+    mock_merge = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"merged": False, "message": "mergeable state is null"},
+            {"merged": True, "sha": "abc", "message": "Pull Request successfully merged"},
+        ],
+    )
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, None),
+    )
+    # Suppress the asyncio.sleep so the test runs instantly.
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # merge_pull_request must have been called twice: initial + re-poll retry.
+    assert mock_merge.await_count == 2
+    await cleanup_db.refresh(parent)
+    # Parent moved to COMPLETED or EVALUATING (not stuck EVALUATING with deferred counters).
+    assert parent.status in (TaskStatus.COMPLETED, TaskStatus.EVALUATING)
+    # No deferral counters written — the re-poll resolved it.
+    ctx = parent.context or {}
+    assert "_merge_deferred_count" not in ctx
+    assert "_merge_deferred_state" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_empty_mergeability_defers_when_repoll_exhausted(
+    cleanup_db, mocker
+):
+    """When mergeable_state stays None/empty through all re-poll attempts, the
+    sweep falls through to the normal deferral path — counters are bumped, no
+    fix task is spawned."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+    )
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.is_ancestor_of", new_callable=AsyncMock, return_value=False
+    )
+    # All get_pull_request calls return empty mergeable_state.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"merged": False, "state": "open"},
+            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},
+            # Post-merge-failure refetch + 3 re-polls all return empty state.
+            {"mergeable_state": None, "head": {"sha": "deadbeef"}},
+            {"mergeable_state": None, "head": {"sha": "deadbeef"}},
+            {"mergeable_state": None, "head": {"sha": "deadbeef"}},
+            {"mergeable_state": None, "head": {"sha": "deadbeef"}},
+        ],
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "mergeable state is null"},
+    )
+    mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, None),
+    )
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    # Deferral counters written — empty state causes deferral.
+    assert ctx.get("_merge_deferred_state") == "empty"
+    assert ctx.get("_merge_deferred_count") == 1
+    assert ctx.get("_merge_total_deferrals") == 1
+    assert parent.status == TaskStatus.EVALUATING

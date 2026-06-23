@@ -740,6 +740,14 @@ runtime_config: Dict = {
     # retarget is a further opt-in below.
     "warm_pool_account_retarget_enabled": False,
     "warm_pool_cross_provider_retarget_enabled": False,
+    # Cloud Run Jobs routing allowlist. When non-empty, task types listed here
+    # that are also in CLOUD_RUN_CANDIDATE_TASK_TYPES (all read-only types) are
+    # dispatched to Cloud Run Jobs instead of a dedicated e2-standard-2 GCE VM.
+    # Default EMPTY — no types are routed to Cloud Run until an operator adds
+    # them, so the change is completely inert on merge. Validated at PATCH time:
+    # only read-only (non-merging) task types are accepted.
+    # Set via /api/admin/settings.
+    "cloud_run_task_type_allowlist": [],
     # Per-project warm-pool enablement scope (allowlist). An EMPTY list (the
     # default) means the pool is fleet-wide — the legacy all-or-nothing behavior
     # where the maintainer reconciles every demand-active project once
@@ -1048,7 +1056,11 @@ def _seed_promotion_policy() -> None:
         }
     runtime_config["promotion_threshold"] = float(policy["threshold"])
     runtime_config["promotion_weights"] = dict(policy["weights"])
-    for _k in ("theme_warn_threshold", "theme_block_threshold"):
+    for _k in (
+        "theme_warn_threshold",
+        "theme_block_threshold",
+        "merge_grade_block_threshold",
+    ):
         if _k in policy:
             runtime_config[_k] = policy[_k]
 
@@ -1369,6 +1381,12 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "evergreen_fill_deferred_memo_enrollment",
                         bool(config_json["evergreen_fill_deferred_memo_enrollment"]),
                     )
+                if "evergreen_fill_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["evergreen_fill_mode"] or "").strip().lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("evergreen_fill_mode", raw_mode)
                 if "cochange_decomposition_enabled" in config_json:
                     _set(
                         "cochange_decomposition_enabled",
@@ -1435,6 +1453,19 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "warm_pool_enabled",
                         bool(config_json["warm_pool_enabled"]),
                     )
+                if "cloud_run_task_type_allowlist" in config_json:
+                    # Persisted Cloud Run task-type allowlist. Normalize to a
+                    # sorted list of strings — mirroring the admin PATCH surface —
+                    # so every instance agrees on the allowlist and the setting
+                    # survives across restarts.
+                    raw_allow = config_json["cloud_run_task_type_allowlist"]
+                    if isinstance(raw_allow, str):
+                        raw_allow = raw_allow.split(",")
+                    if isinstance(raw_allow, (list, tuple, set)):
+                        _set(
+                            "cloud_run_task_type_allowlist",
+                            sorted({str(t).strip() for t in raw_allow if str(t).strip()}),
+                        )
                 if "warm_pool_account_retarget_enabled" in config_json:
                     _set(
                         "warm_pool_account_retarget_enabled",
@@ -1587,6 +1618,10 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "reaper_max_orphans_per_cycle",
                     "usage_headroom_threshold_pct",
                     "max_concurrent_act_on_verdict_followons",
+                    "evergreen_fill_interval_minutes",
+                    "evergreen_fill_min_free_slots",
+                    "evergreen_fill_max_active",
+                    "evergreen_fill_daily_cap",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
@@ -1598,6 +1633,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "related_tests_holdback_fraction",
                     "affected_consumers_holdback_fraction",
                     "diagnostics_after_edit_holdback_fraction",
+                    "evergreen_fill_util_threshold",
                 ):
                     if float_key in config_json:
                         _set(float_key, float(config_json[float_key]))

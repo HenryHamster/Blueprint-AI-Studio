@@ -632,7 +632,7 @@ See `backend/alembic/versions/` for migration history.
 
 The current schema revision is tracked in `backend/app/main.py`:
 ```python
-EXPECTED_SCHEMA_REVISION = "0131"
+EXPECTED_SCHEMA_REVISION = "0330"
 ```
 
 This matches the latest Alembic migration. When adding new models or columns:

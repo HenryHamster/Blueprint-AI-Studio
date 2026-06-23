@@ -57,6 +57,11 @@ from app.compute import (
     record_zone_failure,
     zone_recovery_wait_seconds,
 )
+from app.compute_cloud_run import (
+    _resolve_machine_type as _cr_resolve_machine_type,
+    launch_agent_cloud_run_job,
+)
+from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES
 from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.depends_on_provenance import remap_structural_depends_on
 from app.models import (
@@ -218,6 +223,39 @@ def _ci_waiting_sql_filter(session):
     if dialect_name == "sqlite":
         return _func.json_extract(Task.context, "$.review_loop.ci_waiting") == 1
     return Task.context["review_loop"]["ci_waiting"].astext == "true"
+
+
+async def _reconcile_active_per_account(session: AsyncSession) -> Dict[str, int]:
+    """Count active (PROVISIONING/IN_PROGRESS) tasks per LLM account id.
+
+    Drives the Max-Plan reconcile each ~30s dispatch cycle. D2 over-fetch fix
+    (d-57436105): projects ONLY the promoted, indexed ``Task.llm_account_id``
+    scalar column instead of TOAST-fetching every active task's full multi-MB
+    ``Task.context`` JSONB blob each cycle (the previous query was
+    ``select(Task.context)``). The backfill migration COALESCEd the legacy
+    ``context->>'max_plan_account_id'`` fallback into the column and every
+    dispatch/requeue write path keeps the column in sync, so the column is
+    authoritative for active tasks — no context read is needed.
+
+    SCALAR COLUMN PROJECTION (returns plain rows) — deliberately NOT
+    ``select(Task)`` with ``load_only``: touching a deferred attribute on a
+    returned Task in this async context risks a MissingGreenlet crash of the
+    dispatch cycle (see reference_load_only_event_listeners.md /
+    reference_load_only_lazy_load_trap.md).
+    """
+    active_per_account: Dict[str, int] = {}
+    rows = (
+        await session.execute(
+            select(Task.id, Task.llm_account_id).where(
+                Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+            )
+        )
+    ).all()
+    for row in rows:
+        acct_id = row[1]
+        if acct_id:
+            active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
+    return active_per_account
 
 
 async def _lock_task_for_mutation(
@@ -2034,6 +2072,8 @@ async def orchestrator_worker():
                         if serial_log:
                             requeue_ctx["last_serial_log"] = serial_log
                         fresh_t.context = clear_task_llm_runtime_context(requeue_ctx)
+                        # Keep the promoted column in sync (D2 over-fetch fix).
+                        fresh_t.llm_account_id = None
                         session.add(fresh_t)
                         tasks_recovered += 1
                         if fresh_t.last_heartbeat is None:
@@ -2083,6 +2123,29 @@ async def orchestrator_worker():
                     project_active_counts[_active_task.project_id] = (
                         project_active_counts.get(_active_task.project_id, 0) + 1
                     )
+
+                # Capacity partition: Cloud Run tasks run in a container and never
+                # consume a GCE VM slot. Compute the effective CR type set (candidate
+                # set ∩ runtime allowlist) and exclude those tasks from the GCE
+                # dispatch budget. `payloads` is loaded by ACTIVE_TASKS_LIGHT_COLUMNS.
+                _cr_capacity_allowlist = frozenset(
+                    _runtime_config.get("cloud_run_task_type_allowlist", [])
+                )
+                _effective_cr_types_capacity = (
+                    CLOUD_RUN_CANDIDATE_TASK_TYPES & _cr_capacity_allowlist
+                )
+                if _effective_cr_types_capacity:
+                    _cr_active_count = sum(
+                        1
+                        for _t in active_tasks_result
+                        if ((_t.first_payload or {}).get("type", ""))
+                        in _effective_cr_types_capacity
+                    )
+                else:
+                    _cr_active_count = 0
+                # GCE-only active count for the VM slot budget.
+                _gce_active_count = active_count - _cr_active_count
+
                 # Cross-check with actual GCP VM count (cached, refreshed every 2 min)
                 actual_vm_count = await _get_actual_gcp_vm_count()
                 # Warm-pool slot accounting: a pre-provisioned idle pool VM is a
@@ -2129,12 +2192,13 @@ async def orchestrator_worker():
                 gcp_dispatch_vms = max(
                     0, actual_vm_count - idle_pool_count - orphaned_leased_count
                 )
-                effective_count = max(active_count, gcp_dispatch_vms)
-                if gcp_dispatch_vms > active_count + 2:
+                # Use _gce_active_count (CR tasks excluded) for the GCE VM budget.
+                effective_count = max(_gce_active_count, gcp_dispatch_vms)
+                if gcp_dispatch_vms > _gce_active_count + 2:
                     logger.warning(
                         f"[ORCHESTRATOR] GCP VM count ({actual_vm_count}, "
                         f"{idle_pool_count} idle-pool, {orphaned_leased_count} orphaned-lease) "
-                        f"> DB active count ({active_count}) — possible orphans, "
+                        f"> DB active count ({_gce_active_count}) — possible orphans, "
                         f"using GCP count for slot calculation"
                     )
                 slots_available = max(
@@ -2417,29 +2481,10 @@ async def orchestrator_worker():
                     continue
 
                 # Reconcile Max Plan active_tasks counters from DB each cycle.
-                # Fetch the JSON path raw and group in Python — avoids Postgres
-                # GROUP BY quirks with JSONB path expressions (SQLAlchemy was
-                # emitting a SELECT that Postgres saw as referencing task.context
-                # without a matching GROUP BY token).
-                active_per_account: Dict[str, int] = {}
-                _acct_id_rows = (
-                    await session.execute(
-                        select(Task.context).where(
-                            Task.status.in_(
-                                [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                            ),
-                        )
-                    )
-                ).all()
-                for row in _acct_id_rows:
-                    ctx = row[0] or {}
-                    acct_id = ctx.get("llm_account_id") or ctx.get(
-                        "max_plan_account_id"
-                    )
-                    if acct_id:
-                        active_per_account[acct_id] = (
-                            active_per_account.get(acct_id, 0) + 1
-                        )
+                # Reads only the promoted Task.llm_account_id column (no longer
+                # the full Task.context JSONB blob) — see
+                # _reconcile_active_per_account (D2 over-fetch fix, d-57436105).
+                active_per_account = await _reconcile_active_per_account(session)
                 async with _max_plan_pool_lock:
                     for acct in _account_by_id.values():
                         # Reconcile from DB — the pre-increment in select_max_plan_account() is always
@@ -2572,8 +2617,8 @@ async def orchestrator_worker():
                 # session; loading the dep rows in their own session and detaching
                 # them keeps their already-loaded column values (status / context /
                 # payloads, read via first_payload) intact for the downstream
-                # ``_check_candidate_task_deps`` reads — a full ``select(Task)``
-                # (no load_only) loads every column, so reading them on a detached
+                # ``_check_candidate_task_deps`` reads — load_only projects exactly
+                # the columns those reads need, so accessing them on the detached
                 # instance returns the cached value rather than firing a sync
                 # lazy-load → MissingGreenlet (the rollback-expiry / detached-read
                 # trap in reference_load_only_lazy_load_trap.md). The
@@ -2587,11 +2632,33 @@ async def orchestrator_worker():
 
                 _dep_by_id: dict[uuid.UUID, Task] = {}
                 if _all_dep_uuids:
+                    # Column projection for the dep batch: _check_candidate_task_deps
+                    # reads status, context (_replaced_by_task_id / has_landed_signal /
+                    # is_genuine_code_dependency / verify_pr_merged), and payloads
+                    # (first_payload for _same_base_branch + task-type checks).
+                    # title is included so the cascade-cancel alert (raised from a
+                    # separate session against the DETACHED prereq row) can read
+                    # prereq_task.title without a raiseload DetachedInstanceError.
+                    # Drops plan_output / status_log / depends_on and other heavy JSONB.
+                    # Rows are detached (expunge_all) so loaded columns remain accessible
+                    # without triggering async lazy-loads (MissingGreenlet). raiseload=True
+                    # catches accidental projection-widening during development.
+                    _dep_light = load_only(
+                        Task.id,
+                        Task.status,
+                        Task.context,
+                        Task.payloads,
+                        Task.project_id,
+                        Task.title,
+                        raiseload=True,
+                    )
                     async with AsyncSessionLocal() as _dep_batch_session:
                         _dep_rows = (
                             (
                                 await _dep_batch_session.execute(
-                                    select(Task).where(Task.id.in_(_all_dep_uuids))
+                                    select(Task)
+                                    .where(Task.id.in_(_all_dep_uuids))
+                                    .options(_dep_light)
                                 )
                             )
                             .scalars()
@@ -3637,11 +3704,29 @@ async def orchestrator_worker():
                         # (runtime_selection is None — the cold path's no-account handling
                         # takes over). On no lease, fall through to the existing cold path
                         # and count it as a cold dispatch.
+                        # Cloud Run types bypass the warm VM pool — they run in
+                        # a Cloud Run Job container, not on a pool VM. Compute
+                        # the effective CR set here from the runtime allowlist.
+                        _cr_dispatch_allowlist = frozenset(
+                            _runtime_config.get("cloud_run_task_type_allowlist", [])
+                        )
+                        _effective_cr_types_dispatch = (
+                            CLOUD_RUN_CANDIDATE_TASK_TYPES & _cr_dispatch_allowlist
+                        )
+                        _task_type_dispatch = (
+                            (task.first_payload or {}).get("type", "")
+                            if task.payloads
+                            else ""
+                        )
+                        _is_cloud_run_dispatch = (
+                            _task_type_dispatch in _effective_cr_types_dispatch
+                        )
                         if (
                             not _warm_target_vm_id
                             and not task.depends_on
                             and is_warm_pool_enabled()
                             and runtime_selection is not None
+                            and not _is_cloud_run_dispatch
                         ):
                             _leased_member = await try_pool_dispatch(
                                 session,
@@ -4033,6 +4118,10 @@ async def orchestrator_worker():
                             model=runtime_model,
                             execution_mode=runtime_execution_mode,
                         )
+                        # Keep the promoted column in sync with context
+                        # (D2 over-fetch fix) — context keys are still written
+                        # above so in-flight rows / rollbacks stay safe.
+                        task.llm_account_id = account_id
                         # A dispatch that reaches the PROVISIONING commit resets
                         # the contained-crash counter (persisted by that commit;
                         # rolled back with everything else if prep still crashes
@@ -4154,6 +4243,8 @@ async def orchestrator_worker():
                                 )
                             _iter_preclaimed_account_id = None
                             task.context = clear_task_llm_runtime_context(task.context)
+                            # Keep the promoted column in sync (D2 over-fetch fix).
+                            task.llm_account_id = None
                             await session.rollback()
                             continue
 
@@ -4218,24 +4309,63 @@ async def orchestrator_worker():
                                     ),
                                 )
 
-                                success = await provision_agent_vm(
-                                    vm_id,
-                                    t_id,
-                                    payload_uri,
-                                    oauth_token=secret_value,
-                                    claude_config_json=config_json,
-                                    task_type=t_type,
-                                    secret_version_name=secret_version_name,
-                                    provider=llm_provider,
-                                    auth_mode=llm_auth_mode,
-                                    model=llm_model,
-                                    execution_mode=llm_execution_mode,
-                                    provider_metadata=llm_provider_metadata,
-                                    provider_settings=llm_provider_settings,
-                                    provisioning_model="STANDARD"
-                                    if force_standard
-                                    else None,
+                                # Dispatch to Cloud Run Jobs when the task type
+                                # is in the effective Cloud Run allowlist
+                                # (CLOUD_RUN_CANDIDATE_TASK_TYPES ∩ runtime allowlist).
+                                _cr_allowlist = frozenset(
+                                    _runtime_config.get(
+                                        "cloud_run_task_type_allowlist", []
+                                    )
                                 )
+                                _effective_cr_types = (
+                                    CLOUD_RUN_CANDIDATE_TASK_TYPES & _cr_allowlist
+                                )
+                                if t_type in _effective_cr_types:
+                                    # Stamp the Cloud Run sentinel machine type
+                                    # so cost attribution and teardown skips work.
+                                    async with AsyncSessionLocal() as _cr_stamp_session:
+                                        _cr_task = await _cr_stamp_session.get(
+                                            Task, t_id
+                                        )
+                                        if _cr_task is not None:
+                                            _cr_task.vm_machine_type = (
+                                                _cr_resolve_machine_type(t_type)
+                                            )
+                                            _cr_stamp_session.add(_cr_task)
+                                            await _cr_stamp_session.commit()
+                                    success = await launch_agent_cloud_run_job(
+                                        vm_id,
+                                        t_id,
+                                        payload_uri,
+                                        secret_version_name,
+                                        t_type,
+                                        oauth_token=secret_value,
+                                        provider=llm_provider,
+                                        auth_mode=llm_auth_mode,
+                                        model=llm_model,
+                                        execution_mode=llm_execution_mode,
+                                        provider_metadata=llm_provider_metadata,
+                                        provider_settings=llm_provider_settings,
+                                    )
+                                else:
+                                    success = await provision_agent_vm(
+                                        vm_id,
+                                        t_id,
+                                        payload_uri,
+                                        oauth_token=secret_value,
+                                        claude_config_json=config_json,
+                                        task_type=t_type,
+                                        secret_version_name=secret_version_name,
+                                        provider=llm_provider,
+                                        auth_mode=llm_auth_mode,
+                                        model=llm_model,
+                                        execution_mode=llm_execution_mode,
+                                        provider_metadata=llm_provider_metadata,
+                                        provider_settings=llm_provider_settings,
+                                        provisioning_model="STANDARD"
+                                        if force_standard
+                                        else None,
+                                    )
                                 if success:
                                     # Verify the task still wants this VM — stale recovery may have
                                     # requeued the task with a new vm_id while we were provisioning.
@@ -4573,6 +4703,7 @@ async def orchestrator_worker():
                                                             ctx
                                                         )
                                                     )
+                                                    failed_task.llm_account_id = None
                                                 failed_task.context = ctx
                                                 inner_session.add(failed_task)
                                                 await inner_session.commit()
@@ -6421,14 +6552,12 @@ async def orchestrator_worker():
                                     )
                                 else:
                                     _spawn_deferrals = (
-                                        ci_loop.get(
-                                            "verify_tests_spawn_deferrals", 0
-                                        )
+                                        ci_loop.get("verify_tests_spawn_deferrals", 0)
                                         or 0
                                     ) + 1
-                                    ci_loop[
-                                        "verify_tests_spawn_deferrals"
-                                    ] = _spawn_deferrals
+                                    ci_loop["verify_tests_spawn_deferrals"] = (
+                                        _spawn_deferrals
+                                    )
                                     if (
                                         _spawn_deferrals
                                         >= _VERIFY_TESTS_SPAWN_DEFERRAL_CAP

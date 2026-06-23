@@ -6,7 +6,8 @@ import {
 } from '../json-extract.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
-  recordFormatRepairInfraFailure, recordFormatRepairTokens, getLlmTelemetry,
+  recordFormatRepairInfraFailure, recordFormatRepairTokens, recordFormatRepairMiss,
+  getLlmTelemetry,
   type FormatMissReason, type SchemaLabel,
 } from '../telemetry.js';
 
@@ -241,7 +242,14 @@ export async function repairStructuredOutput<T = unknown>(
       recordFormatRepairInfraFailure(schemaLabel);
     }
     value = retryAttempt.value as T | null;
-    if (value !== null) recordFormatRepairSuccess(schemaLabel);
+    if (value === null && retry.exitCode === 0 && retryAttempt.missReason !== null) {
+      recordFormatRepairMiss(retryAttempt.missReason, schemaLabel);
+    }
+    // Only count a clean-exit recovery as a success. When the reopen crashed
+    // (exitCode !== 0), the attempt is already excluded from the denominator
+    // via recordFormatRepairInfraFailure; recording success here too would
+    // push self_repair_success_rate above 1.0.
+    if (value !== null && retry.exitCode === 0) recordFormatRepairSuccess(schemaLabel);
   }
 
   return { value, missReason: firstAttempt.missReason, retry };

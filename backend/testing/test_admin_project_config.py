@@ -690,6 +690,37 @@ async def test_get_auto_remediation_stored_value_overrides_computed_default(
     assert resp.json()["config"]["branch_whitelist"] == ["release"]
 
 
+@pytest.mark.asyncio
+async def test_auto_remediation_stats_exclude_non_auto_tasks(
+    client: AsyncClient, db_session, project_owner
+):
+    """SQL containment filter excludes tasks without auto_remediation=True."""
+    project = project_owner
+
+    auto_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"auto_remediation": True},
+    )
+    regular_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"auto_remediation": False},
+    )
+    unrelated_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db_session.add_all([auto_task, regular_task, unrelated_task])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/auto-remediation")
+    assert resp.status_code == 200, resp.text
+    stats = resp.json()["stats"]
+    assert stats["spawned_7d"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Issue-implementation config — project-aware defaults
 # ---------------------------------------------------------------------------
@@ -903,6 +934,7 @@ async def test_patch_integration_branch_null_skips_remote_check(
     async with AsyncClient(
         transport=ASGITransport(app=app, raise_app_exceptions=False),
         base_url="http://test",
+        headers={"Authorization": "Bearer test-token"},
     ) as safe_client:
         with patch(
             "app.github.get_repo_installation_token",
@@ -975,6 +1007,7 @@ async def test_patch_integration_branch_equal_to_promotion_target_blocks(
     async with AsyncClient(
         transport=ASGITransport(app=app, raise_app_exceptions=False),
         base_url="http://test",
+        headers={"Authorization": "Bearer test-token"},
     ) as safe_client:
         resp = await safe_client.patch(
             f"/api/admin/projects/{project.id}/integration-branch",

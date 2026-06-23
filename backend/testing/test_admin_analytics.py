@@ -3748,209 +3748,105 @@ class TestLanePilotPreflight:
         assert resp.status_code == 404
 
 
-class TestVisualPilotStatus:
+class TestSpendBurnRate:
     @pytest.mark.asyncio
-    async def test_returns_404_for_unknown_project(self, client: AsyncClient):
-        """Unknown project_id → HTTP 404."""
-        resp = await client.get(
-            f"/api/admin/visual-pilot-status?project_id={uuid.uuid4()}"
-        )
-        assert resp.status_code == 404
-
-    @pytest.mark.asyncio
-    async def test_returns_200_with_required_fields_for_empty_project(
+    async def test_returns_daily_and_monthly_spend(
         self, client: AsyncClient, db_session
     ):
-        """Project with no tasks returns 200 with zero counts and thresholds."""
+        """Completed tasks in window contribute to daily rate and monthly forecast."""
         project = make_project()
         db_session.add(project)
         await db_session.commit()
 
+        now = _utcnow()
+        # Two tasks completing 1 day apart (within 7d window), each 1h of VM time.
+        for days_ago in (1, 3):
+            completed_at = now - timedelta(days=days_ago)
+            started_at = completed_at - timedelta(hours=1)
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    title=f"task-{days_ago}d",
+                    status=TaskStatus.COMPLETED,
+                    created_by="ORCHESTRATOR",
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    started_at=started_at,
+                    created_at=started_at,
+                    status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                    vm_provisioned_at=started_at,
+                    vm_stopped_at=completed_at,
+                    vm_spot=False,
+                )
+            )
+        await db_session.commit()
+
         resp = await client.get(
-            f"/api/admin/visual-pilot-status?project_id={project.id}"
+            f"/api/admin/spend-burn-rate?project_id={project.id}&window_days=7"
         )
         assert resp.status_code == 200
         body = resp.json()
         assert body["project_id"] == str(project.id)
-        assert body["admin_task_count"] == 0
-        assert body["entry_count"] == 0
-        assert body["infra_rate"] == 0.0
-        assert body["caught"] == []
-        assert body["caught_count"] == 0
-        assert "thresholds" in body
-        assert body["thresholds"]["target_admin_tasks"] == 25
-        assert body["thresholds"]["target_days"] == 42
-        assert body["thresholds"]["early_pause_infra_rate"] == 0.50
-        assert "generated_at" in body
+        assert body["window_days"] == 7
+        assert body["task_count"] == 2
+        # Two 1-hour tasks at on-demand rate
+        expected_total = round(2 * 3600 * admin_analytics.ON_DEMAND_RATE, 2)
+        assert body["window_cost_usd"] == pytest.approx(expected_total, abs=0.01)
+        assert body["daily_spend_usd"] == pytest.approx(expected_total / 7, abs=0.01)
+        assert body["monthly_forecast_usd"] == pytest.approx(
+            (expected_total / 7) * 30, abs=0.01
+        )
 
     @pytest.mark.asyncio
-    async def test_caught_list_contains_task_with_visual_issue(
+    async def test_excludes_tasks_outside_window(
         self, client: AsyncClient, db_session
     ):
-        """Task with caught_visual_issue=True appears in the caught list."""
+        """Tasks older than window_days do not contribute to burn rate."""
         project = make_project()
         db_session.add(project)
         await db_session.commit()
 
-        task = make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            title="Frontend update",
-            context={
-                "_pr_changed_files": ["admin-ui/src/App.tsx"],
-                "_self_review_outcome": {
-                    "visual_verification": {
-                        "passed": True,
-                        "pairs_inspected": 3,
-                        "pairs_changed": 2,
-                        "caught_visual_issue": True,
-                        "note": "caught a layout shift",
-                    }
-                },
-            },
-        )
-        db_session.add(task)
+        now = _utcnow()
+        # One task inside the window, one outside
+        for days_ago, title in [(1, "in-window"), (10, "out-of-window")]:
+            completed_at = now - timedelta(days=days_ago)
+            started_at = completed_at - timedelta(hours=1)
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    title=title,
+                    status=TaskStatus.COMPLETED,
+                    created_by="ORCHESTRATOR",
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    started_at=started_at,
+                    created_at=started_at,
+                    status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                    vm_provisioned_at=started_at,
+                    vm_stopped_at=completed_at,
+                    vm_spot=False,
+                )
+            )
         await db_session.commit()
 
         resp = await client.get(
-            f"/api/admin/visual-pilot-status?project_id={project.id}"
+            f"/api/admin/spend-burn-rate?project_id={project.id}&window_days=7"
         )
         assert resp.status_code == 200
         body = resp.json()
-        assert body["admin_task_count"] == 1
-        assert body["entry_count"] == 1
-        assert body["pairs_inspected"] == 3
-        assert body["pairs_changed"] == 2
-        assert body["caught_count"] == 1
-        caught = body["caught"]
-        assert len(caught) == 1
-        assert caught[0]["task_id"] == str(task.id)
-        assert caught[0]["task_title"] == "Frontend update"
-        assert caught[0]["note"] == "caught a layout shift"
-        assert caught[0]["viewport_shot_names"] == []
+        assert body["task_count"] == 1
 
     @pytest.mark.asyncio
-    async def test_caught_entry_includes_viewport_shot_names(
-        self, client: AsyncClient, db_session
-    ):
-        """viewport_shot_names lists shot names from task context; missing key → []."""
+    async def test_no_tasks_returns_zero_rates(self, client: AsyncClient, db_session):
+        """Empty project returns zero daily and monthly rates."""
         project = make_project()
         db_session.add(project)
         await db_session.commit()
 
-        # Task with viewport_screenshots in context.
-        task_with_shots = make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            title="With screenshots",
-            context={
-                "_pr_changed_files": ["admin-ui/src/App.tsx"],
-                "_self_review_outcome": {
-                    "visual_verification": {
-                        "passed": True,
-                        "pairs_inspected": 2,
-                        "pairs_changed": 1,
-                        "caught_visual_issue": True,
-                        "note": "layout drift caught",
-                    }
-                },
-                "viewport_screenshots": [
-                    {
-                        "name": "main-before",
-                        "storage_uri": "gs://bucket/main-before.png",
-                    },
-                    {"name": "main-after", "storage_uri": "gs://bucket/main-after.png"},
-                ],
-            },
-        )
-        # Task without viewport_screenshots key in context.
-        task_no_shots = make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            title="No screenshots",
-            context={
-                "_pr_changed_files": ["admin-ui/src/Other.tsx"],
-                "_self_review_outcome": {
-                    "visual_verification": {
-                        "passed": True,
-                        "pairs_inspected": 1,
-                        "pairs_changed": 0,
-                        "caught_visual_issue": True,
-                        "note": "caught something else",
-                    }
-                },
-            },
-        )
-        db_session.add(task_with_shots)
-        db_session.add(task_no_shots)
-        await db_session.commit()
-
         resp = await client.get(
-            f"/api/admin/visual-pilot-status?project_id={project.id}"
+            f"/api/admin/spend-burn-rate?project_id={project.id}&window_days=7"
         )
         assert resp.status_code == 200
         body = resp.json()
-        assert body["caught_count"] == 2
-
-        by_id = {e["task_id"]: e for e in body["caught"]}
-        entry_with = by_id[str(task_with_shots.id)]
-        assert entry_with["viewport_shot_names"] == ["main-before", "main-after"]
-        assert entry_with["viewport_shot_entries"] == [
-            {"name": "main-before"},
-            {"name": "main-after"},
-        ]
-
-        entry_without = by_id[str(task_no_shots.id)]
-        assert entry_without["viewport_shot_names"] == []
-        assert entry_without["viewport_shot_entries"] == []
-
-    @pytest.mark.asyncio
-    async def test_caught_entry_viewport_shot_entries_includes_magnitude(
-        self, client: AsyncClient, db_session
-    ):
-        """viewport_shot_entries exposes magnitude from diff screenshots."""
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-
-        task = make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            title="With diff magnitude",
-            context={
-                "_pr_changed_files": ["admin-ui/src/App.tsx"],
-                "_self_review_outcome": {
-                    "visual_verification": {
-                        "passed": True,
-                        "pairs_inspected": 1,
-                        "pairs_changed": 1,
-                        "caught_visual_issue": True,
-                        "note": "drift caught",
-                    }
-                },
-                "viewport_screenshots": [
-                    {"name": "main-before", "storage_uri": "gs://b/main-before.png"},
-                    {"name": "main-after", "storage_uri": "gs://b/main-after.png"},
-                    {
-                        "name": "main-diff",
-                        "storage_uri": "gs://b/main-diff.png",
-                        "magnitude": 0.23,
-                    },
-                ],
-            },
-        )
-        db_session.add(task)
-        await db_session.commit()
-
-        resp = await client.get(
-            f"/api/admin/visual-pilot-status?project_id={project.id}"
-        )
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["caught_count"] == 1
-        entry = body["caught"][0]
-        entries_by_name = {e["name"]: e for e in entry["viewport_shot_entries"]}
-        assert "main-diff" in entries_by_name
-        assert entries_by_name["main-diff"]["magnitude"] == pytest.approx(0.23)
-        assert "magnitude" not in entries_by_name.get("main-before", {})
-        assert "magnitude" not in entries_by_name.get("main-after", {})
+        assert body["task_count"] == 0
+        assert body["window_cost_usd"] == 0.0
+        assert body["daily_spend_usd"] == 0.0
+        assert body["monthly_forecast_usd"] == 0.0

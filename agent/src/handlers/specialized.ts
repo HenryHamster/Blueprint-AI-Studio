@@ -1,4 +1,27 @@
 import { execFileSync } from 'child_process';
+/**
+ * Specialized task handlers — domain-specific operations.
+ *
+ * - **handleMigrate**: Write database migrations. Clones repo, runs Claude Code,
+ *   produces a new Alembic migration file, creates a PR.
+ *
+ * - **handleSmoketest**: Run smoke tests against a deployment. Clones repo,
+ *   executes test scripts, validates deployment health, reports pass/fail.
+ *
+ * - **handleDebug**: Investigate and diagnose a bug. Clones repo, runs Claude Code
+ *   with debugging tools, may run tests, produces analysis and proposed fixes.
+ *
+ * - **handlePerf**: Profile and optimize performance. Clones repo, runs profilers,
+ *   analyzes hot paths, produces optimized code, creates a PR.
+ *
+ * - **handleInvestigate**: Open-ended investigation of an issue or area. Clones
+ *   repo, runs Claude Code exploration, produces findings artifact.
+ *
+ * - **handleRepoBootstrap**: Inspect a newly onboarded repository and produce
+ *   bootstrap metadata (build config, test runners, environment setup guidance).
+ *   Does not clone repo or produce PR; artifact-first.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sanitizeError, sendLog, validateBranchName, readHandlerOutput,
@@ -13,7 +36,7 @@ import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
   buildCodeChangeHelperGuidance, codeChangeGuidanceVariant,
   READ_THE_FAILURE_MESSAGE, SIZE_GUARDRAIL_GUIDANCE, PRIOR_ATTEMPT_DIVERGENCE, BEYOND_SCOPE_REPORTING,
-  PARALLEL_AUDIT_GUIDANCE,
+  PARALLEL_AUDIT_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE,
   getTaskTypeFocusBlock,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
@@ -446,7 +469,7 @@ Follow these steps:
    - Count tests collected for curated and regression suites
    - If count < guardrails.min_test_count for either suite, record a guardrail_violation
 
-4. Write results to /tmp/smoketest_result_${taskId}.json with this structure:
+4. Write results to /tmp/smoketest_result_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with this structure:
 {
   "passed": false,
   "suites": {
@@ -460,7 +483,7 @@ Follow these steps:
 
 Set top-level "passed" to true only if ALL suites passed and there are no guardrail violations.
 
-IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.${smoketestFirstTaskSection}
+IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.${smoketestFirstTaskSection}
 
 ${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
 
@@ -607,7 +630,7 @@ ${gitDiffStat}
 
 4. Identify the specific root cause — name the file, function, and line where the problem originates.
 
-5. Write your analysis to /tmp/debug_report_${taskId}.json with EXACTLY this structure:
+5. Write your analysis to /tmp/debug_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with EXACTLY this structure:
 {
   "root_cause": "One clear paragraph explaining what caused the failure, which file/function is responsible, and how it broke",
   "affected_files": ["path/to/file1.ts", "path/to/file2.py"],
@@ -620,7 +643,7 @@ Set confidence to:
 - "medium" if you have a strong hypothesis but some uncertainty
 - "low" if the root cause is unclear or spans many systems
 
-IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot determine the root cause (use confidence "low" and explain what you found in root_cause). Never leave the file unwritten.`;
+IMPORTANT: Always write /tmp/debug_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} even if you cannot determine the root cause (use confidence "low" and explain what you found in root_cause). Never leave the file unwritten.`;
 
   statusRef.value = 'Analyzing failure...';
   const debugFingerprint = computePromptFingerprint('debug');
@@ -699,7 +722,7 @@ Instructions:
 1. Read key files in ${perfPyDir}/ (table/index definitions, query patterns, endpoint handlers) and ${perfNodeDir}/src (React components, imports).
 2. For each finding, identify the specific file, function, and line range where the problem is observable.
 3. Only report findings that are demonstrably present — cite the exact code pattern that shows the problem.
-4. Produce your findings as a JSON array written to /tmp/perf_report_${taskId}.json:
+4. Produce your findings as a JSON array written to /tmp/perf_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE}:
 
 [
   {
@@ -721,7 +744,7 @@ Rules:
 - Do NOT flag theoretical issues (e.g. "this could be slow if data grows") — only flag patterns that are demonstrably inefficient now
 - fix_prompt must be fully self-contained — the fixing agent has no context beyond that string
 - Limit to 15 findings maximum, prioritized by severity
-- IMPORTANT: Write your findings JSON array to /tmp/perf_report_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
+- IMPORTANT: Write your findings JSON array to /tmp/perf_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 - Also output the same JSON array as the final output in your logs.`;
 
   const perfPerfSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
@@ -743,7 +766,7 @@ Rules:
       schemaLabel: 'specialized_findings',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior performance analysis response did not end with a parseable JSON findings array.
-Return ONLY the JSON array for /tmp/perf_report_${taskId}.json. Each finding object must include at least "severity" plus area, title, description, fix_prompt, and related_files. Use [] if there are no findings. No markdown, prose, or code fences.`,
+Output ONLY the JSON array now — each finding must include at least "severity" plus area, title, description, fix_prompt, and related_files. Use [] if there are no findings. No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,
@@ -940,7 +963,7 @@ Instructions:
 2. DO NOT make any changes to any files — this is a read-only analysis.
 3. If the user prompt above frames this as a regression / signal trip / pipeline anomaly, FIRST triage whether what was observed is actually a real regression, or whether it is intended behavior, expected variance, or a known-incomplete pipeline step. When the prompt explicitly asks for a verdict, you MUST emit one.
 4. Otherwise, identify the root cause, affected files, and a recommended fix.
-5. Write your diagnosis as a JSON object to /tmp/investigation_report_${taskId}.json with EXACTLY this schema:
+5. Write your diagnosis as a JSON object to /tmp/investigation_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with EXACTLY this schema:
 
 {
   "summary": "Brief summary of the issue and findings",
@@ -976,7 +999,8 @@ recommended_fix guidance:
 - Name the file paths, function names, and exact conditions to change. Include the intended behavior, not just the symptom.
 
 IMPORTANT:
-- Write ONLY the JSON object to /tmp/investigation_report_${taskId}.json — no markdown, no code fences, no extra text.
+- Write ONLY the JSON object to /tmp/investigation_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} — no markdown, no code fences, no extra text.
+- Also output the same JSON object as the final output in your logs.
 - Do NOT modify any files in the repository.
 - Base every claim on code you have actually read.`;
 
@@ -995,8 +1019,8 @@ IMPORTANT:
       requiredKeys: ['root_cause', 'recommended_fix'],
       schemaLabel: 'specialized_result',
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `Your prior investigation response did not end with a parseable JSON diagnosis object.
-Return ONLY the JSON object for /tmp/investigation_report_${taskId}.json with top-level "summary", "root_cause", "affected_files", "recommended_fix", "severity", and "confidence". Include verdict fields when relevant. No markdown, prose, or code fences.`,
+      reopenPrompt: `${(lastResultText || allOutput || '').slice(-8000) ? `${(lastResultText || allOutput || '').slice(-8000)}\n\n` : ''}Your prior investigation response did not end with a parseable JSON diagnosis object.
+Output ONLY the JSON object now — with top-level "summary", "root_cause", "affected_files", "recommended_fix", "severity", and "confidence". Include verdict fields when relevant. No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,
@@ -1118,7 +1142,7 @@ Read as many of these as exist:
 Also read any detected build/CI manifests you find.
 
 ## What to produce
-1. **Repo overview**: Write the following JSON object to \`/tmp/bootstrap_overview_${taskId}.json\` (NOT inside the repository):
+1. **Repo overview**: Write the following JSON object to \`/tmp/bootstrap_overview_${taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} (NOT inside the repository):
    \`\`\`json
    {
      "tech_stack": "programming language(s), key frameworks, dependency manager",
@@ -1138,7 +1162,7 @@ Also read any detected build/CI manifests you find.
    \`${writebackEndpoint}\`
    with the confirmed commands per directory.
 
-3. **Command-memory outcome**: Record the result of step 2 — separately from the overview — by writing the following JSON object to \`/tmp/command_memory_${taskId}.json\` (NOT inside the repository):
+3. **Command-memory outcome**: Record the result of step 2 — separately from the overview — by writing the following JSON object to \`/tmp/command_memory_${taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} (NOT inside the repository):
    \`\`\`json
    {
      "status": "success | missing_commands | writeback_failed",
@@ -1148,7 +1172,7 @@ Also read any detected build/CI manifests you find.
    \`\`\`
    Use \`success\` only if the write-back call actually succeeded with at least one confirmed command. Use \`missing_commands\` if you could not confirm any runnable command, and \`writeback_failed\` if the write-back call itself errored. The file must contain ONLY the JSON object, no markdown wrapping. This is reported independently of the overview — a good overview does NOT imply confirmed commands.
 
-4. **Domain overview**: Extract product-domain knowledge from the documentation you read and write the following JSON object to \`/tmp/bootstrap_domain_${taskId}.json\` (NOT inside the repository):
+4. **Domain overview**: Extract product-domain knowledge from the documentation you read and write the following JSON object to \`/tmp/bootstrap_domain_${taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} (NOT inside the repository):
    \`\`\`json
    {
      "purpose": "2-3 sentences: what the product does and who its primary users are",

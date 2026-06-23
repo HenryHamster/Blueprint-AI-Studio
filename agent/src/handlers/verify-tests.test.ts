@@ -544,11 +544,17 @@ describe('handleVerifyTests', () => {
   // Distinguish the git working-tree snapshot calls from the build command so a
   // test can simulate a real build (tree changes) vs a no-op build (tree static).
   function mockProbeWithTree(before: string, after: string): void {
-    let gitCalls = 0;
-    vi.mocked(execFileAsync).mockImplementation((cmd: unknown) => {
+    let gitStatusCalls = 0;
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
       if (cmd === 'git') {
-        gitCalls += 1;
-        return Promise.resolve(gitCalls === 1 ? before : after);
+        const a = args as string[];
+        if (a[0] === 'status') {
+          // snapshotWorkingTree calls: 1st → before, 2nd → after
+          gitStatusCalls += 1;
+          return Promise.resolve(gitStatusCalls === 1 ? before : after);
+        }
+        // git diff calls (from computePrDiff) return empty
+        return Promise.resolve('');
       }
       return Promise.resolve(''); // the declared build exits 0
     });
@@ -1068,5 +1074,86 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
     vi.mocked(execFileAsync).mockResolvedValue('');
     await handleVerifyTests('at7', payload, declaredTask('something', 'behavior'), 'tok', 'o', 'r', null, { value: '' });
     expect(acceptanceBlock()).toBeUndefined();
+  });
+});
+
+describe('handleVerifyTests — diff-aware runner filtering', () => {
+  const payload = { branch: 'feature/x', base_branch: 'main' };
+  const AGENT_RUNNER = { cmd: 'npx', args: ['vitest'], cwd: `${WORKSPACE}/agent`, label: 'vitest (agent)' };
+  const BACKEND_RUNNER = { cmd: 'pytest', args: [], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' };
+  const FRONTEND_RUNNER = { cmd: 'npm', args: ['run', 'build'], cwd: `${WORKSPACE}/admin-ui`, label: 'npm run build (admin-ui)' };
+
+  function mockDiff(changedFiles: string[]): void {
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+      if (cmd === 'git') {
+        const a = args as string[];
+        if (a.includes('--name-only')) return Promise.resolve(changedFiles.join('\n'));
+        if (a.includes('--unified=0')) return Promise.resolve('');
+      }
+      return Promise.resolve('');
+    });
+  }
+
+  function runnersUsed(): string[] {
+    const calls = vi.mocked(testFixLoop).mock.calls;
+    if (calls.length === 0) return [];
+    const opts = calls[0][8] as { runnersOverride?: Array<{ label: string }> } | undefined;
+    return (opts?.runnersOverride ?? []).map((r: { label: string }) => r.label);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+    vi.mocked(detectAutoTestRunners).mockReturnValue([]);
+    vi.mocked(detectAcceptanceProbes).mockReturnValue([]);
+    vi.mocked(discoverDocumentedCommands).mockReturnValue([]);
+    vi.mocked(execFileAsync).mockResolvedValue('');
+  });
+
+  it('runs only backend runner when only backend/ files changed', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([AGENT_RUNNER, BACKEND_RUNNER, FRONTEND_RUNNER]);
+    mockDiff(['backend/app/foo.py', 'backend/testing/test_foo.py']);
+
+    await handleVerifyTests('df1', payload, {}, 'tok', 'o', 'r', null, { value: '' });
+
+    expect(runnersUsed()).toEqual([BACKEND_RUNNER.label]);
+  });
+
+  it('runs only agent runner when only agent/ files changed', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([AGENT_RUNNER, BACKEND_RUNNER, FRONTEND_RUNNER]);
+    mockDiff(['agent/src/handlers/foo.ts']);
+
+    await handleVerifyTests('df2', payload, {}, 'tok', 'o', 'r', null, { value: '' });
+
+    expect(runnersUsed()).toEqual([AGENT_RUNNER.label]);
+  });
+
+  it('falls back to all runners when diff is unavailable', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([AGENT_RUNNER, BACKEND_RUNNER]);
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+      if (cmd === 'git' && (args as string[]).includes('--name-only')) {
+        return Promise.reject(new Error('unknown revision origin/main'));
+      }
+      return Promise.resolve('');
+    });
+
+    await handleVerifyTests('df3', payload, {}, 'tok', 'o', 'r', null, { value: '' });
+
+    expect(runnersUsed()).toEqual([AGENT_RUNNER.label, BACKEND_RUNNER.label]);
+  });
+
+  it('MERGE_TEST_RESULT.tests contains only activeRunners, not skipped-by-path runners', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([AGENT_RUNNER, BACKEND_RUNNER, FRONTEND_RUNNER]);
+    mockDiff(['agent/src/handlers/foo.ts']);
+
+    await handleVerifyTests('df4', payload, {}, 'tok', 'o', 'r', null, { value: '' });
+
+    const calls = vi.mocked(persistAndPostStatus).mock.calls;
+    const lastPost = calls[calls.length - 1][1];
+    const verdict = JSON.parse(lastPost.logs as string) as { tests: Array<{ name: string }> };
+    const testNames = verdict.tests.map(t => t.name);
+    expect(testNames).toEqual([AGENT_RUNNER.label]);
+    expect(testNames).not.toContain(BACKEND_RUNNER.label);
+    expect(testNames).not.toContain(FRONTEND_RUNNER.label);
   });
 });

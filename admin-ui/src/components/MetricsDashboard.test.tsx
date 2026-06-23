@@ -77,6 +77,16 @@ const { apiFetch } = vi.hoisted(() => ({
         instance_note: 'per-instance aggregate; does not sum across replicas',
       }), { status: 200 });
     }
+    if (url.includes('/spend-burn-rate')) {
+      return new Response(JSON.stringify({
+        project_id: null,
+        window_days: 7,
+        window_cost_usd: 100.00,
+        task_count: 42,
+        daily_spend_usd: 14.28,
+        monthly_forecast_usd: 435.00,
+      }), { status: 200 });
+    }
     return new Response(JSON.stringify({
       axes: {
         cost_per_merged_pr: {

@@ -64,6 +64,7 @@ from app.reaper import (
     _ORPHAN_PRIORITY_PROVISION,
     _ORPHAN_PRIORITY_DEFAULT,
     _normalize_reaper_retry_failure_class,
+    _build_active_scan_stmt,
 )
 from app.retry_prompt import _build_retry_prompt_suffix
 from app.shared_state import runtime_config as _runtime_config
@@ -394,6 +395,11 @@ def reaper_side_effects(mocker):
     )
     mocker.patch("app.reaper_orphan_io._capture_serial_for_vm", return_value=None)
     mocker.patch("app.reaper.record_zone_failure")
+    # Prevent task-failure results from polluting deploy_monitoring.task_results,
+    # which is a global deque shared across test sessions and would cause the
+    # degradation-gate to fire in subsequent research_completion tests.
+    # Patch at the source (record_task_result is imported lazily inside reaper_service).
+    mocker.patch("app.routers.agent_status.record_task_result")
     # Disable infra-recovery resurrection so FAILED tasks stay FAILED where asserted.
     mocker.patch("app.reaper.any_zone_available", return_value=True)
 
@@ -1867,6 +1873,44 @@ async def test_heartbeat_timeout_api_error_logs_classified_as_external_api(
     ctx = t.context or {}
     assert t.status == TaskStatus.QUEUED
     assert ctx.get("_previous_failure_class") == "EXTERNAL_API"
+
+
+@pytest.mark.asyncio
+async def test_cloud_run_task_reap_skips_vm_deletion(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Reaped Cloud Run task must not enqueue a GCE VM deletion.
+
+    Cloud Run tasks carry a synthetic vm_instance_id (not a real GCE instance
+    name). Calling _ensure_vm_deleted on them fires a GCE API call against a
+    non-existent resource. The guard added to reaper.py must prevent that.
+    """
+    ensure_deleted = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_machine_type="cloud-run-1vcpu-2gib",
+        vm_instance_id="cloud-run-job-test-123",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    # Task must have been reaped (heartbeat expired).
+    assert t.status in (TaskStatus.FAILED, TaskStatus.QUEUED), (
+        f"Expected task to be reaped, got status={t.status}"
+    )
+    # The synthetic Cloud Run vm_id must NOT have triggered a GCE deletion call.
+    ensure_deleted.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -14827,3 +14871,247 @@ async def test_orphan_external_io_gather_result_bundle(mocker):
     # No provision failure — serial capture skipped
     assert snapshot.io_serial_log is None
     assert snapshot.io_prov_zone is None
+
+
+def test_reaper_active_scan_projection_invariant():
+    """The active-scan stmt must exclude plan_output and retain the columns
+    required by event listeners and _heartbeat_stale_cutoff."""
+    from sqlalchemy.dialects import postgresql
+
+    stmt = _build_active_scan_stmt()
+    sql_text = str(stmt.compile(dialect=postgresql.dialect()))
+
+    # plan_output must NOT appear in the projected columns
+    assert "plan_output" not in sql_text, (
+        "Active-scan projection must exclude plan_output JSONB. "
+        "Re-adding it re-introduces the over-fetch this guard protects against."
+    )
+
+    # These columns are required by Task event listeners (_heartbeat_stale_cutoff
+    # / status assignment); removing any triggers MissingGreenlet under async sessions.
+    for required in ("status_log", "context", "payloads"):
+        assert required in sql_text, (
+            f"Active-scan projection must include '{required}' — "
+            "removing it will trigger MissingGreenlet under async sessions."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 20: sweep_orphaned_cross_base_children
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_converge_guard_cancels_unreachable_cross_base_child(reaper_db):
+    """A QUEUED child of a COMPLETED parent whose cross-base code-dep is
+    permanently stranded (STRANDED_LANDING_REASON_KEY set on dep, no landed
+    signal) is cancelled and stamped _orphaned_cross_base_cancel.
+
+    This is the primary acceptance test for the converge guard (Step 20).
+    """
+    from app.reaper_sweeps import sweep_orphaned_cross_base_children
+
+    project = await _make_project(reaper_db)
+
+    # Dep: cross-base code task, COMPLETED, definitively stranded (never lands).
+    dep = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "base_branch": "plan/dep-branch"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "related_files": ["backend/app/foo.py"],
+            "landed_on_integration": False,
+            "rollup_landing_stranded": "not_ancestor_of_integration",
+        },
+    )
+    reaper_db.add(dep)
+    await reaper_db.commit()
+    await reaper_db.refresh(dep)
+
+    # Parent: research/plan direction, COMPLETED.
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    # Child: QUEUED, on a different base branch, with file overlap so the dep
+    # is a genuine code dependency, and waiting on the stranded dep.
+    child = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "base_branch": "plan/child-branch"}],
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent.id,
+        depends_on=[str(dep.id)],
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    reaper_db.add(child)
+    await reaper_db.commit()
+    await reaper_db.refresh(child)
+
+    cancelled = await sweep_orphaned_cross_base_children(reaper_db)
+
+    assert cancelled == 1
+    await reaper_db.refresh(child)
+    assert child.status == TaskStatus.CANCELLED
+    assert child.context.get("_orphaned_cross_base_cancel") is True
+
+
+@pytest.mark.asyncio
+async def test_converge_guard_skips_legitimately_waiting_child(reaper_db):
+    """A QUEUED child whose dep is cross-base COMPLETED but lacks
+    STRANDED_LANDING_REASON_KEY (it may still land via rollup propagation) is
+    left untouched — confirms the conservative 'only-cancel-when-definitive' policy.
+    """
+    from app.reaper_sweeps import sweep_orphaned_cross_base_children
+
+    project = await _make_project(reaper_db)
+
+    # Dep: COMPLETED, landed_on_integration=False BUT no stranded marker.
+    dep = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "base_branch": "plan/dep-branch"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "related_files": ["backend/app/foo.py"],
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "staging_only_merge",
+        },
+    )
+    reaper_db.add(dep)
+    await reaper_db.commit()
+    await reaper_db.refresh(dep)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "base_branch": "plan/child-branch"}],
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent.id,
+        depends_on=[str(dep.id)],
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    reaper_db.add(child)
+    await reaper_db.commit()
+    await reaper_db.refresh(child)
+
+    cancelled = await sweep_orphaned_cross_base_children(reaper_db)
+
+    assert cancelled == 0
+    await reaper_db.refresh(child)
+    assert child.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_converge_guard_skips_child_of_active_parent(reaper_db):
+    """A QUEUED child whose parent is still EVALUATING (not COMPLETED) is left
+    untouched — the direction may still converge and handle the child normally.
+    """
+    from app.reaper_sweeps import sweep_orphaned_cross_base_children
+
+    project = await _make_project(reaper_db)
+
+    dep = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "base_branch": "plan/dep-branch"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "related_files": ["backend/app/foo.py"],
+            "landed_on_integration": False,
+            "rollup_landing_stranded": "not_ancestor_of_integration",
+        },
+    )
+    reaper_db.add(dep)
+    await reaper_db.commit()
+    await reaper_db.refresh(dep)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "base_branch": "plan/child-branch"}],
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent.id,
+        depends_on=[str(dep.id)],
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    reaper_db.add(child)
+    await reaper_db.commit()
+    await reaper_db.refresh(child)
+
+    cancelled = await sweep_orphaned_cross_base_children(reaper_db)
+
+    assert cancelled == 0
+    await reaper_db.refresh(child)
+    assert child.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_converge_guard_skips_ordering_only_dep(reaper_db):
+    """A dep that is ordering-only (non-code-producing type, e.g. research) is not
+    a genuine code dependency, so the child waiting on it is not cancelled even
+    when the dep is stranded cross-base.
+    """
+    from app.reaper_sweeps import sweep_orphaned_cross_base_children
+
+    project = await _make_project(reaper_db)
+
+    # Dep is a research task (non-code-producing) — ordering-only.
+    dep = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "base_branch": "plan/dep-branch"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "related_files": ["backend/app/foo.py"],
+            "landed_on_integration": False,
+            "rollup_landing_stranded": "not_ancestor_of_integration",
+        },
+    )
+    reaper_db.add(dep)
+    await reaper_db.commit()
+    await reaper_db.refresh(dep)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "base_branch": "plan/child-branch"}],
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent.id,
+        depends_on=[str(dep.id)],
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    reaper_db.add(child)
+    await reaper_db.commit()
+    await reaper_db.refresh(child)
+
+    cancelled = await sweep_orphaned_cross_base_children(reaper_db)
+
+    assert cancelled == 0
+    await reaper_db.refresh(child)
+    assert child.status == TaskStatus.QUEUED

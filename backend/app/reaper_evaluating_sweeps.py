@@ -16,11 +16,12 @@ import uuid
 from datetime import timedelta
 from typing import Callable, Dict, Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import Task, TaskStatus
+from app.models import Direction, Task, TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,10 @@ async def sweep_evaluating_parents(
                     )
                     .where(
                         Task.status == TaskStatus.EVALUATING,
-                        Task.updated_at < stale_cutoff,
+                        or_(
+                            Task.updated_at < stale_cutoff,
+                            Task.updated_at.is_(None),
+                        ),
                     )
                     # C3: per-cycle row cap. Step 3 calls
                     # _check_and_trigger_rollup (serial GitHub I/O)
@@ -125,7 +129,7 @@ async def sweep_evaluating_parents(
                     # first (most-stuck parents); deferred parents
                     # re-qualify next cycle (status+age scan, no
                     # deferral queue needed).
-                    .order_by(Task.updated_at.asc())
+                    .order_by(Task.updated_at.asc().nullsfirst())
                     .limit(_REAPER_MAX_EVALUATING_PER_CYCLE)
                 )
             )
@@ -358,3 +362,138 @@ async def sweep_evaluating_parents(
         # the Step 6/7/8/10 handlers and the Step 3 guard above.
         with contextlib.suppress(Exception):
             await session.rollback()
+
+
+# Terminal direction statuses — duplicated from research_direction_state to
+# avoid a cross-module import that would create a cycle between the reaper
+# and the research completion layer.
+_RETIRED_DIRECTION_STATUSES = frozenset(
+    {"expired", "retired", "superseded", "completed"}
+)
+
+_ORPHANED_PROVIDER_SWEEP_BATCH = 200
+
+
+async def sweep_orphaned_direction_provider_tasks(session) -> int:
+    """Cancel EVALUATING research/refactor tasks whose parent direction is retired.
+
+    When a direction closes (status in _RETIRED_DIRECTION_STATUSES), any EVALUATING
+    task that was providing for it has nowhere to land.  Such tasks hold no VM (slots
+    already released), so the heartbeat reaper ignores them, and a null updated_at
+    can hide them from the staleness sweep — they orphan forever until an operator
+    manually cancels them.
+
+    This sweep finds EVALUATING tasks that carry a direction_id in their context and
+    whose direction row now has a retired status, then cancels them cleanly (not a
+    pipeline failure — the direction simply closed before the task completed).
+
+    Returns the number of tasks cancelled.
+    """
+    cancelled = 0
+    try:
+        # Step A: find EVALUATING tasks with a direction_id in context.
+        # The context["direction_id"] key is set by research/refactor flows
+        # when the task is tied to a specific autonomous-improvement direction.
+        candidates = (
+            (
+                await session.execute(
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.id,
+                            Task.status,
+                            Task.project_id,
+                            Task.context,
+                            Task.latest_status_message,
+                            Task.status_log,
+                            raiseload=True,
+                        )
+                    )
+                    .where(
+                        Task.status == TaskStatus.EVALUATING,
+                        Task.archived.is_(False),
+                        Task.context["direction_id"].is_not(None),
+                    )
+                    .limit(_ORPHANED_PROVIDER_SWEEP_BATCH)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not candidates:
+            return 0
+
+        # Step B: batch-fetch Direction rows grouped by project to minimise
+        # round-trips.  A direction that does not exist in the Direction table
+        # (e.g. it was never synced) is left alone — missing ≠ retired.
+        from collections import defaultdict
+
+        tasks_by_proj: dict = defaultdict(list)
+        for task in candidates:
+            tasks_by_proj[task.project_id].append(task)
+
+        for proj_id, proj_tasks in tasks_by_proj.items():
+            direction_keys = {
+                (t.context or {}).get("direction_id")
+                for t in proj_tasks
+                if (t.context or {}).get("direction_id")
+            }
+            if not direction_keys:
+                continue
+
+            direction_rows = (
+                (
+                    await session.execute(
+                        select(Direction)
+                        .options(
+                            load_only(
+                                Direction.direction_key,
+                                Direction.status,
+                                raiseload=True,
+                            )
+                        )
+                        .where(
+                            Direction.project_id == proj_id,
+                            Direction.direction_key.in_(list(direction_keys)),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            dir_status_by_key = {d.direction_key: d.status for d in direction_rows}
+
+            for task in proj_tasks:
+                did = (task.context or {}).get("direction_id")
+                if not did:
+                    continue
+                dir_status = dir_status_by_key.get(did)
+                if dir_status not in _RETIRED_DIRECTION_STATUSES:
+                    continue
+                logger.warning(
+                    "[REAPER] Auto-cancelling EVALUATING task %s: direction %s is %s",
+                    str(task.id)[:8],
+                    did,
+                    dir_status,
+                )
+                task.status = TaskStatus.CANCELLED
+                task.latest_status_message = (
+                    f"Auto-cancelled: direction {did} is {dir_status} — "
+                    "provider task has nowhere to land"
+                )
+                session.add(task)
+                cancelled += 1
+
+        if cancelled:
+            await session.commit()
+            logger.info(
+                "[REAPER] Cancelled %d EVALUATING tasks for retired directions",
+                cancelled,
+            )
+    except Exception as e:
+        logger.error(
+            "[REAPER] Orphaned direction provider sweep error: %s", e, exc_info=True
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
+    return cancelled

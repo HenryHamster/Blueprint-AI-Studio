@@ -88,14 +88,14 @@ echo ""
 // /api/agent/projects/{project_id}/... — all share the standard agent auth and
 // are callable by any of the project's agent tokens, so the helper works for
 // every task type, not just strategic-cycle agents.
-export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'qualification';
+export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'qualification' | 'vm-cost' | 'efficiency-snapshot';
 
 // Canonical order of the full vocabulary. STRATEGIC provisions all of these.
 // `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
 // distinct from the single-id project-path verbs that precede it; it is appended
 // last so the historical path-verb ordering is otherwise preserved.
 export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
-  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'qualification',
+  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'qualification', 'vm-cost', 'efficiency-snapshot',
 ];
 
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
@@ -120,6 +120,8 @@ const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'message':       'message)    PATH_SUFFIX="messages/$ID"',
   'section':       'section)    PATH_SUFFIX="design-doc/$ID"',
   'qualification': 'qualification) PATH_SUFFIX="qualification"',
+  'vm-cost':            'vm-cost)              PATH_SUFFIX="vm-cost"',
+  'efficiency-snapshot': 'efficiency-snapshot)  PATH_SUFFIX="efficiency-snapshot"',
 };
 
 // Self-contained case arm for the SEARCH-shaped `knowledge` verb. Unlike the
@@ -169,6 +171,8 @@ const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'section':       '`./fetch section <key>` — a full design-doc section',
   'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--tag T]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body',
   'qualification': '`./fetch qualification` — latest qualification verdict for the open version: candidate SHA, confidence, sub_scores, and full audit findings list (no id)',
+  'vm-cost':            '`./fetch vm-cost` — live VM cost by task type: cost_usd, task/VM count, merged count, and merge-yield per type over the last 7 days (no id)',
+  'efficiency-snapshot': '`./fetch efficiency-snapshot` — current efficiency metrics: cost_per_merged_pr, vm_reuse_rate, llm_cost_per_merged_pr, and format_compliance over the last 7 days (no id)',
 };
 
 function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
@@ -210,7 +214,7 @@ case "$KIND" in
 ${caseBody}
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "qualification" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi

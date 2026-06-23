@@ -246,6 +246,7 @@ async def _handle_ci_waiting_backstop(
         was_escalated=was_escalated,
         review_summary=review_summary,
         review_loop=rl,
+        parent_ctx=ctx,
     )
 
     # One-shot recovery: if CI passed but the review-approved gate never

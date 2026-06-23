@@ -19,7 +19,7 @@ import pytest
 # auth.py raises ValueError at module load if these are absent; keeping them
 # here lets the route-table invariant run in standalone mode without the
 # backend test conftest.
-os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check")
+os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check-x")
 os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
 
 
@@ -326,13 +326,7 @@ def test_all_admin_routes_require_auth():
     # Intentional exceptions — should stay empty. If a route is intentionally
     # public (for example, a monitored liveness probe), add its path here with
     # a short comment explaining why the public surface is deliberate.
-    public_allowlist: dict[str, str] = {
-        "/api/admin/viewport-shots/download-url": (
-            "Intentionally unauthenticated: endpoint returns a 302 redirect to a "
-            "time-limited GCS signed URL. Operators click these links from GitHub PR "
-            "bodies without a bearer token; the signed URL itself is the security boundary."
-        ),
-    }
+    public_allowlist: dict[str, str] = {}
 
     # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
     # JWTs; it is a valid auth callable for metrics-only endpoints.
@@ -552,14 +546,21 @@ class TestSafetyConstants:
 
 class TestSchemaRevisionSync:
     def test_expected_revision_matches_latest_migration(self):
-        """EXPECTED_SCHEMA_REVISION must match the latest alembic migration.
+        """EXPECTED_SCHEMA_REVISION must match the structural head of the alembic chain.
+
+        Compares against the structural chain head (walking internal
+        revision/down_revision via build_migration_chain + find_heads) rather
+        than the lexicographic max of filename prefixes, so a non-monotonic
+        chain — where the filename-max is not the structural head — is caught.
 
         If this fails, you added a migration but forgot to bump
         EXPECTED_SCHEMA_REVISION in main.py. The orchestrator will crash
         on startup with a schema version mismatch.
         """
         import glob as globmod
+
         from app.main import EXPECTED_SCHEMA_REVISION
+        from app.migration_chain import build_migration_chain, find_heads
 
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
@@ -567,10 +568,21 @@ class TestSchemaRevisionSync:
         files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
         assert files, "No migration files found"
 
-        latest = max(os.path.basename(f).split("_")[0] for f in files)
-        assert EXPECTED_SCHEMA_REVISION == latest, (
-            f"EXPECTED_SCHEMA_REVISION is '{EXPECTED_SCHEMA_REVISION}' but latest "
-            f"migration is '{latest}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
+        sources: dict[str, str] = {}
+        for f in files:
+            with open(f) as fh:
+                sources[os.path.basename(f)] = fh.read()
+
+        chain, _dups, _unp = build_migration_chain(sources)
+        heads = find_heads(chain)
+        assert len(heads) == 1, (
+            f"Migration chain has {len(heads)} structural heads: {heads}. "
+            "Cannot determine EXPECTED_SCHEMA_REVISION until the chain is linear."
+        )
+        structural_head = heads[0]
+        assert structural_head == EXPECTED_SCHEMA_REVISION, (
+            f"EXPECTED_SCHEMA_REVISION is '{EXPECTED_SCHEMA_REVISION}' but structural "
+            f"chain head is '{structural_head}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
         )
 
     def test_task_context_size_constraint_exists_in_migration(self):
@@ -836,6 +848,30 @@ class TestSchemaRevisionSync:
             "_validate_rollup_migration_chain must be called with target_branch in "
             "rollup_management.py. Without it the guard is blind to parallel-development "
             "migration collisions (two branches each adding the same revision id)."
+        )
+
+    def test_rollup_guard_calls_content_immutability_check(self):
+        """rollup_migration_validation.py must reference find_deployed_migration_content_edits.
+
+        Regression guard for the in-place-edit defect class: a migration file
+        whose filename matches a deployed promotion-target file but whose body
+        was changed. The filename-only reuse/renumber detector
+        (find_content_divergent_revisions) is blind to this class because both
+        sides share the same filename, revision id, and description — no
+        filename divergence is reported. Dropping the content call silently
+        reverts the guard to filename-only coverage and leaves the in-place-edit
+        class undetected (the v17 third defect class).
+        """
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "rollup_migration_validation.py"
+        )
+        with open(path) as f:
+            content = f.read()
+        assert "find_deployed_migration_content_edits" in content, (
+            "rollup_migration_validation.py must reference "
+            "find_deployed_migration_content_edits. Without it the guard is blind "
+            "to in-place body edits of deployed migrations (same filename and "
+            "revision id, different content — the v17 in-place-edit defect class)."
         )
 
     def test_backmerge_guard_uses_combined_chain_check(self):
@@ -1661,6 +1697,136 @@ class TestSchemaRevisionSync:
             + "\n\nUse op.create_index(..., if_not_exists=True) or raw SQL "
             "'CREATE INDEX IF NOT EXISTS' for any migration that re-asserts "
             "an index name an earlier migration already created."
+        )
+
+
+# ── Chain-invariant detector self-certification (seeded bad fixtures) ────────
+
+
+class TestChainInvariantSeedFixtures:
+    """Negative-coverage: prove each chain-invariant detector fires on seeded bad fixtures.
+
+    The positive invariants in TestSchemaRevisionSync / test_migration_chain_is_linear
+    assert the real on-disk chain is clean but never verify the detectors
+    themselves fire when given bad input.  These tests seed deliberately broken
+    in-memory source dicts (no I/O) and assert each detector returns an error,
+    so the smoke set self-certifies the tooling rather than passing only because
+    the current chain happens to be clean.
+    """
+
+    @staticmethod
+    def _src(revision: str, down_revision: str | None) -> str:
+        down = "None" if down_revision is None else f"'{down_revision}'"
+        return f"revision = '{revision}'\ndown_revision = {down}\n"
+
+    def test_chain_invariant_flags_seeded_duplicate_revision(self):
+        """build_migration_chain reports a duplicate when two sources share a revision id."""
+        from app.migration_chain import build_migration_chain
+
+        sources = {
+            "0001_a.py": self._src("0001", None),
+            "0002_b.py": self._src("0001", None),  # duplicate revision id
+        }
+        _chain, duplicates, _unp = build_migration_chain(sources)
+        assert duplicates, (
+            "build_migration_chain did not detect duplicate revision '0001' across "
+            "two sources — the in-file dup-revision detector is not firing"
+        )
+        assert "0001" in duplicates
+
+    def test_chain_invariant_flags_seeded_multi_head(self):
+        """find_heads returns >1 entry when two sources both chain from the same parent."""
+        from app.migration_chain import build_migration_chain, find_heads
+
+        sources = {
+            "0001_root.py": self._src("0001", None),
+            "0002_a.py": self._src("0002", "0001"),
+            "0003_b.py": self._src("0003", "0001"),  # second child of 0001 → branch
+        }
+        chain, _dups, _unp = build_migration_chain(sources)
+        heads = find_heads(chain)
+        assert len(heads) > 1, (
+            f"find_heads returned {heads} for a branched chain — "
+            "the multi-head detector is not firing"
+        )
+
+    def test_chain_invariant_flags_seeded_filename_desync(self):
+        """find_filename_revision_mismatches fires when filename prefix != internal revision."""
+        from app.migration_chain import find_filename_revision_mismatches
+
+        sources = {
+            "0002_foo.py": self._src(
+                "0001", None
+            ),  # filename says 0002, file says 0001
+        }
+        mismatches = find_filename_revision_mismatches(sources)
+        assert mismatches, (
+            "find_filename_revision_mismatches did not detect filename/revision mismatch "
+            "for '0002_foo.py' (internal revision '0001') — the desync detector is not firing"
+        )
+
+    def test_chain_invariant_flags_seeded_expected_revision_mismatch(self):
+        """validate_standalone_chain fires when EXPECTED_SCHEMA_REVISION != structural head.
+
+        Proves the detector correctly identifies the STRUCTURAL head (the revision
+        no other revision points to) rather than the lexicographic/filename max.
+        Uses a three-migration linear chain: structural head is '0003', not '0099'.
+        """
+        from app.migration_chain import validate_standalone_chain
+
+        sources = {
+            "0001_root.py": self._src("0001", None),
+            "0002_mid.py": self._src("0002", "0001"),
+            "0003_tip.py": self._src("0003", "0002"),
+        }
+        # A wrong EXPECTED_SCHEMA_REVISION must produce a non-empty errors list.
+        errors = validate_standalone_chain(sources, expected_schema_revision="0099")
+        assert errors, (
+            "validate_standalone_chain did not fire for mismatched "
+            "EXPECTED_SCHEMA_REVISION '0099' (structural head is '0003') — "
+            "the expected-revision detector is not wired into validate_standalone_chain"
+        )
+        assert any("EXPECTED_SCHEMA_REVISION" in e for e in errors), (
+            f"Expected an EXPECTED_SCHEMA_REVISION error but got: {errors}"
+        )
+        # Passing the correct head must produce no errors.
+        no_errors = validate_standalone_chain(sources, expected_schema_revision="0003")
+        assert not no_errors, (
+            f"validate_standalone_chain reported errors for correct revision '0003': {no_errors}"
+        )
+
+    def test_validate_standalone_chain_aggregates_all_detectors(self):
+        """validate_standalone_chain reports errors for each class of chain defect."""
+        from app.migration_chain import validate_standalone_chain
+
+        # Duplicate revision id
+        dup_sources = {
+            "0001_a.py": self._src("0001", None),
+            "0002_b.py": self._src("0001", None),
+        }
+        errors = validate_standalone_chain(dup_sources)
+        assert any("duplicate" in e for e in errors), (
+            f"validate_standalone_chain did not report duplicate revision; got: {errors}"
+        )
+
+        # Multi-head (branched chain)
+        branch_sources = {
+            "0001_root.py": self._src("0001", None),
+            "0002_a.py": self._src("0002", "0001"),
+            "0003_b.py": self._src("0003", "0001"),
+        }
+        errors = validate_standalone_chain(branch_sources)
+        assert any("head" in e for e in errors), (
+            f"validate_standalone_chain did not report multi-head; got: {errors}"
+        )
+
+        # Filename/revision desync
+        desync_sources = {
+            "0099_foo.py": self._src("0001", None),
+        }
+        errors = validate_standalone_chain(desync_sources)
+        assert any("mismatch" in e for e in errors), (
+            f"validate_standalone_chain did not report filename desync; got: {errors}"
         )
 
 
@@ -9519,149 +9685,260 @@ def test_dropped_dead_orm_columns_write_sites_removed():
     )
 
 
-def test_authorized_test_deletions_require_documentation():
-    """Each AUTHORIZED_TEST_DELETIONS entry must have non-empty co_deleted_subject,
-    commit_ref, and rationale fields, and each path_suffix must be properly anchored
-    so that only a genuine path-segment match (not a prefix-collision) is authorized.
+def test_authorized_test_deletion_allowlist_is_sealed():
+    """The hardcoded test-deletion allowlist must NOT be importable.
 
-    A bare or undocumented entry can silently widen the promotion gate bypass.
-    This tripwire fails CI when any entry omits required documentation or when the
-    path_suffix matching would authorize files in unintended directories.
+    The release qualifier retired the ``AUTHORIZED_TEST_DELETIONS`` tuple and its
+    ``_get_lifecycle_bounded_authorized_deletions()`` lifecycle filter in favour
+    of per-file LLM classification emitted by the release audit agent
+    (``deleted_test_file_classifications``).  The allowlist was authorization-as-
+    code: widening it required a backend deploy, which created the catch-22 that
+    blocked two legitimate promotions (v14 viewportRegression, v17 visual-
+    verification dead-code cut).
+
+    This invariant seals the backdoor: neither symbol may be reintroduced into
+    ``app.release_scoring`` without a deliberate decision that also updates this
+    test.  Importing either name must raise ImportError.
     """
-    from app.release_scoring import AUTHORIZED_TEST_DELETIONS
+    import app.release_scoring as rs
 
-    missing: list[str] = []
-    for entry in AUTHORIZED_TEST_DELETIONS:
-        gaps = []
-        if not entry.co_deleted_subject.strip():
-            gaps.append("co_deleted_subject")
-        if not entry.commit_ref.strip():
-            gaps.append("commit_ref")
-        if not entry.rationale.strip():
-            gaps.append("rationale")
-        if gaps:
-            missing.append(f"  {entry.path_suffix!r}: missing {', '.join(gaps)}")
-
-    assert not missing, (
-        "AUTHORIZED_TEST_DELETIONS entries are missing required documentation fields.\n"
-        "Each entry must supply co_deleted_subject, commit_ref, and rationale.\n"
-        "Add the missing fields to the AuthorizedTestDeletion(...) constructor in "
-        "backend/app/release_scoring.py:\n" + "\n".join(missing)
-    )
-
-    # Verify that the production matching logic is anchored at a path separator:
-    # a file whose name merely ends with the suffix string but is NOT separated by
-    # a '/' must NOT be authorized.  This catches e.g. "evilviewportRegression.test.ts"
-    # being silently bypassed when "viewportRegression.test.ts" is in the allowlist.
-    def _is_authorized(path: str) -> bool:
-        return any(
-            path == entry.path_suffix or path.endswith("/" + entry.path_suffix)
-            for entry in AUTHORIZED_TEST_DELETIONS
+    for name in (
+        "AUTHORIZED_TEST_DELETIONS",
+        "_get_lifecycle_bounded_authorized_deletions",
+    ):
+        assert not hasattr(rs, name), (
+            f"app.release_scoring.{name} is importable again. The hardcoded "
+            "test-deletion allowlist was deliberately retired in favour of per-file "
+            "LLM classification (deleted_test_file_classifications). Do not "
+            "reintroduce the allowlist — classify deletions in the release audit "
+            "agent (agent/src/handlers/audits.ts) instead."
         )
 
-    unanchored: list[str] = []
-    for entry in AUTHORIZED_TEST_DELETIONS:
-        # A path that shares the suffix but has no preceding separator must NOT match.
-        spoofed = "evil" + entry.path_suffix
-        if _is_authorized(spoofed):
-            unanchored.append(
-                f"  {entry.path_suffix!r}: unanchored — '{spoofed}' is incorrectly authorized"
-            )
-        # The canonical suffixed path (with separator) MUST match.
-        canonical = "some/dir/" + entry.path_suffix
-        if not _is_authorized(canonical):
-            unanchored.append(
-                f"  {entry.path_suffix!r}: broken — '{canonical}' is not authorized"
-            )
-
-    assert not unanchored, (
-        "AUTHORIZED_TEST_DELETIONS path_suffix matching is not anchored at a path separator.\n"
-        "The production matcher in release_scoring.py must use:\n"
-        "  str(f) == entry.path_suffix or str(f).endswith('/' + entry.path_suffix)\n"
-        "Failures:\n" + "\n".join(unanchored)
-    )
+    with pytest.raises(ImportError):
+        from app.release_scoring import AUTHORIZED_TEST_DELETIONS  # noqa: F401
+    with pytest.raises(ImportError):
+        from app.release_scoring import (  # noqa: F401
+            _get_lifecycle_bounded_authorized_deletions,
+        )
 
 
-def test_authorized_test_deletions_lifecycle_bounded():
-    """Entries in AUTHORIZED_TEST_DELETIONS must remain active only while their
-    co-deleted subject code is actually deleted from the working tree.
+def test_main_py_admin_endpoints_auth_and_401_path():
+    """All @app.{method}('/api/admin/...') handlers declared directly in main.py
+    must use get_current_user or get_current_user_optional, and any handler
+    using get_current_user_optional must include an explicit
+    HTTPException(status_code=401) path so unauthenticated callers are never
+    served a non-error response.
 
-    When a co-deleted file is restored (re-added to the repo), its entry becomes
-    "spent" and must be removed from the allowlist. Otherwise entries accumulate
-    indefinitely as permanent gate-bypass holes, allowing test deletions that were
-    never meant to be authorized.
-
-    The lifecycle-bounded filter _get_lifecycle_bounded_authorized_deletions()
-    enforces this: only entries whose subject code is still deleted remain active.
+    This is a static AST check on main.py only (not on included routers) to
+    complement the live-app dependency scan in test_all_admin_routes_require_auth.
     """
-    from app.release_scoring import (
-        AUTHORIZED_TEST_DELETIONS,
-        _get_lifecycle_bounded_authorized_deletions,
-    )
+    import ast
     from pathlib import Path
 
-    # Anchor to the repo root (backend/testing/test_invariants.py -> repo root is 3 levels up).
-    _repo_root = Path(__file__).parent.parent.parent
+    main_py = Path(__file__).parent.parent / "app" / "main.py"
+    source = main_py.read_text()
+    tree = ast.parse(source, filename=str(main_py))
 
-    def _subject_file_exists(file_part: str) -> list[str]:
-        """Return list of repo-relative paths where file_part is found (recursive search)."""
-        matches = []
-        for base_dir in ("admin-ui", "backend", "agent"):
-            for p in (_repo_root / base_dir).rglob(file_part):
-                matches.append(str(p.relative_to(_repo_root)))
-        # Also check full relative path from repo root
-        direct = _repo_root / file_part
-        if direct.exists() and str(direct.relative_to(_repo_root)) not in matches:
-            matches.append(str(direct.relative_to(_repo_root)))
-        return matches
+    # Endpoints that intentionally skip the 401-path requirement — document why.
+    OPTIONAL_401_ALLOWLIST: dict[str, str] = {}
 
-    active = _get_lifecycle_bounded_authorized_deletions()
+    AUTH_DEPS = {"get_current_user", "get_current_user_optional"}
+    HTTP_METHODS = {"get", "post", "put", "delete", "patch"}
 
-    # Verify that the filtered list contains only entries whose subject files
-    # are actually deleted (no longer exist in the working tree).
-    spent_entries = []
-    for entry in AUTHORIZED_TEST_DELETIONS:
-        if entry not in active:
-            # This entry was filtered out — check that its subject file exists.
-            # If it exists, the entry is correctly identified as spent.
-            subject_str = entry.co_deleted_subject.strip()
-            file_part = subject_str.split()[0] if subject_str else ""
-            if not file_part:
-                spent_entries.append(f"  {entry.path_suffix!r}: malformed co_deleted_subject (no file part)")
+    def _has_status_401_raise(funcdef: ast.AST) -> bool:
+        """Return True if the function body contains raise HTTPException(status_code=401, ...)."""
+        for node in ast.walk(funcdef):
+            if not isinstance(node, ast.Raise):
                 continue
+            exc = node.exc
+            if exc is None:
+                continue
+            if not (
+                isinstance(exc, ast.Call)
+                and isinstance(exc.func, ast.Name)
+                and exc.func.id == "HTTPException"
+            ):
+                continue
+            for kw in exc.keywords:
+                if (
+                    kw.arg == "status_code"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == 401
+                ):
+                    return True
+        return False
 
-            # Try to find the file anywhere under the repo root (recursive).
-            found_paths = _subject_file_exists(file_part)
+    def _dep_name_from_call(call_node: ast.expr | None) -> str | None:
+        """Return the callable name from a Depends(...) call node, or None."""
+        if call_node is None:
+            return None
+        if not (
+            isinstance(call_node, ast.Call)
+            and isinstance(call_node.func, ast.Name)
+            and call_node.func.id == "Depends"
+            and call_node.args
+        ):
+            return None
+        dep_arg = call_node.args[0]
+        if isinstance(dep_arg, ast.Name):
+            return dep_arg.id
+        return None
 
-            if not found_paths:
-                # Subject file does not exist but entry was filtered — this is an
-                # inconsistency. The entry should be active since the code is deleted.
-                spent_entries.append(
-                    f"  {entry.path_suffix!r}: subject file '{file_part}' is deleted "
-                    "but entry was filtered out (should be active)"
-                )
+    def _auth_deps_in_funcdef(
+        funcdef: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        """Return the set of AUTH_DEPS callables used as Depends() default values."""
+        # FastAPI resolves Depends() from the *default value* of parameters,
+        # not from the type annotation.  Positional-arg defaults are aligned to
+        # the tail of args.args; keyword-only defaults map 1:1 with kwonlyargs.
+        found: set[str] = set()
 
-    assert not spent_entries, (
-        "AUTHORIZED_TEST_DELETIONS lifecycle check failed. Entries are filtered as "
-        "'spent' only when their co-deleted subject files have been restored (re-added "
-        "to the repo). If the subject is still deleted, the entry must remain active.\n"
-        "Issues:\n" + "\n".join(spent_entries)
-    )
+        for default in funcdef.args.defaults:
+            name = _dep_name_from_call(default)
+            if name in AUTH_DEPS:
+                found.add(name)
 
-    # Verify that active entries correspond to entries where the subject code
-    # is actually deleted (proving the entry is valid and currently-needed).
-    for entry in active:
-        subject_str = entry.co_deleted_subject.strip()
-        file_part = subject_str.split()[0] if subject_str else ""
-        if not file_part:
+        for kw_default in funcdef.args.kw_defaults:
+            name = _dep_name_from_call(kw_default)
+            if name in AUTH_DEPS:
+                found.add(name)
+
+        return found
+
+    missing_auth: list[str] = []
+    missing_401: list[str] = []
+    found_paths: list[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
 
-        # The subject file must NOT exist (must be deleted) for an entry to be active.
-        # Search recursively from the repo root so nested paths are found.
-        found_paths = _subject_file_exists(file_part)
+        for dec in node.decorator_list:
+            # Match @app.get(...), @app.post(...), etc.
+            if not (
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Attribute)
+                and isinstance(dec.func.value, ast.Name)
+                and dec.func.value.id == "app"
+                and dec.func.attr in HTTP_METHODS
+            ):
+                continue
 
-        assert not found_paths, (
-            f"AUTHORIZED_TEST_DELETIONS entry {entry.path_suffix!r} is active but its "
-            f"co-deleted subject '{file_part}' exists at {found_paths}. The entry is "
-            "'spent' (the code came back) and must be removed from AUTHORIZED_TEST_DELETIONS."
-        )
+            # Extract path from the first positional arg or the 'path' keyword.
+            path_node = None
+            if dec.args:
+                path_node = dec.args[0]
+            else:
+                for kw in dec.keywords:
+                    if kw.arg == "path":
+                        path_node = kw.value
+                        break
+
+            if not isinstance(path_node, ast.Constant) or not isinstance(
+                path_node.value, str
+            ):
+                continue
+
+            path = path_node.value
+            if not path.startswith("/api/admin/"):
+                continue
+
+            found_paths.append(path)
+
+            # Check parameter *defaults* for recognized auth dependency callables.
+            auth_deps_present = _auth_deps_in_funcdef(node)
+
+            if not auth_deps_present:
+                missing_auth.append(path)
+                continue
+
+            # For get_current_user_optional endpoints, require an explicit 401.
+            if (
+                "get_current_user_optional" in auth_deps_present
+                and "get_current_user" not in auth_deps_present
+                and path not in OPTIONAL_401_ALLOWLIST
+                and not _has_status_401_raise(node)
+            ):
+                missing_401.append(path)
+
+    assert found_paths, (
+        "No @app.{method}('/api/admin/...') handlers found in main.py — "
+        "the decorator pattern match may be broken."
+    )
+    assert not missing_auth, (
+        "The following /api/admin/ endpoints in main.py have no recognized auth "
+        "dependency (get_current_user or get_current_user_optional):\n"
+        + "\n".join(f"  - {p}" for p in sorted(missing_auth))
+        + "\n\nAdd Depends(get_current_user) or Depends(get_current_user_optional) "
+        "to the handler signature."
+    )
+    assert not missing_401, (
+        "The following /api/admin/ endpoints in main.py use get_current_user_optional "
+        "but have no explicit raise HTTPException(status_code=401) path:\n"
+        + "\n".join(f"  - {p}" for p in sorted(missing_401))
+        + "\n\nWhen current_user is None the endpoint must raise HTTPException(status_code=401). "
+        "Add a 401 path or add the endpoint to OPTIONAL_401_ALLOWLIST with justification."
+    )
+
+
+def test_deleted_test_file_classification_fails_closed_without_authorization():
+    """The deleted-test-file gate must FAIL CLOSED on unclassified deletions.
+
+    With the hardcoded allowlist retired, the escape hatch for a legitimate
+    test deletion is an explicit ``dead_code_removal`` classification emitted
+    by the release audit agent.  This invariant proves the gate is fail-closed:
+    when ``_score_audit()`` sees ``deleted_test_files`` but the report carries
+    NO ``deleted_test_file_classifications`` entry (or an empty one), it must
+    return ``erosion=None`` (the hard-blocker sentinel) — just like an explicit
+    ``genuine_erosion`` classification would.
+
+    The v14/v17 deadlock is avoided by a different mechanism: the audit agent
+    classifies per-file at qualification time (candidate-bound), so the
+    authorisation lives in the audit report rather than a backend allowlist.
+    A ``dead_code_removal`` classification in the report is all that is needed
+    to allow the deletion; no backend deploy is required.  Fail-closed on
+    absent/ambiguous classification ensures that a missed classification does
+    not silently promote an eroding deletion.
+    """
+    from app.release_scoring import _score_audit
+
+    # Part 1: absent classifications key → fail-closed
+    report_absent = {
+        "audit_score": 0.9,
+        "test_erosion": {
+            "deleted_test_files": ["testing/test_some_module.py"],
+            "assertion_delta": 0,
+            "test_count_delta": 0,
+        },
+        # No deleted_test_file_classifications key at all.
+        "findings": [],
+    }
+    _, erosion_absent = _score_audit(report_absent)
+    assert erosion_absent is None, (
+        "An unclassified deleted test file must fail closed (erosion=None). "
+        "The allowlist was retired; the escape hatch is now an explicit "
+        "dead_code_removal classification in the audit report."
+    )
+
+    # Part 2: explicit dead_code_removal classification → gate passes (non-None)
+    report_authorized = {
+        "audit_score": 0.9,
+        "test_erosion": {
+            "deleted_test_files": ["testing/test_some_module.py"],
+            "assertion_delta": 0,
+            "test_count_delta": 0,
+        },
+        "deleted_test_file_classifications": [
+            {
+                "path": "testing/test_some_module.py",
+                "classification": "dead_code_removal",
+                "rationale": "app/some_module.py co-deleted; no callers remain.",
+            }
+        ],
+        "findings": [],
+    }
+    _, erosion_authorized = _score_audit(report_authorized)
+    assert erosion_authorized is not None, (
+        "A dead_code_removal-classified deletion must pass (non-None erosion). "
+        "This is the non-deadlock escape hatch replacing the old allowlist."
+    )

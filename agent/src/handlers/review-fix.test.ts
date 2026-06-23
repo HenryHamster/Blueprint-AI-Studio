@@ -132,7 +132,7 @@ import { computeReviewPromptFingerprint } from '../prompts/review-prompt.js';
 import { runCodeChangeTask } from './code-change.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { shouldFanOutReview, shouldFanOutFix } from '../constants.js';
-import { computePromptFingerprint, buildScopedLintOneliner } from '../prompt.js';
+import { computePromptFingerprint, buildScopedLintOneliner, READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { getFormatComplianceTelemetry, resetFormatComplianceTelemetry } from '../telemetry.js';
 
@@ -1131,6 +1131,7 @@ describe('handleReview — verdict file parsing', () => {
 
     expect(getFormatComplianceTelemetry()).toEqual({
       format_miss_by_reason: { malformed_json: 1 },
+      format_repair_miss_by_reason: {},
       format_error_total: 1,
       format_repair_attempts: 1,
       format_repair_successes: 1,
@@ -1143,6 +1144,7 @@ describe('handleReview — verdict file parsing', () => {
       format_repair_infra_failures_by_schema: {},
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
+      format_repair_miss_by_schema: {},
     });
   });
 
@@ -1173,6 +1175,8 @@ describe('handleReview — verdict file parsing', () => {
     const repairPrompt = vi.mocked(indexMod.runClaudeCode).mock.calls[1][0];
     expect(repairPrompt).toContain('ONLY the JSON object');
     expect(repairPrompt).toContain('/tmp/review_verdict_task-2b.json');
+    expect(repairPrompt).not.toContain('After your review');
+    expect(repairPrompt).toContain('Your review analysis is complete');
 
     const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
     const verdictJson = JSON.parse(String(status.verdict_json)) as { verdict: string; feedback: string; investigated_files: string[] };
@@ -1186,6 +1190,7 @@ describe('handleReview — verdict file parsing', () => {
 
     expect(getFormatComplianceTelemetry()).toEqual({
       format_miss_by_reason: { missing_required_key: 1 },
+      format_repair_miss_by_reason: {},
       format_error_total: 1,
       format_repair_attempts: 1,
       format_repair_successes: 1,
@@ -1198,6 +1203,7 @@ describe('handleReview — verdict file parsing', () => {
       format_repair_infra_failures_by_schema: {},
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
+      format_repair_miss_by_schema: {},
     });
   });
 
@@ -2797,6 +2803,10 @@ describe('handleReview structural prompt invariants', () => {
 
   it('handleReview prompt contains verdict JSON file path pattern', async () => {
     expect(await captureReviewPrompt()).toContain('/tmp/review_verdict_');
+  });
+
+  it('handleReview prompt contains READ_ONLY_BASH_WRITE_NOTE next to /tmp verdict path', async () => {
+    expect(await captureReviewPrompt()).toContain(READ_ONLY_BASH_WRITE_NOTE);
   });
 
   it('handleReview prompt contains Correctness & Logic checklist section', async () => {

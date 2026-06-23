@@ -78,7 +78,7 @@ export function formatSnoozeRemaining(until: number): string {
 const CATCH_UP_VIEWED_KEY_BASE = 'blueprint-admin:lastCatchUpViewed';
 
 /** Returns the localStorage key for the last-catch-up-viewed timestamp, scoped per operator when userEmail is provided. */
-function getCatchUpViewedKey(userEmail?: string | null): string {
+export function getCatchUpViewedKey(userEmail?: string | null): string {
   return userEmail ? `${CATCH_UP_VIEWED_KEY_BASE}:${userEmail}` : CATCH_UP_VIEWED_KEY_BASE;
 }
 

@@ -632,6 +632,82 @@ async def get_task_cost_breakdown(
     }
 
 
+@router.get("/spend-burn-rate")
+async def get_spend_burn_rate(
+    project_id: uuid.UUID | None = Query(None),
+    window_days: int = Query(7, ge=1, le=30),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return daily spend burn rate and monthly cost forecast.
+
+    Queries completed tasks over ``window_days`` to compute a rolling daily
+    average and a 30-day projection so operators can track spend trajectory.
+    """
+    cutoff = _utcnow() - timedelta(days=window_days)
+    filters = [
+        Task.status.in_(
+            [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+        ),
+        Task.created_at >= cutoff,
+    ]
+    if project_id is not None:
+        filters.append(Task.project_id == project_id)
+
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.created_at,
+                        Task.status_log,
+                        Task.context,
+                        Task.vm_provisioned_at,
+                        Task.vm_stopped_at,
+                        Task.vm_spot,
+                        Task.vm_runtime_cost_banked_db,
+                        raiseload=True,
+                    )
+                )
+                .where(*filters)
+                .order_by(Task.created_at.desc())
+                .limit(20000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    total_cost = 0.0
+    task_count = 0
+    for task in tasks:
+        cost = get_task_total_vm_cost_usd_or_none(task)
+        if cost is None:
+            continue
+        total_cost += cost
+        task_count += 1
+
+    # Derive the daily rate and 30-day forecast from the SAME rounded window
+    # cost we report, so the three figures stay internally consistent (an
+    # operator can reconcile monthly ≈ daily*30 ≈ window/days*30); deriving the
+    # forecast off the un-rounded total made monthly drift from window_cost_usd.
+    window_cost_usd = round(total_cost, 2)
+    daily_spend_usd = window_cost_usd / window_days if window_days > 0 else 0.0
+    monthly_forecast_usd = daily_spend_usd * 30
+
+    return {
+        "project_id": str(project_id) if project_id else None,
+        "window_days": window_days,
+        "window_cost_usd": window_cost_usd,
+        "task_count": task_count,
+        "daily_spend_usd": round(daily_spend_usd, 2),
+        "monthly_forecast_usd": round(monthly_forecast_usd, 2),
+    }
+
+
 @router.get("/lane-diag")
 async def get_lane_diag(
     project_id: uuid.UUID | None = Query(None),
@@ -1692,108 +1768,6 @@ async def get_improvement_lane_detail(
         "reservation_force_expired_count": lane.reservation_force_expired_count or 0,
         "current_task_id": str(lane.current_task_id) if lane.current_task_id else None,
         "current_task": current_task_obj,
-    }
-
-
-@router.get("/visual-pilot-status")
-async def get_visual_pilot_status(
-    project_id: uuid.UUID = Query(...),
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(require_admin),
-):
-    """Return visual-verification pilot kill-criterion aggregates for a project."""
-    from app.visual_verification_audit import aggregate_visual_pilot  # noqa: PLC0415
-
-    exists = (
-        await session.execute(select(Project.id).where(Project.id == project_id))
-    ).scalar_one_or_none()
-    if exists is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    tasks = (
-        (
-            await session.execute(
-                select(Task)
-                .options(
-                    load_only(
-                        Task.id,
-                        Task.status,
-                        Task.context,
-                        Task.created_at,
-                        Task.title,
-                        raiseload=True,
-                    )
-                )
-                .where(
-                    Task.project_id == project_id,
-                    Task.status == TaskStatus.COMPLETED,
-                )
-                .order_by(Task.created_at.desc())
-                .limit(300)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    task_dicts = [
-        {
-            "id": str(task.id),
-            "status": task.status.value
-            if hasattr(task.status, "value")
-            else task.status,
-            "context": task.context or {},
-            "created_at": task.created_at.isoformat() if task.created_at else None,
-            "title": task.title or "",
-        }
-        for task in tasks
-    ]
-
-    agg = aggregate_visual_pilot(task_dicts)
-
-    return {
-        "project_id": str(project_id),
-        "admin_task_count": agg.admin_task_count,
-        "entry_count": agg.entry_count,
-        "malformed_count": agg.malformed_count,
-        "pairs_inspected": agg.pairs_inspected,
-        "pairs_changed": agg.pairs_changed,
-        "infra_total": agg.infra_total,
-        "infra_rate": round(agg.infra_rate, 4),
-        "days_elapsed": agg.days_elapsed,
-        "caught_count": len(agg.caught),
-        "caught": [
-            {
-                "task_id": t.get("id"),
-                "task_title": t.get("title", ""),
-                "note": e.get("note"),
-                "created_at": t.get("created_at"),
-                "viewport_shot_names": [
-                    s.get("name")
-                    for s in (t.get("context") or {}).get("viewport_screenshots", [])
-                    if s.get("name")
-                ],
-                "viewport_shot_entries": [
-                    {
-                        "name": s["name"],
-                        **(
-                            {"magnitude": s["magnitude"]}
-                            if s.get("magnitude") is not None
-                            else {}
-                        ),
-                    }
-                    for s in (t.get("context") or {}).get("viewport_screenshots", [])
-                    if s.get("name")
-                ],
-            }
-            for t, e in agg.caught
-        ],
-        "thresholds": {
-            "target_admin_tasks": 25,
-            "target_days": 42,
-            "early_pause_infra_rate": 0.50,
-        },
-        "generated_at": _utcnow().isoformat(),
     }
 
 

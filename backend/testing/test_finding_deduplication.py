@@ -891,7 +891,7 @@ def test_deduplicate_findings_evidence_overlap_below_threshold():
         "sources": [
             {"type": "file", "ref": "backend/app/cache.py"},
             {"type": "file", "ref": "backend/app/models.py"},
-            {"type": "file", "ref": "backend/app/db.py"},
+            {"type": "file", "ref": "backend/app/database.py"},
             {"type": "file", "ref": "backend/app/api.py"},
             {"type": "file", "ref": "backend/app/utils.py"},
         ],

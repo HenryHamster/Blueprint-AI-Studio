@@ -500,6 +500,60 @@ async def test_delete_max_plan_account_conflicts_then_force_removes_db_and_memor
     delete_secret.assert_awaited_once_with("projects/test/secrets/delete/versions/1")
 
 
+async def test_delete_max_plan_account_conflict_detected_via_llm_account_id_column(
+    client, db_session, inject_pool, mocker
+):
+    """Delete conflict is detected via Task.llm_account_id column (not JSONB path)."""
+    acct_id = uuid.uuid4()
+    project = Project(name="col-conflict", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+    acct = MaxPlanAccount(
+        id=acct_id,
+        user_id="test-user-123",
+        name="Column Guard",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/col/versions/1",
+        secret_blob_ref="projects/test/secrets/col/versions/1",
+    )
+    # Task with llm_account_id column set — account_id is intentionally unset
+    # so the conflict is found only via the indexed column, not account_id.
+    active_task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        llm_account_id=str(acct_id),
+    )
+    db_session.add_all([acct, active_task])
+    await db_session.commit()
+    inject_pool(
+        "test-user-123",
+        [
+            {
+                "id": str(acct_id),
+                "user_id": "test-user-123",
+                "name": "Column Guard",
+                "provider": "anthropic",
+                "auth_mode": "oauth",
+                "enabled": True,
+                "active_tasks": 0,
+            }
+        ],
+    )
+    mocker.patch(
+        "app.secrets_manager.delete_user_secret",
+        new=AsyncMock(return_value=None),
+    )
+
+    conflict = await client.delete(f"/api/admin/max-plan-accounts/{acct_id}")
+    assert conflict.status_code == 409
+    body = conflict.json()
+    detail = (
+        body.get("detail") or (body.get("error") or {}).get("message") or ""
+    )
+    assert "active task(s)" in detail
+
+
 # ── /max-plan-accounts/health ──────────────────────────────────────────────
 
 

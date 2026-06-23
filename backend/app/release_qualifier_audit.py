@@ -198,6 +198,7 @@ async def _spawn_release_audit_task(
     base_branch: str,
     diff_range: str,
     candidate_sha: str,
+    version_goal: str | None = None,
 ) -> Task:
     """Create + queue a ``release_audit`` task for the qualifier."""
     payload: dict[str, Any] = {
@@ -208,6 +209,8 @@ async def _spawn_release_audit_task(
         # reads this from the payload and checks out this SHA.
         "candidate_sha": candidate_sha,
     }
+    if version_goal:
+        payload["version_goal"] = version_goal
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
         "release_audit"
     )
@@ -268,6 +271,7 @@ async def _spawn_release_audit_challenge_task(
     candidate_sha: str,
     primary_audit_task_id: str | None = None,
     primary_findings: list[dict[str, str]] | None = None,
+    version_goal: str | None = None,
 ) -> Task:
     """Create + queue a challenge task for the release-audit flow.
 
@@ -282,6 +286,8 @@ async def _spawn_release_audit_challenge_task(
         "diff_range": diff_range,
         "candidate_sha": candidate_sha,
     }
+    if version_goal:
+        payload["version_goal"] = version_goal
     if primary_audit_task_id is not None:
         payload["primary_audit_task_id"] = primary_audit_task_id
         payload["primary_audit_report"] = None
@@ -408,6 +414,106 @@ async def _spawn_qualifier_smoketest_task(
     return task
 
 
+async def _spawn_release_merge_grade_task(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_id: uuid.UUID,
+    base_branch: str,
+    diff_range: str,
+    candidate_sha: str,
+    version_goal: str,
+    merged_pr_numbers: list[int],
+) -> Task:
+    """Create + queue a blind ``release_merge_grade`` task for the qualifier.
+
+    The merge-grade agent grades the MERGED DIFFS of this version (the
+    ``base_branch...candidate_sha`` range plus the merged-PR window) against the
+    frozen ``version_goal`` and returns ``{covers_goal, coverage_score,
+    biggest_gap}``.
+
+    BLINDNESS CONTRACT (dir d-c0fe439f): this grade must be UNINVESTED — the
+    agent sees the version goal and the merged diffs ONLY.  The strategist's
+    ``Project.running_update`` narrative (or any running-update text) MUST NOT
+    be threaded into this payload; doing so would let the optimistic strategist
+    narrative bias a grade that is meant to independently check whether the
+    merges actually advanced the goal.  The ``assert`` below is a tripwire that
+    fails loudly if a future edit ever leaks a running-update key in.
+    """
+    payload: dict[str, Any] = {
+        "type": "release_merge_grade",
+        "base_branch": base_branch,
+        "diff_range": diff_range,
+        # Pin the grade to the exact qualified commit (mirrors release_audit).
+        "candidate_sha": candidate_sha,
+        # The ONLY narrative the grader is allowed to see: the frozen goal.
+        "version_goal": version_goal,
+        # The merged-PR window for this version (same acceptance-window /
+        # merged-PR discovery theme evidence uses); the agent fetches each PR's
+        # diff to grade goal coverage.
+        "merged_prs": list(merged_pr_numbers),
+    }
+    # Blindness guard — see the contract note above. No payload key may carry
+    # the strategist running-update narrative into a grade that must be blind to
+    # it. This is the explicit guard the gate's design requires.
+    assert not any("running_update" in str(key).lower() for key in payload), (
+        "release_merge_grade payload must stay BLIND to the strategist "
+        "running_update — no running-update text may be threaded in"
+    )
+    type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
+        "release_merge_grade"
+    )
+    if type_model:
+        payload["model"] = type_model
+    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get(
+        "release_merge_grade"
+    )
+    if type_effort:
+        payload["effort"] = type_effort
+    try:
+        payload = validate_internal_payload(
+            payload, "release_qualifier:release_merge_grade"
+        )
+    except PayloadTooLargeError:
+        # A too-large merge-grade payload (an enormous goal or PR list) is a real
+        # bug worth surfacing — let it raise to the spawn caller's handler.
+        raise
+
+    task = Task(
+        project_id=project_id,
+        title=f"Release merge grade: {base_branch}...{candidate_sha[:8]} vs goal",
+        description=(
+            f"Blind goal-coverage grade of the merged diffs ({diff_range}) "
+            f"against the version goal for the release qualifier"
+        ),
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context={
+            "release_version_id": str(version_id),
+            "candidate_sha": candidate_sha,
+            "scope": "medium",
+        },
+    )
+    session.add(task)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "RELEASE_QUALIFIER",
+                "task_type": "release_merge_grade",
+                "diff_range": diff_range,
+                "release_version_id": str(version_id),
+                "merged_pr_count": len(merged_pr_numbers),
+            },
+        )
+    )
+    return task
+
+
 async def _latest_artifact_logs(
     session: AsyncSession,
     task_id: uuid.UUID,
@@ -519,8 +625,7 @@ async def get_latest_release_audit_challenge(
                 select(Task)
                 .where(
                     Task.project_id == project_id,
-                    Task.payloads[0]["type"].as_string()
-                    == "release_audit_challenge",
+                    Task.payloads[0]["type"].as_string() == "release_audit_challenge",
                     Task.context["candidate_sha"].as_string() == candidate_sha,
                 )
                 .order_by(Task.created_at.desc())
@@ -561,7 +666,9 @@ async def _audit_report_for_task(
         session, task.id, ArtifactType.RELEASE_AUDIT_REPORT
     )
     ctx = task.context or {}
-    status_val = task.status.value if hasattr(task.status, "value") else str(task.status)
+    status_val = (
+        task.status.value if hasattr(task.status, "value") else str(task.status)
+    )
     return {
         "audit_task_id": str(task.id),
         "task_status": status_val,
@@ -898,9 +1005,7 @@ async def _handle_independent_blocker(
         f0 = independent_blocker_findings[0]
         sev = str(f0.get("severity") or "high").upper()
         summary = str(f0.get("summary") or "").strip()
-        blocker_detail = (
-            f" ({sev}: {summary[:120]})" if summary else f" ({sev})"
-        )
+        blocker_detail = f" ({sev}: {summary[:120]})" if summary else f" ({sev})"
     rq = _release_qualifier_module()
     await rq._notify_operator(
         session,

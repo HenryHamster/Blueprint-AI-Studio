@@ -423,6 +423,8 @@ async def run_infra_recovery_and_hold_maintenance(
             # general retry path with a depleted budget.
             _new_ctx.pop("_api_failure_retries", None)
             _t.context = _new_ctx
+            # Keep the promoted column in sync (D2 over-fetch fix).
+            _t.llm_account_id = None
             clear_retry_after(_t)
             _t.attempt_count = 0
             bank_task_current_attempt(_t, stopped_at=_utcnow())

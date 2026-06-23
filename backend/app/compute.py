@@ -1652,10 +1652,9 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
     """
     Store agent credentials in GCP Secret Manager.
     Returns the full resource name of the created secret version.
-    Grants the agent service account secretAccessor on this specific secret.
+    Agent SA reads via project-level secretAccessor (Terraform-managed).
     """
     from google.cloud import secretmanager
-    from google.iam.v1 import policy_pb2
 
     client = secretmanager.SecretManagerServiceClient()
     secret_id = f"agent-creds-{vm_instance_id}"
@@ -1692,49 +1691,10 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
         }
     )
 
-    # Grant the agent service account secretAccessor on this specific secret only.
-    # Wrapped in exponential-backoff retry because concurrent provisions race on
-    # IAM policy ETags and produce Aborted/409, which previously crashed VM
-    # provisioning. Also short-circuits when the SA is already bound so reused
-    # secrets don't accumulate duplicate bindings.
-    from google.api_core.exceptions import Aborted
-
-    agent_sa_member = f"serviceAccount:{AGENT_SERVICE_ACCOUNT_EMAIL}"
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            policy = client.get_iam_policy(request={"resource": secret.name})
-            already_bound = any(
-                b.role == "roles/secretmanager.secretAccessor"
-                and agent_sa_member in b.members
-                for b in policy.bindings
-            )
-            if already_bound:
-                break
-            binding = policy_pb2.Binding(
-                role="roles/secretmanager.secretAccessor",
-                members=[agent_sa_member],
-            )
-            policy.bindings.append(binding)
-            client.set_iam_policy(request={"resource": secret.name, "policy": policy})
-            break
-        except Aborted:
-            if attempt == max_retries - 1:
-                logger.exception(
-                    "[COMPUTE] IAM policy ETag retry exhausted for %s after %d attempts",
-                    secret.name,
-                    max_retries,
-                )
-                raise
-            backoff_seconds = exponential_backoff(attempt + 1, base=0.1, cap=2.0)
-            logger.warning(
-                "[COMPUTE] IAM policy ETag conflict on %s (attempt %d/%d), retrying in %.2fs",
-                secret.name,
-                attempt + 1,
-                max_retries,
-                backoff_seconds,
-            )
-            time.sleep(backoff_seconds)
+    # Agent SA holds secretAccessor scoped to agent-creds-* secrets only (via
+    # IAM condition on google_project_iam_member.agent_secret_accessor in
+    # infra/terraform/iam.tf). No runtime get/setIamPolicy calls needed —
+    # orchestrator does not hold secretmanager.admin.
 
     # E15: verify the version is actually accessible before handing it off
     # to provisioning. Without this, transient Secret Manager replication
@@ -2021,8 +1981,7 @@ async def _provision_gcp(
     # Security note: cloud-platform is the ONLY OAuth2 scope that covers Secret Manager.
     # There is no narrower secretmanager-specific scope. The actual security boundary is
     # the agent SA's IAM bindings (see infra/terraform/iam.tf):
-    #   - ZERO project-level IAM roles
-    #   - secretAccessor on its own specific secret only (granted per-VM in _store_agent_secret)
+    #   - secretAccessor scoped to agent-creds-* secrets only (IAM condition in iam.tf)
     #   - objectViewer on the artifact bucket only
     #   - logWriter for Stackdriver logs
     service_account.scopes = [

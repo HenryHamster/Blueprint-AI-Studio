@@ -217,7 +217,9 @@ async def _check_evaluating_timeouts(progress_cb=None):
                         # cycle. Deferred rows re-qualify next cycle (the scan is
                         # status-based; oldest-updated first so the most-stuck
                         # parents are always serviced before the cap truncates).
-                        .order_by(Task.updated_at.asc())
+                        # nullsfirst(): a null updated_at must be treated as
+                        # maximally stale (never invisible behind the cap limit).
+                        .order_by(Task.updated_at.asc().nullsfirst())
                         .limit(services._EVAL_TIMEOUT_MAX_PER_CYCLE)
                     )
                 )

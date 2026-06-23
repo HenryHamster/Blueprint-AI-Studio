@@ -1,4 +1,20 @@
 import { execFileSync } from 'child_process';
+/**
+ * Panel review handler — multi-agent structured PR review.
+ *
+ * Spawns a fixed multi-agent review workflow over a PR to independently
+ * examine code changes across multiple dimensions (correctness, security,
+ * performance, style, etc.) and produce a durable, structured verdict.
+ *
+ * Unlike handleReview (which posts comments), panel_review runs parallel
+ * agent lanes and persists a single PanelReviewVerdict artifact with unified
+ * findings, severity scores, and merge-readiness assessment. Used for high-stakes
+ * reviews and to catch issues a single reviewer might miss.
+ *
+ * Verdicts are stored as Artifacts and can be displayed in UI or used by
+ * merge gates to block or require modifications.
+ */
+
 import type WebSocket from 'ws';
 import {
   WORKSPACE,
@@ -19,6 +35,7 @@ import {
   matchesAuthFailure,
   AuthFailureError,
   PROVIDER,
+  getAgentToken,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
@@ -439,6 +456,7 @@ export async function handlePanelReview(
 
   // Download viewport screenshots forwarded from the review task so panel lenses
   // have access to the rendered PNGs when evaluating visual-change PRs.
+  // The agent JWT authenticates cross-task access within the same project.
   const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
   const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
   const panelProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
@@ -452,6 +470,7 @@ export async function handlePanelReview(
       orchestratorUrl: panelOrchestratorUrl,
       projectId: panelProjectIdForShots,
       sourceTaskId: viewportSourceTaskId,
+      agentToken: getAgentToken(),
       onError: (name) => { sendLog(ws, `[VIEWPORT] Failed to download screenshot: ${name}\n`); },
     });
     if (downloadedShotPaths.length > 0) {

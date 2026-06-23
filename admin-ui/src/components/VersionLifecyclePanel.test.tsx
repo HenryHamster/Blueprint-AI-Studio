@@ -1361,6 +1361,282 @@ describe('VersionLifecyclePanel', () => {
       const evidence = screen.getByTestId('durable-qualification-evidence');
       expect(within(evidence).queryByTestId('challenger-refuted-findings')).not.toBeInTheDocument();
     });
+
+    it('renders theme_delivery certified chip with grade', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                theme_delivery: { state: 'certified', assessed_grade: 1.0 },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('theme-delivery-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('theme certified 100%');
+    });
+
+    it('renders theme_delivery shortfall chip with gap sentence in title', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                theme_delivery: {
+                  state: 'shortfall',
+                  assessed_grade: 0.4,
+                  shortfalls: [{ criterion: 'leanness', why: 'Diff added unrelated auth boilerplate' }],
+                },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('theme-delivery-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('theme shortfall 40%');
+      expect(chip).toHaveAttribute('title', 'Diff added unrelated auth boilerplate');
+    });
+
+    it('does not render theme_delivery chip when state is not_applicable', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                theme_delivery: { state: 'not_applicable' },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('theme-delivery-chip')).not.toBeInTheDocument();
+    });
+
+    it('does not render theme_delivery chip when theme_delivery is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('theme-delivery-chip')).not.toBeInTheDocument();
+    });
+
+    it('renders goal_alignment aligned chip with grade', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                goal_alignment: { state: 'aligned', assessed_grade: 0.9 },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('goal-alignment-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('goal aligned 90%');
+    });
+
+    it('renders goal_alignment shortfall chip with biggest_gap in title', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                goal_alignment: {
+                  state: 'shortfall',
+                  assessed_grade: 0.3,
+                  biggest_gap: 'DB hot-loop over-fetch was not addressed',
+                },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('goal-alignment-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('goal shortfall 30%');
+      expect(chip).toHaveAttribute('title', 'DB hot-loop over-fetch was not addressed');
+    });
+
+    it('does not render goal_alignment chip when state is not_applicable', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                goal_alignment: { state: 'not_applicable' },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('goal-alignment-chip')).not.toBeInTheDocument();
+    });
+
+    it('does not render goal_alignment chip when goal_alignment is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('goal-alignment-chip')).not.toBeInTheDocument();
+    });
+
+    it('renders blind_merge_grade covers chip', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                blind_merge_grade: { coverage_verdict: 'covers', biggest_gap: 'No significant gap' },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('blind-merge-grade-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('merge covers');
+      expect(chip).toHaveAttribute('title', 'No significant gap');
+    });
+
+    it('renders blind_merge_grade misses chip with red styling', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                blind_merge_grade: { coverage_verdict: 'misses', biggest_gap: 'Core feature not implemented' },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('blind-merge-grade-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('merge misses');
+      expect(chip).toHaveAttribute('title', 'Core feature not implemented');
+    });
+
+    it('renders blind_merge_grade partial chip with biggest_gap in title', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+                blind_merge_grade: { coverage_verdict: 'partial', biggest_gap: 'DB migration not addressed' },
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      const chip = within(evidence).getByTestId('blind-merge-grade-chip');
+      expect(chip).toBeInTheDocument();
+      expect(chip).toHaveTextContent('merge partial');
+      expect(chip).toHaveAttribute('title', 'DB migration not addressed');
+    });
+
+    it('does not render blind_merge_grade chip when blind_merge_grade is absent', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                audit_findings: [{ severity: 'low', summary: 'minor' }],
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const evidence = screen.getByTestId('durable-qualification-evidence');
+      expect(within(evidence).queryByTestId('blind-merge-grade-chip')).not.toBeInTheDocument();
+    });
   });
 
   describe('qualification verdict staleness', () => {
@@ -3246,6 +3522,85 @@ describe('VersionLifecyclePanel', () => {
         />
       );
       expect(screen.queryByTestId('fleet-match-count')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('confidence sparkline', () => {
+    function makeVerdict(confidence: number | null, wouldPromote: boolean = true): api.QualificationVerdictRecord {
+      return {
+        id: `v-${Math.random()}`,
+        release_version_id: 'rv1',
+        candidate_sha: 'abcdef123456',
+        confidence,
+        sub_scores: null,
+        blocker: null,
+        audit_missing_reason: null,
+        would_promote: wouldPromote,
+        promotion_enabled: false,
+        terminal_status: wouldPromote ? 'promoted' : 'not_promoted',
+        threshold: 0.9,
+        started_at: null,
+        finalized_at: '2026-01-01T00:00:00Z',
+        created_at: '2026-01-01T00:00:00Z',
+      };
+    }
+
+    it('renders confidence sparkline when verdicts with non-null confidence exist', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [makeVerdict(0.95), makeVerdict(0.88), makeVerdict(0.91)],
+        total: 3,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const history = await screen.findByTestId('verdict-history');
+      expect(history).toBeInTheDocument();
+      expect(screen.getByTestId('confidence-sparkline')).toBeInTheDocument();
+    });
+
+    it('omits sparkline when all confidences are null', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [makeVerdict(null), makeVerdict(null)],
+        total: 2,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await screen.findByTestId('verdict-history');
+      expect(screen.queryByTestId('confidence-sparkline')).not.toBeInTheDocument();
+    });
+
+    it('omits sparkline when fewer than 2 verdicts have non-null confidence', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [makeVerdict(0.9), makeVerdict(null)],
+        total: 2,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await screen.findByTestId('verdict-history');
+      expect(screen.queryByTestId('confidence-sparkline')).not.toBeInTheDocument();
     });
   });
 });

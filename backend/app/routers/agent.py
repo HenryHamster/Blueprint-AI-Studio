@@ -1268,6 +1268,15 @@ async def claim_task(
                     history_artifact
                 )
         history_tasks_rows = [history_tasks_by_id[tid] for tid in history_task_order]
+        # Detach history rows from the session so that a session.rollback() in
+        # one SR-analytics error handler cannot expire the already-loaded
+        # attributes and cascade MissingGreenlet lazy-load failures into sibling
+        # analytics calls (C1 rollback-on-swallow discipline; incident
+        # 2026-05-29, reference_load_only_lazy_load_trap).  All columns
+        # required by the SR functions are covered by _history_loadonly, so
+        # detached objects are fully readable.
+        for _hr in history_tasks_rows:
+            session.expunge(_hr)
 
         from app.failure_classification import classify_failure
 
@@ -4436,11 +4445,34 @@ async def agent_heartbeat(
     # reaper to kill the task.
     # Skipping one heartbeat is safe — the reaper's threshold is 5 minutes,
     # and the next heartbeat (30s later) will succeed once the lock releases.
+    # Defer the three large JSONB blobs never read by the heartbeat handler
+    # (payloads/plan_output/depends_on can be multi-MB for plan/research tasks).
+    # All other columns are loaded because context, status_log, fix_loop_history,
+    # and many scalar fields are conditionally written each cycle.
+    _hb_load_only = load_only(
+        Task.id,
+        Task.status,
+        Task.vm_instance_id,
+        Task.last_heartbeat,
+        Task.vm_started_at,
+        Task.latest_status_message,
+        Task.context,
+        Task.status_log,
+        Task.heartbeat_count,
+        Task.last_metrics_json,
+        Task.last_tool_use_at,
+        Task.fix_loop_history,
+        Task.prompt_fingerprint,
+        Task.api_call_summary,
+        Task.format_compliance_summary,
+        raiseload=True,
+    )
     stmt = (
         select(Task)
         .where(
             Task.id == req.task_id, Task.vm_instance_id == token.get("vm_instance_id")
         )
+        .options(_hb_load_only)
         .with_for_update(skip_locked=True)
     )
     task = (await session.execute(stmt)).scalars().first()
@@ -4448,7 +4480,13 @@ async def agent_heartbeat(
     if not task:
         # Row is either locked (skip_locked skipped it) or vm_instance_id changed.
         # Distinguish: check without FOR UPDATE to see if the task exists at all.
-        check_stmt = select(Task).where(Task.id == req.task_id)
+        check_stmt = (
+            select(Task)
+            .where(Task.id == req.task_id)
+            .options(
+                load_only(Task.id, Task.vm_instance_id, Task.status, raiseload=True)
+            )
+        )
         check_task = (await session.execute(check_stmt)).scalars().first()
         if not check_task:
             raise HTTPException(status_code=404, detail="Task not found")
@@ -4725,6 +4763,7 @@ async def agent_heartbeat(
     # agents that don't ship these fields leave format_compliance_summary NULL.
     if (
         req.format_miss_by_reason is not None
+        or req.format_repair_miss_by_reason is not None
         or req.format_error_total is not None
         or req.format_repair_attempts is not None
         or req.format_repair_successes is not None
@@ -4737,11 +4776,16 @@ async def agent_heartbeat(
         or req.format_repair_output_tokens is not None
         or req.format_repair_input_tokens_by_schema is not None
         or req.format_repair_output_tokens_by_schema is not None
+        or req.format_repair_miss_by_schema is not None
     ):
         task.format_compliance_summary = {
             "format_miss_by_reason": {
                 str(reason): int(count)
                 for reason, count in (req.format_miss_by_reason or {}).items()
+            },
+            "format_repair_miss_by_reason": {
+                str(reason): int(count)
+                for reason, count in (req.format_repair_miss_by_reason or {}).items()
             },
             "format_error_total": int(req.format_error_total or 0),
             "format_repair_attempts": int(req.format_repair_attempts or 0),
@@ -4782,6 +4826,10 @@ async def agent_heartbeat(
                 for schema, count in (
                     req.format_repair_output_tokens_by_schema or {}
                 ).items()
+            },
+            "format_repair_miss_by_schema": {
+                str(schema): int(count)
+                for schema, count in (req.format_repair_miss_by_schema or {}).items()
             },
             "last_updated_at": _utcnow().isoformat(),
         }

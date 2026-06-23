@@ -113,6 +113,11 @@ SELF_REPAIR_BURN_SHARE_KEY = "self_repair_burn_share"
 # drift is meaningful. Below this threshold the ratio is too noisy (rare-event denominator)
 # and drift_pct is suppressed to None to avoid phantom regression signals.
 SELF_REPAIR_MIN_ATTEMPTS = 10
+# Guard threshold for self_repair_burn_share: alert when repair tokens consume
+# more than this fraction of total LLM tokens. When repair-call overhead exceeds
+# the ceiling, it signals a drift in self-repair effectiveness and should trigger
+# an investigation of failure patterns that require multiple repair attempts.
+SELF_REPAIR_BURN_SHARE_THRESHOLD = 0.20
 
 ALL_AXES: tuple[str, ...] = (
     AXIS_COST_PER_MERGED_PR,
@@ -170,8 +175,7 @@ AXIS_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
     AXIS_PROMPT_STATIC_BYTES: {
-        "pending": "drift alerting — leading indicator for static prompt budget growth "
-        "before mean_input_tokens_per_call rises in production"
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
 }
 
@@ -267,6 +271,13 @@ LAST_ALERTED_PAYOFF_KEY = "last_alerted_payoff_verdict"
 # degradation crossing rather than every tick, and re-arms on recovery.
 LAST_ALERTED_UNPRICED_KEY = "last_alerted_unpriced_coverage"
 
+# Sub-key under the efficiency_baseline container recording whether the last
+# self-repair burn-share check alerted on an elevated state. The per-project
+# transition check (:func:`maybe_alert_self_repair_burn_share`) compares the
+# current burn-share against this marker so it fires once per threshold crossing
+# rather than every tick, and re-arms on recovery.
+LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY = "last_alerted_self_repair_burn_share"
+
 # Fire the unpriced-models alert when at least this share of attributed
 # (provider+model+token-bearing) tasks ran on combos absent from the pricing
 # table, and at least this many such tasks exist (so a single stray task on a
@@ -351,6 +362,10 @@ async def _load_recent_tasks(
                 Task.vm_dispatched_at,
                 Task.provider,
                 Task.model,
+                # Read by estimate_pool_hit_rate via get_task_llm_account_id,
+                # which prefers this promoted column over the context fallback;
+                # must be loaded so the access doesn't trip raiseload=True.
+                Task.llm_account_id,
                 Task.format_compliance_summary,
                 # payloads: required so task.first_payload can be read without
                 # triggering an async lazy-load (used by compute_llm_cost_by_task_type
@@ -2501,7 +2516,11 @@ def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
         if r.get("priced") and r["total_cost_usd"] > 0
     ]
     by_task_type = [
-        {"task_type": r["task_type"], "cost_usd": r["total_cost_usd"]}
+        {
+            "task_type": r["task_type"],
+            "cost_usd": r["total_cost_usd"],
+            "mean_input_tokens_per_call": r.get("mean_input_tokens_per_call"),
+        }
         for r in by_type_rows
         if r["total_cost_usd"] > 0
     ]
@@ -2721,22 +2740,61 @@ def _extract_ts_template_literal_length(src: str, const_name: str) -> int | None
     return None
 
 
+def _extract_ts_plain_string_length(src: str, const_name: str) -> int | None:
+    """Find a TypeScript `const NAME = '...'` or `"..."` and return its source char count.
+
+    Walks forward from the opening quote, honouring backslash escape sequences.
+    Returns None if the constant declaration is not found or the string is unterminated.
+    """
+    pattern = re.compile(r"\bconst\s+" + re.escape(const_name) + r"""\s*=\s*(['"])""")
+    m = pattern.search(src)
+    if not m:
+        return None
+    quote = m.group(1)
+    pos = m.end()
+    start = pos
+    n = len(src)
+    while pos < n:
+        ch = src[pos]
+        if ch == "\\":
+            pos += 2
+        elif ch == quote:
+            return pos - start
+        else:
+            pos += 1
+    return None
+
+
 _PROMPT_STATIC_CONST_NAMES: tuple[str, ...] = (
+    "SHARED_LIFECYCLE_PREAMBLE",
+    "BLUEPRINT_CHECK_INTRO",
     "SHARED_LIFECYCLE_REMAINDER",
     "READ_THE_FAILURE_MESSAGE",
     "SIZE_GUARDRAIL_GUIDANCE",
     "PRIOR_ATTEMPT_DIVERGENCE",
     "BEYOND_SCOPE_REPORTING",
     "EDGES_CONSIDERED_GUIDANCE",
+    "PLAYBOOK_GUIDANCE",
 )
+
+# Plain-string constants (single- or double-quoted) that are also part of the
+# static prompt footprint and are not template literals.
+_PROMPT_STATIC_PLAIN_CONST_NAMES: tuple[str, ...] = ("DEFAULT_TOOL_GUIDANCE",)
 
 
 def _compute_prompt_static_bytes() -> int | None:
-    """Sum the source character lengths of the major static code-change prompt sections.
+    """Sum the source character lengths of all static code-change prompt sections.
 
-    Reads agent/src/prompt.ts and measures SHARED_LIFECYCLE_REMAINDER plus the five
-    blocks concatenated by assembleFailureGuidanceBlocks(). Returns None when prompt.ts
-    is unavailable (production backend containers that do not mount agent/src).
+    Reads agent/src/prompt.ts and measures the template-literal constants in
+    _PROMPT_STATIC_CONST_NAMES plus the plain-string constants in
+    _PROMPT_STATIC_PLAIN_CONST_NAMES. Returns None when prompt.ts is unavailable
+    (production backend containers that do not mount agent/src) or when any
+    declared constant is absent from the source.
+
+    Baseline (post-v16, 2026-06-20): ~16 420 bytes / ~4 678 tokens.
+    The 2026-06-19 experiment measured ~34 997 bytes before v16 prompt reductions
+    (SHARED_LIFECYCLE_REMAINDER cut from ~6 742 to ~1 712 tokens in PR #10960;
+    SIZE_GUARDRAIL_GUIDANCE cut from ~573 to ~266 tokens in PR #10956).
     """
     agent_src = _find_agent_src()
     if agent_src is None:
@@ -2752,6 +2810,11 @@ def _compute_prompt_static_bytes() -> int | None:
     total = 0
     for name in _PROMPT_STATIC_CONST_NAMES:
         length = _extract_ts_template_literal_length(src, name)
+        if length is None:
+            return None
+        total += length
+    for name in _PROMPT_STATIC_PLAIN_CONST_NAMES:
+        length = _extract_ts_plain_string_length(src, name)
         if length is None:
             return None
         total += length
@@ -3425,6 +3488,7 @@ async def read_baseline_with_drift(
         "repair_attempts": latest_format.get("repair_attempts"),
         "repair_successes": latest_format.get("repair_successes"),
         "repair_infra_failures": latest_format.get("repair_infra_failures"),
+        "by_schema": latest_format.get("by_schema"),
     }
 
     return {
@@ -3783,6 +3847,79 @@ async def maybe_alert_unpriced_models_coverage(
         unpriced,
         attributed,
         unpriced_share,
+    )
+    return True
+
+
+async def maybe_alert_self_repair_burn_share(
+    session: AsyncSession, project_id: uuid.UUID
+) -> bool | None:
+    """Raise an operator Alert when a project's self-repair burn-share exceeds ceiling.
+
+    Self-repair tokens (reopen attempts during structured-output format recovery)
+    are overhead that reduce effective LLM productivity. When repair tokens consume
+    an excessive fraction of total LLM tokens, it signals repair-effectiveness drift
+    and warrants investigation of the underlying failure patterns that require
+    multiple attempts to resolve.
+
+    Reuses :func:`_compact_llm_cost_attribution` as the source of truth for
+    burn-share calculation. The alert fires when the self_repair_burn_share
+    crosses :data:`SELF_REPAIR_BURN_SHARE_THRESHOLD`.
+
+    Edge-triggered against ``last_alerted_self_repair_burn_share`` in the
+    efficiency-baseline container (locked read-modify-write, mirroring
+    :func:`maybe_alert_unpriced_models_coverage`): fires once when burn-share
+    crosses above threshold from below, does not re-fire while it stays elevated,
+    and re-arms when burn-share recovers. Runs every hourly snapshot tick for
+    every project. Returns ``True`` when an alert fired, else ``None``.
+    """
+    from app.alert_dispatch import _maybe_create_self_repair_burn_share_alert
+    from app.models import AlertSeverity
+    from app.task_locking import with_design_doc_locked
+
+    tasks = await _load_recent_tasks(session, project_id)
+    llm_attribution = _compact_llm_cost_attribution(tasks)
+    burn_share = llm_attribution.get(SELF_REPAIR_BURN_SHARE_KEY)
+
+    # Elevated when burn_share exists and exceeds the threshold.
+    elevated = (
+        isinstance(burn_share, (int, float))
+        and burn_share >= SELF_REPAIR_BURN_SHARE_THRESHOLD
+    )
+
+    # Transition edge: fire only when crossing into elevated from a non-elevated
+    # marker; re-arm the marker on recovery so a future elevation alerts again.
+    # Locked read-modify-write via the canonical design_doc helper.
+    changed = {"fire": False}
+
+    def _advance_marker(doc: Dict[str, Any]) -> None:
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        prev = container.get(LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY)
+        new_state = "elevated" if elevated else "healthy"
+        if prev == new_state:
+            return  # no transition — leave the marker untouched
+        container[LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY] = new_state
+        doc[DESIGN_DOC_KEY] = container
+        changed["fire"] = elevated  # only the elevated crossing raises an alert
+
+    await with_design_doc_locked(
+        session, project_id, _advance_marker, skip_locked=False
+    )
+    if not changed["fire"]:
+        return None
+
+    await _maybe_create_self_repair_burn_share_alert(
+        project_id,
+        session,
+        burn_share=burn_share,
+        threshold=SELF_REPAIR_BURN_SHARE_THRESHOLD,
+        severity=AlertSeverity.WARNING,
+    )
+    logger.info(
+        "[SELF_REPAIR_BURN_SHARE_ALERT] project=%s burn_share=%.4f threshold=%.4f",
+        project_id,
+        burn_share,
+        SELF_REPAIR_BURN_SHARE_THRESHOLD,
     )
     return True
 

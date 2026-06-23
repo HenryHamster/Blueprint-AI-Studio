@@ -537,6 +537,25 @@ class ReleaseAuditChallengePayload(_SystemPopulated):
     primary_audit_report: dict | None = None
 
 
+class ReleaseMergeGradePayload(_SystemPopulated):
+    """Payload for the blind merge-grade goal-coverage grader (dir d-c0fe439f).
+
+    The agent grades the MERGED DIFFS of one release version (the pinned
+    ``candidate_sha`` / ``diff_range`` plus the ``merged_prs`` window)
+    against the frozen ``version_goal`` and emits a goal-coverage verdict.  The
+    grade is BLIND to the strategist ``running_update`` — that field is
+    deliberately absent from this schema, and the spawner guards against it
+    being threaded in.  Fields stay optional (BasePayload is extra-tolerant) and
+    the handler fails loud at runtime when the candidate SHA / goal is missing.
+    """
+
+    diff_range: str | None = None
+    candidate_sha: str | None = None
+    version_goal: str | None = None
+    merged_prs: list[int] | None = None
+    prompt: str | None = None
+
+
 class QAPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     pass
 
@@ -932,6 +951,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.self_audit: SelfAuditPayload,
     TaskType.release_audit: ReleaseAuditPayload,
     TaskType.release_audit_challenge: ReleaseAuditChallengePayload,
+    TaskType.release_merge_grade: ReleaseMergeGradePayload,
     TaskType.memo: MemoPayload,
     TaskType.verify_tests: VerifyTestsPayload,
     TaskType.compute_experiment: ComputeExperimentPayload,
