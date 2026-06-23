@@ -39,12 +39,12 @@ done
 # Fresh GATE-ENVIRONMENT marker per run: cleared here, re-written by the
 # config-driven pytest gate below only if this environment still cannot run
 # the suite faithfully. ./pr surfaces it after a passing `./check test`.
-rm -f /tmp/check_gate_env_46d9d37b-42b0-4fa4-abde-dc2a9bd1158d.txt
+rm -f /tmp/check_gate_env_6867e9ef-f0d6-41cb-8b9d-1be50b02c806.txt
 
 # Determine changed paths: committed since base + uncommitted. Verify at
 # least one diff source actually worked — silently-empty CHANGED used to
 # fall through to "PASS — all checks green" without running anything.
-BASE="research/eb3dfcd4"
+BASE="automain"
 COMMITTED=""
 if git rev-parse --verify "origin/$BASE" >/dev/null 2>&1; then
   COMMITTED=$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null || true)
@@ -230,7 +230,7 @@ if touches "backend/"; then
         echo "[check]   - Validate the diff where the suite CAN faithfully run (the project's Docker/Postgres harness, or targeted single-file runs) and record that evidence in the PR body."
         echo "[check]   - CI runs the authoritative Postgres suite on the PR after ./pr open."
         echo "[check]   - If you have NO faithful test evidence for a test-relevant change, call ./blocked \"<reason>\" --needs-capability \"postgres test environment\" instead of shipping blind."
-        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "backend: pytest gate skipped — no Docker for the sanctioned harness and no Postgres test env; a bare run would be an unfaithful SQLite fallback" >> /tmp/check_gate_env_46d9d37b-42b0-4fa4-abde-dc2a9bd1158d.txt ;;
+        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "backend: pytest gate skipped — no Docker for the sanctioned harness and no Postgres test env; a bare run would be an unfaithful SQLite fallback" >> /tmp/check_gate_env_6867e9ef-f0d6-41cb-8b9d-1be50b02c806.txt ;;
     esac
   fi
 fi

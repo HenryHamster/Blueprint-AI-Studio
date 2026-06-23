@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText } from 'lucide-react';
+import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid } from 'lucide-react';
 import { analyzeComputeJob, fetchComputeJobs, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
@@ -19,6 +19,131 @@ import {
 } from './ComputeJobsPanel.utils';
 
 const POLL_INTERVAL_MS = 10_000;
+
+type MetricDirection = 'higher_better' | 'lower_better' | 'unknown';
+
+function metricDirection(key: string, group: ComputeJob[]): MetricDirection {
+  if (key === '__cost__' || key === '__runtime__') return 'lower_better';
+  for (const job of group) {
+    const v = job.criterion_verdict;
+    if (v && v.metric === key) {
+      return v.operator === '>=' || v.operator === '>' ? 'higher_better' : 'lower_better';
+    }
+  }
+  return 'unknown';
+}
+
+function bestIndex(values: (number | null)[], dir: MetricDirection): number | null {
+  if (dir === 'unknown') return null;
+  let bi: number | null = null;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    if (v === null) continue;
+    if (bi === null) { bi = i; continue; }
+    const bv = values[bi]!;
+    if (dir === 'higher_better' ? v > bv : v < bv) bi = i;
+  }
+  return bi;
+}
+
+function jobMetricValue(job: ComputeJob, key: string, criterionMetric: string | null): number | null {
+  if (key === '__cost__') return computeJobSpent(job);
+  if (key === '__runtime__') return computeJobRuntimeSec(job);
+  if (key === criterionMetric && job.criterion_verdict?.value != null) return job.criterion_verdict.value;
+  const rm = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
+  const v = rm?.[key];
+  return typeof v === 'number' ? v : null;
+}
+
+function formatMetricLabel(key: string): string {
+  if (key === '__cost__') return 'Cost';
+  if (key === '__runtime__') return 'Runtime';
+  return key;
+}
+
+function formatMetricValue(key: string, v: number | null): string {
+  if (v === null) return '—';
+  if (key === '__cost__') return fmtUsd(v);
+  if (key === '__runtime__') return fmtDuration(v);
+  return String(v);
+}
+
+function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
+  let criterionMetric: string | null = null;
+  const extraKeys = new Set<string>();
+  for (const job of group) {
+    if (!criterionMetric && job.criterion_verdict?.metric) criterionMetric = job.criterion_verdict.metric;
+    const rm = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
+    if (rm) for (const k of Object.keys(rm)) if (k !== criterionMetric) extraKeys.add(k);
+  }
+
+  const allKeys: string[] = [
+    ...(criterionMetric ? [criterionMetric] : []),
+    ...extraKeys,
+    '__cost__',
+    '__runtime__',
+  ];
+
+  const rows = allKeys
+    .map((key) => {
+      const dir = metricDirection(key, group);
+      const values = group.map((job) => jobMetricValue(job, key, criterionMetric));
+      return { key, dir, values, bi: bestIndex(values, dir) };
+    })
+    .filter((r) => r.values.some((v) => v !== null));
+
+  const metCount = group.filter((j) => j.criterion_verdict?.met).length;
+
+  return (
+    <div data-testid="run-comparison-matrix">
+      <div className="mb-1 text-ui-sm font-mono text-neutral-400">{metCount}/{group.length} met criterion</div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-ui-sm font-mono">
+          <thead>
+            <tr>
+              <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Metric</th>
+              {group.map((job) => (
+                <th key={job.id} className="text-right pr-2 pb-1 text-neutral-300 font-semibold max-w-28 truncate">
+                  {(job.task_title ?? job.id).slice(0, 24)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(({ key, values, bi }) => (
+              <tr key={key} className="border-t border-neutral-800/50">
+                <td className="py-0.5 pr-3 text-neutral-500">{formatMetricLabel(key)}</td>
+                {values.map((v, i) => (
+                  <td
+                    key={i}
+                    className={`py-0.5 pr-2 text-right ${i === bi ? 'text-emerald-300 font-semibold' : 'text-neutral-400'}`}
+                    data-testid={i === bi ? 'matrix-best-cell' : undefined}
+                  >
+                    {formatMetricValue(key, v)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-1.5" data-testid="matrix-verdict-summary">
+        {group.map((job) => {
+          const v = job.criterion_verdict;
+          return (
+            <span
+              key={job.id}
+              className={`rounded border px-1.5 py-0.5 text-ui-xs font-semibold ${v?.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : v ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-600/40 bg-neutral-800/60 text-neutral-400'}`}
+              data-testid="matrix-verdict-chip"
+            >
+              {(job.task_title ?? job.id).slice(0, 20)}: {v?.met ? 'met' : v ? 'missed' : 'no verdict'}
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 function groupJobsByExperiment(jobs: ComputeJob[]): Map<string, ComputeJob[]> {
   const groups = new Map<string, ComputeJob[]>();
@@ -48,12 +173,23 @@ function bestRunId(group: ComputeJob[]): string | null {
 function ExperimentSweepSummary({ jobs }: { jobs: ComputeJob[] }) {
   const groups = groupJobsByExperiment(jobs);
   const multiRun = [...groups.entries()].filter(([, g]) => g.length >= 2);
+  const [compareSet, setCompareSet] = useState<Set<string>>(new Set());
   if (multiRun.length === 0) return null;
+
+  function toggleCompare(expName: string) {
+    setCompareSet((prev) => {
+      const next = new Set(prev);
+      if (next.has(expName)) next.delete(expName); else next.add(expName);
+      return next;
+    });
+  }
+
   return (
     <div className="mb-3 flex flex-col gap-2">
       {multiRun.map(([expName, group]) => {
         const metCount = group.filter((j) => j.criterion_verdict?.met).length;
         const best = bestRunId(group);
+        const comparing = compareSet.has(expName);
         return (
           <div
             key={expName}
@@ -62,39 +198,56 @@ function ExperimentSweepSummary({ jobs }: { jobs: ComputeJob[] }) {
           >
             <div className="flex items-center justify-between gap-2 mb-1.5">
               <span className="text-ui-sm font-semibold text-violet-300 break-words">{expName}</span>
-              <span className="shrink-0 text-ui-sm text-neutral-400 font-mono" data-testid="sweep-criterion-count">
-                {metCount}/{group.length} met criterion
-              </span>
+              <div className="flex items-center gap-2 shrink-0">
+                {!comparing && (
+                  <span className="text-ui-sm text-neutral-400 font-mono" data-testid="sweep-criterion-count">
+                    {metCount}/{group.length} met criterion
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => toggleCompare(expName)}
+                  className="min-h-[44px] flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-violet-400 hover:text-violet-200 hover:bg-violet-500/15 transition-colors"
+                  data-testid="sweep-compare-toggle"
+                >
+                  <LayoutGrid className="w-3 h-3" />
+                  {comparing ? 'List' : 'Compare'}
+                </button>
+              </div>
             </div>
-            <div className="flex flex-col gap-0.5">
-              {group.map((job) => {
-                const isBest = job.id === best;
-                const verdict = job.criterion_verdict;
-                return (
-                  <div
-                    key={job.id}
-                    className={`flex items-center gap-2 text-ui-sm font-mono ${isBest ? 'text-emerald-300' : 'text-neutral-400'}`}
-                    data-testid={isBest ? 'sweep-best-run' : 'sweep-run-row'}
-                  >
-                    <span className="min-w-0 flex-1 truncate">{job.task_title ?? job.id}</span>
-                    {verdict?.value != null && (
-                      <span className={isBest ? 'font-semibold' : ''}>{verdict.value}</span>
-                    )}
-                    {verdict ? (
-                      verdict.met ? (
-                        <span className="shrink-0 rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-ui-xs text-emerald-300">
-                          met
-                        </span>
-                      ) : (
-                        <span className="shrink-0 rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-ui-xs text-red-300">
-                          unmet
-                        </span>
-                      )
-                    ) : null}
-                  </div>
-                );
-              })}
-            </div>
+            {comparing ? (
+              <RunComparisonMatrix group={group} />
+            ) : (
+              <div className="flex flex-col gap-0.5">
+                {group.map((job) => {
+                  const isBest = job.id === best;
+                  const verdict = job.criterion_verdict;
+                  return (
+                    <div
+                      key={job.id}
+                      className={`flex items-center gap-2 text-ui-sm font-mono ${isBest ? 'text-emerald-300' : 'text-neutral-400'}`}
+                      data-testid={isBest ? 'sweep-best-run' : 'sweep-run-row'}
+                    >
+                      <span className="min-w-0 flex-1 truncate">{job.task_title ?? job.id}</span>
+                      {verdict?.value != null && (
+                        <span className={isBest ? 'font-semibold' : ''}>{verdict.value}</span>
+                      )}
+                      {verdict ? (
+                        verdict.met ? (
+                          <span className="shrink-0 rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-ui-xs text-emerald-300">
+                            met
+                          </span>
+                        ) : (
+                          <span className="shrink-0 rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-ui-xs text-red-300">
+                            unmet
+                          </span>
+                        )
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         );
       })}

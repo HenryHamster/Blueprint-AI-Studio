@@ -973,6 +973,79 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('experiment-sweep-summary')).toBeNull();
   });
 
+  test('renders run comparison matrix with per-metric best highlight', async () => {
+    // job1: accuracy=0.85 (unmet), loss=0.3, cost=$1.00
+    // job2: accuracy=0.93 (met), loss=0.2, cost=$2.00
+    // criterion: accuracy >= 0.9 → higher-better → job2 is best
+    // loss: no direction (unknown result_metric) → no best highlight
+    // cost (__cost__): lower-better → job1 ($1.00) is best
+    // runtime: both null (no timestamps) → no best highlight
+    const job1 = makeJob({
+      id: 'cmp-job1',
+      task_title: 'run A',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'comparison-test',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.85, met: false, measurable: true },
+      polling_metadata: { result_metrics: { accuracy: 0.85, loss: 0.3 } },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'cmp-job2',
+      task_title: 'run B',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.0,
+      experiment: 'comparison-test',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.93, met: true, measurable: true },
+      polling_metadata: { result_metrics: { accuracy: 0.93, loss: 0.2 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue([job1, job2]);
+    const { findByTestId, getAllByTestId, queryAllByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Sweep summary appears; open compare mode
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    // Matrix is shown
+    const matrix = await findByTestId('run-comparison-matrix');
+    expect(matrix).toBeTruthy();
+    // Matrix unions metric keys across runs (accuracy from criterion + loss from result_metrics)
+    expect(matrix.textContent).toContain('accuracy');
+    expect(matrix.textContent).toContain('loss');
+    // Cost row is present (known direction: lower-better)
+    expect(matrix.textContent).toContain('Cost');
+    // Best-per-metric cells: accuracy → run B (0.93), cost → run A ($1.00)
+    const bestCells = getAllByTestId('matrix-best-cell');
+    const bestTexts = bestCells.map((c) => c.textContent);
+    // accuracy best = 0.93 (job2)
+    expect(bestTexts).toContain('0.93');
+    // cost best = $1.00 (job1)
+    expect(bestTexts.some((t) => t?.includes('$1.00'))).toBe(true);
+    // loss has no best-cell (unknown direction)
+    // All matrix-best-cell entries should be for accuracy or cost, not loss
+    // Get loss row: find the row containing 'loss' label and verify no matrix-best-cell in it
+    const allRows = matrix.querySelectorAll('tbody tr');
+    let lossRowHasBest = false;
+    for (const row of allRows) {
+      if (row.textContent?.includes('loss')) {
+        lossRowHasBest = row.querySelector('[data-testid="matrix-best-cell"]') !== null;
+      }
+    }
+    expect(lossRowHasBest).toBe(false);
+    // Met/missed summary
+    const verdictSummary = getByTestId('matrix-verdict-summary');
+    expect(verdictSummary.textContent).toContain('met');
+    expect(verdictSummary.textContent).toContain('missed');
+    // Both runs appear as verdict chips
+    const chips = queryAllByTestId('matrix-verdict-chip');
+    expect(chips).toHaveLength(2);
+  });
+
   test('active jobs are excluded from sweep summary groups', async () => {
     const activeJob = makeJob({ experiment: 'active-sweep', status: 'RUNNING', outcome: null });
     const terminalJob = makeJob({
