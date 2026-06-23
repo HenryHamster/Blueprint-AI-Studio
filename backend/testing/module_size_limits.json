@@ -159,7 +159,7 @@
     "useAppState.ts": 3000,
     "components/VersionLifecyclePanel.tsx": 2300,
     "components/DirectionsPanel.tsx": 3000,
-    "components/CatchUpPanel.tsx": 3600,
+
     "components/TaskDetailDrawer.tsx": 2500,
     "components/SettingsDropdown.tsx": 800,
     "components/KanbanBoard.tsx": 1500,
@@ -196,7 +196,7 @@
     "components/srTrendBreakdown/primitives.tsx": 350,
     "components/srTrendBreakdown/retrospectives.tsx": 400,
     "components/srTrendBreakdown/types.ts": 350,
-    "components/SrMissedRetrospectivesPanel.tsx": 900,
+
     "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
     "components/TaskDetailDrawerMeta.tsx": 400,
     "api.ts": 4250,

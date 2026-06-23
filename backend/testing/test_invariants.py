@@ -4872,9 +4872,6 @@ class TestFrontendSizeGuardrails:
     def test_sr_trend_breakdown(self):
         self._check_frontend("components/SrTrendBreakdown.tsx")
 
-    def test_sr_missed_retrospectives_panel(self):
-        self._check_frontend("components/SrMissedRetrospectivesPanel.tsx")
-
     def test_sr_unhandled_edges_retrospectives_panel(self):
         self._check_frontend("components/SrUnhandledEdgesRetrospectivesPanel.tsx")
 

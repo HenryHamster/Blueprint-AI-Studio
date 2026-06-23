@@ -165,6 +165,7 @@ vi.mock('./strategic-sections.js', () => ({
   buildClockAndRecentWorkSection: () => ({ clockHeader: '', recentWorkSection: '' }),
   buildConversationThreadSection: () => '',
   buildFeedbackSection: () => '',
+  buildQuestionSection: () => '',
   buildOpenMessagesText: () => '',
   // Echo the authoritative count args so wiring tests can assert the handler
   // threads payload.direction_counts through to these builders.

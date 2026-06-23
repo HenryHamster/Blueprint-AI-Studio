@@ -6,6 +6,8 @@ all with blueprint_api.api mocked so no network/credentials are needed.
 """
 import io
 import json
+import os
+import subprocess
 import urllib.error
 import urllib.request
 
@@ -13,6 +15,59 @@ import pytest
 
 import blueprint
 import blueprint_api
+
+# ── root wrapper existence and invocation tests ───────────────────────────────
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_blueprint_wrapper_exists_and_is_executable():
+    """./blueprint exists at the repo root and is executable."""
+    wrapper = os.path.join(REPO_ROOT, "blueprint")
+    assert os.path.isfile(wrapper), f"./blueprint not found at {wrapper}"
+    assert os.access(wrapper, os.X_OK), "./blueprint is not executable"
+
+
+def test_check_wrapper_exists_and_is_executable():
+    """./check exists at the repo root and is executable."""
+    wrapper = os.path.join(REPO_ROOT, "check")
+    assert os.path.isfile(wrapper), f"./check not found at {wrapper}"
+    assert os.access(wrapper, os.X_OK), "./check is not executable"
+
+
+def test_blueprint_wrapper_help_exits_zero():
+    """./blueprint --help exits 0 and emits CLI output."""
+    wrapper = os.path.join(REPO_ROOT, "blueprint")
+    result = subprocess.run(
+        [wrapper, "--help"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"./blueprint --help exited {result.returncode}: {result.stderr}"
+    assert len(result.stdout) > 0, "./blueprint --help produced no output"
+
+
+def test_check_test_delegates_to_standalone_harness():
+    """./check test script delegates to scripts/test-backend.sh --standalone --no-postgres."""
+    check_path = os.path.join(REPO_ROOT, "check")
+    with open(check_path) as f:
+        content = f.read()
+    assert "scripts/test-backend.sh" in content, "./check does not reference scripts/test-backend.sh"
+    assert "--standalone" in content, "./check does not pass --standalone to scripts/test-backend.sh"
+    assert "--no-postgres" in content, "./check does not pass --no-postgres to scripts/test-backend.sh"
+
+
+def test_blueprint_wrapper_shell_syntax():
+    """./blueprint passes bash -n (no syntax errors)."""
+    wrapper = os.path.join(REPO_ROOT, "blueprint")
+    result = subprocess.run(["bash", "-n", wrapper], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed on ./blueprint: {result.stderr}"
+
+
+def test_check_wrapper_shell_syntax():
+    """./check passes bash -n (no syntax errors)."""
+    wrapper = os.path.join(REPO_ROOT, "check")
+    result = subprocess.run(["bash", "-n", wrapper], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed on ./check: {result.stderr}"
 
 
 # ── --help for every (sub)command parses and exits 0 ─────────────────────────

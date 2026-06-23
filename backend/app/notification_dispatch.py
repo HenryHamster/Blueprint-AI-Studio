@@ -1982,6 +1982,36 @@ async def post_feedback_acknowledgment(
     )
 
 
+async def post_question_answer(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    original_msg_id: uuid.UUID,
+    answer: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Create a strategist reply message answering a resolved QUESTION message.
+
+    Uses from_type="strategic" (NOT "system") so the answer reads as a
+    first-class strategist response in the operator conversation feed.
+    The event_type "question_answer" is a cross-component contract consumed
+    by the frontend threading logic — use it verbatim.
+    """
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        from_task_id=task_id,
+        content=f"Answer: {answer}",
+        context={
+            "event_type": "question_answer",
+            "reply_to": str(original_msg_id),
+            "answer": answer,
+        },
+    )
+    session.add(msg)
+    return msg
+
+
 async def post_version_calcification_message(
     session: AsyncSession,
     project_id: uuid.UUID,

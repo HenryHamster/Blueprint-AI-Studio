@@ -10,6 +10,7 @@ import {
   buildClockAndRecentWorkSection,
   buildConversationThreadSection,
   buildFeedbackSection,
+  buildQuestionSection,
   buildOpenMessagesText,
   buildDirSummaryText,
   buildDirHealthSummary,
@@ -1031,5 +1032,22 @@ describe('buildDirSummaryText authoritative count', () => {
     const result = buildDirSummaryText(dirs, 9);
     expect(result).toContain('Showing 2 of 9 active directions');
     expect(result).toContain('Dir one');
+  });
+});
+
+describe('buildQuestionSection', () => {
+  it('returns empty string when no QUESTION messages', () => {
+    expect(buildQuestionSection([])).toBe('');
+    expect(buildQuestionSection([{ type: 'FEEDBACK', id: '1', from: 'op', content: 'x' }])).toBe('');
+  });
+
+  it('renders QUESTION messages under the heading with id, from, age, content', () => {
+    const msg = { type: 'QUESTION', id: 'abc123', from: 'operator', content: 'What is the plan?', created_at: new Date().toISOString() };
+    const result = buildQuestionSection([msg]);
+    expect(result).toContain('## Operator Questions Awaiting Answers');
+    expect(result).toContain('id: abc123');
+    expect(result).toContain('from: operator');
+    expect(result).toContain('What is the plan?');
+    expect(result).toContain('./messages resolve');
   });
 });

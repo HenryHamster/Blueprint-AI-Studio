@@ -253,6 +253,7 @@ Key test invariants:
 - Schema revision (`EXPECTED_SCHEMA_REVISION` in `backend/app/main.py`) — must match the latest Alembic migration
 - Database migrations are immutable — new migrations must chain from the latest `down_revision`
 - Use `./check` for the fast repo gate; use `./check test` for the lightweight backend smoke pass
+- Use `./blueprint status` (or `./blueprint --help`) to query the operator CLI; `./blueprint` is a root wrapper over `scripts/blueprint.py`
 
 ### Adding Features
 

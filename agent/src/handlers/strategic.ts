@@ -61,6 +61,7 @@ import {
   buildClockAndRecentWorkSection,
   buildConversationThreadSection,
   buildFeedbackSection,
+  buildQuestionSection,
   buildOpenMessagesText,
   buildDirSummaryText,
   buildDirHealthSummary,
@@ -286,6 +287,7 @@ export async function handleStrategic(
       : [];
     const threadSection = buildConversationThreadSection(conversationThread);
     const feedbackSection = buildFeedbackSection(openMessages);
+    const questionSection = buildQuestionSection(openMessages);
     const openMessagesText = buildOpenMessagesText(openMessages);
 
     const dirSummaryText = buildDirSummaryText(directionsSummary, authoritativeActive);
@@ -630,6 +632,7 @@ prompts, schemas, tools, or orchestration.` : '';
       driftSection,
       recentWorkSection,
       feedbackSection,
+      questionSection,
       threadSection,
       taskId,
       versionPhaseSection: buildVersionPhaseSection(versionPhase),
@@ -879,7 +882,7 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # Existing directions (for update/retire operations)
 ${dirSummaryText}
 
-${feedbackSection}${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\nA message tagged \`⚠ STALE\` is a BUG_REPORT/BLOCKER citing code that no longer exists on HEAD — treat it as discounted/unproven: do NOT spawn a fix or investigation to chase it. Resolve/close it as already-fixed, or re-verify the defect still reproduces on HEAD before acting.\n${openMessagesText}\n` : ''}
+${questionSection}${feedbackSection}${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\nA message tagged \`⚠ STALE\` is a BUG_REPORT/BLOCKER citing code that no longer exists on HEAD — treat it as discounted/unproven: do NOT spawn a fix or investigation to chase it. Resolve/close it as already-fixed, or re-verify the defect still reproduces on HEAD before acting.\n${openMessagesText}\n` : ''}
 # Strategic analysis to execute
 
 ${analysisText.slice(0, 50_000)}

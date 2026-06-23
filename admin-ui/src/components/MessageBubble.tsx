@@ -258,10 +258,16 @@ export function MessageBubble({
   const taskId = msg.from_task_id;
 
   let replyContextMsg: ProjectMessage | null = null;
+  let replyContextType: 'feedback' | 'question' | null = null;
   if (msg.message_type === 'NOTE' &&
-      msg.context.event_type === 'feedback_acknowledgment' &&
       typeof msg.context.reply_to === 'string') {
-    replyContextMsg = allMessages.find(m => m.id === msg.context.reply_to) || null;
+    if (msg.context.event_type === 'feedback_acknowledgment') {
+      replyContextMsg = allMessages.find(m => m.id === msg.context.reply_to) || null;
+      replyContextType = replyContextMsg ? 'feedback' : null;
+    } else if (msg.context.event_type === 'question_answer') {
+      replyContextMsg = allMessages.find(m => m.id === msg.context.reply_to) || null;
+      replyContextType = replyContextMsg ? 'question' : null;
+    }
   }
 
   return (
@@ -292,10 +298,12 @@ export function MessageBubble({
             <span className="flex-1" />
             <CopyableMessageRef msgId={msg.id} />
           </div>
-          {/* Reply context for feedback acknowledgment */}
+          {/* Reply context for feedback acknowledgment and question answer */}
           {replyContextMsg && (
             <div className="mb-1.5 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
-              <p className="text-[11px] text-neutral-500 mb-0.5">In reply to your feedback:</p>
+              <p className="text-[11px] text-neutral-500 mb-0.5">
+                {replyContextType === 'question' ? 'Answering your question:' : 'In reply to your feedback:'}
+              </p>
               <p className="text-[11px] text-neutral-400 truncate">{replyContextMsg.content}</p>
             </div>
           )}

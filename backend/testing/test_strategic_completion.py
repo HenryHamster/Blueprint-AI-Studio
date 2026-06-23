@@ -14344,3 +14344,267 @@ def test_compute_model_gc_telemetry_gap_memory_absent():
 
     assert result["gap_memory_trimmed_count"] == 0
     assert result["gap_memory_hidden_entries"] == 0
+
+
+# ── QUESTION answer threading tests ──────────────────────────────────────────
+
+
+@pytest_asyncio.fixture()
+async def question_db(mocker):
+    """Isolated in-memory DB for QUESTION-answer threading tests."""
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
+    if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+            type_, **kw
+        )
+
+    _engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    _Session = sessionmaker(
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    async with _Session() as session:
+        yield session
+
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await _engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_question_answer_posted_on_resolution(question_db, mocker):
+    """Resolving a QUESTION via the log-parse path posts a from_type=strategic reply
+    whose context carries event_type='question_answer' and reply_to=<question id>."""
+    from unittest.mock import AsyncMock
+    from app.models import MessageType, Project, ProjectMessage, Task
+    from app.strategic_completion import _handle_strategic_completion
+    from sqlalchemy import select
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(name="P-qa", user_id="u1", vision={"purpose": "test"})
+    question_db.add(project)
+    await question_db.commit()
+    await question_db.refresh(project)
+
+    question_msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        content="What is the current deploy cadence?",
+        context={},
+        status="open",
+        from_type="operator",
+    )
+    question_db.add(question_msg)
+    await question_db.commit()
+    await question_db.refresh(question_msg)
+    question_id = question_msg.id
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {}}],
+        context={},
+    )
+    question_db.add(task)
+    await question_db.commit()
+    await question_db.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"revision": 1},
+            "resolved_messages": [
+                {
+                    "id": str(question_id),
+                    "resolution": "We deploy on Tuesdays and Fridays via the CI pipeline.",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, question_db)
+
+    await question_db.refresh(question_msg)
+    assert question_msg.status == "resolved"
+
+    result = await question_db.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.from_type == "strategic",
+        )
+    )
+    reply = result.scalars().first()
+    assert reply is not None, "Expected a from_type=strategic reply message"
+    assert reply.context is not None
+    assert reply.context.get("event_type") == "question_answer"
+    assert reply.context.get("reply_to") == str(question_id)
+    assert (
+        reply.context.get("answer")
+        == "We deploy on Tuesdays and Fridays via the CI pipeline."
+    )
+
+
+@pytest.mark.asyncio
+async def test_question_answer_not_posted_when_no_resolution(question_db, mocker):
+    """A QUESTION not in resolved_messages produces no reply message."""
+    from unittest.mock import AsyncMock
+    from app.models import MessageType, Project, ProjectMessage, Task
+    from app.strategic_completion import _handle_strategic_completion
+    from sqlalchemy import select
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(name="P-qa-nr", user_id="u1", vision={"purpose": "test"})
+    question_db.add(project)
+    await question_db.commit()
+    await question_db.refresh(project)
+
+    question_msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        content="Is the product ready?",
+        context={},
+        status="open",
+        from_type="operator",
+    )
+    question_db.add(question_msg)
+    await question_db.commit()
+    await question_db.refresh(question_msg)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {}}],
+        context={},
+    )
+    question_db.add(task)
+    await question_db.commit()
+    await question_db.refresh(task)
+
+    # No resolved_messages entry for the question
+    logs = json.dumps({"vision": {"revision": 1}})
+
+    await _handle_strategic_completion(task, logs, question_db)
+
+    # Question should still be open
+    await question_db.refresh(question_msg)
+    assert question_msg.status == "open"
+
+    result = await question_db.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.from_type == "strategic",
+        )
+    )
+    reply = result.scalars().first()
+    assert reply is None, "No reply should be posted for an unresolved QUESTION"
+
+
+@pytest.mark.asyncio
+async def test_open_questions_audit_fallback_path(question_db, mocker):
+    """Log-parse path: an open QUESTION after completion triggers a strategic alert."""
+    from unittest.mock import AsyncMock
+    from app.models import MessageType, Project, ProjectMessage, Task
+    from app.strategic_completion import _handle_strategic_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="P-qa-audit", user_id="u1", vision={"purpose": "test"})
+    question_db.add(project)
+    await question_db.commit()
+    await question_db.refresh(project)
+
+    question_msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        content="What should we prioritize?",
+        context={},
+        status="open",
+        from_type="operator",
+    )
+    question_db.add(question_msg)
+    await question_db.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {}}],
+        context={},
+    )
+    question_db.add(task)
+    await question_db.commit()
+    await question_db.refresh(task)
+
+    # No resolution for the question — it remains open
+    logs = json.dumps({"vision": {"revision": 1}})
+
+    await _handle_strategic_completion(task, logs, question_db)
+
+    assert alert_mock.called, "Expected _create_strategic_alert to be called"
+    alert_texts = [str(call) for call in alert_mock.call_args_list]
+    assert any(
+        "QUESTION" in t or "unanswered" in t or "question" in t.lower()
+        for t in alert_texts
+    ), f"Expected a QUESTION-related alert, got: {alert_texts}"
+
+
+@pytest.mark.asyncio
+async def test_open_questions_audit_api_path(question_db, mocker):
+    """API path: an open QUESTION after completion triggers a strategic alert."""
+    from unittest.mock import AsyncMock
+    from app.models import MessageType, Project, ProjectMessage, Task
+    from app.strategic_completion import _handle_strategic_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="P-qa-api", user_id="u1", vision={"purpose": "test", "revision": 1}
+    )
+    question_db.add(project)
+    await question_db.commit()
+    await question_db.refresh(project)
+
+    question_msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        content="When does v2 ship?",
+        context={},
+        status="open",
+        from_type="operator",
+    )
+    question_db.add(question_msg)
+    await question_db.commit()
+
+    # Simulate API path: set _strategic_api_called so api_was_used=True
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"_strategic_api_called": True},
+    )
+    question_db.add(task)
+    await question_db.commit()
+    await question_db.refresh(task)
+
+    # Empty logs — API path doesn't use the log-parse fallback
+    await _handle_strategic_completion(task, "", question_db)
+
+    assert alert_mock.called, "Expected _create_strategic_alert to be called"
+    alert_texts = [str(call) for call in alert_mock.call_args_list]
+    assert any(
+        "QUESTION" in t or "unanswered" in t or "question" in t.lower()
+        for t in alert_texts
+    ), f"Expected a QUESTION-related alert, got: {alert_texts}"

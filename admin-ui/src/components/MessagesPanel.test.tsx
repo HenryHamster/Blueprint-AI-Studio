@@ -1991,6 +1991,50 @@ describe('MessagesPanel feedback acknowledgment reply context', () => {
     expect(text).not.toContain('In reply to your feedback:');
   });
 
+  test('renders reply context label and original question excerpt for question_answer NOTE', async () => {
+    const question = makeMsg({
+      id: 'question-1',
+      message_type: 'QUESTION',
+      from_type: 'user',
+      content: 'Should we switch to a different caching strategy?',
+    });
+    const answer = makeMsg({
+      id: 'answer-1',
+      message_type: 'NOTE',
+      from_type: 'strategic',
+      content: 'Yes, switching to a distributed cache would improve performance.',
+      context: { event_type: 'question_answer', reply_to: 'question-1' },
+    });
+    const el = await renderPanel([question, answer]);
+
+    // question_answer is high-signal, so the bubble renders directly (not in routine ops).
+    const text = el.textContent ?? '';
+    // Reply context label should appear with question-specific wording
+    expect(text).toContain('Answering your question:');
+    // Original question excerpt should appear
+    expect(text).toContain('Should we switch to a different caching strategy');
+    // Answer content should appear
+    expect(text).toContain('Yes, switching to a distributed cache');
+  });
+
+  test('gracefully handles missing reply_to reference for question_answer (original question not in list)', async () => {
+    const answer = makeMsg({
+      id: 'answer-1',
+      message_type: 'NOTE',
+      from_type: 'strategic',
+      content: 'This answer refers to a question that was already resolved.',
+      context: { event_type: 'question_answer', reply_to: 'question-missing' },
+    });
+    const el = await renderPanel([answer]);
+
+    // question_answer is high-signal — bubble renders directly.
+    const text = el.textContent ?? '';
+    // Answer content should still render
+    expect(text).toContain('This answer refers to a question');
+    // Reply context label should NOT appear when reference is missing
+    expect(text).not.toContain('Answering your question:');
+  });
+
   test('renders clickable task slug when onOpenTask is provided', async () => {
     const mockOpenTask = vi.fn();
     const agentMsg = makeMsg({

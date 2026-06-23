@@ -105,6 +105,7 @@ export interface ThinkerPromptParams {
   driftSection: string;
   recentWorkSection: string;
   feedbackSection: string;
+  questionSection: string;
   threadSection: string;
   taskId: string;
   versionPhaseSection: string;
@@ -184,7 +185,7 @@ ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPa
 ## Portfolio Composition
 ${p.portfolioCompositionText}
 ${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
-${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
+${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
 You operate on a **problem model** — a structured representation of what the user wants (intent), what the project can do (capabilities), and what's between those (gaps). Directions are *moves* toward specific gaps. Friction is *obstacles* in the way.
