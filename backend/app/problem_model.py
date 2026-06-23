@@ -80,7 +80,12 @@ class Intent(BaseModel):
     """Long-term stable statement — what the project is *for*."""
 
     current_focus: str = Field(default="")
-    """What we're actively working toward right now. Updates as phases complete."""
+    """Concise, forward-looking mission statement for the current version — one or two
+    sentences stating what this version is *for* in user-visible terms. Write as an
+    objective (e.g. "Add design-system token layer to admin-ui"), NOT as a status or
+    progress log (not "v18 re-qualifying... deliverables confirmed complete...").
+    version.goal is seeded from this field at version-open and frozen for the version
+    lifetime; keep it meaningful for grading and operator communication."""
 
     user_purpose: str = Field(default="")
     """Durable operator-owned copy of the project purpose.
@@ -584,9 +589,7 @@ def _trim_gap_append_only_tail(gap: Gap) -> dict[str, Any] | None:
         trimmed["history_trimmed"] = len(gap.history) - GAP_APPEND_ONLY_GC_FLOOR
         gap.history = gap.history[-GAP_APPEND_ONLY_GC_FLOOR:]
     if len(gap.past_moves) > GAP_APPEND_ONLY_GC_FLOOR:
-        trimmed["past_moves_trimmed"] = (
-            len(gap.past_moves) - GAP_APPEND_ONLY_GC_FLOOR
-        )
+        trimmed["past_moves_trimmed"] = len(gap.past_moves) - GAP_APPEND_ONLY_GC_FLOOR
         gap.past_moves = gap.past_moves[-GAP_APPEND_ONLY_GC_FLOOR:]
     return trimmed if len(trimmed) > 1 else None
 
@@ -792,9 +795,7 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
         model
     ):
         # Oldest-first so list.pop(0) drops the oldest archived gap.
-        model.archived_gaps = sorted(
-            model.archived_gaps, key=_archived_gap_recency_key
-        )
+        model.archived_gaps = sorted(model.archived_gaps, key=_archived_gap_recency_key)
         while _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and (
             model.archived_gaps or model.rejected_agent_edits
         ):
@@ -1582,7 +1583,11 @@ def _merge_gap(current: Gap, proposed: Gap, past_moves_directive: bool = False) 
     # History watermark: monotonic max of current and proposed.  A write that
     # omits the field cannot regress a durable watermark.
     effective_h_wm = max(
-        (wm for wm in (current.history_compacted_at, merged.history_compacted_at) if wm),
+        (
+            wm
+            for wm in (current.history_compacted_at, merged.history_compacted_at)
+            if wm
+        ),
         default=None,
     )
     merged.history_compacted_at = effective_h_wm
@@ -1601,7 +1606,11 @@ def _merge_gap(current: Gap, proposed: Gap, past_moves_directive: bool = False) 
 
     # past_moves watermark: monotonic max for observability/durability.
     effective_pm_wm = max(
-        (wm for wm in (current.past_moves_compacted_at, merged.past_moves_compacted_at) if wm),
+        (
+            wm
+            for wm in (current.past_moves_compacted_at, merged.past_moves_compacted_at)
+            if wm
+        ),
         default=None,
     )
     merged.past_moves_compacted_at = effective_pm_wm
@@ -1876,7 +1885,9 @@ def apply_agent_update(
     # Non-destructive merge of agent-owned collections: an agent acting on a
     # trimmed/dropped payload view must not wipe entries it never saw. Runs
     # before the diff so the diff reflects the true merged state.
-    _merge_agent_owned_collections(current, proposed, deletions, floor_applied, pm_compacted_gaps)
+    _merge_agent_owned_collections(
+        current, proposed, deletions, floor_applied, pm_compacted_gaps
+    )
 
     # Compute diff before archival so closed gaps are still visible on
     # proposed.gaps — otherwise _compute_diff can't see what got closed

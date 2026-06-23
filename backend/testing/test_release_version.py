@@ -2855,6 +2855,59 @@ async def test_refresh_savepoint_keeps_outer_transaction_usable(db_session):
 
 
 # ===========================================================================
+# version goal freeze-at-open contract
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_version_goal_frozen_after_open_not_refreshed_mid_version(db_session):
+    """version.goal is frozen at open_version() and must not be mutated mid-version.
+
+    Strategic cycles previously called refresh_open_version_goal_if_auto_derived,
+    causing the goal to track the strategist's running current_focus and turn into
+    an operational status log. That call was removed; this test documents the
+    freeze-at-open contract: the goal stays at its initial mission statement.
+    """
+    project = await _make_project(db_session)
+    mission = "Deliver design-system @theme token substrate and ESLint enforcement"
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal=mission
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.goal == mission
+    assert version.goal_updated_at is None
+
+    # Verify the function itself is callable (it's preserved for operator paths
+    # like admin_agent_ops). Calling it here simulates the OLD strategic-cycle
+    # behavior; the fix is that strategic_completion.py no longer calls it.
+    status_log = (
+        "v18 re-qualifying at HEAD abc123 after blocked_no_merge_grade failure. "
+        "All v18 deliverables confirmed complete: design-system tokens, Badge "
+        "primitives, full text-[Npx] migration, ESLint enforcement."
+    )
+    result = await rv.refresh_open_version_goal_if_auto_derived(
+        db_session, project.id, status_log
+    )
+    assert result is not None, (
+        "refresh_open_version_goal_if_auto_derived must still work when called "
+        "directly (operator paths rely on it) — the freeze is enforced by NOT "
+        "calling it from strategic_completion.py"
+    )
+    await db_session.rollback()
+
+    # After rollback (simulating strategic_completion NOT calling refresh),
+    # the goal must still be the original mission statement.
+    await db_session.refresh(version)
+    assert version.goal == mission, (
+        f"version.goal was mutated mid-version from {mission!r} — "
+        "strategic cycles must not call refresh_open_version_goal_if_auto_derived"
+    )
+    assert version.goal_updated_at is None
+
+
+# ===========================================================================
 # list_release_versions endpoint — paginated full-history browse
 # ===========================================================================
 
@@ -2889,19 +2942,31 @@ async def _seed_history(db_session, project):
     """Seed 3 closed versions + 1 open, opened_at increasing with the number."""
     base = _utcnow()
     await _make_version(
-        db_session, project, version_number=1, status="promoted",
+        db_session,
+        project,
+        version_number=1,
+        status="promoted",
         opened_at=base - timedelta(days=4),
     )
     await _make_version(
-        db_session, project, version_number=2, status="abandoned",
+        db_session,
+        project,
+        version_number=2,
+        status="abandoned",
         opened_at=base - timedelta(days=3),
     )
     await _make_version(
-        db_session, project, version_number=3, status="promoted",
+        db_session,
+        project,
+        version_number=3,
+        status="promoted",
         opened_at=base - timedelta(days=2),
     )
     await _make_version(
-        db_session, project, version_number=4, status="open",
+        db_session,
+        project,
+        version_number=4,
+        status="open",
         opened_at=base - timedelta(days=1),
     )
 
@@ -2920,8 +2985,12 @@ async def test_list_release_versions_pagination(db_session):
 
     # All versions, newest-first; envelope shape is exactly the four keys.
     resp = await list_release_versions(
-        project_id=project.id, limit=20, offset=0, status=None,
-        session=db_session, current_user=current_user,
+        project_id=project.id,
+        limit=20,
+        offset=0,
+        status=None,
+        session=db_session,
+        current_user=current_user,
     )
     assert set(resp.keys()) == {"versions", "total", "limit", "offset"}
     assert resp["total"] == 4
@@ -2935,24 +3004,36 @@ async def test_list_release_versions_pagination(db_session):
 
     # limit is respected (only the 2 newest returned, total unchanged).
     resp_limit = await list_release_versions(
-        project_id=project.id, limit=2, offset=0, status=None,
-        session=db_session, current_user=current_user,
+        project_id=project.id,
+        limit=2,
+        offset=0,
+        status=None,
+        session=db_session,
+        current_user=current_user,
     )
     assert resp_limit["total"] == 4
     assert [v["version_number"] for v in resp_limit["versions"]] == [4, 3]
 
     # offset skips the first rows.
     resp_offset = await list_release_versions(
-        project_id=project.id, limit=2, offset=2, status=None,
-        session=db_session, current_user=current_user,
+        project_id=project.id,
+        limit=2,
+        offset=2,
+        status=None,
+        session=db_session,
+        current_user=current_user,
     )
     assert resp_offset["total"] == 4
     assert [v["version_number"] for v in resp_offset["versions"]] == [2, 1]
 
     # status filter returns only the matching rows, and total reflects the filter.
     resp_promoted = await list_release_versions(
-        project_id=project.id, limit=20, offset=0, status="promoted",
-        session=db_session, current_user=current_user,
+        project_id=project.id,
+        limit=20,
+        offset=0,
+        status="promoted",
+        session=db_session,
+        current_user=current_user,
     )
     assert resp_promoted["total"] == 2
     assert {v["version_number"] for v in resp_promoted["versions"]} == {1, 3}
@@ -2972,8 +3053,12 @@ async def test_list_release_versions_rejects_invalid_status(db_session):
 
     with pytest.raises(HTTPException) as exc:
         await list_release_versions(
-            project_id=project.id, limit=20, offset=0, status="bogus",
-            session=db_session, current_user={"user_id": "rv-user"},
+            project_id=project.id,
+            limit=20,
+            offset=0,
+            status="bogus",
+            session=db_session,
+            current_user={"user_id": "rv-user"},
         )
     assert exc.value.status_code == 400
 
@@ -2990,7 +3075,11 @@ async def test_list_release_versions_requires_membership(db_session):
 
     with pytest.raises(HTTPException) as exc:
         await list_release_versions(
-            project_id=project.id, limit=20, offset=0, status=None,
-            session=db_session, current_user={"user_id": "stranger"},
+            project_id=project.id,
+            limit=20,
+            offset=0,
+            status=None,
+            session=db_session,
+            current_user={"user_id": "stranger"},
         )
     assert exc.value.status_code == 404

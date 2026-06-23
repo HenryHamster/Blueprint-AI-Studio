@@ -5494,28 +5494,6 @@ def _qualifier_ci_resolves_green(mocker):
         new=AsyncMock(return_value=("ok", None)),
     )
 
-    # Default the blind merge-grade gate to a usable computed grade for the
-    # candidate SHA so the overwhelming majority of run_qualification tests
-    # (which assume the candidate reaches the spawn path) proceed without a real
-    # LLM call. The grade echoes the candidate_sha so blind_merge_grade_satisfied
-    # short-circuits a re-run for the same SHA. Tests that exercise the gate
-    # itself (the fail-closed block, the positive persistence path, the escape
-    # hatch) re-patch this in their own body; the later patch wins.
-    async def _default_blind_merge_grade(_session, _project, _version, candidate_sha):
-        return {
-            "candidate_sha": candidate_sha,
-            "coverage_verdict": "partial",
-            "biggest_gap": "default test gap (autouse fixture)",
-            "model": "test-model",
-            "pr_count": 0,
-            "graded_at": "2026-01-01T00:00:00+00:00",
-        }
-
-    mocker.patch(
-        "app.release_qualifier.compute_blind_merge_grade",
-        new=AsyncMock(side_effect=_default_blind_merge_grade),
-    )
-
 
 # ===========================================================================
 # run_qualification — phase 1: guards + snapshot + spawn
@@ -6013,20 +5991,15 @@ async def test_run_qualification_wrong_phase_is_noop(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_blocked_without_blind_merge_grade(db_session, mocker):
-    """The blind merge-grade gate (d-c0fe439f) CANNOT be skipped.
+async def test_run_qualification_no_anthropic_key_spawns(db_session, mocker):
+    """Without a raw ANTHROPIC_API_KEY, run_qualification must still reach 'spawned'.
 
-    A stabilize-phase version with NO persisted blind merge-grade, with the
-    grader patched to be unavailable (returns None), must cause run_qualification
-    to FAIL CLOSED: it returns blocked_no_merge_grade, spawns NO audit task,
-    leaves version.phase == "stabilize", and blind_merge_grade_satisfied stays
-    False. This pins that an uninvested goal-coverage grade is REQUIRED before
-    the stabilize->qualify transition."""
-    from app import blind_merge_grade as bmg
-
+    The old inline blind-merge-grade pre-gate required ANTHROPIC_API_KEY and
+    failed closed without it.  That gate is removed: qualification now proceeds
+    directly to spawning the audit + merge_grade tasks (which use OAuth, not a
+    raw key) regardless of whether ANTHROPIC_API_KEY is set.
+    """
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    # Must set a non-empty goal so the empty-goal early-exit does NOT fire —
-    # this test exercises the fail-closed path when the grader is unavailable.
     version.goal = "deliver user analytics dashboard"
     db_session.add(version)
     await db_session.commit()
@@ -6036,27 +6009,23 @@ async def test_run_qualification_blocked_without_blind_merge_grade(db_session, m
         "app.github.get_branch_sha",
         new=AsyncMock(return_value=candidate),
     )
-    # Grader unavailable -> None. Re-patches the autouse default; later wins.
-    grade_mock = mocker.patch(
-        "app.release_qualifier.compute_blind_merge_grade",
-        new=AsyncMock(return_value=None),
-    )
 
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
 
-    assert result["status"] == "blocked_no_merge_grade"
+    # No raw key needed — qualification reaches spawned.
+    assert result["status"] == "spawned", (
+        f"expected 'spawned' without ANTHROPIC_API_KEY; got {result['status']!r}"
+    )
     assert result["candidate_sha"] == candidate
-    grade_mock.assert_awaited_once()
 
     await db_session.refresh(version)
-    # The transition is refused: phase stays stabilize, the gate is unsatisfied.
-    assert version.phase == "stabilize"
-    assert version.last_qualification["status"] == "blocked_no_merge_grade"
-    assert version.last_qualification["candidate_sha"] == candidate
-    assert bmg.blind_merge_grade_satisfied(version, candidate) is False
+    assert version.last_qualification["status"] == "pending"
+    # A merge_grade task is spawned alongside the audit task.
+    assert result.get("merge_grade_task_id"), (
+        "merge_grade_task_id must be set when version.goal is non-empty"
+    )
 
-    # NO audit / smoketest children were spawned.
     from sqlmodel import select
 
     tasks = (
@@ -6064,51 +6033,55 @@ async def test_run_qualification_blocked_without_blind_merge_grade(db_session, m
         .scalars()
         .all()
     )
-    assert len(tasks) == 0
+    types = sorted((t.first_payload or {}).get("type") for t in tasks)
+    assert "release_audit" in types
+    assert "release_merge_grade" in types
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_empty_goal_skips_blind_merge_grade(db_session, mocker):
-    """When version.goal is empty/None the blind-merge-grade gate is a no-op PASS.
+async def test_run_qualification_empty_goal_no_merge_grade_task(db_session, mocker):
+    """When version.goal is empty/None no merge_grade task is spawned.
 
-    compute_blind_merge_grade must NOT be called (it returns None for empty goals,
-    which would wedge the version in blocked_no_merge_grade forever).  The
-    qualification should proceed to spawning the audit child.
+    An empty goal means there is nothing to grade the merged diffs against, so
+    the qualifier skips spawning a merge_grade child entirely.  Qualification
+    must still reach 'spawned' (audit task is always spawned).
     """
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    # version.goal defaults to None — do NOT set it, that is the point of the test.
+    # version.goal defaults to None — do NOT set it.
     candidate = "cafe" * 10  # 40-char placeholder SHA
 
     mocker.patch(
         "app.github.get_branch_sha",
         new=AsyncMock(return_value=candidate),
     )
-    grade_mock = mocker.patch(
-        "app.release_qualifier.compute_blind_merge_grade",
-        new=AsyncMock(return_value=None),
-    )
 
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
 
-    # The gate must NOT fire for an empty goal — grader never called.
-    grade_mock.assert_not_awaited()
-    # Qualification proceeds past the gate (spawns or records a non-blocked status).
-    assert result["status"] != "blocked_no_merge_grade", (
-        "empty-goal version must not be wedged by the blind-merge-grade gate"
+    assert result["status"] == "spawned", (
+        f"empty-goal version must reach 'spawned'; got {result['status']!r}"
     )
+    # No merge_grade task for an empty goal.
+    assert result.get("merge_grade_task_id") is None, (
+        "merge_grade_task_id must be absent when version.goal is empty"
+    )
+
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    types = [(t.first_payload or {}).get("type") for t in tasks]
+    assert "release_audit" in types
+    assert "release_merge_grade" not in types
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_persists_blind_merge_grade_and_spawns(
-    db_session, mocker
-):
-    """Positive path: with a computable grade, run_qualification persists it on
-    last_qualification['blind_merge_grade'] (keyed to the candidate SHA, with a
-    non-empty biggest_gap and coverage_verdict) and proceeds to the normal
-    audit-spawn path."""
-    from app import blind_merge_grade as bmg
-
+async def test_run_qualification_with_goal_spawns_merge_grade_task(db_session, mocker):
+    """Positive path: a version with a non-empty goal spawns both audit and
+    merge_grade tasks; the merge_grade_task_id is recorded on last_qualification."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     version.goal = "deliver cost-reduction VM substrate change"
     db_session.add(version)
@@ -6120,39 +6093,26 @@ async def test_run_qualification_persists_blind_merge_grade_and_spawns(
         new=AsyncMock(return_value=candidate),
     )
 
-    async def _grade(_session, _project, _version, candidate_sha):
-        return {
-            "candidate_sha": candidate_sha,
-            "coverage_verdict": "misses",
-            "biggest_gap": "the cost-reduction VM substrate change was never merged",
-            "model": "test-model",
-            "pr_count": 3,
-            "graded_at": "2026-01-01T00:00:00+00:00",
-        }
-
-    mocker.patch(
-        "app.release_qualifier.compute_blind_merge_grade",
-        new=AsyncMock(side_effect=_grade),
-    )
-
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
 
     assert result["status"] == "spawned"
     assert result["candidate_sha"] == candidate
+    assert result.get("merge_grade_task_id"), (
+        "merge_grade_task_id must be set when version.goal is non-empty"
+    )
 
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
-    grade = version.last_qualification["blind_merge_grade"]
-    assert grade["candidate_sha"] == candidate
-    assert grade["coverage_verdict"] == "misses"
-    assert grade["biggest_gap"]  # non-empty single biggest gap
-    # The persisted grade satisfies the gate for this exact SHA.
-    assert bmg.blind_merge_grade_satisfied(version, candidate) is True
-    # A different SHA is NOT satisfied — a new candidate must be graded afresh.
-    assert bmg.blind_merge_grade_satisfied(version, "f00d" * 10) is False
+    assert (
+        version.last_qualification.get("merge_grade_task_id")
+        == result["merge_grade_task_id"]
+    )
+    # No inline blind_merge_grade key on the pending record — grading is now
+    # done exclusively by the spawned merge_grade task.
+    assert "blind_merge_grade" not in version.last_qualification
 
-    # The normal audit child was spawned.
+    # Both audit and merge_grade children were spawned.
     from sqlmodel import select
 
     tasks = (
@@ -6162,39 +6122,7 @@ async def test_run_qualification_persists_blind_merge_grade_and_spawns(
     )
     types = sorted((t.first_payload or {}).get("type") for t in tasks)
     assert "release_audit" in types
-
-
-@pytest.mark.asyncio
-async def test_run_qualification_blind_merge_grade_escape_hatch(
-    db_session, mocker, monkeypatch
-):
-    """Escape hatch: with DISABLE_BLIND_MERGE_GRADE=1 the gate is skipped — the
-    grader is NEVER invoked and run_qualification proceeds to spawn even though
-    the grader (if called) would return None."""
-    monkeypatch.setenv("DISABLE_BLIND_MERGE_GRADE", "1")
-
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
-    candidate = "0ff1ce00" * 5
-
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=AsyncMock(return_value=candidate),
-    )
-    # If the gate were not skipped this None would block; assert it is not called.
-    grade_mock = mocker.patch(
-        "app.release_qualifier.compute_blind_merge_grade",
-        new=AsyncMock(return_value=None),
-    )
-
-    result = await rq.run_qualification(db_session, project.id, version)
-    await db_session.commit()
-
-    assert result["status"] == "spawned"
-    grade_mock.assert_not_called()
-
-    await db_session.refresh(version)
-    assert version.last_qualification["status"] == "pending"
-    assert version.last_qualification["blind_merge_grade"]["status"] == "skipped"
+    assert "release_merge_grade" in types
 
 
 @pytest.mark.asyncio
@@ -6202,14 +6130,13 @@ async def test_run_qualification_reuses_grade_when_skipped_pr_count_nonzero(
     db_session, mocker
 ):
     """Regression: a persisted grade with pr_count>0 and skipped_pr_count>0 must
-    satisfy blind_merge_grade_satisfied so run_qualification reuses it and does NOT
-    call compute_blind_merge_grade again.
+    allow run_qualification to proceed normally — spawning both audit and
+    merge_grade tasks. Grading is now done exclusively by the spawned
+    merge_grade task; there is no inline re-grade.
 
     Previously blind_merge_grade_satisfied returned False whenever skipped_pr_count>0,
-    causing a fresh ~90s Opus re-grade under the qualification lock on every cycle
-    even though a valid grade already existed.
+    causing incorrect behavior in the qualification pipeline.
     """
-    from app import blind_merge_grade as bmg
     from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -6235,25 +6162,27 @@ async def test_run_qualification_reuses_grade_when_skipped_pr_count_nonzero(
         "app.github.get_branch_sha",
         new=AsyncMock(return_value=candidate),
     )
-    # Patch compute_blind_merge_grade — if the fix is correct it must NOT be called.
-    grade_mock = mocker.patch(
-        "app.release_qualifier.compute_blind_merge_grade",
-        new=AsyncMock(return_value=None),
-    )
 
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
 
-    # Qualification proceeds (spawned) — the grade is reused, not re-computed.
+    # Qualification proceeds (spawned).
     assert result["status"] == "spawned", f"unexpected status: {result}"
-    grade_mock.assert_not_called()
+
+    # A merge_grade task was spawned for the non-empty goal.
+    assert result.get("merge_grade_task_id"), (
+        "merge_grade_task_id must be set when version.goal is non-empty"
+    )
 
     await db_session.refresh(version)
-    # The prior grade is still present and satisfies the gate.
-    assert bmg.blind_merge_grade_satisfied(version, candidate) is True
-    carried = (version.last_qualification or {}).get(BLIND_MERGE_GRADE_KEY, {})
-    assert carried.get("skipped_pr_count") == 1
-    assert carried.get("pr_count") == 3
+    assert version.last_qualification["status"] == "pending"
+    assert (
+        version.last_qualification.get("merge_grade_task_id")
+        == result["merge_grade_task_id"]
+    )
+    # Grading is now done exclusively by the spawned merge_grade task — no
+    # inline blind_merge_grade key on the pending record.
+    assert "blind_merge_grade" not in version.last_qualification
 
 
 @pytest.mark.asyncio
@@ -23821,7 +23750,9 @@ async def test_qualification_verdict_persists_blind_merge_grade(db_session):
     immutable QualificationVerdict row at finalize, surfaced intact by
     format_verdict_for_api, and absent (None, not error) on legacy rows."""
     from app import release_promotion as rp
-    from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
+
+    # Stable key under which QualificationVerdict stores inline grade records.
+    BLIND_MERGE_GRADE_KEY = "blind_merge_grade"
 
     _grade = {
         "candidate_sha": "abc123",
@@ -25984,74 +25915,6 @@ class TestThemeDeliveryCertification:
 
 
 # ===========================================================================
-# blind_merge_grade carry-forward into finalized record
-# ===========================================================================
-
-
-@pytest.mark.asyncio
-async def test_finalize_carries_blind_merge_grade_forward(db_session, mocker):
-    """_finalize_qualification must carry blind_merge_grade from the pending
-    record into the finalized last_qualification so it survives all finalize
-    outcomes and is reusable on re-qualification of the same candidate SHA.
-    """
-    from app import shared_state
-    from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
-
-    shared_state.runtime_config["promotion_enabled"] = False
-
-    project, version = await _make_project_and_version(db_session)
-
-    await _seed_qualification_children(
-        db_session,
-        project,
-        version,
-        audit_logs={
-            "audit_score": 1.0,
-            "test_erosion": {
-                "deleted_test_files": [],
-                "assertion_delta": 5,
-                "test_count_delta": 2,
-            },
-        },
-        smoke_logs={
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        },
-    )
-
-    # Embed a blind merge-grade on the pending record (as run_qualification does).
-    blind_grade = {
-        "candidate_sha": version.last_qualification["candidate_sha"],
-        "coverage_verdict": "partial",
-        "biggest_gap": "Auth module changes not covered by merged PRs",
-        "graded_at": "2026-06-20T00:00:00",
-    }
-    version.last_qualification[BLIND_MERGE_GRADE_KEY] = blind_grade
-    from sqlalchemy.orm.attributes import flag_modified
-
-    flag_modified(version, "last_qualification")
-    db_session.add(version)
-    await db_session.commit()
-
-    await rq._finalize_qualification(db_session, version)
-    await db_session.commit()
-    await db_session.refresh(version)
-
-    lq = version.last_qualification
-    assert lq.get("status") != "pending", (
-        f"record was not finalized: {lq.get('status')}"
-    )
-
-    carried = lq.get(BLIND_MERGE_GRADE_KEY)
-    assert carried is not None, (
-        f"blind_merge_grade was dropped from finalized record; last_qualification={lq!r}"
-    )
-    assert carried.get("coverage_verdict") == "partial"
-    assert carried.get("biggest_gap") == "Auth module changes not covered by merged PRs"
-
-
-# ===========================================================================
 # evaluate_merge_grade — pure scoring function unit tests
 # ===========================================================================
 
@@ -26234,230 +26097,6 @@ class TestBlindMergeGradeBlock:
         )
         assert result["confidence"] == 0.0
         assert result["blocker"] == "merge_grade_goal_coverage"
-
-    def test_compute_composite_merge_grade_misses_takes_precedence_over_goal_coverage(
-        self,
-    ):
-        """When both merge_grade_misses and merge_grade_blocked are True,
-        merge_grade_misses fires first (armable-dark checked before child-task gate)."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=1.0,
-            policy=_POLICY,
-            merge_grade_blocked=True,
-            merge_grade_misses=True,
-        )
-        assert result["blocker"] == "merge_grade_misses"
-
-    # --- Integration tests: _finalize_qualification gate -------------------
-
-    @pytest.mark.asyncio
-    async def test_blind_merge_grade_block_armable_dark(self, db_session, mocker):
-        """ACCEPTANCE: armed knob makes a 'misses' verdict force confidence 0.0/no-promote;
-        dark default (threshold=0.0) leaves promotion unchanged.
-
-        Case 1: coverage_verdict=misses + threshold=0.0 (dark) → promotes (confidence 1.0).
-        Case 2: coverage_verdict=misses + threshold=0.5 (armed) → not_promoted,
-                blocker=merge_grade_misses, confidence=0.0.
-        """
-        from app import shared_state
-
-        shared_state.runtime_config["promotion_enabled"] = False
-
-        _clean_audit_logs = {
-            "audit_score": 1.0,
-            "test_erosion": {
-                "deleted_test_files": [],
-                "assertion_delta": 5,
-                "test_count_delta": 2,
-            },
-        }
-        _clean_smoke_logs = {
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        }
-
-        _misses_grade = {
-            "candidate_sha": "feed" * 10,
-            "coverage_verdict": "misses",
-            "biggest_gap": "goal not delivered at all",
-            "model": "test-model",
-            "pr_count": 1,
-            "graded_at": "2026-06-20T00:00:00",
-        }
-
-        # --- Case 1: misses + dark threshold (0.0) → promotes ---------------
-        _dark_policy = {
-            "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
-            "threshold": 0.75,
-            "merge_grade_block_threshold": 0.0,
-        }
-        mocker.patch("app.release_qualifier._load_policy", return_value=_dark_policy)
-
-        project, version = await _make_project_and_version(db_session)
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        await _seed_qualification_children(
-            db_session,
-            project,
-            version,
-            audit_logs=_clean_audit_logs,
-            smoke_logs=_clean_smoke_logs,
-        )
-        # Inject a 'misses' grade into last_qualification under BLIND_MERGE_GRADE_KEY
-        from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
-
-        lq = dict(version.last_qualification or {})
-        lq[BLIND_MERGE_GRADE_KEY] = _misses_grade
-        version.last_qualification = lq
-        from sqlalchemy.orm.attributes import flag_modified
-
-        flag_modified(version, "last_qualification")
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        mocker.patch(
-            "app.release_qualifier._fetch_version_theme_evidence",
-            new=AsyncMock(return_value=None),
-        )
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        lq1 = version.last_qualification
-        assert lq1.get("blocker") != "merge_grade_misses", (
-            f"dark threshold=0.0 must NOT hard-block; got blocker={lq1.get('blocker')!r}"
-        )
-        assert result["status"] in ("promoted", "dry_run", "not_promoted"), (
-            f"unexpected status with dark threshold: {result['status']!r}"
-        )
-        # blind_merge_grade must be surfaced in the finalized record
-        assert "blind_merge_grade" in lq1, (
-            "blind_merge_grade must be present in the finalized last_qualification record"
-        )
-        assert lq1["blind_merge_grade"]["coverage_verdict"] == "misses"
-
-        # --- Case 2: misses + armed threshold (0.5) → hard block ------------
-        _armed_policy = {
-            "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
-            "threshold": 0.75,
-            "merge_grade_block_threshold": 0.5,
-        }
-        mocker.patch("app.release_qualifier._load_policy", return_value=_armed_policy)
-
-        project2, version2 = await _make_project_and_version(db_session)
-        db_session.add(version2)
-        await db_session.commit()
-        await db_session.refresh(version2)
-
-        await _seed_qualification_children(
-            db_session,
-            project2,
-            version2,
-            audit_logs=_clean_audit_logs,
-            smoke_logs=_clean_smoke_logs,
-        )
-        lq2 = dict(version2.last_qualification or {})
-        lq2[BLIND_MERGE_GRADE_KEY] = {**_misses_grade, "candidate_sha": "feed" * 10}
-        version2.last_qualification = lq2
-        flag_modified(version2, "last_qualification")
-        db_session.add(version2)
-        await db_session.commit()
-        await db_session.refresh(version2)
-
-        result2 = await rq._finalize_qualification(db_session, version2)
-        await db_session.commit()
-        await db_session.refresh(version2)
-
-        lq2_final = version2.last_qualification
-        assert result2["status"] == "not_promoted", (
-            f"armed threshold + misses must not_promote; got {result2['status']!r}"
-        )
-        assert result2.get("blocker") == "merge_grade_misses", (
-            f"expected merge_grade_misses blocker for armed coverage_verdict==misses; got {result2.get('blocker')!r}"
-        )
-        assert lq2_final.get("confidence") == 0.0, (
-            f"expected confidence=0.0; got {lq2_final.get('confidence')!r}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_blind_merge_grade_covers_not_blocked(self, db_session, mocker):
-        """coverage_verdict=covers + armed threshold → no merge-grade block."""
-        from app import shared_state
-
-        shared_state.runtime_config["promotion_enabled"] = False
-
-        _armed_policy = {
-            "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
-            "threshold": 0.75,
-            "merge_grade_block_threshold": 0.5,
-        }
-        mocker.patch("app.release_qualifier._load_policy", return_value=_armed_policy)
-
-        _clean_audit_logs = {
-            "audit_score": 1.0,
-            "test_erosion": {
-                "deleted_test_files": [],
-                "assertion_delta": 0,
-                "test_count_delta": 0,
-            },
-        }
-        _clean_smoke_logs = {
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        }
-
-        project, version = await _make_project_and_version(db_session)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        await _seed_qualification_children(
-            db_session,
-            project,
-            version,
-            audit_logs=_clean_audit_logs,
-            smoke_logs=_clean_smoke_logs,
-        )
-
-        from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
-        from sqlalchemy.orm.attributes import flag_modified
-
-        lq = dict(version.last_qualification or {})
-        lq[BLIND_MERGE_GRADE_KEY] = {
-            "candidate_sha": "feed" * 10,
-            "coverage_verdict": "covers",
-            "biggest_gap": "weakest aspect: test coverage",
-            "model": "test-model",
-            "pr_count": 1,
-            "graded_at": "2026-06-20T00:00:00",
-        }
-        version.last_qualification = lq
-        flag_modified(version, "last_qualification")
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        mocker.patch(
-            "app.release_qualifier._fetch_version_theme_evidence",
-            new=AsyncMock(return_value=None),
-        )
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        assert result.get("blocker") != "merge_grade_misses", (
-            f"covers verdict must not trigger merge_grade_misses blocker; "
-            f"got blocker={result.get('blocker')!r}"
-        )
 
 
 @pytest.mark.asyncio
