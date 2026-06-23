@@ -423,8 +423,14 @@ export async function runThinkerWithGate(
     }
   }
 
+  // Command-mode signal: thinker applied state via ./strategic commands rather
+  // than writing inline JSON. Skip repair to avoid false-positive format misses
+  // under the 'thinker' schema label. The filesPresent() check below still runs
+  // and fires the focused retry if the handoff files were not written to disk.
+  const isCommandMode = thinkerResult.allOutput.includes('./strategic ');
+
   let problemModelRepair: RepairStructuredOutputResult<Record<string, unknown>> | null = null;
-  if (!problemModelParseable) {
+  if (!problemModelParseable && !isCommandMode) {
     // Embed the thinker's prior analysis in the repair prompt so the fresh
     // session can extract the real problem_model JSON rather than echoing
     // schema-template placeholders (incident: a repair with no prior context
