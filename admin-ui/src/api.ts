@@ -218,6 +218,7 @@ export interface ComputeExperimentLaunchRequest {
   success_criterion?: ComputeSuccessCriterion;
   require_live_release?: boolean;
   require_durable_artifact?: boolean;
+  provisioning_model?: string;
   model?: string;
   effort?: string;
 }

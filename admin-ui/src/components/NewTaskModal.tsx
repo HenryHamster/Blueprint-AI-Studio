@@ -376,6 +376,17 @@ export function NewTaskModal({
                   </div>
                 )}
               </div>
+              <div className="mb-3">
+                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Provisioning <span className="text-neutral-600 normal-case font-normal tracking-normal">(SPOT saves ~60–90% for preemption-tolerant workloads)</span></label>
+                <select
+                  value={computeExperiment.provisioningModel}
+                  onChange={e => updateCompute('provisioningModel', e.target.value as 'STANDARD' | 'SPOT')}
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                >
+                  <option value="STANDARD">STANDARD (on-demand)</option>
+                  <option value="SPOT">SPOT (preemptible, ~60–90% cheaper)</option>
+                </select>
+              </div>
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>
                   <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Spend Cap (USD)</label>

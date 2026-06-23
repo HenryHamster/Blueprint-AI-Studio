@@ -1545,9 +1545,20 @@ class ComputeExperimentTaskPayload(BaseModel):
     success_criterion: ComputeSuccessCriterion | None = None
     require_live_release: bool = False
     require_durable_artifact: bool = False
+    provisioning_model: str | None = None
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
+
+    @field_validator("provisioning_model")
+    @classmethod
+    def validate_provisioning_model(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        normalized = v.upper()
+        if normalized not in {"STANDARD", "SPOT"}:
+            raise ValueError("provisioning_model must be STANDARD or SPOT")
+        return normalized
 
     @field_validator("base_branch")
     @classmethod
@@ -2005,6 +2016,7 @@ async def create_compute_experiment_task(
         "benchmark",
         "hypothesis",
         "metric",
+        "provisioning_model",
     ):
         val = getattr(payload, opt_key)
         if val is not None:
@@ -2055,6 +2067,7 @@ async def create_compute_experiment_task(
                 "benchmark",
                 "hypothesis",
                 "metric",
+                "provisioning_model",
             )
             if launch_contract.get(k) is not None
         },

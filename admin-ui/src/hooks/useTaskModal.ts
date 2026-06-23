@@ -35,6 +35,7 @@ export interface ComputeExperimentForm {
   successThreshold: string;
   requireLiveRelease: boolean;
   requireDurableArtifact: boolean;
+  provisioningModel: 'STANDARD' | 'SPOT';
 }
 
 export const COMPUTE_ACCELERATOR_OPTIONS = [
@@ -64,6 +65,7 @@ export function defaultComputeExperimentForm(): ComputeExperimentForm {
     successThreshold: '',
     requireLiveRelease: false,
     requireDurableArtifact: false,
+    provisioningModel: 'STANDARD',
   };
 }
 
@@ -364,6 +366,9 @@ export function useTaskModal(
       ...(computeExperiment.requireLiveRelease ? { require_live_release: true } : {}),
       ...(computeExperiment.requireDurableArtifact
         ? { require_durable_artifact: true }
+        : {}),
+      ...(computeExperiment.provisioningModel !== 'STANDARD'
+        ? { provisioning_model: computeExperiment.provisioningModel }
         : {}),
       ...(newTaskModel ? { model: newTaskModel } : {}),
       ...(newTaskEffort ? { effort: newTaskEffort } : {}),
