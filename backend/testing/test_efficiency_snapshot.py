@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
+from testing.conftest import USE_POSTGRES
 
 from app.efficiency_snapshot import (
     ALL_AXES,
@@ -7514,6 +7515,7 @@ async def _self_repair_burn_share_alerts(db_session, project_id):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not USE_POSTGRES, reason="SQLite StaticPool reads stale state after DELETE in same session")
 async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
     """Alert fires when self_repair_burn_share exceeds threshold.
 
