@@ -2928,6 +2928,11 @@ export interface ComputeJob {
   // Durable KnowledgeDocument auto-persisted on task completion for all
   // measured terminal jobs. Surfaced from task.plan_output.knowledge_document.id.
   knowledge_document_id?: string | null;
+  // Compute experiment identity fields from the task launch payload.
+  // Absent on legacy rows or non-compute-experiment tasks.
+  experiment?: string | null;
+  benchmark?: string | null;
+  hypothesis?: string | null;
 }
 
 export async function fetchComputeJobs(

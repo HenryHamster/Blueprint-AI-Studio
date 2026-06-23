@@ -19,6 +19,88 @@ import {
 
 const POLL_INTERVAL_MS = 10_000;
 
+function groupJobsByExperiment(jobs: ComputeJob[]): Map<string, ComputeJob[]> {
+  const groups = new Map<string, ComputeJob[]>();
+  for (const job of jobs) {
+    if (isComputeJobActive(job)) continue;
+    const key = job.experiment ?? job.benchmark;
+    if (!key) continue;
+    const group = groups.get(key) ?? [];
+    group.push(job);
+    groups.set(key, group);
+  }
+  return groups;
+}
+
+function bestRunId(group: ComputeJob[]): string | null {
+  const measurable = group.filter((j) => j.criterion_verdict?.value != null);
+  if (measurable.length === 0) return null;
+  const op = measurable[0].criterion_verdict?.operator ?? '>=';
+  const higherBetter = op === '>=' || op === '>';
+  return measurable.reduce((best, job) => {
+    const bv = best.criterion_verdict!.value!;
+    const jv = job.criterion_verdict!.value!;
+    return higherBetter ? (jv > bv ? job : best) : (jv < bv ? job : best);
+  }, measurable[0]).id;
+}
+
+function ExperimentSweepSummary({ jobs }: { jobs: ComputeJob[] }) {
+  const groups = groupJobsByExperiment(jobs);
+  const multiRun = [...groups.entries()].filter(([, g]) => g.length >= 2);
+  if (multiRun.length === 0) return null;
+  return (
+    <div className="mb-3 flex flex-col gap-2">
+      {multiRun.map(([expName, group]) => {
+        const metCount = group.filter((j) => j.criterion_verdict?.met).length;
+        const best = bestRunId(group);
+        return (
+          <div
+            key={expName}
+            className="rounded-lg border border-violet-500/20 bg-violet-500/5 px-3 py-2"
+            data-testid="experiment-sweep-summary"
+          >
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <span className="text-ui-sm font-semibold text-violet-300 break-words">{expName}</span>
+              <span className="shrink-0 text-ui-sm text-neutral-400 font-mono" data-testid="sweep-criterion-count">
+                {metCount}/{group.length} met criterion
+              </span>
+            </div>
+            <div className="flex flex-col gap-0.5">
+              {group.map((job) => {
+                const isBest = job.id === best;
+                const verdict = job.criterion_verdict;
+                return (
+                  <div
+                    key={job.id}
+                    className={`flex items-center gap-2 text-ui-sm font-mono ${isBest ? 'text-emerald-300' : 'text-neutral-400'}`}
+                    data-testid={isBest ? 'sweep-best-run' : 'sweep-run-row'}
+                  >
+                    <span className="min-w-0 flex-1 truncate">{job.task_title ?? job.id}</span>
+                    {verdict?.value != null && (
+                      <span className={isBest ? 'font-semibold' : ''}>{verdict.value}</span>
+                    )}
+                    {verdict ? (
+                      verdict.met ? (
+                        <span className="shrink-0 rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-ui-xs text-emerald-300">
+                          met
+                        </span>
+                      ) : (
+                        <span className="shrink-0 rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-ui-xs text-red-300">
+                          unmet
+                        </span>
+                      )
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function statusBadgeClass(job: ComputeJob): string {
   if (isComputeJobActive(job)) return 'bg-sky-500/20 text-sky-200 border-sky-500/30';
   if (job.outcome === 'SUCCESS') return 'bg-emerald-500/20 text-emerald-200 border-emerald-500/30';
@@ -197,6 +279,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           </div>
         </div>
       )}
+
+      <ExperimentSweepSummary jobs={jobs} />
 
       <div className="flex flex-col gap-2">
         {jobs.map((job) => {
@@ -499,6 +583,30 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <span className="text-neutral-500">{k}:</span> {String(v)}
                       </span>
                     ))}
+                  </div>
+                );
+              })()}
+              {(() => {
+                if (active) return null;
+                const { experiment, benchmark, hypothesis } = job;
+                if (!experiment && !benchmark && !hypothesis) return null;
+                return (
+                  <div
+                    className="mt-1.5 flex flex-col gap-0.5 text-ui-sm font-mono"
+                    data-testid="compute-experiment-identity"
+                  >
+                    {(experiment || benchmark) && (
+                      <div className="flex items-start gap-1.5">
+                        <span className="text-neutral-500 shrink-0">{experiment ? 'Experiment' : 'Benchmark'}</span>
+                        <span className="text-neutral-300 break-words">{experiment ?? benchmark}</span>
+                      </div>
+                    )}
+                    {hypothesis && (
+                      <div className="flex items-start gap-1.5">
+                        <span className="text-neutral-500 shrink-0">Hypothesis</span>
+                        <span className="text-neutral-300 break-words">{hypothesis}</span>
+                      </div>
+                    )}
                   </div>
                 );
               })()}

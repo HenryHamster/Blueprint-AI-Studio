@@ -146,13 +146,18 @@ export function ComposeDrawer({
         <div className="px-4 py-2 flex flex-col gap-1.5 overflow-y-auto shrink-0 border-b border-neutral-800/60">
           <span className="text-ui-sm text-neutral-500 uppercase tracking-wide font-medium">Recent</span>
           {recentMessages.map(msg => (
-            <div key={msg.id} className="flex items-start gap-2">
+            <button
+              key={msg.id}
+              type="button"
+              onClick={() => { setNewType(msg.message_type); setNewContent(msg.content); }}
+              className="flex items-start gap-2 w-full text-left hover:bg-neutral-800/50 rounded px-1 py-0.5 transition-colors min-h-[44px]"
+            >
               <span className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 font-medium shrink-0 uppercase">{msg.message_type}</span>
               <span className="text-xs text-neutral-300 truncate flex-1">{msg.content}</span>
               {msg.created_at && (
                 <span className="text-ui-sm text-neutral-600 shrink-0">{timeAgo(msg.created_at)}</span>
               )}
-            </div>
+            </button>
           ))}
         </div>
       )}

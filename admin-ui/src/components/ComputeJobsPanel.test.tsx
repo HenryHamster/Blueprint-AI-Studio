@@ -738,6 +738,162 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-durable-1');
   });
 
+  test('terminal job with hypothesis and experiment shows experiment identity block', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        experiment: 'sweep-v3',
+        hypothesis: 'Increasing learning rate to 0.01 will improve accuracy by 5%.',
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-experiment-identity');
+    expect(block.textContent).toContain('sweep-v3');
+    expect(block.textContent).toContain('Increasing learning rate to 0.01');
+  });
+
+  test('terminal job with benchmark (no experiment) shows Benchmark label', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'FAILED',
+        outcome: 'FAILURE',
+        final_cost_usd: 0.5,
+        benchmark: 'mlperf-v4',
+        hypothesis: null,
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-experiment-identity');
+    expect(block.textContent).toContain('Benchmark');
+    expect(block.textContent).toContain('mlperf-v4');
+  });
+
+  test('active job does not show experiment identity block even when fields present', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({ experiment: 'sweep-v3', hypothesis: 'some hypothesis' }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-experiment-identity')).toBeNull();
+  });
+
+  test('terminal job without experiment/benchmark/hypothesis shows no identity block', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-experiment-identity')).toBeNull();
+  });
+
+  test('groups terminal jobs sharing an experiment identity into a sweep summary with best run highlighted and criterion count', async () => {
+    const run1 = makeJob({
+      id: 'job-run1',
+      task_title: 'sweep run 1',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'lr-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.85, met: false, measurable: true },
+    });
+    const run2 = makeJob({
+      id: 'job-run2',
+      task_title: 'sweep run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'lr-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.93, met: true, measurable: true },
+    });
+    const run3 = makeJob({
+      id: 'job-run3',
+      task_title: 'sweep run 3',
+      status: 'FAILED',
+      outcome: 'FAILURE',
+      final_cost_usd: 0.5,
+      experiment: 'lr-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.91, met: true, measurable: true },
+    });
+    fetchComputeJobs.mockResolvedValue([run1, run2, run3]);
+    const { findByTestId, getAllByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Sweep summary section appears
+    await findByTestId('experiment-sweep-summary');
+    // 2/3 met criterion
+    expect(getByTestId('sweep-criterion-count').textContent).toBe('2/3 met criterion');
+    // Best run (highest accuracy = 0.93 = run2) is highlighted
+    const bestRow = getByTestId('sweep-best-run');
+    expect(bestRow.textContent).toContain('sweep run 2');
+    expect(bestRow.textContent).toContain('0.93');
+    // Other runs appear as non-best rows
+    const otherRows = getAllByTestId('sweep-run-row');
+    expect(otherRows).toHaveLength(2);
+  });
+
+  test('sweep summary shows lower-is-better best run when operator is <=', async () => {
+    const run1 = makeJob({
+      id: 'job-lat1',
+      task_title: 'latency run 1',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'latency-sweep',
+      criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 95, met: true, measurable: true },
+    });
+    const run2 = makeJob({
+      id: 'job-lat2',
+      task_title: 'latency run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'latency-sweep',
+      criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 80, met: true, measurable: true },
+    });
+    fetchComputeJobs.mockResolvedValue([run1, run2]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('experiment-sweep-summary');
+    // Best run for latency (lower is better) should be run2 with 80ms
+    const bestRow = await findByTestId('sweep-best-run');
+    expect(bestRow.textContent).toContain('latency run 2');
+    expect(bestRow.textContent).toContain('80');
+  });
+
+  test('single terminal job with experiment does not show sweep summary', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        experiment: 'lone-sweep',
+        criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.91, met: true, measurable: true },
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('experiment-sweep-summary')).toBeNull();
+  });
+
+  test('active jobs are excluded from sweep summary groups', async () => {
+    const activeJob = makeJob({ experiment: 'active-sweep', status: 'RUNNING', outcome: null });
+    const terminalJob = makeJob({
+      id: 'job-terminal',
+      experiment: 'active-sweep',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+    });
+    fetchComputeJobs.mockResolvedValue([activeJob, terminalJob]);
+    const { findAllByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const titles = await findAllByText('compute_experiment: sweep');
+    expect(titles.length).toBeGreaterThanOrEqual(1);
+    // Only one terminal job in the group — no summary shown
+    expect(queryByTestId('experiment-sweep-summary')).toBeNull();
+  });
+
   test('run analysis without knowledge_document_id still shows feedback without crashing', async () => {
     const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
     fetchComputeJobs.mockResolvedValue([terminal]);

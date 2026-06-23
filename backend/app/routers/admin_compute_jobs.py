@@ -18,11 +18,18 @@ from sqlmodel import select
 
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
-from app.compute_jobs import build_compute_result_logs, kill_compute_job, list_compute_jobs
+from app.compute_jobs import (
+    build_compute_result_logs,
+    kill_compute_job,
+    list_compute_jobs,
+)
 from app.database import get_session
 from app.models import Artifact, ComputeJob, ComputeJobStatus, Task
 from app.schemas import serialize_compute_job_response_safe
-from app.task_evaluators import _declared_success_criterion, evaluate_compute_success_criterion
+from app.task_evaluators import (
+    _declared_success_criterion,
+    evaluate_compute_success_criterion,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +101,13 @@ async def _build_compute_job_payload(
             verdict = compute_result.get("criterion")
             if not isinstance(verdict, dict):
                 verdict = None
-            task_meta[task.id] = (task.title, task_type, success_criterion, verdict, task)
+            task_meta[task.id] = (
+                task.title,
+                task_type,
+                success_criterion,
+                verdict,
+                task,
+            )
 
     # Batch-load linked artifacts to avoid an N+1 query across the listed jobs.
     artifact_ids = {job.artifact_id for job in jobs if job.artifact_id is not None}
@@ -114,8 +127,8 @@ async def _build_compute_job_payload(
     payload: list[Dict[str, Any]] = []
     for job in jobs:
         data = serialize_compute_job_response_safe(job)
-        title, task_type, success_criterion, criterion_verdict, task_obj = task_meta.get(
-            job.task_id, (None, None, None, None, None)
+        title, task_type, success_criterion, criterion_verdict, task_obj = (
+            task_meta.get(job.task_id, (None, None, None, None, None))
         )
         # For terminal jobs whose task hasn't been finalized yet (plan_output
         # does not carry compute_result.criterion), compute the verdict directly
@@ -127,7 +140,9 @@ async def _build_compute_job_payload(
             and task_obj is not None
         ):
             artifact_text = build_compute_result_logs(job)
-            criterion_verdict = evaluate_compute_success_criterion(task_obj, artifact_text)
+            criterion_verdict = evaluate_compute_success_criterion(
+                task_obj, artifact_text
+            )
         # Derive knowledge_document_id from the task's plan_output.
         knowledge_document_id: str | None = None
         if task_obj is not None:
@@ -135,12 +150,28 @@ async def _build_compute_job_payload(
             raw_kdoc_id = (
                 knowledge_doc.get("id") if isinstance(knowledge_doc, dict) else None
             )
-            knowledge_document_id = str(raw_kdoc_id) if raw_kdoc_id is not None else None
+            knowledge_document_id = (
+                str(raw_kdoc_id) if raw_kdoc_id is not None else None
+            )
+        experiment: str | None = None
+        benchmark: str | None = None
+        hypothesis: str | None = None
+        if task_obj is not None:
+            fp = task_obj.first_payload
+            raw_experiment = fp.get("experiment")
+            raw_benchmark = fp.get("benchmark")
+            raw_hypothesis = fp.get("hypothesis")
+            experiment = str(raw_experiment) if raw_experiment else None
+            benchmark = str(raw_benchmark) if raw_benchmark else None
+            hypothesis = str(raw_hypothesis) if raw_hypothesis else None
         data["task_title"] = title
         data["task_type"] = task_type
         data["success_criterion"] = success_criterion
         data["criterion_verdict"] = criterion_verdict
         data["knowledge_document_id"] = knowledge_document_id
+        data["experiment"] = experiment
+        data["benchmark"] = benchmark
+        data["hypothesis"] = hypothesis
         linked_artifact = artifacts.get(job.artifact_id) if job.artifact_id else None
         data["artifact"] = (
             _artifact_descriptor(linked_artifact) if linked_artifact else None
