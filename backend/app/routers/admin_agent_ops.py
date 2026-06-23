@@ -1875,6 +1875,24 @@ async def strategic_operation(
         msg.resolved_at = _utcnow()
         session.add(msg)
         await session.commit()
+        if msg.message_type == MessageType.QUESTION:
+            try:
+                from app.notification_dispatch import post_question_answer as _post_qa
+
+                await _post_qa(
+                    session,
+                    project.id,
+                    msg.id,
+                    msg.resolution or "Addressed by strategic review",
+                    task.id,
+                )
+                await session.commit()
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "post_question_answer failed for message %s", msg.id, exc_info=True
+                )
         return _resp(
             {"status": "ok", "op": "resolve_message", "message_id": str(msg.id)}
         )

@@ -2391,3 +2391,58 @@ async def test_fetch_efficiency_snapshot_rejects_cross_project(
         headers={"x-agent-token": token},
     )
     assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_strategic_resolve_question_posts_answer_note(
+    client: AsyncClient, db_session
+):
+    """resolve_message on a QUESTION-type message posts a question_answer NOTE."""
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="What is the current approach?",
+        status="open",
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "resolve_message",
+            "data": {
+                "message_id": str(msg.id),
+                "resolution": "We use an iterative approach with weekly cycles.",
+            },
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "ok"
+
+    from sqlalchemy import select
+    from app.models import ProjectMessage
+
+    notes = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.message_type == MessageType.NOTE,
+                ProjectMessage.from_type == "strategic",
+            )
+        )
+    ).scalars().all()
+    matching = [
+        n
+        for n in notes
+        if isinstance(n.context, dict)
+        and n.context.get("event_type") == "question_answer"
+        and n.context.get("reply_to") == str(msg.id)
+    ]
+    assert len(matching) == 1, f"Expected 1 question_answer NOTE, got {len(matching)}"
