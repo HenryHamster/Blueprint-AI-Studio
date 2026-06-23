@@ -1742,8 +1742,10 @@ let firstToolUseAt: number | null = null; // @per-role
 // pollForNextRole on a warm VM, false on the initial cold-start role.
 let isWarmStart = false; // @per-role
 
-// True when the agent is running in Cloud Run Job mode (CLOUD_RUN_JOB=1).
-// Set at startup from the env var injected by compute_cloud_run.py.
+// True when the agent is running in Cloud Run Job mode. Cloud Run *automatically*
+// sets CLOUD_RUN_JOB to the job name on every job execution (it is a reserved env
+// name the backend cannot inject), so presence — not a specific value — is the
+// signal. Set at startup; never set on the GCE VM path.
 let isJobMode = false;
 
 export function recordToolUse(toolName: string, input: unknown): void {
@@ -3095,9 +3097,10 @@ export async function main() {
   startEventLoopLagMonitor();
   installExitMarkers();
 
-  // Detect Cloud Run Job execution mode from the CLOUD_RUN_JOB sentinel
-  // injected by compute_cloud_run.py. Used for job-mode behavioral branching.
-  isJobMode = process.env.CLOUD_RUN_JOB === '1';
+  // Detect Cloud Run Job execution mode from the platform-set CLOUD_RUN_JOB env
+  // var (Cloud Run auto-sets it to the job name on job executions; it is reserved
+  // and cannot be injected). Presence — not a specific value — is the signal.
+  isJobMode = !!process.env.CLOUD_RUN_JOB;
 
   log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
   log(`Registered handlers (${Object.keys(handlers).length}): ${Object.keys(handlers).join(', ')}`);
@@ -3156,8 +3159,9 @@ export async function main() {
   const PRE_CLAIM_TASK_ID = process.env.TASK_ID || '';
   const poolMode = process.env.BLUEPRINT_POOL_MODE === '1';
   // Cloud Run Job containers run exactly one task per execution — no warm
-  // continuity poll, no heartbeat idle window between roles.
-  const jobMode = process.env.CLOUD_RUN_JOB === '1';
+  // continuity poll, no heartbeat idle window between roles. Cloud Run auto-sets
+  // CLOUD_RUN_JOB (reserved) to the job name, so presence is the signal.
+  const jobMode = !!process.env.CLOUD_RUN_JOB;
 
   // Report a pre-claim failure via the existing heartbeat endpoint. The backend's
   // /api/agent/heartbeat accepts PROVISIONING-status tasks, so this turns silent

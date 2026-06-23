@@ -151,7 +151,12 @@ async def launch_agent_cloud_run_job(
         {"name": "VM_INSTANCE_ID", "value": str(vm_id)},
         {"name": "TASK_ID", "value": str(task_id)},
         {"name": "ORCHESTRATOR_URL", "value": _orch_url},
-        {"name": "CLOUD_RUN_JOB", "value": "1"},
+        # Do NOT set CLOUD_RUN_JOB here: it is a Cloud Run *reserved* env name
+        # that the platform auto-populates (with the job name) on every job
+        # execution. Providing it in container_overrides makes run_job fail with
+        # 400 "reserved env names were provided: CLOUD_RUN_JOB". The agent
+        # detects job mode from the platform-set CLOUD_RUN_JOB's presence
+        # (see agent/src/index.ts), so no injection is needed.
     ]
     if payload_uri:
         env_overrides.append({"name": "PAYLOAD_URI", "value": payload_uri})
