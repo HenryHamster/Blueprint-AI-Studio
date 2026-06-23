@@ -6198,7 +6198,7 @@ async def test_pipeline_dedup_cancels_when_sibling_already_running(db_session, m
     broadcast_mock.assert_awaited_once()
     # Cancelled candidate must carry an infra failure_category so rollup parents
     # don't get upgraded to CODE_ERROR by worst_child_failure_category.
-    assert (candidate.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+    assert (candidate.context or {}).get("failure_category") == "ADMIN_CANCEL"
     # Sibling must not be touched.
     await db_session.refresh(running)
     assert running.status == TaskStatus.IN_PROGRESS
@@ -6304,7 +6304,7 @@ async def test_pipeline_dedup_keeps_oldest_queued_cancels_newer(db_session, mock
     assert newer.id not in result, "Newer duplicate must be filtered"
     await db_session.refresh(newer)
     assert newer.status == TaskStatus.CANCELLED
-    assert (newer.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+    assert (newer.context or {}).get("failure_category") == "ADMIN_CANCEL"
 
 
 @pytest.mark.asyncio
@@ -6465,7 +6465,7 @@ async def test_spawn_pipeline_supersedes_stale_task_with_agent_timeout(
 ):
     """A review/fix candidate older than PIPELINE_TASK_STALE_MINUTES with no
     heartbeat is superseded: status flips to CANCELLED and failure_category
-    must be AGENT_TIMEOUT so rollup parents don't treat it as a code defect."""
+    must be ADMIN_CANCEL so rollup parents don't treat it as a code defect."""
     from datetime import timedelta
     from app.review_pipeline import PIPELINE_TASK_STALE_MINUTES, _utcnow
 
@@ -6542,7 +6542,7 @@ async def test_spawn_pipeline_supersedes_stale_task_with_agent_timeout(
     await db_session.refresh(stale_review)
     assert stale_review.status == TaskStatus.CANCELLED
     assert "Superseded" in (stale_review.latest_status_message or "")
-    assert (stale_review.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+    assert (stale_review.context or {}).get("failure_category") == "ADMIN_CANCEL"
 
 
 @pytest.mark.asyncio
@@ -6718,7 +6718,7 @@ async def test_spawn_fix_cancels_in_flight_review_with_agent_timeout(
     await db_session.refresh(in_flight_review)
     assert in_flight_review.status == TaskStatus.CANCELLED
     assert "Superseded by fix" in (in_flight_review.latest_status_message or "")
-    assert (in_flight_review.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+    assert (in_flight_review.context or {}).get("failure_category") == "ADMIN_CANCEL"
 
 
 @pytest.mark.asyncio

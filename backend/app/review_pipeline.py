@@ -1399,8 +1399,8 @@ def task_counts_toward_review_cap(task: Task) -> bool:
         mirroring the manual iteration-cap reset path;
       * it is FAILED/CANCELLED with an infra-class ``failure_category`` — it
         never actually ran a review (provisioning / rate limit / agent timeout
-        / external API / supersede-cancel), so counting it would trip the cap
-        with zero real reviews on the PR; or
+        / external API / admin-cancel supersede), so counting it would trip the
+        cap with zero real reviews on the PR; or
       * it is a stale-head discard (``_review_stale_head``) — a review that ran
         against an older head than the live PR head, discarded and respawned;
         counting it would penalise the chain for a verdict it couldn't act on.
@@ -2056,7 +2056,9 @@ async def _spawn_pipeline_task(
             superseded_stale_task = True
             # Collect VM for deletion after commit
             if t.vm_instance_id:
-                vms_to_delete.append((t.vm_instance_id, "superseded_fix_replaces_review"))
+                vms_to_delete.append(
+                    (t.vm_instance_id, "superseded_fix_replaces_review")
+                )
             supersede_churn_last_snapshot = t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY]
             if orig_task is not None:
                 orig_ctx = dict(orig_task.context or {})
@@ -2206,7 +2208,9 @@ async def _spawn_pipeline_task(
             session.add(_inflight)
             # Collect VM for deletion after commit
             if _inflight.vm_instance_id:
-                vms_to_delete.append((_inflight.vm_instance_id, "cancelled_by_churn_halt"))
+                vms_to_delete.append(
+                    (_inflight.vm_instance_id, "cancelled_by_churn_halt")
+                )
             logger.info(
                 f"[PIPELINE] Cancelled in-flight {_inflight_type} task {_inflight.id} "
                 f"for PR #{pr_number} (churn halt)"
@@ -4087,8 +4091,6 @@ async def _spawn_pipeline_task(
 
     # Delete VMs for all superseded/churn-halted tasks after successful spawn
     for vm_id, reason in vms_to_delete:
-        await vm_lifecycle._ensure_vm_deleted(
-            vm_id, reason=f"review_pipeline_{reason}"
-        )
+        await vm_lifecycle._ensure_vm_deleted(vm_id, reason=f"review_pipeline_{reason}")
 
     return (new_task, True)
