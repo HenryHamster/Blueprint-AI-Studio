@@ -2803,6 +2803,11 @@ export interface ComputeJobCommandLog {
   byte_count: number;
 }
 
+export interface ComputeJobLiveOutput {
+  text: string;
+  truncated: boolean;
+}
+
 export interface ComputeJob {
   id: string;
   project_id: string;
@@ -2867,6 +2872,9 @@ export interface ComputeJob {
     met: boolean;
     measurable: boolean;
   } | null;
+  // Durable KnowledgeDocument auto-persisted on task completion for all
+  // measured terminal jobs. Surfaced from task.plan_output.knowledge_document.id.
+  knowledge_document_id?: string | null;
 }
 
 export async function fetchComputeJobs(

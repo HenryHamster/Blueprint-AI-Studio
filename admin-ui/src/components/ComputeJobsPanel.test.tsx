@@ -557,6 +557,39 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('compute-command-log')).toBeNull();
   });
 
+  test('shows live output tail when job is running', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'RUNNING',
+        polling_metadata: { live_output: { text: 'line1\nline2\n', truncated: false } },
+      }),
+    ]);
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-live-output');
+    expect(block.textContent).toContain('line1');
+    // While the job is still active, the terminal command-log block is absent.
+    expect(queryByTestId('compute-command-log')).toBeNull();
+  });
+
+  test('live output hidden when job is terminal and command_log shown', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        polling_metadata: {
+          live_output: { text: 'line1\nline2\n', truncated: false },
+          command_log: { text: 'line1\nline2\ndone', truncated: false, byte_count: 16 },
+        },
+      }),
+    ]);
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const log = await findByTestId('compute-command-log');
+    expect(log.textContent).toContain('done');
+    // Once terminal, the live-output section disappears.
+    expect(queryByTestId('compute-live-output')).toBeNull();
+  });
+
   test('terminal job with exit_code in polling_metadata shows exit code chip', async () => {
     fetchComputeJobs.mockResolvedValue([
       makeJob({
@@ -677,6 +710,32 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(docBlock.textContent).toContain('Sweep result: 87.3% accuracy');
     expect(docBlock.textContent).toContain('87.3% accuracy at epoch 50');
     expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-xyz');
+  });
+
+  test('renders knowledge document link for terminal experiment', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      knowledge_document_id: 'doc-durable-1',
+    });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchKnowledgeDocument.mockResolvedValue({
+      id: 'doc-durable-1',
+      title: 'Experiment: sweep accuracy 91.2%',
+      summary: 'Achieved 91.2% accuracy at epoch 40.',
+      tags: [],
+      source_citations: [],
+      source_task_id: 'task-1',
+      created_at: null,
+      updated_at: null,
+      forward_quality_verdict: null,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-knowledge-doc-link');
+    expect(block.textContent).toContain('Experiment: sweep accuracy 91.2%');
+    expect(block.textContent).toContain('Achieved 91.2% accuracy at epoch 40.');
+    expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-durable-1');
   });
 
   test('run analysis without knowledge_document_id still shows feedback without crashing', async () => {

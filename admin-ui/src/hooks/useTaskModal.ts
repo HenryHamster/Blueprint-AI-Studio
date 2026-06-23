@@ -535,10 +535,14 @@ export function useTaskModal(
     const branch = (payload.base_branch as string) || '';
     const model = (payload.model as string) || '';
     const effort = (payload.effort as string) || '';
-    const taskType: UserLaunchableTaskType =
-      task.task_type && launchableTaskTypeIds.includes(task.task_type)
-        ? (task.task_type as UserLaunchableTaskType)
-        : 'create';
+    // compute_experiment is operator_contract_launchable but not in USER_LAUNCHABLE_TASK_TYPE_IDS,
+    // so check for it explicitly. Otherwise use launchableTaskTypeIds.
+    const taskType: UserLaunchableTaskType | 'compute_experiment' =
+      (task.task_type as string) === COMPUTE_EXPERIMENT_TASK_TYPE
+        ? COMPUTE_EXPERIMENT_TASK_TYPE
+        : task.task_type && launchableTaskTypeIds.includes(task.task_type)
+          ? (task.task_type as UserLaunchableTaskType)
+          : 'create';
 
     setModalOpener('duplicate');
     setShowNewTaskModal(true);
@@ -555,6 +559,45 @@ export function useTaskModal(
     setUseManualBranch(false);
     setBranchOptions([]);
     setBranchError(null);
+
+    // For compute_experiment tasks, prefill the compute experiment form from the payload.
+    if ((task.task_type as string) === COMPUTE_EXPERIMENT_TASK_TYPE) {
+      setComputeExperiment({
+        command: (payload.command as string) || '',
+        cwd: (payload.cwd as string) || '',
+        envVars: (() => {
+          const env = payload.env as Record<string, string> | undefined;
+          if (!env) return '';
+          return Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\n');
+        })(),
+        accelerator: (payload.accelerator as string) || '',
+        machineType: (payload.machine_type as string) || '',
+        spendCapUsd: String(payload.spend_cap_usd ?? ''),
+        deadlineSeconds: String(payload.deadline_seconds ?? ''),
+        experiment: (payload.experiment as string) || '',
+        benchmark: (payload.benchmark as string) || '',
+        hypothesis: (payload.hypothesis as string) || '',
+        metric: (payload.metric as string) || '',
+        successMetric: (() => {
+          const sc = payload.success_criterion as { metric: string; operator: string; threshold: number } | undefined;
+          return sc?.metric || '';
+        })(),
+        successOperator: (() => {
+          const sc = payload.success_criterion as { metric: string; operator: ComputeSuccessOperator; threshold: number } | undefined;
+          return (sc?.operator as ComputeSuccessOperator) || '>=';
+        })(),
+        successThreshold: (() => {
+          const sc = payload.success_criterion as { metric: string; operator: string; threshold: number } | undefined;
+          return sc ? String(sc.threshold) : '';
+        })(),
+        requireLiveRelease: (payload.require_live_release as boolean) || false,
+        requireDurableArtifact: (payload.require_durable_artifact as boolean) || false,
+        provisioningModel: ((payload.provisioning_model as 'STANDARD' | 'SPOT') || 'STANDARD'),
+      });
+    } else {
+      setComputeExperiment(defaultComputeExperimentForm());
+    }
+
     fetchRepoOptions();
     fetchLaunchableTaskTypeOptions();
     if (repo) fetchBranchOptions(repo);

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobs, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, fetchComputeJobs, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -35,9 +35,10 @@ interface ComputeJobsPanelProps {
   projectId: string | null;
   onNavigateToTask?: (taskId: string) => void;
   onLaunchCompute?: () => void;
+  onDuplicateTask?: (taskId: string) => Promise<void>;
 }
 
-export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute }: ComputeJobsPanelProps) {
+export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onDuplicateTask }: ComputeJobsPanelProps) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -45,6 +46,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
   const [analysisDocs, setAnalysisDocs] = useState<Record<string, KnowledgeDocument>>({});
+  const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   const load = useCallback(
@@ -69,6 +71,18 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
     enabled: !!projectId,
     deps: [projectId],
   });
+
+  // Auto-fetch durable knowledge docs for terminal jobs that have a knowledge_document_id.
+  useEffect(() => {
+    if (!projectId) return;
+    for (const job of jobs) {
+      const docId = job.knowledge_document_id;
+      if (!docId || isComputeJobActive(job) || knowledgeDocs[job.id]) continue;
+      fetchKnowledgeDocument(projectId, docId).then((doc) => {
+        setKnowledgeDocs((prev) => ({ ...prev, [job.id]: doc }));
+      }).catch(() => {/* non-fatal */});
+    }
+  }, [jobs, projectId, knowledgeDocs]);
 
   // Local 1s clock drives the live deadline countdowns between polls.
   const hasActive = jobs.some(isComputeJobActive);
@@ -298,15 +312,27 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   {!active && (
-                    <button
-                      onClick={() => void handleAnalyze(job)}
-                      disabled={analyzingId === job.id}
-                      className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-violet-500/20 text-violet-200 hover:bg-violet-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
-                      title="Run analysis for this terminal compute job"
-                    >
-                      <Cpu className="w-3 h-3" />
-                      {analyzingId === job.id ? 'Analyzing…' : 'Run analysis'}
-                    </button>
+                    <>
+                      <button
+                        onClick={() => void handleAnalyze(job)}
+                        disabled={analyzingId === job.id}
+                        className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-violet-500/20 text-violet-200 hover:bg-violet-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
+                        title="Run analysis for this terminal compute job"
+                      >
+                        <Cpu className="w-3 h-3" />
+                        {analyzingId === job.id ? 'Analyzing…' : 'Run analysis'}
+                      </button>
+                      {onDuplicateTask && (
+                        <button
+                          onClick={() => job.task_id && void onDuplicateTask(job.task_id)}
+                          className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-sky-500/20 text-sky-200 hover:bg-sky-500/30 text-[11px] font-semibold px-3 transition-colors"
+                          title="Re-run this experiment with the same configuration"
+                        >
+                          <Cpu className="w-3 h-3" />
+                          Re-run
+                        </button>
+                      )}
+                    </>
                   )}
                   {active && (
                     <button
@@ -361,6 +387,26 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                             {typeof deadlineSec === 'number' && provModel ? ' · ' : ''}
                             {provModel ? `provisioning model ${provModel}` : ''}
                           </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+              {(() => {
+                const doc = knowledgeDocs[job.id];
+                if (!doc) return null;
+                return (
+                  <div
+                    className="mt-1.5 rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1.5 text-[10px]"
+                    data-testid="compute-knowledge-doc-link"
+                  >
+                    <div className="flex items-start gap-1.5">
+                      <FileText className="w-3 h-3 shrink-0 mt-0.5 text-sky-300" />
+                      <div className="min-w-0">
+                        <div className="font-semibold text-sky-200 break-words">{doc.title}</div>
+                        {doc.summary && (
+                          <div className="mt-0.5 text-sky-300/80 break-words whitespace-pre-wrap">{doc.summary}</div>
                         )}
                       </div>
                     </div>
@@ -501,6 +547,32 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                       </span>
                     )}
                     {chip}
+                  </div>
+                );
+              })()}
+              {(() => {
+                if (!active) return null;
+                const lo = job.polling_metadata?.live_output as ComputeJobLiveOutput | undefined | null;
+                if (!lo || typeof lo.text !== 'string' || !lo.text.trim()) return null;
+                const lines = lo.text.split('\n');
+                const displayLines = lines.length > 30 ? lines.slice(-30) : lines;
+                const clipped = lines.length > 30;
+                return (
+                  <div className="mt-1.5" data-testid="compute-live-output">
+                    <div className="flex items-center gap-1.5 mb-0.5 text-[10px] text-neutral-500 font-mono">
+                      <span>Live output</span>
+                      <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-[9px] text-neutral-500">
+                        updating…
+                      </span>
+                      {(lo.truncated || clipped) && (
+                        <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-[9px] text-neutral-400">
+                          truncated
+                        </span>
+                      )}
+                    </div>
+                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-[9px] text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
+                      {displayLines.join('\n')}
+                    </pre>
                   </div>
                 );
               })()}

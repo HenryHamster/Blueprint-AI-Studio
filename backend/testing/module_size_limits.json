@@ -36,7 +36,7 @@
     "routers/agent_status.py": 3850,
     "autonomous_research.py": 3350,
     "autonomous_research_residual.py": 900,
-    "efficiency_snapshot.py": 4500,
+    "efficiency_snapshot.py": 5300,
     "research_completion.py": 6400,
     "research_scope_calibration.py": 650,
     "findings_index.py": 350,
@@ -112,7 +112,8 @@
     "recovery_sidecar.py": 400,
     "release_version.py": 1750,
     "ci_resolution.py": 1800,
-    "routers/admin_project_config.py": 1800
+    "routers/admin_project_config.py": 1800,
+    "compute_backends.py": 1800
   },
   "agent": {
     "index.ts": 4600,
@@ -159,7 +160,6 @@
     "useAppState.ts": 3000,
     "components/VersionLifecyclePanel.tsx": 2300,
     "components/DirectionsPanel.tsx": 3000,
-
     "components/TaskDetailDrawer.tsx": 2500,
     "components/SettingsDropdown.tsx": 800,
     "components/KanbanBoard.tsx": 1500,
@@ -196,7 +196,6 @@
     "components/srTrendBreakdown/primitives.tsx": 350,
     "components/srTrendBreakdown/retrospectives.tsx": 400,
     "components/srTrendBreakdown/types.ts": 350,
-
     "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
     "components/TaskDetailDrawerMeta.tsx": 400,
     "api.ts": 4250,

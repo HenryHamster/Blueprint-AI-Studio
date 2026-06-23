@@ -1,5 +1,8 @@
 """Agent-facing compute-job launch and polling endpoints."""
 
+import base64
+import binascii
+import json
 import logging
 import uuid
 from typing import Any, Dict
@@ -17,11 +20,14 @@ from app.compute_jobs import (
 from app.database import get_session
 from app.models import ComputeJob, ComputeJobStatus, Task
 from app.routers.agent import verify_agent_token
-from app.schemas import serialize_compute_job_response
+from app.schemas import redact_command_log_text, serialize_compute_job_response
 from app.shared_state import limiter
 from app.task_capabilities import COMPUTE_JOB_LAUNCH_TASK_TYPES
 from app.time_utils import _utcnow
 from app.vm_cost_rates import resolve_compute_machine_type, supported_machine_types
+
+_LIVE_TAIL_MAX_DECODED_BYTES = 20480
+_LIVE_TAIL_MAX_TEXT_CHARS = 10240
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent"])
@@ -191,5 +197,45 @@ async def compute_job_vm_heartbeat(
         job.status = ComputeJobStatus.RUNNING
         if job.started_at is None:
             job.started_at = now
+    # Optional live output tail: the VM runner writes a base64 JSON tail every
+    # ~30 s and includes it in the heartbeat body. Parse and store it so the
+    # operator can see partial output while the job runs. All failures degrade
+    # gracefully — a malformed or missing body never causes a non-204 response.
+    live_output = _parse_live_output_tail(await request.body())
+    if live_output is not None:
+        meta = dict(job.polling_metadata or {})
+        meta["live_output"] = live_output
+        job.polling_metadata = meta
     await session.commit()
     return Response(status_code=204)
+
+
+def _parse_live_output_tail(body: bytes) -> dict[str, Any] | None:
+    """Decode a heartbeat body and extract a safe live_output dict, or None."""
+    if not body:
+        return None
+    try:
+        body_json = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    raw_tail = body_json.get("live_output_tail") if isinstance(body_json, dict) else None
+    if not isinstance(raw_tail, str) or not raw_tail:
+        return None
+    try:
+        decoded = base64.b64decode(raw_tail.encode("ascii"), validate=True)
+    except (binascii.Error, ValueError, UnicodeEncodeError):
+        return None
+    if len(decoded) > _LIVE_TAIL_MAX_DECODED_BYTES:
+        return None
+    try:
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    text = parsed.get("text")
+    truncated = parsed.get("truncated")
+    if not isinstance(text, str) or not isinstance(truncated, bool):
+        return None
+    text = redact_command_log_text(text[: _LIVE_TAIL_MAX_TEXT_CHARS])
+    return {"text": text, "truncated": truncated}

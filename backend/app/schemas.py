@@ -607,14 +607,19 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
         for key in _POLLING_METADATA_LAUNCH_SPEC_KEYS:
             metadata.pop(key, None)
 
-    # Redact credential-bearing patterns from command_log text so raw stdout/stderr
-    # captured on the VM never reaches operator-facing API responses.
+    # Redact credential-bearing patterns from command_log and live_output text so
+    # raw stdout/stderr captured on the VM never reaches operator-facing API responses.
     if isinstance(metadata, dict):
         command_log = metadata.get("command_log")
         if isinstance(command_log, dict) and isinstance(command_log.get("text"), str):
             command_log = dict(command_log)
             command_log["text"] = redact_command_log_text(command_log["text"])
             metadata["command_log"] = command_log
+        live_output = metadata.get("live_output")
+        if isinstance(live_output, dict) and isinstance(live_output.get("text"), str):
+            live_output = dict(live_output)
+            live_output["text"] = redact_command_log_text(live_output["text"])
+            metadata["live_output"] = live_output
 
     # Sanitize the promoted diagnostic — may carry raw provider exception text
     # with signed URLs or credential values.  Overwrite both the top-level

@@ -10988,3 +10988,179 @@ async def test_create_compute_job_allows_matching_hardware_policy(db_session):
 
     assert job.status == ComputeJobStatus.QUEUED
     assert job.machine_type == "e2-standard-2"
+
+
+# ---------------------------------------------------------------------------
+# Live output tail: heartbeat delivery and local backend reading
+# ---------------------------------------------------------------------------
+
+
+def _make_live_tail_b64(text: str, truncated: bool = False) -> str:
+    """Build the base64-encoded JSON payload the VM runner writes to live_tail.b64."""
+    payload = json.dumps({"text": text, "truncated": truncated}).encode("utf-8")
+    return base64.b64encode(payload).decode("ascii")
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_stores_live_output(
+    client, db_session, monkeypatch
+):
+    """Heartbeat with live_output_tail body stores decoded text in polling_metadata."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="Live Tail HB Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hello",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    tail_text = "experiment output line 1\nexperiment output line 2"
+    tail_b64 = _make_live_tail_b64(tail_text)
+    body = json.dumps({"live_output_tail": tail_b64}).encode()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={
+            "Authorization": f"Bearer {job.id}",
+            "Content-Type": "application/json",
+        },
+        content=body,
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    live_output = meta.get("live_output")
+    assert isinstance(live_output, dict), "live_output must be stored in polling_metadata"
+    assert live_output.get("text") == tail_text, (
+        f"live_output text must match: {live_output.get('text')!r}"
+    )
+    assert live_output.get("truncated") is False
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_empty_body_unchanged(
+    client, db_session, monkeypatch
+):
+    """Heartbeat with no body must remain backward-compatible (no live_output stored)."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Empty Body Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hello",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    assert "live_output" not in meta, "no live_output should be stored for empty body"
+
+
+def test_gcp_startup_script_passes_live_tail_path_to_command_runner():
+    """The GCP startup script must pass live_tail.b64 as a 4th arg to command_runner.py."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "live_tail.b64" in script, "live_tail.b64 path must appear in startup script"
+    assert "blueprint_command_runner.py" in script
+    runner_idx = script.index("python3 /tmp/blueprint_command_runner.py")
+    runner_invocation = script[runner_idx : runner_idx + 400]
+    assert "live_tail.b64" in runner_invocation, (
+        "live_tail.b64 path must be passed as an argument to command_runner.py"
+    )
+
+
+def test_gcp_startup_script_heartbeat_reads_live_tail():
+    """The _compute_heartbeat function in the startup script must read live_tail.b64."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    hb_func_start = script.index("_compute_heartbeat() {")
+    hb_func_body = script[hb_func_start : hb_func_start + 600]
+    assert "live_tail.b64" in hb_func_body, (
+        "_compute_heartbeat must reference live_tail.b64"
+    )
+    assert "live_output_tail" in hb_func_body, (
+        "_compute_heartbeat must include live_output_tail in the POST body"
+    )
+
+
+def test_local_backend_live_tail_read_on_poll(tmp_path):
+    """poll_status returns live_output when live_tail.b64 exists in the artifact dir."""
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    tail_text = "partial output so far"
+    tail_b64 = _make_live_tail_b64(tail_text)
+    (artifact_dir / "live_tail.b64").write_text(tail_b64)
+
+    job = ComputeJob(
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"artifact_dir": str(artifact_dir)},
+    )
+    result = compute_backends_module._read_local_live_tail(job)
+    assert result is not None, "_read_local_live_tail must return a dict when file exists"
+    assert result["text"] == tail_text
+    assert result["truncated"] is False

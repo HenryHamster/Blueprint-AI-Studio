@@ -81,11 +81,16 @@ async def _build_compute_job_payload(
             task_type = str(task.first_payload.get("type") or "") or None
             normalized = _declared_success_criterion(task)
             success_criterion = (
-                {"metric": normalized[0], "operator": normalized[1], "threshold": normalized[2]}
+                {
+                    "metric": normalized[0],
+                    "operator": normalized[1],
+                    "threshold": normalized[2],
+                }
                 if normalized is not None
                 else None
             )
-            compute_result = (task.plan_output or {}).get("compute_result") or {}
+            plan_output = task.plan_output or {}
+            compute_result = plan_output.get("compute_result") or {}
             verdict = compute_result.get("criterion")
             if not isinstance(verdict, dict):
                 verdict = None
@@ -123,10 +128,19 @@ async def _build_compute_job_payload(
         ):
             artifact_text = build_compute_result_logs(job)
             criterion_verdict = evaluate_compute_success_criterion(task_obj, artifact_text)
+        # Derive knowledge_document_id from the task's plan_output.
+        knowledge_document_id: str | None = None
+        if task_obj is not None:
+            knowledge_doc = (task_obj.plan_output or {}).get("knowledge_document") or {}
+            raw_kdoc_id = (
+                knowledge_doc.get("id") if isinstance(knowledge_doc, dict) else None
+            )
+            knowledge_document_id = str(raw_kdoc_id) if raw_kdoc_id is not None else None
         data["task_title"] = title
         data["task_type"] = task_type
         data["success_criterion"] = success_criterion
         data["criterion_verdict"] = criterion_verdict
+        data["knowledge_document_id"] = knowledge_document_id
         linked_artifact = artifacts.get(job.artifact_id) if job.artifact_id else None
         data["artifact"] = (
             _artifact_descriptor(linked_artifact) if linked_artifact else None

@@ -175,6 +175,9 @@ class ComputeStatusResult:
     # garbled. Only populated for live-proof jobs where BLUEPRINT_RELEASE_SHA was
     # injected into the runtime environment.
     echoed_release_sha: str | None = None
+    # Live output tail written by the runner during execution. Only populated for
+    # RUNNING local jobs that have flushed a live_tail.b64 to the artifact dir.
+    live_output: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -320,7 +323,10 @@ class LocalSubprocessComputeBackend:
                     finished_at=_utcnow(),
                 )
             if _is_pid_running(pid):
-                return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+                return ComputeStatusResult(
+                    status=ComputeJobStatus.RUNNING,
+                    live_output=_read_local_live_tail(job),
+                )
             terminal = _read_local_terminal_status(job)
             if terminal is not None:
                 return terminal
@@ -331,7 +337,10 @@ class LocalSubprocessComputeBackend:
             )
         return_code = handle.proc.poll()
         if return_code is None:
-            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+            return ComputeStatusResult(
+                status=ComputeJobStatus.RUNNING,
+                live_output=_read_local_live_tail(job),
+            )
         self._processes.pop(job.external_compute_id or "", None)
         terminal = _read_local_terminal_status(job)
         if terminal is not None:
@@ -675,6 +684,12 @@ def _build_local_wrapper_command(command: str, *, external_id: str) -> str:
             "command.log.json",
         )
     )
+    live_tail_path_local = shlex.quote(
+        os.path.join(
+            _local_artifact_dir_for_external_id(external_id),
+            "live_tail.b64",
+        )
+    )
     command_literal = shlex.quote(command)
     # The artifact dir is created but NOT removed: its contents are the durable
     # output channel and must survive the subprocess (and an idempotent relaunch).
@@ -689,14 +704,13 @@ export {ARTIFACT_DIR_ENV}={artifact_dir}
 EXIT_CODE=0
 if python3 - \
   {command_literal} \
-  {command_log_path} <<'PY'; then
-import json
-import pathlib
-import subprocess
-import sys
+  {command_log_path} \
+  {live_tail_path_local} <<'PY'; then
+import base64, json, pathlib, subprocess, sys, threading
 
 command = sys.argv[1]
 log_path = pathlib.Path(sys.argv[2])
+live_tail_path = pathlib.Path(sys.argv[3]) if len(sys.argv) > 3 else None
 log_path.parent.mkdir(parents=True, exist_ok=True)
 proc = subprocess.Popen(
     ["bash", "-lc", command],
@@ -705,6 +719,25 @@ proc = subprocess.Popen(
 )
 captured = bytearray()
 truncated = False
+_stop = threading.Event()
+
+def _flush_tail():
+    if live_tail_path is None:
+        return
+    snap = bytes(captured)
+    tail = snap[-10240:]
+    payload = json.dumps({{"text": tail.decode("utf-8", "replace"), "truncated": len(snap) > 10240 or truncated}}, ensure_ascii=False).encode()
+    try:
+        live_tail_path.write_bytes(base64.b64encode(payload))
+    except OSError:
+        pass
+
+def _tail_worker():
+    while not _stop.wait(30):
+        _flush_tail()
+
+_t = threading.Thread(target=_tail_worker, daemon=True)
+_t.start()
 assert proc.stdout is not None
 while True:
     chunk = proc.stdout.read(8192)
@@ -720,6 +753,7 @@ while True:
     else:
         truncated = True
 exit_code = proc.wait()
+_stop.set()
 if proc.stdout is not None:
     proc.stdout.close()
 if captured or truncated:
@@ -818,6 +852,33 @@ def _local_artifact_metadata(external_id: str | None) -> dict[str, str]:
     """
     path = _local_artifact_dir_for_external_id(external_id)
     return {"artifact_dir": path, "artifact_uri": f"file://{path}"}
+
+
+def _read_local_live_tail(job: ComputeJob) -> dict[str, Any] | None:
+    """Read live_tail.b64 from a running local job's artifact dir, if present."""
+    meta = job.polling_metadata or {}
+    artifact_dir = str(meta.get("artifact_dir") or "").strip()
+    if not artifact_dir:
+        artifact_dir = _local_artifact_dir_for_external_id(job.external_compute_id)
+    live_tail_path = Path(artifact_dir) / "live_tail.b64"
+    try:
+        data = live_tail_path.read_bytes()
+    except OSError:
+        return None
+    if not data:
+        return None
+    try:
+        decoded = base64.b64decode(data, validate=True)
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    text = parsed.get("text")
+    truncated = parsed.get("truncated")
+    if not isinstance(text, str) or not isinstance(truncated, bool):
+        return None
+    return {"text": text, "truncated": truncated}
 
 
 async def collect_terminal_artifact_reference(
@@ -989,6 +1050,9 @@ def _build_gcp_startup_script(
     command_log_path = shlex.quote(
         os.path.join(_GCP_ARTIFACT_DIR_PATH, "command.log.json")
     )
+    live_tail_path = shlex.quote(
+        os.path.join(_GCP_ARTIFACT_DIR_PATH, "live_tail.b64")
+    )
     # Optional repo checkout: clone the project repo at the requested ref into a
     # scratch dir, cd into it, and put it on PYTHONPATH so the command can import
     # the project's packages. Runs BEFORE cwd_line (an explicit cwd still wins).
@@ -1129,6 +1193,13 @@ TTL_PID=$!
 _COMPUTE_ORCHESTRATOR_URL={orchestrator_url_q}
 _COMPUTE_JOB_ID={job_id_q}
 _compute_heartbeat() {{
+  if [ -s {live_tail_path} ]; then
+    _LT_VAL=$(cat {live_tail_path} 2>/dev/null || true)
+    if [ -n "$_LT_VAL" ]; then
+      curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_JOB_ID" -H "Content-Type: application/json" -d '{{"live_output_tail": "'"$_LT_VAL"'"}}' "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
+      return
+    fi
+  fi
   curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_JOB_ID" "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
 }}
 _compute_heartbeat
@@ -1155,7 +1226,8 @@ EXIT_CODE=0
 if python3 /tmp/blueprint_command_runner.py \
   {command} \
   {command_log_path} \
-  {max_log_bytes}; then
+  {max_log_bytes} \
+  {live_tail_path}; then
   EXIT_CODE=0
   STATUS=SUCCEEDED
   REASON=completed

@@ -1677,6 +1677,8 @@ async def _apply_polled_compute_job_result(
             live.status = ComputeJobStatus.RUNNING
             if status.message:
                 _set_meta(live, status_message=status.message)
+            if status.live_output is not None:
+                _set_meta(live, live_output=dict(status.live_output))
         await session.commit()
         return True
 
