@@ -4329,8 +4329,29 @@ async def agent_get_efficiency_snapshot_format_compliance(
     other agent endpoints; extracts the project_id from the task identified
     by the token's ``sub`` claim.
 
-    Returns ``{captured_at, format_compliance, format_compliance_by_type}``
-    from the latest persisted snapshot, or 404 when no snapshot exists yet.
+    Returns::
+
+        {
+            "captured_at": "<ISO timestamp>",
+            "format_compliance": {
+                "format_compliance_rate": {...},
+                "self_repair_success_rate": {...},
+                "tasks_measured": <int>,
+                "well_formed_tasks": <int>,
+                "format_error_total": <int>,
+                "repair_attempts": <int>,
+                "repair_successes": <int>,
+                "repair_infra_failures": <int>,
+                "by_schema": {<schema_label>: {"miss": <int>, "repair_attempt": <int>, "repair_success": <int>}, ...}
+            },
+            "format_compliance_by_type": {<task_type>: {...}, ...},
+            "by_schema": {<schema_label>: {"miss": <int>, "repair_attempt": <int>, "repair_success": <int>}, ...}
+        }
+
+    ``by_schema`` is also exposed at the top level (mirroring its location
+    inside ``format_compliance``) so callers can access per-schema miss and
+    repair counts without navigating the nested blob. Returns 404 when no
+    snapshot exists yet.
     """
     from app.auth import verify_agent_jwt
 
@@ -4370,8 +4391,10 @@ async def agent_get_efficiency_snapshot_format_compliance(
         raise HTTPException(status_code=404, detail="no_snapshot_available")
 
     latest = snapshots[-1]
+    fc_blob = latest.get(FORMAT_COMPLIANCE_KEY) or {}
     return {
         "captured_at": latest.get("captured_at"),
-        FORMAT_COMPLIANCE_KEY: latest.get(FORMAT_COMPLIANCE_KEY),
+        FORMAT_COMPLIANCE_KEY: fc_blob,
         "format_compliance_by_type": latest.get("format_compliance_by_type"),
+        "by_schema": fc_blob.get("by_schema"),
     }

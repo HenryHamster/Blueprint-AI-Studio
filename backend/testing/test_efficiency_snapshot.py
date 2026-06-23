@@ -6006,6 +6006,8 @@ async def test_agent_format_compliance_snapshot_endpoint(
     assert "research" in by_type
     assert by_type["create"]["format_compliance_rate"] == 1.0
     assert by_type["research"]["format_compliance_rate"] == 0.0
+    # by_schema is exposed at the top level for direct access
+    assert "by_schema" in data
 
 
 # ---------------------------------------------------------------------------
