@@ -10871,3 +10871,120 @@ class TestLaunchAgentCloudRunJob:
 
         assert result is True
         assert not api_called, "Cloud Run API must not be called in LOCAL_MODE"
+
+
+# ---------------------------------------------------------------------------
+# Hardware policy enforcement in create_compute_job
+# ---------------------------------------------------------------------------
+
+
+def _make_project_with_hardware_policy(
+    *,
+    allowed_machine_types: list | None = None,
+    allowed_accelerator_types: list | None = None,
+) -> Project:
+    envelope = {}
+    if allowed_machine_types is not None:
+        envelope["allowed_machine_types"] = allowed_machine_types
+    if allowed_accelerator_types is not None:
+        envelope["allowed_accelerator_types"] = allowed_accelerator_types
+    return Project(
+        name="Hardware Policy Project",
+        user_id="test-user",
+        build_config={"resource_envelope": envelope},
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_disallowed_machine_type(db_session):
+    """allowed_machine_types set, request uses a disallowed type → ComputeLaunchPreconditionFailed."""
+    project = _make_project_with_hardware_policy(
+        allowed_machine_types=["e2-standard-2"]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc_info:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo test",
+            machine_type="e2-standard-4",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+
+    detail = exc_info.value.detail
+    assert detail["error"] == "project_hardware_policy_violated"
+    assert "e2-standard-4" in detail["message"]
+    assert detail["requested"] == "e2-standard-4"
+    assert detail["allowed"] == ["e2-standard-2"]
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_disallowed_accelerator(
+    db_session, monkeypatch
+):
+    """allowed_accelerator_types set, request uses a disallowed accelerator → ComputeLaunchPreconditionFailed."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+
+    project = _make_project_with_hardware_policy(allowed_accelerator_types=["T4"])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc_info:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo gpu test",
+            accelerator="L4",
+            backend_name="gcp",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+        )
+
+    detail = exc_info.value.detail
+    assert detail["error"] == "project_hardware_policy_violated"
+    assert "L4" in detail["message"]
+    assert detail["requested"] == "L4"
+    assert detail["allowed"] == ["T4"]
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_allows_matching_hardware_policy(db_session):
+    """allowed_machine_types set, request matches the allowed type → job created."""
+    project = _make_project_with_hardware_policy(
+        allowed_machine_types=["e2-standard-2"]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo allowed",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    assert job.status == ComputeJobStatus.QUEUED
+    assert job.machine_type == "e2-standard-2"

@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from app.schemas import BuildConfig, ResourceEnvelope
 from app.resource_envelope import (
+    resolve_project_hardware_policy,
     resolve_project_vm_cap,
     resolve_project_spend_ceiling,
     resolve_project_spend_window_days,
@@ -641,3 +642,97 @@ async def test_get_project_recent_spend_usd_combines_all_three_sources(db_sessio
     assert result["compute"] == pytest.approx(2.0, abs=1e-6)
     assert result["agent_vm"] == pytest.approx(1.0, abs=1e-6)
     assert result["idle"] == pytest.approx(4.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# ResourceEnvelope hardware policy field validation
+# ---------------------------------------------------------------------------
+
+
+def test_resource_envelope_allowed_machine_types_valid():
+    env = ResourceEnvelope(allowed_machine_types=["e2-standard-2", "e2-standard-4"])
+    assert env.allowed_machine_types == ["e2-standard-2", "e2-standard-4"]
+
+
+def test_resource_envelope_allowed_machine_types_rejects_unknown():
+    with pytest.raises(ValidationError) as exc_info:
+        ResourceEnvelope(allowed_machine_types=["e2-standard-2", "n1-standard-4"])
+    assert "n1-standard-4" in str(exc_info.value)
+
+
+def test_resource_envelope_allowed_machine_types_empty_list_accepted():
+    env = ResourceEnvelope(allowed_machine_types=[])
+    assert env.allowed_machine_types == []
+
+
+def test_resource_envelope_allowed_machine_types_none_accepted():
+    env = ResourceEnvelope(allowed_machine_types=None)
+    assert env.allowed_machine_types is None
+
+
+def test_resource_envelope_allowed_accelerator_types_valid():
+    env = ResourceEnvelope(allowed_accelerator_types=["T4", "L4"])
+    assert env.allowed_accelerator_types == ["T4", "L4"]
+
+
+def test_resource_envelope_allowed_accelerator_types_rejects_unknown():
+    with pytest.raises(ValidationError) as exc_info:
+        ResourceEnvelope(allowed_accelerator_types=["T4", "A100"])
+    assert "A100" in str(exc_info.value)
+
+
+def test_resource_envelope_allowed_accelerator_types_empty_list_accepted():
+    env = ResourceEnvelope(allowed_accelerator_types=[])
+    assert env.allowed_accelerator_types == []
+
+
+def test_resource_envelope_allowed_accelerator_types_none_accepted():
+    env = ResourceEnvelope(allowed_accelerator_types=None)
+    assert env.allowed_accelerator_types is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_project_hardware_policy
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_project_hardware_policy_returns_none_when_absent():
+    project = make_project(build_config={})
+    machines, accels = resolve_project_hardware_policy(project)
+    assert machines is None
+    assert accels is None
+
+
+def test_resolve_project_hardware_policy_returns_lists_when_set():
+    project = make_project(
+        build_config={
+            "resource_envelope": {
+                "allowed_machine_types": ["e2-standard-2"],
+                "allowed_accelerator_types": ["T4", "L4"],
+            }
+        }
+    )
+    machines, accels = resolve_project_hardware_policy(project)
+    assert machines == ["e2-standard-2"]
+    assert accels == ["T4", "L4"]
+
+
+def test_resolve_project_hardware_policy_returns_none_no_build_config():
+    project = make_project(build_config=None)
+    machines, accels = resolve_project_hardware_policy(project)
+    assert machines is None
+    assert accels is None
+
+
+def test_resolve_project_hardware_policy_tolerates_junk_values():
+    project = make_project(
+        build_config={
+            "resource_envelope": {
+                "allowed_machine_types": "bad",
+                "allowed_accelerator_types": 42,
+            }
+        }
+    )
+    machines, accels = resolve_project_hardware_policy(project)
+    assert machines is None
+    assert accels is None

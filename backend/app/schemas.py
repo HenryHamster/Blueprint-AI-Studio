@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.failure_classification import _CRED_FIELD_RE, _CRED_REDACT_SUBS
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
+from app.vm_cost_rates import SUPPORTED_ACCELERATORS, supported_machine_types
 from app.payload_schemas import RepoDomainOverview, RepoBootstrapOverview
 from app.task_blocked import (
     NEED_KINDS,
@@ -834,6 +835,42 @@ class ResourceEnvelope(BaseModel):
     # Fraction of spend_ceiling_usd at which to fire a proactive approaching-ceiling alert.
     # e.g. 0.8 fires when rolling spend reaches 80% of the ceiling. Default 0.8 when absent.
     spend_warning_fraction: float | None = Field(None, gt=0, le=1)
+    # If set, CPU compute jobs must use one of these machine types.
+    # GPU machine types are determined by the accelerator and are not checked here.
+    allowed_machine_types: list[str] | None = Field(None)
+    # If set, GPU compute jobs must use one of these accelerators (e.g. ["T4", "L4"]).
+    # An empty list blocks all GPU jobs. CPU jobs (no accelerator) are never blocked by this field.
+    allowed_accelerator_types: list[str] | None = Field(None)
+
+    @field_validator("allowed_machine_types", mode="before")
+    @classmethod
+    def _validate_allowed_machine_types(cls, v: object) -> object:
+        if v is None:
+            return v
+        if not isinstance(v, list):
+            raise ValueError("must be a list of strings")
+        valid = supported_machine_types()
+        for item in v:
+            if item not in valid:
+                raise ValueError(
+                    f"unknown machine type {item!r}: must be one of {sorted(valid)}"
+                )
+        return v
+
+    @field_validator("allowed_accelerator_types", mode="before")
+    @classmethod
+    def _validate_allowed_accelerator_types(cls, v: object) -> object:
+        if v is None:
+            return v
+        if not isinstance(v, list):
+            raise ValueError("must be a list of strings")
+        valid = set(SUPPORTED_ACCELERATORS.keys())
+        for item in v:
+            if item not in valid:
+                raise ValueError(
+                    f"unknown accelerator type {item!r}: must be one of {sorted(valid)}"
+                )
+        return v
 
 
 class BuildConfig(BaseModel):

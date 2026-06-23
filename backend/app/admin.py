@@ -33,7 +33,6 @@ from app.shared_state import (
     get_project_task_branch_namespace,
     limiter,
     resolve_task_branch as _resolve_task_branch,
-    runtime_config,
 )
 from app.models import (
     Task,
@@ -61,7 +60,6 @@ from app.payload_schemas import (
 from app.task_capabilities import USER_LAUNCHABLE_TASK_TYPES
 from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
-    resolve_compute_spend_approval,
 )
 from app.vm_cost_rates import validate_compute_request
 from app.schemas import TaskEvaluationSummary, TaskEvaluationSummaryItem
@@ -2038,11 +2036,6 @@ async def create_compute_experiment_task(
     if gpu_reason is not None:
         raise HTTPException(status_code=422, detail=gpu_reason)
 
-    requires_approval, threshold = resolve_compute_spend_approval(
-        runtime_config=runtime_config,
-        direction=None,
-        spend_cap_usd=float(launch_contract["spend_cap_usd"]),
-    )
     task_payload_raw = {
         "type": "compute_experiment",
         "prompt": payload.prompt,
@@ -2154,17 +2147,9 @@ async def create_compute_experiment_task(
         status=TaskStatus.QUEUED,
         created_by="USER",
         launched_by_user_id=current_user["user_id"],
-        requires_approval=requires_approval,
+        requires_approval=False,
         idempotency_key=scoped_idempotency_key,
-        context={"approval_hold_reason": "spend_budget"} if requires_approval else {},
     )
-    if requires_approval:
-        new_task.latest_status_message = (
-            "Held for operator approval: compute_experiment proposes "
-            f"${float(launch_contract['spend_cap_usd']):.2f} spend cap / "
-            f"{int(launch_contract['deadline_seconds'])}s deadline, exceeding "
-            f"the ${threshold:.2f} approval threshold."
-        )
     session.add(new_task)
     try:
         await session.commit()

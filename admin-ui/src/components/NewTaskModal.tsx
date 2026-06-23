@@ -341,6 +341,27 @@ export function NewTaskModal({
               </div>
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Working Dir <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                  <input
+                    type="text"
+                    value={computeExperiment.cwd}
+                    onChange={e => updateCompute('cwd', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    placeholder="/workspace/myproject"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Env Vars <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional, KEY=VALUE)</span></label>
+                  <textarea
+                    value={computeExperiment.envVars}
+                    onChange={e => updateCompute('envVars', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[48px] transition-all placeholder:text-neutral-600"
+                    placeholder={"BATCH_SIZE=32\nLR=0.001"}
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <div>
                   <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Accelerator <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
                   <select
                     value={computeExperiment.accelerator}

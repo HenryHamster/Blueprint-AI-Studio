@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobs, killComputeJob, type ComputeJob, type ComputeJobCommandLog } from '../api';
+import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText } from 'lucide-react';
+import { analyzeComputeJob, fetchComputeJobs, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -42,6 +42,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
   const [killingId, setKillingId] = useState<string | null>(null);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
+  const [analysisDocs, setAnalysisDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   const load = useCallback(
@@ -115,8 +116,16 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
         } else {
           setAnalysisFeedback((prev) => ({
             ...prev,
-            [job.id]: { kind: 'upgraded', message: 'Analysis upgraded' },
+            [job.id]: { kind: 'upgraded', message: 'Analysis complete' },
           }));
+          if (result.knowledge_document_id && projectId) {
+            try {
+              const doc = await fetchKnowledgeDocument(projectId, result.knowledge_document_id);
+              setAnalysisDocs((prev) => ({ ...prev, [job.id]: doc }));
+            } catch {
+              // Non-fatal: feedback already shown, doc fetch is best-effort
+            }
+          }
         }
       } catch (e) {
         setAnalysisFeedback((prev) => ({
@@ -131,7 +140,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
         await load();
       }
     },
-    [load],
+    [load, projectId],
   );
 
   if (!projectId) return null;
@@ -330,6 +339,31 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                   {analysisFeedback[job.id].message}
                 </div>
               )}
+              {(() => {
+                const doc = analysisDocs[job.id];
+                if (!doc) return null;
+                return (
+                  <div
+                    className="mt-1.5 rounded border border-violet-500/30 bg-violet-500/10 px-2 py-1.5 text-[10px]"
+                    data-testid="compute-analysis-doc"
+                  >
+                    <div className="flex items-start gap-1.5">
+                      <FileText className="w-3 h-3 shrink-0 mt-0.5 text-violet-300" />
+                      <div className="min-w-0">
+                        <div className="font-semibold text-violet-200 break-words">{doc.title}</div>
+                        {doc.summary && (
+                          <div className="mt-0.5 text-violet-300/80 break-words whitespace-pre-wrap">{doc.summary}</div>
+                        )}
+                        {doc.body && !doc.summary && (
+                          <div className="mt-0.5 text-violet-300/80 break-words line-clamp-4 whitespace-pre-wrap">
+                            {doc.body.slice(0, 400)}{doc.body.length > 400 ? '…' : ''}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
               {job.artifact_id && (
                 <div className="mt-1.5 flex items-start gap-1.5 text-[10px]">
                   <Package className="w-3 h-3 shrink-0 mt-px text-emerald-300" />

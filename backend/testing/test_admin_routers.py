@@ -16167,9 +16167,11 @@ class TestComputeExperimentTaskLaunch:
         assert tasks == []
 
     @pytest.mark.asyncio
-    async def test_spend_above_threshold_requires_approval_with_status_message(
+    async def test_spend_above_threshold_runs_without_approval(
         self, client: AsyncClient, db_session
     ):
+        # compute_experiment tasks no longer gate on spend threshold approval:
+        # requires_approval is always False regardless of spend cap vs threshold.
         await self._project_with_repo(db_session)
         from app.shared_state import runtime_config as _rc
 
@@ -16192,13 +16194,8 @@ class TestComputeExperimentTaskLaunch:
                 select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
             )
         ).scalar_one()
-        assert task.requires_approval is True
-        assert task.context["approval_hold_reason"] == "spend_budget"
-        assert task.latest_status_message == (
-            "Held for operator approval: compute_experiment proposes "
-            "$5.01 spend cap / 1200s deadline, exceeding "
-            "the $5.00 approval threshold."
-        )
+        assert task.requires_approval is False
+        assert task.latest_status_message is None
 
     @pytest.mark.asyncio
     async def test_spend_at_threshold_is_runnable(

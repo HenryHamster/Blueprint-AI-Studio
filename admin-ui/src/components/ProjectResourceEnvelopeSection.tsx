@@ -12,12 +12,49 @@ interface ProjectResourceEnvelopeSectionProps {
   onSave: (patch: ResourceEnvelopePatch) => Promise<void>;
 }
 
+// Known hardware-policy values. These MUST mirror the backend's
+// `supported_machine_types()` (vm_cost_rates.VM_COST_RATES) and
+// `SUPPORTED_ACCELERATORS` — the backend rejects any unknown item, so the UI
+// only ever offers values from these sets.
+const KNOWN_MACHINE_TYPES = [
+  'e2-standard-2',
+  'e2-standard-4',
+  'e2-standard-8',
+  'e2-standard-16',
+  'e2-standard-32',
+] as const;
+const KNOWN_ACCELERATOR_TYPES = ['T4', 'L4', 'V100'] as const;
+
 function formatUsd(value: number | null | undefined): string {
   return value == null ? 'Unlimited' : `$${value.toFixed(2)}`;
 }
 
 function formatCount(value: number | null | undefined): string {
   return value == null ? 'Unlimited' : String(value);
+}
+
+/** Machine-type policy display: null/undefined = unlimited, else the list. */
+function formatMachinePolicy(value: string[] | null | undefined): string {
+  if (value == null) return 'Unlimited';
+  if (value.length === 0) return 'None allowed';
+  return value.join(', ');
+}
+
+/** Accelerator policy display: null/undefined = unlimited, [] = all GPUs blocked. */
+function formatAcceleratorPolicy(value: string[] | null | undefined): string {
+  if (value == null) return 'Unlimited';
+  if (value.length === 0) return 'All GPU jobs blocked';
+  return value.join(', ');
+}
+
+/** Order-insensitive equality for `string[] | null` policy values. A `null`
+ *  policy (unrestricted) is distinct from an empty list (explicit block). */
+function policyEquals(a: string[] | null, b: string[] | null): boolean {
+  if (a == null || b == null) return a === b;
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((item, i) => item === sortedB[i]);
 }
 
 export function ProjectResourceEnvelopeSection({
@@ -34,6 +71,11 @@ export function ProjectResourceEnvelopeSection({
   const [spendWindowDaysInput, setSpendWindowDaysInput] = useState('30');
   const [spendWarningPctInput, setSpendWarningPctInput] = useState('');
   const [maxConcurrentComputeJobsInput, setMaxConcurrentComputeJobsInput] = useState('');
+  const [machineTypes, setMachineTypes] = useState<string[]>([]);
+  const [acceleratorTypes, setAcceleratorTypes] = useState<string[]>([]);
+  // Distinct from "no accelerators selected": when true we save an explicit
+  // empty list (`[]`) that blocks all GPU jobs, rather than `null` (unlimited).
+  const [blockAllGpu, setBlockAllGpu] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -42,6 +84,12 @@ export function ProjectResourceEnvelopeSection({
     setSpendWindowDaysInput(String(data?.spend_window_days ?? 30));
     setSpendWarningPctInput(data?.spend_warning_fraction != null ? String(Math.round(data.spend_warning_fraction * 100)) : '');
     setMaxConcurrentComputeJobsInput(data?.max_concurrent_compute_jobs != null ? String(data.max_concurrent_compute_jobs) : '');
+    setMachineTypes(data?.allowed_machine_types != null ? [...data.allowed_machine_types] : []);
+    const accel = data?.allowed_accelerator_types;
+    // An explicit empty list means "block all GPUs"; a populated list is a
+    // whitelist; null/absent means unrestricted.
+    setBlockAllGpu(Array.isArray(accel) && accel.length === 0);
+    setAcceleratorTypes(accel != null ? [...accel] : []);
   }, [data]);
 
   const parsedMaxConcurrent = useMemo(() => {
@@ -80,6 +128,8 @@ export function ProjectResourceEnvelopeSection({
     spend_window_days: 30,
     spend_warning_fraction: null,
     max_concurrent_compute_jobs: null,
+    allowed_machine_types: null,
+    allowed_accelerator_types: null,
     active_vm_count: 0,
     recent_spend_usd: 0,
     recent_spend_compute_usd: 0,
@@ -99,6 +149,19 @@ export function ProjectResourceEnvelopeSection({
   const spendOverCeiling =
     current.spend_ceiling_usd != null && current.recent_spend_usd > current.spend_ceiling_usd;
 
+  // Resolve the hardware-policy values that would be saved. A fully-unchecked
+  // machine-type set clears the policy (null). For accelerators, the explicit
+  // "block all GPU jobs" toggle wins and saves an empty list; otherwise a
+  // fully-unchecked set clears the policy (null).
+  const machineTypesToSave = useMemo<string[] | null>(
+    () => (machineTypes.length > 0 ? KNOWN_MACHINE_TYPES.filter(m => machineTypes.includes(m)) : null),
+    [machineTypes],
+  );
+  const acceleratorTypesToSave = useMemo<string[] | null>(() => {
+    if (blockAllGpu) return [];
+    return acceleratorTypes.length > 0 ? KNOWN_ACCELERATOR_TYPES.filter(a => acceleratorTypes.includes(a)) : null;
+  }, [acceleratorTypes, blockAllGpu]);
+
   const hasChanges = useMemo(() => {
     const maxChanged = maxConcurrentVmsInput.trim()
       ? String(current.max_concurrent_vms ?? '') !== maxConcurrentVmsInput.trim()
@@ -113,18 +176,32 @@ export function ProjectResourceEnvelopeSection({
     const computeJobsChanged = maxConcurrentComputeJobsInput.trim()
       ? String(current.max_concurrent_compute_jobs ?? '') !== maxConcurrentComputeJobsInput.trim()
       : current.max_concurrent_compute_jobs !== null;
-    return maxChanged || spendChanged || windowChanged || warningChanged || computeJobsChanged;
+    const machineTypesChanged = !policyEquals(current.allowed_machine_types ?? null, machineTypesToSave);
+    const acceleratorTypesChanged = !policyEquals(current.allowed_accelerator_types ?? null, acceleratorTypesToSave);
+    return (
+      maxChanged ||
+      spendChanged ||
+      windowChanged ||
+      warningChanged ||
+      computeJobsChanged ||
+      machineTypesChanged ||
+      acceleratorTypesChanged
+    );
   }, [
     current.max_concurrent_vms,
     current.spend_ceiling_usd,
     current.spend_window_days,
     current.spend_warning_fraction,
     current.max_concurrent_compute_jobs,
+    current.allowed_machine_types,
+    current.allowed_accelerator_types,
     maxConcurrentVmsInput,
     spendCeilingUsdInput,
     spendWindowDaysInput,
     spendWarningPctInput,
     maxConcurrentComputeJobsInput,
+    machineTypesToSave,
+    acceleratorTypesToSave,
   ]);
 
   const handleSave = async () => {
@@ -139,10 +216,29 @@ export function ProjectResourceEnvelopeSection({
         spend_window_days: parsedSpendWindowDays,
         spend_warning_fraction: parsedSpendWarningFraction,
         max_concurrent_compute_jobs: parsedMaxConcurrentComputeJobs,
+        allowed_machine_types: machineTypesToSave,
+        allowed_accelerator_types: acceleratorTypesToSave,
       });
     } finally {
       setSaving(false);
     }
+  };
+
+  const toggleMachineType = (type: string) => {
+    setMachineTypes(prev => (prev.includes(type) ? prev.filter(t => t !== type) : [...prev, type]));
+  };
+  const toggleAcceleratorType = (type: string) => {
+    // Selecting a specific accelerator implies GPUs are not fully blocked.
+    setBlockAllGpu(false);
+    setAcceleratorTypes(prev => (prev.includes(type) ? prev.filter(t => t !== type) : [...prev, type]));
+  };
+  const toggleBlockAllGpu = () => {
+    setBlockAllGpu(prev => {
+      const next = !prev;
+      // Blocking all GPUs clears any specific whitelist selection.
+      if (next) setAcceleratorTypes([]);
+      return next;
+    });
   };
 
   const inputDisabled = !canSave || saving;
@@ -182,6 +278,20 @@ export function ProjectResourceEnvelopeSection({
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
             <div className="text-[10px] uppercase tracking-wider text-neutral-500">Concurrent compute jobs</div>
             <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? formatCount(current.max_concurrent_compute_jobs)}</div>
+          </div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+          <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
+            <div className="text-[10px] uppercase tracking-wider text-neutral-500">Machine types</div>
+            <div className="mt-1 text-sm font-semibold text-neutral-100 break-words">
+              {noDataLabel ?? formatMachinePolicy(current.allowed_machine_types)}
+            </div>
+          </div>
+          <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
+            <div className="text-[10px] uppercase tracking-wider text-neutral-500">GPU accelerators</div>
+            <div className="mt-1 text-sm font-semibold text-neutral-100 break-words">
+              {noDataLabel ?? formatAcceleratorPolicy(current.allowed_accelerator_types)}
+            </div>
           </div>
         </div>
       </div>
@@ -315,6 +425,70 @@ export function ProjectResourceEnvelopeSection({
         {error && <p className="mt-2 text-[11px] text-red-400">{error}</p>}
         {loading && <p className="mt-2 text-[11px] text-neutral-500">Loading resource envelope…</p>}
         {!canSave && <p className="mt-2 text-[11px] text-neutral-500">Only project owners can edit resource envelopes.</p>}
+      </div>
+
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Hardware Policy</h3>
+        <p className="text-[11px] text-neutral-600 mb-3">
+          Leave all boxes unchecked to allow any hardware (no restriction). Checking a subset
+          whitelists only those values for this project's compute jobs.
+        </p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <fieldset>
+            <legend className="block text-xs text-neutral-400 mb-2">Allowed CPU machine types</legend>
+            <div className="space-y-1">
+              {KNOWN_MACHINE_TYPES.map(type => (
+                <label key={type} className="flex items-center gap-2 min-h-[44px] cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={machineTypes.includes(type)}
+                    disabled={inputDisabled}
+                    onChange={() => toggleMachineType(type)}
+                    className="h-4 w-4 rounded border-neutral-700 bg-neutral-950 disabled:opacity-60"
+                  />
+                  <span className="text-xs font-mono text-neutral-200">{type}</span>
+                </label>
+              ))}
+            </div>
+            <p className="text-[11px] text-neutral-600 mt-1">
+              {machineTypesToSave == null ? 'Any (unlimited)' : `Whitelist: ${machineTypesToSave.join(', ')}`}
+            </p>
+          </fieldset>
+          <fieldset>
+            <legend className="block text-xs text-neutral-400 mb-2">Allowed GPU accelerator types</legend>
+            <div className="space-y-1">
+              {KNOWN_ACCELERATOR_TYPES.map(type => (
+                <label key={type} className="flex items-center gap-2 min-h-[44px] cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={acceleratorTypes.includes(type)}
+                    disabled={inputDisabled || blockAllGpu}
+                    onChange={() => toggleAcceleratorType(type)}
+                    className="h-4 w-4 rounded border-neutral-700 bg-neutral-950 disabled:opacity-60"
+                  />
+                  <span className="text-xs font-mono text-neutral-200">{type}</span>
+                </label>
+              ))}
+              <label className="flex items-center gap-2 min-h-[44px] cursor-pointer border-t border-neutral-800 mt-1 pt-1">
+                <input
+                  type="checkbox"
+                  checked={blockAllGpu}
+                  disabled={inputDisabled}
+                  onChange={toggleBlockAllGpu}
+                  className="h-4 w-4 rounded border-neutral-700 bg-neutral-950 disabled:opacity-60"
+                />
+                <span className="text-xs text-amber-300">Block all GPU jobs</span>
+              </label>
+            </div>
+            <p className="text-[11px] text-neutral-600 mt-1">
+              {acceleratorTypesToSave == null
+                ? 'Any (unlimited)'
+                : acceleratorTypesToSave.length === 0
+                  ? 'All GPU jobs blocked'
+                  : `Whitelist: ${acceleratorTypesToSave.join(', ')}`}
+            </p>
+          </fieldset>
+        </div>
       </div>
 
       <div className="flex justify-end pt-2">

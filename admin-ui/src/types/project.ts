@@ -37,6 +37,12 @@ export interface ResourceEnvelopeConfig {
   spend_window_days?: number;
   spend_warning_fraction?: number | null;
   max_concurrent_compute_jobs?: number | null;
+  /** Hardware policy: if set, CPU compute jobs must use one of these machine
+   *  types. `null`/undefined means unrestricted (any machine type). */
+  allowed_machine_types?: string[] | null;
+  /** Hardware policy: if set, GPU jobs must use one of these accelerator types.
+   *  `null`/undefined means unrestricted; an empty list `[]` blocks all GPU jobs. */
+  allowed_accelerator_types?: string[] | null;
 }
 
 export interface BuildConfig {

@@ -22,6 +22,8 @@ export const COMPUTE_EXPERIMENT_TASK_TYPE = 'compute_experiment';
 // all-or-nothing: leave them blank to launch without a machine-checkable goal.
 export interface ComputeExperimentForm {
   command: string;
+  cwd: string;
+  envVars: string;
   accelerator: string;
   machineType: string;
   spendCapUsd: string;
@@ -52,6 +54,8 @@ export function canonicalMachineTypeForAccelerator(accelerator: string): string 
 export function defaultComputeExperimentForm(): ComputeExperimentForm {
   return {
     command: '',
+    cwd: '',
+    envVars: '',
     accelerator: '',
     machineType: '',
     spendCapUsd: '',
@@ -346,6 +350,17 @@ export function useTaskModal(
     const benchmark = computeExperiment.benchmark.trim();
     const hypothesis = computeExperiment.hypothesis.trim();
     const metric = computeExperiment.metric.trim();
+    const cwd = computeExperiment.cwd.trim();
+    // Parse KEY=VALUE lines into an env record; skip blank lines and comments.
+    const envRecord: Record<string, string> = {};
+    for (const line of computeExperiment.envVars.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx < 1) continue;
+      envRecord[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1);
+    }
+    const hasEnv = Object.keys(envRecord).length > 0;
     const title = newTaskTitle.trim() || `Compute experiment: ${command.slice(0, 60)}`;
     const prompt = newTaskPrompt.trim() || hypothesis || `Run compute experiment: ${command}`;
     const body: ComputeExperimentLaunchRequest = {
@@ -358,6 +373,8 @@ export function useTaskModal(
       deadline_seconds: deadline,
       ...(accelerator ? { accelerator } : {}),
       ...(machineType ? { machine_type: machineType } : {}),
+      ...(cwd ? { cwd } : {}),
+      ...(hasEnv ? { env: envRecord } : {}),
       ...(experiment ? { experiment } : {}),
       ...(benchmark ? { benchmark } : {}),
       ...(hypothesis ? { hypothesis } : {}),
