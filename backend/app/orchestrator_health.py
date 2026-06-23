@@ -283,7 +283,18 @@ async def _classify_stuck_tasks(
             t, dep_tasks, list(deps), session, verify_pr_merged
         )
         if result == "cascade_cancel":
-            out.append((t.id, "cascade_cancel"))
+            from app.failure_classification import is_non_death_cancellation
+
+            failed_prereq = next(
+                (
+                    dt
+                    for dt in dep_tasks
+                    if dt.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+                    and not is_non_death_cancellation(dt)
+                ),
+                None,
+            )
+            out.append((t.id, "cascade_cancel", failed_prereq))
         elif result == "eligible":
             out.append((t.id, "dead_deps"))
         # result == "waiting" (e.g. a requeue clone still in flight) → keep waiting.
@@ -377,11 +388,7 @@ async def reorder_eligible_by_health(
     _projects_by_id: dict = {}
     if _project_ids:
         _proj_rows = (
-            (
-                await session.execute(
-                    select(Project).where(Project.id.in_(_project_ids))
-                )
-            )
+            (await session.execute(select(Project).where(Project.id.in_(_project_ids))))
             .scalars()
             .all()
         )
