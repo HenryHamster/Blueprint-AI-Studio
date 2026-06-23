@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timedelta
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
@@ -1333,6 +1334,103 @@ async def _harvest_promotion_ci_failures(
                 version_number,
             )
             return
+
+        # ── Infra-flake guard (Fix X) ──────────────────────────────────────────
+        # Before spawning a code-fix task, check whether the promotion CI failure
+        # is a transient infrastructure flake (npm registry unreachable,
+        # Docker Hub rate-limit, Playwright install failure, setup-step only).
+        # If so, skip the fix spawn and immediately re-qualify (which opens a fresh
+        # promotion PR with fresh CI) — a code change cannot fix an infra flake,
+        # and spawning a doomed agent wastes a retry slot.
+        #
+        # NOTE: by the time this harvest runs, _cleanup_managed_check_wait_failure_
+        # artifacts has already closed the promotion PR and deleted the release
+        # branch.  Re-running the dead workflow via rerun_failed_jobs is useless;
+        # instead, schedule a new qualification run directly so a fresh release
+        # branch and promotion PR are created.  The Z circuit breaker in
+        # _redrive_promotion_failed_qualification caps total re-qualify attempts.
+        try:
+            from app.github import get_repo_installation_token, get_check_runs_cached
+            from app.failure_classification import _is_ci_infra_flake_log
+
+            _token = await get_repo_installation_token(owner, repo)
+            if _token:
+                _ci_result = await get_check_runs_cached(
+                    _token,
+                    owner,
+                    repo,
+                    ci_source_sha,
+                    project_id=str(project_id),
+                )
+                _setup_flake = _ci_result.get("setup_phase_failure", False)
+                _failed_logs = _ci_result.get("failed_logs", "")
+                _content_flake = _is_ci_infra_flake_log(_failed_logs)
+                if _setup_flake or _content_flake:
+                    _flake_reason = (
+                        "setup_phase_failure" if _setup_flake else "infra_log_patterns"
+                    )
+                    logger.info(
+                        "[RELEASE_QUALIFIER] promotion-CI harvest: v%d CI failure "
+                        "is an infrastructure flake (%s) — scheduling fresh "
+                        "re-qualification (new promotion PR) and skipping fix "
+                        "spawn (source %s)",
+                        version_number,
+                        _flake_reason,
+                        ci_source_sha[:8],
+                    )
+                    # Trigger a fresh qualification immediately so the version
+                    # gets a new promotion PR rather than waiting for the next
+                    # sweep cycle.  "promotion_failed" is not a conclusive
+                    # verdict status so run_qualification proceeds even if the
+                    # candidate SHA has not changed.  Best-effort; the Z
+                    # re-driver in sweep_stuck_qualifications is the fallback.
+                    try:
+                        from app import release_qualifier as _rq_mod
+                        from app.database import AsyncSessionLocal as _ASL
+
+                        async with _ASL() as _rq_session:
+                            _rq_version = await _rq_session.get(
+                                release_version.ReleaseVersion, version_id
+                            )
+                            if _rq_version is not None:
+                                _rq_result = await _rq_mod.run_qualification(
+                                    _rq_session, project_id, _rq_version
+                                )
+                                if _rq_result and _rq_result.get("status") == "spawned":
+                                    await _rq_session.commit()
+                                    logger.info(
+                                        "[RELEASE_QUALIFIER] promotion-CI harvest: "
+                                        "v%d infra-flake re-qualify spawned (%s)",
+                                        version_number,
+                                        _flake_reason,
+                                    )
+                                else:
+                                    await _rq_session.rollback()
+                                    logger.info(
+                                        "[RELEASE_QUALIFIER] promotion-CI harvest: "
+                                        "v%d infra-flake re-qualify deferred "
+                                        "(run_qualification status=%s) — Z "
+                                        "re-driver will retry next sweep",
+                                        version_number,
+                                        _rq_result.get("status") if _rq_result else None,
+                                    )
+                    except Exception:
+                        logger.warning(
+                            "[RELEASE_QUALIFIER] promotion-CI harvest: v%d "
+                            "infra-flake re-qualify attempt failed — Z re-driver "
+                            "will retry next sweep",
+                            version_number,
+                            exc_info=True,
+                        )
+                    return
+        except Exception:
+            logger.warning(
+                "[RELEASE_QUALIFIER] promotion-CI harvest: infra-flake check "
+                "failed for v%d — proceeding to fix spawn",
+                version_number,
+                exc_info=True,
+            )
+
         logger.info(
             "[RELEASE_QUALIFIER] promotion-CI harvest: spawning auto-remediation "
             "on %s for v%d promotion CI failures (source %s)",

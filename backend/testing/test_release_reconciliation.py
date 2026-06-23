@@ -6864,3 +6864,208 @@ async def test_ci_unresolved_guard_does_not_set_managed_check_wait_for_non_migra
     assert not pending.get("managed_check_wait")
     assert not pending.get("migration_carrying")
     assert pending.get("restored_by_ci_unresolved_guard") is True
+
+
+# ===========================================================================
+# Fix X: infra-flake detection + re-run in _harvest_promotion_ci_failures
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_harvest_infra_flake_requalifies_and_skips_spawn(db_session, mocker):
+    """When CI failure logs contain npm-registry / Docker infra patterns,
+    _harvest_promotion_ci_failures must call run_qualification (schedule a fresh
+    re-qualify) and NOT call rerun_failed_jobs or spawn a fix task.  The promotion
+    PR is already torn down by the time harvest runs, so re-running the dead
+    workflow is useless; a fresh qualification opens a new promotion PR."""
+    from app.release_reconciliation import _harvest_promotion_ci_failures
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+    auto_remediation_config = {"enabled": True}
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "build", "conclusion": "failure"}],
+                "failed_logs": "npm error code ECONNREFUSED connecting to registry.npmjs.org",
+                "setup_phase_failure": False,
+                "failed_run_ids": [12345],
+            }
+        ),
+    )
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        new=AsyncMock(return_value=True),
+    )
+    rq_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+    handle_mock = mocker.patch(
+        "app.auto_remediation._handle_main_branch_ci_failure",
+        new=AsyncMock(),
+    )
+
+    await _harvest_promotion_ci_failures(
+        project_id=_project.id,
+        version_id=version.id,
+        version_number=version.version_number,
+        owner="acme",
+        repo="widget",
+        ci_source_sha="dead" * 10,
+        integration_branch="automain",
+        auto_remediation_config=auto_remediation_config,
+    )
+
+    rq_mock.assert_awaited_once()
+    rerun_mock.assert_not_awaited()
+    handle_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_harvest_setup_phase_flake_requalifies_and_skips_spawn(db_session, mocker):
+    """setup_phase_failure=True triggers the same re-qualify + skip path as
+    content-based infra detection: run_qualification is called to open a fresh
+    promotion PR; rerun_failed_jobs is NOT called (the promotion PR is already
+    torn down by harvest time)."""
+    from app.release_reconciliation import _harvest_promotion_ci_failures
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "build", "conclusion": "failure"}],
+                "failed_logs": "Set up job failed",
+                "setup_phase_failure": True,
+                "failed_run_ids": [99999],
+            }
+        ),
+    )
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        new=AsyncMock(return_value=True),
+    )
+    rq_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+    handle_mock = mocker.patch(
+        "app.auto_remediation._handle_main_branch_ci_failure",
+        new=AsyncMock(),
+    )
+
+    await _harvest_promotion_ci_failures(
+        project_id=_project.id,
+        version_id=version.id,
+        version_number=version.version_number,
+        owner="acme",
+        repo="widget",
+        ci_source_sha="cafe" * 10,
+        integration_branch="automain",
+        auto_remediation_config={"enabled": True},
+    )
+
+    rq_mock.assert_awaited_once()
+    rerun_mock.assert_not_awaited()
+    handle_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_harvest_real_failure_spawns_fix(db_session, mocker):
+    """When CI logs do NOT match infra patterns, the fix task is spawned normally."""
+    from app.release_reconciliation import _harvest_promotion_ci_failures
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "pytest", "conclusion": "failure"}],
+                "failed_logs": "FAILED testing/test_foo.py::test_bar\nAssertionError",
+                "setup_phase_failure": False,
+                "failed_run_ids": [],
+            }
+        ),
+    )
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        new=AsyncMock(return_value=True),
+    )
+    handle_mock = mocker.patch(
+        "app.auto_remediation._handle_main_branch_ci_failure",
+        new=AsyncMock(),
+    )
+
+    await _harvest_promotion_ci_failures(
+        project_id=_project.id,
+        version_id=version.id,
+        version_number=version.version_number,
+        owner="acme",
+        repo="widget",
+        ci_source_sha="beef" * 10,
+        integration_branch="automain",
+        auto_remediation_config={"enabled": True},
+    )
+
+    rerun_mock.assert_not_awaited()
+    handle_mock.assert_awaited_once()
+
+
+# ===========================================================================
+# Fix X: _is_ci_infra_flake_log pattern matching
+# ===========================================================================
+
+
+def test_is_ci_infra_flake_log_detects_npm_error():
+    """npm registry connection errors are detected as infra flakes."""
+    from app.failure_classification import _is_ci_infra_flake_log
+
+    assert _is_ci_infra_flake_log("npm error code ECONNREFUSED\nsome other output")
+    assert _is_ci_infra_flake_log("npm error code ETIMEDOUT connecting to registry.npmjs.org")
+    assert _is_ci_infra_flake_log("npm ERR! network Connection refused")
+
+
+def test_is_ci_infra_flake_log_detects_playwright():
+    """Playwright install failures are detected as infra flakes."""
+    from app.failure_classification import _is_ci_infra_flake_log
+
+    assert _is_ci_infra_flake_log("playwright install failed: network error")
+
+
+def test_is_ci_infra_flake_log_returns_false_for_real_failure():
+    """Real test failures are NOT classified as infra flakes."""
+    from app.failure_classification import _is_ci_infra_flake_log
+
+    assert not _is_ci_infra_flake_log(
+        "FAILED testing/test_foo.py::test_bar\nAssertionError: assert 0 == 1"
+    )
+    assert not _is_ci_infra_flake_log("")
+    assert not _is_ci_infra_flake_log("SyntaxError: invalid syntax at line 42")

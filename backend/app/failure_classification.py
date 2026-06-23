@@ -406,6 +406,50 @@ _ORCHESTRATOR_DEFER_MARKERS: tuple[str, ...] = (
 )
 
 
+# Substrings found in GitHub Actions CI job logs that indicate a transient
+# infrastructure failure (not a code defect): npm registry unreachable, Docker
+# Hub rate-limit / network error, Playwright browser installation failure, or
+# generic ECONNREFUSED / ETIMEDOUT network errors.  Matched case-insensitively
+# against the raw log text by _is_ci_infra_flake_log().  Kept specific enough
+# to avoid false-positives on legitimate test output (e.g. tests that intentionally
+# test connection-refused behaviour).
+_CI_INFRA_LOG_PATTERNS: tuple[str, ...] = (
+    # npm registry / network errors
+    "npm error code econnrefused",
+    "npm error code etimedout",
+    "npm error code enotfound",
+    "npm err! network",
+    "npm error network",
+    "request to https://registry.npmjs.org",
+    # Docker Hub rate-limit / network failures
+    "error pulling image",
+    "toomanyrequests: you have reached",
+    "docker pull",
+    # Playwright browser installation failure
+    "playwright install",
+    "failed to install playwright",
+    # Generic setup-phase connectivity errors
+    "error: connect econnrefused",
+    "error: connect etimedout",
+    "registry unreachable",
+    "failed to fetch",
+    "getaddrinfo enotfound",
+)
+
+
+def _is_ci_infra_flake_log(logs: str) -> bool:
+    """Return True if the CI job logs indicate a transient infrastructure failure.
+
+    Matches known patterns for npm-registry / Docker-Hub / Playwright network
+    failures that cannot be fixed by a code change.  Used by the promotion-gate
+    harvest to skip spawning a doomed fix task and instead re-run the workflow.
+    """
+    if not logs:
+        return False
+    logs_lower = logs.lower()
+    return any(pat in logs_lower for pat in _CI_INFRA_LOG_PATTERNS)
+
+
 # Substrings that uniquely identify migration-related failures. Kept narrow so
 # generic database connectivity errors stay in EXTERNAL_API.
 _MIGRATION_PATTERNS: tuple[str, ...] = (

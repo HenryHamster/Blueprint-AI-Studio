@@ -827,6 +827,15 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const regressingCats = getRegressingCategories(projectCtxForSr);
   const thinningCats = getThinningCategories(projectCtxForSr);
   const reasoningGateCats = [...new Set([...regressingCats, ...thinningCats])];
+  // For auto-remediation create tasks the backend stamped the failing pytest
+  // node-ids onto the payload as ci_failure_selectors.  Forward them so the
+  // generated ./check script runs those selectors against real Postgres via
+  // buildCiFailureVerifyBlock — closing the SQLite-vs-Postgres masking gap
+  // where a fix declared green locally could still fail CI on Postgres-only
+  // assertions (see auto_remediation.py task_payload construction).
+  const rawCiSelectors = Array.isArray(payload.ci_failure_selectors)
+    ? (payload.ci_failure_selectors as unknown[]).filter((s): s is string => typeof s === 'string')
+    : [];
   await runCodeChangeTask({
     taskId,
     prompt: finalPromptWithTree,
@@ -846,6 +855,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     regressingCategories: reasoningGateCats.length > 0 ? reasoningGateCats : undefined,
     buildConfig,
     visualAcceptance: resolveVisualAcceptance(payload, ctx),
+    ciFailureSelectors: rawCiSelectors.length > 0 ? rawCiSelectors : undefined,
   });
 
   // Fresh reviewer pass: read-only second session to catch what the implementing

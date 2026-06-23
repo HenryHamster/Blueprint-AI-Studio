@@ -26195,3 +26195,167 @@ async def test_release_audit_payload_omits_version_goal_when_none(db_session, mo
     )
     audit_task = audit_tasks[0]
     assert "version_goal" not in audit_task.first_payload
+
+
+# ===========================================================================
+# Fix Z: promotion_failed re-driver + circuit breaker
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_redrive_promotion_failed_spawns_qualification(db_session, mocker):
+    """_redrive_promotion_failed_qualification must call run_qualification when
+    the version is promotion_failed, readiness is ready, and count < cap."""
+    from app.release_qualifier_sweep import _redrive_promotion_failed_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": "dead" * 10,
+        "error": "required_check_failed",
+        "promotion_failure_count": 1,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_readiness.compute_requalification_readiness",
+        new=AsyncMock(return_value={"requalification_ready": True}),
+    )
+    mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_redrive_promotion_failed_circuit_breaker_at_cap(db_session, mocker):
+    """When promotion_failure_count reaches the cap, re-driver must return False
+    and raise an operator Alert instead of re-qualifying."""
+    from app.release_qualifier_sweep import (
+        _redrive_promotion_failed_qualification,
+        _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": "cafe" * 10,
+        "error": "required_check_failed",
+        "promotion_failure_count": _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+
+    # An Alert must have been created.
+    from sqlalchemy import select as _select
+    alerts = (
+        (await db_session.execute(_select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "promotion" in alerts[0].message.lower()
+
+
+@pytest.mark.asyncio
+async def test_redrive_promotion_failed_defers_when_remediation_in_flight(db_session, mocker):
+    """When compute_requalification_readiness returns not-ready (fix in flight),
+    the re-driver must return False without calling run_qualification."""
+    from app.release_qualifier_sweep import _redrive_promotion_failed_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": "beef" * 10,
+        "error": "required_check_failed",
+        "promotion_failure_count": 1,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_readiness.compute_requalification_readiness",
+        new=AsyncMock(
+            return_value={
+                "requalification_ready": False,
+                "reason": "promotion-CI remediation in flight",
+            }
+        ),
+    )
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_record_promotion_failure_increments_count(db_session, mocker):
+    """_record_promotion_failure must increment promotion_failure_count from
+    the previous last_qualification, starting at 1 for a fresh version."""
+    from app.release_promotion import _record_promotion_failure
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # No prior promotion failure — count should become 1.
+    base_record = {
+        "candidate_sha": "aaaa" * 10,
+        "confidence": 0.0,
+    }
+
+    mocker.patch(
+        "app.release_promotion._relock_version_for_promotion_write",
+        new=AsyncMock(return_value=version),
+    )
+    mocker.patch(
+        "app.release_promotion._record_qualification_verdict",
+        new=AsyncMock(return_value=None),
+    )
+
+    result = await _record_promotion_failure(
+        db_session,
+        version,
+        base_record,
+        "required_check_failed",
+        lock_released=False,
+    )
+
+    assert result["status"] == "promotion_failed"
+    assert version.last_qualification["promotion_failure_count"] == 1
+
+    # Second failure should increment to 2.
+    await _record_promotion_failure(
+        db_session,
+        version,
+        base_record,
+        "required_check_failed",
+        lock_released=False,
+    )
+    assert version.last_qualification["promotion_failure_count"] == 2

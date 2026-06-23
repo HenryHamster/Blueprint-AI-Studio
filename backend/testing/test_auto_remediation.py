@@ -2670,3 +2670,123 @@ async def test_spawn_direction_stamp_uses_directions_lock(db_session: AsyncSessi
     assert "last_remediation_task_id" in target, (
         "direction was not stamped — with_directions_locked bypass may have silently dropped the mutation"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fix Y: ci_failure_selectors wired from structured signals into task payload
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_selectors_stamped_on_payload(db_session: AsyncSession):
+    """When _extract_ci_context returns failing pytest node-ids the spawned task
+    payload carries ci_failure_selectors so check-helper.ts can run the targeted
+    Postgres verify block before ./pr open."""
+    project = await _create_project(db_session)
+
+    # Simulate CI context with failing pytest selectors
+    failing_tests = [
+        "testing/test_foo.py::test_bar",
+        "testing/test_baz.py::test_qux",
+    ]
+    with (
+        patch(
+            "app.auto_remediation.get_repo_installation_token",
+            new=AsyncMock(return_value="tok"),
+        ),
+        patch(
+            "app.auto_remediation.get_check_runs_cached",
+            new=AsyncMock(
+                return_value={
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "details": [{"name": "pytest", "conclusion": "failure"}],
+                    "failed_logs": "FAILED testing/test_foo.py::test_bar\nFAILED testing/test_baz.py::test_qux",
+                    "setup_phase_failure": False,
+                    "failed_run_ids": [],
+                }
+            ),
+        ),
+        patch(
+            "app.auto_remediation._extract_structured_signals",
+            return_value={
+                "failing_tests": failing_tests,
+                "error_locations": [],
+                "error_messages": [],
+            },
+        ),
+    ):
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    await db_session.commit()
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert len(tasks) == 1
+    payload = tasks[0].payloads[0]
+    assert "ci_failure_selectors" in payload, (
+        "ci_failure_selectors not stamped on task payload"
+    )
+    assert payload["ci_failure_selectors"] == failing_tests
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_selectors_absent_when_no_failing_tests(db_session: AsyncSession):
+    """When _extract_structured_signals finds no pytest node-ids, the payload
+    must NOT contain ci_failure_selectors (absent key, not empty list)."""
+    project = await _create_project(db_session)
+
+    with (
+        patch(
+            "app.auto_remediation.get_repo_installation_token",
+            new=AsyncMock(return_value="tok"),
+        ),
+        patch(
+            "app.auto_remediation.get_check_runs_cached",
+            new=AsyncMock(
+                return_value={
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "details": [{"name": "build", "conclusion": "failure"}],
+                    "failed_logs": "SyntaxError: invalid syntax",
+                    "setup_phase_failure": False,
+                    "failed_run_ids": [],
+                }
+            ),
+        ),
+        patch(
+            "app.auto_remediation._extract_structured_signals",
+            return_value={
+                "failing_tests": [],
+                "error_locations": [],
+                "error_messages": [],
+            },
+        ),
+    ):
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme",
+            repo="webapp",
+            head_sha="cafecafe",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    await db_session.commit()
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert len(tasks) == 1
+    payload = tasks[0].payloads[0]
+    assert "ci_failure_selectors" not in payload, (
+        "ci_failure_selectors should be absent when no failing_tests extracted"
+    )
