@@ -64,7 +64,7 @@
     "release_qualifier.py": 4600,
     "release_reconciliation.py": 3700,
     "release_stall_alerts.py": 1050,
-    "release_promotion.py": 2000,
+    "release_promotion.py": 2350,
     "sr_analytics.py": 150,
     "sr_analytics_common.py": 900,
     "sr_analytics_catch_rate.py": 3800,

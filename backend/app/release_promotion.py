@@ -1608,10 +1608,18 @@ async def _record_promotion_failure(
             "next_version_number": None,
             "already_promoted": True,
         }
+    # Carry forward the promotion_failure_count from the previous record so the
+    # Z circuit breaker in sweep_stuck_qualifications can cap re-qualify attempts.
+    _prev_count = 0
+    if isinstance(version.last_qualification, dict):
+        _prev_count = int(
+            version.last_qualification.get("promotion_failure_count") or 0
+        )
     record = {
         **base_record,
         "status": "promotion_failed",
         "error": error,
+        "promotion_failure_count": _prev_count + 1,
     }
     if detail:
         record["detail"] = detail

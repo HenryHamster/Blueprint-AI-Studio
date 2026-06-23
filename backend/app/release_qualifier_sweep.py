@@ -586,6 +586,126 @@ async def _auto_stale_not_promoted_findings(
         return written
 
 
+_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS = 3
+"""Circuit-breaker cap on autonomous re-qualify attempts after a promotion_failed.
+
+When a version's ``last_qualification.promotion_failure_count`` reaches this cap
+the automatic re-driver stops and raises an operator-visible Alert instead of
+looping forever.  Each _record_promotion_failure call increments the counter,
+so this caps the TOTAL number of autonomous promotion attempts (fix→qualify→
+promote→CI-red) before human review is required.
+"""
+
+
+async def _redrive_promotion_failed_qualification(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Re-enter the qualifier for a ``promotion_failed`` version after automain advances.
+
+    When a promotion PR's CI goes red the version is recorded as
+    ``promotion_failed`` and returned to the stabilize phase.  Neither the
+    strategist nor the admin endpoint drives a re-entry automatically: the
+    strategist reads the standing ``promotion_failed`` status as "awaiting fix"
+    and the next ``qualify_request`` only fires once a strategic cycle emits one.
+
+    This is the missing scheduled re-driver.  For each sweep it:
+
+      1. Checks ``compute_requalification_readiness``.  That function already
+         defers while a ``promotion_ci_remediation``-tagged fix task is in
+         flight (``release_readiness._has_active_promotion_ci_remediation``),
+         so the re-driver naturally waits for any harvested fix to land on the
+         integration branch before triggering a fresh promotion.
+
+      2. Circuit-breaker: when ``promotion_failure_count`` in
+         ``last_qualification`` exceeds ``_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS``
+         the loop stops and an operator Alert is raised — preventing a
+         persistently-red candidate from cycling forever.
+
+      3. Calls ``run_qualification``.  Its cached-verdict guard re-resolves the
+         candidate SHA under a FOR UPDATE lock.  If automain has NOT advanced
+         the same-SHA cached verdict fires and this returns False (no-op).  If
+         automain HAS advanced, a fresh qualification spawns.
+
+    Returns True only when the re-entry actually STARTED a new qualification
+    (``status == "spawned"``).  Any guard no-op, circuit-breaker, or readiness
+    miss returns False.
+    """
+    from app import release_qualifier
+    from app.release_readiness import compute_requalification_readiness
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "promotion_failed"
+            or version.phase != "stabilize"
+        ):
+            return False
+
+        # Circuit breaker: stop re-qualifying if the failure count is at the cap.
+        failure_count = int(qual.get("promotion_failure_count") or 0)
+        if failure_count >= _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS:
+            # Raise an operator Alert (once) so the cap is visible.  Guard
+            # against duplicate alerts with a flag on last_qualification.
+            if not qual.get("promotion_loop_escalated"):
+                alert = Alert(
+                    project_id=version.project_id,
+                    severity=AlertSeverity.ERROR,
+                    title=(
+                        f"Release v{version.version_number} promotion loop halted"
+                    ),
+                    message=(
+                        f"Release v{version.version_number} has failed promotion "
+                        f"{failure_count} time(s) — autonomous re-qualification "
+                        f"halted. Human review required before next promote attempt."
+                    ),
+                    extra={
+                        "version_id": str(version.id),
+                        "version_number": version.version_number,
+                        "promotion_failure_count": failure_count,
+                        "last_error": qual.get("error"),
+                    },
+                )
+                redrive_session.add(alert)
+                version.last_qualification = {
+                    **qual,
+                    "promotion_loop_escalated": True,
+                }
+                flag_modified(version, "last_qualification")
+                redrive_session.add(version)
+                await redrive_session.commit()
+                logger.warning(
+                    "[RELEASE_QUALIFIER] sweep: v%d promotion_failure_count=%d "
+                    "reached cap=%d — raised operator Alert and halted auto-requalify",
+                    version.version_number,
+                    failure_count,
+                    _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+                )
+            return False
+
+        # Readiness guard: defers while a promotion-CI remediation fix is in flight.
+        readiness = await compute_requalification_readiness(
+            redrive_session, version.project_id
+        )
+        if not readiness.get("requalification_ready"):
+            return False
+
+        result = await release_qualifier.run_qualification(
+            redrive_session, version.project_id, version
+        )
+        if result and result.get("status") == "spawned":
+            await redrive_session.commit()
+            return True
+        await redrive_session.rollback()
+        return False
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -852,6 +972,38 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep reconciled version %s "
                 "(promotion_failed candidate landed on main)",
+                version_id,
+            )
+
+    # Re-drive open versions stranded in ``promotion_failed``.  After a promotion
+    # PR's CI goes red, the version is recorded as ``promotion_failed`` and
+    # returned to stabilize — but no scheduled path triggers re-qualification once
+    # the underlying CI failure is fixed (or was an infra flake).  This loop
+    # re-enters the qualifier for each open stabilize-phase ``promotion_failed``
+    # version, gated by ``compute_requalification_readiness`` (which already defers
+    # while a ``promotion_ci_remediation`` fix task is in flight) and by the
+    # circuit-breaker cap on consecutive promotion failures.  Runs AFTER
+    # ``_reconcile_if_promotion_failed_landed`` (which handles the version if the
+    # candidate already landed on main) so an out-of-band promotion is recorded
+    # before we attempt to re-qualify.
+    for version_id in version_ids:
+        try:
+            redriven = await _redrive_promotion_failed_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: promotion_failed re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove promotion_failed version %s "
+                "(re-qualification spawned after automain advanced)",
                 version_id,
             )
 

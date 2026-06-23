@@ -618,18 +618,28 @@ async def _handle_main_branch_ci_failure_inner(
     # Strip the now-redundant context keys (no dual-source).
     task_context.pop("auto_remediation", None)
     task_context.pop("_previous_error_fingerprint", None)
+    # Forward the failing pytest node-ids as ci_failure_selectors so the agent's
+    # ./check script runs those selectors against real Postgres (via the existing
+    # buildCiFailureVerifyBlock path in check-helper.ts) before ./pr open — this
+    # closes the SQLite-vs-Postgres masking gap described in the harvest prompt.
+    # Cap at 20 selectors to keep the ./check command line manageable; the most
+    # specific failing-test ids are listed first by _extract_structured_signals.
+    _ci_failure_selectors: list[str] = (
+        structured_signals.get("failing_tests") or []
+    )[:20]
+    task_payload: dict[str, object] = {
+        "type": "create",
+        "effort": "medium",
+        "base_branch": head_branch,
+        "title": f"fix: auto-remediate CI failure on {head_branch}",
+        "prompt": prompt,
+    }
+    if _ci_failure_selectors:
+        task_payload["ci_failure_selectors"] = _ci_failure_selectors
     task = Task(
         project_id=project_id,
         title=f"Auto-fix: CI failure on {head_branch}",
-        payloads=[
-            {
-                "type": "create",
-                "effort": "medium",
-                "base_branch": head_branch,
-                "title": f"fix: auto-remediate CI failure on {head_branch}",
-                "prompt": prompt,
-            }
-        ],
+        payloads=[task_payload],
         context=task_context,
         status=TaskStatus.QUEUED,
         created_by="SYSTEM_AUTO_REMEDIATION",
