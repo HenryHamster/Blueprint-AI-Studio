@@ -8948,6 +8948,86 @@ async def test_apply_gate_defer_with_duplicate_revision_blocks_instead_of_infra_
     assert "dup01" in (detail or ""), f"detail should name the dup revision: {detail!r}"
 
 
+@pytest.mark.asyncio
+async def test_apply_gate_defer_with_broken_chain_blocks_instead_of_infra_retry():
+    """Structural defect detection: when the candidate's migration chain has a
+    broken down_revision pointer (a revision referencing a parent not in the
+    chain) or a cyclic chain (zero structural heads), the apply gate returns
+    'block' (a hard deterministic finding) even when production state is
+    unavailable (the scenario that would normally produce a 'defer'/infra-retry).
+
+    This exercises the structural pre-checks added to run_migration_apply_gate:
+    sources are checked for chain integrity BEFORE the prod-state DB read, so
+    structurally-defective candidates surface as real blocking findings instead
+    of being auto-retried as migration_apply_check_unavailable."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.migration_apply_gate import run_migration_apply_gate
+
+    # Case 1: Broken down_revision — the root migration references a parent
+    # that is not in the chain. The chain appears to have a single head ('0002'),
+    # so the existing multi-head check does NOT catch this; the broken-pointer
+    # check must fire.
+    broken_sources = {
+        "0001_init.py": (
+            "revision = '0001'\ndown_revision = 'missing_parent'\ndef upgrade(): pass\n"
+        ),
+        "0002_next.py": (
+            "revision = '0002'\ndown_revision = '0001'\ndef upgrade(): pass\n"
+        ),
+    }
+
+    # A postgres-URL engine pointing at a non-existent host: passes the postgres
+    # URL check but would fail (defer) at the prod-state read step. The structural
+    # check runs before that step, so the result must be 'block', not 'defer'.
+    engine = create_async_engine("postgresql+asyncpg://u:p@127.0.0.1:1/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources=broken_sources,
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "block", (
+        f"expected block on broken down_revision, got {verdict!r}: {detail}"
+    )
+    assert "0001" in (detail or "") or "missing_parent" in (detail or ""), (
+        f"detail should name the broken revision or missing parent: {detail!r}"
+    )
+    assert "broken" in (detail or "").lower() or "pointer" in (detail or "").lower(), (
+        f"detail should describe the defect class: {detail!r}"
+    )
+
+    # Case 2: Cyclic chain — every revision points to another in the chain, so
+    # there are zero structural heads. The existing multi-head check (>1) does
+    # NOT catch the zero-head case; the cycle check must fire.
+    cyclic_sources = {
+        "0001_a.py": (
+            "revision = '0001'\ndown_revision = '0002'\ndef upgrade(): pass\n"
+        ),
+        "0002_b.py": (
+            "revision = '0002'\ndown_revision = '0001'\ndef upgrade(): pass\n"
+        ),
+    }
+
+    engine2 = create_async_engine("postgresql+asyncpg://u:p@127.0.0.1:1/nope")
+    try:
+        verdict2, detail2 = await run_migration_apply_gate(
+            prod_engine=engine2,
+            candidate_sources=cyclic_sources,
+        )
+    finally:
+        await engine2.dispose()
+
+    assert verdict2 == "block", (
+        f"expected block on cyclic chain, got {verdict2!r}: {detail2}"
+    )
+    assert "cycle" in (detail2 or "").lower() or "zero" in (detail2 or "").lower(), (
+        f"detail should mention cycle or zero heads: {detail2!r}"
+    )
+
+
 # ===========================================================================
 # Audit challenge reconciliation — fail-closed gate
 # ===========================================================================

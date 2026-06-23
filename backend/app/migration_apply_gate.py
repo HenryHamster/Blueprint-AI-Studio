@@ -657,6 +657,29 @@ def _check_structural_defects(candidate_sources: dict[str, str]) -> Verdict | No
             "candidate migration chain has multiple heads (not a single linear chain): "
             + ", ".join(sorted(_heads)),
         )
+    # A cycle produces zero structural heads (every revision is pointed to by
+    # another — no revision has down_revision = None or an external parent).
+    if len(_heads) == 0 and _chain:
+        return (
+            "block",
+            "candidate migration chain has a cycle (zero structural heads) — "
+            "no revision chains back to down_revision = None",
+        )
+    # Broken down_revision pointer: a revision whose parent is absent from the
+    # chain. This case can produce a single apparent head (masking the defect
+    # from the multi-head check above) when only the root has a dangling pointer.
+    _dangling = sorted(
+        (rev, down)
+        for rev, down in _chain.items()
+        if down is not None and down not in _chain
+    )
+    if _dangling:
+        rev, down = _dangling[0]
+        return (
+            "block",
+            f"candidate migration chain has a broken down_revision pointer: "
+            f"revision '{rev}' references '{down}' which is not in the chain",
+        )
     return None
 
 
