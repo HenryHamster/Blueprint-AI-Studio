@@ -1192,6 +1192,9 @@ export default function App() {
           setComputeExperiment={s.setComputeExperiment}
           getDefaultModelForType={s.getDefaultModelForType}
           getDefaultEffortForType={s.getDefaultEffortForType}
+          preflightResult={s.preflightResult}
+          preflightLoading={s.preflightLoading}
+          preflightError={s.preflightError}
           repoOptions={s.repoOptions}
           repoLoading={s.repoLoading}
           repoError={s.repoError}

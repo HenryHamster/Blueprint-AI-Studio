@@ -51,6 +51,7 @@ from app.models import (
     ComputeJobStatus,
     KnowledgeDocument,
     Project,
+    ProjectMember,
     ReleaseDeployArtifact,
     ReleaseVersion,
     Task,
@@ -10988,6 +10989,233 @@ async def test_create_compute_job_allows_matching_hardware_policy(db_session):
 
     assert job.status == ComputeJobStatus.QUEUED
     assert job.machine_type == "e2-standard-2"
+
+
+# Compute-experiment preflight endpoint and at-launch hardware policy gate
+# ---------------------------------------------------------------------------
+
+_PREFLIGHT_TEST_USER_ID = "preflight-test-user"
+
+
+async def _make_preflight_project(
+    session,
+    *,
+    repo: str = "acme/preflight-repo",
+    hardware_policy: dict | None = None,
+) -> Project:
+    owner, name = repo.split("/", 1)
+    build_config: dict = {}
+    if hardware_policy is not None:
+        build_config["resource_envelope"] = hardware_policy
+    project = Project(
+        name=repo,
+        user_id=_PREFLIGHT_TEST_USER_ID,
+        github_owner=owner,
+        github_repo=name,
+        autonomous_enabled=False,
+        build_config=build_config,
+    )
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    session.add(
+        ProjectMember(
+            project_id=project.id,
+            user_id=_PREFLIGHT_TEST_USER_ID,
+            role="owner",
+        )
+    )
+    await session.commit()
+    return project
+
+
+class TestComputeExperimentPreflight:
+    """Tests for POST /api/admin/tasks/compute-experiment/preflight."""
+
+    def _headers(self):
+        return {"x-user-id": _PREFLIGHT_TEST_USER_ID}
+
+    @pytest.mark.asyncio
+    async def test_cpu_shape_returns_cost_projection(self, client, db_session):
+        """CPU shape returns rate, projected_cost, and max_runtime."""
+        from app.vm_cost_rates import get_compute_rate_per_second
+
+        await _make_preflight_project(db_session)
+        spend_cap = 5.0
+        deadline = 3600
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment/preflight",
+            json={
+                "github_repo": "acme/preflight-repo",
+                "machine_type": "e2-standard-2",
+                "spend_cap_usd": spend_cap,
+                "deadline_seconds": deadline,
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        expected_rate = get_compute_rate_per_second(machine_type="e2-standard-2")
+        assert data["rate_per_second"] == pytest.approx(expected_rate, rel=1e-6)
+        assert data["rate_per_hour"] == pytest.approx(expected_rate * 3600, rel=1e-6)
+        assert data["projected_cost_usd"] == pytest.approx(expected_rate * deadline, rel=1e-6)
+        assert data["max_runtime_seconds"] == int(spend_cap / expected_rate)
+        assert data["in_policy"] is True
+        assert data["reason"] is None
+        assert data["shape_rejection"] is None
+
+    @pytest.mark.asyncio
+    async def test_gpu_l4_spot_returns_correct_rate(self, client, db_session):
+        """GPU L4 spot request returns the bundled spot rate."""
+        from app.vm_cost_rates import get_compute_rate_per_second
+
+        await _make_preflight_project(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment/preflight",
+            json={
+                "github_repo": "acme/preflight-repo",
+                "accelerator": "L4",
+                "machine_type": "g2-standard-4",
+                "spend_cap_usd": 10.0,
+                "deadline_seconds": 1800,
+                "provisioning_model": "SPOT",
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        expected_rate = get_compute_rate_per_second(
+            machine_type="g2-standard-4", accelerator="L4", spot=True
+        )
+        assert data["rate_per_second"] == pytest.approx(expected_rate, rel=1e-6)
+        assert data["projected_cost_usd"] == pytest.approx(expected_rate * 1800, rel=1e-6)
+        assert data["in_policy"] is True
+        assert data["shape_rejection"] is None
+
+    @pytest.mark.asyncio
+    async def test_policy_violation_returns_out_of_policy(self, client, db_session):
+        """Accelerator disallowed by project policy → in_policy=False with reason."""
+        await _make_preflight_project(
+            db_session,
+            hardware_policy={"allowed_accelerator_types": ["T4"]},
+        )
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment/preflight",
+            json={
+                "github_repo": "acme/preflight-repo",
+                "accelerator": "L4",
+                "machine_type": "g2-standard-4",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["in_policy"] is False
+        assert "L4" in data["reason"]
+        assert data["allowed_accelerator_types"] == ["T4"]
+        assert data["shape_rejection"] is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_accelerator_returns_shape_rejection(self, client, db_session):
+        """Unknown accelerator name → shape_rejection set, in_policy still True."""
+        await _make_preflight_project(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment/preflight",
+            json={
+                "github_repo": "acme/preflight-repo",
+                "accelerator": "A100",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["shape_rejection"] is not None
+        assert "A100" in data["shape_rejection"]
+        assert data["rate_per_second"] is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_project_returns_unlimited_policy(self, client, db_session):
+        """Project not yet created → preflight succeeds with unlimited policy."""
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment/preflight",
+            json={
+                "github_repo": "acme/no-such-repo",
+                "machine_type": "e2-standard-2",
+                "spend_cap_usd": 2.0,
+                "deadline_seconds": 600,
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["in_policy"] is True
+        assert data["allowed_machine_types"] is None
+        assert data["allowed_accelerator_types"] is None
+
+
+class TestComputeExperimentLaunchPolicyGate:
+    """Tests that create_compute_experiment_task enforces hardware policy."""
+
+    def _headers(self):
+        return {"x-user-id": _PREFLIGHT_TEST_USER_ID}
+
+    @pytest.mark.asyncio
+    async def test_disallowed_accelerator_rejected_at_launch(self, client, db_session):
+        """Accelerator outside project allowed_accelerator_types → 422 before task is persisted."""
+        await _make_preflight_project(
+            db_session,
+            repo="acme/policy-launch-repo",
+            hardware_policy={"allowed_accelerator_types": ["T4"]},
+        )
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={
+                "github_repo": "acme/policy-launch-repo",
+                "title": "GPU test",
+                "prompt": "Run benchmark",
+                "command": "python bench.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+                "accelerator": "L4",
+                "machine_type": "g2-standard-4",
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "project_hardware_policy_violated"
+        assert "L4" in detail["message"]
+        assert detail["requested"] == "L4"
+        assert detail["allowed"] == ["T4"]
+
+    @pytest.mark.asyncio
+    async def test_allowed_accelerator_proceeds_at_launch(self, client, db_session):
+        """Accelerator in project allowed_accelerator_types → task created successfully."""
+        await _make_preflight_project(
+            db_session,
+            repo="acme/policy-launch-allowed-repo",
+            hardware_policy={"allowed_accelerator_types": ["L4"]},
+        )
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={
+                "github_repo": "acme/policy-launch-allowed-repo",
+                "title": "GPU test",
+                "prompt": "Run benchmark",
+                "command": "python bench.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+                "accelerator": "L4",
+                "machine_type": "g2-standard-4",
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["requires_approval"] is False
 
 
 # ---------------------------------------------------------------------------

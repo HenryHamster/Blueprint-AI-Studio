@@ -61,7 +61,12 @@ from app.task_capabilities import USER_LAUNCHABLE_TASK_TYPES
 from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
 )
-from app.vm_cost_rates import validate_compute_request
+from app.vm_cost_rates import (
+    get_compute_rate_per_second,
+    resolve_compute_machine_type,
+    validate_compute_request,
+)
+from app.resource_envelope import resolve_project_hardware_policy
 from app.schemas import TaskEvaluationSummary, TaskEvaluationSummaryItem
 from app.task_outcomes import build_task_evaluation_summary
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
@@ -1948,6 +1953,117 @@ async def create_task_manually(
     }
 
 
+class ComputeExperimentPreflightPayload(BaseModel):
+    github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
+    accelerator: str | None = None
+    machine_type: str | None = None
+    spend_cap_usd: float
+    deadline_seconds: int
+    provisioning_model: str | None = None
+
+    @field_validator("provisioning_model")
+    @classmethod
+    def validate_provisioning_model(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        normalized = v.upper()
+        if normalized not in {"STANDARD", "SPOT"}:
+            raise ValueError("provisioning_model must be STANDARD or SPOT")
+        return normalized
+
+
+@router.post("/tasks/compute-experiment/preflight")
+@limiter.limit("60/minute")
+async def compute_experiment_preflight(
+    request: Request,
+    payload: ComputeExperimentPreflightPayload,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return projected cost and hardware-policy verdict for a compute experiment selection."""
+    github_owner, github_repo = payload.github_repo.split("/", 1)
+
+    stmt = select(Project).where(
+        Project.github_owner == github_owner,
+        Project.github_repo == github_repo,
+        Project.id.in_(_user_project_ids(current_user["user_id"])),
+    )
+    project = (await session.execute(stmt)).scalars().first()
+
+    allowed_machines: list[str] | None
+    allowed_accels: list[str] | None
+    if project is not None:
+        allowed_machines, allowed_accels = resolve_project_hardware_policy(project)
+    else:
+        allowed_machines, allowed_accels = None, None
+
+    spec, shape_rejection = validate_compute_request(
+        payload.accelerator,
+        payload.machine_type,
+    )
+
+    resolved_machine_type = resolve_compute_machine_type(
+        accelerator=payload.accelerator,
+        machine_type=payload.machine_type,
+    )
+
+    rate_per_second: float | None = None
+    rate_per_hour: float | None = None
+    projected_cost_usd: float | None = None
+    max_runtime_seconds: int | None = None
+    if shape_rejection is None:
+        spot = payload.provisioning_model == "SPOT"
+        rate_per_second = get_compute_rate_per_second(
+            machine_type=resolved_machine_type,
+            accelerator=payload.accelerator,
+            spot=spot,
+        )
+        rate_per_hour = rate_per_second * 3600
+        projected_cost_usd = rate_per_second * payload.deadline_seconds
+        if rate_per_second > 0:
+            max_runtime_seconds = int(payload.spend_cap_usd / rate_per_second)
+
+    # Policy verdict: use the canonical accelerator name (spec.name) to mirror
+    # the comparison done in _check_project_hardware_policy.
+    canonical_accelerator = spec.name if spec is not None else None
+    in_policy = True
+    reason: str | None = None
+    if shape_rejection is None:
+        if canonical_accelerator is not None:
+            if (
+                allowed_accels is not None
+                and canonical_accelerator not in allowed_accels
+            ):
+                in_policy = False
+                reason = (
+                    f"accelerator {canonical_accelerator!r} is not in the project's "
+                    f"allowed_accelerator_types {allowed_accels!r}"
+                )
+        else:
+            if (
+                allowed_machines is not None
+                and resolved_machine_type not in allowed_machines
+            ):
+                in_policy = False
+                reason = (
+                    f"machine type {resolved_machine_type!r} is not in the project's "
+                    f"allowed_machine_types {allowed_machines!r}"
+                )
+
+    return {
+        "resolved_machine_type": resolved_machine_type,
+        "rate_per_second": rate_per_second,
+        "rate_per_hour": rate_per_hour,
+        "projected_cost_usd": projected_cost_usd,
+        "max_runtime_seconds": max_runtime_seconds,
+        "allowed_accelerator_types": allowed_accels,
+        "allowed_machine_types": allowed_machines,
+        "in_policy": in_policy,
+        "reason": reason,
+        "shape_rejection": shape_rejection,
+    }
+
+
 @router.post("/tasks/compute-experiment")
 @limiter.limit("60/minute")
 async def create_compute_experiment_task(
@@ -2029,12 +2145,54 @@ async def create_compute_experiment_task(
     # fast with a clear 422 instead of creating a task that can never launch.
     # Accelerator-only requests for supported accelerators stay valid and are
     # canonicalized downstream when the agent launches the actual compute job.
-    _, gpu_reason = validate_compute_request(
+    accel_spec, gpu_reason = validate_compute_request(
         launch_contract.get("accelerator"),
         launch_contract.get("machine_type"),
     )
     if gpu_reason is not None:
         raise HTTPException(status_code=422, detail=gpu_reason)
+
+    # Enforce the project's hardware policy before persisting the Task so a
+    # project-disallowed accelerator or machine type fails at dispatch time
+    # rather than silently passing the form and dying later in create_compute_job.
+    _lc_accelerator = launch_contract.get("accelerator")
+    _canonical_accelerator = accel_spec.name if accel_spec is not None else None
+    _resolved_mt = resolve_compute_machine_type(
+        accelerator=_lc_accelerator,
+        machine_type=launch_contract.get("machine_type"),
+    )
+    _allowed_machines, _allowed_accels = resolve_project_hardware_policy(project)
+    if _canonical_accelerator is not None:
+        if (
+            _allowed_accels is not None
+            and _canonical_accelerator not in _allowed_accels
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "project_hardware_policy_violated",
+                    "message": (
+                        f"accelerator {_canonical_accelerator!r} is not in the project's "
+                        f"allowed_accelerator_types {_allowed_accels!r}"
+                    ),
+                    "requested": _canonical_accelerator,
+                    "allowed": _allowed_accels,
+                },
+            )
+    else:
+        if _allowed_machines is not None and _resolved_mt not in _allowed_machines:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "project_hardware_policy_violated",
+                    "message": (
+                        f"machine type {_resolved_mt!r} is not in the project's "
+                        f"allowed_machine_types {_allowed_machines!r}"
+                    ),
+                    "requested": _resolved_mt,
+                    "allowed": _allowed_machines,
+                },
+            )
 
     task_payload_raw = {
         "type": "compute_experiment",

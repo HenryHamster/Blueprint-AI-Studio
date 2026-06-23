@@ -253,6 +253,59 @@ export async function createComputeExperiment(
   return res.json();
 }
 
+/**
+ * Request body for the compute-experiment preflight projection endpoint.
+ * Mirrors `ComputeExperimentPreflightPayload` in backend/app/admin.py.
+ */
+export interface ComputeExperimentPreflightRequest {
+  github_repo: string;
+  accelerator?: string;
+  machine_type?: string;
+  spend_cap_usd: number;
+  deadline_seconds: number;
+  provisioning_model?: string;
+}
+
+/**
+ * Response from the preflight endpoint — projected cost, rate, and hardware-policy verdict.
+ * Kept loose/additive so backend-additive fields don't force a frontend change.
+ */
+export interface ComputeExperimentPreflightResponse {
+  resolved_machine_type: string;
+  rate_per_second: number | null;
+  rate_per_hour: number | null;
+  projected_cost_usd: number | null;
+  max_runtime_seconds: number | null;
+  allowed_accelerator_types: string[] | null;
+  allowed_machine_types: string[] | null;
+  in_policy: boolean;
+  reason: string | null;
+  shape_rejection: string | null;
+  [key: string]: unknown;
+}
+
+/**
+ * Run a pre-launch cost/policy preflight check for a compute experiment.
+ * Returns projected cost for the full deadline and max runtime under the spend cap,
+ * plus a hardware-policy verdict for the selected accelerator/machine type.
+ * Throws on non-2xx (caller should degrade gracefully on error, not block submission).
+ */
+export async function computeExperimentPreflight(
+  body: ComputeExperimentPreflightRequest,
+  signal?: AbortSignal,
+): Promise<ComputeExperimentPreflightResponse> {
+  const res = await apiFetch('/api/admin/tasks/compute-experiment/preflight', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }, 0, 15000, signal);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.error?.message || data?.detail || `Error ${res.status}`;
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
 export async function getBlockDegradedUnverifiedMerge(
   projectId: string,
 ): Promise<{ block_degraded_unverified_merge: boolean; is_default: boolean }> {

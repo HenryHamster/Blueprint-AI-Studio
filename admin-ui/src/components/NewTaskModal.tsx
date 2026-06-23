@@ -3,7 +3,7 @@ import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, CheckSquare, Aler
 import type { LaunchableTaskTypeOption } from '../taskCapabilities';
 import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import { COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator } from '../hooks/useTaskModal';
-import type { ComputeSuccessOperator } from '../api';
+import type { ComputeSuccessOperator, ComputeExperimentPreflightResponse } from '../api';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   create: Plus,
@@ -62,6 +62,9 @@ interface NewTaskModalProps {
   taskBranchDefaultsLoading: boolean;
   taskBranchDefaultsError: string | null;
   integrationBranch?: string;
+  preflightResult: ComputeExperimentPreflightResponse | null;
+  preflightLoading: boolean;
+  preflightError: string | null;
   onRepoChange: (value: string) => void;
   onSubmit: (e: React.FormEvent) => Promise<void>;
   onClose: () => void;
@@ -106,6 +109,9 @@ export function NewTaskModal({
   taskBranchDefaultsLoading,
   taskBranchDefaultsError,
   integrationBranch,
+  preflightResult,
+  preflightLoading,
+  preflightError,
   onRepoChange,
   onSubmit,
   onClose,
@@ -149,6 +155,11 @@ export function NewTaskModal({
   const computeDeadline = Number(computeExperiment.deadlineSeconds);
   const computeDeadlineInvalid = !(Number.isInteger(computeDeadline) && computeDeadline > 0);
 
+  // Block submission only when a successful preflight explicitly reports the
+  // hardware is outside policy. A missing result (error / still loading) degrades
+  // gracefully — the server still enforces policy on the actual launch.
+  const isPreflightBlocking = !!(preflightResult && !preflightResult.in_policy);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitAttempted(true);
@@ -161,6 +172,10 @@ export function NewTaskModal({
     }
     if (isComputeExperiment && (computeCommandInvalid || computeSpendInvalid || computeDeadlineInvalid)) {
       // Inline errors render via submitAttempted; don't round-trip a doomed launch.
+      return;
+    }
+    if (isComputeExperiment && isPreflightBlocking) {
+      // Policy panel shows the reason inline; just prevent the submit.
       return;
     }
     setSubmitting(true);
@@ -436,6 +451,54 @@ export function NewTaskModal({
                   {submitAttempted && computeDeadlineInvalid && <p className="text-[10px] text-red-500 mt-1">Deadline must be a positive integer.</p>}
                 </div>
               </div>
+              {/* Preflight cost & policy panel */}
+              {isComputeExperiment && (preflightLoading || preflightResult || (preflightError && false)) && (
+                <div className={`mb-3 rounded-md px-3 py-2 text-[11px] border ${isPreflightBlocking ? 'bg-red-950/40 border-red-800/60' : 'bg-neutral-900 border-neutral-800'}`}>
+                  {preflightLoading && (
+                    <span className="flex items-center gap-1.5 text-neutral-500">
+                      <Loader2 className="animate-spin" style={{ width: 11, height: 11 }} />
+                      Checking rates…
+                    </span>
+                  )}
+                  {!preflightLoading && preflightResult && (
+                    <div className="space-y-1">
+                      {preflightResult.rate_per_hour != null && (
+                        <div className="flex justify-between text-neutral-400">
+                          <span>Rate</span>
+                          <span className="font-mono text-neutral-300">${preflightResult.rate_per_hour.toFixed(3)}/hr</span>
+                        </div>
+                      )}
+                      {preflightResult.projected_cost_usd != null && (
+                        <div className={`flex justify-between ${preflightResult.projected_cost_usd > computeSpendCap && computeSpendCap > 0 ? 'text-amber-400' : 'text-neutral-400'}`}>
+                          <span>Full-deadline cost</span>
+                          <span className="font-mono">${preflightResult.projected_cost_usd.toFixed(3)}{preflightResult.projected_cost_usd > computeSpendCap && computeSpendCap > 0 ? ' ⚠ exceeds cap' : ''}</span>
+                        </div>
+                      )}
+                      {preflightResult.max_runtime_seconds != null && (
+                        <div className="flex justify-between text-neutral-400">
+                          <span>Cap buys</span>
+                          <span className="font-mono text-neutral-300">
+                            {preflightResult.max_runtime_seconds >= 3600
+                              ? `~${(preflightResult.max_runtime_seconds / 3600).toFixed(1)} hr`
+                              : `~${Math.round(preflightResult.max_runtime_seconds / 60)} min`}
+                          </span>
+                        </div>
+                      )}
+                      {!preflightResult.in_policy && (
+                        <div className="mt-1 pt-1 border-t border-red-800/50 text-red-400">
+                          <span className="font-semibold">Policy violation — </span>
+                          {preflightResult.reason || 'hardware not allowed for this project.'}
+                          {(preflightResult.allowed_accelerator_types || preflightResult.allowed_machine_types) && (
+                            <div className="mt-0.5 text-red-500">
+                              Allowed: {(preflightResult.allowed_accelerator_types || preflightResult.allowed_machine_types)?.join(', ')}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>
                   <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Experiment <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
@@ -619,11 +682,11 @@ export function NewTaskModal({
             </button>
             <button
               type="submit"
-              disabled={submitting || !taskBranchDefaultsReady}
+              disabled={submitting || !taskBranchDefaultsReady || (isComputeExperiment && isPreflightBlocking)}
               className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
             >
               {submitting && <Loader2 className="animate-spin" style={{ width: 14, height: 14 }} />}
-              Launch
+              {isComputeExperiment && isPreflightBlocking ? 'Policy violation' : 'Launch'}
             </button>
           </div>
         </form>

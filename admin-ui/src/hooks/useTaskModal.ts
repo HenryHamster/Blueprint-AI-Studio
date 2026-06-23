@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type React from 'react';
-import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog, createComputeExperiment } from '../api';
-import type { ComputeSuccessOperator, ComputeExperimentLaunchRequest, ComputeSuccessCriterion } from '../api';
+import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog, createComputeExperiment, computeExperimentPreflight } from '../api';
+import type { ComputeSuccessOperator, ComputeExperimentLaunchRequest, ComputeSuccessCriterion, ComputeExperimentPreflightResponse } from '../api';
 import type { LaunchableTaskTypeOption, UserLaunchableTaskType } from '../taskCapabilities';
 import { USER_LAUNCHABLE_TASK_TYPE_IDS, USER_LAUNCHABLE_TASK_TYPE_OPTIONS, resolveTaskCapabilities } from '../taskCapabilities';
 import type { TaskCapabilityContract } from '../types/settings';
@@ -114,6 +114,11 @@ export function useTaskModal(
   const [computeExperiment, setComputeExperiment] =
     useState<ComputeExperimentForm>(defaultComputeExperimentForm);
 
+  // Preflight projection state — debounced on hardware/budget inputs.
+  const [preflightResult, setPreflightResult] = useState<ComputeExperimentPreflightResponse | null>(null);
+  const [preflightLoading, setPreflightLoading] = useState(false);
+  const [preflightError, setPreflightError] = useState<string | null>(null);
+
   // GitHub repo/branch dropdown state
   const [repoOptions, setRepoOptions] = useState<RepoOption[]>([]);
   const [repoLoading, setRepoLoading] = useState(false);
@@ -161,6 +166,61 @@ export function useTaskModal(
       setNewTaskBranch(defaultTaskBranch);
     }
   }, [defaultTaskBranch, newTaskBranch, showNewTaskModal]);
+
+  // Debounced preflight projection: fires 500ms after hardware/budget inputs settle.
+  // Stale in-flight requests are aborted via AbortController. On error the panel
+  // degrades silently (preflightError is set) rather than blocking submission.
+  useEffect(() => {
+    if (newTaskType !== COMPUTE_EXPERIMENT_TASK_TYPE) {
+      setPreflightResult(null);
+      setPreflightLoading(false);
+      setPreflightError(null);
+      return;
+    }
+    const repo = newTaskRepo;
+    if (!repo || !repo.includes('/')) {
+      setPreflightResult(null);
+      return;
+    }
+    const spendCap = Number(computeExperiment.spendCapUsd);
+    const deadline = Number(computeExperiment.deadlineSeconds);
+    if (!Number.isFinite(spendCap) || spendCap <= 0) {
+      setPreflightResult(null);
+      return;
+    }
+    if (!Number.isInteger(deadline) || deadline <= 0) {
+      setPreflightResult(null);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      setPreflightLoading(true);
+      setPreflightError(null);
+      computeExperimentPreflight(
+        {
+          github_repo: repo,
+          ...(computeExperiment.accelerator.trim() ? { accelerator: computeExperiment.accelerator.trim() } : {}),
+          ...(computeExperiment.machineType.trim() ? { machine_type: computeExperiment.machineType.trim() } : {}),
+          spend_cap_usd: spendCap,
+          deadline_seconds: deadline,
+          ...(computeExperiment.provisioningModel !== 'STANDARD' ? { provisioning_model: computeExperiment.provisioningModel } : {}),
+        },
+        controller.signal,
+      ).then(result => {
+        setPreflightResult(result);
+        setPreflightLoading(false);
+      }).catch(e => {
+        if (e instanceof Error && e.name === 'AbortError') return;
+        setPreflightError(e instanceof Error ? e.message : 'Preflight check failed');
+        setPreflightLoading(false);
+      });
+    }, 500);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [newTaskType, newTaskRepo, computeExperiment.accelerator, computeExperiment.machineType, computeExperiment.spendCapUsd, computeExperiment.deadlineSeconds, computeExperiment.provisioningModel]);
 
   const getDefaultBranchForRepo = (repo: string) => {
     const repoMeta = repoOptions.find(r => r.full_name === repo);
@@ -307,6 +367,21 @@ export function useTaskModal(
   // immediate inline error instead of a round-trip rejection. Returns nothing;
   // surfaces all outcomes through addToast.
   const handleCreateComputeExperiment = async () => {
+    // Block submission when a resolved preflight verdict marks the selected
+    // hardware as outside the project's allowed set. A fetch error (preflightError
+    // set, preflightResult null) degrades gracefully — the server still enforces
+    // the policy, so we don't hard-block on a transient preflight failure.
+    if (preflightResult && !preflightResult.in_policy) {
+      const allowed =
+        preflightResult.allowed_accelerator_types?.join(', ') ||
+        preflightResult.allowed_machine_types?.join(', ') ||
+        'none configured';
+      addToast(
+        `Hardware is outside this project's policy. Allowed: ${allowed}`,
+        'error',
+      );
+      return;
+    }
     const command = computeExperiment.command.trim();
     if (!command) {
       addToast('Command is required for compute experiments', 'error');
@@ -610,6 +685,7 @@ export function useTaskModal(
     setNewTaskRepo, setNewTaskBranch, setNewTaskTitle, setNewTaskPrompt,
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     computeExperiment, setComputeExperiment,
+    preflightResult, preflightLoading, preflightError,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
     launchableTaskTypeOptions,
