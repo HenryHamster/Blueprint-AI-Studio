@@ -48,7 +48,7 @@ function SpawnSignalBadges({ task }: { task: Task }) {
       {lowConfidence && (
         <span
           title={lowConfTooltip}
-          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-orange-500/10 border-orange-500/20 text-orange-400"
+          className="inline-flex items-center text-ui-sm font-medium border px-1.5 py-0.5 rounded bg-orange-500/10 border-orange-500/20 text-orange-400"
         >
           {lowConfLabel}
         </span>
@@ -56,7 +56,7 @@ function SpawnSignalBadges({ task }: { task: Task }) {
       {autoDecomposed && (
         <span
           title="Finding was auto-decomposed by co-change clustering"
-          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-neutral-700/30 border-neutral-600/30 text-neutral-400"
+          className="inline-flex items-center text-ui-sm font-medium border px-1.5 py-0.5 rounded bg-neutral-700/30 border-neutral-600/30 text-neutral-400"
         >
           auto-split
         </span>
@@ -64,7 +64,7 @@ function SpawnSignalBadges({ task }: { task: Task }) {
       {mediumExploration && (
         <span
           title="Medium-scope task kept despite low confidence as an exploration bypass"
-          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-neutral-700/30 border-neutral-600/30 text-neutral-400"
+          className="inline-flex items-center text-ui-sm font-medium border px-1.5 py-0.5 rounded bg-neutral-700/30 border-neutral-600/30 text-neutral-400"
         >
           explore
         </span>
@@ -72,7 +72,7 @@ function SpawnSignalBadges({ task }: { task: Task }) {
       {spawnGate.kind === 'fail-open-pass' && (
         <span
           title={spawnGate.reason ?? 'Passed by fail-open — no challenger verdict was returned for this finding'}
-          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-amber-500/10 border-amber-500/20 text-amber-400"
+          className="inline-flex items-center text-ui-sm font-medium border px-1.5 py-0.5 rounded bg-amber-500/10 border-amber-500/20 text-amber-400"
         >
           fail-open
         </span>
@@ -80,7 +80,7 @@ function SpawnSignalBadges({ task }: { task: Task }) {
       {spawnGate.kind === 'challenged-pass' && (
         <span
           title={spawnGate.reason ?? 'Challenger confirmed this finding as actionable'}
-          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+          className="inline-flex items-center text-ui-sm font-medium border px-1.5 py-0.5 rounded bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
         >
           gate ✓
         </span>
@@ -110,7 +110,7 @@ function FixLoopBadge({ summary }: { summary: FixLoopSummary[] }) {
           <span
             key={entry.loop}
             title={tooltip}
-            className={`inline-flex items-center gap-0.5 text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass}`}
+            className={`inline-flex items-center gap-0.5 text-ui-sm font-medium border px-1.5 py-0.5 rounded ${colorClass}`}
           >
             <AlertTriangle className="w-3 h-3 shrink-0" />
             {label}
@@ -428,7 +428,7 @@ export function TaskTypeBadge({ taskType, expanded }: { taskType?: TaskType; exp
   const label = getLabel(taskType);
   return (
     <span
-      className={`group/badge ${style.bg} ${style.text} border text-[10px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-0 hover:gap-1 p-1 hover:px-2 hover:py-0.5 transition-all duration-150 ${expanded ? 'gap-1 px-2 py-0.5' : ''}`}
+      className={`group/badge ${style.bg} ${style.text} border text-ui-sm uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-0 hover:gap-1 p-1 hover:px-2 hover:py-0.5 transition-all duration-150 ${expanded ? 'gap-1 px-2 py-0.5' : ''}`}
       title={label}
     >
       <Icon className="w-3 h-3 shrink-0" />
@@ -449,9 +449,9 @@ export function ResearchFindings({ findings }: { findings: ResearchFinding[] }) 
       <div className={`space-y-1 ${expanded ? 'max-h-64 overflow-y-auto custom-scrollbar' : ''}`}>
         {items.map((f, i) => (
           <div key={i} className="text-neutral-300">
-            <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 ${f.risk === 'high' ? 'bg-red-900/40 text-red-400' : f.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{f.scope}/{f.risk}</span>
+            <span className={`inline-block text-ui-xs uppercase px-1 rounded mr-1 ${f.risk === 'high' ? 'bg-red-900/40 text-red-400' : f.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{f.scope}/{f.risk}</span>
             {f.finding_challenge && (
-              <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 border ${
+              <span className={`inline-block text-ui-xs uppercase px-1 rounded mr-1 border ${
                 f.finding_challenge.agreement === 'agrees' ? 'bg-emerald-900/30 text-emerald-500 border-emerald-700/30' :
                 f.finding_challenge.agreement === 'disagrees' ? 'bg-red-900/30 text-red-400 border-red-700/30' :
                 'bg-neutral-800 text-neutral-500 border-neutral-700/30'
@@ -463,7 +463,7 @@ export function ResearchFindings({ findings }: { findings: ResearchFinding[] }) 
             )}
             {f.title}
             {expanded && f.description ? (
-              <div className="text-[10px] text-neutral-500 ml-1 mt-0.5">{f.description}</div>
+              <div className="text-ui-sm text-neutral-500 ml-1 mt-0.5">{f.description}</div>
             ) : null}
           </div>
         ))}
@@ -471,7 +471,7 @@ export function ResearchFindings({ findings }: { findings: ResearchFinding[] }) 
       {findings.length > 5 ? (
         <button
           onClick={() => setExpanded(!expanded)}
-          className="text-[10px] text-neutral-500 hover:text-neutral-300 mt-1 transition-colors"
+          className="text-ui-sm text-neutral-500 hover:text-neutral-300 mt-1 transition-colors"
         >
           {expanded ? 'Show less' : `Show all ${findings.length} findings`}
         </button>
@@ -492,7 +492,7 @@ export function StatusBadge({ status }: { status: TaskStatus }) {
   const Icon = cfg.icon;
   return (
     <span
-      className={`group/status inline-flex items-center gap-0 hover:gap-1 ${taskStatusBadgeClasses(status)} text-[10px] uppercase tracking-wider p-1 hover:px-2 hover:py-0.5 rounded font-semibold whitespace-nowrap transition-all duration-150`}
+      className={`group/status inline-flex items-center gap-0 hover:gap-1 ${taskStatusBadgeClasses(status)} text-ui-sm uppercase tracking-wider p-1 hover:px-2 hover:py-0.5 rounded font-semibold whitespace-nowrap transition-all duration-150`}
       title={cfg.label}
     >
       <Icon className={`w-3 h-3 shrink-0 ${cfg.spin ? 'animate-spin' : ''}`} />
@@ -513,7 +513,7 @@ function ErrorLogsBlock({ errorLogs }: { errorLogs: string }) {
   };
 
   return (
-    <div className="bg-red-950/30 text-red-400 text-[11px] p-2 rounded mb-2 border border-red-900/30 font-mono max-h-20 overflow-y-auto relative group">
+    <div className="bg-red-950/30 text-red-400 text-ui-md p-2 rounded mb-2 border border-red-900/30 font-mono max-h-20 overflow-y-auto relative group">
       {/* eslint-disable-next-line viewport/min-touch-target -- dense toolbar */}
       <button
         onClick={(e) => { e.stopPropagation(); handleCopy(); }}
@@ -532,7 +532,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   const subtasks = planOutput.subtasks as Record<string, unknown>[] | undefined;
   if (!subtasks) return null;
   return (
-    <div className="bg-purple-950/20 text-purple-300 text-[11px] p-2.5 rounded-lg mb-3 border border-purple-900/30 max-h-32 overflow-y-auto">
+    <div className="bg-purple-950/20 text-purple-300 text-ui-md p-2.5 rounded-lg mb-3 border border-purple-900/30 max-h-32 overflow-y-auto">
       <span className="font-semibold block mb-1 text-purple-400 font-sans">Plan ({subtasks.length} subtasks):</span>
       {subtasks.map((s, i) => (
         <div key={i} className="mb-0.5 text-neutral-300 font-mono">
@@ -792,7 +792,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           {isActive && task.last_heartbeat && (
             <div className="flex items-center gap-0.5" title={heartbeat.text}>
               <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${heartbeat.color}`} />
-              {hbAgeText && <span className={`text-[10px] font-mono ${hbAgeColor}`}>{hbAgeText}</span>}
+              {hbAgeText && <span className={`text-ui-sm font-mono ${hbAgeColor}`}>{hbAgeText}</span>}
             </div>
           )}
         </div>
@@ -800,18 +800,18 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       <div className="flex items-center gap-1.5 flex-wrap mb-1.5">
         <TaskTypeBadge taskType={task.task_type} />
         {task.requires_approval && (
-          <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1">
+          <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-ui-sm uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1">
             <Shield className="w-3 h-3" />Approval
           </span>
         )}
-        <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${(task.attempt_count ?? 0) > 0 ? 'bg-neutral-800 text-neutral-300' : 'bg-neutral-800/50 text-neutral-500'}`}>
+        <span className={`text-ui-sm px-1.5 py-0.5 rounded font-mono ${(task.attempt_count ?? 0) > 0 ? 'bg-neutral-800 text-neutral-300' : 'bg-neutral-800/50 text-neutral-500'}`}>
           #{(task.attempt_count ?? 0) + 1}
         </span>
         {task.fix_loop_summary && task.fix_loop_summary.length > 0 && (
           <FixLoopBadge summary={task.fix_loop_summary} />
         )}
         {(blockingCount ?? 0) > 0 && (task.status === 'FAILED' || task.status === 'CANCELLED') && (
-          <span className="inline-flex items-center gap-1 text-[10px] font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded">
+          <span className="inline-flex items-center gap-1 text-ui-sm font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded">
             <AlertTriangle className="w-3 h-3" />
             Blocking {blockingCount} task{(blockingCount ?? 0) > 1 ? 's' : ''}
           </span>
@@ -821,7 +821,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); onDirectionClick(directionId); }}
-              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 rounded px-1 -mx-1 transition-colors cursor-pointer min-h-[44px] sm:min-h-auto"
+              className="inline-flex items-center gap-0.5 text-ui-sm text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 rounded px-1 -mx-1 transition-colors cursor-pointer min-h-[44px] sm:min-h-auto"
               title={directionTooltip}
             >
               <Compass className="w-3 h-3" />
@@ -829,7 +829,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             </button>
           ) : (
             <span
-              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500"
+              className="inline-flex items-center gap-0.5 text-ui-sm text-neutral-500"
               title={directionTooltip}
             >
               <Compass className="w-3 h-3" />
@@ -852,7 +852,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           if (!label) return null;
           return (
             <span
-              className={`inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border ${verdictToneBadgeClass(tone)}`}
+              className={`inline-flex items-center text-ui-sm font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border ${verdictToneBadgeClass(tone)}`}
               title={`Evaluation verdict: ${label}`}
             >
               {label}
@@ -864,7 +864,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             const label = humanizeUnverifiedReason(task.unverified_merge_reason);
             return (
               <span
-                className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/20 text-amber-400"
+                className="inline-flex items-center text-ui-sm font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/20 text-amber-400"
                 title={`Merge unverified: ${label}`}
               >
                 <AlertTriangle className="w-3 h-3 mr-1 shrink-0" />
@@ -878,7 +878,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           if (landedOnIntegration === false || nonMergeReason) {
             return (
               <span
-                className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-neutral-500/10 border-neutral-500/20 text-neutral-400"
+                className="inline-flex items-center text-ui-sm font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-neutral-500/10 border-neutral-500/20 text-neutral-400"
                 title={nonMergeReason ? `Completed without merge: ${nonMergeReason}` : 'PR closed without merge'}
               >
                 <X className="w-3 h-3 mr-1 shrink-0" />
@@ -888,7 +888,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           }
           return (
             <span
-              className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+              className="inline-flex items-center text-ui-sm font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
               title="Merge verified by tests"
             >
               <ShieldCheck className="w-3 h-3 mr-1 shrink-0" />
@@ -898,7 +898,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         })() : null}
         {task.status === 'COMPLETED' && task.post_commit_pending && (
           <span
-            className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/20 text-amber-400"
+            className="inline-flex items-center text-ui-sm font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/20 text-amber-400"
             title="Post-commit side effects (PR submission, child spawns, merge) are queued and have not fired yet"
           >
             <Clock className="w-3 h-3 mr-1 shrink-0" />
@@ -920,7 +920,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-neutral-400 opacity-75" />
             <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-neutral-500" />
           </span>
-          <span className="text-[11px] text-neutral-400 truncate">{parsePhase(task.latest_status_message)}</span>
+          <span className="text-ui-md text-neutral-400 truncate">{parsePhase(task.latest_status_message)}</span>
         </div>
       )}
 
@@ -939,14 +939,14 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       )}
 
       {!compact && task.latest_status_message ? (
-        <div className="bg-neutral-950 text-neutral-400 text-[11px] rounded-lg mb-2 border border-neutral-800/50 font-mono">
+        <div className="bg-neutral-950 text-neutral-400 text-ui-md rounded-lg mb-2 border border-neutral-800/50 font-mono">
           <button
             data-viewport-allow-small-target
             onClick={() => setStatusExpanded(!statusExpanded)}
             className="w-full flex items-center gap-1.5 p-2.5 text-left hover:text-neutral-300 transition-colors"
           >
             <ChevronRight className={`w-3 h-3 shrink-0 text-neutral-500 transition-transform ${statusExpanded ? 'rotate-90' : ''}`} />
-            <span className="font-semibold text-neutral-500 font-sans text-[11px]">Agent Status:</span>
+            <span className="font-semibold text-neutral-500 font-sans text-ui-md">Agent Status:</span>
             {!statusExpanded && (
               <span className="truncate ml-1">&gt; {task.latest_status_message.split('\n')[0].slice(0, 80)}</span>
             )}
@@ -974,7 +974,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           href={`${task.repo_url}/pull/${task.payloads[0].pr_number}`}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-neutral-400 hover:text-neutral-200 text-[11px] mb-2 transition-colors"
+          className="inline-flex items-center gap-1 text-neutral-400 hover:text-neutral-200 text-ui-md mb-2 transition-colors"
         >
           <ExternalLink className="w-3 h-3" />
           PR #{task.payloads[0].pr_number as number}
@@ -987,12 +987,12 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             type="button"
             data-viewport-allow-small-target
             onClick={(e) => { e.stopPropagation(); window.dispatchEvent(new CustomEvent('blueprint:failure-class-filter', { detail: task.failure_class })); }}
-            className={`inline-flex items-center text-[10px] px-1.5 py-0.5 rounded font-semibold hover:opacity-80 transition-opacity ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}
+            className={`inline-flex items-center text-ui-sm px-1.5 py-0.5 rounded font-semibold hover:opacity-80 transition-opacity ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}
             title={FAILURE_CLASS_CONFIG[task.failure_class].hint}
           >
             {FAILURE_CLASS_CONFIG[task.failure_class].label}
           </button>
-          <p className="text-[10px] text-neutral-500 mt-0.5">{FAILURE_CLASS_CONFIG[task.failure_class].suggestion}</p>
+          <p className="text-ui-sm text-neutral-500 mt-0.5">{FAILURE_CLASS_CONFIG[task.failure_class].suggestion}</p>
           {(() => {
             const retryAfter = task.context?.retry_after as string | undefined;
             if (!retryAfter) return null;
@@ -1000,9 +1000,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             const isFuture = retryTime > now30;
             if (isFuture) {
               const mins = Math.ceil((retryTime - now30) / 60000);
-              return <p className="text-[10px] text-emerald-400 mt-0.5">Auto-retrying in {mins}m</p>;
+              return <p className="text-ui-sm text-emerald-400 mt-0.5">Auto-retrying in {mins}m</p>;
             }
-            return <p className="text-[10px] text-amber-400 mt-0.5">Auto-retry pending</p>;
+            return <p className="text-ui-sm text-amber-400 mt-0.5">Auto-retry pending</p>;
           })()}
         </div>
       ) : null}
@@ -1012,7 +1012,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       ) : null}
 
       {task.research_findings ? (
-        <div className="bg-cyan-950/20 text-cyan-300 text-[11px] p-2 rounded mb-2 border border-cyan-900/30 font-mono">
+        <div className="bg-cyan-950/20 text-cyan-300 text-ui-md p-2 rounded mb-2 border border-cyan-900/30 font-mono">
           <span
             onClick={(e) => { e.stopPropagation(); setFindingsExpanded(!findingsExpanded); }}
             className="flex items-center gap-1 text-cyan-400 font-sans cursor-pointer mb-1"
@@ -1034,17 +1034,17 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         <div className="bg-amber-950/30 border border-amber-900/40 rounded-lg px-2.5 py-2 mb-2">
           <div className="flex items-center gap-1.5 mb-0.5">
             <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-            <span className="text-[11px] font-semibold text-amber-400">Blocked</span>
+            <span className="text-ui-md font-semibold text-amber-400">Blocked</span>
             {task.blocker_kind ? (
-              <span className="text-[9px] uppercase tracking-wider font-mono bg-amber-500/10 text-amber-300 border border-amber-500/20 px-1.5 py-0.5 rounded">
+              <span className="text-ui-xs uppercase tracking-wider font-mono bg-amber-500/10 text-amber-300 border border-amber-500/20 px-1.5 py-0.5 rounded">
                 {task.blocker_kind}
               </span>
             ) : null}
           </div>
           {task.blocked_reason ? (
-            <p className="text-[11px] text-amber-200/80 break-words">{task.blocked_reason}</p>
+            <p className="text-ui-md text-amber-200/80 break-words">{task.blocked_reason}</p>
           ) : (
-            <p className="text-[11px] text-amber-200/60 italic">Parked on an unmet precondition</p>
+            <p className="text-ui-md text-amber-200/60 italic">Parked on an unmet precondition</p>
           )}
           {(() => {
             if (!task.recheck_after) return null;
@@ -1052,9 +1052,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             const isFuture = recheckTime > now30;
             if (isFuture) {
               const mins = Math.max(1, Math.ceil((recheckTime - now30) / 60000));
-              return <p className="text-[10px] text-amber-400/80 mt-0.5 font-mono">Rechecks in {mins}m</p>;
+              return <p className="text-ui-sm text-amber-400/80 mt-0.5 font-mono">Rechecks in {mins}m</p>;
             }
-            return <p className="text-[10px] text-amber-400/80 mt-0.5 font-mono">Recheck due</p>;
+            return <p className="text-ui-sm text-amber-400/80 mt-0.5 font-mono">Recheck due</p>;
           })()}
         </div>
       ) : null}
@@ -1063,14 +1063,14 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         <div className="bg-violet-950/30 border border-violet-900/40 rounded-lg px-2.5 py-2 mb-2">
           <div className="flex items-center gap-1.5 mb-0.5">
             <Clock className="w-3.5 h-3.5 text-violet-400 shrink-0" />
-            <span className="text-[11px] font-semibold text-violet-400">Parked</span>
+            <span className="text-ui-md font-semibold text-violet-400">Parked</span>
             {task.wake_registration?.wake_source_kind ? (
-              <span className="text-[9px] uppercase tracking-wider font-mono bg-violet-500/10 text-violet-300 border border-violet-500/20 px-1.5 py-0.5 rounded">
+              <span className="text-ui-xs uppercase tracking-wider font-mono bg-violet-500/10 text-violet-300 border border-violet-500/20 px-1.5 py-0.5 rounded">
                 {task.wake_registration.wake_source_kind}
               </span>
             ) : null}
             {task.wake_registration?.delivery_state ? (
-              <span className={`text-[9px] uppercase tracking-wider font-mono px-1.5 py-0.5 rounded border ${
+              <span className={`text-ui-xs uppercase tracking-wider font-mono px-1.5 py-0.5 rounded border ${
                 task.wake_registration.delivery_state === 'DELIVERED' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20' :
                 task.wake_registration.delivery_state === 'FIRED' ? 'bg-blue-500/10 text-blue-300 border-blue-500/20' :
                 task.wake_registration.delivery_state === 'EXPIRED' || task.wake_registration.delivery_state === 'FAILED' ? 'bg-red-500/10 text-red-300 border-red-500/20' :
@@ -1081,7 +1081,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             ) : null}
           </div>
           {task.park_reason ? (
-            <p className="text-[11px] text-violet-200/80 break-words">{task.park_reason}</p>
+            <p className="text-ui-md text-violet-200/80 break-words">{task.park_reason}</p>
           ) : null}
           {(() => {
             if (!task.wake_registration?.deadline_at) return null;
@@ -1089,21 +1089,21 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             const isFuture = deadlineTime > now30;
             if (isFuture) {
               const mins = Math.max(1, Math.ceil((deadlineTime - now30) / 60000));
-              return <p className="text-[10px] text-violet-400/80 mt-0.5 font-mono">Wake deadline in {mins}m</p>;
+              return <p className="text-ui-sm text-violet-400/80 mt-0.5 font-mono">Wake deadline in {mins}m</p>;
             }
-            return <p className="text-[10px] text-red-400/80 mt-0.5 font-mono">Wake deadline passed</p>;
+            return <p className="text-ui-sm text-red-400/80 mt-0.5 font-mono">Wake deadline passed</p>;
           })()}
         </div>
       ) : null}
 
       {task.depends_on && task.depends_on.length > 0 ? (
-        <div className="text-[10px] text-neutral-500 mb-2 font-mono flex items-center gap-1">
+        <div className="text-ui-sm text-neutral-500 mb-2 font-mono flex items-center gap-1">
           <GitFork className="w-3 h-3" />
           Waiting on {task.depends_on.length} task{task.depends_on.length > 1 ? 's' : ''}
         </div>
       ) : null}
 
-      <div className="flex items-center justify-between text-[10px] text-neutral-500 mt-auto pt-2 border-t border-neutral-800">
+      <div className="flex items-center justify-between text-ui-sm text-neutral-500 mt-auto pt-2 border-t border-neutral-800">
         <div className="flex items-center gap-1.5">
           <Clock className="w-3 h-3" />
           {parseTimestamp(task.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -1129,14 +1129,14 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           {isActive ? (
             <div className="flex items-center gap-1.5" title={heartbeat.text}>
               <div className={`w-1.5 h-1.5 rounded-full ${heartbeat.color}`} />
-              {hbAgeText && <span className={`text-[10px] font-mono ${hbAgeColor}`}>{hbAgeText}</span>}
+              {hbAgeText && <span className={`text-ui-sm font-mono ${hbAgeColor}`}>{hbAgeText}</span>}
             </div>
           ) : null}
 
           {task.status !== 'QUEUED' && onTrack ? (
             <button
               onClick={(e) => { e.stopPropagation(); onTrack(task); }}
-              className={`flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors text-[10px] min-h-[44px] sm:min-h-auto ${isTracked ? 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800'}`}
+              className={`flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors text-ui-sm min-h-[44px] sm:min-h-auto ${isTracked ? 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800'}`}
               title={isTracked ? 'Tracking live' : 'Track task'}
             >
               <Radio className="w-3 h-3" />
@@ -1260,7 +1260,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                   onChange={e => setEditPrompt(e.target.value)}
                   className={`w-full bg-neutral-950 text-neutral-100 rounded px-2 py-1.5 text-xs resize-y focus:outline-none focus:ring-1 focus:ring-blue-500/50 min-h-[120px] font-mono border ${editPrompt.trim() === '' ? 'border-red-500/70' : 'border-neutral-700'}`}
                 />
-                <div className="text-[10px] text-neutral-500">{editPrompt.length} characters</div>
+                <div className="text-ui-sm text-neutral-500">{editPrompt.length} characters</div>
                 <div className="flex gap-2">
                   <button onClick={() => { onEditPrompt(task.id, editPrompt); setEditing(false); }}
                     disabled={!!actionLoading || editPrompt.trim() === ''}

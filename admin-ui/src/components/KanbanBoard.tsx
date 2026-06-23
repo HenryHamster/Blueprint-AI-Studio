@@ -388,7 +388,7 @@ export function KanbanBoard({
                 }`}
               >
                 <span>{col.label}</span>
-                <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${isActive ? 'bg-neutral-600 text-neutral-200' : 'bg-neutral-800 text-neutral-500'}`}>
+                <span className={`text-ui-sm px-1.5 py-0.5 rounded-full ${isActive ? 'bg-neutral-600 text-neutral-200' : 'bg-neutral-800 text-neutral-500'}`}>
                   {count}
                 </span>
               </button>
@@ -451,7 +451,7 @@ export function KanbanBoard({
           return (
             <div key={col.id} className="flex-1 overflow-y-auto p-3 custom-scrollbar">
               <div className="flex items-center justify-between mb-3">
-                <h2 className={`text-[11px] font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'}`}>{col.label}</h2>
+                <h2 className={`text-ui-md font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'}`}>{col.label}</h2>
                 <div className="flex items-center gap-1.5">
                   {selectionMode && columnTasks.length > 0 && (
                     <ColumnSelectCheckbox
@@ -463,7 +463,7 @@ export function KanbanBoard({
                   <span title={`Sorted: ${SORT_LABELS[sortBy]}`} className="text-neutral-600 flex items-center">
                     <ArrowDownUp className="w-3 h-3" />
                   </span>
-                  <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
+                  <span className="text-ui-sm bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
                     {columnTasks.length}
                   </span>
                   {isArchivable && columnTasks.length > 0 && (

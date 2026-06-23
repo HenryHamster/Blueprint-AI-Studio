@@ -45,7 +45,7 @@ function MergeGradeGateSettings() {
   return (
     <div>
       <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Release Gate Thresholds</h3>
-      <p className="text-[11px] text-neutral-500 mb-3">
+      <p className="text-ui-md text-neutral-500 mb-3">
         Arm the blind merge-grade hard block by raising <code className="font-mono">merge_grade_block_threshold</code> above <code className="font-mono">0.0</code> (typically <code className="font-mono">1.0</code>).
         When the blind merge-grade verdict is <em>misses</em> and this threshold is &gt;&nbsp;0, qualification is blocked.
         Default <code className="font-mono">0.0</code> ships dark (gate never fires).
@@ -65,7 +65,7 @@ function MergeGradeGateSettings() {
         >
           {saving ? 'Saving…' : saveOk ? 'Saved' : 'Save'}
         </button>
-        <span className="text-[11px] text-neutral-500">current: <span className="font-mono text-neutral-300">{threshold}</span></span>
+        <span className="text-ui-md text-neutral-500">current: <span className="font-mono text-neutral-300">{threshold}</span></span>
       </div>
       {saveError && <p className="text-xs text-red-400 mt-1">{saveError}</p>}
     </div>
@@ -137,7 +137,7 @@ export function DeploySection({
           <div className="space-y-3">
             <div className="grid grid-cols-3 gap-4 bg-neutral-900 rounded-lg border border-neutral-800 p-4">
               <div>
-                <span className="text-[11px] text-neutral-500 block mb-1">Status</span>
+                <span className="text-ui-md text-neutral-500 block mb-1">Status</span>
                 <span className={`text-sm font-semibold ${
                   deployState.status === 'STABLE' ? 'text-emerald-400' :
                   deployState.status === 'MONITORING' ? 'text-blue-400' :
@@ -147,17 +147,17 @@ export function DeploySection({
                 }`}>{deployState.status}</span>
               </div>
               <div>
-                <span className="text-[11px] text-neutral-500 block mb-1">{deployState.rolled_back_from_sha ? 'Live SHA' : 'SHA'}</span>
+                <span className="text-ui-md text-neutral-500 block mb-1">{deployState.rolled_back_from_sha ? 'Live SHA' : 'SHA'}</span>
                 <span className="text-sm text-neutral-300 font-mono">{deployState.current_sha?.slice(0, 8) || '\u2014'}</span>
                 {deployState.status === 'ROLLED_BACK' && deployState.rolled_back_from_sha && (
-                  <span className="text-[11px] text-red-400/80 font-mono block mt-0.5" title={deployState.rolled_back_from_sha}>
+                  <span className="text-ui-md text-red-400/80 font-mono block mt-0.5" title={deployState.rolled_back_from_sha}>
                     rolled back from {deployState.rolled_back_from_sha.slice(0, 8)}
                   </span>
                 )}
               </div>
               {(deployState.failure_rate ?? 0) > 0 && (
                 <div>
-                  <span className="text-[11px] text-neutral-500 block mb-1">Failure Rate</span>
+                  <span className="text-ui-md text-neutral-500 block mb-1">Failure Rate</span>
                   <span className={`text-sm font-mono ${(deployState.failure_rate ?? 0) > 0.3 ? 'text-red-400' : 'text-neutral-300'}`}>
                     {((deployState.failure_rate ?? 0) * 100).toFixed(0)}%
                   </span>
@@ -177,7 +177,7 @@ export function DeploySection({
                     style={{ width: `${deployState.monitoring_window.percent}%` }}
                   />
                 </div>
-                <div className="flex items-center justify-between text-[11px]">
+                <div className="flex items-center justify-between text-ui-md">
                   <span className="text-neutral-500">
                     {Math.floor(deployState.monitoring_window.elapsed_seconds / 60)}m / {Math.floor(deployState.monitoring_window.total_seconds / 60)}m elapsed
                   </span>
@@ -200,7 +200,7 @@ export function DeploySection({
               const externalHealth = deployState.external_health;
               return (
               <div className="bg-neutral-900 rounded-lg border border-neutral-800 p-4 space-y-2">
-                <div className="text-[11px] text-neutral-500 uppercase tracking-wider mb-1">External Dependencies</div>
+                <div className="text-ui-md text-neutral-500 uppercase tracking-wider mb-1">External Dependencies</div>
                 {EXTERNAL_DEP_ORDER.filter((dep) => {
                   if (!(dep in externalHealth)) return false;
                   return typeof externalHealth[dep] === 'boolean';
@@ -217,23 +217,23 @@ export function DeploySection({
                         </span>
                       </div>
                       {error && (
-                        <p className="text-[11px] text-red-400/70 bg-red-950/20 rounded px-2 py-1 break-all">{String(error)}</p>
+                        <p className="text-ui-md text-red-400/70 bg-red-950/20 rounded px-2 py-1 break-all">{String(error)}</p>
                       )}
                     </div>
                   );
                 })}
                 {typeof deployState.external_health?.last_check === 'string' && (
                   <div className="flex items-center justify-between mt-1 pt-1 border-t border-neutral-800">
-                    <span className="text-[11px] text-neutral-600">Last check</span>
-                    <span className="text-[11px] text-neutral-500 font-mono">
+                    <span className="text-ui-md text-neutral-600">Last check</span>
+                    <span className="text-ui-md text-neutral-500 font-mono">
                       {parseTimestamp(deployState.external_health.last_check as string).toLocaleTimeString()}
                     </span>
                   </div>
                 )}
                 {nextCheckSeconds !== null && (
                   <div className="flex items-center justify-between">
-                    <span className="text-[11px] text-neutral-600">Next check</span>
-                    <span className="text-[11px] text-blue-400 font-mono">
+                    <span className="text-ui-md text-neutral-600">Next check</span>
+                    <span className="text-ui-md text-blue-400 font-mono">
                       {nextCheckSeconds === 0 ? 'running…' : `in ${nextCheckSeconds}s`}
                       <span className="text-neutral-600"> (every {deployState.health_check_interval_seconds ?? 60}s)</span>
                     </span>
@@ -241,8 +241,8 @@ export function DeploySection({
                 )}
                 {(deployState.health_failure_streak ?? 0) > 0 && (
                   <div className="flex items-center justify-between">
-                    <span className="text-[11px] text-neutral-600">Failure streak</span>
-                    <span className="text-[11px] text-amber-400 font-mono">
+                    <span className="text-ui-md text-neutral-600">Failure streak</span>
+                    <span className="text-ui-md text-amber-400 font-mono">
                       {deployState.health_failure_streak}/{deployState.health_failure_streak_threshold ?? 3} before pause
                     </span>
                   </div>
@@ -265,7 +265,7 @@ export function DeploySection({
                   </span>
                 </div>
                 {deployState.health_recovery_flap_escalated && (
-                  <p className="text-[11px] text-orange-400 bg-orange-950/20 rounded px-2 py-1 flex items-start gap-1.5">
+                  <p className="text-ui-md text-orange-400 bg-orange-950/20 rounded px-2 py-1 flex items-start gap-1.5">
                     <Zap className="w-3 h-3 mt-0.5 shrink-0" />
                     <span>
                       Recovery bar raised to {deployState.health_recovery_streak_required ?? 3} because the
@@ -282,7 +282,7 @@ export function DeploySection({
                 </div>
                 {Array.isArray(deployState.health_recovery_history) && (
                   <div className="flex items-center justify-between pt-1">
-                    <span className="text-[11px] text-neutral-600">Last {deployState.health_recovery_history_size ?? 5} probes</span>
+                    <span className="text-ui-md text-neutral-600">Last {deployState.health_recovery_history_size ?? 5} probes</span>
                     <div className="flex gap-1">
                       {Array.from({ length: deployState.health_recovery_history_size ?? 5 }).map((_, i) => {
                         const hist = deployState.health_recovery_history ?? [];
@@ -309,13 +309,13 @@ export function DeploySection({
                 <AlertTriangle className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />
                 <div className="space-y-0.5 min-w-0">
                   <p className="text-xs font-semibold text-red-400">Last rollback failed — traffic still serves the current revision</p>
-                  <p className="text-[11px] text-red-400/80 break-all">
+                  <p className="text-ui-md text-red-400/80 break-all">
                     Traffic still serves{' '}
                     <span className="font-mono">{failedRollback.serving_sha?.slice(0, 8) ?? 'the current revision'}</span>
                     . Retry the rollback below.
                   </p>
                   {failedRollback.gcloud_error && (
-                    <p className="text-[11px] text-red-400/70 font-mono break-all">{failedRollback.gcloud_error}</p>
+                    <p className="text-ui-md text-red-400/70 font-mono break-all">{failedRollback.gcloud_error}</p>
                   )}
                 </div>
               </div>

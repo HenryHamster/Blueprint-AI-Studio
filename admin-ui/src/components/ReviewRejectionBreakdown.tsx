@@ -19,13 +19,13 @@ export function ReviewRejectionBreakdown({ digest }: { digest: DigestData | null
   return (
     <section>
       <div className="flex flex-wrap gap-1.5 items-center">
-        <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Review Rejection</span>
+        <span className="text-ui-sm text-neutral-500 uppercase tracking-wide mr-1">Review Rejection</span>
         {allKeys.map(k => {
           const pct = cats[k];
           if (pct == null) return null;
           const color = REVIEW_CAT_COLORS[k] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
           return (
-            <span key={k} className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${color}`} title={`${k}: ${Math.round(pct * 100)}% of first-attempt rejections`}>
+            <span key={k} className={`inline-flex items-center gap-1 text-ui-sm font-semibold px-2 py-0.5 rounded border ${color}`} title={`${k}: ${Math.round(pct * 100)}% of first-attempt rejections`}>
               {k}
               <span className="font-bold">{Math.round(pct * 100)}%</span>
             </span>

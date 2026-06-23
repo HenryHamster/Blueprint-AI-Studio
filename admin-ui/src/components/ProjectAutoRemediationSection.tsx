@@ -105,7 +105,7 @@ export function ProjectAutoRemediationSection({
       {/* Enable/disable toggle */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Auto-Remediation</h3>
-        <p className="text-[11px] text-neutral-600 mb-3">
+        <p className="text-ui-md text-neutral-600 mb-3">
           When enabled, Blueprint automatically opens fix PRs for CI failures on protected branches.
         </p>
         <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center justify-between">
@@ -124,7 +124,7 @@ export function ProjectAutoRemediationSection({
       {/* Branch whitelist */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-2">Protected Branches</h3>
-        <p className="text-[11px] text-neutral-600 mb-3">
+        <p className="text-ui-md text-neutral-600 mb-3">
           Auto-remediation only triggers for CI failures on these branches.
         </p>
         <div className="space-y-1.5 mb-2">
@@ -200,7 +200,7 @@ export function ProjectAutoRemediationSection({
         <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center justify-between">
           <div>
             <span className="text-xs text-neutral-300">Require human review before merge</span>
-            <p className="text-[11px] text-neutral-600 mt-0.5">Auto-remediation PRs will wait for approval before auto-merging.</p>
+            <p className="text-ui-md text-neutral-600 mt-0.5">Auto-remediation PRs will wait for approval before auto-merging.</p>
           </div>
           {/* reason: dense-UI toggle (h-5 w-9) — operator-density convention for settings panels */}
           <button
@@ -220,24 +220,24 @@ export function ProjectAutoRemediationSection({
           <div className="grid grid-cols-3 gap-2 mb-3">
             <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-center">
               <div className="text-lg font-semibold text-neutral-100">{stats.spawned_24h}</div>
-              <div className="text-[10px] text-neutral-500">spawned 24h</div>
+              <div className="text-ui-sm text-neutral-500">spawned 24h</div>
             </div>
             <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-center">
               <div className="text-lg font-semibold text-neutral-100">{stats.spawned_7d}</div>
-              <div className="text-[10px] text-neutral-500">spawned 7d</div>
+              <div className="text-ui-sm text-neutral-500">spawned 7d</div>
             </div>
             <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-center">
               <div className="text-lg font-semibold text-neutral-100">
                 {stats.success_rate !== null ? `${stats.success_rate}%` : '—'}
               </div>
-              <div className="text-[10px] text-neutral-500">success rate</div>
+              <div className="text-ui-sm text-neutral-500">success rate</div>
             </div>
           </div>
           {stats.recent_tasks.length > 0 && (
             <div className="space-y-1">
               {stats.recent_tasks.map(t => (
                 <div key={t.id} className="flex items-center gap-2 bg-neutral-900 border border-neutral-800 rounded px-3 py-1.5">
-                  <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${STATUS_BADGE[t.status] ?? 'bg-neutral-800 text-neutral-400'}`}>
+                  <span className={`text-ui-sm font-medium px-1.5 py-0.5 rounded ${STATUS_BADGE[t.status] ?? 'bg-neutral-800 text-neutral-400'}`}>
                     {t.status}
                   </span>
                   <span className="text-xs font-mono text-neutral-400 truncate flex-1">{t.branch || t.title}</span>
@@ -246,7 +246,7 @@ export function ProjectAutoRemediationSection({
             </div>
           )}
           {stats.spawned_7d === 0 && (
-            <p className="text-[11px] text-neutral-600">No auto-remediation tasks in the last 7 days.</p>
+            <p className="text-ui-md text-neutral-600">No auto-remediation tasks in the last 7 days.</p>
           )}
         </div>
       )}

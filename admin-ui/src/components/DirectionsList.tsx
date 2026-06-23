@@ -94,7 +94,7 @@ export function DirectionsList(props: DirectionsListProps) {
             <button
               key={cat}
               onClick={() => setCategoryFilter(cat)}
-              className={`text-[10px] px-2 py-0.5 rounded border font-medium transition-colors capitalize min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto ${
+              className={`text-ui-sm px-2 py-0.5 rounded border font-medium transition-colors capitalize min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto ${
                 categoryFilter === cat
                   ? cat === 'product' ? 'bg-emerald-950/60 border-emerald-900/50 text-emerald-400'
                     : cat === 'structural' ? 'bg-blue-950/60 border-blue-900/50 text-blue-400'
@@ -130,11 +130,11 @@ export function DirectionsList(props: DirectionsListProps) {
                     ? <ChevronRight className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
                     : <ChevronDown className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
                   }
-                  <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider group-hover:text-neutral-300 transition-colors">
+                  <span className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider group-hover:text-neutral-300 transition-colors">
                     {label} ({items.length})
                   </span>
                   {key === 'staged' && stageTargetVersion != null && (
-                    <span className="text-[10px] text-sky-400/70 normal-case">
+                    <span className="text-ui-sm text-sky-400/70 normal-case">
                       current open: v{stageTargetVersion}
                     </span>
                   )}

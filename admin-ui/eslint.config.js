@@ -38,7 +38,7 @@ export default defineConfig([
       'no-console': ['warn', { allow: ['warn', 'error'] }],
       'viewport/no-fixed-width': 'error',
       'viewport/min-touch-target': 'error',
-      'viewport/no-arbitrary-font-size': 'warn',
+      'viewport/no-arbitrary-font-size': 'error',
       'size/no-oversized-file': 'error',
     },
   },

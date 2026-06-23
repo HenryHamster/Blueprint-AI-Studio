@@ -75,7 +75,7 @@ export function ProjectIssueImplementationSection({
       {/* Enable/disable toggle */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Issue Implementation</h3>
-        <p className="text-[11px] text-neutral-600 mb-3">
+        <p className="text-ui-md text-neutral-600 mb-3">
           When enabled, Blueprint automatically spawns an implementation task when a GitHub issue is labeled with the trigger label.
         </p>
         <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center justify-between">
@@ -94,7 +94,7 @@ export function ProjectIssueImplementationSection({
       {/* Trigger label */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-2">Trigger Label</h3>
-        <p className="text-[11px] text-neutral-600 mb-3">
+        <p className="text-ui-md text-neutral-600 mb-3">
           GitHub issues labeled with this label will trigger Blueprint to create an implementation task.
         </p>
         <input
@@ -109,7 +109,7 @@ export function ProjectIssueImplementationSection({
       {/* Base branch — read-only; derived live from the project's integration branch */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-2">Base Branch</h3>
-        <p className="text-[11px] text-neutral-600 mb-3">
+        <p className="text-ui-md text-neutral-600 mb-3">
           Implementation PRs are based on the project's integration branch. Change it in the Integration Branch section.
         </p>
         <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center gap-2">

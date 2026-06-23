@@ -74,7 +74,7 @@ export function ProjectSwitcherDropdown({
               >
                 <span className="block truncate">{p.name ?? p.github_repo ?? p.id}</span>
                 {p.github_owner && p.github_repo && (
-                  <span className="block text-[10px] text-neutral-600 truncate">
+                  <span className="block text-ui-sm text-neutral-600 truncate">
                     {p.github_owner}/{p.github_repo}
                   </span>
                 )}

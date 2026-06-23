@@ -82,8 +82,8 @@ function GradeDistributionRow({
   mergeRate?: number | null;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
-      <span className={`px-1.5 py-0.5 rounded border text-[10px] font-medium w-14 text-center ${gradeColor(grade)}`}>
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-ui-md">
+      <span className={`px-1.5 py-0.5 rounded border text-ui-sm font-medium w-14 text-center ${gradeColor(grade)}`}>
         {grade}
       </span>
       <span className="text-neutral-300 font-mono">{count}</span>
@@ -137,30 +137,30 @@ function CycleHistorySparkline({
 
 function CritiqueRow({ critique }: { critique: RetirementCritique }) {
   return (
-    <div className="border border-neutral-800 rounded-lg p-3 space-y-1.5 text-[11px]">
+    <div className="border border-neutral-800 rounded-lg p-3 space-y-1.5 text-ui-md">
       <div className="flex items-center gap-2">
-        <span className="text-neutral-500 font-mono text-[10px]">{critique.direction_id ?? '—'}</span>
+        <span className="text-neutral-500 font-mono text-ui-sm">{critique.direction_id ?? '—'}</span>
         {critique.cycle_created_at && (
-          <span className="text-neutral-600 text-[10px]">
+          <span className="text-neutral-600 text-ui-sm">
             {new Date(critique.cycle_created_at).toLocaleDateString()}
           </span>
         )}
       </div>
       {critique.what_it_addressed && (
         <div>
-          <span className="text-neutral-500 uppercase tracking-wide text-[9px]">Addressed </span>
+          <span className="text-neutral-500 uppercase tracking-wide text-ui-xs">Addressed </span>
           <span className="text-neutral-300 line-clamp-2">{critique.what_it_addressed}</span>
         </div>
       )}
       {critique.pattern_that_produced_it && (
         <div>
-          <span className="text-neutral-500 uppercase tracking-wide text-[9px]">Pattern </span>
+          <span className="text-neutral-500 uppercase tracking-wide text-ui-xs">Pattern </span>
           <span className="text-neutral-400 line-clamp-2">{critique.pattern_that_produced_it}</span>
         </div>
       )}
       {critique.lesson && (
         <div>
-          <span className="text-neutral-500 uppercase tracking-wide text-[9px]">Lesson </span>
+          <span className="text-neutral-500 uppercase tracking-wide text-ui-xs">Lesson </span>
           <span className="text-neutral-200 line-clamp-2">{critique.lesson}</span>
         </div>
       )}
@@ -210,7 +210,7 @@ export function StrategicAuditPanel({ projectId, calibrationFloor = 0.05 }: Stra
 
   if (error) {
     return (
-      <div className="mt-4 text-[11px] text-red-400 bg-red-900/10 border border-red-800/30 rounded-lg p-3">
+      <div className="mt-4 text-ui-md text-red-400 bg-red-900/10 border border-red-800/30 rounded-lg p-3">
         {error}
       </div>
     );
@@ -229,11 +229,11 @@ export function StrategicAuditPanel({ projectId, calibrationFloor = 0.05 }: Stra
         const history = actionability.cycle_history ?? [];
         return (
           <div>
-            <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 flex flex-wrap items-center gap-x-2 gap-y-1">
+            <h3 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2 flex flex-wrap items-center gap-x-2 gap-y-1">
               <span>Research Actionability</span>
               <span
                 data-testid="calibration-badge"
-                className={`px-1.5 py-0.5 rounded border text-[10px] font-medium normal-case ${badge.className}`}
+                className={`px-1.5 py-0.5 rounded border text-ui-sm font-medium normal-case ${badge.className}`}
                 title={badge.tooltip}
               >
                 {badge.label}
@@ -263,7 +263,7 @@ export function StrategicAuditPanel({ projectId, calibrationFloor = 0.05 }: Stra
 
       {hasCritiques && (
         <div>
-          <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+          <h3 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
             Retirement Critiques
             <span className="ml-2 text-neutral-600 font-normal normal-case">
               ({critiques.length})

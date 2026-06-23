@@ -36,7 +36,7 @@ export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
 
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">System Status</h2>
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">System Status</h2>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
         {loading ? (
           <Skeleton className="h-16 w-full" />
@@ -57,7 +57,7 @@ export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
             )}
             {cycle && (
               <>
-                <div className="text-[10px] text-neutral-500 mt-2 flex items-center gap-2">
+                <div className="text-ui-sm text-neutral-500 mt-2 flex items-center gap-2">
                   {cycle.outcome === 'completed' ? (
                     <CheckCircle className="w-3 h-3 text-emerald-400 shrink-0" />
                   ) : (
@@ -77,26 +77,26 @@ export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
                   )}
                 </div>
                 {cycle.summary_text && (
-                  <p className="text-[10px] text-neutral-500 mt-1">{cycle.summary_text}</p>
+                  <p className="text-ui-sm text-neutral-500 mt-1">{cycle.summary_text}</p>
                 )}
               </>
             )}
             {memoExits > 0 && (
               <div className="mt-2 pt-2 border-t border-neutral-800/50">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Memo pathway</span>
-                  <span className="text-[10px] font-semibold text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/10">
+                  <span className="text-ui-sm text-neutral-500 uppercase tracking-wide">Memo pathway</span>
+                  <span className="text-ui-sm font-semibold text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/10">
                     {memoExits} exit{memoExits !== 1 ? 's' : ''}
                   </span>
                   {memoEverCited?.ever_cited ? (
                     <span
-                      className="text-[10px] font-semibold text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/30 bg-emerald-500/10"
+                      className="text-ui-sm font-semibold text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/30 bg-emerald-500/10"
                       title={memoEverCited.first_cited_at ? `first cited ${timeAgo(memoEverCited.first_cited_at)}` : undefined}
                     >
                       ever cited ✓
                     </span>
                   ) : memoEverCited != null ? (
-                    <span className="text-[10px] text-neutral-500 px-1.5 py-0.5 rounded border border-neutral-700/50">
+                    <span className="text-ui-sm text-neutral-500 px-1.5 py-0.5 rounded border border-neutral-700/50">
                       not yet cited
                     </span>
                   ) : null}
@@ -105,7 +105,7 @@ export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
                       {recentCycleMemoStats.slice(0, 5).map((s: typeof recentCycleMemoStats[0], i: number) => (
                         <span
                           key={s.cycle_id ?? i}
-                          className="text-[10px] text-neutral-400 px-1.5 py-0.5 rounded border border-neutral-700/50 bg-neutral-800/50"
+                          className="text-ui-sm text-neutral-400 px-1.5 py-0.5 rounded border border-neutral-700/50 bg-neutral-800/50"
                           title={s.started_at ? `cycle ${timeAgo(s.started_at)}` : undefined}
                         >
                           {s.memos_cited}/{s.memos_available}

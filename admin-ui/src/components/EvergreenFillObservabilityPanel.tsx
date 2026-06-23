@@ -113,15 +113,15 @@ export function EvergreenFillObservabilityPanel() {
             <>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                 <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
-                  <p className="text-[10px] text-neutral-500 uppercase tracking-wider mb-1">Items Created</p>
+                  <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Items Created</p>
                   <p className="text-lg font-mono text-neutral-100">{data.created_count}</p>
                 </div>
                 <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
-                  <p className="text-[10px] text-neutral-500 uppercase tracking-wider mb-1">Reason Types</p>
+                  <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Reason Types</p>
                   <p className="text-lg font-mono text-neutral-100">{reasonEntries.length}</p>
                 </div>
                 <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
-                  <p className="text-[10px] text-neutral-500 uppercase tracking-wider mb-1">Trigger Types</p>
+                  <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Trigger Types</p>
                   <p className="text-lg font-mono text-neutral-100">{triggerEntries.length}</p>
                 </div>
               </div>
@@ -160,7 +160,7 @@ export function EvergreenFillObservabilityPanel() {
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs">
                       <thead>
-                        <tr className="text-left text-[10px] text-neutral-500 border-b border-neutral-800">
+                        <tr className="text-left text-ui-sm text-neutral-500 border-b border-neutral-800">
                           <th className="pb-1 pr-3 font-medium">Action</th>
                           <th className="pb-1 pr-3 font-medium">Reason</th>
                           <th className="pb-1 pr-3 font-medium">Trigger</th>
@@ -173,7 +173,7 @@ export function EvergreenFillObservabilityPanel() {
                             <td className="py-1 pr-3 font-mono text-neutral-300">{d.action}</td>
                             <td className="py-1 pr-3 text-neutral-400">{d.reason}</td>
                             <td className="py-1 pr-3 text-neutral-500">{d.trigger ?? '—'}</td>
-                            <td className="py-1 text-neutral-600 font-mono text-[10px]">
+                            <td className="py-1 text-neutral-600 font-mono text-ui-sm">
                               {d.project_id ? d.project_id.slice(0, 8) + '…' : '—'}
                             </td>
                           </tr>

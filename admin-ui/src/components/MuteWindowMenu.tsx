@@ -39,7 +39,7 @@ export function MuteWindowMenu({ muteActive, muteWindow, onSetMuteWindow }: Mute
           <div className="absolute right-0 top-full mt-1 z-50 w-44 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-2 space-y-0.5">
             {muteActive && muteWindow ? (
               <>
-                <p className="text-[10px] text-neutral-500 px-2 py-1">Mute active</p>
+                <p className="text-ui-sm text-neutral-500 px-2 py-1">Mute active</p>
                 {EXTEND_OPTIONS.map(([label, ms]) => (
                   <button key={label} onClick={() => {
                     onSetMuteWindow({ expiresAt: muteWindow.expiresAt + ms });
@@ -54,7 +54,7 @@ export function MuteWindowMenu({ muteActive, muteWindow, onSetMuteWindow }: Mute
               </>
             ) : (
               <>
-                <p className="text-[10px] text-neutral-500 px-2 py-1">Mute routine ops for</p>
+                <p className="text-ui-sm text-neutral-500 px-2 py-1">Mute routine ops for</p>
                 {ARM_OPTIONS.map(([label, ms]) => (
                   <button key={label} onClick={() => {
                     onSetMuteWindow({ expiresAt: Date.now() + ms });

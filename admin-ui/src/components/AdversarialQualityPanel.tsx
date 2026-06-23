@@ -16,9 +16,9 @@ function DistributionBar({ confirmed, revised, rejected }: { confirmed: number; 
 
 function GateHealthBadge({ failOpen, total }: { failOpen: number; total: number }) {
   const rate = total + failOpen > 0 ? failOpen / (total + failOpen) : 0;
-  if (rate >= 0.05) return <span data-testid="health-badge" className="text-red-400 font-mono text-[10px]">DEGRADED</span>;
-  if (rate >= 0.01) return <span data-testid="health-badge" className="text-amber-400 font-mono text-[10px]">PARTIAL</span>;
-  return <span data-testid="health-badge" className="text-emerald-400 font-mono text-[10px]">HEALTHY</span>;
+  if (rate >= 0.05) return <span data-testid="health-badge" className="text-red-400 font-mono text-ui-sm">DEGRADED</span>;
+  if (rate >= 0.01) return <span data-testid="health-badge" className="text-amber-400 font-mono text-ui-sm">PARTIAL</span>;
+  return <span data-testid="health-badge" className="text-emerald-400 font-mono text-ui-sm">HEALTHY</span>;
 }
 
 function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
@@ -30,7 +30,7 @@ function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <span className="text-neutral-400 text-[10px]">Gate health</span>
+        <span className="text-neutral-400 text-ui-sm">Gate health</span>
         <GateHealthBadge failOpen={failOpen} total={total} />
       </div>
       {total > 0 && (
@@ -40,7 +40,7 @@ function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
             revised={data.challenged_revised}
             rejected={data.challenged_rejected}
           />
-          <div className="flex flex-wrap gap-x-3 text-[10px]">
+          <div className="flex flex-wrap gap-x-3 text-ui-sm">
             <span className="text-emerald-400/80">confirmed: {data.challenged_confirmed}</span>
             <span className="text-amber-400/80">revised: {data.challenged_revised}</span>
             <span className="text-blue-400/80">overturned: {data.challenged_rejected}</span>
@@ -50,12 +50,12 @@ function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
         </>
       )}
       {failOpen > 0 && (
-        <div data-testid="fail-open-row" className="text-[10px] text-red-400/80">
+        <div data-testid="fail-open-row" className="text-ui-sm text-red-400/80">
           fail-open: {failOpen}{failOpenRate != null ? ` (${failOpenRate}%)` : ''} — challenger failed, primary adopted
         </div>
       )}
       {data.cost_per_challenge_usd != null && (
-        <div className="text-[10px] text-neutral-500">cost/challenge: ${data.cost_per_challenge_usd.toFixed(4)}</div>
+        <div className="text-ui-sm text-neutral-500">cost/challenge: ${data.cost_per_challenge_usd.toFixed(4)}</div>
       )}
     </div>
   );
@@ -86,12 +86,12 @@ export function AdversarialQualityPanel({ projectId }: { projectId: string | nul
 
   return (
     <section data-testid="adversarial-quality-panel">
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
         Challenge Gate Health
       </h2>
       <div className="rounded-lg bg-neutral-800/50 p-3 text-xs">
         {loading ? (
-          <div data-testid="panel-loading" className="text-neutral-600 text-[10px]">Loading…</div>
+          <div data-testid="panel-loading" className="text-neutral-600 text-ui-sm">Loading…</div>
         ) : (
           data && <PanelReviewView data={data} />
         )}

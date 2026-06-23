@@ -231,11 +231,11 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
             <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
           )}
           <div>
-            <div className="text-[11px] font-bold text-neutral-300 uppercase tracking-widest">
+            <div className="text-ui-md font-bold text-neutral-300 uppercase tracking-widest">
               Bootstrap
             </div>
             {displayState === 'completed' && completedAt && (
-              <div className="text-[11px] text-emerald-400">
+              <div className="text-ui-md text-emerald-400">
                 Completed {formatAbsolute(completedAt)}
               </div>
             )}
@@ -243,7 +243,7 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
               project.build_config?.bootstrap_overview_refreshed_at ||
               project.build_config?.bootstrap_overview_source_branch
             ) && (
-              <div className="text-[10px] text-neutral-400 mt-0.5">
+              <div className="text-ui-sm text-neutral-400 mt-0.5">
                 {project.build_config?.bootstrap_overview_refreshed_at && (
                   <>Refreshed {formatAbsolute(project.build_config.bootstrap_overview_refreshed_at)}</>
                 )}
@@ -257,12 +257,12 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
             )}
             {displayState === 'completed' &&
               project.build_config?.bootstrap_domain_knowledge_refreshed_at && (
-              <div className="text-[10px] text-neutral-400 mt-0.5">
+              <div className="text-ui-sm text-neutral-400 mt-0.5">
                 Domain knowledge captured {formatAbsolute(project.build_config.bootstrap_domain_knowledge_refreshed_at)}
               </div>
             )}
             {displayState === 'completed' && commandMemoryMarker && (
-              <div className="text-[10px] text-amber-300 mt-0.5 flex items-start gap-1">
+              <div className="text-ui-sm text-amber-300 mt-0.5 flex items-start gap-1">
                 <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />
                 <span>
                   {commandMemoryMarker.label}
@@ -273,31 +273,31 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
               </div>
             )}
             {displayState === 'pending' && (
-              <div className="text-[11px] text-amber-300">
+              <div className="text-ui-md text-amber-300">
                 Bootstrap pending — implementation tasks deferred until complete
               </div>
             )}
             {displayState === 'degraded' && (
               <>
-                <div className="text-[11px] text-red-300">
+                <div className="text-ui-md text-red-300">
                   {project.build_config?.bootstrap_degraded_reason
                     ? `Bootstrap degraded — ${project.build_config.bootstrap_degraded_reason}`
                     : 'Bootstrap failed — cycles running without repo memory'}
                 </div>
                 {recoveryDetail && (
-                  <div className="text-[10px] text-neutral-400">
+                  <div className="text-ui-sm text-neutral-400">
                     {recoveryDetail}
                   </div>
                 )}
               </>
             )}
             {displayState === 'retryable' && (
-              <div className="text-[11px] text-amber-300">
+              <div className="text-ui-md text-amber-300">
                 Bootstrap has not run yet — retry will enqueue the first-cycle bootstrap
               </div>
             )}
             {displayState === 'empty' && (
-              <div className="text-[11px] text-emerald-400">
+              <div className="text-ui-md text-emerald-400">
                 Empty repository — bootstrap will start after initial project files land
               </div>
             )}
@@ -308,7 +308,7 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
             <button
               onClick={handleRetry}
               disabled={retryPending}
-              className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] font-semibold text-amber-200 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-60 min-h-[44px]"
+              className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-ui-sm font-semibold text-amber-200 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-60 min-h-[44px]"
             >
               {retryPending ? 'Retrying…' : 'Retry bootstrap'}
             </button>
@@ -317,7 +317,7 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
             <button
               onClick={handleRefresh}
               disabled={refreshPending}
-              className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[10px] font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-60 min-h-[44px]"
+              className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-ui-sm font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-60 min-h-[44px]"
             >
               {refreshPending ? 'Refreshing…' : 'Refresh bootstrap'}
             </button>
@@ -325,7 +325,7 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
           {completedAt && hasOverviewContent && (
             <button
               onClick={() => setOverviewExpanded(e => !e)}
-              className="flex items-center gap-1 text-[10px] text-neutral-400 hover:text-neutral-200 transition-colors shrink-0"
+              className="flex items-center gap-1 text-ui-sm text-neutral-400 hover:text-neutral-200 transition-colors shrink-0"
             >
               Repo Overview
               {overviewExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
@@ -334,7 +334,7 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
           {commands !== null && commands.length > 0 && (
             <button
               onClick={() => setExpanded(e => !e)}
-              className="flex items-center gap-1 text-[10px] text-neutral-400 hover:text-neutral-200 transition-colors shrink-0"
+              className="flex items-center gap-1 text-ui-sm text-neutral-400 hover:text-neutral-200 transition-colors shrink-0"
             >
               Commands
               {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
@@ -344,31 +344,31 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
       </div>
 
       {retryOutcomeMessage && (
-        <p className="mt-2 text-[10px] text-emerald-300 bg-emerald-500/10 border border-emerald-500/20 rounded px-1.5 py-1 break-words">
+        <p className="mt-2 text-ui-sm text-emerald-300 bg-emerald-500/10 border border-emerald-500/20 rounded px-1.5 py-1 break-words">
           {retryOutcomeMessage}
         </p>
       )}
 
       {retryError && (
-        <p className="mt-2 text-[10px] text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 break-words">
+        <p className="mt-2 text-ui-sm text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 break-words">
           {retryError}
         </p>
       )}
 
       {refreshOutcomeMessage && (
-        <p className="mt-2 text-[10px] text-emerald-300 bg-emerald-500/10 border border-emerald-500/20 rounded px-1.5 py-1 break-words">
+        <p className="mt-2 text-ui-sm text-emerald-300 bg-emerald-500/10 border border-emerald-500/20 rounded px-1.5 py-1 break-words">
           {refreshOutcomeMessage}
         </p>
       )}
 
       {refreshError && (
-        <p className="mt-2 text-[10px] text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 break-words">
+        <p className="mt-2 text-ui-sm text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 break-words">
           {refreshError}
         </p>
       )}
 
       {commandsError && (
-        <p className="mt-2 text-[10px] text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 break-words">
+        <p className="mt-2 text-ui-sm text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 break-words">
           {commandsError}
         </p>
       )}
@@ -377,70 +377,70 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
         <div className="mt-3 space-y-2">
           {repoOverview.tech_stack && (
             <div>
-              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+              <div className="text-ui-sm font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
                 Tech Stack
               </div>
-              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+              <div className="text-ui-md text-neutral-300 leading-relaxed whitespace-pre-wrap">
                 {repoOverview.tech_stack}
               </div>
             </div>
           )}
           {repoOverview.directory_layout && (
             <div>
-              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+              <div className="text-ui-sm font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
                 Directory Layout
               </div>
-              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+              <div className="text-ui-md text-neutral-300 leading-relaxed whitespace-pre-wrap">
                 {repoOverview.directory_layout}
               </div>
             </div>
           )}
           {repoOverview.first_steps_summary && (
             <div>
-              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+              <div className="text-ui-sm font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
                 First Steps
               </div>
-              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+              <div className="text-ui-md text-neutral-300 leading-relaxed whitespace-pre-wrap">
                 {repoOverview.first_steps_summary}
               </div>
             </div>
           )}
           {repoOverview.entry_points && (
             <div>
-              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+              <div className="text-ui-sm font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
                 Entry Points
               </div>
-              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+              <div className="text-ui-md text-neutral-300 leading-relaxed whitespace-pre-wrap">
                 {repoOverview.entry_points}
               </div>
             </div>
           )}
           {repoOverview.test_layout && (
             <div>
-              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+              <div className="text-ui-sm font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
                 Test Layout
               </div>
-              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+              <div className="text-ui-md text-neutral-300 leading-relaxed whitespace-pre-wrap">
                 {repoOverview.test_layout}
               </div>
             </div>
           )}
           {repoOverview.key_conventions && (
             <div>
-              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+              <div className="text-ui-sm font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
                 Key Conventions
               </div>
-              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+              <div className="text-ui-md text-neutral-300 leading-relaxed whitespace-pre-wrap">
                 {repoOverview.key_conventions}
               </div>
             </div>
           )}
           {repoOverview.environment_requirements && (
             <div>
-              <div className="text-[10px] font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
+              <div className="text-ui-sm font-semibold text-neutral-400 uppercase tracking-widest mb-0.5">
                 Environment Requirements
               </div>
-              <div className="text-[11px] text-neutral-300 leading-relaxed whitespace-pre-wrap">
+              <div className="text-ui-md text-neutral-300 leading-relaxed whitespace-pre-wrap">
                 {repoOverview.environment_requirements}
               </div>
             </div>
@@ -450,7 +450,7 @@ export function BootstrapStatusPanel({ project, tasks }: Props) {
 
       {expanded && commands !== null && commands.length > 0 && (
         <div className="mt-3 overflow-x-auto">
-          <table className="w-full text-[10px] font-mono border-collapse">
+          <table className="w-full text-ui-sm font-mono border-collapse">
             <thead>
               <tr className="text-neutral-500 border-b border-neutral-800">
                 <th className="text-left py-1 pr-2 font-semibold">Directory</th>

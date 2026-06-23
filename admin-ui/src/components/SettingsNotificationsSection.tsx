@@ -133,7 +133,7 @@ export function SettingsNotificationsSection({
               }}
               className="w-32 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
-            <p className="text-[11px] text-neutral-600 mt-1">
+            <p className="text-ui-md text-neutral-600 mt-1">
               {dailyCostCeilingUsd === 0 ? 'No ceiling — pipeline runs without a daily cost limit.' : `Pipeline will raise a warning alert (and send a notification, if enabled) when daily spend exceeds $${dailyCostCeilingUsd}. Autonomous tasks keep running.`}
             </p>
           </>
@@ -160,9 +160,9 @@ export function SettingsNotificationsSection({
               }`}
             />
             {!urlIsValid && (
-              <p className="text-[11px] text-red-400 mt-1">URL must start with http:// or https://</p>
+              <p className="text-ui-md text-red-400 mt-1">URL must start with http:// or https://</p>
             )}
-            <p className="text-[11px] text-neutral-600 mt-1">POST requests with JSON payloads will be sent to this URL</p>
+            <p className="text-ui-md text-neutral-600 mt-1">POST requests with JSON payloads will be sent to this URL</p>
           </>
         ) : (
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-500">
@@ -183,7 +183,7 @@ export function SettingsNotificationsSection({
             <div key={opt.key} className="flex items-center justify-between">
               <div className="min-w-0 mr-4">
                 <div className="text-xs text-neutral-300">{opt.label}</div>
-                <div className="text-[11px] text-neutral-600">{opt.description}</div>
+                <div className="text-ui-md text-neutral-600">{opt.description}</div>
               </div>
               {isAdmin ? (
                 <Toggle
@@ -242,7 +242,7 @@ export function SettingsNotificationsSection({
             <p className="text-xs text-red-400 mt-2">Failed: {testError}</p>
           )}
           {!webhookUrl && (
-            <p className="text-[11px] text-neutral-600 mt-1">Configure a webhook URL above to enable test notifications.</p>
+            <p className="text-ui-md text-neutral-600 mt-1">Configure a webhook URL above to enable test notifications.</p>
           )}
         </div>
       )}

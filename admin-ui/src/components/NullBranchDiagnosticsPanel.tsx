@@ -49,11 +49,11 @@ export function NullBranchDiagnosticsPanel({ onConfigure }: NullBranchDiagnostic
 
   return (
     <div className="mb-3 shrink-0">
-      <div className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest px-1 py-1">
+      <div className="flex items-center gap-2 text-ui-md font-bold text-neutral-400 uppercase tracking-widest px-1 py-1">
         <GitBranch className="w-3 h-3" />
         Branch Config
         {projects.length > 0 && (
-          <span className="ml-1 bg-amber-500/20 border border-amber-500/40 text-amber-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+          <span className="ml-1 bg-amber-500/20 border border-amber-500/40 text-amber-400 text-ui-sm font-bold px-1.5 py-0.5 rounded-full leading-none">
             {projects.length} need fix
           </span>
         )}
@@ -70,17 +70,17 @@ export function NullBranchDiagnosticsPanel({ onConfigure }: NullBranchDiagnostic
           {projects.map(project => (
             <div key={project.id} className="flex flex-wrap items-center gap-2">
               <span className="text-neutral-300 font-medium">{project.name}</span>
-              <span className="text-neutral-500 font-mono text-[10px]">
+              <span className="text-neutral-500 font-mono text-ui-sm">
                 {project.github_owner}/{project.github_repo}
               </span>
               {errors[project.id] && (
-                <span className="text-red-400 text-[10px]">{errors[project.id]}</span>
+                <span className="text-red-400 text-ui-sm">{errors[project.id]}</span>
               )}
               <div className="ml-auto flex items-center gap-1.5">
                 {onConfigure && (
                   <button
                     onClick={() => onConfigure(project.id)}
-                    className="px-2 min-h-[44px] rounded text-[10px] font-medium bg-neutral-800 border border-neutral-700 text-neutral-300 hover:bg-neutral-700 transition-colors"
+                    className="px-2 min-h-[44px] rounded text-ui-sm font-medium bg-neutral-800 border border-neutral-700 text-neutral-300 hover:bg-neutral-700 transition-colors"
                   >
                     Configure
                   </button>
@@ -88,7 +88,7 @@ export function NullBranchDiagnosticsPanel({ onConfigure }: NullBranchDiagnostic
                 <button
                   onClick={() => handleBackfill(project)}
                   disabled={backfilling.has(project.id)}
-                  className="px-2 min-h-[44px] rounded text-[10px] font-medium bg-blue-500/10 border border-blue-500/30 text-blue-400 hover:bg-blue-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  className="px-2 min-h-[44px] rounded text-ui-sm font-medium bg-blue-500/10 border border-blue-500/30 text-blue-400 hover:bg-blue-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
                   {backfilling.has(project.id) ? 'Backfilling…' : 'Backfill'}
                 </button>
@@ -102,7 +102,7 @@ export function NullBranchDiagnosticsPanel({ onConfigure }: NullBranchDiagnostic
         <div className="mt-1">
           <button
             onClick={() => setSelfRepoExpanded(e => !e)}
-            className="flex items-center gap-1.5 text-[10px] text-neutral-500 hover:text-neutral-400 transition-colors px-1 min-h-[44px]"
+            className="flex items-center gap-1.5 text-ui-sm text-neutral-500 hover:text-neutral-400 transition-colors px-1 min-h-[44px]"
           >
             {selfRepoExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
             {selfRepoSkipped.length} self-repo skipped (intentional)
@@ -112,8 +112,8 @@ export function NullBranchDiagnosticsPanel({ onConfigure }: NullBranchDiagnostic
               {selfRepoSkipped.map(project => (
                 <div key={project.id} className="flex items-center gap-2 text-neutral-500">
                   <span className="font-medium text-neutral-400">{project.name}</span>
-                  <span className="font-mono text-[10px]">{project.github_owner}/{project.github_repo}</span>
-                  <span className="text-[10px] text-neutral-600">LTS-managed</span>
+                  <span className="font-mono text-ui-sm">{project.github_owner}/{project.github_repo}</span>
+                  <span className="text-ui-sm text-neutral-600">LTS-managed</span>
                 </div>
               ))}
             </div>

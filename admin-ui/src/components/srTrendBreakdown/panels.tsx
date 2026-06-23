@@ -37,13 +37,13 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
   return (
     <div data-testid="edges-trend-breakdown" className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]">
       <div className="flex items-baseline gap-2 mb-1">
-        <p className="text-[9px] text-neutral-500 uppercase tracking-wide">Edges considered</p>
-        {cycleLabel && <span className="text-[9px] text-neutral-600 font-mono">{cycleLabel}</span>}
+        <p className="text-ui-xs text-neutral-500 uppercase tracking-wide">Edges considered</p>
+        {cycleLabel && <span className="text-ui-xs text-neutral-600 font-mono">{cycleLabel}</span>}
         {curr.sample_size != null && (
-          <span className="text-[9px] text-neutral-600 font-mono ml-auto">n={curr.sample_size}</span>
+          <span className="text-ui-xs text-neutral-600 font-mono ml-auto">n={curr.sample_size}</span>
         )}
       </div>
-      <div className="flex items-center gap-2 text-[10px]">
+      <div className="flex items-center gap-2 text-ui-sm">
         <span className="text-neutral-400 flex-1">tasks with edges</span>
         <span className={`font-mono tabular-nums ${frTrendColor(trendVal)}`}>
           {curr.tasks_with_edges_rate != null ? `${Math.round(curr.tasks_with_edges_rate * 100)}%` : '–'}
@@ -55,7 +55,7 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
         )}
       </div>
       {curr.unhandled_edge_flagged_rate != null && (
-        <div className="flex items-center gap-2 text-[10px]" title="Share of enumerated edges the agent itself marked as not handled — its honesty about uncertainty.">
+        <div className="flex items-center gap-2 text-ui-sm" title="Share of enumerated edges the agent itself marked as not handled — its honesty about uncertainty.">
           <span className="text-neutral-400 flex-1">unhandled flagged</span>
           <span className="font-mono tabular-nums text-neutral-300">
             {Math.round(curr.unhandled_edge_flagged_rate * 100)}%
@@ -67,20 +67,20 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
         const withoutEdges = curr.correctness_rejection_rate_without_edges;
         const gap = withEdges != null && withoutEdges != null ? withoutEdges - withEdges : null;
         return (
-          <div className="flex items-center gap-2 text-[10px]">
+          <div className="flex items-center gap-2 text-ui-sm">
             <span className="text-neutral-400 flex-1" title="Human-reviewer correctness rejection rate, split by whether the task enumerated edges.">
               correctness rej w/wo
             </span>
             <span className="font-mono tabular-nums text-neutral-300" title="correctness rejection rate when edges were enumerated">
               {withEdges != null ? `${Math.round(withEdges * 100)}%` : '–'}
             </span>
-            <span className="text-neutral-600 text-[9px]">/</span>
+            <span className="text-neutral-600 text-ui-xs">/</span>
             <span className="font-mono tabular-nums text-neutral-300" title="correctness rejection rate when edges were NOT enumerated">
               {withoutEdges != null ? `${Math.round(withoutEdges * 100)}%` : '–'}
             </span>
             {gap != null && (
               <span
-                className={`font-mono tabular-nums text-[9px] ${deltaColorClass(-gap)}`}
+                className={`font-mono tabular-nums text-ui-xs ${deltaColorClass(-gap)}`}
                 title="gap = without-edges minus with-edges; positive = edges correlate with fewer correctness rejections"
               >
                 {`Δ${formatDelta(gap)}`}
@@ -94,7 +94,7 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
         const allHandled = curr.correctness_rejection_rate_with_all_handled;
         const gap = unhandled != null && allHandled != null ? unhandled - allHandled : null;
         return (
-          <div className="flex items-center gap-2 text-[10px]">
+          <div className="flex items-center gap-2 text-ui-sm">
             <span
               className="text-neutral-400 flex-1"
               title="Higher rate-with-unhandled-flag than rate-with-all-handled means the agent's honesty about unhandled edges is informative — reviewers consistently catch issues the author flagged."
@@ -104,13 +104,13 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
             <span className="font-mono tabular-nums text-neutral-300" title="correctness rejection rate when ≥1 author-origin edge was flagged unhandled">
               {unhandled != null ? `${Math.round(unhandled * 100)}%` : '–'}
             </span>
-            <span className="text-neutral-600 text-[9px]">/</span>
+            <span className="text-neutral-600 text-ui-xs">/</span>
             <span className="font-mono tabular-nums text-neutral-300" title="correctness rejection rate when all author-origin edges were marked handled">
               {allHandled != null ? `${Math.round(allHandled * 100)}%` : '–'}
             </span>
             {gap != null && (
               <span
-                className={`font-mono tabular-nums text-[9px] ${deltaColorClass(-gap)}`}
+                className={`font-mono tabular-nums text-ui-xs ${deltaColorClass(-gap)}`}
                 title="gap = with-unhandled-flag minus with-all-handled; positive = author's unhandled-flag signal is informative"
               >
                 {`Δ${formatDelta(gap)}`}
@@ -121,16 +121,16 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
       })()}
       {history.length > 0 && (
         <div className="flex items-center gap-1 mt-1">
-          <span className="text-[9px] text-neutral-600">history</span>
+          <span className="text-ui-xs text-neutral-600">history</span>
           <div className="flex gap-0.5">
             {history.map((rate, index) => (
-              <span key={index} className="text-[9px] font-mono text-neutral-500">{Math.round(rate * 100)}%</span>
+              <span key={index} className="text-ui-xs font-mono text-neutral-500">{Math.round(rate * 100)}%</span>
             ))}
           </div>
         </div>
       )}
       {prev && prev.tasks_with_edges_rate != null && (
-        <div className="flex items-center gap-2 text-[10px] pt-1 border-t border-neutral-800/60">
+        <div className="flex items-center gap-2 text-ui-sm pt-1 border-t border-neutral-800/60">
           <span className="text-neutral-600 flex-1">prev</span>
           <span className="font-mono tabular-nums text-neutral-500">
             {Math.round(prev.tasks_with_edges_rate * 100)}%
@@ -165,7 +165,7 @@ export function DirectionSrBreakdownPanel({
           {trends?.is_stale && (
             <span
               data-testid="sr-trend-stale-badge"
-              className="text-[9px] text-amber-400 font-mono"
+              className="text-ui-xs text-amber-400 font-mono"
               title={`Trend data is stale — last computed ${trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : 'unknown'}. Numbers may not reflect current production.`}
             >
               stale · as of {trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : '?'}
@@ -177,7 +177,7 @@ export function DirectionSrBreakdownPanel({
             return (
               <span
                 data-testid="sr-trend-insufficient-badge"
-                className="text-[9px] text-amber-500 font-mono"
+                className="text-ui-xs text-amber-500 font-mono"
                 title="Most recent measurement windows had insufficient reviewer-finding data — displayed numbers are frozen and may not reflect current production."
               >
                 frozen · last real data {lastRealDate}
@@ -203,7 +203,7 @@ export function DirectionSrBreakdownPanel({
                 {rate != null ? `${Math.round(rate * 100)}%` : '–'}
               </span>
               <span
-                className={`text-[10px] text-neutral-300 truncate flex-1${onDirectionClick ? ' cursor-pointer hover:underline' : ''}`}
+                className={`text-ui-sm text-neutral-300 truncate flex-1${onDirectionClick ? ' cursor-pointer hover:underline' : ''}`}
                 title={direction.direction_text}
                 onClick={() => onDirectionClick?.(direction.direction_id)}
                 role={onDirectionClick ? 'button' : undefined}
@@ -211,19 +211,19 @@ export function DirectionSrBreakdownPanel({
                 {direction.direction_text || direction.direction_id}
               </span>
               {direction.mixed_prompt_versions && (
-                <span className="text-[9px] text-amber-400 font-mono shrink-0" title="Tasks from multiple SR prompt versions — attribution unreliable">mixed v</span>
+                <span className="text-ui-xs text-amber-400 font-mono shrink-0" title="Tasks from multiple SR prompt versions — attribution unreliable">mixed v</span>
               )}
               {!direction.mixed_prompt_versions && direction.prompt_version && (
-                <span className="text-[9px] text-amber-600 font-mono shrink-0" title="SR prompt version for this window">{`v=${direction.prompt_version.slice(0, 7)}`}</span>
+                <span className="text-ui-xs text-amber-600 font-mono shrink-0" title="SR prompt version for this window">{`v=${direction.prompt_version.slice(0, 7)}`}</span>
               )}
-              <span className="text-[9px] text-neutral-600 shrink-0">n={direction.sample_size}</span>
+              <span className="text-ui-xs text-neutral-600 shrink-0">n={direction.sample_size}</span>
             </div>
             {categories.length > 0 && (
               <div className="flex flex-col gap-0.5">
                 {categories.map(([cat, stat]) => {
                   const tooSmall = isSampleTooSmall(stat.sample_count);
                   return (
-                    <div key={cat} className="text-[10px]">
+                    <div key={cat} className="text-ui-sm">
                       <div className="flex items-center gap-1.5">
                         <span className="text-neutral-400">{cat}</span>
                         {stat.miss_rate != null && (
@@ -242,7 +242,7 @@ export function DirectionSrBreakdownPanel({
                         <span className="text-neutral-600 ml-auto">n={stat.sample_count}</span>
                       </div>
                       {(stat.sr_alone_hit_rate != null || stat.reviewer_save_rate != null) && (
-                        <div className="flex items-center gap-1 text-[9px] text-neutral-500 font-mono ml-3 mt-0.5">
+                        <div className="flex items-center gap-1 text-ui-xs text-neutral-500 font-mono ml-3 mt-0.5">
                           <span>SR-alone {stat.sr_alone_hit_rate != null ? `${Math.round(stat.sr_alone_hit_rate * 100)}%` : '–'}</span>
                           <span className="text-neutral-700">·</span>
                           <span>reviewer-save {stat.reviewer_save_rate != null ? `${Math.round(stat.reviewer_save_rate * 100)}%` : '–'}</span>
@@ -326,7 +326,7 @@ export function SrReviewerDisagreementsPanel({
               key={index}
               title={`${disagreement.count} task${disagreement.count !== 1 ? 's' : ''} where self-review passed ${disagreement.category} but reviewer flagged it${severity ? ` (max: ${severity})` : ''}${hasExamples ? ' — click to expand' : ''}`}
               onClick={() => hasExamples ? setExpandedKey(isExpanded ? null : key) : undefined}
-              className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${disagreementBadgeClass(severity)}${hasExamples ? ' cursor-pointer' : ''}`}
+              className={`inline-flex items-center gap-1.5 text-ui-sm font-semibold px-2 py-0.5 rounded border ${disagreementBadgeClass(severity)}${hasExamples ? ' cursor-pointer' : ''}`}
             >
               <span className="truncate max-w-[120px]">{disagreement.category}</span>
               {disagreement.task_type && <span className="opacity-60 font-normal">·</span>}
@@ -352,7 +352,7 @@ export function SrReviewerDisagreementsPanel({
         return (
           <div
             data-testid="sr-disagreement-examples"
-            className="mt-0.5 rounded border border-neutral-800/60 bg-neutral-900/60 divide-y divide-neutral-800/40 text-[10px]"
+            className="mt-0.5 rounded border border-neutral-800/60 bg-neutral-900/60 divide-y divide-neutral-800/40 text-ui-sm"
           >
             {examples.map((example, exampleIndex) => (
               <div
@@ -385,12 +385,12 @@ export function CoFailurePairsSection({ pairs }: { pairs: SrCoFailurePair[] }) {
   if (top.length === 0) return null;
   return (
     <div className="mt-1.5 pt-1.5 border-t border-neutral-800/60" data-testid="sr-co-failure-pairs">
-      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-1">Co-failures</p>
+      <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-1">Co-failures</p>
       <div className="flex flex-col gap-0.5">
         {top.map((pair, index) => {
           const liftColor = pair.lift >= 2.5 ? 'text-red-400' : pair.lift >= 1.8 ? 'text-amber-400' : 'text-neutral-400';
           return (
-            <div key={index} className="flex items-center gap-1.5 text-[10px] min-w-0">
+            <div key={index} className="flex items-center gap-1.5 text-ui-sm min-w-0">
               <span className="text-neutral-300 truncate flex-1" title={`${pair.cat_a} + ${pair.cat_b} co-fail`}>
                 <span className="font-medium">{pair.cat_a}</span>
                 <span className="text-neutral-600 mx-0.5">+</span>
@@ -402,7 +402,7 @@ export function CoFailurePairsSection({ pairs }: { pairs: SrCoFailurePair[] }) {
               >
                 {`×${pair.lift.toFixed(1)}`}
               </span>
-              <span className="font-mono tabular-nums text-neutral-600 shrink-0 text-[9px]">n={pair.co_fail_count}</span>
+              <span className="font-mono tabular-nums text-neutral-600 shrink-0 text-ui-xs">n={pair.co_fail_count}</span>
             </div>
           );
         })}

@@ -402,7 +402,7 @@ export function HeaderBar(props: HeaderBarProps) {
         />
         {/* API connection problem — only visible when API is unreachable */}
         {!apiHealthy && (
-          <div className="flex items-center gap-2 text-[10px] px-2 py-1 rounded bg-red-950/30 border border-red-900/30">
+          <div className="flex items-center gap-2 text-ui-sm px-2 py-1 rounded bg-red-950/30 border border-red-900/30">
             <div className="flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
               <span className="text-red-400">API down</span>
@@ -628,11 +628,13 @@ export function HeaderBar(props: HeaderBarProps) {
           >
             <MessageSquare className="w-4 h-4" />
             {props.openMessageCount > 0 && (
+              // eslint-disable-next-line viewport/no-arbitrary-font-size
               <span className="ml-0.5 bg-blue-500 text-white text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
                 {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
               </span>
             )}
             {!showMessages && (props.newSinceLastVisitCount ?? 0) > 0 && (
+              // eslint-disable-next-line viewport/no-arbitrary-font-size
               <span className="ml-0.5 bg-amber-500 text-black text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center" title={`${props.newSinceLastVisitCount} new since last visit`}>
                 {(props.newSinceLastVisitCount ?? 0) > 9 ? '9+' : props.newSinceLastVisitCount}
               </span>
@@ -680,7 +682,7 @@ export function HeaderBar(props: HeaderBarProps) {
                 <Microscope className="w-4 h-4 shrink-0" />
                 <span>Research Browser</span>
                 {pendingFindingsCount > 0 && (
-                  <span className="ml-auto bg-cyan-500 text-black text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                  <span className="ml-auto bg-cyan-500 text-black text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
                     {pendingFindingsCount}
                   </span>
                 )}
@@ -707,12 +709,12 @@ export function HeaderBar(props: HeaderBarProps) {
                 <MessageSquare className="w-4 h-4 shrink-0" />
                 <span>Messages</span>
                 {props.openMessageCount > 0 && (
-                  <span className="ml-auto bg-blue-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                  <span className="ml-auto bg-blue-500 text-white text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
                     {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
                   </span>
                 )}
                 {!showMessages && (props.newSinceLastVisitCount ?? 0) > 0 && (
-                  <span className="ml-auto bg-amber-500 text-black text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                  <span className="ml-auto bg-amber-500 text-black text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
                     {(props.newSinceLastVisitCount ?? 0) > 9 ? '9+' : props.newSinceLastVisitCount} new
                   </span>
                 )}
@@ -763,7 +765,7 @@ export function HeaderBar(props: HeaderBarProps) {
                     ].map(([key, desc]) => (
                       <div key={key} className="flex items-center justify-between">
                         <span className="text-neutral-400">{desc}</span>
-                        <kbd className="bg-neutral-800 border border-neutral-700 text-neutral-300 px-1.5 py-0.5 rounded text-[10px] font-mono min-w-[24px] text-center">{key}</kbd>
+                        <kbd className="bg-neutral-800 border border-neutral-700 text-neutral-300 px-1.5 py-0.5 rounded text-ui-sm font-mono min-w-[24px] text-center">{key}</kbd>
                       </div>
                     ))}
                   </div>

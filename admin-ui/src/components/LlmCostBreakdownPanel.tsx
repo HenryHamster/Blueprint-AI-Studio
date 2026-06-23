@@ -61,7 +61,7 @@ export function LlmCostBreakdownPanel({
     if (pollError) {
       return (
         <section>
-          <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+          <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
             LLM Cost by Model
           </h2>
           <div className="text-xs text-red-400 px-1">Cost data unavailable — fetch failed.</div>
@@ -78,13 +78,13 @@ export function LlmCostBreakdownPanel({
   const fullCoverage = coverage == null || coverage >= 1;
 
   const Header = (
-    <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+    <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
       LLM Cost by Model <span className="text-neutral-600 normal-case font-normal">· {data.window_days}d</span>
     </h2>
   );
 
   const StaleBanner = pollError && (
-    <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+    <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-ui-sm text-amber-300">
       Data may be stale — last poll failed.
     </div>
   );
@@ -94,7 +94,7 @@ export function LlmCostBreakdownPanel({
       <section>
         {Header}
         {StaleBanner}
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-4 text-[11px] text-neutral-500">
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-4 text-ui-md text-neutral-500">
           No priced LLM token spend in the last {data.window_days} days for this project.
         </div>
       </section>
@@ -103,7 +103,7 @@ export function LlmCostBreakdownPanel({
 
   const allUnpriced = totals.total_cost_usd <= 0 && totals.unpriced_task_count > 0;
   const coverageWarning = (allUnpriced || !fullCoverage) && (
-    <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+    <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-ui-sm text-amber-300">
       <span className="font-semibold">
         {allUnpriced ? 'Cost data unavailable' : `Pricing coverage ${fmtShare(coverage)}`}
       </span>
@@ -121,7 +121,7 @@ export function LlmCostBreakdownPanel({
   );
 
   const fallbackWarning = totals.fallback_task_count > 0 && (
-    <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+    <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-ui-sm text-amber-300">
       <span className="font-semibold">
         {totals.fallback_task_count} fallback {totals.fallback_task_count === 1 ? 'task' : 'tasks'}
       </span>
@@ -130,7 +130,7 @@ export function LlmCostBreakdownPanel({
   );
 
   const approximateWarning = approximate_priced_combos.length > 0 && (
-    <div className="mb-2 rounded border border-blue-500/30 bg-blue-500/10 px-2.5 py-1.5 text-[10px] text-blue-300">
+    <div className="mb-2 rounded border border-blue-500/30 bg-blue-500/10 px-2.5 py-1.5 text-ui-sm text-blue-300">
       <span className="font-semibold">Approximate pricing</span>
       {' — '}some combos are priced at a proxy rate (closest GA-tier equivalent) as no separately published API rate exists.
       <div className="mt-1 text-blue-400/80">
@@ -142,11 +142,11 @@ export function LlmCostBreakdownPanel({
   const { rework_attribution } = data;
   const ReworkSection = rework_attribution && (
     <section className="mt-4">
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
         LLM Cost Rework Attribution <span className="text-neutral-600 normal-case font-normal">· {data.window_days}d</span>
       </h2>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-3">
-        <div className="flex flex-wrap gap-x-6 gap-y-1 text-[11px] mb-3">
+        <div className="flex flex-wrap gap-x-6 gap-y-1 text-ui-md mb-3">
           <span className="text-neutral-400">
             Rework share:{' '}
             <span className="text-neutral-200 font-semibold tabular-nums">
@@ -170,10 +170,10 @@ export function LlmCostBreakdownPanel({
         </div>
         {rework_attribution.top_rework_prs.length > 0 && (
           <>
-            <div className="text-[10px] text-neutral-500 mb-1 uppercase tracking-wider">Top rework PRs</div>
+            <div className="text-ui-sm text-neutral-500 mb-1 uppercase tracking-wider">Top rework PRs</div>
             <div className="divide-y divide-neutral-800/30">
               {rework_attribution.top_rework_prs.map((pr: ReworkPrEntry) => (
-                <div key={pr.pr_number} className="flex items-center justify-between py-1 text-[11px]">
+                <div key={pr.pr_number} className="flex items-center justify-between py-1 text-ui-md">
                   <span className="text-neutral-400 font-mono">#{pr.pr_number}</span>
                   <div className="flex gap-x-4 text-neutral-500">
                     <span>LLM: <span className="text-neutral-300 font-mono tabular-nums">${pr.rework_llm_cost_usd.toFixed(2)}</span></span>
@@ -190,14 +190,14 @@ export function LlmCostBreakdownPanel({
 
   const TaskTypeSection = by_task_type.length > 0 && (
     <section className="mt-4">
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
         LLM Cost by Task Type <span className="text-neutral-600 normal-case font-normal">· {data.window_days}d</span>
       </h2>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
           {by_task_type.map((row: LlmCostTaskTypeRow, i: number) => (
-            <div key={i} className="px-3 py-2 text-[10px]">
+            <div key={i} className="px-3 py-2 text-ui-sm">
               <div className="flex items-start justify-between gap-2 mb-1">
                 <span className="font-medium text-neutral-200 break-words font-mono">{row.task_type}</span>
                 <span className="text-neutral-500 shrink-0 tabular-nums">{fmtShare(row.share_of_total_cost)}</span>
@@ -215,7 +215,7 @@ export function LlmCostBreakdownPanel({
         {/* Desktop: table layout */}
         <table className="hidden sm:table w-full text-xs">
           <thead>
-            <tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50">
+            <tr className="text-ui-sm text-neutral-500 border-b border-neutral-800/50">
               <th className="text-left px-3 py-2 font-medium">Task Type</th>
               <th className="text-right px-3 py-2 font-medium">In / Out Tokens</th>
               <th className="text-right px-3 py-2 font-medium">Cost</th>
@@ -270,7 +270,7 @@ export function LlmCostBreakdownPanel({
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
           {by_model.map((row, i) => (
-            <div key={i} className="px-3 py-2 text-[10px]">
+            <div key={i} className="px-3 py-2 text-ui-sm">
               <div className="flex items-start justify-between gap-2 mb-1">
                 <span className="font-medium text-neutral-200 break-words">
                   {row.model}
@@ -294,7 +294,7 @@ export function LlmCostBreakdownPanel({
         {/* Desktop: table layout */}
         <table className="hidden sm:table w-full text-xs">
           <thead>
-            <tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50">
+            <tr className="text-ui-sm text-neutral-500 border-b border-neutral-800/50">
               <th className="text-left px-3 py-2 font-medium">Provider / Model</th>
               <th className="text-right px-3 py-2 font-medium">In / Out Tokens</th>
               <th className="text-right px-3 py-2 font-medium">Cost</th>
@@ -310,9 +310,9 @@ export function LlmCostBreakdownPanel({
               <tr key={i}>
                 <td className="px-3 py-2">
                   <span className="font-medium text-neutral-200">{row.model}</span>
-                  <span className="text-neutral-500 ml-1.5 text-[10px]">{row.provider}</span>
-                  {!row.priced && <span className="ml-1.5 text-[10px] text-amber-400">unpriced</span>}
-                  {row.approximate_priced && <span className="ml-1.5 text-[10px] text-blue-400">approx</span>}
+                  <span className="text-neutral-500 ml-1.5 text-ui-sm">{row.provider}</span>
+                  {!row.priced && <span className="ml-1.5 text-ui-sm text-amber-400">unpriced</span>}
+                  {row.approximate_priced && <span className="ml-1.5 text-ui-sm text-blue-400">approx</span>}
                 </td>
                 <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">
                   {fmtTokens(row.total_input_tokens)} / {fmtTokens(row.total_output_tokens)}

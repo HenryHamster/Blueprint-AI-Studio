@@ -190,7 +190,7 @@ function StatCard({ value, label, color }: { value: string; label: string; color
   return (
     <div className="bg-neutral-900/60 rounded-lg p-3 border border-neutral-800 flex flex-col gap-1 min-w-0">
       <span className={`text-lg font-bold leading-none ${color ?? 'text-neutral-100'}`}>{value}</span>
-      <span className="text-[10px] text-neutral-500 truncate">{label}</span>
+      <span className="text-ui-sm text-neutral-500 truncate">{label}</span>
     </div>
   );
 }
@@ -223,7 +223,7 @@ function MetricChip({
         data-viewport-allow-small-target
         type="button"
         onClick={onClick}
-        className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border cursor-pointer hover:brightness-125 transition-all ${toneCls} ${active ? 'ring-1 ring-white/40' : ''}`}
+        className={`inline-flex items-center gap-1 text-ui-sm px-1.5 py-0.5 rounded border cursor-pointer hover:brightness-125 transition-all ${toneCls} ${active ? 'ring-1 ring-white/40' : ''}`}
         title={title}
       >
         {content}
@@ -232,7 +232,7 @@ function MetricChip({
   }
   return (
     <span
-      className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border ${toneCls}`}
+      className={`inline-flex items-center gap-1 text-ui-sm px-1.5 py-0.5 rounded border ${toneCls}`}
       title={title}
     >
       {content}
@@ -442,38 +442,38 @@ function ChainDrillDownPanel({
     <div className="mt-2 bg-neutral-900/80 rounded-lg border border-neutral-700 p-3">
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-400">PR chains</span>
-          <span className={`inline-flex items-center text-[10px] px-1.5 py-0.5 rounded border ${reasonCls}`}>
+          <span className="text-ui-sm font-semibold uppercase tracking-wide text-neutral-400">PR chains</span>
+          <span className={`inline-flex items-center text-ui-sm px-1.5 py-0.5 rounded border ${reasonCls}`}>
             {reasonLabel}
           </span>
-          {!loading && <span className="text-[10px] text-neutral-500">{total} chain{total !== 1 ? 's' : ''}</span>}
+          {!loading && <span className="text-ui-sm text-neutral-500">{total} chain{total !== 1 ? 's' : ''}</span>}
         </div>
         <button data-viewport-allow-small-target type="button" onClick={onClose} className="text-neutral-500 hover:text-neutral-300 text-xs leading-none px-1" aria-label="Close">✕</button>
       </div>
 
-      {loading && <p className="text-[10px] text-neutral-500">Loading…</p>}
-      {error && <p className="text-[10px] text-red-400">{error}</p>}
+      {loading && <p className="text-ui-sm text-neutral-500">Loading…</p>}
+      {error && <p className="text-ui-sm text-red-400">{error}</p>}
       {!loading && !error && chains.length === 0 && (
-        <p className="text-[10px] text-neutral-600">No PR chains found for this outcome.</p>
+        <p className="text-ui-sm text-neutral-600">No PR chains found for this outcome.</p>
       )}
       {!loading && !error && chains.length > 0 && (
         <div className="flex flex-col gap-1.5 max-h-64 overflow-y-auto pr-1">
           {chains.map((c, i) => (
             <div key={c.pr_number ?? `chain-${i}`} className="bg-neutral-800/60 rounded p-2 flex flex-col gap-0.5 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-[11px] text-neutral-200 font-medium">
+                <span className="text-ui-md text-neutral-200 font-medium">
                   {c.pr_number != null ? `PR #${c.pr_number}` : 'no PR'}
                 </span>
                 {c.terminal_reason && (
-                  <span className={`text-[10px] px-1 py-0.5 rounded border ${TERMINAL_OUTCOME_TONES[c.terminal_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}>
+                  <span className={`text-ui-sm px-1 py-0.5 rounded border ${TERMINAL_OUTCOME_TONES[c.terminal_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}>
                     {TERMINAL_OUTCOME_LABELS[c.terminal_reason] ?? c.terminal_reason.replace(/_/g, ' ')}
                   </span>
                 )}
               </div>
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-[10px] text-neutral-600">{c.max_iteration} iter</span>
-                <span className="text-[10px] text-neutral-600">churn {c.churn_count}</span>
-                <span className="text-[10px] text-neutral-500 truncate min-w-0" title={c.task_ids.join(', ')}>
+                <span className="text-ui-sm text-neutral-600">{c.max_iteration} iter</span>
+                <span className="text-ui-sm text-neutral-600">churn {c.churn_count}</span>
+                <span className="text-ui-sm text-neutral-500 truncate min-w-0" title={c.task_ids.join(', ')}>
                   {c.task_ids.length} task{c.task_ids.length !== 1 ? 's' : ''}
                 </span>
               </div>
@@ -553,8 +553,8 @@ export function OuterReviewLoopConvergenceWidget({
   return (
     <section>
       <div className="flex items-center gap-2 mb-2">
-        <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Outer Review↔Fix Convergence</p>
-        <span className="text-[10px] text-neutral-600">{data.prs_with_review_loop} PR cycles · {formatWindowHours(data.window_hours || windowHours)}</span>
+        <p className="text-ui-sm text-neutral-500 uppercase tracking-wide">Outer Review↔Fix Convergence</p>
+        <span className="text-ui-sm text-neutral-600">{data.prs_with_review_loop} PR cycles · {formatWindowHours(data.window_hours || windowHours)}</span>
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -566,7 +566,7 @@ export function OuterReviewLoopConvergenceWidget({
 
       {data.dominant_blocker && (
         <div className="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2">
-          <p className="text-[10px] uppercase tracking-wide text-amber-300/80">dominant non-convergence blocker</p>
+          <p className="text-ui-sm uppercase tracking-wide text-amber-300/80">dominant non-convergence blocker</p>
           <p className="mt-0.5 text-xs text-amber-100">
             <span className="font-bold">
               {BLOCKER_CAUSE_LABELS[data.dominant_blocker.cause] ?? data.dominant_blocker.cause.replace(/_/g, ' ')}
@@ -577,12 +577,12 @@ export function OuterReviewLoopConvergenceWidget({
       )}
 
       <div className="mt-2 flex flex-col gap-1">
-        <span className="text-[10px] text-neutral-500">cycles-to-terminal distribution</span>
+        <span className="text-ui-sm text-neutral-500">cycles-to-terminal distribution</span>
         <IterDistBar dist={data.iteration_distribution} />
       </div>
 
       <div className="mt-2 flex flex-col gap-1">
-        <span className="text-[10px] text-neutral-500">terminal outcomes</span>
+        <span className="text-ui-sm text-neutral-500">terminal outcomes</span>
         <div className="flex flex-wrap gap-1">
           {terminalOutcomes.map(({ key, count }) => {
             const canDrill = DRILLDOWN_REASONS.has(key);
@@ -608,7 +608,7 @@ export function OuterReviewLoopConvergenceWidget({
       </div>
 
       <div className="mt-2 flex flex-col gap-1">
-        <span className="text-[10px] text-neutral-500">incidence</span>
+        <span className="text-ui-sm text-neutral-500">incidence</span>
         <div className="flex flex-wrap gap-1">
           {incidenceEntries.map(({ key, count, rate }) => {
             const reason = INCIDENCE_DRILLDOWN_REASON[key];
@@ -664,8 +664,8 @@ export function OuterReviewLoopConvergenceWidget({
         <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div className="min-w-0">
             <div className="flex items-center gap-2 mb-1.5">
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide">{trendDays}-day convergence trend</p>
-              <span className="flex items-center gap-1 text-[10px] text-neutral-600">
+              <p className="text-ui-sm text-neutral-500 uppercase tracking-wide">{trendDays}-day convergence trend</p>
+              <span className="flex items-center gap-1 text-ui-sm text-neutral-600">
                 <span className="inline-block w-3 border-t border-emerald-400" /> converged %
               </span>
             </div>
@@ -673,15 +673,15 @@ export function OuterReviewLoopConvergenceWidget({
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-2 mb-1.5 flex-wrap">
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide">{trendDays}-day churn trend</p>
-              <span className={`inline-flex items-center gap-0.5 text-[10px] font-semibold ${churnDirMeta.tone}`} title={`Churn is ${churnDirMeta.label} across the window`}>
+              <p className="text-ui-sm text-neutral-500 uppercase tracking-wide">{trendDays}-day churn trend</p>
+              <span className={`inline-flex items-center gap-0.5 text-ui-sm font-semibold ${churnDirMeta.tone}`} title={`Churn is ${churnDirMeta.label} across the window`}>
                 <span aria-hidden>{churnDirMeta.glyph}</span> {churnDirMeta.label}
               </span>
             </div>
             <ChurnTrend buckets={trendBuckets} />
           </div>
           {latestBucket && (
-            <p className="mt-1 text-[10px] text-neutral-600 sm:col-span-2">{getTrendBucketSummary(latestBucket)}</p>
+            <p className="mt-1 text-ui-sm text-neutral-600 sm:col-span-2">{getTrendBucketSummary(latestBucket)}</p>
           )}
         </div>
       )}

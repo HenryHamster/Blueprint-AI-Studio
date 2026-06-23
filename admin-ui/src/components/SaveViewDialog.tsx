@@ -55,13 +55,13 @@ export function SaveViewDialog({ open, mode, name, description, error, summaryTe
           />
         </label>
         {mode === 'create' && summaryText && (
-          <div className="text-[11px] text-neutral-500 bg-neutral-950/50 border border-neutral-800/60 rounded-md px-3 py-2">
+          <div className="text-ui-md text-neutral-500 bg-neutral-950/50 border border-neutral-800/60 rounded-md px-3 py-2">
             <span className="text-neutral-400">Saving:</span>{' '}
             {summaryText}
           </div>
         )}
         {error && (
-          <div role="alert" className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/30 rounded-md px-3 py-2">
+          <div role="alert" className="text-ui-md text-red-400 bg-red-500/10 border border-red-500/30 rounded-md px-3 py-2">
             {error}
           </div>
         )}

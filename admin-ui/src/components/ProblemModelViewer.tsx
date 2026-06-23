@@ -71,7 +71,7 @@ function SourceBadge({ source }: { source: Source }) {
   if (source.direction_id) tail.push(`dir ${source.direction_id.slice(0, 8)}`);
   if (source.friction_id) tail.push(`friction ${source.friction_id.slice(0, 8)}`);
   return (
-    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-800/70 text-neutral-400 border border-neutral-800">
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-ui-sm font-medium rounded bg-neutral-800/70 text-neutral-400 border border-neutral-800">
       {source.type.replace(/_/g, ' ')}
       {messageRef && (
         <span
@@ -108,7 +108,7 @@ function CapabilityBar({ capability }: { capability: Capability }) {
         <div className="flex items-baseline gap-2">
           <span className="text-sm text-neutral-200 truncate">{capability.name}</span>
           <span className="text-xs text-neutral-500">{capabilityStatusLabels[status] || status}</span>
-          <span className={`text-[10px] font-medium uppercase tracking-wide ${proofStatus === 'proven' ? 'text-emerald-400' : 'text-neutral-500'}`}>
+          <span className={`text-ui-sm font-medium uppercase tracking-wide ${proofStatus === 'proven' ? 'text-emerald-400' : 'text-neutral-500'}`}>
             {proofStatusLabels[proofStatus] || proofStatus}
           </span>
         </div>
@@ -120,7 +120,7 @@ function CapabilityBar({ capability }: { capability: Capability }) {
             {proofRecords.map((record: CapabilityProofRecord, index: number) => (
               <div
                 key={`${record.task_id}-${record.proof_ref}-${index}`}
-                className="rounded border border-emerald-500/20 bg-emerald-500/5 px-2 py-1 text-[11px] text-neutral-300"
+                className="rounded border border-emerald-500/20 bg-emerald-500/5 px-2 py-1 text-ui-md text-neutral-300"
               >
                 <div className="flex flex-wrap gap-x-3 gap-y-0.5">
                   <span>
@@ -154,18 +154,18 @@ function GapCard({ gap }: { gap: Gap }) {
       <div className="flex items-start justify-between gap-2 mb-1">
         <div className="flex-1 min-w-0">
           <div className="flex flex-wrap items-center gap-1.5 mb-1">
-            <span className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded border ${priorityColors[gap.priority] || priorityColors.medium}`}>
+            <span className={`inline-flex items-center px-1.5 py-0.5 text-ui-sm font-medium rounded border ${priorityColors[gap.priority] || priorityColors.medium}`}>
               {gap.priority}
             </span>
-            <span className={`text-[10px] uppercase tracking-wide ${sizeColors[gap.size] || sizeColors.medium}`}>
+            <span className={`text-ui-sm uppercase tracking-wide ${sizeColors[gap.size] || sizeColors.medium}`}>
               {gap.size}
             </span>
             {gap.tag && (
-              <span className="inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+              <span className="inline-flex items-center px-1.5 py-0.5 text-ui-sm font-medium rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
                 {gap.tag}
               </span>
             )}
-            <span className="text-[10px] font-mono text-neutral-600">{gap.id}</span>
+            <span className="text-ui-sm font-mono text-neutral-600">{gap.id}</span>
           </div>
           <h4 className="text-sm font-medium text-neutral-100">{gap.name}</h4>
         </div>
@@ -196,7 +196,7 @@ function ArchivedGapRow({ gap }: { gap: Gap }) {
     <div className="flex items-baseline gap-2 py-1 text-sm">
       <span className="text-neutral-600 text-xs font-mono shrink-0">{gap.id}</span>
       <span className="text-neutral-300 truncate flex-1">{gap.name}</span>
-      <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded ${gap.status === 'closed' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-neutral-700/40 text-neutral-500'}`}>
+      <span className={`text-ui-sm uppercase px-1.5 py-0.5 rounded ${gap.status === 'closed' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-neutral-700/40 text-neutral-500'}`}>
         {gap.status}
       </span>
       {gap.closed && <span className="text-xs text-neutral-500">{timeAgo(gap.closed)}</span>}
@@ -244,14 +244,14 @@ function PendingConfirmationRow({ pending }: { pending: PendingConfirmation }) {
             <span className="text-xs font-semibold text-amber-300 uppercase tracking-wide">
               {pendingTypeLabels[pending.type] || pending.type}
             </span>
-            <span className="text-[10px] font-mono text-neutral-600">{pending.id}</span>
+            <span className="text-ui-sm font-mono text-neutral-600">{pending.id}</span>
           </div>
           <p className="text-sm text-neutral-100">{pending.proposal}</p>
           {pending.rationale && (
             <p className="text-xs text-neutral-400 mt-1">{pending.rationale}</p>
           )}
           {pending.created_at && (
-            <p className="text-[10px] text-neutral-500 mt-1">{timeAgo(pending.created_at)}</p>
+            <p className="text-ui-sm text-neutral-500 mt-1">{timeAgo(pending.created_at)}</p>
           )}
         </div>
       </div>
@@ -263,26 +263,26 @@ function SelfReflectionCard({ entry }: { entry: SelfReflectionEntry }) {
   return (
     <div className="border border-neutral-800 rounded-md p-3 bg-neutral-900/30 space-y-2">
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-[10px] text-neutral-500">{timeAgo(entry.ts)}</span>
+        <span className="text-ui-sm text-neutral-500">{timeAgo(entry.ts)}</span>
         {entry.cycle_task_id && (
-          <span className="text-[10px] font-mono text-neutral-600">{entry.cycle_task_id.slice(0, 8)}</span>
+          <span className="text-ui-sm font-mono text-neutral-600">{entry.cycle_task_id.slice(0, 8)}</span>
         )}
       </div>
       {entry.what_was_hard && (
         <div>
-          <h4 className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wide mb-0.5">What was hard</h4>
+          <h4 className="text-ui-sm font-semibold text-neutral-500 uppercase tracking-wide mb-0.5">What was hard</h4>
           <p className="text-xs text-neutral-300">{entry.what_was_hard}</p>
         </div>
       )}
       {entry.missing_context && (
         <div>
-          <h4 className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wide mb-0.5">Missing context</h4>
+          <h4 className="text-ui-sm font-semibold text-neutral-500 uppercase tracking-wide mb-0.5">Missing context</h4>
           <p className="text-xs text-neutral-300">{entry.missing_context}</p>
         </div>
       )}
       {entry.proposed_self_improvement && (
         <div>
-          <h4 className="text-[10px] font-semibold text-amber-600/80 uppercase tracking-wide mb-0.5">Proposed improvement</h4>
+          <h4 className="text-ui-sm font-semibold text-amber-600/80 uppercase tracking-wide mb-0.5">Proposed improvement</h4>
           <p className="text-xs text-neutral-200">{entry.proposed_self_improvement}</p>
         </div>
       )}
@@ -441,7 +441,7 @@ export default function ProblemModelViewer({
                 if (caps.length === 0) return null;
                 return (
                   <div key={status}>
-                    <h4 className="text-[11px] font-medium text-neutral-500 uppercase tracking-wide mb-1">
+                    <h4 className="text-ui-md font-medium text-neutral-500 uppercase tracking-wide mb-1">
                       {capabilityStatusLabels[status]} ({caps.length})
                     </h4>
                     <div className="divide-y divide-neutral-800/70 border border-neutral-800/70 rounded-md">

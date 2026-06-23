@@ -260,35 +260,35 @@ export function ProjectResourceEnvelopeSection({
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Configured Limits</h3>
         <div className="grid grid-cols-1 sm:grid-cols-5 gap-3">
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
-            <div className="text-[10px] uppercase tracking-wider text-neutral-500">Concurrent VMs</div>
+            <div className="text-ui-sm uppercase tracking-wider text-neutral-500">Concurrent VMs</div>
             <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? currentCapLabel}</div>
           </div>
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
-            <div className="text-[10px] uppercase tracking-wider text-neutral-500">Spend ceiling</div>
+            <div className="text-ui-sm uppercase tracking-wider text-neutral-500">Spend ceiling</div>
             <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? currentCeilingLabel}</div>
           </div>
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
-            <div className="text-[10px] uppercase tracking-wider text-neutral-500">Spend window</div>
+            <div className="text-ui-sm uppercase tracking-wider text-neutral-500">Spend window</div>
             <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? `${current.spend_window_days} days`}</div>
           </div>
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
-            <div className="text-[10px] uppercase tracking-wider text-neutral-500">Warning threshold</div>
+            <div className="text-ui-sm uppercase tracking-wider text-neutral-500">Warning threshold</div>
             <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? `${Math.round((current.spend_warning_fraction ?? 0.8) * 100)}%`}</div>
           </div>
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
-            <div className="text-[10px] uppercase tracking-wider text-neutral-500">Concurrent compute jobs</div>
+            <div className="text-ui-sm uppercase tracking-wider text-neutral-500">Concurrent compute jobs</div>
             <div className="mt-1 text-sm font-semibold text-neutral-100">{noDataLabel ?? formatCount(current.max_concurrent_compute_jobs)}</div>
           </div>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
-            <div className="text-[10px] uppercase tracking-wider text-neutral-500">Machine types</div>
+            <div className="text-ui-sm uppercase tracking-wider text-neutral-500">Machine types</div>
             <div className="mt-1 text-sm font-semibold text-neutral-100 break-words">
               {noDataLabel ?? formatMachinePolicy(current.allowed_machine_types)}
             </div>
           </div>
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-3">
-            <div className="text-[10px] uppercase tracking-wider text-neutral-500">GPU accelerators</div>
+            <div className="text-ui-sm uppercase tracking-wider text-neutral-500">GPU accelerators</div>
             <div className="mt-1 text-sm font-semibold text-neutral-100 break-words">
               {noDataLabel ?? formatAcceleratorPolicy(current.allowed_accelerator_types)}
             </div>
@@ -306,7 +306,7 @@ export function ProjectResourceEnvelopeSection({
                 {noDataLabel ?? `${current.active_vm_count} / ${currentCapLabel}`}
               </span>
             </div>
-            <p className="text-[11px] text-neutral-600 mt-1">Counts PROVISIONING and IN_PROGRESS tasks.</p>
+            <p className="text-ui-md text-neutral-600 mt-1">Counts PROVISIONING and IN_PROGRESS tasks.</p>
           </div>
           {!noDataLabel && current.is_throttled && (
             <div className="bg-amber-950/50 border border-amber-600 rounded-lg px-4 py-2 flex items-center gap-2">
@@ -323,33 +323,33 @@ export function ProjectResourceEnvelopeSection({
             ) : (
               <div className="space-y-1">
                 <div className="flex items-center justify-between gap-3">
-                  <span className="text-[11px] text-neutral-400">Compute jobs</span>
+                  <span className="text-ui-md text-neutral-400">Compute jobs</span>
                   <span className="text-xs font-mono text-neutral-100">{formatUsd(current.recent_spend_compute_usd)}</span>
                 </div>
                 <div className="flex items-center justify-between gap-3">
-                  <span className="text-[11px] text-neutral-400">Agent VMs</span>
+                  <span className="text-ui-md text-neutral-400">Agent VMs</span>
                   <span className="text-xs font-mono text-neutral-100">{formatUsd(current.recent_spend_agent_vm_usd)}</span>
                 </div>
                 <div className="flex items-center justify-between gap-3">
-                  <span className="text-[11px] text-neutral-400">Warm-pool idle</span>
+                  <span className="text-ui-md text-neutral-400">Warm-pool idle</span>
                   <span className="text-xs font-mono text-neutral-100">{formatUsd(current.recent_spend_idle_usd)}</span>
                 </div>
                 <div className="flex items-center justify-between gap-3 border-t border-neutral-800 pt-1 mt-1">
-                  <span className="text-[11px] font-semibold text-neutral-300">Total</span>
+                  <span className="text-ui-md font-semibold text-neutral-300">Total</span>
                   <span className={`text-xs font-mono ${spendOverCeiling ? 'text-red-400' : 'text-neutral-100'}`}>
                     {`${formatUsd(current.recent_spend_usd)} / ${currentCeilingLabel}`}
                   </span>
                 </div>
               </div>
             )}
-            <p className="text-[11px] text-neutral-600 mt-2">{current.spend_window_days}-day rolling window.</p>
+            <p className="text-ui-md text-neutral-600 mt-2">{current.spend_window_days}-day rolling window.</p>
           </div>
         </div>
       </div>
 
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Edit Limits</h3>
-        <p className="text-[11px] text-neutral-600 mb-3">
+        <p className="text-ui-md text-neutral-600 mb-3">
           Blank concurrent-VM or spend-ceiling fields clear the cap. Spend window stays required.
         </p>
         <div className="grid grid-cols-1 sm:grid-cols-5 gap-3">
@@ -422,14 +422,14 @@ export function ProjectResourceEnvelopeSection({
             />
           </label>
         </div>
-        {error && <p className="mt-2 text-[11px] text-red-400">{error}</p>}
-        {loading && <p className="mt-2 text-[11px] text-neutral-500">Loading resource envelope…</p>}
-        {!canSave && <p className="mt-2 text-[11px] text-neutral-500">Only project owners can edit resource envelopes.</p>}
+        {error && <p className="mt-2 text-ui-md text-red-400">{error}</p>}
+        {loading && <p className="mt-2 text-ui-md text-neutral-500">Loading resource envelope…</p>}
+        {!canSave && <p className="mt-2 text-ui-md text-neutral-500">Only project owners can edit resource envelopes.</p>}
       </div>
 
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Hardware Policy</h3>
-        <p className="text-[11px] text-neutral-600 mb-3">
+        <p className="text-ui-md text-neutral-600 mb-3">
           Leave all boxes unchecked to allow any hardware (no restriction). Checking a subset
           whitelists only those values for this project's compute jobs.
         </p>
@@ -450,7 +450,7 @@ export function ProjectResourceEnvelopeSection({
                 </label>
               ))}
             </div>
-            <p className="text-[11px] text-neutral-600 mt-1">
+            <p className="text-ui-md text-neutral-600 mt-1">
               {machineTypesToSave == null ? 'Any (unlimited)' : `Whitelist: ${machineTypesToSave.join(', ')}`}
             </p>
           </fieldset>
@@ -480,7 +480,7 @@ export function ProjectResourceEnvelopeSection({
                 <span className="text-xs text-amber-300">Block all GPU jobs</span>
               </label>
             </div>
-            <p className="text-[11px] text-neutral-600 mt-1">
+            <p className="text-ui-md text-neutral-600 mt-1">
               {acceleratorTypesToSave == null
                 ? 'Any (unlimited)'
                 : acceleratorTypesToSave.length === 0

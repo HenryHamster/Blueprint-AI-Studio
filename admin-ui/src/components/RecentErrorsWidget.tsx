@@ -112,7 +112,7 @@ export function RecentErrorsWidget() {
   if (loading) {
     return (
       <section aria-label="Recent orchestrator errors">
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
+        <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 h-14 animate-pulse" />
       </section>
     );
@@ -121,14 +121,14 @@ export function RecentErrorsWidget() {
   if (hasApiError) {
     return (
       <section aria-label="Recent orchestrator errors">
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
+        <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
         <div
           className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
           role="status"
         >
           <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
           <span>Error fetching log data</span>
-          <span className="text-[10px] text-neutral-600 truncate" title={backendErrorMessage}>
+          <span className="text-ui-sm text-neutral-600 truncate" title={backendErrorMessage}>
             {backendErrorMessage}
           </span>
         </div>
@@ -139,7 +139,7 @@ export function RecentErrorsWidget() {
   if (totalCount === 0) {
     return (
       <section aria-label="Recent orchestrator errors">
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
+        <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
         <div
           className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2"
           role="status"
@@ -147,7 +147,7 @@ export function RecentErrorsWidget() {
           <CheckCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
           <span>No errors in last hour</span>
           {ackedCount > 0 && (
-            <span className="text-[10px] text-neutral-600 ml-auto">
+            <span className="text-ui-sm text-neutral-600 ml-auto">
               {ackedCount} acknowledged
             </span>
           )}
@@ -158,7 +158,7 @@ export function RecentErrorsWidget() {
 
   return (
     <section aria-label="Recent orchestrator errors">
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
       <div className="bg-neutral-900/50 border border-red-500/30 rounded-lg overflow-hidden">
         <div className="flex items-center">
           <button
@@ -177,7 +177,7 @@ export function RecentErrorsWidget() {
             <span className="text-xs text-red-400 font-semibold">
               {totalCount} error{totalCount !== 1 ? 's' : ''} in last hour
             </span>
-            <span className="text-[10px] text-neutral-500 ml-auto">
+            <span className="text-ui-sm text-neutral-500 ml-auto">
               {buckets.length} unique{ackedCount > 0 ? ` · ${ackedCount} acked` : ''}
             </span>
           </button>
@@ -236,18 +236,18 @@ export function RecentErrorsWidget() {
                     <span className="text-red-400 font-semibold truncate max-w-[40%]" title={bucket.exception_class}>
                       {bucket.exception_class}
                     </span>
-                    <span className="text-neutral-500 font-mono text-[10px] truncate flex-1" title={bucket.source}>
+                    <span className="text-neutral-500 font-mono text-ui-sm truncate flex-1" title={bucket.source}>
                       {bucket.source}
                     </span>
                     <span className="text-neutral-300 shrink-0">
                       {bucket.count}&times; in last hour
                     </span>
-                    <span className="text-[10px] text-neutral-500 shrink-0">
+                    <span className="text-ui-sm text-neutral-500 shrink-0">
                       {timeAgo(bucket.last_seen_iso)}
                     </span>
                   </div>
                   {isHovered && bucket.sample_message && (
-                    <pre className="mt-2 text-[10px] text-neutral-400 bg-neutral-950/60 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-32">
+                    <pre className="mt-2 text-ui-sm text-neutral-400 bg-neutral-950/60 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-32">
                       {bucket.sample_message}
                     </pre>
                   )}

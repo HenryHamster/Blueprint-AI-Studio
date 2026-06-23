@@ -155,15 +155,15 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
 
   return (
     <section aria-label="SR unhandled edges retrospectives" data-testid="sr-unhandled-edges-retrospectives-panel">
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Unhandled Edge Cases</h2>
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Unhandled Edge Cases</h2>
 
-      <div className="flex flex-wrap items-center gap-2 mb-2 text-[10px]">
+      <div className="flex flex-wrap items-center gap-2 mb-2 text-ui-sm">
         <RetrospectiveDayWindowButtons days={days} onChange={setDays} />
         {stableTaskTypes.length > 0 && (
           <select
             value={taskTypeFilter}
             onChange={e => setTaskTypeFilter(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300 text-[10px]"
+            className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300 text-ui-sm"
             aria-label="Filter by task type"
           >
             <option value="">All types</option>
@@ -180,7 +180,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
               key={theme}
               type="button"
               onClick={() => setBlindSpotFilter(theme === blindSpotFilter ? '' : theme)}
-              className={`px-1.5 py-0.5 rounded text-[9px] border transition-colors ${theme === blindSpotFilter ? 'border-amber-500/60 bg-amber-950/30 text-amber-300' : 'border-neutral-700 text-neutral-400 hover:border-amber-500/40'}`}
+              className={`px-1.5 py-0.5 rounded text-ui-xs border transition-colors ${theme === blindSpotFilter ? 'border-amber-500/60 bg-amber-950/30 text-amber-300' : 'border-neutral-700 text-neutral-400 hover:border-amber-500/40'}`}
               aria-pressed={theme === blindSpotFilter}
               title={`Filter by blind-spot theme: ${theme}`}
             >
@@ -188,7 +188,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
             </button>
           ))}
           {blindSpotPillsHidden > 0 && (
-            <span className="text-[9px] text-neutral-600 self-center ml-1">+{blindSpotPillsHidden} more</span>
+            <span className="text-ui-xs text-neutral-600 self-center ml-1">+{blindSpotPillsHidden} more</span>
           )}
         </div>
       )}
@@ -201,7 +201,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
               key={pattern}
               type="button"
               onClick={() => setCasePatternFilter(pattern === casePatternFilter ? '' : pattern)}
-              className={`px-1.5 py-0.5 rounded text-[9px] border transition-colors ${pattern === casePatternFilter ? 'border-amber-500/60 bg-amber-950/30 text-amber-300' : 'border-neutral-700 text-neutral-400 hover:border-amber-500/40'}`}
+              className={`px-1.5 py-0.5 rounded text-ui-xs border transition-colors ${pattern === casePatternFilter ? 'border-amber-500/60 bg-amber-950/30 text-amber-300' : 'border-neutral-700 text-neutral-400 hover:border-amber-500/40'}`}
               aria-pressed={pattern === casePatternFilter}
               title={`Filter by edge-case pattern: ${pattern}`}
             >
@@ -224,7 +224,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
         >
           <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
           <span>Error fetching SR data</span>
-          <span className="text-[10px] text-neutral-600 truncate" title={fetchError}>{fetchError}</span>
+          <span className="text-ui-sm text-neutral-600 truncate" title={fetchError}>{fetchError}</span>
         </div>
       ) : items.length === 0 ? (
         (taskTypeFilter || blindSpotFilter || casePatternFilter) ? (
@@ -278,7 +278,7 @@ function SrUnhandledEdgesRow({ task, onClick }: { task: SrUnhandledEdgesTask; on
   return (
     // eslint-disable-next-line viewport/min-touch-target -- dense row, consistent with SrMissedRetrospective
     <div
-      className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[10px] cursor-pointer hover:border-neutral-600"
+      className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-sm cursor-pointer hover:border-neutral-600"
       onClick={onClick}
       role="button"
       tabIndex={0}
@@ -299,7 +299,7 @@ function SrUnhandledEdgesRow({ task, onClick }: { task: SrUnhandledEdgesTask; on
         {task.task_type && <span className="text-neutral-500 shrink-0">{task.task_type}</span>}
         {task.scope && <span className="text-neutral-600 shrink-0">{task.scope}</span>}
         {task.unhandled_edges.length > 0 && (
-          <span className="bg-amber-950/40 border border-amber-800/30 rounded px-1 py-0.5 text-amber-300 text-[9px] shrink-0">
+          <span className="bg-amber-950/40 border border-amber-800/30 rounded px-1 py-0.5 text-amber-300 text-ui-xs shrink-0">
             {task.unhandled_edges.length} edge{task.unhandled_edges.length !== 1 ? 's' : ''}
           </span>
         )}
@@ -308,7 +308,7 @@ function SrUnhandledEdgesRow({ task, onClick }: { task: SrUnhandledEdgesTask; on
         )}
         {task.pr_url && isSafeUrl(task.pr_url) && (
           // eslint-disable-next-line viewport/min-touch-target -- dense inline link
-          <a href={task.pr_url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-blue-400 hover:underline text-[9px] shrink-0">PR</a>
+          <a href={task.pr_url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-blue-400 hover:underline text-ui-xs shrink-0">PR</a>
         )}
       </div>
       {expanded && task.unhandled_edges.length > 0 && (
@@ -316,8 +316,8 @@ function SrUnhandledEdgesRow({ task, onClick }: { task: SrUnhandledEdgesTask; on
           {task.unhandled_edges.map((edge: SrUnhandledEdge, i: number) => (
             <div key={i} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
               <div className="mb-1 text-neutral-400 font-medium">{edge.case}</div>
-              {edge.blind_spot && <div className="text-neutral-500 text-[9px]">{edge.blind_spot}</div>}
-              {edge.origin && <div className="text-neutral-600 text-[9px]">source: {edge.origin}</div>}
+              {edge.blind_spot && <div className="text-neutral-500 text-ui-xs">{edge.blind_spot}</div>}
+              {edge.origin && <div className="text-neutral-600 text-ui-xs">source: {edge.origin}</div>}
             </div>
           ))}
         </div>

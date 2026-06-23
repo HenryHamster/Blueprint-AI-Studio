@@ -16,8 +16,8 @@ export function PipelineEfficiencyPanel({ projectId }: { projectId: string | nul
 
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Pipeline Efficiency</h2>
-      <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400">
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Pipeline Efficiency</h2>
+      <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 flex flex-wrap gap-x-4 gap-y-1 text-ui-sm text-neutral-400">
         <span>
           <span className="text-neutral-500">cold-start p50</span>{': '}
           <span className="font-mono text-neutral-300">{fmtEffSecs(w24?.setup_p50_secs)}</span>

@@ -164,13 +164,13 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
   return (
     <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4" data-viewport-allow-truncation>
-      <div className="flex items-center gap-2 mb-3 text-[11px] font-bold text-neutral-400 uppercase tracking-widest">
+      <div className="flex items-center gap-2 mb-3 text-ui-md font-bold text-neutral-400 uppercase tracking-widest">
         <Cpu className="w-3.5 h-3.5 shrink-0" />
         Compute jobs
       </div>
 
       {error && (
-        <p className="text-[10px] text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 mb-2 break-words flex items-start gap-1.5">
+        <p className="text-ui-sm text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 mb-2 break-words flex items-start gap-1.5">
           <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
           {error}
         </p>
@@ -181,7 +181,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <div className="text-xs font-semibold text-neutral-200">No compute jobs</div>
-              <div className="mt-0.5 text-[10px] text-neutral-500">
+              <div className="mt-0.5 text-ui-sm text-neutral-500">
                 Launch a structured experiment for this project.
               </div>
             </div>
@@ -189,7 +189,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               <button
                 type="button"
                 onClick={onLaunchCompute}
-                className="shrink-0 min-h-[36px] rounded bg-sky-500/20 px-3 text-[11px] font-semibold text-sky-200 transition-colors hover:bg-sky-500/30"
+                className="shrink-0 min-h-[36px] rounded bg-sky-500/20 px-3 text-ui-md font-semibold text-sky-200 transition-colors hover:bg-sky-500/30"
               >
                 Launch compute experiment
               </button>
@@ -223,7 +223,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       {job.task_title ?? job.task_id ?? job.id}
                     </div>
                   )}
-                  <div className="text-[10px] text-neutral-500 font-mono mt-0.5 break-words">
+                  <div className="text-ui-sm text-neutral-500 font-mono mt-0.5 break-words">
                     {job.backend}
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
                     {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
@@ -240,14 +240,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   })()}
                 </div>
                 <span
-                  className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${statusBadgeClass(job)}`}
+                  className={`shrink-0 rounded border px-1.5 py-0.5 text-ui-sm font-semibold ${statusBadgeClass(job)}`}
                 >
                   {active ? job.status : computeJobTerminalLabel(job)}
                 </span>
               </div>
 
               <div className="mb-1.5">
-                <div className="flex items-center justify-between text-[10px] text-neutral-400 font-mono mb-1">
+                <div className="flex items-center justify-between text-ui-sm text-neutral-400 font-mono mb-1">
                   <span>Budget</span>
                   <span>
                     {fmtUsd(spent)} / {fmtUsd(job.spend_cap_usd)}
@@ -272,7 +272,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 if (runtimeSec === null && costRate === null) return null;
                 return (
                   <div
-                    className="mb-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-neutral-400 font-mono"
+                    className="mb-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-400 font-mono"
                     data-testid="compute-result-story"
                   >
                     {runtimeSec !== null && (
@@ -294,7 +294,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 );
               })()}
               <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-1.5 text-[10px] text-neutral-400 font-mono min-w-0">
+                <div className="flex items-center gap-1.5 text-ui-sm text-neutral-400 font-mono min-w-0">
                   <Clock className="w-3 h-3 shrink-0" />
                   {active ? (
                     <span className="break-words">{fmtCountdown(job.wall_clock_deadline, nowMs)} left</span>
@@ -303,7 +303,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   )}
                   {!active && typeof (job.polling_metadata?.exit_code) === 'number' && (
                     <span
-                      className="shrink-0 rounded border border-neutral-700 bg-neutral-800/60 px-1 py-0.5 text-[9px] text-neutral-400"
+                      className="shrink-0 rounded border border-neutral-700 bg-neutral-800/60 px-1 py-0.5 text-ui-xs text-neutral-400"
                       data-testid="compute-exit-code"
                     >
                       exit {job.polling_metadata.exit_code as number}
@@ -316,7 +316,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       <button
                         onClick={() => void handleAnalyze(job)}
                         disabled={analyzingId === job.id}
-                        className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-violet-500/20 text-violet-200 hover:bg-violet-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
+                        className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-violet-500/20 text-violet-200 hover:bg-violet-500/30 text-ui-md font-semibold px-3 transition-colors disabled:opacity-50"
                         title="Run analysis for this terminal compute job"
                       >
                         <Cpu className="w-3 h-3" />
@@ -325,7 +325,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       {onDuplicateTask && (
                         <button
                           onClick={() => job.task_id && void onDuplicateTask(job.task_id)}
-                          className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-sky-500/20 text-sky-200 hover:bg-sky-500/30 text-[11px] font-semibold px-3 transition-colors"
+                          className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-sky-500/20 text-sky-200 hover:bg-sky-500/30 text-ui-md font-semibold px-3 transition-colors"
                           title="Re-run this experiment with the same configuration"
                         >
                           <Cpu className="w-3 h-3" />
@@ -338,7 +338,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     <button
                       onClick={() => void handleKill(job)}
                       disabled={killingId === job.id}
-                      className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-red-500/20 text-red-200 hover:bg-red-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
+                      className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-red-500/20 text-red-200 hover:bg-red-500/30 text-ui-md font-semibold px-3 transition-colors disabled:opacity-50"
                       title="Kill this compute job"
                     >
                       <Square className="w-3 h-3" />
@@ -364,7 +364,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 if (!cause && !hasContract) return null;
                 return (
                   <div
-                    className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-200"
+                    className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-ui-sm text-amber-200"
                     data-testid="compute-provisioning-cause"
                   >
                     <div className="flex items-start gap-1.5">
@@ -398,7 +398,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 if (!doc) return null;
                 return (
                   <div
-                    className="mt-1.5 rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1.5 text-[10px]"
+                    className="mt-1.5 rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1.5 text-ui-sm"
                     data-testid="compute-knowledge-doc-link"
                   >
                     <div className="flex items-start gap-1.5">
@@ -415,7 +415,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               })()}
               {analysisFeedback[job.id] && (
                 <div
-                  className={`mt-1.5 rounded border px-2 py-1 text-[10px] ${
+                  className={`mt-1.5 rounded border px-2 py-1 text-ui-sm ${
                     analysisFeedback[job.id].kind === 'error'
                       ? 'border-red-500/30 bg-red-500/10 text-red-200'
                       : analysisFeedback[job.id].kind === 'analysis_unavailable'
@@ -433,7 +433,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 if (!doc) return null;
                 return (
                   <div
-                    className="mt-1.5 rounded border border-violet-500/30 bg-violet-500/10 px-2 py-1.5 text-[10px]"
+                    className="mt-1.5 rounded border border-violet-500/30 bg-violet-500/10 px-2 py-1.5 text-ui-sm"
                     data-testid="compute-analysis-doc"
                   >
                     <div className="flex items-start gap-1.5">
@@ -454,7 +454,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 );
               })()}
               {job.artifact_id && (
-                <div className="mt-1.5 flex items-start gap-1.5 text-[10px]">
+                <div className="mt-1.5 flex items-start gap-1.5 text-ui-sm">
                   <Package className="w-3 h-3 shrink-0 mt-px text-emerald-300" />
                   <div className="min-w-0">
                     {job.result_reference ? (
@@ -475,7 +475,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 </div>
               )}
               {job.result_reference && (
-                <div className="mt-1.5 flex items-start gap-1.5 text-[10px] text-neutral-400 font-mono break-words">
+                <div className="mt-1.5 flex items-start gap-1.5 text-ui-sm text-neutral-400 font-mono break-words">
                   <span className="shrink-0 text-neutral-500">Result reference</span>
                   <ResolvedReferenceLink
                     projectId={projectId}
@@ -493,7 +493,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const entries = Object.entries(metrics);
                 if (entries.length === 0) return null;
                 return (
-                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-neutral-400 font-mono">
+                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-400 font-mono">
                     {entries.map(([k, v]) => (
                       <span key={k}>
                         <span className="text-neutral-500">{k}:</span> {String(v)}
@@ -536,7 +536,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 }
                 return (
                   <div
-                    className="mt-1.5 flex items-center gap-1.5 text-[10px] font-mono"
+                    className="mt-1.5 flex items-center gap-1.5 text-ui-sm font-mono"
                     data-testid="criterion-verdict-row"
                   >
                     <span className="text-neutral-500 shrink-0">Criterion</span>
@@ -559,18 +559,18 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const clipped = lines.length > 30;
                 return (
                   <div className="mt-1.5" data-testid="compute-live-output">
-                    <div className="flex items-center gap-1.5 mb-0.5 text-[10px] text-neutral-500 font-mono">
+                    <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
                       <span>Live output</span>
-                      <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-[9px] text-neutral-500">
+                      <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-500">
                         updating…
                       </span>
                       {(lo.truncated || clipped) && (
-                        <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-[9px] text-neutral-400">
+                        <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-400">
                           truncated
                         </span>
                       )}
                     </div>
-                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-[9px] text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
+                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
                       {displayLines.join('\n')}
                     </pre>
                   </div>
@@ -585,15 +585,15 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const clipped = lines.length > 30;
                 return (
                   <div className="mt-1.5" data-testid="compute-command-log">
-                    <div className="flex items-center gap-1.5 mb-0.5 text-[10px] text-neutral-500 font-mono">
+                    <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
                       <span>Command log</span>
                       {(cl.truncated || clipped) && (
-                        <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-[9px] text-neutral-400">
+                        <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-400">
                           truncated
                         </span>
                       )}
                     </div>
-                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-[9px] text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
+                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
                       {displayLines.join('\n')}
                     </pre>
                   </div>
@@ -616,7 +616,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 }
                 return (
                   <div
-                    className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-200"
+                    className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-ui-sm text-amber-200"
                     data-testid="compute-rpc-diagnostic"
                   >
                     <div className="flex items-start gap-1.5">

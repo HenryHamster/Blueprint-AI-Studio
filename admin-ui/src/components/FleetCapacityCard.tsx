@@ -78,20 +78,20 @@ export function FleetCapacityCard({
   return (
     <section>
       <div className="flex items-center gap-2 mb-2">
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Fleet Capacity</h2>
+        <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest">Fleet Capacity</h2>
         {!loading && data && headerSatStyle && (
-          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${headerSatStyle.badge}`}>
+          <span className={`text-ui-sm font-semibold px-2 py-0.5 rounded border ${headerSatStyle.badge}`}>
             {headerSatStyle.label}
           </span>
         )}
         {!loading && data && data.saturation == null && (
-          <span className="text-[10px] font-semibold px-2 py-0.5 rounded border bg-neutral-800/50 border-neutral-700/50 text-neutral-500">
+          <span className="text-ui-sm font-semibold px-2 py-0.5 rounded border bg-neutral-800/50 border-neutral-700/50 text-neutral-500">
             Unknown
           </span>
         )}
         {!loading && data && asOfLabel && (
           <span
-            className={`text-[10px] ${stale ? 'text-amber-400 font-semibold' : 'text-neutral-500'}`}
+            className={`text-ui-sm ${stale ? 'text-amber-400 font-semibold' : 'text-neutral-500'}`}
             title={stale ? 'Cached snapshot is stale — may not reflect current fleet capacity' : 'When this fleet-capacity snapshot was computed'}
           >
             {stale && '⚠ '}as of {asOfLabel}{stale && ' · stale'}
@@ -133,19 +133,19 @@ export function FleetCapacityCard({
             </div>
           </div>
           {cooldownNote && (
-            <p className="text-[10px] text-amber-400/80">{cooldownNote} — usable capacity is lower than nominal</p>
+            <p className="text-ui-sm text-amber-400/80">{cooldownNote} — usable capacity is lower than nominal</p>
           )}
           {data.vm_cap != null && (
             <div className="border-t border-neutral-800/70 pt-2 space-y-2">
               <div className="flex items-center justify-between gap-2">
-                <h3 className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">VM Slots</h3>
+                <h3 className="text-ui-sm font-bold text-neutral-500 uppercase tracking-widest">VM Slots</h3>
                 {vmSatStyle && (
-                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${vmSatStyle.badge}`}>
+                  <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${vmSatStyle.badge}`}>
                     {vmSatStyle.label}
                   </span>
                 )}
               </div>
-              <div className="grid gap-x-3 gap-y-1 text-[10px] sm:grid-cols-2">
+              <div className="grid gap-x-3 gap-y-1 text-ui-sm sm:grid-cols-2">
                 <div className="flex justify-between gap-2">
                   <span className="text-neutral-500">VM cap</span>
                   <span className="font-mono text-neutral-300 text-right">{data.vm_cap ?? '—'}</span>
@@ -171,43 +171,43 @@ export function FleetCapacityCard({
                 </div>
               </div>
               {data.vm_saturation == null && (
-                <p className="text-[10px] text-amber-400/80">VM measurements partially unavailable — slot saturation unknown</p>
+                <p className="text-ui-sm text-amber-400/80">VM measurements partially unavailable — slot saturation unknown</p>
               )}
             </div>
           )}
           {data.saturation == null && (
-            <p className="text-[10px] text-neutral-500">No enabled accounts — capacity unknown</p>
+            <p className="text-ui-sm text-neutral-500">No enabled accounts — capacity unknown</p>
           )}
           {agentServingShas && (
             <div className="border-t border-neutral-800/70 pt-2 space-y-2">
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
-                  <h3 className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Agent Image</h3>
+                  <h3 className="text-ui-sm font-bold text-neutral-500 uppercase tracking-widest">Agent Image</h3>
                   {agentServingShas.fleet.mixed && (
-                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/30 text-amber-400">
+                    <span className="text-ui-sm font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 border-amber-500/30 text-amber-400">
                       Mixed rollover
                     </span>
                   )}
                 </div>
-                <span className="text-[10px] text-neutral-500">
+                <span className="text-ui-sm text-neutral-500">
                   {agentServingShas.fleet.total_observed} observed
                 </span>
               </div>
               <div className="grid gap-1.5 sm:grid-cols-2">
                 {shaBuckets.length === 0 ? (
-                  <p className="text-[10px] text-neutral-500 sm:col-span-2">No agent image heartbeat data yet</p>
+                  <p className="text-ui-sm text-neutral-500 sm:col-span-2">No agent image heartbeat data yet</p>
                 ) : shaBuckets.map(bucket => (
                   <div
                     key={bucket.source_sha ?? 'unknown'}
                     className="rounded border border-neutral-800/70 bg-neutral-950/30 px-2 py-1.5"
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <span className={`font-mono text-[11px] ${bucket.source_sha ? 'text-neutral-200' : 'text-amber-400'}`}>
+                      <span className={`font-mono text-ui-md ${bucket.source_sha ? 'text-neutral-200' : 'text-amber-400'}`}>
                         {shortSha(bucket.source_sha)}
                       </span>
-                      <span className="text-[10px] text-neutral-400">{bucket.count} VM{bucket.count === 1 ? '' : 's'}</span>
+                      <span className="text-ui-sm text-neutral-400">{bucket.count} VM{bucket.count === 1 ? '' : 's'}</span>
                     </div>
-                    <div className="mt-1 flex flex-wrap gap-1 text-[9px]">
+                    <div className="mt-1 flex flex-wrap gap-1 text-ui-xs">
                       {bucket.matches_backend_served && <span className="text-emerald-400">backend</span>}
                       {bucket.matches_current_image && <span className="text-sky-400">image</span>}
                       {bucket.matches_active_candidate && <span className="text-violet-400">candidate</span>}
@@ -217,7 +217,7 @@ export function FleetCapacityCard({
                   </div>
                 ))}
               </div>
-              <div className="grid gap-x-3 gap-y-1 text-[10px] sm:grid-cols-2">
+              <div className="grid gap-x-3 gap-y-1 text-ui-sm sm:grid-cols-2">
                 <div className="flex justify-between gap-2">
                   <span className="text-neutral-500">Current image</span>
                   <span className="font-mono text-neutral-300 text-right">

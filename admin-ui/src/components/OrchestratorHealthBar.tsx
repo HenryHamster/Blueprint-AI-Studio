@@ -451,7 +451,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                 })}
               </div>
               {providerApis.fallback_enabled && (
-                <span className="text-[10px] text-blue-400 border border-blue-900/50 bg-blue-950/20 rounded px-1.5 py-0.5">
+                <span className="text-ui-sm text-blue-400 border border-blue-900/50 bg-blue-950/20 rounded px-1.5 py-0.5">
                   fallback
                 </span>
               )}
@@ -552,7 +552,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
                   <span className={textColor}>{label}{isRed && ratio >= 1 ? ' ⚠' : ''}</span>
                   {digestStaleSuffix && (
-                    <span className="text-[10px] text-amber-300">as of {digestAsOfLabel}</span>
+                    <span className="text-ui-sm text-amber-300">as of {digestAsOfLabel}</span>
                   )}
                 </button>
               );
@@ -570,7 +570,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
           >
             ⚠ {staleHeartbeatCount} stale
             {staleHeartbeatIsDigestStale && digestAsOfLabel && (
-              <span className="ml-1 text-[10px] text-amber-300">as of {digestAsOfLabel}</span>
+              <span className="ml-1 text-ui-sm text-amber-300">as of {digestAsOfLabel}</span>
             )}
           </span>
         )}

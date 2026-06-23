@@ -35,7 +35,7 @@ function NeedsAttentionSection({
 
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 flex items-center gap-1.5">
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2 flex items-center gap-1.5">
         <AlertTriangle className="w-3 h-3 text-amber-400" />
         Needs Attention
       </h2>
@@ -48,13 +48,13 @@ function NeedsAttentionSection({
           >
             <div className="flex-1 min-w-0">
               <p className="text-xs text-neutral-300 truncate">{item.title ?? item.task_id}</p>
-              <p className="text-[10px] text-amber-400/80 mt-0.5 truncate">{item.reason}</p>
+              <p className="text-ui-sm text-amber-400/80 mt-0.5 truncate">{item.reason}</p>
               {item.error_snippet && (
-                <p className="text-[10px] text-neutral-500 mt-0.5 truncate font-mono">{item.error_snippet}</p>
+                <p className="text-ui-sm text-neutral-500 mt-0.5 truncate font-mono">{item.error_snippet}</p>
               )}
             </div>
             {item.waiting_hours != null && item.waiting_hours > 0 && (
-              <span className="shrink-0 flex items-center gap-1 text-[10px] text-neutral-500">
+              <span className="shrink-0 flex items-center gap-1 text-ui-sm text-neutral-500">
                 <Clock className="w-3 h-3" />
                 {item.waiting_hours < 24 ? `${item.waiting_hours}h` : `${Math.floor(item.waiting_hours / 24)}d`}
               </span>
@@ -141,7 +141,7 @@ export function ConsoleHome({
           // eslint-disable-next-line viewport/min-touch-target
           <button
             onClick={onOpenFleet}
-            className="absolute top-2 right-2 flex items-center gap-1 text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors px-2 py-1 rounded bg-neutral-900/80 border border-neutral-800/60 opacity-0 group-hover:opacity-100"
+            className="absolute top-2 right-2 flex items-center gap-1 text-ui-sm text-neutral-500 hover:text-neutral-300 transition-colors px-2 py-1 rounded bg-neutral-900/80 border border-neutral-800/60 opacity-0 group-hover:opacity-100"
             title="View full fleet details"
           >
             <Layers className="w-3 h-3" />

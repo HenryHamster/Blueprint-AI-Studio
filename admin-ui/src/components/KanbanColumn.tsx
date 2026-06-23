@@ -35,7 +35,7 @@ function FailureClassBreakdown({ tasks }: { tasks: Task[] }) {
         return (
           <div
             key={failureClass}
-            className={`text-[9px] px-1.5 py-0.5 rounded-sm font-medium whitespace-nowrap ${config?.color ?? 'bg-neutral-700/50 text-neutral-400'}`}
+            className={`text-ui-xs px-1.5 py-0.5 rounded-sm font-medium whitespace-nowrap ${config?.color ?? 'bg-neutral-700/50 text-neutral-400'}`}
             title={config?.hint ?? failureClass}
           >
             {count} {config?.label ?? failureClass}
@@ -437,11 +437,11 @@ export function KanbanColumn({
           >
             <ChevronRight className="w-3.5 h-3.5" />
           </button>
-          <span className="text-[10px] bg-neutral-800 text-neutral-300 px-1.5 py-0.5 rounded-full font-medium border border-neutral-700">
+          <span className="text-ui-sm bg-neutral-800 text-neutral-300 px-1.5 py-0.5 rounded-full font-medium border border-neutral-700">
             {columnTasks.length}
           </span>
           <span
-            className={`text-[10px] font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'} flex-1 flex items-center`}
+            className={`text-ui-sm font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'} flex-1 flex items-center`}
             style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
           >
             {col.label}
@@ -471,7 +471,7 @@ export function KanbanColumn({
                 >
                   <ChevronLeft className="w-3.5 h-3.5" />
                 </button>
-                <h2 className={`text-[11px] font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'}`}>{col.label}</h2>
+                <h2 className={`text-ui-md font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'}`}>{col.label}</h2>
               </div>
               <div className="flex items-center gap-1.5">
                 {selectionMode && columnTasks.length > 0 && (
@@ -484,7 +484,7 @@ export function KanbanColumn({
                 <span title={`Sorted: ${SORT_LABELS[sortBy]}`} className="text-neutral-600 flex items-center">
                   <ArrowDownUp className="w-3 h-3" />
                 </span>
-                <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
+                <span className="text-ui-sm bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
                   {columnTasks.length}
                 </span>
                 {isArchivable && columnTasks.length > 0 && (

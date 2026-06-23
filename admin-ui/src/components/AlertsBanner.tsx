@@ -166,7 +166,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
                 const existingTaskId = srInfo.categories.map(c => activeInvestigationTaskIds?.[c]).find(Boolean) ?? spawnedSrTaskIds[alert.id];
                 const isSpawning = spawningSrAlertId === alert.id;
                 return existingTaskId ? (
-                  <span className="font-mono text-[9px] text-cyan-600 shrink-0 tabular-nums" title={`SR investigation: ${existingTaskId}`}>{existingTaskId.slice(0, 8)}</span>
+                  <span className="font-mono text-ui-xs text-cyan-600 shrink-0 tabular-nums" title={`SR investigation: ${existingTaskId}`}>{existingTaskId.slice(0, 8)}</span>
                 ) : (
                   <button
                     type="button"
@@ -203,14 +203,14 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
             </div>
             {isOpen && (
               <div className="bg-neutral-900/60 border border-neutral-700/40 rounded-lg px-4 py-3 text-xs text-neutral-300 flex flex-col gap-2">
-                <span className="text-neutral-500 text-[11px] font-medium uppercase tracking-wide">Contributing tasks</span>
+                <span className="text-neutral-500 text-ui-md font-medium uppercase tracking-wide">Contributing tasks</span>
                 {drilldownLoading && <span className="text-neutral-500">Loading…</span>}
                 {!drilldownLoading && drilldownRows.length === 0 && <span className="text-neutral-500">No contributing tasks found in the current alert window.</span>}
                 {!drilldownLoading && drilldownRows.map(row => {
                   const findingsByCategory = row.missed_category_findings ?? {};
                   return (
                     <div key={row.task_id} className="flex items-start gap-2">
-                      <span className={`shrink-0 mt-0.5 text-[10px] px-1.5 py-0.5 rounded border font-medium ${row.sr_verdict === 'pass' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-red-500/10 text-red-400 border-red-500/30'}`}>
+                      <span className={`shrink-0 mt-0.5 text-ui-sm px-1.5 py-0.5 rounded border font-medium ${row.sr_verdict === 'pass' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-red-500/10 text-red-400 border-red-500/30'}`}>
                         SR {row.sr_verdict ?? '?'}
                       </span>
                       <div className="flex-1 min-w-0">
@@ -222,7 +222,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
                             const isExpanded = expandedFindings.has(key);
                             const hasFinding = !!finding && !!finding.severity;
                             return (
-                              <div key={cat} className="text-[10px] leading-relaxed">
+                              <div key={cat} className="text-ui-sm leading-relaxed">
                                 <span className="text-neutral-500">{cat}: </span>
                                 {hasFinding ? (
                                   <>

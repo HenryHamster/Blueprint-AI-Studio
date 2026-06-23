@@ -64,14 +64,14 @@ export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled
         <div className="flex items-start gap-2">
           <ShieldCheck className="w-3.5 h-3.5 text-blue-400 shrink-0 mt-0.5" />
           <div className="min-w-0">
-            <p className="text-[11px] font-semibold text-blue-300">
+            <p className="text-ui-md font-semibold text-blue-300">
               Merges wait for the repository's GitHub CI checks
             </p>
-            <p className="text-[10px] text-neutral-400 mt-0.5">
+            <p className="text-ui-sm text-neutral-400 mt-0.5">
               Blueprint will not merge a PR until the repository's required GitHub checks pass.
             </p>
             {summaryLine ? (
-              <p className="text-[10px] text-neutral-400 mt-1 break-words" data-testid="merge-gate-summary">
+              <p className="text-ui-sm text-neutral-400 mt-1 break-words" data-testid="merge-gate-summary">
                 {summaryLine}
               </p>
             ) : null}
@@ -100,53 +100,53 @@ export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled
             <CheckCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" />
           )}
           <div className="min-w-0">
-            <p className={`text-[11px] font-semibold ${mismatch ? 'text-amber-300' : 'text-emerald-300'}`}>
+            <p className={`text-ui-md font-semibold ${mismatch ? 'text-amber-300' : 'text-emerald-300'}`}>
               {mismatch ? 'Config says tests-gated, but the live gate fell back to UNVERIFIED' : 'Merges are gated on your detected tests'}
             </p>
-            <p className="text-[10px] text-neutral-400 mt-0.5">
+            <p className="text-ui-sm text-neutral-400 mt-0.5">
               Blueprint runs these command(s) on the PR head as the merge verdict — passing merges, failing blocks:
             </p>
             <ul className="mt-1 space-y-1">
               {verdict.test_commands.map((tc, i) => (
                 <li key={i} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-                  <span className="text-[10px] font-mono text-neutral-500 break-all">{tc.path || '.'}</span>
-                  <code className="text-[10px] font-mono text-emerald-300 break-all">{tc.test_cmd}</code>
+                  <span className="text-ui-sm font-mono text-neutral-500 break-all">{tc.path || '.'}</span>
+                  <code className="text-ui-sm font-mono text-emerald-300 break-all">{tc.test_cmd}</code>
                 </li>
               ))}
             </ul>
             {mismatch ? (
               <div className="mt-2 rounded-md border border-amber-500/20 bg-amber-500/5 px-2 py-1.5 space-y-0.5">
-                <p className="text-[10px] text-amber-200">
+                <p className="text-ui-sm text-amber-200">
                   Last live merge fell back to UNVERIFIED{unverifiedAt ? ` at ${formatAbsolute(unverifiedAt.getTime())}` : ''}.
                 </p>
                 {unverifiedReason ? (
-                  <p className="text-[10px] text-neutral-300">
+                  <p className="text-ui-sm text-neutral-300">
                     Reason: {unverifiedReason}
                   </p>
                 ) : null}
                 {verifiedAt ? (
-                  <p className="text-[10px] text-neutral-400">
+                  <p className="text-ui-sm text-neutral-400">
                     Last verified real-test run: {formatAbsolute(verifiedAt.getTime())}
                   </p>
                 ) : null}
               </div>
             ) : verifiedAt ? (
-              <p className="mt-1 text-[10px] text-neutral-400">
+              <p className="mt-1 text-ui-sm text-neutral-400">
                 Last verified real-test run: {formatAbsolute(verifiedAt.getTime())}
               </p>
             ) : null}
             {summaryLine ? (
-              <p className="text-[10px] text-neutral-400 mt-1 break-words" data-testid="merge-gate-summary">
+              <p className="text-ui-sm text-neutral-400 mt-1 break-words" data-testid="merge-gate-summary">
                 {summaryLine}
               </p>
             ) : null}
             {blockDegradedEnabled ? (
               <div className="mt-2 rounded-md border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5 space-y-0.5" data-testid="honest-block-badge">
-                <p className="text-[10px] text-indigo-300 font-medium">
+                <p className="text-ui-sm text-indigo-300 font-medium">
                   Honest-block policy active — degraded fall-opens are held{degradedBlockTotal > 0 ? ` (${degradedBlockTotal} total)` : ''}
                 </p>
                 {lastBlockAt ? (
-                  <p className="text-[10px] text-neutral-400">
+                  <p className="text-ui-sm text-neutral-400">
                     Last block: {formatAbsolute(lastBlockAt.getTime())}{lastBlockReason ? ` — ${lastBlockReason}` : ''}
                   </p>
                 ) : null}
@@ -170,36 +170,36 @@ export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled
       <div className="flex items-start gap-2">
         <AlertTriangle className="w-3.5 h-3.5 text-yellow-400 shrink-0 mt-0.5" />
         <div className="min-w-0">
-          <p className="text-[11px] font-semibold text-yellow-300">
+          <p className="text-ui-md font-semibold text-yellow-300">
             No test command detected — PRs will merge UNVERIFIED (no tests run)
           </p>
-          <p className="text-[10px] text-neutral-400 mt-0.5">
+          <p className="text-ui-sm text-neutral-400 mt-0.5">
             Nothing gates these merges. Add a test command for a directory so Blueprint verifies PRs before merging.
           </p>
           {unverifiedAt ? (
             <div className="mt-2 rounded-md border border-yellow-500/20 bg-yellow-500/5 px-2 py-1.5 space-y-0.5">
-              <p className="text-[10px] text-yellow-200">
+              <p className="text-ui-sm text-yellow-200">
                 Last live merge fell back to UNVERIFIED at {formatAbsolute(unverifiedAt.getTime())}.
               </p>
               {unverifiedReason ? (
-                <p className="text-[10px] text-neutral-300">
+                <p className="text-ui-sm text-neutral-300">
                   Reason: {unverifiedReason}
                 </p>
               ) : null}
             </div>
           ) : null}
           {summaryLine ? (
-            <p className="text-[10px] text-neutral-400 mt-1 break-words" data-testid="merge-gate-summary">
+            <p className="text-ui-sm text-neutral-400 mt-1 break-words" data-testid="merge-gate-summary">
               {summaryLine}
             </p>
           ) : null}
           {blockDegradedEnabled ? (
             <div className="mt-2 rounded-md border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5 space-y-0.5" data-testid="honest-block-badge">
-              <p className="text-[10px] text-indigo-300 font-medium">
+              <p className="text-ui-sm text-indigo-300 font-medium">
                 Honest-block policy active — degraded fall-opens are held{degradedBlockTotal > 0 ? ` (${degradedBlockTotal} total)` : ''}
               </p>
               {lastBlockAt ? (
-                <p className="text-[10px] text-neutral-400">
+                <p className="text-ui-sm text-neutral-400">
                   Last block: {formatAbsolute(lastBlockAt.getTime())}{lastBlockReason ? ` — ${lastBlockReason}` : ''}
                 </p>
               ) : null}
@@ -207,11 +207,11 @@ export function MergeVerificationBanner({ verdict, runtime, blockDegradedEnabled
           ) : null}
           {blockNoTestEnabled ? (
             <div className="mt-2 rounded-md border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5 space-y-0.5" data-testid="no-test-block-badge">
-              <p className="text-[10px] text-indigo-300 font-medium">
+              <p className="text-ui-sm text-indigo-300 font-medium">
                 No-test hold policy active — unverified merges are held{noTestBlockTotal > 0 ? ` (${noTestBlockTotal} total)` : ''}
               </p>
               {lastNoTestBlockAt ? (
-                <p className="text-[10px] text-neutral-400">
+                <p className="text-ui-sm text-neutral-400">
                   Last hold: {formatAbsolute(lastNoTestBlockAt.getTime())}{lastNoTestBlockReason ? ` — ${lastNoTestBlockReason}` : ''}
                 </p>
               ) : null}

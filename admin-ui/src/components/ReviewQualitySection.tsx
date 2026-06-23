@@ -35,7 +35,7 @@ function FixIterationBreakdown({ trends }: { trends: SrTrendWithFixIterations | 
   if (!breakdown) return null;
   return (
     <section>
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">SR by Fix Iteration</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">SR by Fix Iteration</p>
       <div className="flex flex-wrap gap-1.5">
         {FIX_ITERATION_BUCKETS.map(bucket => {
           const stats = breakdown[bucket] ?? breakdown[`fix-${bucket}`] ?? breakdown[`fix_${bucket}`] ?? breakdown[bucket.replace('+', 'plus')] ?? null;
@@ -44,7 +44,7 @@ function FixIterationBreakdown({ trends }: { trends: SrTrendWithFixIterations | 
           return (
             <span
               key={bucket}
-              className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-neutral-500/10 text-neutral-300 border-neutral-700/40"
+              className="inline-flex items-center gap-1.5 text-ui-sm font-semibold px-2 py-0.5 rounded border bg-neutral-500/10 text-neutral-300 border-neutral-700/40"
               title={enoughSignal ? `n=${sampleCount}` : 'insufficient signal (<5 qualifying tasks)'}
             >
               fix-{bucket}
@@ -250,29 +250,29 @@ export function ReviewQualitySection({
 
   return (
     <section ref={sectionRef}>
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Review Quality</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">Review Quality</p>
       <div className="flex flex-wrap gap-3">
         {digest?.review_accuracy?.precision != null && (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
-            <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Precision</p>
+            <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">Precision</p>
             <p className={`text-xl font-bold font-mono ${digest.review_accuracy.precision >= 0.8 ? 'text-emerald-400' : digest.review_accuracy.precision >= 0.6 ? 'text-amber-400' : 'text-red-400'}`}>
               {Math.round(digest.review_accuracy.precision * 100)}%
             </p>
-            <p className="text-[9px] text-neutral-600 mt-0.5">{digest.review_accuracy.total_reviews} reviews</p>
+            <p className="text-ui-xs text-neutral-600 mt-0.5">{digest.review_accuracy.total_reviews} reviews</p>
           </div>
         )}
         {digest?.review_accuracy?.recall != null && (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
-            <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Recall</p>
+            <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">Recall</p>
             <p className={`text-xl font-bold font-mono ${digest.review_accuracy.recall >= 0.8 ? 'text-emerald-400' : digest.review_accuracy.recall >= 0.6 ? 'text-amber-400' : 'text-red-400'}`}>
               {Math.round(digest.review_accuracy.recall * 100)}%
             </p>
-            <p className="text-[9px] text-neutral-600 mt-0.5">{digest.review_accuracy.total_approvals} approvals</p>
+            <p className="text-ui-xs text-neutral-600 mt-0.5">{digest.review_accuracy.total_approvals} approvals</p>
           </div>
         )}
         {digest?.self_review_effectiveness?.with_self_review_approval_rate != null && (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]">
-            <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Approval Lift</p>
+            <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">SR Approval Lift</p>
             {(() => {
               const sre = digest.self_review_effectiveness ?? {};
               const withSR = sre.with_self_review_approval_rate ?? 0;
@@ -284,7 +284,7 @@ export function ReviewQualitySection({
                     {Math.round(withSR * 100)}%
                   </p>
                   {lift != null && (
-                    <p className={`text-[9px] mt-0.5 ${lift > 0 ? 'text-emerald-500' : lift < 0 ? 'text-red-500' : 'text-neutral-600'}`}>
+                    <p className={`text-ui-xs mt-0.5 ${lift > 0 ? 'text-emerald-500' : lift < 0 ? 'text-red-500' : 'text-neutral-600'}`}>
                       {lift > 0 ? '+' : ''}{Math.round(lift * 100)}pp vs no SR
                     </p>
                   )}
@@ -320,27 +320,27 @@ export function ReviewQualitySection({
                   : 'text-red-400';
           return (
             <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[200px]">
-              <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Self-Fix Path</p>
+              <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">SR Self-Fix Path</p>
               <div className="space-y-0.5">
                 <div className="flex items-baseline justify-between gap-3">
-                  <span className="text-[10px] text-neutral-400">Self-fixed</span>
+                  <span className="text-ui-sm text-neutral-400">Self-fixed</span>
                   <span className="text-xs font-mono text-neutral-200">
                     {Math.round(fixedShare * 100)}%
-                    <span className="text-[9px] text-neutral-600 ml-1">(n={fixedCount} of {sample})</span>
+                    <span className="text-ui-xs text-neutral-600 ml-1">(n={fixedCount} of {sample})</span>
                     {fixedApproval != null && (
-                      <span className={`text-[9px] ml-1 ${approvalColor(fixedApproval)}`}>
+                      <span className={`text-ui-xs ml-1 ${approvalColor(fixedApproval)}`}>
                         {Math.round(fixedApproval * 100)}% approved
                       </span>
                     )}
                   </span>
                 </div>
                 <div className="flex items-baseline justify-between gap-3">
-                  <span className="text-[10px] text-neutral-400">Clean SR</span>
+                  <span className="text-ui-sm text-neutral-400">Clean SR</span>
                   <span className="text-xs font-mono text-neutral-200">
                     {Math.round(cleanShare * 100)}%
-                    <span className="text-[9px] text-neutral-600 ml-1">(n={cleanCount})</span>
+                    <span className="text-ui-xs text-neutral-600 ml-1">(n={cleanCount})</span>
                     {cleanApproval != null && (
-                      <span className={`text-[9px] ml-1 ${approvalColor(cleanApproval)}`}>
+                      <span className={`text-ui-xs ml-1 ${approvalColor(cleanApproval)}`}>
                         {Math.round(cleanApproval * 100)}% approved
                       </span>
                     )}
@@ -355,12 +355,12 @@ export function ReviewQualitySection({
             className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
             title="SR Prediction Hit Rate: share of issues flagged by SR that the reviewer LLM also flagged. This is inter-agent agreement against the reviewer LLM, not human validation."
           >
-            <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Prediction Hit</p>
+            <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">SR Prediction Hit</p>
             <p className={`text-xl font-bold font-mono ${digest.self_review_prediction_accuracy.prediction_hit_rate >= 0.7 ? 'text-emerald-400' : digest.self_review_prediction_accuracy.prediction_hit_rate >= 0.4 ? 'text-amber-400' : 'text-red-400'}`}>
               {Math.round(digest.self_review_prediction_accuracy.prediction_hit_rate * 100)}%
             </p>
             {digest.self_review_prediction_accuracy.false_alarm_rate != null && (
-              <p className="text-[9px] text-neutral-600 mt-0.5">{Math.round(digest.self_review_prediction_accuracy.false_alarm_rate * 100)}% false alarms</p>
+              <p className="text-ui-xs text-neutral-600 mt-0.5">{Math.round(digest.self_review_prediction_accuracy.false_alarm_rate * 100)}% false alarms</p>
             )}
           </div>
         )}
@@ -380,11 +380,11 @@ export function ReviewQualitySection({
               title={tooltip}
               data-testid="sr-self-flagged-unresolved-tile"
             >
-              <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Unfixed Flags</p>
+              <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">SR Unfixed Flags</p>
               <p className={`text-xl font-bold font-mono ${color}`}>
                 {rate != null ? `${Math.round(rate * 100)}%` : '--'}
               </p>
-              <p className="text-[9px] text-neutral-600 mt-0.5">
+              <p className="text-ui-xs text-neutral-600 mt-0.5">
                 {taskCount != null ? `${taskCount} tasks` : ''}
               </p>
             </div>
@@ -411,11 +411,11 @@ export function ReviewQualitySection({
               className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
               title={tooltip}
             >
-              <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">RR vs Test Signal</p>
+              <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">RR vs Test Signal</p>
               <p className={`text-xl font-bold font-mono ${color}`}>
                 {Math.round(missRate * 100)}%
               </p>
-              <p className="text-[9px] text-neutral-600 mt-0.5">
+              <p className="text-ui-xs text-neutral-600 mt-0.5">
                 {numer}/{denom} miss <span className={trendColor}>{trendIcon}</span>
               </p>
             </div>
@@ -434,11 +434,11 @@ export function ReviewQualitySection({
               className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
               title={tooltip}
             >
-              <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Skip Rate</p>
+              <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">SR Skip Rate</p>
               <p className={`text-xl font-bold font-mono ${color}`}>
                 {Math.round(rate * 100)}%
               </p>
-              <p className="text-[9px] text-neutral-600 mt-0.5">n={skip.sample_size}</p>
+              <p className="text-ui-xs text-neutral-600 mt-0.5">n={skip.sample_size}</p>
             </div>
           );
         })()}
@@ -461,22 +461,22 @@ export function ReviewQualitySection({
               title={tooltip}
               data-testid="reviewer-hallucination-rate-tile"
             >
-              <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Reviewer Hallucination</p>
+              <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">Reviewer Hallucination</p>
               {hasSample && curr != null ? (
                 <>
                   <p className={`text-xl font-bold font-mono ${color}`}>
                     {Math.round(curr * 100)}%
                   </p>
                   {prev != null && hall.delta != null && (
-                    <p className={`text-[9px] mt-0.5 ${hall.delta > 0.005 ? 'text-red-400' : hall.delta < -0.005 ? 'text-emerald-400' : 'text-neutral-600'}`}>
+                    <p className={`text-ui-xs mt-0.5 ${hall.delta > 0.005 ? 'text-red-400' : hall.delta < -0.005 ? 'text-emerald-400' : 'text-neutral-600'}`}>
                       {hall.delta >= 0 ? '+' : ''}
                       {Math.round(hall.delta * 100)}pp
                     </p>
                   )}
-                  <p className="text-[9px] text-neutral-600 mt-0.5">n={sample}</p>
+                  <p className="text-ui-xs text-neutral-600 mt-0.5">n={sample}</p>
                 </>
               ) : (
-                <p className="text-[9px] text-neutral-500 mt-2">insufficient sample</p>
+                <p className="text-ui-xs text-neutral-500 mt-2">insufficient sample</p>
               )}
             </div>
           );
@@ -500,11 +500,11 @@ export function ReviewQualitySection({
               title={tooltip}
               data-testid="sr-disallowed-blind-spot-tile"
             >
-              <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Disallowed</p>
+              <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">SR Disallowed</p>
               <p className={`text-xl font-bold font-mono ${color}`}>
                 {Math.round(rate * 100)}%
               </p>
-              <p className="text-[9px] text-neutral-600 mt-0.5">n={dbs.sample_size}</p>
+              <p className="text-ui-xs text-neutral-600 mt-0.5">n={dbs.sample_size}</p>
             </div>
           );
         })()}
@@ -532,7 +532,7 @@ export function ReviewQualitySection({
               title={['SR False Attestation (SR passed but CI failed):', ...tooltipLines].join('\n')}
               data-testid="sr-false-attestation-tile"
             >
-              <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR False Attest</p>
+              <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">SR False Attest</p>
               <p className={`text-xl font-bold font-mono ${color}`}>
                 {Math.round(worstRate * 100)}%
               </p>
@@ -543,7 +543,7 @@ export function ReviewQualitySection({
                   const trendIcon = v.trend === 'improving' ? '↓' : v.trend === 'regressing' ? '↑' : '→';
                   const trendColor = v.trend === 'improving' ? 'text-emerald-500' : v.trend === 'regressing' ? 'text-red-500' : 'text-neutral-500';
                   return (
-                    <p key={cat} className="text-[9px] text-neutral-600">
+                    <p key={cat} className="text-ui-xs text-neutral-600">
                       {label}: {Math.round(rate * 100)}% <span className={trendColor}>{trendIcon}</span>
                     </p>
                   );
@@ -574,16 +574,16 @@ export function ReviewQualitySection({
           const liftColor = lift == null ? 'text-neutral-400' : lift >= 0.05 ? 'text-emerald-400' : lift >= 0 ? 'text-amber-400' : 'text-red-400';
           return (
             <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]">
-              <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">FR Approval Lift</p>
+              <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">FR Approval Lift</p>
               {n < 5 ? (
                 <p className="text-xs text-neutral-500">n={n} — too small</p>
               ) : (
                 <>
                   <p className={`text-xl font-bold font-mono ${freColor}`}>{freRate != null ? `${Math.round(freRate * 100)}%` : '--'}</p>
                   {lift != null && (
-                    <p className={`text-[9px] mt-0.5 ${liftColor}`}>{lift >= 0 ? '+' : ''}{Math.round(lift * 100)}pp vs baseline</p>
+                    <p className={`text-ui-xs mt-0.5 ${liftColor}`}>{lift >= 0 ? '+' : ''}{Math.round(lift * 100)}pp vs baseline</p>
                   )}
-                  <p className="text-[9px] text-neutral-600 mt-0.5">n={n}</p>
+                  <p className="text-ui-xs text-neutral-600 mt-0.5">n={n}</p>
                 </>
               )}
             </div>
@@ -603,7 +603,7 @@ export function ReviewQualitySection({
                 setSrTrendDrilldownOpen(true);
                 void fetchSrTrendDrilldown(cats);
               }}
-              className="text-[10px] flex items-center gap-1 text-amber-400/70 hover:text-amber-400 transition-colors mb-1"
+              className="text-ui-sm flex items-center gap-1 text-amber-400/70 hover:text-amber-400 transition-colors mb-1"
             >
               <Search className="w-3 h-3" />
               <span>{srTrendDrilldownOpen ? 'Hide' : 'Investigate'} regression ({cats.join(', ')})</span>
@@ -614,12 +614,12 @@ export function ReviewQualitySection({
                 {!srTrendDrilldownLoading && srTrendDrilldownRows.length === 0 && <span className="text-neutral-500">No contributing tasks found.</span>}
                 {!srTrendDrilldownLoading && srTrendDrilldownRows.map(row => (
                   <div key={row.task_id} className="flex items-start gap-2">
-                    <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded border font-medium ${row.sr_verdict === 'pass' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-red-500/10 text-red-400 border-red-500/30'}`}>
+                    <span className={`shrink-0 text-ui-sm px-1.5 py-0.5 rounded border font-medium ${row.sr_verdict === 'pass' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-red-500/10 text-red-400 border-red-500/30'}`}>
                       SR {row.sr_verdict ?? '?'}
                     </span>
                     <div className="flex-1 min-w-0">
                       <span className="text-neutral-200 truncate block">{row.title}</span>
-                      <span className="text-neutral-500 text-[10px]">missed: {row.missed_categories.join(', ')}</span>
+                      <span className="text-neutral-500 text-ui-sm">missed: {row.missed_categories.join(', ')}</span>
                     </div>
                     <button onClick={() => { if (onViewTaskById) { onViewTaskById(row.task_id); } else { const t = tasks.find(t => t.id === row.task_id); if (t) onViewTask(t); } }} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity" title="View task SR panel">
                       <ExternalLink className="w-3 h-3" />

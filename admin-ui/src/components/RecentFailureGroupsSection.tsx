@@ -85,7 +85,7 @@ export function RecentFailureGroupsSection({
       <button
         onClick={onToggleFailuresExpanded}
         aria-expanded={failuresExpanded}
-        className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
+        className="flex items-center gap-1.5 text-ui-md font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
       >
         {failuresExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
         <XCircle className="w-3 h-3 text-red-500" />
@@ -94,7 +94,7 @@ export function RecentFailureGroupsSection({
       {failuresExpanded && (
         <div className="flex flex-col gap-2">
           {filteredGroups.length === 0 && (
-            <div className="text-[11px] text-neutral-500 italic">No failures match the active filter.</div>
+            <div className="text-ui-md text-neutral-500 italic">No failures match the active filter.</div>
           )}
           {filteredGroups.map(group => {
             const isGroupExpanded = expandedGroups.has(group.failure_class);
@@ -124,13 +124,13 @@ export function RecentFailureGroupsSection({
                   className="flex flex-wrap items-center gap-2 w-full text-left hover:opacity-80 transition-opacity mb-1"
                 >
                   {isGroupExpanded ? <ChevronUp className="w-3 h-3 text-neutral-500 shrink-0" /> : <ChevronDown className="w-3 h-3 text-neutral-500 shrink-0" />}
-                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${badgeClass}`}>
+                  <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${badgeClass}`}>
                     {group.label}
                   </span>
-                  <span className="text-[11px] text-neutral-500">× {group.tasks.length}</span>
-                  <span className={`text-[11px] font-bold ${classTrend.color}`} title="Trend: recent 2 periods vs prior 2 periods">{classTrend.arrow}</span>
+                  <span className="text-ui-md text-neutral-500">× {group.tasks.length}</span>
+                  <span className={`text-ui-md font-bold ${classTrend.color}`} title="Trend: recent 2 periods vs prior 2 periods">{classTrend.arrow}</span>
                   {costByFailureClass?.[group.failure_class] != null && (costByFailureClass[group.failure_class] ?? 0) > 0 && (
-                    <span className="text-[10px] text-red-400/70 font-mono" title={`Cost of ${group.label} failures`}>
+                    <span className="text-ui-sm text-red-400/70 font-mono" title={`Cost of ${group.label} failures`}>
                       ${(costByFailureClass[group.failure_class] ?? 0).toFixed(2)}
                     </span>
                   )}
@@ -147,14 +147,14 @@ export function RecentFailureGroupsSection({
                           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
                         >
                           {t.taxonomy && TAXONOMY_LABELS[t.taxonomy] && (
-                            <span className={`shrink-0 text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[t.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`} title={TAXONOMY_LABELS[t.taxonomy]}>
+                            <span className={`shrink-0 text-ui-xs leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[t.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`} title={TAXONOMY_LABELS[t.taxonomy]}>
                               {TAXONOMY_LABELS[t.taxonomy]}
                             </span>
                           )}
                           <span className="flex-1 truncate text-neutral-400">{t.title}</span>
                           {t.direction_text && (
                             <span
-                              className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[9rem] sm:max-w-[12rem]"
+                              className="shrink-0 text-ui-xs px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[9rem] sm:max-w-[12rem]"
                               title={t.direction_text}
                             >
                               {t.direction_text.length > 40 ? t.direction_text.slice(0, 40) + '…' : t.direction_text}
@@ -162,7 +162,7 @@ export function RecentFailureGroupsSection({
                           )}
                           {t.failure_stage && (
                             <span
-                              className="shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40"
+                              className="shrink-0 text-ui-xs font-mono px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40"
                               title={`Failure stage: ${t.failure_stage}`}
                             >
                               {t.failure_stage}
@@ -170,19 +170,19 @@ export function RecentFailureGroupsSection({
                           )}
                           {group.failure_class === 'AGENT_TIMEOUT' && t.timeout_subtype && (
                             <span
-                              className="shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400/80 border border-amber-500/20"
+                              className="shrink-0 text-ui-xs font-mono px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400/80 border border-amber-500/20"
                               title={`Timeout subtype: ${t.timeout_subtype}`}
                             >
                               {TIMEOUT_SUBTYPE_LABELS[t.timeout_subtype] ?? t.timeout_subtype}
                             </span>
                           )}
                           {t.attempt_count > 1 && (
-                            <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-500 border border-neutral-700/40">
+                            <span className="shrink-0 text-ui-xs font-semibold px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-500 border border-neutral-700/40">
                               attempt {t.attempt_count}
                             </span>
                           )}
                           {t.waiting_hours != null && t.waiting_hours > 0 && (
-                            <span className="shrink-0 text-[10px] text-neutral-600 font-mono">{t.waiting_hours}h ago</span>
+                            <span className="shrink-0 text-ui-sm text-neutral-600 font-mono">{t.waiting_hours}h ago</span>
                           )}
                         </div>
                         {t.error_snippet && (
@@ -191,12 +191,12 @@ export function RecentFailureGroupsSection({
                               onClick={() => onToggleSnippet(t.task_id)}
                               aria-expanded={expandedSnippets.has(t.task_id)}
                               aria-label={expandedSnippets.has(t.task_id) ? 'Hide error details' : 'Show error details'}
-                              className="text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
+                              className="text-ui-sm text-neutral-600 hover:text-neutral-400 transition-colors"
                             >
                               {expandedSnippets.has(t.task_id) ? 'hide error ▲' : 'show error ▼'}
                             </button>
                             {expandedSnippets.has(t.task_id) && (
-                              <pre className="mt-1 text-[10px] text-red-400/80 bg-red-950/20 border border-red-900/30 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
+                              <pre className="mt-1 text-ui-sm text-red-400/80 bg-red-950/20 border border-red-900/30 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
                                 {t.error_snippet}
                               </pre>
                             )}

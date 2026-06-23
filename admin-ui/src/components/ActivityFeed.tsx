@@ -133,7 +133,7 @@ function FeedRow({
     return (
       <div style={style}>
         <div className="px-6 pt-2 pb-1">
-          <span className="text-[10px] font-semibold uppercase text-neutral-600 tracking-wider">{item.label}</span>
+          <span className="text-ui-sm font-semibold uppercase text-neutral-600 tracking-wider">{item.label}</span>
         </div>
       </div>
     );
@@ -143,7 +143,7 @@ function FeedRow({
       <div style={style}>
         <div className="px-6 py-1 flex items-center gap-2">
           <div className="flex-1 h-px bg-amber-500/30" />
-          <span className="text-[10px] font-semibold text-amber-500/80 uppercase tracking-wider whitespace-nowrap">New since your last visit</span>
+          <span className="text-ui-sm font-semibold text-amber-500/80 uppercase tracking-wider whitespace-nowrap">New since your last visit</span>
           <div className="flex-1 h-px bg-amber-500/30" />
         </div>
       </div>
@@ -168,20 +168,20 @@ function FeedRow({
                 </span>
 
                 {event.type === 'RESEARCH_FINDINGS' && event.finding_count != null && (
-                  <span className="shrink-0 bg-blue-500/20 text-blue-400 border border-blue-500/30 text-[10px] font-semibold px-1.5 py-0.5 rounded-full leading-none">
+                  <span className="shrink-0 bg-blue-500/20 text-blue-400 border border-blue-500/30 text-ui-sm font-semibold px-1.5 py-0.5 rounded-full leading-none">
                     {event.finding_count} finding{event.finding_count !== 1 ? 's' : ''}
                   </span>
                 )}
 
                 {event.type === 'TASK_COMPLETED' && event.task_type && (
-                  <span className="shrink-0 bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded">
+                  <span className="shrink-0 bg-neutral-800 text-neutral-400 text-ui-sm px-1.5 py-0.5 rounded">
                     {event.task_type}
                   </span>
                 )}
 
                 {event.type === 'TASK_COMPLETED' && event.changed_files && event.changed_files.length > 0 && (
                   <span
-                    className="shrink-0 bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded"
+                    className="shrink-0 bg-neutral-800 text-neutral-400 text-ui-sm px-1.5 py-0.5 rounded"
                     title={event.changed_files.join('\n')}
                   >
                     {event.changed_files.length} file{event.changed_files.length !== 1 ? 's' : ''}
@@ -189,14 +189,14 @@ function FeedRow({
                 )}
 
                 {event.type === 'TASK_COMPLETED' && event.scope && (
-                  <span className="shrink-0 bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-[10px] font-semibold px-1.5 py-0.5 rounded-full leading-none">
+                  <span className="shrink-0 bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-ui-sm font-semibold px-1.5 py-0.5 rounded-full leading-none">
                     {event.scope}
                   </span>
                 )}
 
                 {event.type === 'TASK_COMPLETED' && event.direction_id && (
                   <span
-                    className="shrink-0 bg-neutral-800 text-neutral-500 text-[10px] font-mono px-1.5 py-0.5 rounded"
+                    className="shrink-0 bg-neutral-800 text-neutral-500 text-ui-sm font-mono px-1.5 py-0.5 rounded"
                     title={`Direction ${event.direction_id}`}
                   >
                     dir:{event.direction_id.slice(0, 6)}
@@ -205,7 +205,7 @@ function FeedRow({
 
                 {event.type === 'TASK_COMPLETED' && event.review_iterations != null && event.review_iterations > 0 && (
                   <span
-                    className="shrink-0 bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded"
+                    className="shrink-0 bg-neutral-800 text-neutral-400 text-ui-sm px-1.5 py-0.5 rounded"
                     title="Review iterations"
                   >
                     {event.review_iterations} review{event.review_iterations !== 1 ? 's' : ''}
@@ -214,7 +214,7 @@ function FeedRow({
 
                 {event.type === 'TASK_FAILED' && event.failure_class && FAILURE_CLASS_CONFIG[event.failure_class] && (
                   <span
-                    className={`shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${FAILURE_CLASS_CONFIG[event.failure_class].color}`}
+                    className={`shrink-0 text-ui-xs uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${FAILURE_CLASS_CONFIG[event.failure_class].color}`}
                     title={FAILURE_CLASS_CONFIG[event.failure_class].hint}
                   >
                     {FAILURE_CLASS_CONFIG[event.failure_class].label}
@@ -223,7 +223,7 @@ function FeedRow({
 
                 {event.type === 'TASK_FAILED' && event.taxonomy && TAXONOMY_LABELS[event.taxonomy] && (
                   <span
-                    className={`shrink-0 text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[event.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}
+                    className={`shrink-0 text-ui-xs leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[event.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}
                     title={TAXONOMY_LABELS[event.taxonomy]}
                   >
                     {TAXONOMY_LABELS[event.taxonomy]}
@@ -231,7 +231,7 @@ function FeedRow({
                 )}
 
                 {event.type === 'DEPLOY_EVENT' && event.deploy_status && (
-                  <span className={`shrink-0 border text-[10px] font-semibold px-1.5 py-0.5 rounded-full leading-none ${DEPLOY_STATUS_BADGE[event.deploy_status] ?? 'bg-neutral-700 text-neutral-300 border-neutral-600'}`}>
+                  <span className={`shrink-0 border text-ui-sm font-semibold px-1.5 py-0.5 rounded-full leading-none ${DEPLOY_STATUS_BADGE[event.deploy_status] ?? 'bg-neutral-700 text-neutral-300 border-neutral-600'}`}>
                     {event.deploy_status}
                   </span>
                 )}
@@ -280,13 +280,13 @@ function FeedRow({
                     target="_blank"
                     rel="noopener noreferrer"
                     onClick={e => e.stopPropagation()}
-                    className="font-mono text-[10px] bg-neutral-800 text-neutral-400 hover:text-neutral-200 px-1.5 py-0.5 rounded transition-colors"
+                    className="font-mono text-ui-sm bg-neutral-800 text-neutral-400 hover:text-neutral-200 px-1.5 py-0.5 rounded transition-colors"
                     title={event.commit_hash}
                   >
                     {event.commit_hash.slice(0, 7)}
                   </a>
                 ) : (
-                  <span className="font-mono text-[10px] bg-neutral-800 text-neutral-400 px-1.5 py-0.5 rounded" title={event.commit_hash}>
+                  <span className="font-mono text-ui-sm bg-neutral-800 text-neutral-400 px-1.5 py-0.5 rounded" title={event.commit_hash}>
                     {event.commit_hash.slice(0, 7)}
                   </span>
                 )
@@ -305,7 +305,7 @@ function FeedRow({
               )}
 
               {(event.type === 'TASK_COMPLETED' || event.type === 'TASK_FAILED') && event.duration_seconds != null && (
-                <span className="text-[10px] text-neutral-600 font-mono">ran {formatDurationSec(event.duration_seconds)}</span>
+                <span className="text-ui-sm text-neutral-600 font-mono">ran {formatDurationSec(event.duration_seconds)}</span>
               )}
               <span
                 className="text-xs text-neutral-500 font-mono whitespace-nowrap"
@@ -580,7 +580,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
               <span className="text-xs text-neutral-600">No activity today</span>
             ) : (
               pills.map(({ label, color }) => (
-                <span key={label} className={`border text-[10px] font-semibold px-2 py-0.5 rounded-full leading-none ${color}`}>
+                <span key={label} className={`border text-ui-sm font-semibold px-2 py-0.5 rounded-full leading-none ${color}`}>
                   {label}
                 </span>
               ))
@@ -647,7 +647,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
 
       {/* Loading indicator for background refresh */}
       {!loading && refreshInterval > 0 && (
-        <div className="px-6 py-2 border-t border-neutral-800 flex items-center gap-1.5 text-[10px] text-neutral-600 shrink-0">
+        <div className="px-6 py-2 border-t border-neutral-800 flex items-center gap-1.5 text-ui-sm text-neutral-600 shrink-0">
           <Loader2 className="w-3 h-3" />
           Auto-refreshes every {Math.round(refreshInterval / 1000)}s
         </div>

@@ -94,7 +94,7 @@ export function MessagesComposer({
       </div>
       {/* Steering hint: grounded in the last send's real outcome when available,
           otherwise predicted from the selected type. */}
-      <p className="text-[11px] leading-snug text-neutral-500 mt-1.5 px-0.5">
+      <p className="text-ui-md leading-snug text-neutral-500 mt-1.5 px-0.5">
         {hintText}
       </p>
     </div>

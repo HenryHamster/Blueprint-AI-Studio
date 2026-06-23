@@ -28,7 +28,7 @@ function CopyableMessageRef({ msgId }: { msgId: string }) {
     <button
       onClick={copy}
       title="Copy message ref"
-      className="inline-flex items-center gap-1 font-mono text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
+      className="inline-flex items-center gap-1 font-mono text-ui-sm text-neutral-600 hover:text-neutral-400 transition-colors"
     >
       {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
       {shortRef}
@@ -145,12 +145,12 @@ function StaleCitationBadge({ msg }: { msg: ProjectMessage }) {
   const cfg = CITATION_BADGE_CONFIG[state];
   return (
     <div className={`mt-2 inline-flex max-w-full flex-col gap-1 rounded-xl border px-2.5 py-2 ${cfg.container}`}>
-      <span className={`inline-flex items-center gap-1 text-[11px] font-semibold ${cfg.labelText}`}>
+      <span className={`inline-flex items-center gap-1 text-ui-md font-semibold ${cfg.labelText}`}>
         <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
         {cfg.label}
       </span>
       {refSummary && (
-        <span className={`text-[11px] leading-relaxed break-words ${cfg.refText}`}>
+        <span className={`text-ui-md leading-relaxed break-words ${cfg.refText}`}>
           {refSummary}
         </span>
       )}
@@ -192,7 +192,7 @@ function ContextBadges({ context, fromType }: { context: Record<string, unknown>
   return (
     <div className="flex flex-wrap gap-1 mt-1.5">
       {badges.map((b, i) => (
-        <span key={i} className={`text-[11px] px-1.5 py-0.5 rounded border ${b.className}`}>{b.label}</span>
+        <span key={i} className={`text-ui-md px-1.5 py-0.5 rounded border ${b.className}`}>{b.label}</span>
       ))}
     </div>
   );
@@ -281,8 +281,8 @@ export function MessageBubble({
           {/* Header line */}
           <div className="flex items-center gap-2 mb-1">
             <Icon className={`w-3.5 h-3.5 shrink-0 ${config.color}`} />
-            <span className={`text-[11px] font-semibold ${config.color}`}>{config.label}</span>
-            <span className="text-[11px] text-neutral-600">
+            <span className={`text-ui-md font-semibold ${config.color}`}>{config.label}</span>
+            <span className="text-ui-md text-neutral-600">
               {formatFromType(msg)}
               {taskId && onOpenTask && (
                 <button
@@ -301,16 +301,16 @@ export function MessageBubble({
           {/* Reply context for feedback acknowledgment and question answer */}
           {replyContextMsg && (
             <div className="mb-1.5 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
-              <p className="text-[11px] text-neutral-500 mb-0.5">
+              <p className="text-ui-md text-neutral-500 mb-0.5">
                 {replyContextType === 'question' ? 'Answering your question:' : 'In reply to your feedback:'}
               </p>
-              <p className="text-[11px] text-neutral-400 truncate">{replyContextMsg.content}</p>
+              <p className="text-ui-md text-neutral-400 truncate">{replyContextMsg.content}</p>
             </div>
           )}
           {/* Reply quote (if this message is a reply) */}
           {typeof msg.context.reply_preview === 'string' && (
             <div className="mb-1.5 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
-              <p className="text-[11px] text-neutral-500 truncate">{msg.context.reply_preview}</p>
+              <p className="text-ui-md text-neutral-500 truncate">{msg.context.reply_preview}</p>
             </div>
           )}
           {/* Content */}
@@ -323,7 +323,7 @@ export function MessageBubble({
         {/* Linked indicator (for linked messages) */}
         {msg.status === 'linked' && (
           <div className={`mt-1 ${userMsg ? 'mr-3' : 'ml-3'} px-3 py-1.5 rounded-lg bg-indigo-800/30 border border-indigo-700/40`}>
-            <p className="text-[11px] text-neutral-400">
+            <p className="text-ui-md text-neutral-400">
               <span className="text-indigo-400 font-medium">Being addressed</span>
               {typeof msg.context._convergence_link === 'object' && msg.context._convergence_link && (() => {
                 const link = msg.context._convergence_link as Record<string, unknown>;
@@ -335,7 +335,7 @@ export function MessageBubble({
                     {' in '}
                     <span className="text-indigo-300 font-medium">{kindLabel}</span>
                     {' '}
-                    <code className="text-indigo-200 bg-indigo-950/50 px-1 py-0.5 rounded text-[10px]">
+                    <code className="text-indigo-200 bg-indigo-950/50 px-1 py-0.5 rounded text-ui-sm">
                       {id.slice(0, 8)}
                     </code>
                   </>
@@ -348,7 +348,7 @@ export function MessageBubble({
         {/* Resolution (for resolved messages) */}
         {msg.status === 'resolved' && msg.resolution && (
           <div className={`mt-1 ${userMsg ? 'mr-3' : 'ml-3'} px-3 py-1.5 rounded-lg bg-neutral-800/50 border border-neutral-700/30`}>
-            <p className="text-[11px] text-neutral-500">
+            <p className="text-ui-md text-neutral-500">
               <span className="text-emerald-500/70 font-medium">Resolved:</span> {msg.resolution}
             </p>
           </div>

@@ -325,7 +325,7 @@ export function LogsTab({
                     {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                     <button
                       type="button"
-                      className="w-full bg-neutral-900/80 border border-neutral-700/50 rounded px-2 py-1 text-[11px] text-neutral-400 flex items-center gap-2 cursor-pointer sticky top-0 z-10 hover:bg-neutral-800/80 transition-colors"
+                      className="w-full bg-neutral-900/80 border border-neutral-700/50 rounded px-2 py-1 text-ui-md text-neutral-400 flex items-center gap-2 cursor-pointer sticky top-0 z-10 hover:bg-neutral-800/80 transition-colors"
                       onClick={() => toggleSection(sIdx)}
                     >
                       <ChevronRight

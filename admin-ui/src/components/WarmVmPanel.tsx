@@ -177,7 +177,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
       <div className="flex items-center gap-2 flex-wrap">
         <button
           onClick={toggle}
-          className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors"
+          className="flex items-center gap-2 text-ui-md font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors"
         >
           {collapsed ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
           <Server className="w-3 h-3" />
@@ -191,7 +191,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
               ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/30'
               : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
             ) +
-            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
             (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
             (!data ? ' opacity-50 cursor-not-allowed' : '')
           }
@@ -213,7 +213,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
               ? 'bg-sky-500/20 border border-sky-500/40 text-sky-400 hover:bg-sky-500/30'
               : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
             ) +
-            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
             (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
             (!data ? ' opacity-50 cursor-not-allowed' : '')
           }
@@ -235,7 +235,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
               ? 'bg-violet-500/20 border border-violet-500/40 text-violet-400 hover:bg-violet-500/30'
               : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
             ) +
-            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
             (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
             (!data ? ' opacity-50 cursor-not-allowed' : '')
           }
@@ -258,7 +258,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
               ? 'bg-violet-500/20 border border-violet-500/40 text-violet-400 hover:bg-violet-500/30'
               : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
             ) +
-            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
             (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
             (!data ? ' opacity-50 cursor-not-allowed' : '')
           }
@@ -281,7 +281,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
               ? 'bg-violet-500/20 border border-violet-500/40 text-violet-400 hover:bg-violet-500/30'
               : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
             ) +
-            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
             (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
             (!data ? ' opacity-50 cursor-not-allowed' : '')
           }
@@ -297,22 +297,22 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
         </button>
         <button
           onClick={toggle}
-          className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors"
+          className="flex items-center gap-2 text-ui-md font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors"
         >
           {warmChains > 0 && (
-            <span className="bg-orange-500/20 border border-orange-500/40 text-orange-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none flex items-center gap-1">
+            <span className="bg-orange-500/20 border border-orange-500/40 text-orange-400 text-ui-sm font-bold px-1.5 py-0.5 rounded-full leading-none flex items-center gap-1">
               <Flame className="w-2.5 h-2.5" />
               {warmChains} chain{warmChains !== 1 ? 's' : ''}
             </span>
           )}
           {overThreshold && (
-            <span className="bg-red-500/20 border border-red-500/40 text-red-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none flex items-center gap-1">
+            <span className="bg-red-500/20 border border-red-500/40 text-red-400 text-ui-sm font-bold px-1.5 py-0.5 rounded-full leading-none flex items-center gap-1">
               <AlertTriangle className="w-2.5 h-2.5" />
               {clearsHour} clears/hr
             </span>
           )}
           {collapsed && data && (
-            <span className="text-[10px] text-neutral-500 font-mono ml-1 normal-case tracking-normal font-normal">
+            <span className="text-ui-sm text-neutral-500 font-mono ml-1 normal-case tracking-normal font-normal">
               {vmCount} VM{vmCount !== 1 ? 's' : ''}
               {pinnedQueued > 0 && <> · {pinnedQueued} pinned</>}
             </span>
@@ -320,7 +320,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
         </button>
         {data && asOfLabel && (
           <span
-            className={`text-[10px] ${stale ? 'text-amber-400 font-semibold' : 'text-neutral-500'}`}
+            className={`text-ui-sm ${stale ? 'text-amber-400 font-semibold' : 'text-neutral-500'}`}
             title={stale ? 'Cached snapshot is stale — may not reflect current VM fleet state' : 'When this VM fleet snapshot was computed'}
           >
             {stale && '⚠ '}as of {asOfLabel}{stale && ' · stale'}
@@ -335,7 +335,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
           )}
           {!error && data && (
             <>
-              <div className="flex flex-wrap gap-x-4 gap-y-1 mb-3 text-[10px] text-neutral-400">
+              <div className="flex flex-wrap gap-x-4 gap-y-1 mb-3 text-ui-sm text-neutral-400">
                 <span><span className="text-neutral-500">VMs</span>: <span className="font-mono text-neutral-300">{vmCount}</span></span>
                 <span><span className="text-neutral-500">warm chains</span>: <span className="font-mono text-neutral-300">{warmChains}</span></span>
                 <span><span className="text-neutral-500">backlog reuse</span>: <span className="font-mono text-sky-400">{backlogClaims}</span></span>
@@ -361,7 +361,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
               </div>
 
               {efficiency && (
-                <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60">
+                <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-ui-sm text-neutral-400 pt-2 border-t border-neutral-800/60">
                   <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">Pipeline Efficiency</span>
                   <EffMetric label="cold-start p50" value={fmtEffSecs(efficiency.window_24h?.setup_p50_secs)} delta={efficiency.window_24h?.vs_prior_setup_p50_delta} lowerIsBetter />
                   <EffMetric label="reuse rate" value={fmtEffRate(efficiency.window_24h?.warm_reuse_rate)} delta={efficiency.window_24h?.vs_prior_warm_reuse_rate_delta} lowerIsBetter={false} />
@@ -424,7 +424,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
               )}
 
               {overThreshold && (
-                <div className="mb-3 px-2 py-1.5 rounded border border-red-500/40 bg-red-500/10 text-red-400 text-[11px] flex items-center gap-2">
+                <div className="mb-3 px-2 py-1.5 rounded border border-red-500/40 bg-red-500/10 text-red-400 text-ui-md flex items-center gap-2">
                   <AlertTriangle className="w-3 h-3 shrink-0" />
                   <span>
                     Warm-pin clear-rate is {clearsHour}/hr — investigate. Sustained high
@@ -444,9 +444,9 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
                     ))}
                   </div>
                   {/* Desktop: table layout */}
-                  <table className="hidden sm:table w-full text-[11px] border-collapse">
+                  <table className="hidden sm:table w-full text-ui-md border-collapse">
                     <thead>
-                      <tr className="text-neutral-500 text-[10px] uppercase tracking-wide">
+                      <tr className="text-neutral-500 text-ui-sm uppercase tracking-wide">
                         <th className="text-left font-medium pb-1.5 pr-3">VM</th>
                         <th className="text-left font-medium pb-1.5 pr-3">Heartbeat</th>
                         <th className="text-left font-medium pb-1.5 pr-3">Current Task</th>
@@ -527,7 +527,7 @@ function PoolPayoffVerdictRow({ projects, allowlist }: {
 
   return (
     <div
-      className="mb-3 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60"
+      className="mb-3 text-ui-sm text-neutral-400 pt-2 border-t border-neutral-800/60"
       data-testid="pool-payoff-verdict-row"
     >
       <span className="text-neutral-500 font-bold uppercase tracking-widest block mb-1">
@@ -646,7 +646,7 @@ function PoolHitRateEstimateRow({ data, targets, onTargetSet }: {
 
   return (
     <div
-      className="mb-3 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60"
+      className="mb-3 text-ui-sm text-neutral-400 pt-2 border-t border-neutral-800/60"
       data-testid="pool-hit-rate-estimate-row"
     >
       <span className="text-neutral-500 font-bold uppercase tracking-widest block mb-1">
@@ -792,7 +792,7 @@ function BacklogDropoutRow({ projectId }: { projectId: string }) {
 
   return (
     <div
-      className="mb-3 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60"
+      className="mb-3 text-ui-sm text-neutral-400 pt-2 border-t border-neutral-800/60"
       data-testid="backlog-dropout-row"
     >
       <span className="text-neutral-500 font-bold uppercase tracking-widest block mb-1">

@@ -57,7 +57,7 @@ function SerialLogBlock({ log, taskId, vmInstanceId }: { log: string | null; tas
         <span className="text-neutral-400 font-medium">Serial console</span>
         {displayLog && <span className="text-neutral-600">{byteCount.toLocaleString()} B</span>}
         {liveResult && (
-          <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${liveResult.source === 'live' ? 'bg-emerald-900/40 text-emerald-400' : 'bg-neutral-800 text-neutral-400'}`}>
+          <span className={`px-1.5 py-0.5 rounded text-ui-sm font-semibold ${liveResult.source === 'live' ? 'bg-emerald-900/40 text-emerald-400' : 'bg-neutral-800 text-neutral-400'}`}>
             {liveResult.source}
           </span>
         )}
@@ -139,7 +139,7 @@ function ToolTraceTail({ entries }: { entries: ToolTraceEntry[] }) {
         const isLong = extraStr.length > 200;
         const isExpanded = expandedSet.has(i);
         return (
-          <div key={i} className="font-mono text-[11px] text-neutral-400 leading-relaxed">
+          <div key={i} className="font-mono text-ui-md text-neutral-400 leading-relaxed">
             <span className="text-blue-400">{label}</span>
             {entry.ts && <span className="text-neutral-600 ml-1.5">{String(entry.ts).slice(11, 19)}</span>}
             {extraStr && (

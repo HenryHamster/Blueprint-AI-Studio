@@ -149,7 +149,7 @@ export function ProviderCategoriesPanel({
             </button>
           ))}
         </div>
-        <div className="text-[11px] text-neutral-500 mt-1.5 italic">
+        <div className="text-ui-md text-neutral-500 mt-1.5 italic">
           {MODE_DESCRIPTIONS[selectionMode]}
         </div>
       </div>
@@ -216,7 +216,7 @@ export function ProviderCategoriesPanel({
         </div>
 
         {uncategorized.length > 0 && (
-          <div className="mt-3 p-2 border border-amber-900/50 rounded bg-amber-950/20 text-[11px]">
+          <div className="mt-3 p-2 border border-amber-900/50 rounded bg-amber-950/20 text-ui-md">
             <span className="text-amber-300">Uncategorized:</span>{' '}
             <span className="text-neutral-300">{uncategorized.join(', ')}</span>
             <span className="text-neutral-500"> — these resolve via _default.</span>
@@ -357,7 +357,7 @@ function CategoryCard({
           // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             onClick={onDelete}
-            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-neutral-500 hover:text-red-400 hover:bg-red-950/30"
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-ui-sm text-neutral-500 hover:text-red-400 hover:bg-red-950/30"
             title="Delete category (task types fall back to _default)"
           >
             <X className="w-3 h-3" /> remove
@@ -370,7 +370,7 @@ function CategoryCard({
           {members.map(m => (
             <span
               key={m}
-              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-700 bg-neutral-800/60 text-[11px] text-neutral-200 font-mono"
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-700 bg-neutral-800/60 text-ui-md text-neutral-200 font-mono"
             >
               {m}
               <button
@@ -386,7 +386,7 @@ function CategoryCard({
             <select
               value=""
               onChange={e => { if (e.target.value) onAddMember(e.target.value); }}
-              className="bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-[11px] text-neutral-300"
+              className="bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-ui-md text-neutral-300"
             >
               <option value="">+ add task type</option>
               {addable.map(t => {
@@ -404,7 +404,7 @@ function CategoryCard({
 
       <div className="flex items-center gap-3 pt-1 border-t border-neutral-800/70">
         <div className="flex items-center gap-2">
-          <span className="text-[10px] text-neutral-500 shrink-0">providers:</span>
+          <span className="text-ui-sm text-neutral-500 shrink-0">providers:</span>
           <ProviderChecklist
             providers={providerNames}
             selected={entry.providers}
@@ -412,7 +412,7 @@ function CategoryCard({
           />
         </div>
         <div className="flex items-center gap-2 ml-auto">
-          <span className="text-[10px] text-neutral-500 shrink-0">effort:</span>
+          <span className="text-ui-sm text-neutral-500 shrink-0">effort:</span>
           <EffortSelect
             value={entry.effort}
             onChange={value => value && onEntryChange({ ...entry, effort: value })}
@@ -441,15 +441,15 @@ function TaskOverrideTable({
   return (
     <div className="border border-neutral-800 rounded bg-neutral-900/30 divide-y divide-neutral-800">
       {entries.length === 0 && (
-        <div className="px-3 py-2 text-[11px] text-neutral-500 italic">
+        <div className="px-3 py-2 text-ui-md text-neutral-500 italic">
           No overrides. Add one below to pin a specific task type.
         </div>
       )}
       {entries.map(([taskType, entry]) => (
         <div key={taskType} className="px-3 py-2 flex flex-wrap items-start gap-3">
-          <code className="text-[11px] text-neutral-200 w-28 shrink-0 font-mono truncate">{taskType}</code>
+          <code className="text-ui-md text-neutral-200 w-28 shrink-0 font-mono truncate">{taskType}</code>
           <div className="flex items-center gap-1.5">
-            <span className="text-[10px] text-neutral-500">providers:</span>
+            <span className="text-ui-sm text-neutral-500">providers:</span>
             <ProviderChecklist
               providers={providerNames}
               selected={entry.providers ?? []}
@@ -457,7 +457,7 @@ function TaskOverrideTable({
             />
           </div>
           <div className="flex items-center gap-1.5 ml-auto">
-            <span className="text-[10px] text-neutral-500">effort:</span>
+            <span className="text-ui-sm text-neutral-500">effort:</span>
             <EffortSelect
               value={entry.effort ?? ''}
               onChange={value => onSet(taskType, { ...entry, effort: value || undefined })}
@@ -466,7 +466,7 @@ function TaskOverrideTable({
           </div>
           <button
             onClick={() => onSet(taskType, null)}
-            className="text-[10px] text-neutral-500 hover:text-red-400 shrink-0"
+            className="text-ui-sm text-neutral-500 hover:text-red-400 shrink-0"
             title="Remove override (inherit category)"
           >
             remove
@@ -478,7 +478,7 @@ function TaskOverrideTable({
           <select
             value={newType}
             onChange={e => setNewType(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded px-1.5 py-1 text-[11px] text-neutral-200"
+            className="bg-neutral-900 border border-neutral-700 rounded px-1.5 py-1 text-ui-md text-neutral-200"
           >
             <option value="">+ add override for…</option>
             {eligibleToAdd.map(t => <option key={t} value={t}>{t}</option>)}
@@ -487,7 +487,7 @@ function TaskOverrideTable({
           <button
             onClick={() => { if (newType) { onSet(newType, { providers: providerNames }); setNewType(''); } }}
             disabled={!newType}
-            className="inline-flex items-center gap-1 px-2 py-1 rounded border border-neutral-700 text-neutral-300 hover:bg-neutral-800 text-[11px] disabled:opacity-40"
+            className="inline-flex items-center gap-1 px-2 py-1 rounded border border-neutral-700 text-neutral-300 hover:bg-neutral-800 text-ui-md disabled:opacity-40"
           >
             <Plus className="w-3 h-3" /> add
           </button>

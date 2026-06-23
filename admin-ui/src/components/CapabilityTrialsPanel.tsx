@@ -94,7 +94,7 @@ function DeclareVerdictForm({ projectId, capName, onDone, onSuccess }: { project
         <select
           value={verdict}
           onChange={e => setVerdict(e.target.value as DeclareVerdict)}
-          className="text-[10px] bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200"
+          className="text-ui-sm bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200"
           disabled={submitting}
         >
           <option value="adopt">adopt</option>
@@ -106,14 +106,14 @@ function DeclareVerdictForm({ projectId, capName, onDone, onSuccess }: { project
           placeholder="Rationale (optional)"
           value={rationale}
           onChange={e => setRationale(e.target.value)}
-          className="text-[10px] bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200 flex-1 min-w-0"
+          className="text-ui-sm bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200 flex-1 min-w-0"
           disabled={submitting}
         />
         {/* eslint-disable-next-line viewport/min-touch-target */}
         <button
           onClick={handleSubmit}
           disabled={submitting}
-          className="text-[10px] px-2 py-0.5 rounded bg-neutral-700 hover:bg-neutral-600 text-neutral-200 disabled:opacity-50 shrink-0"
+          className="text-ui-sm px-2 py-0.5 rounded bg-neutral-700 hover:bg-neutral-600 text-neutral-200 disabled:opacity-50 shrink-0"
         >
           {submitting ? '…' : 'Declare'}
         </button>
@@ -121,12 +121,12 @@ function DeclareVerdictForm({ projectId, capName, onDone, onSuccess }: { project
         <button
           onClick={onDone}
           disabled={submitting}
-          className="text-[10px] px-1.5 py-0.5 rounded text-neutral-500 hover:text-neutral-300"
+          className="text-ui-sm px-1.5 py-0.5 rounded text-neutral-500 hover:text-neutral-300"
         >
           ✕
         </button>
       </div>
-      {error && <div className="text-[10px] text-red-400">{error}</div>}
+      {error && <div className="text-ui-sm text-red-400">{error}</div>}
     </div>
   );
 }
@@ -140,7 +140,7 @@ function DeclareButton({ projectId, capName, onSuccess }: { projectId: string; c
     // eslint-disable-next-line viewport/min-touch-target
     <button
       onClick={() => setOpen(true)}
-      className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-200 mt-0.5"
+      className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-200 mt-0.5"
     >
       Declare verdict
     </button>
@@ -155,23 +155,23 @@ export function CapabilityTrialsPanel({ digest, projectId, onRefreshDigest }: { 
   const totalWithout = genericVerdicts.reduce((sum, [, v]) => sum + Math.min(v.n_without ?? 0, v.thresholds?.min_n_per_arm ?? 30), 0);
   const genericTarget = genericVerdicts.reduce((sum, [, v]) => sum + (v.thresholds?.min_n_per_arm ?? 30), 0);
   if (verdicts.length === 0) {
-    return <section><h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Capability Trials</h2><div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-4 text-[11px] text-neutral-500">No capability trials are currently running.</div></section>;
+    return <section><h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Capability Trials</h2><div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-4 text-ui-md text-neutral-500">No capability trials are currently running.</div></section>;
   }
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Capability Trials <span className="text-neutral-600 normal-case font-normal">{genericTarget > 0 ? `· ${totalWith}/${genericTarget} with · ${totalWithout}/${genericTarget} without` : `· ${verdicts.length} verdict${verdicts.length === 1 ? '' : 's'}`}</span></h2>
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Capability Trials <span className="text-neutral-600 normal-case font-normal">{genericTarget > 0 ? `· ${totalWith}/${genericTarget} with · ${totalWithout}/${genericTarget} without` : `· ${verdicts.length} verdict${verdicts.length === 1 ? '' : 's'}`}</span></h2>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         <div className="sm:hidden divide-y divide-neutral-800/30">
           {verdicts.map(([name, v]) => {
             const minN = v.thresholds?.min_n_per_arm ?? 30;
             const isLane = hasLaneMetrics(v);
             return (
-              <div key={name} className="px-3 py-2 text-[10px]">
+              <div key={name} className="px-3 py-2 text-ui-sm">
                 <div className="flex items-start justify-between gap-2 mb-1">
                   <span className="font-medium text-neutral-200 break-words">{name}</span>
                   <div className="shrink-0 text-right">
                     <span className={`font-medium ${verdictClass(v.verdict)}`}>{v.verdict}</span>
-                    {v.is_stalled && <span className="ml-1 inline-block px-1 py-0.5 rounded text-[9px] font-medium bg-amber-900/40 text-amber-400 border border-amber-700/40">Stalled</span>}
+                    {v.is_stalled && <span className="ml-1 inline-block px-1 py-0.5 rounded text-ui-xs font-medium bg-amber-900/40 text-amber-400 border border-amber-700/40">Stalled</span>}
                     {v.verdict_reason && <div className="text-neutral-500">{v.verdict_reason}</div>}
                   </div>
                 </div>
@@ -228,7 +228,7 @@ export function CapabilityTrialsPanel({ digest, projectId, onRefreshDigest }: { 
           })}
         </div>
         <table className="hidden sm:table w-full text-xs">
-          <thead><tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50"><th className="text-left px-3 py-2 font-medium">Capability</th><th className="text-right px-3 py-2 font-medium">Verdict</th><th className="text-right px-3 py-2 font-medium">Metric</th><th className="text-right px-3 py-2 font-medium">Samples</th><th className="text-right px-3 py-2 font-medium">Cost / Guardrails</th><th className="text-right px-3 py-2 font-medium">Evaluated</th>{projectId && <th className="text-right px-3 py-2 font-medium">Action</th>}</tr></thead>
+          <thead><tr className="text-ui-sm text-neutral-500 border-b border-neutral-800/50"><th className="text-left px-3 py-2 font-medium">Capability</th><th className="text-right px-3 py-2 font-medium">Verdict</th><th className="text-right px-3 py-2 font-medium">Metric</th><th className="text-right px-3 py-2 font-medium">Samples</th><th className="text-right px-3 py-2 font-medium">Cost / Guardrails</th><th className="text-right px-3 py-2 font-medium">Evaluated</th>{projectId && <th className="text-right px-3 py-2 font-medium">Action</th>}</tr></thead>
           <tbody className="divide-y divide-neutral-800/30">{verdicts.map(([name, v]) => {
             const minN = v.thresholds?.min_n_per_arm ?? 30;
             const isLane = hasLaneMetrics(v);
@@ -236,19 +236,19 @@ export function CapabilityTrialsPanel({ digest, projectId, onRefreshDigest }: { 
               <tr key={name}>
                 <td className="px-3 py-2 text-neutral-200">
                   {name}
-                  {isLane && <div className="text-[10px] text-neutral-500 font-normal">{laneMetricSummary(v).join(' · ')}</div>}
-                  {v.accrual_projection && <div className="text-[10px] text-neutral-500 font-normal">{fmtAccrual(v.accrual_projection)}</div>}
+                  {isLane && <div className="text-ui-sm text-neutral-500 font-normal">{laneMetricSummary(v).join(' · ')}</div>}
+                  {v.accrual_projection && <div className="text-ui-sm text-neutral-500 font-normal">{fmtAccrual(v.accrual_projection)}</div>}
                 </td>
                 <td className="text-right px-3 py-2">
                   <span className={`font-medium ${verdictClass(v.verdict)}`}>{v.verdict}</span>
-                  {v.is_stalled && <span className="ml-1 inline-block px-1 py-0.5 rounded text-[9px] font-medium bg-amber-900/40 text-amber-400 border border-amber-700/40">Stalled</span>}
-                  {v.verdict_reason && <div className="text-[10px] text-neutral-500">{v.verdict_reason}</div>}
-                  {v.immediate_alert && <div className="text-[10px] text-red-300">Immediate alert</div>}
-                  {v.arm_composition && <div className="text-[10px] text-neutral-500">{v.arm_composition.with_assigned ?? 0}+{v.arm_composition.with_receipt ?? 0}w / {v.arm_composition.without_assigned ?? 0}+{v.arm_composition.without_receipt ?? 0}wo{(v.arm_composition.without_contaminated ?? 0) > 0 ? <span className="text-amber-400 ml-1">· {v.arm_composition.without_contaminated} contaminated</span> : null}</div>}
+                  {v.is_stalled && <span className="ml-1 inline-block px-1 py-0.5 rounded text-ui-xs font-medium bg-amber-900/40 text-amber-400 border border-amber-700/40">Stalled</span>}
+                  {v.verdict_reason && <div className="text-ui-sm text-neutral-500">{v.verdict_reason}</div>}
+                  {v.immediate_alert && <div className="text-ui-sm text-red-300">Immediate alert</div>}
+                  {v.arm_composition && <div className="text-ui-sm text-neutral-500">{v.arm_composition.with_assigned ?? 0}+{v.arm_composition.with_receipt ?? 0}w / {v.arm_composition.without_assigned ?? 0}+{v.arm_composition.without_receipt ?? 0}wo{(v.arm_composition.without_contaminated ?? 0) > 0 ? <span className="text-amber-400 ml-1">· {v.arm_composition.without_contaminated} contaminated</span> : null}</div>}
                 </td>
                 <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">{isLane ? <>{fmtRate(v.lane_merge_rate)} / {fmtRate(v.control_merge_rate)}</> : fmtLift(v.lift ?? null)}</td>
                 <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{v.n_lane ?? 0} lane / {v.n_control ?? 0} control</> : <>{v.n_with}/{minN}</>}</td>
-                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{fmtMoney(v.lane_cost_per_merged)} / {fmtMoney(v.control_cost_per_merged)}<div className="text-[10px] text-neutral-500">loss {fmtRate(v.checkpoint_loss_rate)} · gates {v.gate_integrity_violations ?? 0}</div>{v.lane_fix_tasks_sampled != null && <div className="text-[10px] text-neutral-500">warm {fmtRate(v.warm_resume_fraction)} · ckpt {fmtRate(v.checkpoint_fraction)} ({v.lane_fix_tasks_sampled} fix)</div>}{v.engagement_low && <div className="text-[10px] text-amber-400">engagement low</div>}</> : <>{v.n_without}/{minN}</>}</td>
+                <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{isLane ? <>{fmtMoney(v.lane_cost_per_merged)} / {fmtMoney(v.control_cost_per_merged)}<div className="text-ui-sm text-neutral-500">loss {fmtRate(v.checkpoint_loss_rate)} · gates {v.gate_integrity_violations ?? 0}</div>{v.lane_fix_tasks_sampled != null && <div className="text-ui-sm text-neutral-500">warm {fmtRate(v.warm_resume_fraction)} · ckpt {fmtRate(v.checkpoint_fraction)} ({v.lane_fix_tasks_sampled} fix)</div>}{v.engagement_low && <div className="text-ui-sm text-amber-400">engagement low</div>}</> : <>{v.n_without}/{minN}</>}</td>
                 <td className="text-right px-3 py-2 text-neutral-300">{fmtDate(v.evaluated_at)}</td>
                 {projectId && <td className="text-right px-3 py-2">{!isVerdictDecided(v.verdict) && <DeclareButton projectId={projectId} capName={name} onSuccess={onRefreshDigest} />}</td>}
               </tr>

@@ -54,10 +54,10 @@ function PathListEditor({
   return (
     <div>
       <h4 className="text-xs font-semibold text-neutral-300 mb-1">{label}</h4>
-      <p className="text-[11px] text-neutral-600 mb-2">{hint}</p>
+      <p className="text-ui-md text-neutral-600 mb-2">{hint}</p>
       <div className="space-y-2">
         {paths.length === 0 && (
-          <p className="text-[11px] text-neutral-500 italic">No paths configured.</p>
+          <p className="text-ui-md text-neutral-500 italic">No paths configured.</p>
         )}
         {paths.map((path, i) => {
           const err = path.trim() === '' && paths.length === 1 ? null : pathError(path);
@@ -82,7 +82,7 @@ function PathListEditor({
                   </button>
                 )}
               </div>
-              {err && <p className="text-[11px] text-red-400 mt-1">{err}</p>}
+              {err && <p className="text-ui-md text-red-400 mt-1">{err}</p>}
             </div>
           );
         })}
@@ -158,9 +158,9 @@ export function ProjectApprovalGateSection({ data, canSave, onSave }: ProjectApp
         <div className="min-w-0">
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">
             Approval-Gate Files
-            <span className="ml-2 text-[10px] font-normal normal-case tracking-normal text-neutral-600">optional · none set</span>
+            <span className="ml-2 text-ui-sm font-normal normal-case tracking-normal text-neutral-600">optional · none set</span>
           </h3>
-          <p className="text-[11px] text-neutral-600 mt-0.5">
+          <p className="text-ui-md text-neutral-600 mt-0.5">
             PRs touching configured paths require human approval — add some when you onboard a repo.
           </p>
         </div>
@@ -180,7 +180,7 @@ export function ProjectApprovalGateSection({ data, canSave, onSave }: ProjectApp
     <div className="space-y-4">
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-2">Approval-Gate Files</h3>
-        <p className="text-[11px] text-neutral-600 mb-3">
+        <p className="text-ui-md text-neutral-600 mb-3">
           PRs touching these repo-relative paths require human approval to merge. Empty is fine — changes take effect immediately.
         </p>
 
@@ -198,7 +198,7 @@ export function ProjectApprovalGateSection({ data, canSave, onSave }: ProjectApp
         </div>
       </div>
 
-      {error && <p className="text-[11px] text-red-400">{error}</p>}
+      {error && <p className="text-ui-md text-red-400">{error}</p>}
 
       <div className="flex items-center justify-between pt-1 gap-3 flex-wrap">
         {canSave ? (

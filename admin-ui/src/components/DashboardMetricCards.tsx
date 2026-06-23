@@ -31,7 +31,7 @@ export function MetricCard({ label, value, color, spark, dataKey, loading }: {
   const fill = SPARK_COLORS[color] ?? '#a3a3a3';
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">{label}</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">{label}</p>
       <p className={`text-2xl font-bold font-mono text-${color}-400`}>{value}</p>
       {spark.length >= 3 && (
         <div className="h-8 mt-1">
@@ -69,7 +69,7 @@ export function FailedCard({ value, groups, spark, loading }: {
   const topGroups = (groups ?? []).slice(0, 3);
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Failed (24h)</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Failed (24h)</p>
       <p className="text-2xl font-bold font-mono text-red-400">{value}</p>
       {spark.length >= 3 && (
         <div className="h-8 mt-1">
@@ -92,7 +92,7 @@ export function FailedCard({ value, groups, spark, loading }: {
             const cls = FAILURE_CLASS_COLORS[g.failure_class] ?? 'bg-neutral-500/20 text-neutral-400';
             const short = FAILURE_CLASS_SHORT[g.failure_class] ?? g.failure_class.toLowerCase();
             return (
-              <span key={g.failure_class} className={`text-[9px] px-1.5 py-0.5 rounded font-medium ${cls}`}>
+              <span key={g.failure_class} className={`text-ui-xs px-1.5 py-0.5 rounded font-medium ${cls}`}>
                 {g.count} {short}
               </span>
             );
@@ -114,7 +114,7 @@ export function SuccessRateCard({ rate, trend, trendHistory, loading }: {
   const trendColor = trend === 'improving' ? 'text-emerald-400' : trend === 'declining' ? 'text-red-400' : 'text-neutral-500';
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Success Rate</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Success Rate</p>
       <div className="flex items-center gap-2">
         <p className="text-2xl font-bold font-mono text-neutral-100">{rate != null ? `${Math.round(rate * 100)}%` : '--'}</p>
         <TrendIcon className={`w-4 h-4 ${trendColor}`} />
@@ -147,9 +147,9 @@ export function ConversionRateCard({ rate, loading }: {
   const color = pct == null ? 'text-neutral-500' : pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Conversion Rate</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Conversion Rate</p>
       <p className={`text-2xl font-bold font-mono ${color}`}>{pct != null ? `${pct}%` : '--'}</p>
-      <p className="text-[10px] text-neutral-600 mt-1">PRs merged / PR-eligible tasks created</p>
+      <p className="text-ui-sm text-neutral-600 mt-1">PRs merged / PR-eligible tasks created</p>
     </div>
   );
 }
@@ -163,9 +163,9 @@ export function AcceptanceRateCard({ rate, loading }: {
   const color = pct == null ? 'text-neutral-500' : pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Acceptance Rate</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Acceptance Rate</p>
       <p className={`text-2xl font-bold font-mono ${color}`}>{pct != null ? `${pct}%` : '--'}</p>
-      <p className="text-[10px] text-neutral-600 mt-1">PRs merged / (merged + rejected)</p>
+      <p className="text-ui-sm text-neutral-600 mt-1">PRs merged / (merged + rejected)</p>
     </div>
   );
 }
@@ -181,7 +181,7 @@ export function CostCard({ totalCost, trendHistory, loading }: {
   const display = totalCost == null ? '--' : totalCost < 10 ? `$${totalCost.toFixed(2)}` : `$${Math.round(totalCost)}`;
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Cost (24h)</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Cost (24h)</p>
       <p className="text-2xl font-bold font-mono text-blue-400">{display}</p>
       {sparkPoints.length >= 3 && (
         <div className="h-8 mt-1">
@@ -225,9 +225,9 @@ export function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality
   if (rate == null || reviewerFindingCount < MIN_SR_CATCH_FINDINGS) {
     return (
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
-        <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">SR Catch Rate</p>
+        <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">SR Catch Rate</p>
         <p className="text-2xl font-bold font-mono text-neutral-500">too small</p>
-        <p className="text-[10px] text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
+        <p className="text-ui-sm text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
       </div>
     );
   }
@@ -266,12 +266,12 @@ export function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
       <div className="flex items-center justify-between mb-1">
-        <p className="text-[10px] text-neutral-500 uppercase tracking-wide">SR Catch Rate</p>
+        <p className="text-ui-sm text-neutral-500 uppercase tracking-wide">SR Catch Rate</p>
         {trends?.is_stale && (
-          <span className="text-[9px] text-amber-400 font-mono" title={`Trend data is stale — last computed ${trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : 'unknown'}`}>stale</span>
+          <span className="text-ui-xs text-amber-400 font-mono" title={`Trend data is stale — last computed ${trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : 'unknown'}`}>stale</span>
         )}
         {trends?.data_sufficient === false && !trends?.is_stale && (
-          <span className="text-[9px] text-amber-500 font-mono" title="Insufficient reviewer-finding data — displayed numbers are frozen">frozen</span>
+          <span className="text-ui-xs text-amber-500 font-mono" title="Insufficient reviewer-finding data — displayed numbers are frozen">frozen</span>
         )}
       </div>
       <div className="flex items-center gap-2">
@@ -283,7 +283,7 @@ export function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality
         )}
       </div>
       {srAlonePct != null ? (
-        <p className="text-[10px] font-mono mt-0.5" title="author = SR-alone catch rate (excludes reviewer saves); +reviewer = additional coverage from fresh-reviewer pass">
+        <p className="text-ui-sm font-mono mt-0.5" title="author = SR-alone catch rate (excludes reviewer saves); +reviewer = additional coverage from fresh-reviewer pass">
           <span className={srAloneDeclining ? 'text-red-400' : srAloneImproving ? 'text-emerald-400' : 'text-neutral-400'}>
             author {srAlonePct}%
           </span>
@@ -297,10 +297,10 @@ export function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality
           )}
         </p>
       ) : (
-        <p className="text-[10px] text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
+        <p className="text-ui-sm text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
       )}
       {srAlonePct != null && (
-        <p className="text-[10px] text-neutral-600">n={reviewerFindingCount} findings</p>
+        <p className="text-ui-sm text-neutral-600">n={reviewerFindingCount} findings</p>
       )}
     </div>
   );

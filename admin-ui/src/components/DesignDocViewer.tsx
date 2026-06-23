@@ -79,7 +79,7 @@ function RenderValue({ value, depth = 0 }: { value: unknown; depth?: number }) {
       <div className="space-y-3">
         {entries.map(([key, val]) => (
           <div key={key}>
-            <div className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider mb-0.5 flex items-center gap-1.5">
+            <div className="text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-0.5 flex items-center gap-1.5">
               {key}
               {key === 'status' && typeof val === 'string' && (
                 <span className={`w-1.5 h-1.5 rounded-full ${statusColors[val] || 'bg-neutral-600'}`} />
@@ -216,7 +216,7 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
                 {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => toggleGroup(prefix)}
-                  className="w-full text-left px-2 py-1 rounded text-[10px] font-semibold uppercase tracking-wider text-neutral-500 hover:text-neutral-300 flex items-center gap-1 transition-colors"
+                  className="w-full text-left px-2 py-1 rounded text-ui-sm font-semibold uppercase tracking-wider text-neutral-500 hover:text-neutral-300 flex items-center gap-1 transition-colors"
                 >
                   {isCollapsed
                     ? <ChevronRight className="w-3 h-3 shrink-0" />
@@ -287,7 +287,7 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
                       <span className="text-sm font-medium text-neutral-300 group-hover:text-neutral-100 transition-colors">{prettifyKey(key)}</span>
                       {(() => {
                         const status = getPageStatus(designDoc[key]);
-                        return status ? <span className={`text-[9px] px-1.5 py-0.5 rounded ${statusColors[status] ? `${statusColors[status]}/20` : 'bg-neutral-800'} text-neutral-400`}>{status}</span> : null;
+                        return status ? <span className={`text-ui-xs px-1.5 py-0.5 rounded ${statusColors[status] ? `${statusColors[status]}/20` : 'bg-neutral-800'} text-neutral-400`}>{status}</span> : null;
                       })()}
                     </div>
                     <p className="text-xs text-neutral-500 mt-0.5 truncate pl-[22px]">{getPagePreview(designDoc[key])}</p>
@@ -297,7 +297,7 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
                 {/* Grouped pages */}
                 {Array.from(groups.entries()).map(([prefix, children]) => (
                   <div key={prefix} className="mt-2">
-                    <div className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500 px-3 py-1">{prettifyKey(prefix)}</div>
+                    <div className="text-ui-sm font-semibold uppercase tracking-wider text-neutral-500 px-3 py-1">{prettifyKey(prefix)}</div>
                     {children.map(child => {
                       const fullKey = `${prefix}/${child}`;
                       return (

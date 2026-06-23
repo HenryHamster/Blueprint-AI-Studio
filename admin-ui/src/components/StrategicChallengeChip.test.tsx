@@ -13,7 +13,7 @@ describe('StrategicChallengeChip', () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it('renders an approved verdict with emerald (non-warning) styling and no counts', () => {
+  it('renders an approved verdict with success-tone styling and no counts', () => {
     render(
       <StrategicChallengeChip
         summary={{ mode: 'ok', verdict: 'approved', warned_count: 0, blocked_count: 0 }}
@@ -21,15 +21,15 @@ describe('StrategicChallengeChip', () => {
     );
     const chip = screen.getByLabelText(/strategic judgment challenge/i);
     expect(chip).toHaveTextContent('challenge: ok · approved');
-    expect(chip.className).toContain('emerald');
-    expect(chip.className).not.toContain('red');
-    expect(chip.className).not.toContain('amber');
+    expect(chip.className).toContain('status-success');
+    expect(chip.className).not.toContain('status-blocking');
+    expect(chip.className).not.toContain('status-warning');
     // Approved-clean chip shows no count clause.
     expect(chip.textContent).not.toContain('warned');
     expect(chip.textContent).not.toContain('blocked');
   });
 
-  it('renders a warned verdict in amber with the warned count', () => {
+  it('renders a warned verdict with warning-tone and the warned count', () => {
     render(
       <StrategicChallengeChip
         summary={{ mode: 'ok', verdict: 'warned', warned_count: 2, blocked_count: 0 }}
@@ -38,10 +38,10 @@ describe('StrategicChallengeChip', () => {
     const chip = screen.getByLabelText(/strategic judgment challenge/i);
     expect(chip).toHaveTextContent('challenge: ok · warned');
     expect(chip).toHaveTextContent('2 warned');
-    expect(chip.className).toContain('amber');
+    expect(chip.className).toContain('status-warning');
   });
 
-  it('renders a blocked verdict in red with both blocked and warned counts', () => {
+  it('renders a blocked verdict with blocking-tone and both blocked and warned counts', () => {
     render(
       <StrategicChallengeChip
         summary={{ mode: 'blocked', verdict: 'blocked', warned_count: 1, blocked_count: 3 }}
@@ -51,7 +51,7 @@ describe('StrategicChallengeChip', () => {
     expect(chip).toHaveTextContent('challenge: blocked · blocked');
     expect(chip).toHaveTextContent('3 blocked');
     expect(chip).toHaveTextContent('1 warned');
-    expect(chip.className).toContain('red');
+    expect(chip.className).toContain('status-blocking');
   });
 
   it('defaults verdict to approved when omitted and tolerates missing counts', () => {

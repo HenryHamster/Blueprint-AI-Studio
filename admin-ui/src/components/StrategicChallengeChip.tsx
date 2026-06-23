@@ -1,4 +1,12 @@
 import type { StrategicChallengeSummary } from '../types/digest';
+import { Badge } from './ui/Badge';
+import type { StatusTone } from './ui/Badge';
+
+const VERDICT_TONE: Record<string, StatusTone> = {
+  blocked: 'blocking',
+  warned: 'warning',
+  approved: 'success',
+};
 
 /**
  * Compact, read-only chip summarising a strategic-judgment challenge outcome.
@@ -23,15 +31,7 @@ export function StrategicChallengeChip({
   const verdict = summary.verdict ?? 'approved';
   const warned = summary.warned_count ?? 0;
   const blocked = summary.blocked_count ?? 0;
-
-  // Verdict → border/text/background. Approved is intentionally muted so a clean
-  // challenge does not visually compete with genuine warnings.
-  const tone =
-    verdict === 'blocked'
-      ? 'text-red-300 border-red-500/40 bg-red-500/10'
-      : verdict === 'warned'
-        ? 'text-amber-300 border-amber-500/40 bg-amber-500/10'
-        : 'text-emerald-300 border-emerald-500/30 bg-emerald-500/10';
+  const tone: StatusTone = VERDICT_TONE[verdict] ?? 'success';
 
   const counts: string[] = [];
   if (blocked > 0) counts.push(`${blocked} blocked`);
@@ -42,13 +42,9 @@ export function StrategicChallengeChip({
   const title = `Strategic judgment challenge — ${mode} / ${verdict}`;
 
   return (
-    <span
-      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-semibold ${tone}`}
-      title={title}
-      aria-label={title}
-    >
+    <Badge tone={tone} title={title} aria-label={title} className="gap-1 font-semibold">
       <span>{visibleLabel}</span>
       {counts.length > 0 && <span className="font-normal opacity-90">· {counts.join(', ')}</span>}
-    </span>
+    </Badge>
   );
 }

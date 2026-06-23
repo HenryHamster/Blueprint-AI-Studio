@@ -23,7 +23,7 @@ export function RecentMergesTimeline({
 }) {
   return (
     <>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Recent Merges</h2>
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Recent Merges</h2>
       {loading ? (
         <div className="space-y-3"><Skeleton className="h-12 w-full" /><Skeleton className="h-12 w-full" /><Skeleton className="h-12 w-full" /></div>
       ) : mergeEvents.length === 0 ? (
@@ -45,16 +45,16 @@ export function RecentMergesTimeline({
                     <GitMerge className="w-3.5 h-3.5 text-neutral-500 mt-0.5 shrink-0" />
                     <div className="flex-1 min-w-0">
                       <p className="text-xs text-neutral-200 truncate">{ev.title}</p>
-                      {dirLabel && <p className="text-[9px] text-neutral-500 truncate mt-0.5">{dirLabel}</p>}
-                      <div className="flex items-center gap-2 mt-1 text-[10px] text-neutral-500">
-                        {ev.task_type && <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${typeCls}`}>{ev.task_type}</span>}
+                      {dirLabel && <p className="text-ui-xs text-neutral-500 truncate mt-0.5">{dirLabel}</p>}
+                      <div className="flex items-center gap-2 mt-1 text-ui-sm text-neutral-500">
+                        {ev.task_type && <span className={`px-1.5 py-0.5 rounded text-ui-xs font-medium ${typeCls}`}>{ev.task_type}</span>}
                         <span>{timeAgo(ev.completed_at ?? '')}</span>
                         {ev.duration_seconds != null && <span>{formatDurationSec(ev.duration_seconds)}</span>}
                       </div>
                       {unverifiedReason && (
                         <div className="flex items-center gap-1.5 mt-1">
-                          <span className="px-1.5 py-0.5 rounded text-[9px] font-medium bg-amber-500/20 text-amber-400">UNVERIFIED</span>
-                          <span className="text-[9px] text-amber-400/80 truncate">{humanizeUnverifiedReason(unverifiedReason)}</span>
+                          <span className="px-1.5 py-0.5 rounded text-ui-xs font-medium bg-amber-500/20 text-amber-400">UNVERIFIED</span>
+                          <span className="text-ui-xs text-amber-400/80 truncate">{humanizeUnverifiedReason(unverifiedReason)}</span>
                         </div>
                       )}
                     </div>

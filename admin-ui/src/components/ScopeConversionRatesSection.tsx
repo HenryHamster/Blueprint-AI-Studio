@@ -31,7 +31,7 @@ export function ScopeConversionRatesSection({
 
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Scope Conversion Rates</h2>
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Scope Conversion Rates</h2>
       <div className="flex gap-2 flex-wrap">
         {scopes.map(scope => {
           const { created, merged, merged_cross_module = 0, failed_scope_overflow = 0, calibrated_in = 0, calibrated_out = 0, avg_expansion_ratio_merged, avg_expansion_ratio_failed, failure_stages } = scopeRates[scope];
@@ -69,33 +69,33 @@ export function ScopeConversionRatesSection({
 
           return (
             <div key={scope} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 min-w-[110px]">
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">{scope}</p>
+              <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">{scope}</p>
               <div className="flex items-center gap-1.5">
                 <p className={`text-xl font-bold font-mono ${rateColor}`}>
                   {rate != null ? `${Math.round(rate * 100)}%` : '--'}
                 </p>
                 {trend && <TrendIcon className={`w-3.5 h-3.5 ${trendColor}`} />}
               </div>
-              <p className="text-[10px] text-neutral-600 mt-0.5">{merged}/{created} merged</p>
+              <p className="text-ui-sm text-neutral-600 mt-0.5">{merged}/{created} merged</p>
               {merged_cross_module > 0 && (
-                <p className="text-[10px] text-emerald-500/70 mt-0.5" title="Merged PRs touching 2+ top-level directories">
+                <p className="text-ui-sm text-emerald-500/70 mt-0.5" title="Merged PRs touching 2+ top-level directories">
                   {merged_cross_module}/{merged} cross-dir
                 </p>
               )}
               {failed_scope_overflow > 0 && (
-                <p className="text-[10px] text-red-400/80 mt-0.5" title="Tasks that failed due to scope overflow">
+                <p className="text-ui-sm text-red-400/80 mt-0.5" title="Tasks that failed due to scope overflow">
                   {failed_scope_overflow} scope overflow
                 </p>
               )}
               {recalibrated > 0 && (
-                <p className="text-[10px] text-neutral-600 mt-0.5">{recalibrated} recalibrated</p>
+                <p className="text-ui-sm text-neutral-600 mt-0.5">{recalibrated} recalibrated</p>
               )}
               {topStages.length > 0 && (
                 <div className="flex gap-1 flex-wrap mt-1" title="Top failure stages for this scope">
                   {topStages.map(([stage, count]) => (
                     <span
                       key={stage}
-                      className={`text-[9px] px-1.5 py-0.5 rounded border ${STAGE_COLORS[stage] || 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}
+                      className={`text-ui-xs px-1.5 py-0.5 rounded border ${STAGE_COLORS[stage] || 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}
                     >
                       {stage} {count}
                     </span>
@@ -104,7 +104,7 @@ export function ScopeConversionRatesSection({
               )}
               {(typeof avg_expansion_ratio_merged === 'number' || typeof avg_expansion_ratio_failed === 'number') && (
                 <p
-                  className={`text-[10px] mt-0.5 ${expansionWarn ? 'text-amber-500' : 'text-neutral-600'}`}
+                  className={`text-ui-sm mt-0.5 ${expansionWarn ? 'text-amber-500' : 'text-neutral-600'}`}
                   title="Avg files-changed / declared related_files (merged vs failed). Failed >> merged indicates scope underestimates file count."
                 >
                   exp {typeof avg_expansion_ratio_merged === 'number' ? avg_expansion_ratio_merged.toFixed(1) : '--'}x

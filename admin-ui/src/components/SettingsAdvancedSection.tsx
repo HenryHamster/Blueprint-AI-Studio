@@ -27,7 +27,7 @@ export function SettingsAdvancedSection({ healthCheckUrlsInput, onHealthCheckUrl
       {/* Health Check URLs */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Health Check URLs</h3>
-        <p className="text-[11px] text-neutral-600 mb-3">One URL per line. Probed with HTTP GET after each smoketest.</p>
+        <p className="text-ui-md text-neutral-600 mb-3">One URL per line. Probed with HTTP GET after each smoketest.</p>
         <textarea
           value={healthCheckUrlsInput}
           onChange={e => onHealthCheckUrlsChange(e.target.value)}
@@ -103,7 +103,7 @@ export function SettingsAdvancedSection({ healthCheckUrlsInput, onHealthCheckUrl
             {KEYBOARD_SHORTCUTS.map(([key, label]) => (
               <div key={key} className="flex items-center justify-between">
                 <span className="text-xs text-neutral-500">{label}</span>
-                <kbd className="text-[11px] font-mono bg-neutral-800 border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded ml-4">{key}</kbd>
+                <kbd className="text-ui-md font-mono bg-neutral-800 border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded ml-4">{key}</kbd>
               </div>
             ))}
           </div>

@@ -128,13 +128,13 @@ function LoopCard({ name, data, onChipClick }: { name: string; data: LoopAggrega
         {data.avg_iterations != null && (
           <div className="flex flex-col">
             <span className="text-lg font-bold text-neutral-100 leading-none">{data.avg_iterations.toFixed(1)}</span>
-            <span className="text-[10px] text-neutral-500">avg iter</span>
+            <span className="text-ui-sm text-neutral-500">avg iter</span>
           </div>
         )}
         {convPct != null && (
           <div className="flex flex-col">
             <span className={`text-lg font-bold leading-none ${convColor}`}>{convPct}%</span>
-            <span className="text-[10px] text-neutral-500">converged</span>
+            <span className="text-ui-sm text-neutral-500">converged</span>
           </div>
         )}
       </div>
@@ -149,7 +149,7 @@ function LoopCard({ name, data, onChipClick }: { name: string; data: LoopAggrega
               data-viewport-allow-small-target
               key={reason}
               onClick={() => onChipClick(name, reason)}
-              className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border cursor-pointer hover:brightness-125 transition-all ${cls}`}
+              className={`inline-flex items-center gap-1 text-ui-sm px-1.5 py-0.5 rounded border cursor-pointer hover:brightness-125 transition-all ${cls}`}
               title={`Show tasks: ${reason}`}
             >
               {reason.replace(/_/g, ' ')}
@@ -235,11 +235,11 @@ function DrillDownPanel({
     <div className="mt-2 bg-neutral-900/80 rounded-lg border border-neutral-700 p-3">
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className={`text-[10px] font-semibold uppercase tracking-wide ${LOOP_COLORS[filter.loop]}`}>{LOOP_LABELS[filter.loop]}</span>
-          <span className={`inline-flex items-center text-[10px] px-1.5 py-0.5 rounded border ${reasonCls}`}>
+          <span className={`text-ui-sm font-semibold uppercase tracking-wide ${LOOP_COLORS[filter.loop]}`}>{LOOP_LABELS[filter.loop]}</span>
+          <span className={`inline-flex items-center text-ui-sm px-1.5 py-0.5 rounded border ${reasonCls}`}>
             {effectiveReason.replace(/_/g, ' ')}
           </span>
-          {!loading && <span className="text-[10px] text-neutral-500">{total} task{total !== 1 ? 's' : ''}</span>}
+          {!loading && <span className="text-ui-sm text-neutral-500">{total} task{total !== 1 ? 's' : ''}</span>}
         </div>
         <button data-viewport-allow-small-target onClick={onClose} className="text-neutral-500 hover:text-neutral-300 text-xs leading-none px-1" aria-label="Close">✕</button>
       </div>
@@ -255,7 +255,7 @@ function DrillDownPanel({
                 data-viewport-allow-small-target
                 key={p}
                 onClick={() => setActivePattern(prev => prev === p ? null : p)}
-                className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border transition-all ${cls} ${isActive ? 'ring-1 ring-white/30' : 'opacity-60 hover:opacity-100'}`}
+                className={`inline-flex items-center gap-1 text-ui-sm px-1.5 py-0.5 rounded border transition-all ${cls} ${isActive ? 'ring-1 ring-white/30' : 'opacity-60 hover:opacity-100'}`}
                 title={isActive ? 'Click to show all patterns' : `Filter by ${p.replace(/_/g, ' ')}`}
               >
                 {p.replace(/divergence_/g, '').replace(/_/g, ' ')}
@@ -264,44 +264,44 @@ function DrillDownPanel({
             );
           })}
           {activePattern && (
-            <button data-viewport-allow-small-target onClick={() => setActivePattern(null)} className="text-[10px] text-neutral-400 hover:text-neutral-200 px-1">
+            <button data-viewport-allow-small-target onClick={() => setActivePattern(null)} className="text-ui-sm text-neutral-400 hover:text-neutral-200 px-1">
               show all
             </button>
           )}
         </div>
       )}
 
-      {loading && <p className="text-[10px] text-neutral-500">Loading…</p>}
-      {error && <p className="text-[10px] text-red-400">{error}</p>}
+      {loading && <p className="text-ui-sm text-neutral-500">Loading…</p>}
+      {error && <p className="text-ui-sm text-red-400">{error}</p>}
       {!loading && !error && tasks.length === 0 && (
-        <p className="text-[10px] text-neutral-600">No tasks found for this filter.</p>
+        <p className="text-ui-sm text-neutral-600">No tasks found for this filter.</p>
       )}
       {!loading && !error && tasks.length > 0 && (
         <div className="flex flex-col gap-1.5 max-h-64 overflow-y-auto pr-1">
           {tasks.map(t => (
             <div key={t.task_id} className="bg-neutral-800/60 rounded p-2 flex flex-col gap-0.5 min-w-0">
               <div className="flex items-start justify-between gap-2">
-                <span className="text-[11px] text-neutral-200 font-medium leading-tight truncate flex-1" title={t.title}>{t.title}</span>
+                <span className="text-ui-md text-neutral-200 font-medium leading-tight truncate flex-1" title={t.title}>{t.title}</span>
                 {onViewTask && (
                   <button
                     data-viewport-allow-small-target
                     onClick={() => onViewTask(t.task_id)}
-                    className="text-[10px] text-neutral-400 hover:text-neutral-100 shrink-0 ml-1 underline underline-offset-2"
+                    className="text-ui-sm text-neutral-400 hover:text-neutral-100 shrink-0 ml-1 underline underline-offset-2"
                   >
                     View
                   </button>
                 )}
               </div>
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-[10px] text-neutral-500">{t.task_type}</span>
-                {t.scope && <span className="text-[10px] text-neutral-600">{t.scope}</span>}
-                <span className="text-[10px] text-neutral-600">{t.iteration_count} iter</span>
-                <span className={`text-[10px] px-1 py-0.5 rounded border ${EXIT_REASON_COLORS[t.exit_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}>
+                <span className="text-ui-sm text-neutral-500">{t.task_type}</span>
+                {t.scope && <span className="text-ui-sm text-neutral-600">{t.scope}</span>}
+                <span className="text-ui-sm text-neutral-600">{t.iteration_count} iter</span>
+                <span className={`text-ui-sm px-1 py-0.5 rounded border ${EXIT_REASON_COLORS[t.exit_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}>
                   {t.exit_reason.replace(/_/g, ' ')}
                 </span>
               </div>
               {t.error_tail && (
-                <pre className="text-[9px] text-neutral-500 font-mono mt-0.5 truncate max-w-full" title={t.error_tail}>{t.error_tail.slice(0, 200)}</pre>
+                <pre className="text-ui-xs text-neutral-500 font-mono mt-0.5 truncate max-w-full" title={t.error_tail}>{t.error_tail.slice(0, 200)}</pre>
               )}
             </div>
           ))}
@@ -336,7 +336,7 @@ function TrendSparkline({ loop, buckets }: { loop: string; buckets: TrendBucket[
 
   return (
     <div className="flex flex-col gap-0.5 min-w-0">
-      <span className={`text-[10px] font-semibold uppercase tracking-wide ${LOOP_COLORS[loop]}`}>{LOOP_LABELS[loop]}</span>
+      <span className={`text-ui-sm font-semibold uppercase tracking-wide ${LOOP_COLORS[loop]}`}>{LOOP_LABELS[loop]}</span>
       <div className="h-10">
         <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
           <AreaChart data={data} margin={{ top: 1, right: 0, left: 0, bottom: 1 }}>
@@ -432,8 +432,8 @@ export function FixLoopConvergenceWidget({ trendDays = 7, projectId, onViewTask 
   return (
     <section>
       <div className="flex items-center gap-2 mb-2">
-        <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Fix-Loop Convergence</p>
-        <span className="text-[10px] text-neutral-600">{data.tasks_with_fix_loops} tasks · 24h</span>
+        <p className="text-ui-sm text-neutral-500 uppercase tracking-wide">Fix-Loop Convergence</p>
+        <span className="text-ui-sm text-neutral-600">{data.tasks_with_fix_loops} tasks · 24h</span>
       </div>
       <div className="grid grid-cols-3 gap-2">
         <LoopCard name="lint" data={data.lint} onChipClick={handleChipClick} />
@@ -444,7 +444,7 @@ export function FixLoopConvergenceWidget({ trendDays = 7, projectId, onViewTask 
         {DIST_KEYS.map((k, i) => {
           const colors = ['text-emerald-400', 'text-yellow-400', 'text-orange-400', 'text-red-400'];
           return (
-            <span key={k} className={`text-[10px] ${colors[i]}`}>
+            <span key={k} className={`text-ui-sm ${colors[i]}`}>
               <span className="font-bold">{k}</span> iter
             </span>
           );
@@ -463,8 +463,8 @@ export function FixLoopConvergenceWidget({ trendDays = 7, projectId, onViewTask 
       {trendData && trendData.buckets.length >= 2 && (
         <div className="mt-3">
           <div className="flex items-center gap-2 mb-1.5">
-            <p className="text-[10px] text-neutral-500 uppercase tracking-wide">{trendDays}-day trend</p>
-            <span className="flex items-center gap-1 text-[10px] text-neutral-600">
+            <p className="text-ui-sm text-neutral-500 uppercase tracking-wide">{trendDays}-day trend</p>
+            <span className="flex items-center gap-1 text-ui-sm text-neutral-600">
               <span className="inline-block w-3 border-t border-amber-400" /> converged
               <span className="inline-block w-3 border-t border-orange-500 ml-1" /> diverged
             </span>

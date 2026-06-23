@@ -109,7 +109,7 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
             Drift Signals — {flagged_count} direction{flagged_count !== 1 ? 's' : ''} flagged
           </span>
           {staleLabel && (
-            <span className="text-[10px] text-amber-300">stale · {staleLabel}</span>
+            <span className="text-ui-sm text-amber-300">stale · {staleLabel}</span>
           )}
           {expanded
             ? <ChevronDown className="w-3.5 h-3.5 text-amber-400 ml-auto" />
@@ -126,18 +126,18 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
               <p className="text-xs text-neutral-200 truncate">{d.direction_text || d.direction_id}</p>
               <div className="flex gap-1.5 mt-1 flex-wrap items-center">
                 {d.over_claim_flag && (
-                  <span className="text-[9px] px-1.5 py-0.5 rounded font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                  <span className="text-ui-xs px-1.5 py-0.5 rounded font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30">
                     over-claim
                   </span>
                 )}
                 {d.stalled_despite_churn_flag && (
-                  <span className="text-[9px] px-1.5 py-0.5 rounded font-medium bg-red-500/20 text-red-400 border border-red-500/30">
+                  <span className="text-ui-xs px-1.5 py-0.5 rounded font-medium bg-red-500/20 text-red-400 border border-red-500/30">
                     stalled
                   </span>
                 )}
                 {typeof d.claim_shipped_consistency === 'number' && (
                   <span
-                    className={`text-[9px] px-1.5 py-0.5 rounded-full border ${scoreBadgeClass(d.claim_shipped_consistency)}`}
+                    className={`text-ui-xs px-1.5 py-0.5 rounded-full border ${scoreBadgeClass(d.claim_shipped_consistency)}`}
                     title="Claim-vs-shipped consistency"
                   >
                     {Math.round(d.claim_shipped_consistency * 100)}% consistent
@@ -146,7 +146,7 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
                 {d.drift_history && d.drift_history.length >= 2 && (
                   <DriftSparkline points={d.drift_history} />
                 )}
-                <span className="text-[9px] text-neutral-500 ml-auto">
+                <span className="text-ui-xs text-neutral-500 ml-auto">
                   {d.actually_merged_prs}/{d.claimed_changes_count} merged
                 </span>
               </div>
@@ -160,7 +160,7 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
                 onClick={() => setSystemsExpanded(v => !v)}
                 aria-expanded={systemsExpanded}
               >
-                <span className="text-[11px] font-medium text-neutral-300">System drift summary</span>
+                <span className="text-ui-md font-medium text-neutral-300">System drift summary</span>
                 {systemsExpanded
                   ? <ChevronDown className="w-3.5 h-3.5 text-neutral-500 ml-auto" />
                   : <ChevronRight className="w-3.5 h-3.5 text-neutral-500 ml-auto" />}
@@ -168,7 +168,7 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
               {systemsExpanded && (
                 <div className="px-3 pb-2 space-y-1">
                   {flaggedSystems.map(([systemId, signal]) => (
-                    <div key={systemId} className="flex gap-1.5 flex-wrap items-center text-[10px]">
+                    <div key={systemId} className="flex gap-1.5 flex-wrap items-center text-ui-sm">
                       <span className="text-neutral-300 font-mono">{systemId}</span>
                       {signal.over_claim_flag && <span className="px-1.5 py-0.5 rounded font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30">over-claim</span>}
                       {signal.stalled_despite_churn_flag && <span className="px-1.5 py-0.5 rounded font-medium bg-red-500/20 text-red-400 border border-red-500/30">stalled</span>}

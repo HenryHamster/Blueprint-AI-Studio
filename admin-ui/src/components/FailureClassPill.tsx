@@ -3,6 +3,7 @@ import { ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { FAILURE_CLASS_COLORS } from './DashboardMetricCards';
 import { TAXONOMY_COLORS, TAXONOMY_LABELS } from './dashboardConstants';
 import type { FailureGroup } from '../types/digest';
+import { Badge } from './ui/Badge';
 
 const FAILURE_CLASS_STROKE: Record<string, string> = {
   CODE_ERROR: '#f87171',
@@ -43,14 +44,14 @@ export function FailureClassPill({ group, sparkData, cost }: { group: FailureGro
   return (
     <div ref={ref} className="relative">
       <button
-        className={`inline-flex items-center justify-center gap-1.5 text-[10px] font-semibold px-3 py-2 rounded border min-h-11 ${colorClass} cursor-pointer`}
+        className={`inline-flex items-center justify-center gap-1.5 text-ui-sm font-semibold px-3 py-2 rounded border min-h-11 ${colorClass} cursor-pointer`}
         onClick={() => setOpen(v => !v)}
         title={`${group.label}: ${group.count} failure${group.count !== 1 ? 's' : ''}`}
       >
         {group.label}
         <span className="font-bold">{group.count}</span>
         {cost != null && cost > 0 && (
-          <span className="font-mono text-[9px] opacity-80">${cost.toFixed(2)}</span>
+          <span className="font-mono text-ui-xs opacity-80">${cost.toFixed(2)}</span>
         )}
         {hasSpark && (
           <span className="w-16 h-3 inline-block">
@@ -72,20 +73,21 @@ export function FailureClassPill({ group, sparkData, cost }: { group: FailureGro
         <div className="absolute z-10 top-full mt-1 left-0 w-64 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg">
           <div className="space-y-1">
             {topTasks.map(t => (
-              <div key={t.task_id} className="text-[10px] text-neutral-300 flex items-center gap-1 min-w-0">
+              <div key={t.task_id} className="text-ui-sm text-neutral-300 flex items-center gap-1 min-w-0">
                 {t.taxonomy && TAXONOMY_LABELS[t.taxonomy] && (
-                  <span className={`shrink-0 text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[t.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`} title={TAXONOMY_LABELS[t.taxonomy]}>
+                  <span className={`shrink-0 text-ui-xs leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[t.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`} title={TAXONOMY_LABELS[t.taxonomy]}>
                     {TAXONOMY_LABELS[t.taxonomy]}
                   </span>
                 )}
                 <span className="truncate">{t.title}</span>
                 {group.failure_class === 'AGENT_TIMEOUT' && t.timeout_subtype && (
-                  <span
-                    className="shrink-0 text-[9px] font-mono px-1 py-0.5 rounded bg-amber-500/10 text-amber-400/80 border border-amber-500/20"
+                  <Badge
+                    tone="warning"
                     title={`Timeout subtype: ${t.timeout_subtype}`}
+                    className="shrink-0 font-mono opacity-80"
                   >
                     {TIMEOUT_SUBTYPE_LABELS[t.timeout_subtype] ?? t.timeout_subtype}
-                  </span>
+                  </Badge>
                 )}
               </div>
             ))}

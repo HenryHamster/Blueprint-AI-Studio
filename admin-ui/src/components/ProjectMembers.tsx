@@ -84,7 +84,7 @@ export function ProjectMembers({ members, myRole, onAdd, onUpdateRole, onRemove 
       {isOwner && (
         <div className="px-4 py-3 border-b border-neutral-800 flex gap-2 items-end">
           <div className="flex-1">
-            <label className="block text-[10px] text-neutral-500 mb-1">Email</label>
+            <label className="block text-ui-sm text-neutral-500 mb-1">Email</label>
             <input
               type="email"
               value={newEmail}
@@ -95,7 +95,7 @@ export function ProjectMembers({ members, myRole, onAdd, onUpdateRole, onRemove 
             />
           </div>
           <div>
-            <label className="block text-[10px] text-neutral-500 mb-1">Role</label>
+            <label className="block text-ui-sm text-neutral-500 mb-1">Role</label>
             <select
               value={newRole}
               onChange={e => setNewRole(e.target.value as 'member' | 'viewer')}
@@ -136,7 +136,7 @@ export function ProjectMembers({ members, myRole, onAdd, onUpdateRole, onRemove 
                       {m.email || m.user_id}
                     </div>
                     {m.email && m.email !== m.user_id && (
-                      <div className="text-[10px] text-neutral-500 truncate">{m.user_id}</div>
+                      <div className="text-ui-sm text-neutral-500 truncate">{m.user_id}</div>
                     )}
                   </div>
 
@@ -146,14 +146,14 @@ export function ProjectMembers({ members, myRole, onAdd, onUpdateRole, onRemove 
                       value={m.role}
                       onChange={e => handleRoleChange(m, e.target.value)}
                       disabled={loading === m.id}
-                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium ${badge.bg} ${badge.text} border ${badge.border} bg-transparent cursor-pointer focus:outline-none`}
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-ui-sm font-medium ${badge.bg} ${badge.text} border ${badge.border} bg-transparent cursor-pointer focus:outline-none`}
                       data-viewport-allow-small-target
                     >
                       <option value="member">member</option>
                       <option value="viewer">viewer</option>
                     </select>
                   ) : (
-                    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium ${badge.bg} ${badge.text} border ${badge.border}`}>
+                    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-ui-sm font-medium ${badge.bg} ${badge.text} border ${badge.border}`}>
                       {loading === m.id ? (
                         <Loader2 className="w-3 h-3 animate-spin" />
                       ) : (

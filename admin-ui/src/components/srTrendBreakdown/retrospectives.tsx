@@ -56,12 +56,12 @@ export function SrMissedRetrospective({
   return (
     <div data-testid="sr-missed-retrospective" className="flex flex-col gap-2">
       {truncated && (
-        <div className="bg-amber-950/30 border border-amber-900/50 rounded px-2 py-1.5 text-[10px] text-amber-300 flex items-start gap-2">
+        <div className="bg-amber-950/30 border border-amber-900/50 rounded px-2 py-1.5 text-ui-sm text-amber-300 flex items-start gap-2">
           <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
           <span>Results truncated at 500 items. Task count and filters reflect this subset — apply filters to narrow results for visibility of the full dataset.</span>
         </div>
       )}
-      <div className="flex flex-wrap items-center gap-2 text-[10px]">
+      <div className="flex flex-wrap items-center gap-2 text-ui-sm">
         <span className="text-neutral-500 uppercase tracking-wide">Time</span>
         {WINDOW_OPTIONS.map(window => (
           // eslint-disable-next-line viewport/min-touch-target -- dense toolbar preserves the existing compact drilldown controls
@@ -96,14 +96,14 @@ export function SrMissedRetrospective({
         <span className="text-neutral-600">{visible.length} task{visible.length !== 1 ? 's' : ''}</span>
       </div>
       {visible.length === 0 ? (
-        <p className="text-[10px] text-neutral-600 italic">No missed tasks for this filter.</p>
+        <p className="text-ui-sm text-neutral-600 italic">No missed tasks for this filter.</p>
       ) : (
         <div className="flex flex-col gap-1">
           {visible.map(task => (
             // eslint-disable-next-line viewport/min-touch-target -- task rows are intentionally compact and match the pre-refactor panel behavior
             <div
               key={task.task_id}
-              className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[10px] ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`}
+              className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-sm ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`}
               onClick={() => onTaskClick?.(task.task_id)}
             >
               <div className="flex items-center gap-1.5 mb-0.5">
@@ -147,7 +147,7 @@ export function SrMissedRetrospective({
                         <div className="mb-1 text-neutral-400">{category}</div>
                         <div className="grid gap-2 md:grid-cols-2">
                           <div className="rounded border border-neutral-800/50 bg-neutral-900/60 p-1.5">
-                            <div className="mb-0.5 text-[9px] uppercase tracking-wide text-neutral-500">SR</div>
+                            <div className="mb-0.5 text-ui-xs uppercase tracking-wide text-neutral-500">SR</div>
                             {sr ? (
                               <>
                                 <div className={`font-mono ${sr.passed ? 'text-emerald-400' : 'text-red-400'}`}>{sr.passed ? 'passed' : 'failed'}</div>
@@ -159,10 +159,10 @@ export function SrMissedRetrospective({
                             )}
                           </div>
                           <div className="rounded border border-neutral-800/50 bg-neutral-900/60 p-1.5">
-                            <div className="mb-0.5 text-[9px] uppercase tracking-wide text-neutral-500">Reviewer</div>
+                            <div className="mb-0.5 text-ui-xs uppercase tracking-wide text-neutral-500">Reviewer</div>
                             {reviewer ? (
                               <>
-                                <div className={`inline-flex rounded px-1 py-0.5 text-[9px] font-mono ${reviewerSeverityColor(reviewer.severity)}`}>{reviewer.severity ?? 'unknown'}</div>
+                                <div className={`inline-flex rounded px-1 py-0.5 text-ui-xs font-mono ${reviewerSeverityColor(reviewer.severity)}`}>{reviewer.severity ?? 'unknown'}</div>
                                 <div className="text-neutral-400">{reviewer.description}</div>
                               </>
                             ) : (
@@ -218,7 +218,7 @@ export function SrUnhandledEdgesRetrospective({
 
   return (
     <div data-testid="sr-unhandled-edges-retrospective" className="flex flex-col gap-2">
-      <div className="flex flex-wrap items-center gap-2 text-[10px]">
+      <div className="flex flex-wrap items-center gap-2 text-ui-sm">
         <span className="text-neutral-500 uppercase tracking-wide">Time</span>
         {WINDOW_OPTIONS.map(window => (
           // eslint-disable-next-line viewport/min-touch-target -- dense toolbar preserves the existing compact drilldown controls
@@ -243,14 +243,14 @@ export function SrUnhandledEdgesRetrospective({
         <span className="text-neutral-600">{visible.length} task{visible.length !== 1 ? 's' : ''}</span>
       </div>
       {visible.length === 0 ? (
-        <p className="text-[10px] text-neutral-600 italic">No tasks with unhandled edges for this filter.</p>
+        <p className="text-ui-sm text-neutral-600 italic">No tasks with unhandled edges for this filter.</p>
       ) : (
         <div className="flex flex-col gap-1">
           {visible.map(task => (
             // eslint-disable-next-line viewport/min-touch-target -- task rows are intentionally compact and match the pre-refactor panel behavior
             <div
               key={task.task_id}
-              className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[10px] ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`}
+              className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-sm ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`}
               onClick={() => onTaskClick?.(task.task_id)}
             >
               <div className="flex items-center gap-1.5 mb-0.5">
@@ -284,9 +284,9 @@ export function SrUnhandledEdgesRetrospective({
                 <div className="mt-1.5 flex flex-col gap-1">
                   {task.unhandled_edges.map((edge, index) => (
                     <div key={index} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
-                      <div className="mb-1 text-neutral-400 font-medium text-[10px]">{edge.case}</div>
-                      {edge.blind_spot && <div className="text-neutral-500 text-[9px]">{edge.blind_spot}</div>}
-                      {edge.origin && <div className="text-neutral-600 text-[9px]">source: {edge.origin}</div>}
+                      <div className="mb-1 text-neutral-400 font-medium text-ui-sm">{edge.case}</div>
+                      {edge.blind_spot && <div className="text-neutral-500 text-ui-xs">{edge.blind_spot}</div>}
+                      {edge.origin && <div className="text-neutral-600 text-ui-xs">source: {edge.origin}</div>}
                     </div>
                   ))}
                 </div>

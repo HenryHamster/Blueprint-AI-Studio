@@ -281,7 +281,7 @@ export function ProjectBuildConfigSection({
         </div>
         {buildConfig?.language ? (
           <div className="mt-2 flex flex-wrap gap-1.5">
-            <span className="text-[11px] bg-neutral-800 border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded-full">
+            <span className="text-ui-md bg-neutral-800 border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded-full">
               {buildConfig.language}
             </span>
           </div>
@@ -339,7 +339,7 @@ export function ProjectBuildConfigSection({
               )}
             </div>
           </div>
-          <p className="text-[11px] text-neutral-600 mb-3">
+          <p className="text-ui-md text-neutral-600 mb-3">
             Configure lint, test, and build commands per directory. The agent runs these in CI validation. Leave <code className="font-mono text-neutral-400">lint</code> empty to auto-infer from directory type and scope to changed files.
           </p>
           <div className="space-y-3">
@@ -347,7 +347,7 @@ export function ProjectBuildConfigSection({
               <div key={i} className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 space-y-2">
                 <div className="flex items-center gap-2 mb-1">
                   <div className="flex-1">
-                    <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Path</label>
+                    <label className="block text-ui-sm text-neutral-500 mb-0.5 uppercase">Path</label>
                     <input
                       type="text"
                       value={dir.path}
@@ -357,7 +357,7 @@ export function ProjectBuildConfigSection({
                     />
                   </div>
                   <div className="flex-1">
-                    <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Type</label>
+                    <label className="block text-ui-sm text-neutral-500 mb-0.5 uppercase">Type</label>
                     <input
                       type="text"
                       value={dir.type}
@@ -378,7 +378,7 @@ export function ProjectBuildConfigSection({
                 </div>
                 <div className="grid grid-cols-3 gap-2">
                   <div>
-                    <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Lint</label>
+                    <label className="block text-ui-sm text-neutral-500 mb-0.5 uppercase">Lint</label>
                     <input
                       type="text"
                       value={dir.lint_cmd ?? ''}
@@ -387,14 +387,14 @@ export function ProjectBuildConfigSection({
                       className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
                     {!isRecognizedLintCmd(dir.lint_cmd ?? '') && (
-                      <p className="mt-1 flex items-start gap-1 text-[10px] text-yellow-400" data-testid="lint-cmd-warning">
+                      <p className="mt-1 flex items-start gap-1 text-ui-sm text-yellow-400" data-testid="lint-cmd-warning">
                         <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />
                         Unrecognized — runs against full tree. Use ruff, eslint, mypy, flake8, or pyright for scoped lint.
                       </p>
                     )}
                   </div>
                   <div>
-                    <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Test</label>
+                    <label className="block text-ui-sm text-neutral-500 mb-0.5 uppercase">Test</label>
                     <input
                       type="text"
                       value={dir.test_cmd ?? ''}
@@ -404,7 +404,7 @@ export function ProjectBuildConfigSection({
                     />
                   </div>
                   <div>
-                    <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Build</label>
+                    <label className="block text-ui-sm text-neutral-500 mb-0.5 uppercase">Build</label>
                     <input
                       type="text"
                       value={dir.build_cmd ?? ''}
@@ -433,7 +433,7 @@ export function ProjectBuildConfigSection({
       {hasConfig && (
         <div>
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Git Identity</h3>
-          <p className="text-[11px] text-neutral-600 mb-3">
+          <p className="text-ui-md text-neutral-600 mb-3">
             Used for commits authored by the Blueprint agent.
           </p>
           <div className="grid grid-cols-2 gap-3">
@@ -483,12 +483,12 @@ export function ProjectBuildConfigSection({
             </div>
             <div>
               <span className="text-xs text-neutral-200 font-medium">Fresh Reviewer</span>
-              <p className="text-[11px] text-neutral-500 mt-0.5">
+              <p className="text-ui-md text-neutral-500 mt-0.5">
                 Second-pass critique by an independent Claude session before <code className="font-mono text-neutral-400">./done</code>.
                 Catches issues the primary agent may miss. Adds a small additional cost per code-change task.
               </p>
               {isSelfRepo && (
-                <p className="text-[11px] text-blue-400 mt-1">
+                <p className="text-ui-md text-blue-400 mt-1">
                   Auto-on for this project (self-repo) — runs regardless of this toggle.
                 </p>
               )}
@@ -512,7 +512,7 @@ export function ProjectBuildConfigSection({
             </div>
             <div>
               <span className="text-xs text-neutral-200 font-medium">Parallel Review Fan-Out</span>
-              <p className="text-[11px] text-neutral-500 mt-0.5">
+              <p className="text-ui-md text-neutral-500 mt-0.5">
                 On rollup PRs touching multiple modules, the reviewer fans out per-module investigation subagents
                 and then does its own cross-module coherence pass. Reduces wall-clock on big reviews; auto-skipped
                 for trivial diffs.
@@ -537,7 +537,7 @@ export function ProjectBuildConfigSection({
             </div>
             <div>
               <span className="text-xs text-neutral-200 font-medium">Parallel Fix Investigation</span>
-              <p className="text-[11px] text-neutral-500 mt-0.5">
+              <p className="text-ui-md text-neutral-500 mt-0.5">
                 On fix iterations with multi-module diffs or many reviewer issues, the fix agent fans out
                 root-cause investigation subagents (investigation only — parent applies all edits).
                 Reduces wall-clock on large rollup fixes; auto-skipped for trivial diffs.
@@ -562,7 +562,7 @@ export function ProjectBuildConfigSection({
             </div>
             <div>
               <span className="text-xs text-neutral-200 font-medium">Repository has required CI checks</span>
-              <p className="text-[11px] text-neutral-500 mt-0.5">
+              <p className="text-ui-md text-neutral-500 mt-0.5">
                 On by default — Blueprint waits for the repository's required CI checks to pass before merging a PR.
                 Turn this off for repos without required checks: Blueprint then runs the repository's detected test suite
                 as the merge gate—passing tests merge, failing tests block. If no test command is detected, Blueprint proceeds unverified.
@@ -600,7 +600,7 @@ export function ProjectBuildConfigSection({
                   Block degraded unverified merges
                   {blockDegradedSaving && <RefreshCw className="inline ml-1.5 w-3 h-3 animate-spin text-neutral-400" />}
                 </span>
-                <p className="text-[11px] text-neutral-500 mt-0.5">
+                <p className="text-ui-md text-neutral-500 mt-0.5">
                   When the test suite can't run (setup failure, suite skipped, probe error), Blueprint normally falls open and merges anyway.
                   With this enabled, Blueprint holds the PR instead — requiring operator action to unblock.
                 </p>
@@ -638,7 +638,7 @@ export function ProjectBuildConfigSection({
                   Hold no-test-command merges for review
                   {blockNoTestSaving && <RefreshCw className="inline ml-1.5 w-3 h-3 animate-spin text-neutral-400" />}
                 </span>
-                <p className="text-[11px] text-neutral-500 mt-0.5">
+                <p className="text-ui-md text-neutral-500 mt-0.5">
                   When no test command is detected, Blueprint normally merges PRs UNVERIFIED.
                   With this enabled, Blueprint holds these PRs for operator action instead.
                 </p>
@@ -652,7 +652,7 @@ export function ProjectBuildConfigSection({
           {buildConfig?.has_ci === true && (
             <div
               data-testid="ci-status-banner"
-              className="ml-11 -mt-2 flex items-start gap-2 text-[11px] text-emerald-400 bg-emerald-950/30 border border-emerald-900/50 rounded-lg px-3 py-2"
+              className="ml-11 -mt-2 flex items-start gap-2 text-ui-md text-emerald-400 bg-emerald-950/30 border border-emerald-900/50 rounded-lg px-3 py-2"
             >
               <CheckCircle className="w-3.5 h-3.5 shrink-0 mt-px" />
               <span>
@@ -664,7 +664,7 @@ export function ProjectBuildConfigSection({
           {buildConfig?.has_ci === false && (
             <div
               data-testid="ci-status-banner"
-              className="ml-11 -mt-2 flex items-start gap-2 text-[11px] text-amber-400 bg-amber-950/30 border border-amber-900/50 rounded-lg px-3 py-2"
+              className="ml-11 -mt-2 flex items-start gap-2 text-ui-md text-amber-400 bg-amber-950/30 border border-amber-900/50 rounded-lg px-3 py-2"
             >
               <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
               <span>
@@ -691,7 +691,7 @@ export function ProjectBuildConfigSection({
       {hasConfig && (
         <div>
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Task Branch Naming</h3>
-          <p className="text-[11px] text-neutral-600 mb-3">
+          <p className="text-ui-md text-neutral-600 mb-3">
             Controls the leading segment of agent task branches. Default namespace is <code className="font-mono text-neutral-400">blueprint</code>.
           </p>
           <div className="grid grid-cols-2 gap-3">
@@ -704,7 +704,7 @@ export function ProjectBuildConfigSection({
                 placeholder="blueprint"
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
               />
-              <p className="text-[11px] text-neutral-600 mt-1">
+              <p className="text-ui-md text-neutral-600 mt-1">
                 Leading segment of agent task branches, e.g. <code className="font-mono text-neutral-400">{(taskBranchNamespace.trim() || 'blueprint')}/task-…</code>.
               </p>
             </div>
@@ -717,7 +717,7 @@ export function ProjectBuildConfigSection({
                 placeholder="blueprint/"
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
               />
-              <p className="text-[11px] text-neutral-600 mt-1">
+              <p className="text-ui-md text-neutral-600 mt-1">
                 Legacy override. Leave blank to derive from namespace.
               </p>
             </div>
@@ -729,14 +729,14 @@ export function ProjectBuildConfigSection({
       {hasConfig && projectId && (
         <div>
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Staging Branch Prefixes</h3>
-          <p className="text-[11px] text-neutral-600 mb-3">
+          <p className="text-ui-md text-neutral-600 mb-3">
             Branch prefixes Blueprint treats as staging branches. Gates rollup and auto-merge routing. Defaults to <code className="font-mono text-neutral-400">research/</code> and <code className="font-mono text-neutral-400">plan/</code>.
           </p>
           <div className="flex items-center gap-2 mb-3">
             {stagingPrefixesIsDefault ? (
-              <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700">global default</span>
+              <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700">global default</span>
             ) : (
-              <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50">override</span>
+              <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50">override</span>
             )}
           </div>
           <div className="space-y-2 mb-3">
@@ -795,7 +795,7 @@ export function ProjectBuildConfigSection({
       {hasConfig && (
         <div>
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Pull Request</h3>
-          <p className="text-[11px] text-neutral-600 mb-3">
+          <p className="text-ui-md text-neutral-600 mb-3">
             Optional prefix prepended to agent-authored PR titles. Leave blank to use no prefix.
           </p>
           <div>
@@ -807,7 +807,7 @@ export function ProjectBuildConfigSection({
               placeholder="[Bot]"
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
-            <p className="text-[11px] text-neutral-600 mt-1">
+            <p className="text-ui-md text-neutral-600 mt-1">
               e.g. <code className="font-mono text-neutral-400">{prTitlePrefix.trim() || '[Bot]'}</code>{' '}feat: add new feature
             </p>
           </div>
@@ -818,13 +818,13 @@ export function ProjectBuildConfigSection({
       {hasConfig && projectId && (
         <div id="sr-catch-rate-targets">
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Self-Review Catch-Rate Targets</h3>
-          <p className="text-[11px] text-neutral-600 mb-3">
+          <p className="text-ui-md text-neutral-600 mb-3">
             Set a minimum hit-rate (%) per SR category. An alert fires when a category stays below target for ≥2 consecutive windows. Leave blank for no target.
           </p>
           <div className="grid grid-cols-3 gap-2">
             {SR_CANONICAL_CATEGORIES.map(({ id, label }) => (
               <div key={id}>
-                <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">{label}</label>
+                <label className="block text-ui-sm text-neutral-500 mb-0.5 uppercase">{label}</label>
                 <div className="flex items-center gap-1">
                   <input
                     type="number"
@@ -844,7 +844,7 @@ export function ProjectBuildConfigSection({
                     placeholder="—"
                     className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                   />
-                  <span className="text-[10px] text-neutral-500 shrink-0">%</span>
+                  <span className="text-ui-sm text-neutral-500 shrink-0">%</span>
                 </div>
               </div>
             ))}

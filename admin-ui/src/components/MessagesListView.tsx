@@ -11,7 +11,7 @@ type BubbleProps = Omit<MessageBubbleProps, 'msg' | 'faded' | 'readOnly' | 'allM
 
 function TimeDividerRow({ label, className }: { label: string; className?: string }) {
   return (
-    <div className={`flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2${className ? ` ${className}` : ''}`}>
+    <div className={`flex items-center gap-1.5 text-ui-md text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2${className ? ` ${className}` : ''}`}>
       <div className="flex-1 border-t border-neutral-800/60" />
       <span className="shrink-0">{label}</span>
       <div className="flex-1 border-t border-neutral-800/60" />
@@ -200,7 +200,7 @@ export function MessagesListView({
           {/* Pinned BLOCKERs (importance mode only) */}
           {pinnedBlockers.length > 0 && (
             <>
-              <div className="flex items-center gap-1.5 text-[11px] text-amber-400/70 font-semibold uppercase tracking-wide px-1">
+              <div className="flex items-center gap-1.5 text-ui-md text-amber-400/70 font-semibold uppercase tracking-wide px-1">
                 <AlertTriangle className="w-3 h-3" />
                 <span>Pinned · Blockers</span>
               </div>
@@ -219,10 +219,10 @@ export function MessagesListView({
           <div ref={questionsRefEl}>
             {pinnedQuestions.length > 0 && (
               <>
-                <div className="flex items-center gap-1.5 text-[11px] text-blue-400/70 font-semibold uppercase tracking-wide px-1">
+                <div className="flex items-center gap-1.5 text-ui-md text-blue-400/70 font-semibold uppercase tracking-wide px-1">
                   <HelpCircle className="w-3 h-3" />
                   <span>Awaiting reply · Questions</span>
-                  <span className="ml-auto bg-blue-500/20 text-blue-300 border border-blue-500/40 rounded-full px-1.5 py-0.5 text-[10px]">{pinnedQuestions.length} waiting</span>
+                  <span className="ml-auto bg-blue-500/20 text-blue-300 border border-blue-500/40 rounded-full px-1.5 py-0.5 text-ui-sm">{pinnedQuestions.length} waiting</span>
                 </div>
                 {insertTimeDividers(pinnedQuestions).map((item, idx) =>
                   item.kind === 'divider' ? (
@@ -238,7 +238,7 @@ export function MessagesListView({
 
           {/* Divider: show before first new message if divider time is set and not dismissed */}
           {dividerTime && totalNewCount > 0 && !dividerDismissedRef.current && (
-            <div data-divider-marker className="flex items-center gap-2 px-2 py-3 text-[11px] text-blue-300/70">
+            <div data-divider-marker className="flex items-center gap-2 px-2 py-3 text-ui-md text-blue-300/70">
               <div className="flex-1 border-t border-blue-500/40" />
               <div className="flex items-center gap-2 whitespace-nowrap font-medium">
                 <span className="flex items-center gap-1">
@@ -325,7 +325,7 @@ export function MessagesListView({
                     {visibleRoutineCount} routine ops
                     {mutedRoutineCount > 0 && <span className="text-neutral-600 ml-1">({mutedRoutineCount} muted)</span>}
                   </span>
-                  <span className="text-[11px] text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
+                  <span className="text-ui-md text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
                 </button>
                 <div className="relative shrink-0 px-2">
                   <button
@@ -341,7 +341,7 @@ export function MessagesListView({
                       <div className="absolute right-0 top-full mt-1 z-50 bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl p-2 space-y-1 min-w-48">
                         {getTop3NoisyEventTypes().length > 0 ? (
                           <>
-                            <p className="text-[10px] text-neutral-500 px-2 py-1">Mute for</p>
+                            <p className="text-ui-sm text-neutral-500 px-2 py-1">Mute for</p>
                             {getTop3NoisyEventTypes().map(([eventType, count]) => {
                               const label = ROUTINE_EVENT_LABELS[eventType] ?? eventType.replace(/_/g, ' ');
                               // eslint-disable-next-line react-hooks/purity -- render-time freshness check, unchanged from the original inline MessagesPanel render
@@ -361,7 +361,7 @@ export function MessagesListView({
                                         key={shortLabel}
                                         onClick={() => addTemporaryMute(eventType, ms)}
                                         title={title}
-                                        className={`text-[11px] px-2 py-1 rounded transition-colors min-h-[44px] md:min-h-auto flex items-center ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}
+                                        className={`text-ui-md px-2 py-1 rounded transition-colors min-h-[44px] md:min-h-auto flex items-center ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}
                                       >
                                         {shortLabel}
                                       </button>
@@ -372,7 +372,7 @@ export function MessagesListView({
                             })}
                           </>
                         ) : (
-                          <p className="text-[10px] text-neutral-500 px-2 py-2">No recent events to mute</p>
+                          <p className="text-ui-sm text-neutral-500 px-2 py-2">No recent events to mute</p>
                         )}
                       </div>
                     </>
@@ -380,7 +380,7 @@ export function MessagesListView({
                 </div>
               </div>
               {muteActive && (
-                <div className="px-4 py-2 bg-amber-950/30 border-t border-amber-800/30 text-[11px] text-amber-400">
+                <div className="px-4 py-2 bg-amber-950/30 border-t border-amber-800/30 text-ui-md text-amber-400">
                   🔕 Mute active, but failing groups still surface
                 </div>
               )}
@@ -502,7 +502,7 @@ export function MessagesListView({
           {/* Linked messages (being addressed) */}
           {linkedMessages.length > 0 && (
             <>
-              <div className="flex items-center gap-1.5 text-[11px] text-indigo-400/70 font-semibold uppercase tracking-wide px-1">
+              <div className="flex items-center gap-1.5 text-ui-md text-indigo-400/70 font-semibold uppercase tracking-wide px-1">
                 <span>Being addressed · Linked</span>
               </div>
               {insertTimeDividers(linkedMessages).map((item, idx) =>
@@ -530,7 +530,7 @@ export function MessagesListView({
             <div className="flex justify-center gap-3 pt-1">
               <button
                 onClick={() => setShowResolved(true)}
-                className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
+                className="text-ui-md text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
               >
                 Show {hiddenResolvedCount} older resolved
               </button>
@@ -540,13 +540,13 @@ export function MessagesListView({
             <div className="flex justify-center gap-3 pt-1">
               <button
                 onClick={() => setShowResolved(false)}
-                className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
+                className="text-ui-md text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
               >
                 Hide older resolved
               </button>
               <button
                 onClick={handleBulkDeleteResolved}
-                className="text-[11px] text-neutral-600 hover:text-red-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
+                className="text-ui-md text-neutral-600 hover:text-red-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
               >
                 Clear all resolved
               </button>

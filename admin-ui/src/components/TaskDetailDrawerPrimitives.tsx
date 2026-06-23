@@ -96,11 +96,11 @@ export function DependencyItem({ dep, depTask, hasCycle, onNavigateToTask }: { d
         {onNavigateToTask
           ? <button onClick={() => onNavigateToTask(dep)} className="text-blue-400 hover:text-blue-300 transition-colors text-left">{label}</button>
           : <span>{label}</span>}
-        <span className={`text-[10px] uppercase font-semibold ${statusColor}`}>{depTask.status}</span>
-        {hasCycle && <span className="text-[10px] font-semibold text-orange-400">Cycle detected</span>}
+        <span className={`text-ui-sm uppercase font-semibold ${statusColor}`}>{depTask.status}</span>
+        {hasCycle && <span className="text-ui-sm font-semibold text-orange-400">Cycle detected</span>}
       </>) : (<>
         <span className="text-neutral-500">{dep}</span>
-        <span className="text-[10px] text-neutral-600">(not found)</span>
+        <span className="text-ui-sm text-neutral-600">(not found)</span>
       </>)}
     </div>
   );

@@ -40,7 +40,7 @@ export default {
     schema: [],
     messages: {
       arbitraryFontSize:
-        'Tailwind class "{{cls}}" uses an arbitrary {{px}}px font size — use a @theme design token (e.g. text-label-sm) instead. Add eslint-disable-next-line if migration is deferred.',
+        'Tailwind class "{{cls}}" uses an arbitrary {{px}}px font size — use a @theme design token (e.g. text-ui-sm) instead. Add eslint-disable-next-line if migration is deferred.',
     },
   },
   create(context) {

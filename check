@@ -27,12 +27,6 @@ git rev-parse --git-dir >/dev/null 2>&1 || {
   exit 2
 }
 
-# Delegate to per-task generated check when running as an agent task.
-# writeCheckHelper writes the per-task script to .check-task (gitignored),
-# keeping this tracked file clean and free of per-run values such as taskId
-# and ci_failure selectors. Operators use this static entrypoint directly.
-if [ -x "$WORKSPACE/.check-task" ]; then exec "$WORKSPACE/.check-task" "$@"; fi
-
 WITH_TESTS=0
 FULL_SCOPE=0
 for arg in "$@"; do

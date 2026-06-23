@@ -48,7 +48,7 @@ function renderMobileDebtRow(row: ViewportDebtRow) {
     .replace(/^admin-ui\/src\/components\//, '')
     .replace(/\.tsx$/, '');
   return (
-    <div key={row.component} className="px-3 py-2 text-[10px]">
+    <div key={row.component} className="px-3 py-2 text-ui-sm">
       <div className="flex items-start justify-between gap-2 mb-1">
         <span className="font-mono text-neutral-300 break-all" title={row.component}>{shortName}</span>
         <div className="flex items-center gap-1 shrink-0">
@@ -138,13 +138,13 @@ function renderDebtRow(row: ViewportDebtRow) {
           {row.regression_case_count > 0 ? row.regression_case_count : '—'}
         </span>
         {row.regression_case_count > 0 && row.regression_case_breakdown && (
-          <span className="block text-[9px] text-neutral-500 leading-tight whitespace-nowrap">
+          <span className="block text-ui-xs text-neutral-500 leading-tight whitespace-nowrap">
             {formatBreakdown(row.regression_case_breakdown)}
           </span>
         )}
         {row.regression_case_count > 0 && row.introducing_pr_number != null && (
           <span
-            className="block text-[9px] text-neutral-500 leading-tight"
+            className="block text-ui-xs text-neutral-500 leading-tight"
             title={row.introducing_commit_sha ?? undefined}
           >
             intro: #{row.introducing_pr_number}
@@ -209,16 +209,16 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
 
   return (
     <section data-testid="viewport-debt-panel" className="mt-4">
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
         Viewport Debt
-        <span className="ml-2 bg-neutral-700/40 text-neutral-300 text-[10px] font-semibold px-1.5 py-0.5 rounded-full normal-case tracking-normal">
+        <span className="ml-2 bg-neutral-700/40 text-neutral-300 text-ui-sm font-semibold px-1.5 py-0.5 rounded-full normal-case tracking-normal">
           {totalRowCount}
         </span>
       </h2>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {data.coverage_summary && (
           <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-neutral-800/50">
-            <span className="text-[11px] text-neutral-400 flex-1 min-w-0">
+            <span className="text-ui-md text-neutral-400 flex-1 min-w-0">
               {data.coverage_summary.total_budget != null ? (
                 <>
                   Total opt-outs:{' '}
@@ -242,7 +242,7 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
             </span>
             <button
               onClick={() => setShowUntestedOnly((v) => !v)}
-              className={`min-h-[44px] min-w-[44px] px-3 text-[10px] font-medium rounded transition-colors ${
+              className={`min-h-[44px] min-w-[44px] px-3 text-ui-sm font-medium rounded transition-colors ${
                 showUntestedOnly
                   ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
                   : 'bg-neutral-800/50 text-neutral-400 border border-neutral-700/50 hover:text-neutral-200'
@@ -254,12 +254,12 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
           </div>
         )}
         {untestedHiddenFromTopRows && (
-          <div className="px-3 py-2 text-[11px] text-neutral-400 border-b border-neutral-800/50">
+          <div className="px-3 py-2 text-ui-md text-neutral-400 border-b border-neutral-800/50">
             All top-{optOutRows.length} components by opt-out debt have viewport tests.
           </div>
         )}
         {remainingUntested.length > 0 && (
-          <div className="px-3 py-2 text-[11px] text-neutral-400 border-b border-neutral-800/50">
+          <div className="px-3 py-2 text-ui-md text-neutral-400 border-b border-neutral-800/50">
             +{remainingUntested.length} more untested
             {' '}component{remainingUntested.length === 1 ? '' : 's'} not shown.
           </div>
@@ -269,7 +269,7 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
           {visibleOptOutRows.map((row) => renderMobileDebtRow(row))}
           {visibleUntestedRows.length > 0 && (
             <>
-              <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-neutral-500 bg-neutral-900/40 border-t border-neutral-800/50">
+              <div className="px-3 py-1.5 text-ui-sm uppercase tracking-wider text-neutral-500 bg-neutral-900/40 border-t border-neutral-800/50">
                 Untested (no viewport test)
               </div>
               {visibleUntestedRows.map((row) => renderMobileDebtRow(row))}
@@ -277,7 +277,7 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
           )}
         </div>
         {/* Desktop: table layout */}
-        <table className="hidden sm:table w-full text-[10px]">
+        <table className="hidden sm:table w-full text-ui-sm">
           <thead>
             <tr className="border-b border-neutral-800/50 text-neutral-500">
               <th className="text-left px-3 py-1.5 font-medium">Component</th>
@@ -300,7 +300,7 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
                 <tr className="border-t border-neutral-800/50">
                   <td
                     colSpan={9}
-                    className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-neutral-500 bg-neutral-900/40"
+                    className="px-3 py-1.5 text-ui-sm uppercase tracking-wider text-neutral-500 bg-neutral-900/40"
                   >
                     Untested (no viewport test)
                   </td>

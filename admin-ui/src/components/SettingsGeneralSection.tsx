@@ -290,7 +290,7 @@ export function SettingsGeneralSection({
               onUpdateNotifyOnHighSignalMessage(v);
             }} />
           </div>
-          <p className="text-[11px] text-neutral-600 pt-1">
+          <p className="text-ui-md text-neutral-600 pt-1">
             These are browser-only notifications. For external webhooks (Slack, PagerDuty, etc.), see the{' '}
             <button
               data-viewport-allow-small-target

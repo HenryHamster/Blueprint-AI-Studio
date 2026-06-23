@@ -67,7 +67,7 @@ export function ScopeTrendsSection({
   if (loading && !data) {
     return (
       <section>
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Scope Trends</h2>
+        <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Scope Trends</h2>
         <Skeleton className="h-6 w-full" />
       </section>
     );
@@ -78,7 +78,7 @@ export function ScopeTrendsSection({
       <button
         type="button"
         onClick={onToggle}
-        className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 hover:text-neutral-200"
+        className="flex items-center gap-1.5 text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2 hover:text-neutral-200"
         aria-expanded={open}
       >
         <span>{open ? '▾' : '▸'}</span>
@@ -88,7 +88,7 @@ export function ScopeTrendsSection({
             const t = summary[s]?.trend;
             const color = t === 'improving' ? 'text-emerald-400 border-emerald-700 bg-emerald-900/40' : t === 'declining' ? 'text-red-400 border-red-700 bg-red-900/40' : t === 'stable' ? 'text-neutral-400 border-neutral-700 bg-neutral-900/40' : 'text-neutral-600 border-neutral-800 bg-neutral-900/40';
             return (
-              <span key={s} className={`text-[9px] px-1 py-0.5 rounded border ${color}`}>
+              <span key={s} className={`text-ui-xs px-1 py-0.5 rounded border ${color}`}>
                 {s} {t ?? '—'}
               </span>
             );
@@ -98,7 +98,7 @@ export function ScopeTrendsSection({
       {open && (
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
           {chartData.length === 0 || scopes.length === 0 ? (
-            <p className="text-[11px] text-neutral-500">No weekly data in the last {data?.lookback_days ?? 30} days.</p>
+            <p className="text-ui-md text-neutral-500">No weekly data in the last {data?.lookback_days ?? 30} days.</p>
           ) : (
             <ResponsiveContainer width="100%" height={200}>
               <LineChart data={chartData} margin={{ top: 8, right: 8, left: -12, bottom: 0 }}>

@@ -284,7 +284,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             {selectedProjectId && (
               <>
                 <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-medium text-neutral-400 uppercase tracking-wider">Autonomous Mode</span>
+                  <span className="text-ui-md font-medium text-neutral-400 uppercase tracking-wider">Autonomous Mode</span>
                   <button onClick={data.toggleAutonomous} className="flex items-center gap-1.5 text-sm transition-colors min-h-[44px] md:min-h-auto">
                     {data.autonomousEnabled ? (
                       <><ToggleRight className="w-6 h-6 text-emerald-400" /><span className="text-emerald-400 text-xs font-medium">On</span></>
@@ -501,7 +501,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           {selectedProjectId && (
             <>
               <div className="flex items-center justify-between">
-                <span className="text-[11px] font-medium text-neutral-400 uppercase tracking-wider">Autonomous Mode</span>
+                <span className="text-ui-md font-medium text-neutral-400 uppercase tracking-wider">Autonomous Mode</span>
                 <button onClick={data.toggleAutonomous} className="flex items-center gap-1.5 text-sm transition-colors min-h-[44px] md:min-h-auto">
                   {data.autonomousEnabled ? (
                     <><ToggleRight className="w-6 h-6 text-emerald-400" /><span className="text-emerald-400 text-xs font-medium">On</span></>

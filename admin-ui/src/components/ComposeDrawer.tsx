@@ -144,13 +144,13 @@ export function ComposeDrawer({
 
       {recentMessages.length > 0 && (
         <div className="px-4 py-2 flex flex-col gap-1.5 overflow-y-auto shrink-0 border-b border-neutral-800/60">
-          <span className="text-[10px] text-neutral-500 uppercase tracking-wide font-medium">Recent</span>
+          <span className="text-ui-sm text-neutral-500 uppercase tracking-wide font-medium">Recent</span>
           {recentMessages.map(msg => (
             <div key={msg.id} className="flex items-start gap-2">
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 font-medium shrink-0 uppercase">{msg.message_type}</span>
+              <span className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 font-medium shrink-0 uppercase">{msg.message_type}</span>
               <span className="text-xs text-neutral-300 truncate flex-1">{msg.content}</span>
               {msg.created_at && (
-                <span className="text-[10px] text-neutral-600 shrink-0">{timeAgo(msg.created_at)}</span>
+                <span className="text-ui-sm text-neutral-600 shrink-0">{timeAgo(msg.created_at)}</span>
               )}
             </div>
           ))}

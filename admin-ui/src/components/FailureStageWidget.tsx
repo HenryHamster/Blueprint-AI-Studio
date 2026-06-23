@@ -25,7 +25,7 @@ export function FailureStageWidget({ distribution }: Props) {
   return (
     <section>
       <div className="flex flex-wrap gap-1.5 items-center">
-        <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Stage</span>
+        <span className="text-ui-sm text-neutral-500 uppercase tracking-wide mr-1">Stage</span>
         {STAGE_ORDER.map(stage => {
           const count = distribution.stages[stage];
           if (!count) return null;
@@ -35,7 +35,7 @@ export function FailureStageWidget({ distribution }: Props) {
           return (
             <span
               key={stage}
-              className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border uppercase ${cls}`}
+              className={`inline-flex items-center gap-1 text-ui-sm font-semibold px-2 py-0.5 rounded border uppercase ${cls}`}
               title={`${stage}: ${count}${isDominant ? ' — dominant stage' : ''}`}
             >
               {stage}

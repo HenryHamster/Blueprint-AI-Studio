@@ -453,7 +453,7 @@ export function SettingsDropdown({
                   return (
                     <div key={group.group} className="mb-2">
                       <div className="px-3 py-1.5">
-                        <span className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider">{group.group}</span>
+                        <span className="text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider">{group.group}</span>
                       </div>
                       <div className="space-y-0.5">
                         {visibleGroupSections.map(section => {
@@ -481,7 +481,7 @@ export function SettingsDropdown({
               </div>
               <div className="px-2 py-3 border-t border-neutral-800">
                 <div className="px-3 mb-2">
-                  <span className="text-[11px] text-neutral-500 truncate block" title={userEmail}>{userEmail}</span>
+                  <span className="text-ui-md text-neutral-500 truncate block" title={userEmail}>{userEmail}</span>
                 </div>
                 <button
                   onClick={onSignOut}
@@ -685,7 +685,7 @@ export function SettingsDropdown({
               </div>
               {/* Mobile footer with user info and Sign Out */}
               <div className="md:hidden px-4 py-3 border-t border-neutral-800 bg-neutral-900/50 flex items-center justify-between gap-3">
-                <span className="text-[11px] text-neutral-500 truncate flex-1" title={userEmail}>{userEmail}</span>
+                <span className="text-ui-md text-neutral-500 truncate flex-1" title={userEmail}>{userEmail}</span>
                 <button
                   onClick={onSignOut}
                   className="flex items-center gap-1.5 px-3 py-3.5 rounded-lg text-xs text-neutral-400 hover:text-red-400 hover:bg-red-950/20 transition-colors whitespace-nowrap"
