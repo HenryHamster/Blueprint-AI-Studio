@@ -111,6 +111,43 @@ class TestAccountStateRateLimitCorrelation:
         )
         assert classify_failure(task) == CODE_ERROR
 
+    def test_root_sudo_rejection_not_reclassified_as_rate_limit(self, monkeypatch):
+        """The deterministic --dangerously-skip-permissions root/sudo refusal is a
+        config defect (e.g. the agent container running as root), not throttling.
+        It reproduces on every retry, so it must classify as CODE_ERROR even when
+        the assigned account is in rate-limit cooldown — otherwise the cooldown
+        correlation masks it as RATE_LIMIT and the requeue path retry-storms it."""
+        account_id = "acct-rl-rootsudo"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=True)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        task = _task(
+            "--dangerously-skip-permissions cannot be used with root/sudo "
+            "privileges for security reasons",
+            ctx={"llm_account_id": account_id},
+        )
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_root_sudo_rejection_code_error_during_pool_wide_block(self, monkeypatch):
+        """Same deterministic config refusal stays CODE_ERROR even under a
+        pool-wide rate-limit block (the broadest correlation trigger)."""
+        import app.max_plan_pool as pool_mod
+
+        # Whole pool in cooldown — the pool-wide correlation would otherwise fire.
+        blocked = {
+            "acct-a": self._make_rl_account("acct-a", in_cooldown=True),
+            "acct-b": self._make_rl_account("acct-b", in_cooldown=True),
+        }
+        monkeypatch.setattr(pool_mod, "_account_by_id", blocked)
+
+        task = _task(
+            "claude code exited with code 1\n"
+            "--dangerously-skip-permissions cannot be used with root/sudo privileges"
+        )
+        assert classify_failure(task) == CODE_ERROR
+
     def test_normalize_incomplete_with_rate_limited_account(self, monkeypatch):
         account_id = "acct-rl-norm-1"
         fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=True)}
