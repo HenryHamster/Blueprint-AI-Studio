@@ -228,11 +228,10 @@ describe('handleSelfAudit — bounded self-repair on format miss', () => {
   });
 
   it('records repair success and posts COMPLETED when re-ask returns parseable findings object', async () => {
-    // The self-audit extractor uses requiredKeys ['findings','system_id'], so the
-    // repaired object must have BOTH as top-level own properties for the extractor
-    // to accept it. A bare {"findings":[...]} would fail the own-property check on
-    // "system_id" even though the nested findings contain it.
-    const repairedObj = '{"system_id":"sys-auth","findings":[{"system_id":"sys-auth","score":72,"components":{"test_coverage":80,"friction_density":65,"claim_consistency":75,"failure_mix":70},"top_issues":["Missing tests"],"recommended_mode":"fundamentals","evidence":[{"file":"auth.py","summary":"..."}]}]}';
+    // system_id is nested inside findings elements, not a top-level own property.
+    // The extractor uses requiredKeys ['findings'] so a correctly-formed
+    // {"findings":[{"system_id":...}]} must succeed without a top-level system_id.
+    const repairedObj = '{"findings":[{"system_id":"sys-auth","score":72,"components":{"test_coverage":80,"friction_density":65,"claim_consistency":75,"failure_mix":70},"top_issues":["Missing tests"],"recommended_mode":"fundamentals","evidence":[{"file":"auth.py","summary":"..."}]}]}';
     vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'Analysis...', lastResultText: '' });
     vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: repairedObj });
 

@@ -2736,6 +2736,100 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
   });
 });
 
+// ── handlePlan — structured-output self-repair ───────────────────────────────
+// When the initial Claude Code output doesn't produce valid plan JSON, the
+// repair prompt must include prior analysis context (planProgress) so the
+// reopen has enough detail to recover. This mirrors the pattern in design.ts
+// and audit handlers: repair calls without prior context have ~44% failure rate.
+describe('handlePlan — structured-output self-repair', () => {
+  const SR_TASK_ID = 'sr-plan-001';
+  const SR_GH_TOKEN = 'gh-token';
+  const SR_OWNER = 'owner';
+  const SR_REPO = 'repo';
+  const SR_WS = null;
+  const SR_STATUS_REF = () => ({ value: '' });
+  const SR_TASK = { title: 'Plan task', description: 'planning', context: {}, project_context: {} };
+  const SR_PAYLOAD = { base_branch: 'main', prompt: 'create a plan' };
+
+  const VALID_PLAN_JSON = '{"subtasks":[{"title":"First step","prompt":"Implement feature","type":"create","scope":"small","related_files":["src/app.ts"],"depends_on_indices":[]}]}';
+  const PLAN_PROGRESS_CONTENT = '## Analysis Notes\n\nExamined the codebase and identified key areas to focus on for this implementation.';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('includes prior analysis in repair prompt when initial output is malformed', async () => {
+    // Initial run produces no valid JSON
+    const initialOutput = 'I started planning but did not emit valid JSON.';
+    // Repair call returns valid plan JSON
+    const repairOutput = VALID_PLAN_JSON;
+
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: initialOutput, lastResultText: initialOutput })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: repairOutput, lastResultText: repairOutput });
+
+    // Mock plan_progress file to exist and contain analysis
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockImplementation((path: string) => {
+      // Return true for plan_progress read but false for plan_output (to trigger repair path)
+      if (path === `/tmp/plan_progress_${SR_TASK_ID}.md`) return true;
+      if (path === `/tmp/plan_output_${SR_TASK_ID}.json`) return false;
+      return false;
+    });
+
+    vi.mocked(fs.readFileSync as (p: string | number) => string).mockImplementation((path) => {
+      if (typeof path === 'string' && path === `/tmp/plan_progress_${SR_TASK_ID}.md`) {
+        return PLAN_PROGRESS_CONTENT;
+      }
+      return '';
+    });
+
+    await handlePlan(SR_TASK_ID, SR_PAYLOAD, SR_TASK, SR_GH_TOKEN, SR_OWNER, SR_REPO, SR_WS, SR_STATUS_REF());
+
+    // Verify two runClaudeCode calls: initial + repair
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+
+    // Verify the repair prompt includes prior analysis context
+    const repairCall = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairCall).toContain('## Pre-Implementation Analysis');
+    expect(repairCall).toContain('Analysis Notes');
+
+    // Verify task completed successfully
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+    const parsed = JSON.parse(posted.logs as string) as Record<string, unknown>;
+    expect(Array.isArray(parsed.subtasks)).toBe(true);
+    expect((parsed.subtasks as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it('handles missing plan_progress file gracefully in repair prompt', async () => {
+    const initialOutput = 'Planning incomplete without valid JSON.';
+    const repairOutput = VALID_PLAN_JSON;
+
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: initialOutput, lastResultText: initialOutput })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: repairOutput, lastResultText: repairOutput });
+
+    // Mock existsSync to return false for both plan_output and plan_progress
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+
+    await handlePlan(SR_TASK_ID, SR_PAYLOAD, SR_TASK, SR_GH_TOKEN, SR_OWNER, SR_REPO, SR_WS, SR_STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+
+    // Repair prompt should still be valid even without prior analysis
+    const repairCall = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairCall).toContain('You did not emit the plan JSON in the required schema');
+    expect(repairCall).toContain('subtasks');
+
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+  });
+});
+
 // ── handleResearch — prior-knowledge injection ───────────────────────────────
 // Research must read accumulated knowledge documents back at launch (the same
 // way web-research does) and inject the most relevant ones as a Prior Knowledge

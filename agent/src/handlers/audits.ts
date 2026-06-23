@@ -361,7 +361,7 @@ Rules:
   } else {
     const objRepair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
-      requiredKeys: ['findings', 'system_id'],
+      requiredKeys: ['findings'],
       schemaLabel: 'self_audit',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior self-audit response did not end with a parseable JSON object.

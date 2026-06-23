@@ -1639,13 +1639,15 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   } catch {
     sendLog(ws, `Failed to read ${planPath}, falling back to output parsing\n`);
   }
+  const planProgress = readProgressArtifact(taskId, 'plan');
   if (!logs) {
+    const priorAnalysisSection = planProgress ? `${planProgress.slice(-8000)}\n\n` : '';
     const repair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['subtasks'],
       schemaLabel: 'research_plan',
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `You did not emit the plan JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required field: subtasks (array). Schema:\n\n{"subtasks":[{"title":"...","prompt":"...","type":"create","scope":"medium","related_files":["path/to/file.ts"],"depends_on_indices":[]}]}\n\nOutput ONLY the JSON object.`,
+      reopenPrompt: `${priorAnalysisSection}You did not emit the plan JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required field: subtasks (array). Schema:\n\n{"subtasks":[{"title":"...","prompt":"...","type":"create","scope":"medium","related_files":["path/to/file.ts"],"depends_on_indices":[]}]}\n\nOutput ONLY the JSON object.`,
       ws,
       statusRef,
       model,
@@ -1670,7 +1672,6 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   // creation) and misreading it as failure silently dropped valid plans.
 
   const finalStatus = exitCode === 0 ? 'COMPLETED' : 'FAILED';
-  const planProgress = readProgressArtifact(taskId, 'plan');
   try {
     await persistAndPostStatus(taskId, {
       task_id: taskId,
