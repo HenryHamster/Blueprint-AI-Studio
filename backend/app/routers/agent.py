@@ -4745,9 +4745,11 @@ async def agent_heartbeat(
         req.llm_call_count is not None
         or req.total_input_tokens is not None
         or req.total_output_tokens is not None
+        or req.total_cache_creation_input_tokens is not None
+        or req.total_cache_read_input_tokens is not None
         or req.viewport_screenshot_forwarded_count is not None
     ):
-        task.api_call_summary = {
+        summary = {
             "llm_call_count": int(req.llm_call_count or 0),
             "total_input_tokens": int(req.total_input_tokens or 0),
             "total_output_tokens": int(req.total_output_tokens or 0),
@@ -4756,6 +4758,19 @@ async def agent_heartbeat(
             ),
             "last_updated_at": _utcnow().isoformat(),
         }
+        # Persist the cache-class sub-counts only when the agent actually sent
+        # them, so an older agent's heartbeat writes a byte-for-byte unchanged
+        # summary. total_input_tokens stays the INCLUSIVE input total; these are
+        # sub-counts of it priced at their true cache rates by efficiency_snapshot.
+        if req.total_cache_creation_input_tokens is not None:
+            summary["total_cache_creation_input_tokens"] = int(
+                req.total_cache_creation_input_tokens
+            )
+        if req.total_cache_read_input_tokens is not None:
+            summary["total_cache_read_input_tokens"] = int(
+                req.total_cache_read_input_tokens
+            )
+        task.api_call_summary = summary
 
     # Per-task structured-output format-compliance telemetry (equipping
     # direction d-46468a41), sibling to api_call_summary. Cumulative counters

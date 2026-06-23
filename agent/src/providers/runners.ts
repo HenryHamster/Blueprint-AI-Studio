@@ -1222,9 +1222,11 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
               const usage = (obj as { result?: string; usage?: Record<string, unknown> }).usage;
               if (usage && typeof usage === 'object') {
-                const inputTokens = Number(usage.input_tokens ?? 0) + Number(usage.cache_creation_input_tokens ?? 0) + Number(usage.cache_read_input_tokens ?? 0);
+                const cacheCreationTokens = Number(usage.cache_creation_input_tokens ?? 0);
+                const cacheReadTokens = Number(usage.cache_read_input_tokens ?? 0);
+                const inputTokens = Number(usage.input_tokens ?? 0) + cacheCreationTokens + cacheReadTokens;
                 const outputTokens = Number(usage.output_tokens ?? 0);
-                recordLlmTokens(inputTokens, outputTokens);
+                recordLlmTokens(inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens);
               }
               if (!isNested && resultGraceTimer === null && processGroupStillOwned()) {
                 resultGraceTimer = setTimeout(() => {
@@ -1390,9 +1392,11 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               resultEventSeen = true;  // run report: codex terminal turn event
               const usage = obj.usage as Record<string, unknown> | undefined;
               if (usage && typeof usage === 'object') {
-                const inputTokens = Number(usage.input_tokens ?? 0) + Number(usage.cache_creation_input_tokens ?? 0) + Number(usage.cache_read_input_tokens ?? 0);
+                const cacheCreationTokens = Number(usage.cache_creation_input_tokens ?? 0);
+                const cacheReadTokens = Number(usage.cache_read_input_tokens ?? 0);
+                const inputTokens = Number(usage.input_tokens ?? 0) + cacheCreationTokens + cacheReadTokens;
                 const outputTokens = Number(usage.output_tokens ?? 0);
-                recordLlmTokens(inputTokens, outputTokens);
+                recordLlmTokens(inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens);
               }
             } else if (eventType === 'turn.failed') {
               const errEnvelope = obj.error as { message?: string; code?: string } | undefined;

@@ -30,8 +30,8 @@ describe('attemptStructuredRepair', () => {
       exitCode: 0, allOutput: '{"result":"ok"}', lastResultText: '{"result":"ok"}',
     });
     vi.mocked(getLlmTelemetry)
-      .mockReturnValueOnce({ llm_call_count: 1, total_input_tokens: 100, total_output_tokens: 50, viewport_screenshot_forwarded_count: 0 })
-      .mockReturnValueOnce({ llm_call_count: 2, total_input_tokens: 300, total_output_tokens: 120, viewport_screenshot_forwarded_count: 0 });
+      .mockReturnValueOnce({ llm_call_count: 1, total_input_tokens: 100, total_output_tokens: 50, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 })
+      .mockReturnValueOnce({ llm_call_count: 2, total_input_tokens: 300, total_output_tokens: 120, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 });
 
     await attemptStructuredRepair(
       'prior text', '{"result":"..."}', 'repair-status',
@@ -46,7 +46,7 @@ describe('attemptStructuredRepair', () => {
     const expected = { exitCode: 0, allOutput: 'foo', lastResultText: 'bar' };
     const mockRun = vi.fn().mockResolvedValue(expected);
     vi.mocked(getLlmTelemetry)
-      .mockReturnValue({ llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0, viewport_screenshot_forwarded_count: 0 });
+      .mockReturnValue({ llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 });
 
     const result = await attemptStructuredRepair(
       'prior', 'schema', 'status', WS, STATUS_REF(), undefined, undefined, [],

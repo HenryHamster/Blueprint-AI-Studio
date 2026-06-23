@@ -2018,11 +2018,17 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
     } catch (e) {
       log(`Initial heartbeat failed: ${String(e)}`);
       traceHeartbeat('initial', start, Date.now(), 'err', String(e));
-      // Re-queue drained-but-undelivered events so the next heartbeat (or
-      // terminal status post) can carry them. Without this, a transient
-      // POST failure on the first tick silently drops the events emitted
-      // since the agent started.
       if (fix_loop_events.length > 0) requeueFixLoopEvents(fix_loop_events);
+      // Terminal-task 409 on initial heartbeat: task cancelled/blocked before the
+      // agent even had a chance to run. Self-terminate the same way the periodic
+      // heartbeat would so we don't keep spinning on work that can't proceed.
+      if (e instanceof Error && /failed \(409\)/.test(e.message) && /already terminal/i.test(e.message)) {
+        log('Task already terminal on initial heartbeat — self-terminating gracefully');
+        requestCancel();
+        stopHeartbeat();
+        postTerminalStatusSync(taskId, 'timeout', 'Task became terminal before first heartbeat — agent self-terminating after 409 task-terminal signal');
+        setTimeout(() => process.exit(0), 5000);
+      }
     }
   })().catch((e: unknown) => { log(`Initial heartbeat outer error: ${String(e)}`); });
 
@@ -2094,10 +2100,20 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
       // lose this tick's fix-loop telemetry. The next heartbeat (or the
       // terminal status post) carries them.
       if (fix_loop_events.length > 0) requeueFixLoopEvents(fix_loop_events);
-      // 409 = row temporarily locked (skip_locked) — retry once after 5s.
-      // Silently dropping heartbeats can let last_heartbeat go stale if the
-      // status endpoint holds its FOR UPDATE lock for multiple heartbeat cycles.
+      // 409 = two distinct backend signals:
+      //   "Task already terminal" — task was cancelled/failed/blocked externally.
+      //     Self-terminate immediately (same graceful path as reassignment 401/403).
+      //   "Task row locked" (skip_locked) — row held by concurrent status write.
+      //     Retry once after 5s; silently dropping can let last_heartbeat go stale.
       if (e instanceof Error && /failed \(409\)/.test(e.message)) {
+        if (/already terminal/i.test(e.message)) {
+          log('Task became terminal externally — self-terminating gracefully after heartbeat 409');
+          requestCancel();
+          stopHeartbeat();
+          postTerminalStatusSync(taskId, 'timeout', 'Task became terminal (cancelled/blocked/completed) externally — agent self-terminating after heartbeat 409 task-terminal signal');
+          setTimeout(() => process.exit(0), 5000);
+          return;
+        }
         // Exponential backoff: 5s, then 10s. Total window 15s, within 30s interval.
         for (let retry = 0; retry < 2; retry++) {
           const delay = 5000 * (retry + 1);

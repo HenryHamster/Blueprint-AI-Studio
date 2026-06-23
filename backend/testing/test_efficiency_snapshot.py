@@ -21,6 +21,8 @@ from app.efficiency_snapshot import (
     AXIS_PROMPT_STATIC_BYTES,
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
+    CACHE_CREATION_INPUT_RATE_MULTIPLIER,
+    CACHE_READ_INPUT_RATE_MULTIPLIER,
     DESIGN_DOC_KEY,
     FORMAT_COMPLIANCE_KEY,
     FORMAT_COMPLIANCE_RATE_KEY,
@@ -1411,6 +1413,168 @@ async def test_llm_token_pricing_no_token_data(db_session):
 
 
 @pytest.mark.asyncio
+async def test_llm_cost_prices_cache_classes_separately(db_session):
+    """An api_call_summary carrying the cache breakdown prices cache_read at ~0.1x
+    base and cache_creation at ~1.25x base, with the uncached remainder at base.
+
+    total_input_tokens stays the INCLUSIVE input total (uncached + cache-creation
+    + cache-read), so the breakdown does not change the token volume — only how
+    each input class is priced.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    # 1000 inclusive input = 200 cache-creation + 300 cache-read + 500 uncached.
+    task = _make_efficient_task(
+        project.id,
+        api_call_summary={
+            "llm_call_count": 10,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+            "total_cache_creation_input_tokens": 200,
+            "total_cache_read_input_tokens": 300,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    expected = round(
+        500 * input_rate
+        + 200 * input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
+        + 300 * input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
+        + 400 * output_rate,
+        6,
+    )
+    axes = await compute_current_axes(db_session, project.id)
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] == pytest.approx(expected)
+
+    # The split must be strictly cheaper than pricing the whole inclusive input at
+    # the base rate — proving the cache classes are no longer collapsed into the
+    # uncached counter (cache-read at 0.1x dominates the saving).
+    legacy_full_input = round(1000 * input_rate + 400 * output_rate, 6)
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] < legacy_full_input
+
+    # The truthful cache split is surfaced in the breakdown dicts (totals + by_model),
+    # mirroring how total_input_tokens is surfaced.
+    breakdown = compute_llm_cost_breakdown([task])
+    totals = breakdown["totals"]
+    assert totals["total_input_tokens"] == 1000
+    assert totals["total_cache_creation_input_tokens"] == 200
+    assert totals["total_cache_read_input_tokens"] == 300
+    assert totals["total_cost_usd"] == pytest.approx(expected)
+    row = breakdown["by_model"][0]
+    assert row["total_cache_creation_input_tokens"] == 200
+    assert row["total_cache_read_input_tokens"] == 300
+    assert row["total_cost_usd"] == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_without_cache_breakdown_falls_back_to_base_rate(db_session):
+    """A row WITHOUT the cache breakdown prices the full inclusive input at the
+    base rate — current behavior, unchanged for legacy / pre-tracking rows."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    task = _make_efficient_task(
+        project.id,
+        api_call_summary={
+            "llm_call_count": 10,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    expected = round(1000 * input_rate + 400 * output_rate, 6)
+    axes = await compute_current_axes(db_session, project.id)
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] == pytest.approx(expected)
+
+    breakdown = compute_llm_cost_breakdown([task])
+    totals = breakdown["totals"]
+    # No breakdown present -> cache sub-counts are zero and cost is the legacy value.
+    assert totals["total_cache_creation_input_tokens"] == 0
+    assert totals["total_cache_read_input_tokens"] == 0
+    assert totals["total_input_tokens"] == 1000
+    assert totals["total_cost_usd"] == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_banked_attempt_carries_cache_breakdown_for_per_attempt_pricing(
+    db_session,
+):
+    """bank_task_current_attempt carries the cache sub-counts into attempt_history
+    so per-attempt pricing prices the cache classes after a retry bank.
+
+    The inclusive banked scalar (llm_input_tokens_banked) keeps its meaning.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"pr_merged": True},
+        vm_provisioned_at=_utcnow() - timedelta(minutes=5),
+        vm_stopped_at=_utcnow(),
+        api_call_summary={
+            "llm_call_count": 3,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+            "total_cache_creation_input_tokens": 200,
+            "total_cache_read_input_tokens": 300,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    bank_task_current_attempt(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Cache sub-counts banked into the per-attempt history entry...
+    assert task.attempt_history[0]["llm_cache_creation_input_tokens"] == 200
+    assert task.attempt_history[0]["llm_cache_read_input_tokens"] == 300
+    # ...while the inclusive banked scalar keeps its existing meaning.
+    assert task.llm_input_tokens_banked == 1000
+    assert task.api_call_summary is None
+
+    task.status = TaskStatus.COMPLETED
+    await db_session.commit()
+
+    refreshed = await db_session.get(type(task), task.id)
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected = round(
+        500 * input_rate
+        + 200 * input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
+        + 300 * input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
+        + 400 * output_rate,
+        6,
+    )
+    breakdown = compute_llm_cost_breakdown([refreshed])
+    assert breakdown["totals"]["total_cost_usd"] == pytest.approx(expected)
+    assert breakdown["totals"]["total_cache_creation_input_tokens"] == 200
+    assert breakdown["totals"]["total_cache_read_input_tokens"] == 300
+
+
+@pytest.mark.asyncio
 async def test_retry_banked_vm_and_llm_costs_count_across_attempts(db_session):
     project = make_project()
     db_session.add(project)
@@ -1977,23 +2141,23 @@ def test_task_llm_attempts_resolves_provider_model_pair_atomically():
     assert len(result) == 4
 
     # Attempt 1: full pair → uses attempt's own pair, not task's anthropic pair.
-    p0, m0, _in0, _out0, _c0 = result[0]
+    p0, m0, _in0, _out0, _c0, *_cache0 = result[0]
     assert (p0, m0) == ("openai", "gpt-5.4"), f"expected openai:gpt-5.4, got {p0}:{m0}"
 
     # Attempt 2: provider-only half-filled → (None, None); no chimera with task.model.
-    p1, m1, _in1, _out1, _c1 = result[1]
+    p1, m1, _in1, _out1, _c1, *_cache1 = result[1]
     assert (p1, m1) == (None, None), (
         f"expected (None, None) for provider-only row, got {p1}:{m1}"
     )
 
     # Attempt 3: model-only half-filled → (None, None); no chimera with task.provider.
-    p2, m2, _in2, _out2, _c2 = result[2]
+    p2, m2, _in2, _out2, _c2, *_cache2 = result[2]
     assert (p2, m2) == (None, None), (
         f"expected (None, None) for model-only row, got {p2}:{m2}"
     )
 
     # Attempt 4: neither field → falls back to task's pair as a whole.
-    p3, m3, _in3, _out3, _c3 = result[3]
+    p3, m3, _in3, _out3, _c3, *_cache3 = result[3]
     assert (p3, m3) == ("anthropic", "claude-sonnet-4-6"), (
         f"expected task fallback anthropic:claude-sonnet-4-6, got {p3}:{m3}"
     )
@@ -2030,7 +2194,7 @@ def test_task_llm_attempts_no_chimera_half_filled_provider_only():
 
     result = _task_llm_attempts(task)
     assert len(result) == 1
-    p, m, _in, _out, _c = result[0]
+    p, m, _in, _out, _c, *_cache = result[0]
     assert (p, m) == (None, None), (
         f"provider-only row must yield (None, None), got {p}:{m}"
     )
@@ -2061,7 +2225,7 @@ def test_task_llm_attempts_no_chimera_half_filled_model_only():
 
     result = _task_llm_attempts(task)
     assert len(result) == 1
-    p, m, _in, _out, _c = result[0]
+    p, m, _in, _out, _c, *_cache = result[0]
     assert (p, m) == (None, None), (
         f"model-only row must yield (None, None), got {p}:{m}"
     )
@@ -2092,7 +2256,7 @@ def test_task_llm_attempts_full_pair_used_atomically():
 
     result = _task_llm_attempts(task)
     assert len(result) == 1
-    p, m, in_tok, out_tok, calls = result[0]
+    p, m, in_tok, out_tok, calls, *_cache = result[0]
     assert p == "openai" and m == "gpt-5.4", f"expected openai:gpt-5.4, got {p}:{m}"
     assert in_tok == 500 and out_tok == 200 and calls == 3
 
@@ -2118,7 +2282,7 @@ def test_task_llm_attempts_neither_field_falls_back_to_task():
 
     result = _task_llm_attempts(task)
     assert len(result) == 1
-    p, m, in_tok, out_tok, calls = result[0]
+    p, m, in_tok, out_tok, calls, *_cache = result[0]
     assert p == "anthropic" and m == "claude-haiku-4-5", (
         f"expected task fallback anthropic:claude-haiku-4-5, got {p}:{m}"
     )

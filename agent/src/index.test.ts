@@ -876,6 +876,8 @@ describe('resetPerRoleModuleState (warm-VM isolation)', () => {
       llm_call_count: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
+      total_cache_creation_input_tokens: 0,
+      total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
     });
     expect(_getWarmStartForTesting()).toBe(true);
@@ -6552,6 +6554,85 @@ describe('agent runtime fingerprint heartbeats', () => {
   });
 });
 
+// ── Heartbeat 409 task-terminal detection ────────────────────────────────────
+// When the backend returns 409 with "Task already terminal" the agent must
+// self-terminate (cancel flag + terminal-status POST + exit timer), NOT retry
+// as if it were a transient row-lock.  A plain row-lock 409 still retries.
+describe('heartbeat 409 task-terminal detection', () => {
+  let fetchMock: FetchMock;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fetchMock = makeFetchMock();
+    vi.stubGlobal('fetch', fetchMock);
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(fs.writeFileSync).mockReset();
+    vi.mocked(fs.unlinkSync).mockReset();
+    _resetCancelRequestedForTesting();
+  });
+
+  afterEach(() => {
+    _stopHeartbeatForTesting();
+    _resetCancelRequestedForTesting();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('triggers graceful shutdown (stop+terminal-post+exit) when heartbeat 409 carries "Task already terminal"', async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 409,
+      text: () => Promise.resolve('{"detail":"Task already terminal"}'),
+      json: () => Promise.resolve({}),
+      headers: { get: () => null },
+    });
+
+    _startHeartbeatForTesting('task-terminal-409', () => 'running');
+    // advanceTimersByTimeAsync flushes pending microtasks (fetch chain + catch handler)
+    await vi.advanceTimersByTimeAsync(1);
+
+    // cancel flag set — role loop and subsequent heartbeat ticks see it as shutdown
+    expect(_isCancelRequestedForTesting()).toBe(true);
+    // Terminal-status POST fired via curl (stop+terminal-post+exit pattern)
+    const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
+    expect(curlCall).toBeDefined();
+    const args = curlCall?.[1] as string[];
+    expect(args.some(a => a.includes('/api/agent/status'))).toBe(true);
+    const bodyIdx = args.indexOf('-d');
+    const body = JSON.parse(args[bodyIdx + 1]) as Record<string, unknown>;
+    expect(body.status).toBe('FAILED');
+    expect(body.task_id).toBe('task-terminal-409');
+  });
+
+  it('still retries on a row-lock 409 ("Task row locked") and does NOT set cancel flag', async () => {
+    let callCount = 0;
+    fetchMock.mockImplementation(() => {
+      callCount++;
+      return Promise.resolve({
+        ok: false,
+        status: 409,
+        text: () => Promise.resolve('{"status":"locked","detail":"Task row locked, retry next cycle"}'),
+        json: () => Promise.resolve({}),
+        headers: { get: () => '30' },
+      });
+    });
+
+    _startHeartbeatForTesting('task-locked-409', () => 'running');
+    // Advance past the periodic heartbeat interval (30s) and both retry delays
+    // (5s + 10s) so the periodic handler's retry loop fully runs.
+    await vi.advanceTimersByTimeAsync(50_000);
+
+    // cancel flag must NOT be set — row-lock is transient, not a shutdown signal
+    expect(_isCancelRequestedForTesting()).toBe(false);
+    // Initial heartbeat + periodic initial attempt + 2 retries = >= 4 calls
+    expect(callCount).toBeGreaterThan(1);
+    // No curl terminal POST
+    const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
+    expect(curlCall).toBeUndefined();
+  });
+});
+
 // ── Per-task LLM telemetry (efficiency direction d-91d8dede) ────────────────
 describe('LLM telemetry counters', () => {
   beforeEach(() => {
@@ -6563,6 +6644,8 @@ describe('LLM telemetry counters', () => {
       llm_call_count: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
+      total_cache_creation_input_tokens: 0,
+      total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
     });
   });
@@ -6576,6 +6659,8 @@ describe('LLM telemetry counters', () => {
       llm_call_count: 2,
       total_input_tokens: 300,
       total_output_tokens: 125,
+      total_cache_creation_input_tokens: 0,
+      total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
     });
   });
@@ -6588,6 +6673,8 @@ describe('LLM telemetry counters', () => {
       llm_call_count: 0,
       total_input_tokens: 100,
       total_output_tokens: 50,
+      total_cache_creation_input_tokens: 0,
+      total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
     });
   });
@@ -6600,6 +6687,8 @@ describe('LLM telemetry counters', () => {
       llm_call_count: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
+      total_cache_creation_input_tokens: 0,
+      total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
     });
   });

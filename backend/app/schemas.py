@@ -399,6 +399,14 @@ class HeartbeatRequest(BaseModel):
     llm_call_count: int | None = Field(None, ge=0)
     total_input_tokens: int | None = Field(None, ge=0)
     total_output_tokens: int | None = Field(None, ge=0)
+    # Optional cache-class sub-counts of total_input_tokens (which stays the
+    # INCLUSIVE sum of uncached + cache-creation + cache-read input). Anthropic
+    # prices cache-read input at ~0.1x and cache-creation at ~1.25x the base input
+    # rate, so breaking them out lets the cost snapshot price each class truthfully.
+    # Backwards-compatible: older agents omit these; absent them persistence is
+    # byte-for-byte unchanged and pricing falls back to the base input rate.
+    total_cache_creation_input_tokens: int | None = Field(None, ge=0)
+    total_cache_read_input_tokens: int | None = Field(None, ge=0)
     # Cumulative per-task structured-output format-compliance telemetry, sibling
     # to the LLM fields above. Optional/backwards-compatible — older agents that
     # don't emit these leave Task.format_compliance_summary NULL. format_miss_by_reason

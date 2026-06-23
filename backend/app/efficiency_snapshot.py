@@ -52,6 +52,7 @@ from app.models import (
     Task,
     TaskStatus,
     _utcnow,
+    get_task_current_attempt_cache_input_tokens,
     get_task_current_attempt_llm_totals,
     get_task_total_llm_totals,
     get_task_total_vm_cost_usd,
@@ -254,6 +255,46 @@ LLM_APPROXIMATE_PRICED: set[tuple[str, str]] = {
     ("gemini", "gemini-3-flash-preview"),  # Preview variant
     ("gemini", "gemini-3.1-flash-lite-preview"),  # Preview variant
 }
+
+# Anthropic prompt-cache input-token pricing, expressed as multipliers on the
+# base (uncached) input rate for whichever (provider, model) the attempt ran on:
+#   * cache-read input replays an already-written prefix at ~0.1x the base rate.
+#   * cache-creation (5-minute write) costs ~1.25x the base input rate.
+# Output tokens are unaffected. total_input_tokens is the INCLUSIVE input total,
+# so the uncached remainder is (total - cache_creation - cache_read). Sources:
+# anthropic.com/pricing#api (prompt caching), retrieved 2026-06.
+CACHE_READ_INPUT_RATE_MULTIPLIER = 0.1
+CACHE_CREATION_INPUT_RATE_MULTIPLIER = 1.25
+
+
+def _price_llm_attempt(
+    input_tokens: int,
+    output_tokens: int,
+    cache_creation_input_tokens: int,
+    cache_read_input_tokens: int,
+    input_rate: float,
+    output_rate: float,
+) -> float:
+    """Price one attempt's tokens, charging each Anthropic input class truthfully.
+
+    ``input_tokens`` is the INCLUSIVE input total (uncached + cache-creation +
+    cache-read). The uncached remainder is priced at ``input_rate``, cache-creation
+    at :data:`CACHE_CREATION_INPUT_RATE_MULTIPLIER` x that rate, and cache-read at
+    :data:`CACHE_READ_INPUT_RATE_MULTIPLIER` x. When the attempt carries no cache
+    breakdown the sub-counts are ``0``, so this reduces to
+    ``input_tokens * input_rate + output_tokens * output_rate`` — byte-for-byte
+    the legacy valuation, which is the required fallback for pre-tracking rows.
+    """
+    cc = max(0, int(cache_creation_input_tokens))
+    cr = max(0, int(cache_read_input_tokens))
+    uncached = max(0, int(input_tokens) - cc - cr)
+    return (
+        uncached * input_rate
+        + cc * input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
+        + cr * input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
+        + output_tokens * output_rate
+    )
+
 
 DESIGN_DOC_KEY = "efficiency_baseline"
 
@@ -1162,13 +1203,20 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> float | None:
             input_tokens,
             output_tokens,
             _call_count,
+            cache_creation,
+            cache_read,
         ) in _task_llm_attempts(t):
             if provider and model:
                 pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
                 if pricing:
                     input_rate, output_rate = pricing
-                    total_cost += (
-                        input_tokens * input_rate + output_tokens * output_rate
+                    total_cost += _price_llm_attempt(
+                        input_tokens,
+                        output_tokens,
+                        cache_creation,
+                        cache_read,
+                        input_rate,
+                        output_rate,
                     )
         if is_merged_completion(t):
             merged += 1
@@ -1202,12 +1250,30 @@ def _llm_attempt_nonnegative_int(value: Any) -> int:
 
 def _task_llm_attempts(
     task: Task,
-) -> list[tuple[str | None, str | None, int, int, int]]:
+) -> list[tuple[str | None, str | None, int, int, int, int, int]]:
+    """Per-attempt ``(provider, model, input, output, call_count, cache_creation,
+    cache_read)`` rows.
+
+    ``input`` is the INCLUSIVE input total; ``cache_creation`` / ``cache_read``
+    are its two Anthropic cache sub-counts (``0`` for attempts that predate cache
+    tracking, which makes the pricing helper fall back to the base input rate).
+    """
     history = task.attempt_history or []
     if not history:
         input_tokens, output_tokens, call_count = get_task_total_llm_totals(task)
+        cache_creation, cache_read = get_task_current_attempt_cache_input_tokens(task)
         return (
-            [(task.provider, task.model, input_tokens, output_tokens, call_count)]
+            [
+                (
+                    task.provider,
+                    task.model,
+                    input_tokens,
+                    output_tokens,
+                    call_count,
+                    cache_creation,
+                    cache_read,
+                )
+            ]
             if input_tokens > 0 or output_tokens > 0
             else []
         )
@@ -1229,6 +1295,10 @@ def _task_llm_attempts(
             _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens")),
             _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens")),
             _llm_attempt_nonnegative_int(attempt.get("llm_call_count")),
+            _llm_attempt_nonnegative_int(
+                attempt.get("llm_cache_creation_input_tokens")
+            ),
+            _llm_attempt_nonnegative_int(attempt.get("llm_cache_read_input_tokens")),
         )
         for attempt in history
     ]
@@ -1236,8 +1306,17 @@ def _task_llm_attempts(
         task
     )
     if current_input > 0 or current_output > 0:
+        current_cc, current_cr = get_task_current_attempt_cache_input_tokens(task)
         attempts.append(
-            (task.provider, task.model, current_input, current_output, current_calls)
+            (
+                task.provider,
+                task.model,
+                current_input,
+                current_output,
+                current_calls,
+                current_cc,
+                current_cr,
+            )
         )
     return attempts
 
@@ -1279,6 +1358,8 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     model_buckets: Dict[tuple[str, str], Dict[str, float]] = defaultdict(
         lambda: {
             "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
             "output_tokens": 0,
             "llm_call_count": 0,
             "task_count": 0,
@@ -1290,6 +1371,8 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     provider_buckets: Dict[str, Dict[str, float]] = defaultdict(
         lambda: {
             "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
             "output_tokens": 0,
             "llm_call_count": 0,
             "task_count": 0,
@@ -1307,6 +1390,8 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     fallback_task_count = 0
     fallback_cost_usd = 0.0
     total_input = 0
+    total_cache_creation = 0
+    total_cache_read = 0
     total_output = 0
     total_cost = 0.0
     total_task_count = 0
@@ -1331,6 +1416,8 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             input_tokens,
             output_tokens,
             call_count,
+            cache_creation,
+            cache_read,
         ) in _task_llm_attempts(t):
             if input_tokens <= 0 and output_tokens <= 0:
                 continue
@@ -1344,7 +1431,14 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             pricing = LLM_TOKEN_PRICING.get(key)
             if pricing:
                 input_rate, output_rate = pricing
-                cost = input_tokens * input_rate + output_tokens * output_rate
+                cost = _price_llm_attempt(
+                    input_tokens,
+                    output_tokens,
+                    cache_creation,
+                    cache_read,
+                    input_rate,
+                    output_rate,
+                )
                 priced_combos.add(key)
                 priced_task_count += 1
                 # Track approximate-priced combos (proxy rate, not exactly published).
@@ -1371,8 +1465,13 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             if is_fallback:
                 fallback_cost_usd += cost
 
+            cc = int(cache_creation)
+            cr = int(cache_read)
+
             mb = model_buckets[key]
             mb["input_tokens"] += int(input_tokens)
+            mb["cache_creation_input_tokens"] += cc
+            mb["cache_read_input_tokens"] += cr
             mb["output_tokens"] += int(output_tokens)
             mb["llm_call_count"] += call_count
             mb["task_count"] += 1
@@ -1380,12 +1479,16 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
 
             pb = provider_buckets[provider]
             pb["input_tokens"] += int(input_tokens)
+            pb["cache_creation_input_tokens"] += cc
+            pb["cache_read_input_tokens"] += cr
             pb["output_tokens"] += int(output_tokens)
             pb["llm_call_count"] += call_count
             pb["task_count"] += 1
             pb["cost_usd"] += cost
 
             total_input += int(input_tokens)
+            total_cache_creation += cc
+            total_cache_read += cr
             total_output += int(output_tokens)
             total_cost += cost
             total_task_count += 1
@@ -1439,6 +1542,8 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
         {
             "provider": provider,
             "total_input_tokens": int(pb["input_tokens"]),
+            "total_cache_creation_input_tokens": int(pb["cache_creation_input_tokens"]),
+            "total_cache_read_input_tokens": int(pb["cache_read_input_tokens"]),
             "total_output_tokens": int(pb["output_tokens"]),
             "total_cost_usd": round(pb["cost_usd"], 6),
             "mean_cost_per_task": round(pb["cost_usd"] / pb["task_count"], 6)
@@ -1469,6 +1574,8 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "provider": provider,
             "model": model,
             "total_input_tokens": int(mb["input_tokens"]),
+            "total_cache_creation_input_tokens": int(mb["cache_creation_input_tokens"]),
+            "total_cache_read_input_tokens": int(mb["cache_read_input_tokens"]),
             "total_output_tokens": int(mb["output_tokens"]),
             "total_cost_usd": round(mb["cost_usd"], 6),
             "mean_cost_per_task": round(mb["cost_usd"] / mb["task_count"], 6)
@@ -1504,6 +1611,8 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
         "by_model": by_model,
         "totals": {
             "total_input_tokens": total_input,
+            "total_cache_creation_input_tokens": total_cache_creation,
+            "total_cache_read_input_tokens": total_cache_read,
             "total_output_tokens": total_output,
             "total_cost_usd": round(total_cost, 6),
             "task_count": total_task_count,
@@ -1532,9 +1641,15 @@ def _task_llm_cost(task: Task) -> tuple[float, bool]:
     """Return (total_llm_usd, any_unpriced) for a single task."""
     cost = 0.0
     any_unpriced = False
-    for provider, model, input_tokens, output_tokens, _call_count in _task_llm_attempts(
-        task
-    ):
+    for (
+        provider,
+        model,
+        input_tokens,
+        output_tokens,
+        _call_count,
+        cache_creation,
+        cache_read,
+    ) in _task_llm_attempts(task):
         if input_tokens <= 0 and output_tokens <= 0:
             continue
         if not provider or not model:
@@ -1544,7 +1659,14 @@ def _task_llm_cost(task: Task) -> tuple[float, bool]:
         pricing = LLM_TOKEN_PRICING.get(key)
         if pricing:
             input_rate, output_rate = pricing
-            cost += input_tokens * input_rate + output_tokens * output_rate
+            cost += _price_llm_attempt(
+                input_tokens,
+                output_tokens,
+                cache_creation,
+                cache_read,
+                input_rate,
+                output_rate,
+            )
         else:
             any_unpriced = True
     return cost, any_unpriced
@@ -1747,6 +1869,8 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
     buckets: Dict[str, Dict[str, Any]] = defaultdict(
         lambda: {
             "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
             "output_tokens": 0,
             "llm_call_count": 0,
             "task_count": 0,
@@ -1776,6 +1900,8 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
             input_tokens,
             output_tokens,
             call_count,
+            cache_creation,
+            cache_read,
         ) in _task_llm_attempts(t):
             if input_tokens <= 0 and output_tokens <= 0:
                 continue
@@ -1787,11 +1913,20 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
             pricing = LLM_TOKEN_PRICING.get((provider, model))
             if pricing:
                 input_rate, output_rate = pricing
-                cost = input_tokens * input_rate + output_tokens * output_rate
+                cost = _price_llm_attempt(
+                    input_tokens,
+                    output_tokens,
+                    cache_creation,
+                    cache_read,
+                    input_rate,
+                    output_rate,
+                )
             else:
                 cost = 0.0
 
             bucket["input_tokens"] += int(input_tokens)
+            bucket["cache_creation_input_tokens"] += int(cache_creation)
+            bucket["cache_read_input_tokens"] += int(cache_read)
             bucket["output_tokens"] += int(output_tokens)
             bucket["llm_call_count"] += call_count
             bucket["cost_usd"] += cost
@@ -1818,6 +1953,8 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
         {
             "task_type": task_type,
             "total_input_tokens": int(b["input_tokens"]),
+            "total_cache_creation_input_tokens": int(b["cache_creation_input_tokens"]),
+            "total_cache_read_input_tokens": int(b["cache_read_input_tokens"]),
             "total_output_tokens": int(b["output_tokens"]),
             "total_cost_usd": round(b["cost_usd"], 6),
             "llm_call_count": int(b["llm_call_count"]),
@@ -1928,6 +2065,8 @@ def _compute_llm_cost_pricing_coverage(
             input_tokens,
             output_tokens,
             _call_count,
+            _cache_creation,
+            _cache_read,
         ) in _task_llm_attempts(t):
             if input_tokens <= 0 and output_tokens <= 0:
                 continue
@@ -2172,6 +2311,8 @@ def compute_effort_model_efficiency(
             input_tokens,
             output_tokens,
             call_count,
+            cache_creation,
+            cache_read,
         ) in _task_llm_attempts(t):
             if input_tokens <= 0 and output_tokens <= 0:
                 continue
@@ -2185,7 +2326,14 @@ def compute_effort_model_efficiency(
             priced = pricing is not None
             if priced:
                 input_rate, output_rate = pricing
-                cost = input_tokens * input_rate + output_tokens * output_rate
+                cost = _price_llm_attempt(
+                    input_tokens,
+                    output_tokens,
+                    cache_creation,
+                    cache_read,
+                    input_rate,
+                    output_rate,
+                )
                 priced_model_keys.add(key)
             else:
                 cost = 0.0

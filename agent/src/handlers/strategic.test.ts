@@ -543,8 +543,8 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
 
     // Mock the token telemetry snapshots for before/after repair
     vi.mocked(getLlmTelemetry)
-      .mockReturnValueOnce({ llm_call_count: 1, total_input_tokens: 100, total_output_tokens: 50, viewport_screenshot_forwarded_count: 0 })
-      .mockReturnValueOnce({ llm_call_count: 2, total_input_tokens: 200, total_output_tokens: 100, viewport_screenshot_forwarded_count: 0 });
+      .mockReturnValueOnce({ llm_call_count: 1, total_input_tokens: 100, total_output_tokens: 50, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 })
+      .mockReturnValueOnce({ llm_call_count: 2, total_input_tokens: 200, total_output_tokens: 100, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 });
 
     const statusRef = { value: '' };
     await handleStrategic(
