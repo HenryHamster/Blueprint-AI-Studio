@@ -70,6 +70,7 @@ from sqlmodel import SQLModel
 
 import app.github as github
 from app.deploy_smoketest import reflect_schema_drift
+from app.migration_chain import build_migration_chain, find_heads
 from app.migration_reconciliation import reconcile_pre_renumber_divergence
 
 logger = logging.getLogger(__name__)
@@ -715,23 +716,9 @@ async def run_migration_apply_gate(
             f"bind; got {prod_url.get_backend_name()!r}",
         )
 
-    # 1. Production's REAL recorded state (read-only).
-    try:
-        prod_state = await _read_prod_state(prod_engine)
-    except Exception as exc:  # noqa: BLE001 — indeterminate prod state HOLDS
-        return (
-            "defer",
-            f"could not read production's recorded schema state: "
-            f"{type(exc).__name__}: {exc}",
-        )
-    if prod_state is None:
-        return (
-            "defer",
-            "production's recorded Alembic revision is unset/unreadable "
-            "(no alembic_version stamp) — cannot reproduce the deploy",
-        )
-
-    # 2. Candidate migration sources (fetched unless injected).
+    # 1. Candidate migration sources (fetched unless injected) — resolved BEFORE
+    # reading production's state so a structurally-defective candidate (duplicate
+    # revision id, multi-head chain) blocks immediately without any DB round-trip.
     if candidate_sources is None:
         if not (gh_token and owner and repo and candidate_ref):
             return (
@@ -755,6 +742,40 @@ async def run_migration_apply_gate(
                 f"candidate migration fetch at {candidate_ref!r} returned no "
                 "readable migration sources",
             )
+
+    # 2. Structural check: dup revision ids and multi-head chains are deterministically
+    # defective regardless of production state or scratch-DB availability — block
+    # immediately instead of auto-retrying the run as an infra failure.
+    _chain, _duplicates, _ = build_migration_chain(candidate_sources)
+    if _duplicates:
+        return (
+            "block",
+            "candidate migration chain has duplicate revision id(s): "
+            + ", ".join(sorted(_duplicates)),
+        )
+    _heads = find_heads(_chain)
+    if len(_heads) > 1:
+        return (
+            "block",
+            "candidate migration chain has multiple heads (not a single linear chain): "
+            + ", ".join(sorted(_heads)),
+        )
+
+    # 3. Production's REAL recorded state (read-only).
+    try:
+        prod_state = await _read_prod_state(prod_engine)
+    except Exception as exc:  # noqa: BLE001 — indeterminate prod state HOLDS
+        return (
+            "defer",
+            f"could not read production's recorded schema state: "
+            f"{type(exc).__name__}: {exc}",
+        )
+    if prod_state is None:
+        return (
+            "defer",
+            "production's recorded Alembic revision is unset/unreadable "
+            "(no alembic_version stamp) — cannot reproduce the deploy",
+        )
 
     if required_metadata is None:
         # Derive the candidate's required schema from a clean apply of its OWN

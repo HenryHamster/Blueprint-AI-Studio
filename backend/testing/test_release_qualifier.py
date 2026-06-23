@@ -8843,6 +8843,52 @@ async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocke
     assert version.last_qualification["status"] == "infra_failure"
 
 
+@pytest.mark.asyncio
+async def test_apply_gate_defer_with_duplicate_revision_blocks_instead_of_infra_retry():
+    """Structural defect detection: when the candidate's migration chain has a
+    duplicate revision id, the apply gate returns 'block' (a hard deterministic
+    finding) even when production state is unavailable (the scenario that would
+    normally produce a 'defer' / infra-retry).
+
+    This exercises the structural pre-check added to run_migration_apply_gate:
+    sources are resolved and checked for dup revisions BEFORE the prod-state DB
+    read, so a structurally-defective candidate is surfaced as a real blocking
+    finding instead of being auto-retried as migration_apply_check_unavailable."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.migration_apply_gate import run_migration_apply_gate
+
+    # Two migration files share the same revision id — a deterministic defect.
+    dup_sources = {
+        "0001_init.py": (
+            "revision = 'dup01'\ndown_revision = None\ndef upgrade(): pass\n"
+        ),
+        "0001_also_init.py": (
+            "revision = 'dup01'\ndown_revision = None\ndef upgrade(): pass\n"
+        ),
+        "0002_next.py": (
+            "revision = 'next01'\ndown_revision = 'dup01'\ndef upgrade(): pass\n"
+        ),
+    }
+
+    # A postgres-URL engine pointing at a non-existent host: passes the postgres
+    # URL check but would fail (defer) at the prod-state read step. The structural
+    # check runs before that step, so the result must be 'block', not 'defer'.
+    engine = create_async_engine("postgresql+asyncpg://u:p@127.0.0.1:1/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources=dup_sources,
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "block", (
+        f"expected block on dup revision, got {verdict!r}: {detail}"
+    )
+    assert "dup01" in (detail or ""), f"detail should name the dup revision: {detail!r}"
+
+
 # ===========================================================================
 # Audit challenge reconciliation — fail-closed gate
 # ===========================================================================
