@@ -73,6 +73,16 @@ export default function App() {
   const s = useAppState();
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [drawerWidth, setDrawerWidth] = useState(0);
+  // Dedup guard: track the last lastCycleCompletion object we toasted for so a
+  // WS reconnect that re-emits the same event doesn't fire a second toast.
+  const lastCycleCompletionToastRef = useRef<typeof s.lastCycleCompletion>(null);
+  const { lastCycleCompletion: cycleCompletion, addToast } = s;
+  useEffect(() => {
+    if (!cycleCompletion) return;
+    if (cycleCompletion === lastCycleCompletionToastRef.current) return;
+    lastCycleCompletionToastRef.current = cycleCompletion;
+    addToast('Strategic cycle complete', 'success');
+  }, [cycleCompletion, addToast]);
   const [openMessageCount, setOpenMessageCount] = useState(0);
   const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);
   const handleMessageCountChange = useCallback((count: number) => setOpenMessageCount(count), []);
@@ -916,6 +926,7 @@ export default function App() {
             fetchDirectionsRef={s.fetchDirectionsRef}
             strategistActive={s.strategistActive}
             cycleProgress={s.cycleProgress}
+            lastCycleCompletion={s.lastCycleCompletion}
             onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
             onNavigateToTask={(taskId) => {
               const target = s.tasks.find(t => t.id === taskId);

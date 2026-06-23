@@ -190,7 +190,7 @@ const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'staged' | 'paused' | 
 
 const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
-export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateToTask, selectedProjectId, projects = [], fetchDirectionsRef, strategistActive, cycleProgress, pageMode = false }: { onClose?: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void; selectedProjectId: string | null; projects?: Project[]; fetchDirectionsRef?: React.MutableRefObject<() => void>; strategistActive?: boolean; cycleProgress?: import('../hooks/useLogViewer').StrategicCycleProgress | null; pageMode?: boolean }) {
+export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateToTask, selectedProjectId, projects = [], fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion, pageMode = false }: { onClose?: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void; selectedProjectId: string | null; projects?: Project[]; fetchDirectionsRef?: React.MutableRefObject<() => void>; strategistActive?: boolean; cycleProgress?: import('../hooks/useLogViewer').StrategicCycleProgress | null; lastCycleCompletion?: import('../hooks/useLogViewer').StrategicCycleCompletion | null; pageMode?: boolean }) {
   // Active tab
   const [activeTab, setActiveTab] = useState<DirectionsTab>('directions');
 
@@ -250,6 +250,30 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 <span className="ml-1.5 text-indigo-400/80 italic font-normal truncate block">
                   "{cycleProgress.steering_excerpt.slice(0, 80)}{cycleProgress.steering_excerpt.length > 80 ? '…' : ''}"
                 </span>
+              )}
+            </span>
+          </div>
+        )}
+        {lastCycleCompletion && !strategistActive && activeTab === 'directions' && (
+          <div className="px-5 py-2 border-b border-neutral-800 bg-emerald-950/30 flex items-start gap-2 shrink-0" role="status" aria-live="polite">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 mt-0.5 shrink-0" aria-hidden="true" />
+            <span className="text-xs text-emerald-300 min-w-0">
+              <span className="font-medium">Cycle complete</span>
+              {(lastCycleCompletion.created_count ?? 0) > 0 && (
+                <span className="ml-1.5">· +{lastCycleCompletion.created_count} direction{lastCycleCompletion.created_count !== 1 ? 's' : ''}</span>
+              )}
+              {(lastCycleCompletion.retired_count ?? 0) > 0 && (
+                <span className="ml-1.5">· −{lastCycleCompletion.retired_count} retired</span>
+              )}
+              {(lastCycleCompletion.staged_count ?? 0) > 0 && (
+                <span className="ml-1.5">· {lastCycleCompletion.staged_count} staged</span>
+              )}
+              {(lastCycleCompletion.tasks_spawned ?? 0) > 0 && (
+                <span className="ml-1.5">· {lastCycleCompletion.tasks_spawned} task{lastCycleCompletion.tasks_spawned !== 1 ? 's' : ''} spawned</span>
+              )}
+              {lastCycleCompletion.problem_model_changed && <span className="ml-1.5">· problem model updated</span>}
+              {lastCycleCompletion.status_message && (
+                <span className="ml-1.5 text-emerald-400/80 italic">{lastCycleCompletion.status_message.slice(0, 80)}</span>
               )}
             </span>
           </div>
@@ -441,6 +465,30 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 <span className="ml-1.5 text-indigo-400/80 italic font-normal truncate block">
                   "{cycleProgress.steering_excerpt.slice(0, 80)}{cycleProgress.steering_excerpt.length > 80 ? '…' : ''}"
                 </span>
+              )}
+            </span>
+          </div>
+        )}
+        {lastCycleCompletion && !strategistActive && activeTab === 'directions' && (
+          <div className="px-5 py-2 border-b border-neutral-800 bg-emerald-950/30 flex items-start gap-2 shrink-0" role="status" aria-live="polite">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 mt-0.5 shrink-0" aria-hidden="true" />
+            <span className="text-xs text-emerald-300 min-w-0">
+              <span className="font-medium">Cycle complete</span>
+              {(lastCycleCompletion.created_count ?? 0) > 0 && (
+                <span className="ml-1.5">· +{lastCycleCompletion.created_count} direction{lastCycleCompletion.created_count !== 1 ? 's' : ''}</span>
+              )}
+              {(lastCycleCompletion.retired_count ?? 0) > 0 && (
+                <span className="ml-1.5">· −{lastCycleCompletion.retired_count} retired</span>
+              )}
+              {(lastCycleCompletion.staged_count ?? 0) > 0 && (
+                <span className="ml-1.5">· {lastCycleCompletion.staged_count} staged</span>
+              )}
+              {(lastCycleCompletion.tasks_spawned ?? 0) > 0 && (
+                <span className="ml-1.5">· {lastCycleCompletion.tasks_spawned} task{lastCycleCompletion.tasks_spawned !== 1 ? 's' : ''} spawned</span>
+              )}
+              {lastCycleCompletion.problem_model_changed && <span className="ml-1.5">· problem model updated</span>}
+              {lastCycleCompletion.status_message && (
+                <span className="ml-1.5 text-emerald-400/80 italic">{lastCycleCompletion.status_message.slice(0, 80)}</span>
               )}
             </span>
           </div>

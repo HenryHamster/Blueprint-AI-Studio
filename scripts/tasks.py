@@ -564,61 +564,14 @@ def _print_research_detail(t, verbose=False):
 
 
 def cmd_playbook(args):
-    """List, show, or delete playbook entries.
-
-    Usage:
-        tasks.py playbook                  — list all entries
-        tasks.py playbook delete <key>     — delete a specific entry
-        tasks.py playbook prune <pattern>  — delete entries matching pattern (case-insensitive)
-    """
-    from blueprint_api import api, get_project_id
-    pid = get_project_id()
-    url = f"/api/admin/projects/{pid}/playbook"
-
-    if not args or args[0] not in ("delete", "prune"):
-        data = api("GET", url)
-        entries = data.get("entries", {})
-        if not entries:
-            print("No playbook entries.")
-            return
-        print(f"Playbook entries ({len(entries)}):")
-        for k, v in sorted(entries.items()):
-            content = v if isinstance(v, str) else v.get("content", "")
-            print(f"  {k}: {_safe(content, 120)}")
-    elif args[0] == "delete":
-        if len(args) < 2:
-            print("Usage: tasks.py playbook delete <key>")
-            return
-        key = args[1]
-        api("DELETE", f"{url}/{key}")
-        print(f"Deleted: {key}")
-    elif args[0] == "prune":
-        if len(args) < 2:
-            print("Usage: tasks.py playbook prune <pattern>")
-            return
-        import re
-        pattern = re.compile(args[1], re.IGNORECASE)
-        data = api("GET", url)
-        entries = data.get("entries", {})
-        matched = []
-        for k, v in entries.items():
-            content = v if isinstance(v, str) else v.get("content", "")
-            if pattern.search(k) or pattern.search(content):
-                matched.append((k, content))
-        if not matched:
-            print(f"No entries matching '{args[1]}'.")
-            return
-        print(f"Entries matching '{args[1]}' ({len(matched)}):")
-        for k, content in matched:
-            print(f"  {k}: {_safe(content, 120)}")
-        confirm = input(f"\nDelete {len(matched)} entries? [y/N] ")
-        if confirm.lower() == "y":
-            for k, _ in matched:
-                api("DELETE", f"{url}/{k}")
-                print(f"  Deleted: {k}")
-            print("Done.")
-        else:
-            print("Cancelled.")
+    """DEPRECATED — use: python scripts/blueprint.py playbook"""
+    print(
+        "DEPRECATED: use python scripts/blueprint.py playbook\n"
+        "  List:   python scripts/blueprint.py playbook\n"
+        "  Delete: python scripts/blueprint.py playbook delete <key>\n"
+        "  Prune:  python scripts/blueprint.py playbook prune <pattern> [--yes]"
+    )
+    sys.exit(1)
 
 
 COMMANDS = {

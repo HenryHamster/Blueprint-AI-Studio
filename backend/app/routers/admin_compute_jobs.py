@@ -18,11 +18,11 @@ from sqlmodel import select
 
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
-from app.compute_jobs import kill_compute_job, list_compute_jobs
+from app.compute_jobs import build_compute_result_logs, kill_compute_job, list_compute_jobs
 from app.database import get_session
 from app.models import Artifact, ComputeJob, ComputeJobStatus, Task
 from app.schemas import serialize_compute_job_response_safe
-from app.task_evaluators import _declared_success_criterion
+from app.task_evaluators import _declared_success_criterion, evaluate_compute_success_criterion
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +69,8 @@ async def _build_compute_job_payload(
     an optional descriptor for the job's linked durable Artifact, and the
     declared success criterion + its computed verdict when present."""
     task_ids = {job.task_id for job in jobs if job.task_id is not None}
-    # Maps task_id -> (title, task_type, success_criterion, criterion_verdict)
-    task_meta: Dict[uuid.UUID, tuple[str | None, str | None, Any, Any]] = {}
+    # Maps task_id -> (title, task_type, success_criterion, criterion_verdict, task)
+    task_meta: Dict[uuid.UUID, tuple[str | None, str | None, Any, Any, Any]] = {}
     if task_ids:
         rows = (
             (await session.execute(select(Task).where(Task.id.in_(task_ids))))
@@ -89,7 +89,7 @@ async def _build_compute_job_payload(
             verdict = compute_result.get("criterion")
             if not isinstance(verdict, dict):
                 verdict = None
-            task_meta[task.id] = (task.title, task_type, success_criterion, verdict)
+            task_meta[task.id] = (task.title, task_type, success_criterion, verdict, task)
 
     # Batch-load linked artifacts to avoid an N+1 query across the listed jobs.
     artifact_ids = {job.artifact_id for job in jobs if job.artifact_id is not None}
@@ -109,9 +109,20 @@ async def _build_compute_job_payload(
     payload: list[Dict[str, Any]] = []
     for job in jobs:
         data = serialize_compute_job_response_safe(job)
-        title, task_type, success_criterion, criterion_verdict = task_meta.get(
-            job.task_id, (None, None, None, None)
+        title, task_type, success_criterion, criterion_verdict, task_obj = task_meta.get(
+            job.task_id, (None, None, None, None, None)
         )
+        # For terminal jobs whose task hasn't been finalized yet (plan_output
+        # does not carry compute_result.criterion), compute the verdict directly
+        # from the job row so the panel shows real results immediately.
+        if (
+            criterion_verdict is None
+            and success_criterion is not None
+            and job.status in _COMPUTE_JOB_TERMINAL_STATUSES
+            and task_obj is not None
+        ):
+            artifact_text = build_compute_result_logs(job)
+            criterion_verdict = evaluate_compute_success_criterion(task_obj, artifact_text)
         data["task_title"] = title
         data["task_type"] = task_type
         data["success_criterion"] = success_criterion

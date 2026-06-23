@@ -2931,6 +2931,378 @@ def _render_analytics_failing_types(data: dict) -> None:
         print(f"  {tt:20}  failure_rate={rate:.1%}  n={n}")
 
 
+# ── vision ────────────────────────────────────────────────────────────────────
+
+def cmd_vision(args: argparse.Namespace) -> None:
+    """Show product vision and design document."""
+    pid = get_project_id(getattr(args, "project_id", None))
+    data = api("GET", f"/api/admin/projects/{pid}/directions")
+
+    design_doc_key = getattr(args, "design_doc_key", None)
+    if design_doc_key is not None:
+        doc = data.get("design_doc") or {}
+        if not doc:
+            print("No design document yet.")
+            return
+        if design_doc_key:
+            page = doc.get(design_doc_key)
+            if page is None:
+                print(f"Page not found: {design_doc_key}")
+                print(f"Available pages: {', '.join(sorted(doc.keys()))}")
+                return
+            print(f"=== DESIGN DOC: {design_doc_key} ===")
+            _emit(args, page, lambda p: print(json.dumps(p, indent=2)))
+        else:
+            _emit(args, doc, _render_design_doc)
+        return
+
+    vision = data.get("vision") or {}
+    if not vision:
+        print("No vision set yet.")
+        return
+    _emit(args, vision, _render_vision)
+
+
+def _render_design_doc(doc: dict) -> None:
+    print(f"=== DESIGN DOCUMENT ({len(doc)} pages) ===")
+    for key in sorted(doc.keys()):
+        page = doc[key]
+        if isinstance(page, dict):
+            summary = page.get("summary", page.get("description", str(page)[:120]))
+            status = page.get("status", "")
+            status_str = f" [{status}]" if status else ""
+            print(f"  {key}{status_str} — {str(summary)[:100]}")
+        else:
+            print(f"  {key} — {str(page)[:100]}")
+
+
+def _render_vision(vision: dict) -> None:
+    print("=== PRODUCT VISION ===")
+    print(f"  Purpose:  {vision.get('purpose', '(not set)')}")
+    focus = vision.get("focus")
+    if focus:
+        if isinstance(focus, list):
+            print(f"  Focus ({len(focus)} active):")
+            for f in focus:
+                print(f"    - {f}")
+        else:
+            print(f"  Focus:    {focus}")
+    print(f"  Revision: {vision.get('revision', '?')}")
+    print(f"  Updated:  {(vision.get('last_updated') or '?')[:19]}")
+    criteria = vision.get("success_criteria", [])
+    if criteria:
+        print(f"\n  Success criteria ({len(criteria)}):")
+        for c in criteria:
+            print(f"    - {c}")
+    context = vision.get("context", "")
+    if context:
+        print(f"\n  Context:\n    {context[:500]}")
+    cycles = vision.get("_strategic_cycle_count", 0)
+    spawns = vision.get("_research_spawn_count", 0)
+    if cycles or spawns:
+        print(f"\n  Stats: {spawns} research spawns, {cycles} strategic cycles")
+
+
+# ── strategic-cycle ───────────────────────────────────────────────────────────
+
+def cmd_strategic_cycle(args: argparse.Namespace) -> None:
+    """Manually trigger a strategic cycle."""
+    _require_write_config("strategic-cycle")
+    phase = getattr(args, "phase", "design_doc") or "design_doc"
+    pid = get_project_id(getattr(args, "project_id", None))
+    if not _confirm(f"Trigger strategic-cycle (phase={phase})?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", f"/api/admin/projects/{pid}/strategic-cycle?phase={phase}")
+    out = {"phase": phase, **result}
+    _emit(args, out, _render_strategic_cycle)
+
+
+def _render_strategic_cycle(d: dict) -> None:
+    phase = d.get("phase", "?")
+    task_id = d.get("task_id") or d.get("id") or "?"
+    print(f"Spawned {phase} task: {task_id}")
+    print(f"  Title: {d.get('title', '?')}")
+    if phase == "design_doc":
+        print("  Phase 1 will chain into strategic_review (Phase 2) on completion.")
+
+
+# ── trim-playbook-archive ─────────────────────────────────────────────────────
+
+def cmd_trim_playbook_archive(args: argparse.Namespace) -> None:
+    """Trim design_doc.playbook_archive to the last N entries."""
+    _require_write_config("trim-playbook-archive")
+    keep = getattr(args, "keep", 50) or 50
+    dry_run = getattr(args, "dry_run", False)
+    pid = get_project_id(getattr(args, "project_id", None))
+
+    data = api("GET", f"/api/admin/projects/{pid}/directions")
+    doc = data.get("design_doc") or {}
+    archive = doc.get("playbook_archive") or []
+    before_bytes = len(json.dumps(archive).encode())
+
+    print(f"Current playbook_archive: {len(archive)} entries ({before_bytes:,} bytes)")
+    if len(archive) <= keep:
+        print(f"Already within cap of {keep} — nothing to trim.")
+        return
+
+    trimmed = archive[-keep:]
+    after_bytes = len(json.dumps(trimmed).encode())
+    dropped = len(archive) - len(trimmed)
+    print(f"Would drop {dropped} oldest -> {len(trimmed)} remain ({after_bytes:,} bytes)")
+
+    if dry_run:
+        print("(dry-run — no changes written)")
+        return
+
+    new_doc = {**doc, "playbook_archive": trimmed}
+    api("PATCH", f"/api/admin/projects/{pid}", {"design_doc": new_doc})
+    print(f"Trimmed archive to {len(trimmed)} entries ({before_bytes - after_bytes:,} bytes freed)")
+
+
+# ── fingerprints ──────────────────────────────────────────────────────────────
+
+def _resolve_fingerprint(query: str, project_id: str | None = None) -> dict | None:
+    """Find a residual case by fingerprint substring (case-insensitive)."""
+    path = "/api/admin/residual-cases?limit=200"
+    if project_id:
+        path += f"&project_id={project_id}"
+    cases = api("GET", path).get("cases", [])
+    needle = query.lower()
+    matches = [c for c in cases if needle in (c.get("fingerprint") or "").lower()]
+    if not matches:
+        print(f"No open residual case matches: {query!r}")
+        return None
+    if len(matches) > 1:
+        print(f"Ambiguous — {len(matches)} cases match {query!r}:")
+        for c in matches[:5]:
+            print(f"  - {c['fingerprint'][:120]}")
+        print("Use a longer substring to disambiguate.")
+        return None
+    return matches[0]
+
+
+def cmd_fingerprints(args: argparse.Namespace) -> None:
+    """List or manage residual remediation cases."""
+    from urllib.parse import quote
+    pid = get_project_id(getattr(args, "project_id", None))
+    ignore = getattr(args, "ignore", None)
+    unignore = getattr(args, "unignore", None)
+    clear = getattr(args, "clear", False)
+
+    if ignore:
+        _require_write_config("fingerprints --ignore")
+        case = _resolve_fingerprint(ignore, pid)
+        if not case:
+            return
+        result = api("POST", f"/api/admin/residual-cases/{quote(case['fingerprint'], safe='')}/ignore?project_id={pid}")
+        _emit(args, result, lambda r: print(
+            f"Ignored: {r.get('fingerprint', '')[:100]} → status={r.get('status')}"
+        ))
+        return
+
+    if unignore:
+        _require_write_config("fingerprints --unignore")
+        ignored_path = f"/api/admin/residual-cases?status=IGNORED&limit=200&project_id={pid}"
+        cases = api("GET", ignored_path).get("cases", [])
+        needle = unignore.lower()
+        matches = [c for c in cases if needle in (c.get("fingerprint") or "").lower()]
+        if not matches:
+            print(f"No IGNORED case matches: {unignore!r}")
+            return
+        if len(matches) > 1:
+            print(f"Ambiguous — {len(matches)} IGNORED cases match. Use a longer substring.")
+            return
+        result = api("POST", f"/api/admin/residual-cases/{quote(matches[0]['fingerprint'], safe='')}/unignore?project_id={pid}")
+        _emit(args, result, lambda r: print(
+            f"Unignored: {r.get('fingerprint', '')[:100]} → status={r.get('status')}"
+        ))
+        return
+
+    if clear:
+        _require_write_config("fingerprints --clear")
+        result = api("POST", "/api/admin/residual-fingerprints/clear")
+        _emit(args, result, lambda r: print(f"Cleared in-memory store: {r}"))
+        return
+
+    show_all = getattr(args, "all_statuses", False)
+    statuses = getattr(args, "status", None) or []
+    path = "/api/admin/residual-cases?limit=100"
+    _ALL_FP_STATUSES = ("ACTIVE", "REMEDIATING", "SUSPENDED", "IGNORED",
+                        "RESOLVED", "CLOSED_ORGANICALLY", "MERGED", "FAILED")
+    if show_all:
+        for s in _ALL_FP_STATUSES:
+            path += f"&status={s}"
+    else:
+        for s in statuses:
+            path += f"&status={s}"
+    result = api("GET", path)
+    cases = result.get("cases", [])
+    filt = result.get("status_filter", [])
+    _emit(args, {"cases": cases, "status_filter": filt}, _render_fingerprints)
+
+
+def _render_fingerprints(data: dict) -> None:
+    cases = data.get("cases") or []
+    filt = data.get("status_filter") or []
+    print(f"=== RESIDUAL CASES ({len(cases)}) status={','.join(filt)} ===")
+    if not cases:
+        print("(none)")
+        return
+    for c in cases:
+        fp = (c.get("fingerprint") or "").replace("\n", " ")
+        print(f"  [{c['status']:18}] hits={c['hit_count']:<3} "
+              f"consec={c.get('consecutive_failure_count', 0)}  "
+              f"last_seen={(c.get('last_seen_at') or '')[:19]}  "
+              f"pr={c.get('last_spawned_pr_number') or '-'}")
+        print(f"    fp: {fp[:200]}")
+
+
+# ── regression-cases ──────────────────────────────────────────────────────────
+
+def cmd_regression_cases(args: argparse.Namespace) -> None:
+    """List or close regression remediation cases."""
+    from urllib.parse import quote
+    pid = get_project_id(getattr(args, "project_id", None))
+
+    def _build_close_path(cls: str, reason: str | None) -> str:
+        p = (f"/api/admin/regression-cases/close?project_id={pid}"
+             f"&regression_class={quote(cls, safe='')}")
+        if reason:
+            p += f"&reason={quote(reason, safe='')}"
+        return p
+
+    close = getattr(args, "close", None)
+    close_prefix = getattr(args, "close_prefix", None)
+    reason = getattr(args, "reason", None)
+
+    if close:
+        _require_write_config("regression-cases --close")
+        try:
+            result = api("POST", _build_close_path(close, reason))
+            _emit(args, result, lambda r: print(
+                f"Closed: {r.get('regression_class', '')[:120]} → "
+                f"{r.get('prior_status')} → {r.get('status')}"
+            ))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error closing {close!r}: {exc}", file=sys.stderr)
+        return
+
+    if close_prefix:
+        _require_write_config("regression-cases --close-prefix")
+        path = f"/api/admin/regression-cases?project_id={pid}&limit=200"
+        for s in ("ACTIVE", "REMEDIATING", "NEEDS_MANUAL_INTERVENTION"):
+            path += f"&status={s}"
+        result = api("GET", path)
+        cases = result.get("cases", [])
+        matches = [c for c in cases
+                   if c.get("regression_class", "").startswith(close_prefix)]
+        if not matches:
+            print(f"No open cases match prefix {close_prefix!r}")
+            return
+        print(f"Closing {len(matches)} case(s) matching prefix {close_prefix!r}:")
+        for c in matches:
+            cls = c["regression_class"]
+            try:
+                r = api("POST", _build_close_path(cls, reason))
+                print(f"  {r.get('prior_status'):28} → {r.get('status'):8}  {cls[:80]}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ERROR  {cls[:80]}: {exc}")
+        return
+
+    show_all = getattr(args, "all_statuses", False)
+    statuses = getattr(args, "status", None) or []
+    path = f"/api/admin/regression-cases?project_id={pid}&limit=200"
+    if show_all:
+        for s in ("ACTIVE", "REMEDIATING", "NEEDS_MANUAL_INTERVENTION", "CLOSED", "MERGED"):
+            path += f"&status={s}"
+    else:
+        for s in statuses:
+            path += f"&status={s}"
+    result = api("GET", path)
+    cases = result.get("cases", [])
+    filt = result.get("status_filter", [])
+    _emit(args, {"cases": cases, "status_filter": filt}, _render_regression_cases)
+
+
+def _render_regression_cases(data: dict) -> None:
+    cases = data.get("cases") or []
+    filt = data.get("status_filter") or []
+    print(f"=== REGRESSION CASES ({len(cases)}) status={','.join(filt)} ===")
+    if not cases:
+        print("(none)")
+        return
+    for c in cases:
+        cls = (c.get("regression_class") or "").replace("\n", " ")
+        print(f"  [{c['status']:28}] attempts={c.get('attempts', 0)}  "
+              f"hits={c.get('hit_count', 0)}  "
+              f"last_seen={(c.get('last_seen_at') or '')[:19]}  "
+              f"pr={c.get('last_remediation_pr_number') or '-'}")
+        print(f"    class: {cls[:200]}")
+
+
+# ── playbook ──────────────────────────────────────────────────────────────────
+
+def cmd_playbook(args: argparse.Namespace) -> None:
+    """List, show, or delete playbook entries."""
+    pid = get_project_id(getattr(args, "project_id", None))
+    url = f"/api/admin/projects/{pid}/playbook"
+    sub = getattr(args, "playbook_cmd", None)
+
+    if sub == "delete":
+        _require_write_config("playbook delete")
+        key = args.key
+        api("DELETE", f"{url}/{key}")
+        _emit(args, {"key": key}, lambda r: print(f"Deleted: {key}"))
+        return
+
+    if sub == "prune":
+        import re
+        _require_write_config("playbook prune")
+        pattern_str = args.pattern
+        try:
+            pattern = re.compile(pattern_str, re.IGNORECASE)
+        except re.error as exc:
+            print(f"Invalid pattern {pattern_str!r}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        data = api("GET", url)
+        entries = data.get("entries", {})
+        matched = []
+        for k, v in entries.items():
+            content = v if isinstance(v, str) else (v or {}).get("content", "")
+            if pattern.search(k) or pattern.search(content):
+                matched.append((k, content))
+        if not matched:
+            print(f"No entries matching '{pattern_str}'.")
+            return
+        if not _confirm(
+            f"Delete {len(matched)} entries matching '{pattern_str}'?",
+            getattr(args, "yes", False),
+        ):
+            print("Aborted.")
+            return
+        for k, _ in matched:
+            api("DELETE", f"{url}/{k}")
+            print(f"  Deleted: {k}")
+        print("Done.")
+        return
+
+    data = api("GET", url)
+    entries = data.get("entries", {})
+    _emit(args, {"entries": entries}, _render_playbook)
+
+
+def _render_playbook(data: dict) -> None:
+    entries = data.get("entries") or {}
+    if not entries:
+        print("No playbook entries.")
+        return
+    print(f"Playbook entries ({len(entries)}):")
+    for k, v in sorted(entries.items()):
+        content = v if isinstance(v, str) else (v or {}).get("content", "")
+        print(f"  {k}: {(content or '')[:120]}")
+
+
 # ── argument parser ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3364,22 +3736,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_env_set.add_argument("--yes", action="store_true",
                            help="Skip the confirmation prompt (for scripting).")
 
-    # analytics
-    p_envelope = sub.add_parser(
-        "envelope", parents=[common],
-        help="View or update a project's resource envelope (VM caps, spend ceilings).",
-        description="Per-project resource envelope management.",
-    )
-    envelope_sub = p_envelope.add_subparsers(dest="envelope_cmd")
-    envelope_sub.add_parser("show", parents=[common],
-                            help="Show the resource envelope and live usage.")
-    p_env_set = envelope_sub.add_parser("set", parents=[common],
-                                        help="Update resource envelope fields.")
-    p_env_set.add_argument("assignments", nargs="+", metavar="KEY=VALUE",
-                           help="Fields to update, e.g. max_concurrent_vms=4 spend_ceiling_usd=10.0")
-    p_env_set.add_argument("-y", "--yes", action="store_true",
-                           help="Skip confirmation prompt.")
-
     p_analytics = sub.add_parser(
         "analytics", parents=[common],
         help="Pipeline analytics: cost, duration, pause-stats, failing-types.",
@@ -3398,6 +3754,73 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="Lookback window in hours (default 24).")
     analytics_sub.add_parser("failing-types", parents=[common],
                              help="Task types currently gated by high failure rate.")
+
+    # vision
+    p_vision = sub.add_parser("vision", parents=[common],
+                              help="Show product vision and design document.")
+    p_vision.add_argument(
+        "--design-doc", dest="design_doc_key", nargs="?", const="",
+        help="Show design document pages; optionally pass a page KEY to show one page.",
+    )
+
+    # strategic-cycle
+    p_sc = sub.add_parser("strategic-cycle", parents=[common],
+                          help="Manually trigger a strategic cycle.")
+    p_sc.add_argument("--phase", default="design_doc",
+                      choices=["design_doc", "strategic_review"],
+                      help="Cycle phase (default: design_doc, chains to strategic_review).")
+    p_sc.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
+
+    # trim-playbook-archive
+    p_tpa = sub.add_parser("trim-playbook-archive", parents=[common],
+                           help="Trim design_doc.playbook_archive to the last N entries.")
+    p_tpa.add_argument("--keep", type=int, default=50,
+                       help="Number of entries to keep (default 50).")
+    p_tpa.add_argument("--dry-run", dest="dry_run", action="store_true",
+                       help="Report size without writing changes.")
+
+    # fingerprints
+    p_fp = sub.add_parser("fingerprints", parents=[common],
+                          help="List or manage residual remediation cases.")
+    p_fp.add_argument("--all", dest="all_statuses", action="store_true",
+                      help="Show cases in every status.")
+    p_fp.add_argument("--status", action="append", default=[], metavar="STATUS",
+                      help="Filter by status (repeatable).")
+    p_fp.add_argument("--ignore", metavar="FP_SUBSTRING",
+                      help="Ignore a residual case by fingerprint substring.")
+    p_fp.add_argument("--unignore", metavar="FP_SUBSTRING",
+                      help="Unignore a residual case by fingerprint substring.")
+    p_fp.add_argument("--clear", action="store_true",
+                      help="Wipe the in-memory residual store.")
+
+    # regression-cases
+    p_rc = sub.add_parser("regression-cases", parents=[common],
+                          help="List or close regression remediation cases.")
+    p_rc.add_argument("--all", dest="all_statuses", action="store_true",
+                      help="Show cases in every status.")
+    p_rc.add_argument("--status", action="append", default=[], metavar="STATUS",
+                      help="Filter by status (repeatable).")
+    p_rc.add_argument("--close", metavar="CLASS",
+                      help="Close a regression case by class name.")
+    p_rc.add_argument("--close-prefix", dest="close_prefix", metavar="PREFIX",
+                      help="Close all open cases with a matching class prefix.")
+    p_rc.add_argument("--reason", help="Reason for closing (recorded on the case).")
+
+    # playbook
+    p_pb = sub.add_parser("playbook", parents=[common],
+                          help="List, delete, or prune playbook entries.",
+                          description="Inspect or manage project playbook entries. "
+                                      "Defaults to listing all entries.")
+    pb_sub = p_pb.add_subparsers(dest="playbook_cmd")
+    pb_sub.add_parser("list", parents=[common], help="List all playbook entries.")
+    p_pb_delete = pb_sub.add_parser("delete", parents=[common],
+                                    help="Delete a playbook entry by key.")
+    p_pb_delete.add_argument("key", help="Playbook entry key.")
+    p_pb_prune = pb_sub.add_parser("prune", parents=[common],
+                                   help="Delete entries matching a pattern.")
+    p_pb_prune.add_argument("pattern", help="Case-insensitive regex pattern.")
+    p_pb_prune.add_argument("--yes", action="store_true",
+                            help="Skip the confirmation prompt.")
 
     return parser
 
@@ -3420,7 +3843,12 @@ _DISPATCH = {
     "envelope": cmd_envelope,
     "health": cmd_health,
     "analytics": cmd_analytics,
-    "envelope": cmd_envelope,
+    "vision": cmd_vision,
+    "strategic-cycle": cmd_strategic_cycle,
+    "trim-playbook-archive": cmd_trim_playbook_archive,
+    "fingerprints": cmd_fingerprints,
+    "regression-cases": cmd_regression_cases,
+    "playbook": cmd_playbook,
 }
 
 
