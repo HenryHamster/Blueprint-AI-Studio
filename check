@@ -39,28 +39,19 @@ done
 # Fresh GATE-ENVIRONMENT marker per run: cleared here, re-written by the
 # config-driven pytest gate below only if this environment still cannot run
 # the suite faithfully. ./pr surfaces it after a passing `./check test`.
-rm -f /tmp/check_gate_env.txt
+rm -f /tmp/check_gate_env_0ff16825-1ec9-4493-887b-d79171a21443.txt
 
 # Determine changed paths: committed since base + uncommitted. Verify at
 # least one diff source actually worked — silently-empty CHANGED used to
 # fall through to "PASS — all checks green" without running anything.
-# Auto-detect base: prefer origin/automain (Blueprint staging), fall back to
-# origin/main, then local variants — never hardcode a task branch.
+BASE="automain"
 COMMITTED=""
-_BASE_REF=""
-for _cand in automain main; do
-  if git rev-parse --verify "origin/$_cand" >/dev/null 2>&1; then
-    _BASE_REF="origin/$_cand"
-    break
-  elif git rev-parse --verify "$_cand" >/dev/null 2>&1; then
-    _BASE_REF="$_cand"
-    break
-  fi
-done
-if [ -n "$_BASE_REF" ]; then
-  COMMITTED=$(git diff --name-only "$_BASE_REF...HEAD" 2>/dev/null || true)
+if git rev-parse --verify "origin/$BASE" >/dev/null 2>&1; then
+  COMMITTED=$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null || true)
+elif git rev-parse --verify "$BASE" >/dev/null 2>&1; then
+  COMMITTED=$(git diff --name-only "$BASE...HEAD" 2>/dev/null || true)
 else
-  echo "[check] WARNING: no base branch found (tried origin/automain, origin/main) — falling back to working-tree diff only" >&2
+  echo "[check] WARNING: neither origin/$BASE nor $BASE exists locally — falling back to working-tree diff only" >&2
 fi
 UNCOMMITTED=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 CHANGED=$(printf '%s\n%s\n' "$COMMITTED" "$UNCOMMITTED" | sort -u | grep -v '^$' || true)
@@ -239,7 +230,7 @@ if touches "backend/"; then
         echo "[check]   - Validate the diff where the suite CAN faithfully run (the project's Docker/Postgres harness, or targeted single-file runs) and record that evidence in the PR body."
         echo "[check]   - CI runs the authoritative Postgres suite on the PR after ./pr open."
         echo "[check]   - If you have NO faithful test evidence for a test-relevant change, call ./blocked \"<reason>\" --needs-capability \"postgres test environment\" instead of shipping blind."
-        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "backend: pytest gate skipped — no Docker for the sanctioned harness and no Postgres test env; a bare run would be an unfaithful SQLite fallback" >> /tmp/check_gate_env.txt ;;
+        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "backend: pytest gate skipped — no Docker for the sanctioned harness and no Postgres test env; a bare run would be an unfaithful SQLite fallback" >> /tmp/check_gate_env_0ff16825-1ec9-4493-887b-d79171a21443.txt ;;
     esac
   fi
 fi

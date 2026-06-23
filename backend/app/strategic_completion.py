@@ -3792,17 +3792,9 @@ async def _handle_strategic_completion(
                         )
                     )
                     flag_modified(project, "capability_adoption_verdicts")
-                try:
-                    from app import release_version as _rv
-
-                    _new_focus = (new_pm_raw.get("intent") or {}).get("current_focus")
-                    await _rv.refresh_open_version_goal_if_auto_derived(
-                        session, project.id, _new_focus
-                    )
-                except Exception:
-                    logger.exception(
-                        "[STRATEGIC] Failed to refresh open version goal (non-fatal)"
-                    )
+                # version.goal is frozen at version-open; strategic cycles
+                # must NOT overwrite it with the evolving current_focus narrative.
+                # Operator-facing updates go via admin_agent_ops or set_version_goal.
         except Exception:
             logger.exception(
                 "[STRATEGIC] Failed to apply problem_model update (non-fatal)"
