@@ -10826,13 +10826,17 @@ class TestLaunchAgentCloudRunJob:
             "VM_INSTANCE_ID",
             "TASK_ID",
             "ORCHESTRATOR_URL",
-            "CLOUD_RUN_JOB",
             "PAYLOAD_URI",
             "AGENT_SECRET_VERSION",
         }
         assert set(env_dict.keys()) == baseline_keys, (
             f"Expected only baseline env keys without LLM params; got {set(env_dict.keys())}"
         )
+        # CLOUD_RUN_JOB is a Cloud Run *reserved* env name (the platform auto-sets
+        # it to the job name). Providing it in container_overrides makes run_job
+        # fail 400; the agent detects job mode from the platform-set value's
+        # presence, so the backend must NOT inject it.
+        assert "CLOUD_RUN_JOB" not in env_dict
         # Ensure no plaintext secrets are injected
         assert "AGENT_SECRET_TOKEN" not in env_dict
         assert "ANTHROPIC_API_KEY" not in env_dict
