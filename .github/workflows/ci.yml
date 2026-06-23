@@ -167,20 +167,33 @@ jobs:
         working-directory: ./admin-ui
         run: npm ci || { echo "::warning::npm ci failed (esbuild ETXTBSY postinstall race) - retrying once"; sleep 5; npm ci; }
 
-      - name: Install Playwright Chromium + system deps
-        # Required for the viewport suite (vitest browser-mode + chromium).
-        # Agent VMs lack libatk/libnss/libxkbcommon by default; CI gets a
-        # clean ubuntu-latest each run so we install on every job. Retry the
-        # Docker Hub / apt download to absorb transient registry blips.
+      - name: Cache Playwright Chromium browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # Keyed on the lockfile hash so it auto-invalidates whenever the
+          # resolved Playwright version changes — no manual key bump needed.
+          key: playwright-chromium-${{ hashFiles('admin-ui/package-lock.json') }}
+
+      - name: Install Playwright Chromium browser
+        # Downloads the ~100 MB binary only on a cache miss; served from
+        # ~/.cache/ms-playwright on a hit. Retry absorbs transient blips.
         working-directory: ./admin-ui
         run: |
           for i in 1 2 3; do
-            npx playwright install --with-deps chromium && exit 0
+            npx playwright install chromium && exit 0
             echo "::warning::playwright install failed (attempt $i/3) — retrying"
             sleep $((i * 10))
           done
           echo "::error::playwright install failed after 3 attempts"
           exit 1
+
+      - name: Install Playwright system dependencies
+        # libatk/libnss/libxkbcommon, etc. — these live in apt, not in
+        # ~/.cache/ms-playwright, so they must be installed every run (cannot
+        # be cached); without them chromium fails to launch even on a cache hit.
+        working-directory: ./admin-ui
+        run: npx playwright install-deps chromium
 
       - name: Viewport coverage invariants
         # Static guard (no browser): every operator component has a viewport
