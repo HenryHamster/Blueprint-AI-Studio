@@ -530,9 +530,12 @@ async def get_version_lifecycle(
                 session, project_id, open_row.opened_at
             )
             in_flight_count = await count_in_flight_tasks(session, project_id)
-            tasks_merged = await list_merged_tasks_for_version(
+            _tasks_merged_all = await list_merged_tasks_for_version(
                 session, project_id, open_row.opened_at
             )
+            _TASKS_MERGED_LIMIT = 50
+            tasks_merged = _tasks_merged_all[:_TASKS_MERGED_LIMIT]
+            tasks_merged_has_more = len(_tasks_merged_all) > _TASKS_MERGED_LIMIT
             qual = open_row.last_qualification or {}
             aggregate_serving, artifact_evidence = _version_serving_summary(
                 open_row, project_row
@@ -688,6 +691,9 @@ async def get_version_lifecycle(
                 # number for each merged task, newest-first. Allows operators to see
                 # exactly what shipped without manual release notes.
                 "tasks_merged": tasks_merged,
+                # True when the version has more than _TASKS_MERGED_LIMIT merged
+                # tasks; the UI can show a "showing N of total" indicator.
+                "tasks_merged_has_more": tasks_merged_has_more,
             }
 
         history_rows = (

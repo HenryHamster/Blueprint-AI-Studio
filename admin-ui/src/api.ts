@@ -1918,9 +1918,11 @@ export interface CurrentVersion {
   // this version outside the normal qualification flow.
   out_of_band_promotion?: OutOfBandPromotion | null;
   /** Per-task changelog for this version window: type, title, and PR number for
-   *  each merged task, newest-first. Allows operators to see what shipped without
-   *  manual release notes. */
+   *  each merged task, newest-first. Capped at 50 newest; tasks_merged_has_more
+   *  is true when the version has additional older tasks beyond the limit. */
   tasks_merged?: ChangelogEntry[];
+  /** True when the version has more merged tasks than the 50 returned. */
+  tasks_merged_has_more?: boolean;
   /** Acceptance-criteria bucket counts for all merged tasks in this version. */
   acceptance_aggregate?: Record<string, number> | null;
 }

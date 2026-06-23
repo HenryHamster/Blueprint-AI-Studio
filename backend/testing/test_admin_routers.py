@@ -10961,6 +10961,99 @@ class TestVersionLifecycleTasksMerged:
         current = resp.json()["current_version"]
         assert current["tasks_merged"] == []
 
+    @pytest.mark.asyncio
+    async def test_tasks_merged_has_more_when_over_limit(
+        self, client: AsyncClient, db_session
+    ):
+        """tasks_merged_has_more is True and tasks_merged is capped at 50 when the
+        version has more than 50 landed tasks."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="build")
+
+        over_limit = [
+            {"task_type": "fix", "title": f"task {i}", "pr_number": i, "pr_url": None}
+            for i in range(51)
+        ]
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=51),
+            ),
+            patch(
+                "app.release_version.list_merged_tasks_for_version",
+                new=AsyncMock(return_value=over_limit),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["tasks_merged_has_more"] is True
+        assert len(current["tasks_merged"]) == 50
+
+    @pytest.mark.asyncio
+    async def test_tasks_merged_has_more_false_when_at_or_under_limit(
+        self, client: AsyncClient, db_session
+    ):
+        """tasks_merged_has_more is False when the version has 50 or fewer tasks."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="build")
+
+        at_limit = [
+            {"task_type": "fix", "title": f"task {i}", "pr_number": i, "pr_url": None}
+            for i in range(50)
+        ]
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=50),
+            ),
+            patch(
+                "app.release_version.list_merged_tasks_for_version",
+                new=AsyncMock(return_value=at_limit),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["tasks_merged_has_more"] is False
+        assert len(current["tasks_merged"]) == 50
+
 
 class TestVersionLifecycleCurrentVersionHighlights:
     """GET /version-lifecycle exposes a what's-new ``highlights`` block (headline +

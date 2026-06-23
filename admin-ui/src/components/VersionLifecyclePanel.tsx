@@ -78,6 +78,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const [cuttingVersion, setCuttingVersion] = useState<boolean>(false);
   const [cutReason, setCutReason] = useState<string>('');
   const [expandedVersionId, setExpandedVersionId] = useState<string | null>(null);
+  const [changelogExpanded, setChangelogExpanded] = useState<boolean>(false);
   // One idempotency key per confirmed cut: generated on confirm, reused across
   // a lost-response retry, cleared on success so the next cut gets a fresh key.
   const cutIdempotencyKeyRef = useRef<string | null>(null);
@@ -421,7 +422,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
           <div className="space-y-1">
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-bold text-neutral-200">v{cv.version_number}</span>
-              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${cv.phase === 'stabilize' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-400'}`}>{cv.phase}</span>
+              <span className={`text-xs font-semibold px-1.5 py-0.5 rounded border ${cv.phase === 'stabilize' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-400'}`}>{cv.phase}</span>
               {cv.phase_changed_at && <span className="text-[10px] text-neutral-500">{timeAgo(cv.phase_changed_at)}</span>}
               <span className="text-[10px] text-neutral-500">{cv.merged_task_count} tasks merged</span>
               {cv.qualification_attempts > 0 && <span className="text-[10px] text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
@@ -539,7 +540,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             {cv.qualification_state && (
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700'}`}>
+                  <span className={`text-xs font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700'}`}>
                     {cv.qualification_state.state.replace(/_/g, ' ')}
                   </span>
                   <ServingStatusBadge
@@ -669,7 +670,25 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 <HistoricalAuditContext audit={cv.stale_audit} activeCandidateSha={cv.active_candidate_sha} />
               </div>
             )}
-            <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} />
+            {cv.tasks_merged !== undefined && (
+              <div>
+                <button
+                  onClick={() => setChangelogExpanded(v => !v)}
+                  className="flex items-center gap-1.5 text-xs text-neutral-400 hover:text-neutral-200 transition-colors py-0.5"
+                  data-testid="changelog-toggle"
+                  data-viewport-allow-small-target
+                >
+                  <span>{changelogExpanded ? '▾' : '▸'}</span>
+                  <span>What shipped</span>
+                  <span className="text-neutral-600">
+                    ({cv.merged_task_count} task{cv.merged_task_count !== 1 ? 's' : ''}{cv.tasks_merged_has_more ? ', showing 50 newest' : ''})
+                  </span>
+                </button>
+                {changelogExpanded && (
+                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} />
+                )}
+              </div>
+            )}
             {projectId && (
               <div data-testid="phase-controls" className="flex flex-wrap items-center gap-2 pt-1">
                 {cv.phase === 'build' ? (
@@ -790,7 +809,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         )}
         {verdicts.length > 0 && (
           <div data-testid="verdict-history">
-            <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
+            <p className="text-xs text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
             <ConfidenceSparkline verdicts={verdicts.slice(0, 8)} />
             <div className="space-y-1">
               {verdicts.slice(0, 8).map(v => (
@@ -816,7 +835,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         )}
         {recent.length > 0 && (
           <div>
-            <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
+            <p className="text-xs text-neutral-500 uppercase tracking-wide mb-1">History</p>
             <div className="space-y-1">
               {recent.slice(0, 4).map((v: RecentVersion) => {
                 const isExpanded = !!v.id && expandedVersionId === v.id;

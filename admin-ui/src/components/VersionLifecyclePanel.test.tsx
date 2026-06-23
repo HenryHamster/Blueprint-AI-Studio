@@ -3603,4 +3603,65 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.queryByTestId('confidence-sparkline')).not.toBeInTheDocument();
     });
   });
+
+  describe('changelog toggle', () => {
+    const TASKS: api.ChangelogEntry[] = [
+      { task_type: 'create', title: 'Add feature A', pr_number: 1, pr_url: null },
+      { task_type: 'fix', title: 'Fix bug B', pr_number: 2, pr_url: null },
+    ];
+
+    it('hides VersionSummaryPanel by default when tasks_merged is present', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({ tasks_merged: TASKS, merged_task_count: 2 }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      expect(screen.getByTestId('changelog-toggle')).toBeInTheDocument();
+      expect(screen.queryByTestId('version-summary-panel')).not.toBeInTheDocument();
+    });
+
+    it('expands VersionSummaryPanel when toggle is clicked', async () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({ tasks_merged: TASKS, merged_task_count: 2 }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+      expect(await screen.findByTestId('version-summary-panel')).toBeInTheDocument();
+    });
+
+    it('shows has_more indicator when tasks_merged_has_more is true', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 75,
+          tasks_merged_has_more: true,
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      expect(screen.getByTestId('changelog-toggle').textContent).toContain('showing 50 newest');
+    });
+
+    it('omits changelog toggle when tasks_merged is undefined', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({ tasks_merged: undefined }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      expect(screen.queryByTestId('changelog-toggle')).not.toBeInTheDocument();
+    });
+  });
 });
