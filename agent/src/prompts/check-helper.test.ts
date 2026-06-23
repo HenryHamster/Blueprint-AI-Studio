@@ -48,7 +48,7 @@ describe('writeCheckHelper — direct invocation', () => {
       testsOnMainBranch: true,
     });
 
-    const script = capturedScripts['/tmp/workspace/check'];
+    const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
     expect(script).toMatch(/^#!\/bin\/bash/);
     // Blueprint blocks are the default on the self-repo when no buildConfig is supplied.
@@ -123,7 +123,7 @@ describe('writeCheckHelper — direct invocation', () => {
       repo: 'BlueprintAIStudio',
       testsOnMainBranch: true,
     });
-    const script = capturedScripts['/tmp/workspace/check'];
+    const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
     const { execSync } = await import('child_process');
     // Pipe through stdin so we don't need a writable fs (vi.mock('fs') is in effect).
@@ -141,7 +141,7 @@ describe('writeCheckHelper — direct invocation', () => {
       testsOnMainBranch: true,
       mergeVerify: true,
     });
-    const script = capturedScripts['/tmp/workspace/check'];
+    const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
     // Derives affected backend test files from $CHANGED and runs them under the
     // sanctioned Postgres harness, routed through `run` so a failure lands in
@@ -171,7 +171,7 @@ describe('writeCheckHelper — direct invocation', () => {
       testsOnMainBranch: true,
       // mergeVerify omitted — review-feedback / non-conflict fixes are unchanged.
     });
-    const script = capturedScripts['/tmp/workspace/check'];
+    const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
     expect(script).not.toContain('merge-resolution closed-loop verify');
     expect(script).not.toContain('merge-resolution verify');
@@ -188,7 +188,7 @@ describe('writeCheckHelper — direct invocation', () => {
       testsOnMainBranch: true,
       mergeVerify: true,
     });
-    const script = capturedScripts['/tmp/workspace/check'];
+    const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
     const { execSync } = await import('child_process');
     // Pipe through stdin so we don't need a writable fs (vi.mock('fs') is in effect).
@@ -257,6 +257,40 @@ describe('writeCheckHelper — direct invocation', () => {
       });
     }).toThrow(/taskId contains unsafe characters/);
   });
+
+  it('writes to .check-task for the Blueprint self-repo and to check for foreign repos', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+
+    // Self-repo: must land in .check-task (gitignored), not in the tracked check file.
+    writeCheckHelper({
+      taskId: 'outfile-self',
+      workBranch: 'blueprint/outfile-self',
+      baseBranch: 'main',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+    });
+    expect(capturedScripts['/tmp/workspace/.check-task']).toBeDefined();
+    expect(capturedScripts['/tmp/workspace/check']).toBeUndefined();
+
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+
+    // Foreign repo: must land in check, not in .check-task.
+    writeCheckHelper({
+      taskId: 'outfile-foreign',
+      workBranch: 'blueprint/outfile-foreign',
+      baseBranch: 'main',
+      owner: 'some-org',
+      repo: 'some-other-repo',
+      testsOnMainBranch: true,
+    });
+    expect(capturedScripts['/tmp/workspace/check']).toBeDefined();
+    expect(capturedScripts['/tmp/workspace/.check-task']).toBeUndefined();
+  });
 });
 
 // ── Visual acceptance evidence success-path capture+upload ───────────────────
@@ -291,7 +325,7 @@ describe('writeCheckHelper — visual acceptance capture+upload (success path)',
 
     // WITHOUT a visual declaration: no capture+upload block at all.
     writeCheckHelper({ ...baseCfg, taskId: 'visual-off' });
-    const without = capturedScripts['/tmp/workspace/check'];
+    const without = capturedScripts['/tmp/workspace/.check-task'];
     expect(without).toBeDefined();
     expect(without).not.toContain('visual acceptance evidence capture+upload');
     expect(without).not.toContain('test:viewport:capture');
@@ -307,7 +341,7 @@ describe('writeCheckHelper — visual acceptance capture+upload (success path)',
       taskId: 'visual-on',
       visualAcceptance: { component: 'MetricsDashboard', width: 375 },
     });
-    const withVisual = capturedScripts['/tmp/workspace/check'];
+    const withVisual = capturedScripts['/tmp/workspace/.check-task'];
     expect(withVisual).toBeDefined();
     // It is a SUCCESS-path block: gated on no failed checks + admin-ui touched.
     expect(withVisual).toContain('visual acceptance evidence capture+upload (success path)');
@@ -327,7 +361,7 @@ describe('writeCheckHelper — visual acceptance capture+upload (success path)',
   it('the generated ./check is byte-identical outside the visual block (block-removal round-trips)', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({ ...baseCfg, taskId: 'visual-id' });
-    const without = capturedScripts['/tmp/workspace/check'];
+    const without = capturedScripts['/tmp/workspace/.check-task'];
 
     capturedScripts = {};
     vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
@@ -339,7 +373,7 @@ describe('writeCheckHelper — visual acceptance capture+upload (success path)',
       taskId: 'visual-id',
       visualAcceptance: { component: 'TaskCard', width: 768 },
     });
-    const withVisual = capturedScripts['/tmp/workspace/check'];
+    const withVisual = capturedScripts['/tmp/workspace/.check-task'];
 
     // Splice the visual block back out — the remainder must be byte-for-byte
     // identical to the no-declaration script (presence-gated, additive only).
@@ -360,7 +394,7 @@ describe('writeCheckHelper — visual acceptance capture+upload (success path)',
       taskId: 'visual-syntax',
       visualAcceptance: { component: 'OrchestratorHealthBar', width: 1280 },
     });
-    const script = capturedScripts['/tmp/workspace/check'];
+    const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
     const { execSync } = await import('child_process');
     execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -846,7 +880,7 @@ describe('writeCheckHelper — ci_failure selector verify gate (static)', () => 
       testsOnMainBranch: true,
       ciFailureSelectors,
     });
-    const script = capturedScripts['/tmp/workspace/check'];
+    const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
     return script;
   };
@@ -957,7 +991,7 @@ describe('writeCheckHelper — ci_failure selector verify gate (runtime)', () =>
       testsOnMainBranch: true,
       ciFailureSelectors,
     });
-    const script = capturedScripts['/tmp/workspace/check'];
+    const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
     return script;
   };
@@ -1119,7 +1153,7 @@ describe('writeCheckHelper — npm_ci_if_lock_changed runtime', () => {
       repo: 'BlueprintAIStudio',
       testsOnMainBranch: true,
     });
-    const script = capturedScripts['/tmp/workspace/check'];
+    const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
     return script;
   };

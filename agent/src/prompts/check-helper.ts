@@ -798,7 +798,14 @@ else
 fi
 `;
   const script = header + stackBlocks + visualCaptureBlock + footer;
-  fs.writeFileSync(`${WORKSPACE}/check`, script, { mode: 0o755 });
+  // For Blueprint self-repo, `check` is a committed static entrypoint that
+  // delegates to `.check-task` when present. Write the per-task generated
+  // script there (gitignored) so the tracked `check` file stays clean and
+  // free of per-run values (taskId, baseBranch, ci_failure selectors).
+  const outFile = isBlueprintSelfRepo(cfg.owner, cfg.repo)
+    ? `${WORKSPACE}/.check-task`
+    : `${WORKSPACE}/check`;
+  fs.writeFileSync(outFile, script, { mode: 0o755 });
 }
 
 /** Generic fallback ./check body for a non-Blueprint repo that supplied no
