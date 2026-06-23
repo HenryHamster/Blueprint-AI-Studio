@@ -1003,14 +1003,23 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
     if raw_attr:
         by_model = raw_attr.get("by_model") or []
         by_type = raw_attr.get("by_task_type") or []
+        by_failure_class = raw_attr.get("by_failure_class") or []
+        # Find the dominant non-MERGED failure class (highest cost).
+        dominant_failure_class = None
+        for fc_row in by_failure_class:
+            if fc_row.get("failure_class") != "MERGED":
+                dominant_failure_class = fc_row
+                break
         result["llm_cost_attribution"] = {
             "total_llm_usd": raw_attr.get("total_llm_usd"),
             "rework_share": raw_attr.get("rework_share"),
-            # Dominant driver signals: the single highest-cost model and task type
-            # so the strategist sees WHY llm_cost_per_merged_pr drifted, not just
-            # THAT it did.  Both are sorted desc by cost_usd by _compact_llm_cost_attribution.
+            # Dominant driver signals: the single highest-cost model, task type,
+            # and failure class so the strategist sees WHY llm_cost_per_merged_pr
+            # drifted, not just THAT it did. All are sorted desc by cost_usd by
+            # _compact_llm_cost_attribution.
             "dominant_model": by_model[0] if by_model else None,
             "dominant_task_type": by_type[0] if by_type else None,
+            "dominant_failure_class": dominant_failure_class,
         }
     return result
 

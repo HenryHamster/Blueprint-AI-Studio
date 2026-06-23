@@ -13381,6 +13381,47 @@ def test_summarize_efficiency_snapshot_empty_returns_empty():
     assert _summarize_efficiency_snapshot(None) == {}  # type: ignore[arg-type]
 
 
+def test_summarize_efficiency_snapshot_includes_dominant_failure_class():
+    """strategist efficiency-snapshot summary forwards the dominant non-MERGED
+    failure-class LLM cost (highest-cost failure mode excluding merged tasks)."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "axes": {
+            "cost_per_merged_pr": {
+                "current": 1.5,
+                "baseline": 2.0,
+                "drift_pct": -25.0,
+                "history": [],
+            }
+        },
+        "baseline_captured_at": "2026-04-05T00:00:00",
+        "last_snapshot_at": "2026-05-01T00:00:00",
+        "llm_cost_attribution": {
+            "total_llm_usd": 100.0,
+            "rework_share": 0.15,
+            "by_model": [
+                {"provider": "anthropic", "model": "claude-opus", "cost_usd": 50.0}
+            ],
+            "by_task_type": [{"task_type": "task_edit", "cost_usd": 75.0}],
+            # by_failure_class sorted by cost descending: context_limit (80) > MERGED (15) > import_error (5)
+            "by_failure_class": [
+                {"failure_class": "context_limit", "task_count": 2, "total_cost_usd": 80.0},
+                {"failure_class": "MERGED", "task_count": 3, "total_cost_usd": 15.0},
+                {"failure_class": "import_error", "task_count": 1, "total_cost_usd": 5.0},
+            ],
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    assert "llm_cost_attribution" in result
+    attr = result["llm_cost_attribution"]
+    assert attr["dominant_failure_class"] == {
+        "failure_class": "context_limit",
+        "task_count": 2,
+        "total_cost_usd": 80.0,
+    }
+
+
 # ── direction-linked knowledge in strategist payload ──────────────────────────
 
 
