@@ -1,0 +1,13 @@
+# Keep the Cloud Build / docker build context small. The Dockerfile only needs
+# package.json, package-lock.json, and src/ — everything below is local-dev or
+# build output that would bloat the upload (node_modules can be hundreds of MB).
+node_modules
+dist
+build
+coverage
+.vitest
+*.log
+.env
+.env.*
+*.tsbuildinfo
+.DS_Store

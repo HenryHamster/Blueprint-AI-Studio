@@ -8,3 +8,9 @@
 # which a clone does not carry. The agent's workspace-prep step installs that
 # config (registerSizeCapMergeDriver). See backend/testing/merge_size_limits.py.
 backend/testing/module_size_limits.json merge=sizecap
+
+# The agent Cloud Run Job build context must stay LF regardless of core.autocrlf.
+# A CRLF Dockerfile/.dockerignore handed to Cloud Build / docker can mis-parse
+# (RUN line-continuations, ignore patterns) on some engines.
+agent/Dockerfile text eol=lf
+agent/.dockerignore text eol=lf

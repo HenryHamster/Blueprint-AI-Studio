@@ -12,15 +12,17 @@ until the steps below are completed.
 | Dispatch routing (`launch_agent_cloud_run_job`) | code (dark-gated) | `backend/app/compute_cloud_run.py` |
 | Allowlist gate (`cloud_run_task_type_allowlist`, empty by default) | code (dark-gated) | runtime settings |
 | Cloud Run Job resource + IAM | Terraform | `infra/terraform/cloud_run.tf` (`google_cloud_run_v2_job.blueprint_agent_job`) |
-| Build & push the agent image to the job | **operator** | Cloud Build (manual / new config) |
+| Build & push the agent image to the job | **operator** (or CI) | `agent/Dockerfile` → `gcloud builds submit` |
 | `CLOUD_RUN_JOB_NAME` env on the orchestrator | **operator** | `backend/cloudbuild.yaml` `--set-env-vars` |
 | Enabling the allowlist | **operator** | `PATCH /api/admin/settings` |
 
-> The Job's env-var **secrets** are declared in Terraform (it does not deploy
-> via cloudbuild like the orchestrator service does), but the orchestrator's
-> own `CLOUD_RUN_JOB_NAME` value is added to `cloudbuild.yaml` — Cloud Run
-> service env-var content is owned there, not by Terraform (see the WARNING
-> block in `cloud_run.tf`).
+> The Job declares only **non-secret** base env in Terraform; it bakes **no**
+> credentials. The agent resolves its LLM/JWT credentials at runtime from Secret
+> Manager using the `AGENT_SECRET_VERSION` the backend injects per execution
+> (authenticated by the job's service-account token), so no secrets live on the
+> job. The orchestrator's own `CLOUD_RUN_JOB_NAME` value is added to
+> `cloudbuild.yaml` — Cloud Run *service* env-var content is owned there, not by
+> Terraform (see the WARNING block in `cloud_run.tf`).
 
 ## Enable Cloud Run Jobs for read-only task types
 
@@ -37,13 +39,20 @@ until the steps below are completed.
    ```
 
    The plan must show a new `google_cloud_run_v2_job` resource and a
-   `roles/run.developer` IAM binding, with **no changes** to the existing
-   `google_cloud_run_v2_service.orchestrator` service.
+   `roles/run.jobsExecutorWithOverrides` IAM binding (orchestrator SA → job),
+   with **no changes** to the existing
+   `google_cloud_run_v2_service.orchestrator` service. (A targeted apply was
+   verified safe — it touches only the job + its new `agent-job-sa`.)
 
 3. **Build & push the agent image into the job.** The job is created with the
    `cloudrun/container/hello` placeholder (and `ignore_changes` on the image,
-   so Terraform will not revert your push). Build the agent container from
-   `agent/src` and deploy it to the job, e.g.:
+   so Terraform will not revert your push). The image is built from
+   **`agent/Dockerfile`** — a deliberately **read-only-only** image (Node 20 +
+   the LLM CLIs + the agent app; no docker/postgres/playwright/pytest). Do NOT
+   route heavy/write types to it (see step 8). Consider pinning the LLM-CLI
+   versions to match the deployed VM image via `--build-arg`
+   (`CLAUDE_CODE_VERSION` / `CODEX_VERSION` / `GEMINI_VERSION`). Build and point
+   the job at it:
 
    ```bash
    gcloud builds submit agent \
@@ -51,6 +60,11 @@ until the steps below are completed.
    gcloud run jobs update blueprint-agent-job --region us-central1 \
      --image us-central1-docker.pkg.dev/$PROJECT_ID/blueprint-repo/blueprint-agent-job:latest
    ```
+
+   **Prerequisite:** the job's service account (`agent-job-sa`) must have
+   `roles/secretmanager.secretAccessor` on the agent credential secret, or
+   `resolveCredentialsFromSecretVersion` fails before the task is claimed. Grant
+   it if the Terraform doesn't already.
 
 4. **Verify the job exists** and is healthy:
 
@@ -77,18 +91,29 @@ until the steps below are completed.
    {"cloud_run_task_type_allowlist": ["memo", "web_research"]}
    ```
 
-7. **Watch per-type cost attribution** via `./fetch vm-cost-by-task-type` for
-   24–48h. Confirm the allowlisted types execute on Cloud Run (no dedicated
-   `e2-standard-2` VM) and complete successfully.
+7. **Watch per-type cost attribution** via the agent endpoint
+   `GET /projects/{project_id}/vm-cost` (`compute_vm_cost_by_task_type` in
+   `efficiency_snapshot.py`) for 24–48h. (There is no `./fetch` CLI — that
+   earlier reference was aspirational.) Confirm the allowlisted types execute on
+   Cloud Run (no dedicated `e2-standard-2` VM) and complete successfully.
 
-8. **Expand the allowlist** to short Tier A3 types once healthy — append:
+8. **Expand the allowlist** to the other light/zero-checkout read-only types once
+   healthy — append:
 
    ```text
-   review, panel_review, debug, perf, smoketest, verify_tests
+   review, panel_review, debug, perf
    ```
 
-   (`smoketest` / `verify_tests` get the heavier 2 vCPU / 4 GiB execution
-   shape automatically via the per-execution timeout/override logic.)
+   > ⚠️ **Do NOT add `smoketest` / `verify_tests` / `compute_experiment` (or any
+   > write type).** A previous version of this runbook claimed these "get the
+   > heavier 2 vCPU / 4 GiB shape automatically" — that is **not implemented**:
+   > `_resolve_machine_type` only stamps a cost-attribution sentinel string, the
+   > `RunJobRequest` sets no `resources` override, and the job template is fixed
+   > at 1 vCPU / 2 GiB. They also need docker-in-docker (`scripts/test-backend.sh`),
+   > which `agent/Dockerfile` deliberately omits. Routing them here would OOM /
+   > fail. Enabling them is a **follow-on project**: a real per-execution
+   > `resources` override (code) **plus** a separate heavier image with docker —
+   > not part of this activation.
 
 9. **Rollback** is immediate and per-type: remove any task type from
    `cloud_run_task_type_allowlist` and it reverts to the GCE VM path on the
