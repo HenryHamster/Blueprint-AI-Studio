@@ -21,6 +21,7 @@ import {
 } from './strategic-helpers.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
+  recordFormatRepairTokens, getLlmTelemetry,
 } from '../telemetry.js';
 import { attemptStructuredRepair } from './structured-repair.js';
 import { parseBackendTimestamp } from '../utils/time.js';
@@ -1054,13 +1055,20 @@ ${strategicChallengeSection}
       // path, with a clean exit, re-ask ONCE for the JSON only and re-extract.
       // Mirrors handleMemo / the audit handlers (see structured-repair.ts).
       if (completionLogs.warning && exitCode === 0) {
-        recordFormatMiss(completionLogs.missReason ?? 'no_matching_candidate');
-        recordFormatRepairAttempt();
+        recordFormatMiss(completionLogs.missReason ?? 'no_matching_candidate', 'strategic');
+        recordFormatRepairAttempt('strategic');
+        const tokensBefore = getLlmTelemetry();
         const retryRun = await attemptStructuredRepair(
           lastResultText || allOutput, STRATEGIC_COMPLETION_SCHEMA_HINT,
           'Running strategic execution (retry: emitting decisions)...',
           ws, statusRef, model, effort, disallowedTools,
           runClaudeCode, sendLog,
+        );
+        const tokensAfter = getLlmTelemetry();
+        recordFormatRepairTokens(
+          tokensAfter.total_input_tokens - tokensBefore.total_input_tokens,
+          tokensAfter.total_output_tokens - tokensBefore.total_output_tokens,
+          'strategic',
         );
         // For JSON-stream providers, lastResultText is the clean final answer
         // while allOutput is the raw provider stream where JSON keys may be
@@ -1076,7 +1084,7 @@ ${strategicChallengeSection}
         const retryHasMarkers = retryEffective.includes('"direction_operations"')
           && (retryEffective.includes('"problem_model"') || retryEffective.includes('"vision"'));
         if (retryHasMarkers && !retryLogs.warning) {
-          recordFormatRepairSuccess();
+          recordFormatRepairSuccess('strategic');
           completionLogs = retryLogs;
         } else {
           sendLog(ws, `[WARNING] Strategic self-repair re-ask did not yield parseable inline JSON; keeping fallback.\n`);

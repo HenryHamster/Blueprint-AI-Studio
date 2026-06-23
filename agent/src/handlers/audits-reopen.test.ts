@@ -207,6 +207,26 @@ describe('handleSecurityAudit — bounded self-repair on format miss', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
   });
+
+  it('includes prior allOutput content in the reopen prompt when audit progress file exists', async () => {
+    const { readFileSync, existsSync } = await import('fs');
+    const priorAnalysisContent = 'Found potential SQL injection in auth.py line 42. Reviewing pattern...';
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(priorAnalysisContent);
+
+    // First call: clean exit, no JSON
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'Analysis here.', lastResultText: '' });
+    // Second call (repair): valid findings
+    const repairedFindings = '[{"title":"SQL injection","severity":"high","description":"...","file_path":"app.py","line_number":10,"fix_prompt":"..."}]';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: repairedFindings });
+
+    await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Verify the second call (repair) includes prior analysis in the reopenPrompt
+    const repairCall = vi.mocked(runClaudeCode).mock.calls[1];
+    expect(repairCall[0]).toContain(priorAnalysisContent);
+    expect(repairCall[0]).toContain('## Prior Analysis');
+  });
 });
 
 // ── handleSelfAudit — bounded self-repair ─────────────────────────────────────
@@ -263,6 +283,26 @@ describe('handleSelfAudit — bounded self-repair on format miss', () => {
 
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
+  });
+
+  it('includes prior allOutput content in the reopen prompt when audit progress file exists', async () => {
+    const { readFileSync, existsSync } = await import('fs');
+    const priorAnalysisContent = 'Auditing sys-auth: test coverage 85%, friction 60%...';
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(priorAnalysisContent);
+
+    // First call: clean exit, no JSON
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'Analysis...', lastResultText: '' });
+    // Second call (repair): valid findings
+    const repairedObj = '{"system_id":"sys-auth","findings":[{"system_id":"sys-auth","score":72,"components":{"test_coverage":80,"friction_density":65,"claim_consistency":75,"failure_mix":70},"top_issues":["Missing tests"],"recommended_mode":"fundamentals","evidence":[{"file":"auth.py","summary":"..."}]}]}';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: repairedObj });
+
+    await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Verify the repair call includes prior analysis in the reopenPrompt
+    const repairCall = vi.mocked(runClaudeCode).mock.calls[1];
+    expect(repairCall[0]).toContain(priorAnalysisContent);
+    expect(repairCall[0]).toContain('## Prior Analysis');
   });
 });
 
@@ -326,5 +366,25 @@ describe('handleReleaseAudit — bounded self-repair on format miss', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('claude_code_failed');
+  });
+
+  it('includes prior allOutput content in the reopen prompt when audit progress file exists', async () => {
+    const { readFileSync, existsSync } = await import('fs');
+    const priorAnalysisContent = 'Reviewed diff: 5 files changed, 150 additions. Test erosion: no deleted tests. Security: no injection risks found.';
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(priorAnalysisContent);
+
+    // First call: clean exit, no JSON
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: 'Detailed analysis.', lastResultText: '' });
+    // Second call (repair): valid report
+    const repairedReport = '{"audit_score":0.9,"test_erosion":{"deleted_test_files":[],"assertion_delta":5,"test_count_delta":1},"findings":[]}';
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: repairedReport });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Verify the repair call includes prior analysis in the reopenPrompt
+    const repairCall = vi.mocked(runClaudeCode).mock.calls[1];
+    expect(repairCall[0]).toContain(priorAnalysisContent);
+    expect(repairCall[0]).toContain('## Prior Analysis');
   });
 });

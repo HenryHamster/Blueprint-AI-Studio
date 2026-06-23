@@ -141,8 +141,18 @@ describe('validateMergeGradeShape — RELEASE_MERGE_GRADE schema gate', () => {
     expect(res.ok).toBe(true);
   });
 
-  it('rejects a missing biggest_gap', () => {
+  it('accepts a missing biggest_gap when covers_goal=true (goal fully met)', () => {
     const res = validateMergeGradeShape({ covers_goal: true, coverage_score: 1 });
+    expect(res.ok).toBe(true);
+  });
+
+  it('accepts an empty biggest_gap when covers_goal=true', () => {
+    const res = validateMergeGradeShape({ covers_goal: true, biggest_gap: '', coverage_score: 1 });
+    expect(res.ok).toBe(true);
+  });
+
+  it('rejects a missing biggest_gap when covers_goal=false', () => {
+    const res = validateMergeGradeShape({ covers_goal: false, coverage_score: 0 });
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.reason).toBe('parsed_object_schema_mismatch');
@@ -356,15 +366,15 @@ describe('handleReleaseMergeGrade — pinned candidate + diff-range pre-flight',
     expect(parsed.biggest_gap).toBe('The persisted gate is missing — nothing blocks qualify.');
   });
 
-  it('reopens once to repair a grade missing biggest_gap, then COMPLETES', async () => {
-    // First handler-file read parses but is schema-invalid (no biggest_gap) →
+  it('reopens once to repair a grade missing biggest_gap when goal not fully covered, then COMPLETES', async () => {
+    // First handler-file read parses but is schema-invalid (covers_goal=false without biggest_gap) →
     // the bounded reopen path runs and the retry returns a valid grade.
-    vi.mocked(readHandlerOutput).mockReturnValue({ covers_goal: true, coverage_score: 1 });
+    vi.mocked(readHandlerOutput).mockReturnValue({ covers_goal: false, coverage_score: 0.5 });
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({
         exitCode: 0,
-        allOutput: JSON.stringify({ covers_goal: true, coverage_score: 1 }),
-        lastResultText: JSON.stringify({ covers_goal: true, coverage_score: 1 }),
+        allOutput: JSON.stringify({ covers_goal: false, coverage_score: 0.5 }),
+        lastResultText: JSON.stringify({ covers_goal: false, coverage_score: 0.5 }),
       })
       .mockResolvedValueOnce({
         exitCode: 0,
@@ -375,8 +385,8 @@ describe('handleReleaseMergeGrade — pinned candidate + diff-range pre-flight',
     await handleReleaseMergeGrade(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
-    // The first-run output parses but omits the required biggest_gap key, so the
-    // extractor's ground-truth miss reason is missing_required_key.
+    // The first-run output parses but omits the required biggest_gap key when goal not fully covered,
+    // so the extractor's ground-truth miss reason is missing_required_key.
     expectCalledWith(recordFormatMiss, 'missing_required_key', 'merge_grade');
     expectCalledWith(recordFormatRepairAttempt, 'merge_grade');
     expectCalledWith(recordFormatRepairSuccess, 'merge_grade');

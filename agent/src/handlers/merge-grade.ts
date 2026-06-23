@@ -59,11 +59,11 @@ function clampCoverageScore(raw: unknown): number | null {
 }
 
 /**
- * Validate the raw LLM output against the RELEASE_MERGE_GRADE contract. The
- * single load-bearing requirement is a non-empty `biggest_gap` — the gate's
- * entire value is naming the biggest unmet goal component, so an empty/missing
- * gap is a schema miss that triggers a focused reopen. A goal-coverage signal
- * (`covers_goal` boolean OR `coverage_score` number) must also be present.
+ * Validate the raw LLM output against the RELEASE_MERGE_GRADE contract. When
+ * covers_goal=true (goal fully met), `biggest_gap` may be empty or omitted since
+ * there is no unmet gap to name. When covers_goal=false or absent, a non-empty
+ * `biggest_gap` is required. A goal-coverage signal (`covers_goal` boolean OR
+ * `coverage_score` number) must always be present.
  */
 export function validateMergeGradeShape(raw: unknown): ParsedValueValidationResult {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -75,15 +75,28 @@ export function validateMergeGradeShape(raw: unknown): ParsedValueValidationResu
   }
   const obj = raw as Record<string, unknown>;
   const hasOwn = (key: string): boolean => Object.prototype.hasOwnProperty.call(obj, key);
-  if (!hasOwn('biggest_gap') || typeof obj.biggest_gap !== 'string' || obj.biggest_gap.trim() === '') {
+
+  const rawCoversGoal = typeof obj.covers_goal === 'boolean' ? obj.covers_goal : null;
+  const clampedScore = clampCoverageScore(obj.coverage_score);
+  const coversGoal = rawCoversGoal !== null
+    ? rawCoversGoal
+    : (clampedScore !== null ? clampedScore >= 0.5 : false);
+
+  // When covers_goal=true, biggest_gap may be empty/omitted. Otherwise, require it.
+  const gapValid = coversGoal
+    ? true // goal fully covered; no gap required
+    : (hasOwn('biggest_gap') && typeof obj.biggest_gap === 'string' && obj.biggest_gap.trim() !== '');
+  if (!gapValid) {
     return {
       ok: false,
       reason: 'parsed_object_schema_mismatch',
-      detail: 'release merge grade output missed a non-empty biggest_gap',
+      detail: coversGoal
+        ? 'internal validation error: gap should not be required when covers_goal=true'
+        : 'release merge grade output missed a non-empty biggest_gap when goal is not fully covered',
     };
   }
-  const hasCoverageSignal =
-    typeof obj.covers_goal === 'boolean' || clampCoverageScore(obj.coverage_score) !== null;
+
+  const hasCoverageSignal = rawCoversGoal !== null || clampedScore !== null;
   if (!hasCoverageSignal) {
     return {
       ok: false,
@@ -390,12 +403,28 @@ Rules:
   if (handlerOutput !== null && validateMergeGradeShape(handlerOutput).ok) {
     logs = sanitize(JSON.stringify(normalizeMergeGradeOutput(handlerOutput, candidateSha)));
   } else {
+    // Infer coverage state from the invalid output to determine whether biggest_gap is required during repair.
+    const handlerObj = (handlerOutput && typeof handlerOutput === 'object' && !Array.isArray(handlerOutput))
+      ? handlerOutput as Record<string, unknown>
+      : {};
+    const rawCoversGoal = typeof handlerObj.covers_goal === 'boolean' ? handlerObj.covers_goal : null;
+    const clampedScore = clampCoverageScore(handlerObj.coverage_score);
+    const coversGoalInferred = rawCoversGoal !== null
+      ? rawCoversGoal
+      : (clampedScore !== null ? clampedScore >= 0.5 : false);
+
+    // When covers_goal=true, biggest_gap is optional. Otherwise, require it.
+    const requiredKeys = coversGoalInferred ? [] : ['biggest_gap'];
+    const gapRequiredText = coversGoalInferred
+      ? ' (biggest_gap is not required when the goal is fully covered, but may be included if needed)'
+      : ' (one specific sentence naming the single biggest unmet goal requirement)';
+
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
-      requiredKeys: ['biggest_gap'],
+      requiredKeys,
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `Your prior release merge grade response did not end with a parseable JSON grade object.
-Output ONLY the JSON object now — with top-level "graded_candidate_sha" (use "${candidateSha}"), "covers_goal" (boolean), "coverage_score" (float 0..1), a non-empty "biggest_gap" (one specific sentence naming the single biggest unmet goal requirement), and a short "rationale". No markdown, no code fences, no prose.`,
+Output ONLY the JSON object now — with top-level "graded_candidate_sha" (use "${candidateSha}"), "covers_goal" (boolean), "coverage_score" (float 0..1), "biggest_gap"${gapRequiredText}, and a short "rationale". No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,

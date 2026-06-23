@@ -18,6 +18,7 @@
  * persisted as Artifacts and embedded in task context for downstream consumers.
  */
 
+import fs from 'fs';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
@@ -110,6 +111,20 @@ export function resolveCandidateSha(
   return null;
 }
 
+// Read the audit progress markdown the agent writes for retry context.
+// Returns the content prefixed with the standard analysis header so the reopen
+// prompt includes prior analysis, or undefined when the file is missing/empty.
+function readAuditProgress(taskId: string): string | undefined {
+  const path = `/tmp/audit_progress_${taskId}.md`;
+  try {
+    if (fs.existsSync(path)) {
+      const content = fs.readFileSync(path, 'utf-8').trim();
+      if (content) return `## Prior Analysis\n\n${content}`;
+    }
+  } catch { /* ignore */ }
+  return undefined;
+}
+
 // ── Handler: Security Audit (analyze codebase for vulnerabilities, output findings) ──
 export async function handleSecurityAudit(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -200,12 +215,14 @@ Rules:
   const findings = readHandlerOutput(taskId, 'security_findings', ws);
   let logs = findings !== null ? sanitize(JSON.stringify(findings)) : '';
   if (!logs) {
+    const priorAnalysis = readAuditProgress(taskId);
+    const priorAnalysisSection = priorAnalysis ? `${priorAnalysis}\n\n` : '';
     const repaired = await repairStructuredOutput<unknown[]>({
       mode: 'array',
       requiredKeys: ['severity'],
       schemaLabel: 'security_audit',
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `Your prior security audit response did not end with a parseable JSON findings array.
+      reopenPrompt: `${priorAnalysisSection}Your prior security audit response did not end with a parseable JSON findings array.
 Output ONLY the JSON array now — each finding must include at least "severity" plus title, description, file_path, line_number, and fix_prompt. Use [] if there are no findings. No markdown, no code fences, no prose.`,
       ws,
       statusRef,
@@ -359,12 +376,14 @@ Rules:
   if (handlerOutput !== null) {
     logs = sanitize(JSON.stringify(handlerOutput));
   } else {
+    const priorAnalysis = readAuditProgress(taskId);
+    const priorAnalysisSection = priorAnalysis ? `${priorAnalysis}\n\n` : '';
     const objRepair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['findings'],
       schemaLabel: 'self_audit',
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `Your prior self-audit response did not end with a parseable JSON object.
+      reopenPrompt: `${priorAnalysisSection}Your prior self-audit response did not end with a parseable JSON object.
 Output ONLY the JSON object now — with top-level "findings": [...] and each finding carrying "system_id", score, components, top_issues, recommended_mode, and evidence. No markdown, no code fences, no prose.`,
       ws,
       statusRef,
@@ -732,12 +751,14 @@ Rules:
   if (enrichedOutput !== null) {
     logs = sanitize(JSON.stringify(enrichedOutput));
   } else {
+    const priorAnalysis = readAuditProgress(taskId);
+    const priorAnalysisSection = priorAnalysis ? `${priorAnalysis}\n\n` : '';
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['audit_score', 'findings'],
       schemaLabel: 'release_audit',
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `Your prior release audit response did not end with a parseable JSON report object.
+      reopenPrompt: `${priorAnalysisSection}Your prior release audit response did not end with a parseable JSON report object.
 Output ONLY the JSON object now — with top-level "audit_score", "test_erosion", and "findings". Each finding must include "severity", "summary", "file", and "verification_note". No markdown, no code fences, no prose.`,
       ws,
       statusRef,

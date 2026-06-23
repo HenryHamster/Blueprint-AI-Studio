@@ -125,6 +125,7 @@ export type SchemaLabel =
   | 'thinker'
   | 'review_verdict'
   | 'panel_review_lens'
+  | 'strategic'
   | 'unknown';
 
 let _formatMissByReason: Record<string, number> = {}; // @per-role

@@ -26,7 +26,9 @@ import {
 import { extractJsonObjectDetailed, describeJsonExtractionResult, JsonExtractionError } from '../json-extract.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
+  recordFormatRepairTokens, recordFormatRepairMiss,
   type FormatMissReason,
+  getLlmTelemetry,
 } from '../telemetry.js';
 import { attemptStructuredRepair } from './structured-repair.js';
 
@@ -291,11 +293,18 @@ Rules:
     // Whether it succeeded is recorded after re-extraction below.
     if (firstAttempt.missReason !== null) recordFormatMiss(firstAttempt.missReason, 'memo');
     recordFormatRepairAttempt('memo');
+    const tokensBefore = getLlmTelemetry();
     const retryRun = await attemptStructuredRepair(
       lastResultText || allOutput, MEMO_SCHEMA_HINT,
       'Writing memo (retry)...',
       ws, statusRef, model, effort, disallowedTools,
       runClaudeCode, sendLog,
+    );
+    const tokensAfter = getLlmTelemetry();
+    recordFormatRepairTokens(
+      tokensAfter.total_input_tokens - tokensBefore.total_input_tokens,
+      tokensAfter.total_output_tokens - tokensBefore.total_output_tokens,
+      'memo',
     );
     retryExitCode = retryRun.exitCode;
     retryAllOutput = retryRun.allOutput;
@@ -306,7 +315,11 @@ Rules:
       buildSources(retryRun.lastResultText, retryRun.allOutput),
     );
     memoObj = retryAttempt.value;
-    if (memoObj !== null) recordFormatRepairSuccess('memo');
+    if (memoObj !== null) {
+      recordFormatRepairSuccess('memo');
+    } else if (retryExitCode === 0 && retryAttempt.missReason !== null) {
+      recordFormatRepairMiss(retryAttempt.missReason, 'memo');
+    }
   }
 
   if (memoObj === null) {
