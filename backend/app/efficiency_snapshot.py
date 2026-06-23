@@ -189,7 +189,7 @@ NESTED_METRIC_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)",
     },
     "llm_cost_attribution": {
-        "ground_truth": "Task.llm_*_tokens_banked + api_call_summary tokens priced via LLM_TOKEN_PRICING; self_repair_burn_share from Task.format_compliance_summary.format_repair_attempts",
+        "ground_truth": "Task.llm_*_tokens_banked + api_call_summary tokens priced via LLM_TOKEN_PRICING; self_repair_burn_share from Task.format_compliance_summary.format_repair_attempts; by_failure_class from Task.context.failure_category",
         "consumer": "read_baseline_with_drift -> llm_cost_attribution (strategic_spawning digest payload)",
     },
     "panel_review_effectiveness": {
@@ -2518,6 +2518,45 @@ def _qualification_infra_usd(versions: list[Any]) -> float | None:
     return round(total_usd, 6) if found_any else None
 
 
+def compute_llm_cost_by_failure_class(tasks: list[Task]) -> list[Dict[str, Any]]:
+    """Per-failure-class LLM cost rollup over the given tasks.
+
+    Buckets each task by ``task.context['failure_category']`` for failed/cancelled
+    tasks, or ``'MERGED'`` for tasks that landed on the integration branch.
+    Tasks with no failure_category and no merge signal are bucketed as ``'OTHER'``.
+
+    Returns a list sorted by ``total_cost_usd`` descending so the most expensive
+    failure class is first. Each row carries task_count alongside cost so operators
+    can distinguish high-volume cheap classes from low-volume expensive ones.
+    """
+    from collections import defaultdict
+
+    buckets: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"task_count": 0, "cost_usd": 0.0}
+    )
+
+    for t in tasks:
+        llm_cost, _ = _task_llm_cost(t)
+        if is_merged_completion(t):
+            failure_class = "MERGED"
+        else:
+            failure_class = (t.context or {}).get("failure_category") or "OTHER"
+        b = buckets[failure_class]
+        b["task_count"] += 1
+        b["cost_usd"] += llm_cost
+
+    return [
+        {
+            "failure_class": fc,
+            "task_count": b["task_count"],
+            "total_cost_usd": round(b["cost_usd"], 6),
+        }
+        for fc, b in sorted(
+            buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
+        )
+    ]
+
+
 def _compact_llm_cost_attribution(
     tasks: list[Task], qualification_infra_usd: float | None = None
 ) -> Dict[str, Any]:
@@ -2621,6 +2660,7 @@ def _compact_llm_cost_attribution(
     return {
         "by_model": by_model,
         "by_task_type": by_task_type,
+        "by_failure_class": compute_llm_cost_by_failure_class(tasks),
         "rework_share": rework.get("rework_share_of_total_llm_cost"),
         "total_llm_usd": total_usd,
         "unpriced_coverage": breakdown["totals"].get("unpriced_coverage_fraction"),

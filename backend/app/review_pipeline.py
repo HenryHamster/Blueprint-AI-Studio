@@ -1940,7 +1940,7 @@ async def _spawn_pipeline_task(
             and _is_pipeline_task_stale(t)
         ):
             from app.failure_classification import (
-                AGENT_TIMEOUT,
+                ADMIN_CANCEL,
                 persist_failure_category,
             )
             from sqlalchemy.orm.attributes import flag_modified
@@ -1959,7 +1959,7 @@ async def _spawn_pipeline_task(
                 f"Superseded by new {task_type} for PR #{pr_number}: "
                 f"no heartbeat for >{PIPELINE_TASK_STALE_MINUTES}min"
             )
-            persist_failure_category(t, AGENT_TIMEOUT)
+            persist_failure_category(t, ADMIN_CANCEL)
             flag_modified(t, "context")
             session.add(t)
             superseded_stale_task = True
@@ -2016,7 +2016,7 @@ async def _spawn_pipeline_task(
 
         if task_type == "fix" and t_type == "review":
             from app.failure_classification import (
-                AGENT_TIMEOUT,
+                ADMIN_CANCEL,
                 persist_failure_category,
             )
             from sqlalchemy.orm.attributes import flag_modified
@@ -2035,7 +2035,7 @@ async def _spawn_pipeline_task(
                 f"Superseded by fix on PR #{pr_number}: review was scoped to "
                 f"a pre-conflict / pre-CI-failure snapshot"
             )
-            persist_failure_category(t, AGENT_TIMEOUT)
+            persist_failure_category(t, ADMIN_CANCEL)
             flag_modified(t, "context")
             session.add(t)
             superseded_stale_task = True
@@ -2151,7 +2151,7 @@ async def _spawn_pipeline_task(
         # Cancel any remaining in-flight review/fix tasks on this PR chain so
         # they don't fail later with "PR closed without being merged" / BRANCH_GONE.
         from app.failure_classification import (
-            AGENT_TIMEOUT,
+            ADMIN_CANCEL,
             persist_failure_category,
         )
 
@@ -2177,7 +2177,7 @@ async def _spawn_pipeline_task(
                 f"Cancelled: review/fix loop terminated (churn halt) "
                 f"for PR #{pr_number}"
             )
-            persist_failure_category(_inflight, AGENT_TIMEOUT)
+            persist_failure_category(_inflight, ADMIN_CANCEL)
             flag_modified(_inflight, "context")
             session.add(_inflight)
             logger.info(

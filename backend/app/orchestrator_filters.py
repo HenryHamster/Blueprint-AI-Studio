@@ -1220,7 +1220,7 @@ async def filter_pipeline_duplicates(
         running_other = next((t for t in others if t.status in RUNNING), None)
         if running_other:
             from app.failure_classification import (
-                AGENT_TIMEOUT,
+                ADMIN_CANCEL,
                 persist_failure_category,
             )  # noqa: PLC0415
 
@@ -1230,7 +1230,7 @@ async def filter_pipeline_duplicates(
                 f"is already {running_other.status.value if hasattr(running_other.status, 'value') else running_other.status} "
                 f"on PR #{fp.get('pr_number')}"
             )
-            persist_failure_category(candidate, AGENT_TIMEOUT)
+            persist_failure_category(candidate, ADMIN_CANCEL)
             session.add(candidate)
             # If the dedup loser already opened a PR (race: candidate had run
             # past the spawn-time dedup window before this filter caught it),
@@ -1280,7 +1280,7 @@ async def filter_pipeline_duplicates(
                 oldest_queued.id,
             ):
                 from app.failure_classification import (
-                    AGENT_TIMEOUT,
+                    ADMIN_CANCEL,
                     persist_failure_category,
                 )  # noqa: PLC0415
 
@@ -1289,7 +1289,7 @@ async def filter_pipeline_duplicates(
                     f"Deduplicated: older QUEUED {fp.get('type')} task "
                     f"{str(oldest_queued.id)[:8]} already exists on PR #{fp.get('pr_number')}"
                 )
-                persist_failure_category(candidate, AGENT_TIMEOUT)
+                persist_failure_category(candidate, ADMIN_CANCEL)
                 session.add(candidate)
                 # See comment above re: c56fa118 / PR #5983.
                 from app.task_lifecycle import close_orphan_pr_if_any

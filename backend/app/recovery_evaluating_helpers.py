@@ -513,7 +513,7 @@ async def _supersede_long_queued_pipeline_tasks(
 
     Returns the count of tasks superseded so the caller can log it.
     """
-    from app.failure_classification import AGENT_TIMEOUT, persist_failure_category
+    from app.failure_classification import ADMIN_CANCEL, persist_failure_category
 
     cutoff = _utcnow() - timedelta(seconds=_QUEUED_PIPELINE_SUPERSEDE_AFTER_SECONDS)
     candidates = (
@@ -550,7 +550,7 @@ async def _supersede_long_queued_pipeline_tasks(
             f"queued >{_QUEUED_PIPELINE_SUPERSEDE_AFTER_SECONDS // 60}min "
             f"without claim, blocking parent recovery"
         )
-        persist_failure_category(t, AGENT_TIMEOUT)
+        persist_failure_category(t, ADMIN_CANCEL)
         session.add(t)
         superseded += 1
         logger.warning(

@@ -7866,3 +7866,74 @@ def test_llm_cost_attribution_strategic_cycle_counts_distinct_cycles():
     expected_total = round(2 * (400 * input_rate + 80 * output_rate), 6)
     assert sc["total_usd"] == pytest.approx(expected_total)
     assert sc["per_event_usd"] == pytest.approx(expected_total / 2)
+
+
+def test_llm_cost_by_failure_class_attributes_admin_cancel_to_own_bucket():
+    """LLM cost of an ADMIN_CANCEL/cancelled task is attributed to the ADMIN_CANCEL
+    bucket and a merged task's cost lands in MERGED — end-to-end through
+    _compact_llm_cost_attribution so the by_failure_class key is validated at the
+    seam that writes the durable daily snapshot.
+    """
+    import uuid
+
+    from app.efficiency_snapshot import (
+        LLM_TOKEN_PRICING,
+        _compact_llm_cost_attribution,
+        compute_llm_cost_by_failure_class,
+    )
+
+    project_id = uuid.uuid4()
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    # ADMIN_CANCEL task: CANCELLED status, failure_category = ADMIN_CANCEL, has LLM cost.
+    cancelled_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.CANCELLED,
+        context={"failure_category": "ADMIN_CANCEL"},
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 8,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Merged task: COMPLETED + pr_merged, no failure_category.
+    merged_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 4,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    tasks = [cancelled_task, merged_task]
+
+    # Verify the pure helper directly.
+    rows = compute_llm_cost_by_failure_class(tasks)
+    by_class = {r["failure_class"]: r for r in rows}
+
+    cancel_cost = round(2000 * input_rate + 400 * output_rate, 6)
+    merge_cost = round(1000 * input_rate + 200 * output_rate, 6)
+
+    assert "ADMIN_CANCEL" in by_class
+    assert by_class["ADMIN_CANCEL"]["task_count"] == 1
+    assert by_class["ADMIN_CANCEL"]["total_cost_usd"] == pytest.approx(cancel_cost)
+
+    assert "MERGED" in by_class
+    assert by_class["MERGED"]["task_count"] == 1
+    assert by_class["MERGED"]["total_cost_usd"] == pytest.approx(merge_cost)
+
+    # Verify it flows through _compact_llm_cost_attribution (the snapshot seam).
+    attribution = _compact_llm_cost_attribution(tasks)
+    assert "by_failure_class" in attribution
+    attr_by_class = {r["failure_class"]: r for r in attribution["by_failure_class"]}
+    assert "ADMIN_CANCEL" in attr_by_class
+    assert attr_by_class["ADMIN_CANCEL"]["total_cost_usd"] == pytest.approx(cancel_cost)
+    assert "MERGED" in attr_by_class
+    assert attr_by_class["MERGED"]["total_cost_usd"] == pytest.approx(merge_cost)
