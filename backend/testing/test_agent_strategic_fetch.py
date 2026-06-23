@@ -2199,6 +2199,76 @@ async def test_fetch_efficiency_snapshot(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot_includes_llm_cost_attribution(
+    client: AsyncClient, db_session
+):
+    """Efficiency snapshot includes llm_cost_attribution with by_task_type rows
+    and strategic_cycle_cost_per_event, and panel_review_effectiveness."""
+    from datetime import datetime, timezone
+
+    from app.models import TaskStatus
+
+    project = Project(name="LLM Attribution Test", user_id="test-user-llmattr")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token_task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-llmattr",
+    )
+    db_session.add(token_task)
+
+    # A completed create task with LLM cost data
+    create_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        updated_at=datetime.now(timezone.utc),
+        vm_provisioned_at=datetime.now(timezone.utc),
+        vm_stopped_at=datetime.now(timezone.utc),
+        context={
+            "llm_cost_usd": 0.05,
+            "llm_input_tokens": 1000,
+            "llm_output_tokens": 200,
+        },
+    )
+    db_session.add(create_task)
+
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-llmattr")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+
+    # Existing scalar fields still present
+    assert "cost_per_merged_pr" in data
+    assert "llm_cost_per_merged_pr" in data
+    assert "format_compliance" in data
+    assert data["window_days"] == 7
+
+    # New llm_cost_attribution block present with required sub-fields
+    assert "llm_cost_attribution" in data
+    attr = data["llm_cost_attribution"]
+    assert "by_task_type" in attr
+    assert "strategic_cycle_cost_per_event" in attr
+    assert "self_repair_burn_share" in attr
+    assert "total_llm_usd" in attr
+    assert isinstance(attr["by_task_type"], list)
+
+    # panel_review_effectiveness key present (may be None when no gate invocations)
+    assert "panel_review_effectiveness" in data
+
+
+@pytest.mark.asyncio
 async def test_fetch_efficiency_snapshot_rejects_cross_project(
     client: AsyncClient, db_session
 ):

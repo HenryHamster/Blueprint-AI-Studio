@@ -732,6 +732,25 @@ describe('runThinkerWithGate validateParsedValue guard', () => {
     expect(fsMockState.presentFiles.has(problemModelPath)).toBe(true);
     expect(result).toEqual({ ok: true, analysisText: 'analysis without JSON' });
   });
+
+  it('accepts partial problem_model update omitting intent (non-destructive merge) — no repair, file written', async () => {
+    // The prompt explicitly permits partial updates: "entries you omit are preserved".
+    // A legitimate partial update might omit intent entirely (only changing gaps or capabilities).
+    fsMockState.presentFiles.add(runningUpdatePath);
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"gaps":[{"id":"g-new","name":"new gap","priority":"high"}],"capabilities":[]}',
+        lastResultText: '{"gaps":[{"id":"g-new","name":"new gap","priority":"high"}],"capabilities":[]}',
+      });
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
+    expect(fsMockState.presentFiles.has(problemModelPath)).toBe(true);
+    expect(result).toEqual({ ok: true, analysisText: 'analysis without JSON' });
+  });
 });
 
 describe('buildThinkerPrompt on_automain annotation', () => {

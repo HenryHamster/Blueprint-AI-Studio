@@ -438,16 +438,23 @@ export async function runThinkerWithGate(
 
     problemModelRepair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
-      requiredKeys: ['intent'],
+      requiredKeys: [],
       schemaLabel: 'thinker',
       // Reject schema-template placeholder echoes (BUG_REPORT 8154c2d3 / PR #7435):
       // a repair session with insufficient context may echo back the schema reminder
       // text as actual values (e.g. purpose="<from analysis>" or purpose="..." or
       // empty string). Routing the guard here ensures recordFormatRepairSuccess only
       // fires when the value is actually accepted, not merely parseable.
+      // Accept partial problem_model updates that omit intent (entries omitted are
+      // preserved by non-destructive merge); validate intent.purpose when present.
       validateParsedValue: (value) => {
         const intent = (value as Record<string, unknown>).intent as Record<string, unknown> | undefined;
-        const purpose = typeof intent?.purpose === 'string' ? intent.purpose.trim() : '';
+        // Partial updates may omit intent entirely — that's legitimate. Only validate
+        // when intent is present.
+        if (intent == null) {
+          return { ok: true };
+        }
+        const purpose = typeof intent.purpose === 'string' ? intent.purpose.trim() : '';
         // Reject empty-string, '...', or a full XML/schema-tag value like
         // '<from analysis>'. A legitimate purpose starting with '<' but not
         // ending with '>' won't match the full-tag regex, so real values are safe.

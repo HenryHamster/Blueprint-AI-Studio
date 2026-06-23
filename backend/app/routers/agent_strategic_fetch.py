@@ -389,16 +389,19 @@ async def agent_fetch_efficiency_snapshot(
         AXIS_VM_REUSE_RATE,
         FORMAT_COMPLIANCE_KEY,
         _AXIS_WINDOW_DAYS,
+        _compact_llm_cost_attribution,
         _compute_cost_per_merged_pr,
         _compute_llm_cost_per_merged_pr,
         _compute_vm_reuse_rate,
         _load_recent_tasks,
+        compute_panel_review_effectiveness,
     )
     from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
 
     await _resolve_agent_project(project_id, token, session)
     tasks = await _load_recent_tasks(session, project_id)
     format_compliance = compute_format_compliance_metrics(tasks)
+    llm_cost_attribution = _compact_llm_cost_attribution(tasks)
     return {
         "status": "success",
         "data": {
@@ -406,6 +409,8 @@ async def agent_fetch_efficiency_snapshot(
             AXIS_VM_REUSE_RATE: _compute_vm_reuse_rate(tasks),
             AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
             FORMAT_COMPLIANCE_KEY: format_compliance,
+            "llm_cost_attribution": llm_cost_attribution,
+            "panel_review_effectiveness": compute_panel_review_effectiveness(tasks),
             "window_days": _AXIS_WINDOW_DAYS,
         },
     }
