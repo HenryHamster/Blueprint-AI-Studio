@@ -74,6 +74,25 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY src ./src
 
+# Run as a NON-ROOT user — mandatory, not cosmetic. Claude Code (and codex's
+# --dangerously-bypass-approvals-and-sandbox) HARD-REFUSE their permission-skip
+# flags under root/sudo: `claude -p ... --dangerously-skip-permissions` exits
+# immediately with "--dangerously-skip-permissions cannot be used with root/sudo
+# privileges for security reasons" (runners.ts:619,646). The GCE VM image runs
+# the agent as user `agent` (agent.pkr.hcl:214,246,255) so the flag is allowed;
+# this image previously ran as root, so EVERY LLM run died in ~5s and the
+# container still exited 0 (false green). The user name + home MUST be
+# `agent` / /home/agent and /opt/agent must be agent-owned: the agent writes LLM
+# credentials to hardcoded paths /home/agent/.claude.json and
+# /opt/agent/{openai,gemini}/ (index.ts:424-427), and Claude Code reads
+# ~/.claude.json via $HOME — so HOME must equal /home/agent for the written
+# config and the CLI's read to line up.
+RUN useradd -m -s /bin/bash agent \
+    && mkdir -p /opt/agent/openai /opt/agent/gemini \
+    && chown -R agent:agent /opt/agent /home/agent
+ENV HOME=/home/agent
+USER agent
+
 # Cloud Run Job entrypoint. The backend injects CLOUD_RUN_JOB=1 plus the
 # per-execution env (TASK_ID, AGENT_SECRET_VERSION, ORCHESTRATOR_URL, ...); the
 # agent claims one task, runs it, and exits.
