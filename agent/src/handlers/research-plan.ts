@@ -194,6 +194,13 @@ export function buildStrategicCompletionLogs(
   lastResultText: string | null | undefined,
 ): { logs: string; warning?: string; missReason?: import('../json-extract.js').JsonExtractionMissReason } {
   const fallbackLogs = sanitize(lastResultText || allOutput.slice(-50_000));
+
+  // Command-mode signal: presence of ./strategic commands means no inline JSON is expected.
+  // Skip legacy extraction entirely to avoid false-positive format misses on prose markers.
+  if (allOutput.includes('./strategic ')) {
+    return { logs: fallbackLogs };
+  }
+
   const hasDirectionOperations = allOutput.includes('"direction_operations"');
   const hasProblemModel = allOutput.includes('"problem_model"');
   const hasVision = allOutput.includes('"vision"');
