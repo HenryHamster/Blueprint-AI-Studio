@@ -540,11 +540,35 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('compute-command-log')).toBeNull();
   });
 
-  test('terminal job without command_log shows no command_log section', async () => {
+  test('terminal job with exit_code in polling_metadata shows exit code chip', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'FAILED',
+        outcome: 'FAILURE',
+        final_cost_usd: 0.5,
+        terminal_reason: 'command failed',
+        polling_metadata: { exit_code: 1 },
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const chip = await findByTestId('compute-exit-code');
+    expect(chip.textContent).toBe('exit 1');
+  });
+
+  test('active job does not show exit code chip even if present', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({ polling_metadata: { exit_code: 0 } }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-exit-code')).toBeNull();
+  });
+
+  test('terminal job without exit_code shows no exit code chip', async () => {
     fetchComputeJobs.mockResolvedValue([makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 })]);
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
-    expect(queryByTestId('compute-command-log')).toBeNull();
+    expect(queryByTestId('compute-exit-code')).toBeNull();
   });
 
   test('launch action calls onLaunchCompute from the empty compute workbench', async () => {

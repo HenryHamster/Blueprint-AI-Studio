@@ -252,6 +252,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                   ) : (
                     <span className="break-words">{job.terminal_reason ?? '—'}</span>
                   )}
+                  {!active && typeof (job.polling_metadata?.exit_code) === 'number' && (
+                    <span
+                      className="shrink-0 rounded border border-neutral-700 bg-neutral-800/60 px-1 py-0.5 text-[9px] text-neutral-400"
+                      data-testid="compute-exit-code"
+                    >
+                      exit {job.polling_metadata.exit_code as number}
+                    </span>
+                  )}
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   {!active && (
