@@ -493,6 +493,57 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(await findByRole('button', { name: 'Launch compute experiment' })).toBeTruthy();
   });
 
+  test('terminal job with command_log renders log text and truncated badge when truncated', async () => {
+    const terminalJob = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      polling_metadata: {
+        command_log: { text: 'step 1\nstep 2\nstep 3\ndone', truncated: false, byte_count: 24 },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue([terminalJob]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-command-log');
+    expect(block.textContent).toContain('step 1');
+    expect(block.textContent).toContain('done');
+    expect(block.textContent).not.toContain('truncated');
+  });
+
+  test('terminal job with truncated command_log shows truncated badge', async () => {
+    const terminalJob = makeJob({
+      status: 'FAILED',
+      outcome: 'FAILURE',
+      final_cost_usd: 0.5,
+      polling_metadata: {
+        command_log: { text: 'error: something went wrong\nexit 1', truncated: true, byte_count: 65536 },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue([terminalJob]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-command-log');
+    expect(block.textContent).toContain('truncated');
+    expect(block.textContent).toContain('error: something went wrong');
+  });
+
+  test('active job does not render command_log section', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        polling_metadata: { command_log: { text: 'running...', truncated: false, byte_count: 10 } },
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-command-log')).toBeNull();
+  });
+
+  test('terminal job without command_log shows no command_log section', async () => {
+    fetchComputeJobs.mockResolvedValue([makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 })]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-command-log')).toBeNull();
+  });
+
   test('launch action calls onLaunchCompute from the empty compute workbench', async () => {
     const onLaunchCompute = vi.fn();
     fetchComputeJobs.mockResolvedValue([]);

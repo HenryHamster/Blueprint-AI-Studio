@@ -591,7 +591,7 @@ describe('writeCheckHelper — config-driven pytest gate', () => {
     const script = await writeBackendPytestCheck('pytest');
     // The bare run still exists — taken when the Postgres test env is present
     // or the suite does not select its DB from env at all.
-    expect(script).toContain(`run "backend test" bash -c 'cd "backend" && pytest'`);
+    expect(script).toContain(`( cd "backend" && pytest )`);
     // Faithfulness probes: Postgres env detection + env-gated-conftest grep.
     expect(script).toContain('USE_TEST_POSTGRES');
     expect(script).toContain('postgresql*)');
@@ -616,7 +616,7 @@ describe('writeCheckHelper — config-driven pytest gate', () => {
   it('routes python -m pytest variants through the honest gate too', async () => {
     const script = await writeBackendPytestCheck('python3 -m pytest -x -q');
     expect(script).toContain('GATE-ENVIRONMENT');
-    expect(script).toContain(`run "backend test" bash -c 'cd "backend" && python3 -m pytest -x -q'`);
+    expect(script).toContain(`( cd "backend" && python3 -m pytest -x -q )`);
   });
 
   it('leaves non-pytest test commands byte-for-byte on the verbatim path', async () => {
@@ -663,7 +663,7 @@ describe('writeCheckHelper — config-driven pytest gate', () => {
     // The faithfulness ladder still applies.
     expect(script).toContain('GATE-ENVIRONMENT');
     expect(script).toContain('grep -qs USE_TEST_POSTGRES "service/api/conftest.py" "service/api"/*/conftest.py');
-    expect(script).toContain(`run "service/api test" bash -c 'cd "service/api" && pytest -q'`);
+    expect(script).toContain(`( cd "service/api" && pytest -q )`);
   });
 
   it('generated pytest-gate ./check passes `bash -n` syntax check', async () => {
@@ -679,6 +679,7 @@ describe('writeCheckHelper — config-driven pytest gate', () => {
   const runCheck = async (
     script: string,
     scenario: 'gate-env' | 'bare' | 'harness',
+    opts?: { pytestExit?: number },
   ): Promise<{ status: number; stdout: string; log: string }> => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
@@ -701,8 +702,9 @@ case "$*" in
   *) exit 0 ;;
 esac
 `, { mode: 0o755 });
-      // pytest shim: records that the bare command actually ran.
-      realFs.writeFileSync(realPath.join(bin, 'pytest'), '#!/bin/sh\necho pytest-ran >> "$LOGFILE"\nexit 0\n', { mode: 0o755 });
+      // pytest shim: records that the bare command actually ran, exits with caller-supplied code.
+      const pytestExit = opts?.pytestExit ?? 0;
+      realFs.writeFileSync(realPath.join(bin, 'pytest'), `#!/bin/sh\necho pytest-ran >> "$LOGFILE"\nexit ${pytestExit}\n`, { mode: 0o755 });
       if (scenario === 'gate-env') {
         // Env-gated conftest (the Blueprint shape) + no harness + no Postgres
         // env: a bare run would be the unfaithful SQLite fallback.
@@ -769,6 +771,41 @@ esac
     expect(r.log).toContain('harness-ran');
     expect(r.log).not.toContain('pytest-ran');
     expect(r.status).toBe(0);
+  });
+
+  // ── Exit-code non-blocking: exit 5 / exit 2 pass, exit 1 blocks ─────────────
+  // On external repos (e.g. stsbot2) the suite may collect no tests (exit 5) or
+  // fail collection because deps aren't installed (exit 2). Both were previously
+  // treated as test failures by `run`, hard-blocking `./pr open`. They should be
+  // non-blocking (a GATE-ENVIRONMENT marker is written); a real test failure
+  // (exit 1) must still block.
+
+  it('runtime: bare pytest exit 5 (no tests collected) is non-blocking — ./check passes', async () => {
+    const script = await writeBackendPytestCheck('pytest', 'smoke-exit5');
+    const r = await runCheck(script, 'bare', { pytestExit: 5 });
+    expect(r.log).toContain('pytest-ran');
+    // Exit 5 is non-blocking: ./check must pass so ./pr open can proceed.
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('PASS — all checks green');
+    expect(r.stdout).toContain('exit 5');
+  });
+
+  it('runtime: bare pytest exit 2 (collection error) is non-blocking — ./check passes', async () => {
+    const script = await writeBackendPytestCheck('pytest', 'smoke-exit2');
+    const r = await runCheck(script, 'bare', { pytestExit: 2 });
+    expect(r.log).toContain('pytest-ran');
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('PASS — all checks green');
+    expect(r.stdout).toContain('exit 2');
+  });
+
+  it('runtime: bare pytest exit 1 (real test failure) still blocks — ./check fails', async () => {
+    const script = await writeBackendPytestCheck('pytest', 'smoke-exit1');
+    const r = await runCheck(script, 'bare', { pytestExit: 1 });
+    expect(r.log).toContain('pytest-ran');
+    // A real test failure must block ./check (and therefore ./pr open).
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).toContain('FAIL');
   });
 });
 

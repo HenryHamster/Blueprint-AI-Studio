@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobs, killComputeJob, type ComputeJob } from '../api';
+import { analyzeComputeJob, fetchComputeJobs, killComputeJob, type ComputeJob, type ComputeJobCommandLog } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -424,6 +424,29 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                       </span>
                     )}
                     {chip}
+                  </div>
+                );
+              })()}
+              {(() => {
+                if (active) return null;
+                const cl = job.polling_metadata?.command_log as ComputeJobCommandLog | undefined | null;
+                if (!cl || typeof cl.text !== 'string' || !cl.text.trim()) return null;
+                const lines = cl.text.split('\n');
+                const displayLines = lines.length > 30 ? lines.slice(-30) : lines;
+                const clipped = lines.length > 30;
+                return (
+                  <div className="mt-1.5" data-testid="compute-command-log">
+                    <div className="flex items-center gap-1.5 mb-0.5 text-[10px] text-neutral-500 font-mono">
+                      <span>Command log</span>
+                      {(cl.truncated || clipped) && (
+                        <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-[9px] text-neutral-400">
+                          truncated
+                        </span>
+                      )}
+                    </div>
+                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-[9px] text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
+                      {displayLines.join('\n')}
+                    </pre>
                   </div>
                 );
               })()}

@@ -2782,6 +2782,12 @@ export interface ComputeRpcDiagnostic {
   reason?: string | null;
 }
 
+export interface ComputeJobCommandLog {
+  text: string;
+  truncated: boolean;
+  byte_count: number;
+}
+
 export interface ComputeJob {
   id: string;
   project_id: string;
