@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Network, Compass, Microscope, BookOpen, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare, CalendarClock } from 'lucide-react';
+import { Activity, Network, Compass, Microscope, BookOpen, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
@@ -333,9 +333,6 @@ export function HeaderBar(props: HeaderBarProps) {
     anyAutonomousEnabled,
     onPauseAllAutonomous,
   } = props;
-  const currentViewMode = viewMode;
-  const setViewMode = onSetViewMode;
-
   const [showMobileMenu, setShowMobileMenu] = useState(false);
   const [showMobileShortcuts, setShowMobileShortcuts] = useState(false);
   const mobileMenuRef = useRef<HTMLDivElement>(null);
@@ -437,14 +434,6 @@ export function HeaderBar(props: HeaderBarProps) {
               title="Pipeline view"
             >
               <Network className="w-4 h-4" />
-            </button>
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-            <button
-              onClick={() => setViewMode('timeline')}
-              className={`p-2 text-xs transition-colors ${currentViewMode === 'timeline' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
-              title="Timeline view"
-            >
-              <CalendarClock className="w-4 h-4" />
             </button>
           </div>
           {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
@@ -731,13 +720,6 @@ export function HeaderBar(props: HeaderBarProps) {
                 <span>Pipeline view</span>
               </button>
               <button
-                onClick={() => { setViewMode('timeline'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${currentViewMode === 'timeline' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-              >
-                <CalendarClock className="w-4 h-4 shrink-0" />
-                <span>Timeline view</span>
-              </button>
-              <button
                 onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
                 className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
               >
@@ -813,7 +795,7 @@ export function HeaderBar(props: HeaderBarProps) {
                       ['R', 'Refresh tasks'],
                       ['1', 'Kanban view'],
                       ['2', 'Pipeline view'],
-                      ['3', 'Timeline view'],
+                      ['3', 'Home view'],
                       ['D', 'Toggle directions'],
                       ['S', 'Toggle settings'],
                       ['M', 'Toggle metrics'],

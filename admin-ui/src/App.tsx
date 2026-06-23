@@ -14,9 +14,9 @@ import { KnowledgeBrowser } from './components/KnowledgeBrowser';
 import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
-import { fetchTask, apiFetch, API_BASE_URL, fetchSrMissedRetrospectives } from './api';
+import { fetchTask, apiFetch, API_BASE_URL } from './api';
 import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen, fetchBackendLastSeen, resolveLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
-import { SrMissedRetrospective, type SrMissedTask, type SrInvestigationSignal } from './components/SrTrendBreakdown';
+import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { AlertsBanner } from './components/AlertsBanner';
@@ -29,17 +29,14 @@ import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { DashboardHome } from './components/DashboardHome';
-import { SrMissedRetrospectivesPanel } from './components/SrMissedRetrospectivesPanel';
 import { BulkActionBar } from './components/BulkActionBar';
 import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
-import { TimelineView } from './components/TimelineView';
 import { downloadTaskCsv, orderTasksForKanbanExport } from './utils/taskCsv';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
-import { CatchUpPanel } from './components/CatchUpPanel';
 import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
@@ -49,11 +46,7 @@ import type { Task } from './components/TaskCard';
 // StatusBar removed — redundant connection info
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
-import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
-import { PipelineRegressionsPanel } from './components/PipelineRegressionsPanel';
-import { PlaybookPanel } from './components/PlaybookPanel';
-import { TaskTypeCatalogPanel } from './components/TaskTypeCatalogPanel';
 import { WarmVmPanel } from './components/WarmVmPanel';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
@@ -307,25 +300,6 @@ export default function App() {
     return () => { cancelled = true; };
   }, [s.showResearchBrowser, selectedProjectId]);
 
-  const [showSrMissed, setShowSrMissed] = useState(false);
-  const [srMissedTasks, setSrMissedTasks] = useState<SrMissedTask[]>([]);
-  const [srMissedLoading, setSrMissedLoading] = useState(false);
-  const [srMissedCategory, setSrMissedCategory] = useState('');
-  const [srMissedScope, setSrMissedScope] = useState('');
-  const [srMissedWindowDays, setSrMissedWindowDays] = useState<7 | 14 | 30>(14);
-  const [srMissedTruncated, setSrMissedTruncated] = useState(false);
-  const srMissedRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!showSrMissed || !selectedProjectId) return;
-    setSrMissedLoading(true);
-    fetchSrMissedRetrospectives(selectedProjectId, { days: srMissedWindowDays, page_size: 500 })
-      .then(r => {
-        setSrMissedTasks(r.items);
-        setSrMissedTruncated(r.items.length < r.total);
-      })
-      .catch(() => {})
-      .finally(() => setSrMissedLoading(false));
-  }, [showSrMissed, selectedProjectId, srMissedWindowDays]);
 
   // Open operator-spawned SR investigations, keyed by category — used to dedup spawning.
   const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
@@ -858,41 +832,6 @@ export default function App() {
         activeInvestigationTaskIds={srInvestigationTaskIds}
       />
 
-      {onDashboardHome && (
-        <CatchUpPanel
-          selectedProjectId={s.selectedProjectId}
-          projects={s.projects}
-          lastVisitTimestamp={s.lastVisitTimestamp}
-          refreshInterval={s.refreshInterval}
-          needsAttentionCount={s.needsAttentionCount}
-          onSelectTask={(task) => {
-            fetchTask(task.id).then(s.handleViewLogs).catch(() => {
-              s.addToast('Could not load task — it may have been deleted', 'error');
-            });
-          }}
-          onApprove={(taskId) => s.handleApprove(taskId)}
-          onRetry={(taskId) => s.handleRetry(taskId)}
-          onBulkApprove={(taskIds) => s.handleBulkAction('approve', taskIds)}
-          onBulkRetry={(taskIds) => s.handleBulkAction('retry', taskIds)}
-          wsRef={s.wsRef}
-          userEmail={s.user?.email ?? null}
-          onOpenActivityFeed={() => setShowActivityFeed(true)}
-        />
-      )}
-
-      {onDashboardHome && (
-        <DiagnosticsPanel
-          diagnostics={s.diagnostics}
-          onViewTask={handleViewTask}
-          handleRetry={s.handleRetry}
-          handleCancel={s.handleCancel}
-          setConfirmDialog={s.setConfirmDialog}
-        />
-      )}
-
-      {onDashboardHome && s.userRole === 'admin' && s.selectedProjectId && (
-        <PipelineRegressionsPanel projectId={s.selectedProjectId} />
-      )}
 
       {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
 
@@ -1062,31 +1001,7 @@ export default function App() {
           />
 
           {s.viewMode === 'home' ? (
-            <>
-              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} globalActiveCount={s.globalActiveCount} globalQueuedCount={s.globalQueuedCount} scopedActiveCount={s.scopedActiveCount} scopedQueuedCount={s.scopedQueuedCount} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onScopeClick={(scope) => { setSrMissedScope(scope); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })} userRole={s.userRole} /></ErrorBoundary>
-              {s.userRole === 'admin' && s.selectedProjectId && (
-                <ErrorBoundary level="panel">
-                  <SrMissedRetrospectivesPanel selectedProjectId={s.selectedProjectId} onSelectTask={handleViewTask} activeCategory={srMissedCategory} activeScope={srMissedScope} activeInvestigationTaskIds={srInvestigationTaskIds} />
-                </ErrorBoundary>
-              )}
-              <PlaybookPanel selectedProjectId={s.selectedProjectId} />
-              <TaskTypeCatalogPanel />
-              {s.selectedProjectId && (
-                <div ref={srMissedRef} className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
-                  <button
-                    onClick={() => { setShowSrMissed(v => { if (v) { setSrMissedCategory(''); setSrMissedScope(''); } return !v; }); }}
-                    className="text-xs font-medium text-neutral-400 hover:text-neutral-200"
-                  >
-                    Self-Review Missed Retrospectives {showSrMissed ? '▲' : '▼'}
-                  </button>
-                  {showSrMissed && (
-                    srMissedLoading
-                      ? <p className="text-[10px] text-neutral-500 mt-2">Loading…</p>
-                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} selectedCategory={srMissedCategory} windowDays={srMissedWindowDays} onWindowDaysChange={setSrMissedWindowDays} truncated={srMissedTruncated} /></div>
-                  )}
-                </div>
-              )}
-            </>
+            <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} globalActiveCount={s.globalActiveCount} globalQueuedCount={s.globalQueuedCount} scopedActiveCount={s.scopedActiveCount} scopedQueuedCount={s.scopedQueuedCount} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })} userRole={s.userRole} /></ErrorBoundary>
           ) : s.viewMode === 'kanban' ? (
             <ErrorBoundary level="panel">
             <KanbanBoard
@@ -1154,17 +1069,7 @@ export default function App() {
               />
             </main>
             </ErrorBoundary>
-          ) : (
-            <ErrorBoundary level="panel">
-            <main className="flex-1 overflow-hidden flex flex-col">
-              <TimelineView
-                tasks={filteredTasks}
-                hasActiveFilters={hasActiveFilters}
-                onViewLogs={s.handleViewLogs}
-              />
-            </main>
-            </ErrorBoundary>
-          )}
+          ) : null}
 
           {s.viewMode !== 'home' && <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />}
         </>

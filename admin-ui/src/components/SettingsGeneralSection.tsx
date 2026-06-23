@@ -130,7 +130,6 @@ export function SettingsGeneralSection({
             >
               <option value="kanban">Kanban</option>
               <option value="pipeline">Pipeline</option>
-              <option value="timeline">Timeline</option>
             </select>
           </div>
           <div>
