@@ -5806,6 +5806,61 @@ async def test_run_qualification_no_merge_grade_child_when_goal_empty(
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_no_merge_grade_child_when_goal_contentless(
+    db_session, mocker
+):
+    """When version.goal is a contentless placeholder ('test'), run_qualification
+    skips the merge_grade child — treats contentless == empty.  This prevents
+    placeholder goals from hard-blocking promotion (e.g. v18 wedge via goal='test').
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Set a contentless placeholder goal — should behave the same as no goal.
+    version.goal = "test"
+    db_session.add(version)
+    await db_session.commit()
+
+    candidate = "aaaa" * 10
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+
+    await db_session.refresh(version)
+    assert version.last_qualification.get("merge_grade_task_id") is None, (
+        "contentless goal should be treated as empty — no merge_grade child"
+    )
+
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task_types = [(t.first_payload or {}).get("type") for t in tasks]
+    assert "release_merge_grade" not in task_types, (
+        "no merge_grade child should be spawned when goal is a contentless placeholder"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_no_credentials(db_session, mocker):
     """With no resolvable GitHub token, run_qualification records an error and
     does not spawn children."""
@@ -10512,15 +10567,15 @@ async def test_promote_end_to_end_over_custom_branch_pair(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_promote_success_snapshots_current_focus_as_next_goal(db_session, mocker):
-    """The next version (N+1) opened by a successful promotion snapshots the
-    project's current_focus into its ``goal``.
+async def test_promote_opens_next_version_with_null_goal(db_session, mocker):
+    """The next version (N+1) opened by a successful promotion starts with goal=None.
 
-    Regression: ``_record_promotion_success`` referenced an undefined ``project``
-    when reading current_focus, so the NameError was always swallowed and every
-    promotion opened v(N+1) with goal=None instead of the real focus.
+    The strategic agent will author the objective in its first cycle after
+    version-open (via new_version_goal output field), replacing the old
+    auto-copy of current_focus.
     """
     project, version = await _make_project_and_version(db_session)
+    # current_focus is set but should NOT be copied to the next version's goal.
     focus = "Promote v1 and stabilize the qualifier loop."
     project.problem_model = {"intent": {"current_focus": focus}}
     db_session.add(project)
@@ -10551,7 +10606,8 @@ async def test_promote_success_snapshots_current_focus_as_next_goal(db_session, 
     next_version = await rv.current_open_version(db_session, project.id)
     assert next_version is not None
     assert next_version.version_number == 2
-    assert next_version.goal == focus
+    # goal is None — strategist authors it in the first cycle after version-open.
+    assert next_version.goal is None
 
 
 @pytest.mark.asyncio
@@ -20823,18 +20879,15 @@ async def test_finalize_records_version_acceptance_aggregate_ignores_post_termin
 
 
 @pytest.mark.asyncio
-async def test_connected_success_promotion_lifecycle_includes_goal_snapshot(
+async def test_connected_success_promotion_lifecycle_opens_next_version_null_goal(
     db_session, mocker
 ):
     """Success branch: _finalize_qualification with a confident composite
     promotes, records v1 as promoted, opens v2 with base_sha = the real merge
-    commit AND goal snapshotted from the project's current_focus.
+    commit AND goal=None (no longer auto-copied from current_focus).
 
-    The goal regression (goal=None on every promotion — a NameError in
-    _record_promotion_success that was always swallowed) is only caught in the
-    CONNECTED flow because the isolated promote() unit test passes the project
-    in directly, bypassing the load path that previously referenced an undefined
-    variable.  This test exercises the connected chain.
+    The strategist will author the goal in its first cycle after version-open
+    via the new_version_goal output field.
     """
     from app import shared_state
 
@@ -20896,13 +20949,14 @@ async def test_connected_success_promotion_lifecycle_includes_goal_snapshot(
     assert version.status == "promoted"
     assert version.promoted_sha == merge_sha
 
-    # v2 was opened: base_sha = the REAL merge commit AND goal = current_focus.
+    # v2 was opened with the real merge base_sha; goal starts as None.
     next_version = await rv.current_open_version(db_session, project.id)
     assert next_version is not None
     assert next_version.version_number == 2
     assert next_version.phase == "build"
     assert next_version.base_sha == merge_sha
-    assert next_version.goal == focus
+    # goal is None — strategist authors it in the first cycle, not at version-open.
+    assert next_version.goal is None
 
 
 @pytest.mark.asyncio
@@ -26020,6 +26074,52 @@ class TestEvaluateMergeGrade:
         )
         assert result["status"] == "unparseable"
         assert result["blocked"] is True
+
+    def test_not_applicable_when_goal_is_contentless_test(self):
+        """'test' is a contentless placeholder — not_applicable, blocked=False (no wedging)."""
+        result = rs.evaluate_merge_grade("test", {"covers_goal": False})
+        assert result["status"] == "not_applicable"
+        assert result["blocked"] is False
+
+    def test_not_applicable_when_goal_is_contentless_na(self):
+        """'n/a' is a contentless placeholder — not_applicable, blocked=False."""
+        result = rs.evaluate_merge_grade("n/a", {"covers_goal": False})
+        assert result["status"] == "not_applicable"
+        assert result["blocked"] is False
+
+    def test_not_applicable_when_goal_is_contentless_tbd(self):
+        """'tbd' is a contentless placeholder — not_applicable, blocked=False."""
+        result = rs.evaluate_merge_grade("TBD", {"covers_goal": False})
+        assert result["status"] == "not_applicable"
+        assert result["blocked"] is False
+
+    def test_real_goal_with_word_test_in_it_is_not_contentless(self):
+        """'test the authentication flow' is a real goal, not a placeholder."""
+        result = rs.evaluate_merge_grade(
+            "test the authentication flow", {"covers_goal": True}
+        )
+        assert result["status"] == "pass"
+        assert result["blocked"] is False
+
+
+class TestIsContentlessGoal:
+    """Unit tests for is_contentless_goal helper."""
+
+    def test_contentless_words(self):
+        """Single-word placeholders are contentless."""
+        from app.release_scoring import is_contentless_goal
+
+        for word in ["test", "n/a", "na", "tbd", "todo", "placeholder", "none", "null"]:
+            assert is_contentless_goal(word), f"{word!r} should be contentless"
+            assert is_contentless_goal(word.upper()), f"{word.upper()!r} should be contentless"
+
+    def test_real_goal_is_not_contentless(self):
+        """A substantive goal is not contentless."""
+        from app.release_scoring import is_contentless_goal
+
+        assert not is_contentless_goal("deliver the design-system token layer")
+        assert not is_contentless_goal("test the authentication flow")
+        assert not is_contentless_goal("ship v18 with 0 text-color literals")
 
 
 # ===========================================================================

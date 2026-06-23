@@ -4749,23 +4749,14 @@ async def _spawn_strategic_review(
                     logger.exception(
                         "[STRATEGIC] could not resolve integration branch SHA for bootstrap"
                     )
-                # Snapshot the project's current focus as the version's goal.
-                _bootstrap_goal: str | None = None
-                try:
-                    _bootstrap_goal = (
-                        parse_problem_model(project.problem_model).intent.current_focus
-                        or None
-                    )
-                except Exception:
-                    logger.exception(
-                        "[STRATEGIC] could not read current_focus for version goal"
-                    )
+                # goal opens as None — the strategic agent will author the
+                # objective in its first cycle (via new_version_goal output).
                 _open_version = await ensure_initial_release_version(
                     session,
                     project.id,
                     integration_branch=_integration_branch,
                     base_sha=_bootstrap_sha,
-                    goal=_bootstrap_goal,
+                    goal=None,
                     promotion_target=_promotion_target,
                 )
             if _open_version is not None:
@@ -4803,6 +4794,13 @@ async def _spawn_strategic_review(
                         artifact_evidence=_open_artifacts,
                     ),
                     "tasks_merged_this_version": _tasks_merged,
+                    # Signals the strategist to author the objective this cycle.
+                    # Absent once the goal is set (null goal → action needed).
+                    **(
+                        {"goal_needed": True}
+                        if _open_version.goal is None
+                        else {}
+                    ),
                 }
             # Enrich with cross-version promotion-readiness trend.  Best-effort:
             # absent when no QualificationVerdict rows exist yet.
@@ -5339,8 +5337,10 @@ async def _spawn_strategic_review(
                 f"NOT yet treat the milestone as fully shipped; the sweep will "
                 f"resolve it to serving_confirmed, confirmation_timed_out, or "
                 f"deploy_failed shortly. You may begin setting v{_cur_n}'s "
-                f"mission, but do not declare v{_prior_n} live until serving is "
-                f"confirmed, and do NOT re-promote/re-qualify v{_prior_n}."
+                f"mission: output `new_version_goal` with a 1-3 sentence "
+                f"concrete, outcome-framed objective for v{_cur_n}. Do not "
+                f"declare v{_prior_n} live until serving is confirmed, and do "
+                f"NOT re-promote/re-qualify v{_prior_n}."
                 f"{_artifact_txt}"
             )
         else:
@@ -5353,17 +5353,20 @@ async def _spawn_strategic_review(
                 f"that is already done and merged to {_target} (cross-check "
                 f"`version_phase.recent_versions` and `deployment_state` — "
                 f"v{_prior_n} is recorded there with status='promoted'). The "
-                f"`goal` field on v{_cur_n} is a frozen version-open snapshot "
-                f"that still reads as v{_prior_n}'s promotion mission — treat it "
-                f"as STALE CARRY-OVER, not a live directive, and disregard its "
-                f"promote/qualify framing. A null "
+                f"`goal` field on v{_cur_n} is null — this version has no "
+                f"objective yet (the old auto-copy of current_focus has been "
+                f"removed). A null "
                 f"`version_phase.last_qualification` on v{_cur_n} means this "
                 f"fresh version has not yet begun its OWN qualification (expected "
                 f"for a just-opened version) — it does NOT mean v{_prior_n}'s "
-                f"promotion is pending or failed. As your first action this "
-                f"cycle, set v{_cur_n}'s real mission: rewrite "
+                f"promotion is pending or failed. As your FIRST action this "
+                f"cycle, author v{_cur_n}'s objective: (1) rewrite "
                 f"`intent.current_focus` to state what v{_cur_n} is for (not what "
-                f"v{_prior_n} achieved), retire directions v{_prior_n} already "
+                f"v{_prior_n} achieved); (2) output `new_version_goal` — a 1-3 "
+                f"sentence concrete, outcome-framed objective for v{_cur_n} (this "
+                f"is stored as the frozen version goal the blind merge-grade will "
+                f"score merged diffs against; write it as a DELIVERABLE statement, "
+                f"not a status line); (3) retire directions v{_prior_n} already "
                 f"satisfied, and propose the directions the next milestone needs."
             )
         prompt_suffix = (

@@ -14713,3 +14713,188 @@ async def test_open_questions_audit_api_path(question_db, mocker):
         "QUESTION" in t or "unanswered" in t or "question" in t.lower()
         for t in alert_texts
     ), f"Expected a QUESTION-related alert, got: {alert_texts}"
+
+
+# ===========================================================================
+# new_version_goal dispatch in _handle_strategic_completion
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_handle_strategic_completion_sets_new_version_goal(db_session, mocker):
+    """When the strategist outputs new_version_goal and the open version has no
+    goal yet, set_version_goal is called with source='strategist' and the goal
+    is stored on the version."""
+    from unittest.mock import AsyncMock
+
+    from app import release_version as rv
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GoalAuthor",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(
+        db_session, project.id, version_number=2, goal=None
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal is None
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "strategic_review",
+                "prompt": "review",
+                "vision": {"revision": 1},
+            }
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "new_version_goal": (
+                "deliver the design-system token layer with 0 text-color literals"
+            )
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(version)
+
+    assert version.goal == (
+        "deliver the design-system token layer with 0 text-color literals"
+    ), f"Expected strategist goal to be stored; got {version.goal!r}"
+    assert version.goal_editor_info is not None
+    assert version.goal_editor_info.startswith("[strategist:"), (
+        f"goal_editor_info must use source='strategist'; got {version.goal_editor_info!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_strategic_completion_skips_new_version_goal_when_already_set(
+    db_session, mocker
+):
+    """When the open version already has a goal, new_version_goal from the
+    agent output does not overwrite it — the goal is frozen once authored."""
+    from unittest.mock import AsyncMock
+
+    from app import release_version as rv
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GoalFrozen",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal=None
+    )
+    await db_session.commit()
+
+    rv.set_version_goal(
+        version, "original strategist goal", editor_id="abc12345", source="strategist"
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal == "original strategist goal"
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "strategic_review",
+                "prompt": "review",
+                "vision": {"revision": 1},
+            }
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps({"new_version_goal": "replacement goal that must be ignored"})
+
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(version)
+
+    assert version.goal == "original strategist goal", (
+        f"Goal must be frozen once authored; got {version.goal!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_strategic_completion_rejects_contentless_new_version_goal(
+    db_session, mocker
+):
+    """A contentless new_version_goal (e.g. 'test') must not be applied.
+
+    The is_contentless_goal guard must fire and leave version.goal as None,
+    so a placeholder goal never wedges a release by producing merge_grade
+    confidence 0.0."""
+    from unittest.mock import AsyncMock
+
+    from app import release_version as rv
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="ContentlessGoal",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal=None
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal is None
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "strategic_review",
+                "prompt": "review",
+                "vision": {"revision": 1},
+            }
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps({"new_version_goal": "test"})
+
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(version)
+
+    assert version.goal is None, (
+        f"Contentless goal 'test' must not be stored; got {version.goal!r}"
+    )

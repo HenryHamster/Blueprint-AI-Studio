@@ -190,6 +190,7 @@ from app.release_scoring import (
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
     evaluate_merge_grade,
+    is_contentless_goal,
 )
 from app.acceptance_gate import summarize_version_acceptance_aggregate
 from app.release_stall_alerts import (
@@ -1406,10 +1407,12 @@ async def run_qualification(
     merge_grade_task_id: str | None = None
     # Blind merge-grade gate (dir d-c0fe439f): grade the merged diffs against the
     # frozen goal.  The goal is the ONLY narrative the grader sees — the spawn
-    # helper enforces blindness to running_update.  When the goal is empty there
-    # is nothing to grade against, so no child is spawned and the finalize gate
-    # is a no-op PASS (see _finalize_qualification).
+    # helper enforces blindness to running_update.  When the goal is empty or a
+    # contentless placeholder (e.g. "test", "n/a") there is nothing to grade
+    # against, so no child is spawned and the finalize gate is a no-op PASS (see
+    # _finalize_qualification).  Contentless == empty for this purpose.
     version_goal = (version.goal or "").strip()
+    _merge_grade_goal_usable = bool(version_goal) and not is_contentless_goal(version_goal)
     try:
         audit_task = await _spawn_release_audit_task(
             session,
@@ -1421,7 +1424,7 @@ async def run_qualification(
             version_goal=version.goal,
         )
         audit_task_id = str(audit_task.id)
-        if version_goal:
+        if _merge_grade_goal_usable:
             merged_pr_numbers = await _merged_pr_numbers_for_version(session, version)
             merge_grade_task = await _spawn_release_merge_grade_task(
                 session,
