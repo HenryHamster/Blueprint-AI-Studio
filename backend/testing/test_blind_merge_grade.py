@@ -828,3 +828,80 @@ class TestValidVerdicts:
             raw = f'{{"coverage_verdict": "{verdict}", "biggest_gap": "test"}}'
             parsed = bmg._parse_grade(raw)
             assert parsed["coverage_verdict"] == verdict
+
+
+# ===========================================================================
+# Token usage tracking in _grade_once and compute_blind_merge_grade
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_grade_once_captures_token_usage(monkeypatch):
+    """_grade_once captures input/output token counts from resp.usage."""
+    mock_usage = MagicMock()
+    mock_usage.input_tokens = 500
+    mock_usage.output_tokens = 120
+
+    mock_content = MagicMock()
+    mock_content.text = '{"coverage_verdict": "covers", "biggest_gap": "minor gap"}'
+
+    mock_resp = MagicMock()
+    mock_resp.content = [mock_content]
+    mock_resp.usage = mock_usage
+
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_resp)
+
+    monkeypatch.setattr(
+        "app.blind_merge_grade._anthropic"
+        if hasattr(bmg, "_anthropic")
+        else "anthropic.AsyncAnthropic",
+        lambda api_key: mock_client,
+        raising=False,
+    )
+
+    with patch("anthropic.AsyncAnthropic", return_value=mock_client):
+        result = await bmg._grade_once(
+            "sk-test", "claude-opus-4-8", "prompt", allow_retry=False
+        )
+
+    assert result is not None
+    assert result["input_tokens"] == 500
+    assert result["output_tokens"] == 120
+    assert result["coverage_verdict"] == "covers"
+
+
+@pytest.mark.asyncio
+async def test_compute_blind_merge_grade_includes_token_counts(monkeypatch):
+    """compute_blind_merge_grade includes input_tokens and output_tokens in the record."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
+    monkeypatch.setattr(
+        "app.blind_merge_grade._resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    monkeypatch.setattr(
+        "app.blind_merge_grade._gather_merged_diff_text",
+        AsyncMock(return_value=("some diffs", 3, 0)),
+    )
+    monkeypatch.setattr(
+        "app.blind_merge_grade._grade_once",
+        AsyncMock(
+            return_value={
+                "coverage_verdict": "partial",
+                "biggest_gap": "gap text",
+                "input_tokens": 800,
+                "output_tokens": 200,
+            }
+        ),
+    )
+
+    session = AsyncMock()
+    project = AsyncMock(spec=Project)
+    version = AsyncMock(spec=ReleaseVersion)
+    version.goal = "some goal"
+
+    result = await bmg.compute_blind_merge_grade(session, project, version, "sha123")
+
+    assert result is not None
+    assert result["input_tokens"] == 800
+    assert result["output_tokens"] == 200

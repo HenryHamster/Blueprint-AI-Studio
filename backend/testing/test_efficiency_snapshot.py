@@ -4447,6 +4447,61 @@ def test_compact_llm_cost_attribution():
     assert create_row["cost_usd"] > 0
 
 
+def test_compact_llm_cost_attribution_includes_qualification_infra_usd():
+    """_compact_llm_cost_attribution includes qualification_infra_usd when passed."""
+    from app.efficiency_snapshot import _compact_llm_cost_attribution
+
+    result = _compact_llm_cost_attribution([], qualification_infra_usd=0.023)
+    assert result["qualification_infra_usd"] == pytest.approx(0.023)
+
+
+def test_compact_llm_cost_attribution_qualification_infra_usd_none_by_default():
+    """qualification_infra_usd is None when not provided (pre-tracking versions)."""
+    from app.efficiency_snapshot import _compact_llm_cost_attribution
+
+    result = _compact_llm_cost_attribution([])
+    assert result["qualification_infra_usd"] is None
+
+
+def test_qualification_infra_usd_sums_token_costs():
+    """_qualification_infra_usd computes cost from blind_merge_grade token records."""
+    from unittest.mock import MagicMock
+
+    from app.efficiency_snapshot import _qualification_infra_usd
+
+    v1 = MagicMock()
+    v1.last_qualification = {
+        "blind_merge_grade": {"input_tokens": 1000, "output_tokens": 100}
+    }
+    v2 = MagicMock()
+    v2.last_qualification = {
+        "blind_merge_grade": {"input_tokens": 500, "output_tokens": 50}
+    }
+    v_no_tokens = MagicMock()
+    v_no_tokens.last_qualification = {
+        "blind_merge_grade": {"coverage_verdict": "covers", "biggest_gap": "gap"}
+    }
+
+    result = _qualification_infra_usd([v1, v2, v_no_tokens])
+    # claude-opus-4-8: $15/MTok input, $75/MTok output
+    expected = (1500 * 15e-6) + (150 * 75e-6)
+    assert result == pytest.approx(expected, rel=1e-5)
+
+
+def test_qualification_infra_usd_returns_none_when_no_token_data():
+    """_qualification_infra_usd returns None when no grade records carry token data."""
+    from unittest.mock import MagicMock
+
+    from app.efficiency_snapshot import _qualification_infra_usd
+
+    v = MagicMock()
+    v.last_qualification = {
+        "blind_merge_grade": {"coverage_verdict": "covers", "biggest_gap": "gap"}
+    }
+    assert _qualification_infra_usd([v]) is None
+    assert _qualification_infra_usd([]) is None
+
+
 @pytest.mark.asyncio
 async def test_llm_cost_breakdown_endpoint_includes_by_task_type(
     client: AsyncClient, db_session
@@ -7515,7 +7570,10 @@ async def _self_repair_burn_share_alerts(db_session, project_id):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not USE_POSTGRES, reason="SQLite StaticPool reads stale state after DELETE in same session")
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="SQLite StaticPool reads stale state after DELETE in same session",
+)
 async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
     """Alert fires when self_repair_burn_share exceeds threshold.
 

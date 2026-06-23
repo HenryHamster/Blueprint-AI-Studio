@@ -369,14 +369,17 @@ async def compute_blind_merge_grade(
         "pr_count": pr_count,
         "skipped_pr_count": skipped_pr_count,
         "graded_at": _utcnow().isoformat(),
+        "input_tokens": parsed.get("input_tokens", 0),
+        "output_tokens": parsed.get("output_tokens", 0),
     }
 
 
 async def _grade_once(
     api_key: str, model: str, prompt: str, *, allow_retry: bool
 ) -> dict[str, Any] | None:
-    """Single LLM grade attempt. Returns parsed ``{coverage_verdict, biggest_gap}``
-    or ``None`` on any failure (after one parse-error retry when ``allow_retry``)."""
+    """Single LLM grade attempt. Returns parsed ``{coverage_verdict, biggest_gap,
+    input_tokens, output_tokens}`` or ``None`` on any failure (after one
+    parse-error retry when ``allow_retry``)."""
     try:
         import anthropic as _anthropic
 
@@ -388,7 +391,11 @@ async def _grade_once(
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
-        return _parse_grade(raw)
+        parsed = _parse_grade(raw)
+        usage = getattr(resp, "usage", None)
+        parsed["input_tokens"] = int(getattr(usage, "input_tokens", 0) or 0)
+        parsed["output_tokens"] = int(getattr(usage, "output_tokens", 0) or 0)
+        return parsed
     except (json.JSONDecodeError, KeyError, ValueError, IndexError) as exc:
         if allow_retry:
             logger.info("[BLIND_MERGE_GRADE] parse error %s — retrying once", exc)

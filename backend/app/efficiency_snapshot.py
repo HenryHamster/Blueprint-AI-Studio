@@ -2480,7 +2480,36 @@ def _compute_cold_start_breakdown_p50(
     }
 
 
-def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
+def _qualification_infra_usd(versions: list[Any]) -> float | None:
+    """Sum blind_merge_grade token costs across recent release versions.
+
+    Returns None when no grade records with token data are found (pre-tracking
+    versions) so callers can distinguish "zero spend" from "no data".
+    """
+    from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
+
+    input_rate, output_rate = LLM_TOKEN_PRICING.get(
+        ("anthropic", "claude-opus-4-8"), (0.0, 0.0)
+    )
+    total_usd = 0.0
+    found_any = False
+    for v in versions:
+        record = (getattr(v, "last_qualification", None) or {}).get(
+            BLIND_MERGE_GRADE_KEY
+        )
+        if not isinstance(record, dict):
+            continue
+        input_tok = record.get("input_tokens") or 0
+        output_tok = record.get("output_tokens") or 0
+        if input_tok > 0 or output_tok > 0:
+            found_any = True
+            total_usd += input_tok * input_rate + output_tok * output_rate
+    return round(total_usd, 6) if found_any else None
+
+
+def _compact_llm_cost_attribution(
+    tasks: list[Task], qualification_infra_usd: float | None = None
+) -> Dict[str, Any]:
     """Compact per-driver LLM cost breakdown for durable daily snapshot storage.
 
     Calls the three existing pure helpers (compute_llm_cost_breakdown,
@@ -2559,6 +2588,7 @@ def _compact_llm_cost_attribution(tasks: list[Task]) -> Dict[str, Any]:
         "total_llm_usd": total_usd,
         "unpriced_coverage": breakdown["totals"].get("unpriced_coverage_fraction"),
         SELF_REPAIR_BURN_SHARE_KEY: self_repair_burn_share,
+        "qualification_infra_usd": qualification_infra_usd,
     }
 
 
@@ -2834,9 +2864,26 @@ async def compute_current_axes(
         compute_dominant_reuse_dropout,
     )
 
+    from app.models import ReleaseVersion  # noqa: PLC0415 — avoid circular import at module load
+
     tasks = await _load_recent_tasks(session, project_id)
     lanes = await _load_project_lanes(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
+
+    axis_cutoff_pre = _utcnow() - timedelta(days=_AXIS_WINDOW_DAYS)
+    _recent_versions = (
+        (
+            await session.execute(
+                select(ReleaseVersion).where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.opened_at >= axis_cutoff_pre,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    _qual_infra_usd = _qualification_infra_usd(_recent_versions)
 
     # Honest net-cost companion: fold the project's warm-pool idle cost into the
     # cost_per_merged_pr numerator so pre-warming a pool can't make the headline
@@ -2922,7 +2969,9 @@ async def compute_current_axes(
         # drove the change — without relying on the on-demand live endpoint
         # (which only covers the current window). Reconciles with the scalar
         # llm_cost_per_merged_pr axis via the shared _task_llm_attempts path.
-        "llm_cost_attribution": _compact_llm_cost_attribution(tasks),
+        "llm_cost_attribution": _compact_llm_cost_attribution(
+            tasks, qualification_infra_usd=_qual_infra_usd
+        ),
         # VM cost by-task-type attribution: compact breakdown of total VM dollars
         # by task type so operators can see how much of cost_per_merged_pr drift
         # comes from primary tasks (review, create) vs quality-gate side-cars
