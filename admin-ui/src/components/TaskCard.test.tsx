@@ -777,7 +777,7 @@ describe('TaskCard evaluation verdict pill', () => {
     });
     render(<TaskCard task={task} {...baseProps} />);
     const pill = screen.getByText('Request Changes');
-    expect(pill.className).toContain('red');
+    expect(pill.className).toContain('status-blocking');
     // The raw machine token must never leak to operators.
     expect(screen.queryByText('request_changes')).toBeNull();
   });
@@ -789,7 +789,7 @@ describe('TaskCard evaluation verdict pill', () => {
     });
     render(<TaskCard task={task} {...baseProps} />);
     const pill = screen.getByText('Approve');
-    expect(pill.className).toContain('emerald');
+    expect(pill.className).toContain('status-success');
   });
 
   it('renders no verdict pill when evaluation_summary is absent', () => {

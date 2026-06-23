@@ -543,7 +543,7 @@ describe('DetailsTab — Merge Test Gate', () => {
     });
     render(<DetailsTab task={task} />);
     const badge = screen.getByText('Approve');
-    expect(badge.className).toContain('emerald');
+    expect(badge.className).toContain('status-success');
     expect(badge.className).not.toContain('cyan');
   });
 
@@ -559,7 +559,7 @@ describe('DetailsTab — Merge Test Gate', () => {
     });
     render(<DetailsTab task={task} />);
     const badge = screen.getByText('Request Changes');
-    expect(badge.className).toContain('red');
+    expect(badge.className).toContain('status-blocking');
     expect(badge.className).not.toContain('cyan');
   });
 
