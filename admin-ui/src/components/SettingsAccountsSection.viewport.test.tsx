@@ -36,7 +36,6 @@ function renderSection() {
     <SettingsAccountsSection
       githubAccount={null}
       onConnectGitHub={() => {}}
-      isAdmin={true}
       maxPlanAccounts={[makeAccount()]}
       onToggleAccount={() => {}}
       onRemoveAccount={() => {}}
@@ -44,13 +43,6 @@ function renderSection() {
       onRefreshAccountModels={() => {}}
       onUpdateAccount={() => {}}
       onUpdateAccountCaps={() => {}}
-      showUserManagement={false}
-      onToggleUserManagement={() => {}}
-      showProjectMembers={false}
-      onToggleProjectMembers={() => {}}
-      selectedProjectId="project-123"
-      selectedProjectMyRole="owner"
-      onToggleSettings={() => {}}
       providers={{
         anthropic: { auth_modes: { oauth: { required_metadata_fields: [] }, api_key: { required_metadata_fields: [] } }, supported_execution_modes: [], execution_modes: [], mode_capabilities: {} },
         openai: { auth_modes: { api_key: { required_metadata_fields: [] }, oauth: { required_metadata_fields: [] } }, supported_execution_modes: [], execution_modes: [], mode_capabilities: {} },

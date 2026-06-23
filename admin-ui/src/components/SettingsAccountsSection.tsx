@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react';
-import { AlertTriangle, ChevronDown, ChevronUp, FileDown, GitBranch, HelpCircle, Loader2, Pencil, Plus, RefreshCw, Sliders, Trash2, Users, X } from 'lucide-react';
+import { AlertTriangle, ChevronDown, ChevronUp, FileDown, GitBranch, HelpCircle, Loader2, Pencil, Plus, RefreshCw, Sliders, Trash2, X } from 'lucide-react';
 import { parseTimestamp, timeAgo } from '../utils/time';
 import type { AccountMutationResult, AccountMutationReturn, AccountUpdatePayload, AuthMode, MaxPlanAccount, ProviderCatalogEntry, ProviderName } from '../types/settings';
 
@@ -123,7 +123,6 @@ function useClockNow() {
 interface SettingsAccountsSectionProps {
   githubAccount: string | null;
   onConnectGitHub: () => void;
-  isAdmin: boolean;
   maxPlanAccounts: MaxPlanAccount[];
   onToggleAccount: (id: string, enabled: boolean) => void;
   onRemoveAccount: (id: string, force?: boolean) => AccountMutationReturn;
@@ -131,13 +130,6 @@ interface SettingsAccountsSectionProps {
   onRefreshAccountModels: (id: string) => void;
   onUpdateAccount: (id: string, payload: AccountUpdatePayload) => AccountMutationReturn;
   onUpdateAccountCaps: (id: string, caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null }) => void;
-  showUserManagement: boolean;
-  onToggleUserManagement: () => void;
-  showProjectMembers: boolean;
-  onToggleProjectMembers: () => void;
-  selectedProjectId: string | null;
-  selectedProjectMyRole: string | null;
-  onToggleSettings: () => void;
   providers: Record<string, ProviderCatalogEntry>;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
@@ -1065,7 +1057,6 @@ function AccountAddForm({
 export function SettingsAccountsSection({
   githubAccount,
   onConnectGitHub,
-  isAdmin,
   maxPlanAccounts,
   onToggleAccount,
   onRemoveAccount,
@@ -1073,13 +1064,6 @@ export function SettingsAccountsSection({
   onRefreshAccountModels,
   onUpdateAccount,
   onUpdateAccountCaps,
-  showUserManagement,
-  onToggleUserManagement,
-  showProjectMembers,
-  onToggleProjectMembers,
-  selectedProjectId,
-  selectedProjectMyRole,
-  onToggleSettings,
   providers,
   newAccountName,
   setNewAccountName,
@@ -1121,41 +1105,6 @@ export function SettingsAccountsSection({
 
   return (
     <div className="space-y-6">
-      {isAdmin && (
-        <div>
-          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">User Management</h3>
-          <button
-            onClick={() => { onToggleUserManagement(); onToggleSettings(); }}
-            className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
-              showUserManagement
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
-            }`}
-          >
-            <Users className="w-3.5 h-3.5" />
-            {showUserManagement ? 'Close User Management' : 'Open User Management'}
-          </button>
-        </div>
-      )}
-
-      {selectedProjectId && (selectedProjectMyRole === 'owner' || isAdmin) && (
-        <div>
-          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Project Members</h3>
-          <button
-            data-testid="toggle-project-members"
-            onClick={() => { onToggleProjectMembers(); onToggleSettings(); }}
-            className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
-              showProjectMembers
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
-            }`}
-          >
-            <Users className="w-3.5 h-3.5" />
-            {showProjectMembers ? 'Close Project Members' : 'Manage Project Members'}
-          </button>
-        </div>
-      )}
-
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">GitHub</h3>
         {githubAccount ? (
