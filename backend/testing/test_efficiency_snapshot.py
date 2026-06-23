@@ -4502,6 +4502,50 @@ def test_qualification_infra_usd_returns_none_when_no_token_data():
     assert _qualification_infra_usd([]) is None
 
 
+def test_qualification_infra_usd_accumulates_across_regrades():
+    """qualification_infra_usd counts tokens from all grade attempts, not just the last.
+
+    Each requalification on a new candidate SHA overwrites the blind_merge_grade
+    record but persist_blind_merge_grade folds prior token counts into cumulative
+    accumulators so _qualification_infra_usd reports the true total Opus spend.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from app.blind_merge_grade import persist_blind_merge_grade
+    from app.efficiency_snapshot import _qualification_infra_usd
+
+    v = MagicMock()
+    v.last_qualification = None
+
+    grade1 = {
+        "candidate_sha": "sha1abc",
+        "coverage_verdict": "partial",
+        "biggest_gap": "missing test coverage",
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "model": "claude-opus-4-8",
+    }
+    grade2 = {
+        "candidate_sha": "sha2def",
+        "coverage_verdict": "covers",
+        "biggest_gap": "minor doc gap",
+        "input_tokens": 800,
+        "output_tokens": 90,
+        "model": "claude-opus-4-8",
+    }
+
+    with patch("app.blind_merge_grade.flag_modified"):
+        persist_blind_merge_grade(v, grade1)
+        persist_blind_merge_grade(v, grade2)
+
+    # Both attempts' tokens must be counted: grade1 is in the cumulative
+    # accumulators and grade2 is in the current blind_merge_grade record.
+    result = _qualification_infra_usd([v])
+    # claude-opus-4-8: $15/MTok input, $75/MTok output
+    expected = (1800 * 15e-6) + (190 * 75e-6)
+    assert result == pytest.approx(expected, rel=1e-5)
+
+
 @pytest.mark.asyncio
 async def test_llm_cost_breakdown_endpoint_includes_by_task_type(
     client: AsyncClient, db_session

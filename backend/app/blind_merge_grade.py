@@ -145,8 +145,26 @@ def persist_blind_merge_grade(
 
     Uses ``flag_modified`` so SQLAlchemy detects the in-place JSONB mutation —
     the caller is responsible for adding the version to the session / commit.
+
+    Token costs from the prior grade (if any) are folded into running cumulative
+    accumulators (``qualification_cumulative_input_tokens`` /
+    ``qualification_cumulative_output_tokens``) before the new record overwrites
+    the ``blind_merge_grade`` key.  This preserves the total Opus spend across
+    all requalification attempts on different candidate SHAs so that
+    ``_qualification_infra_usd`` can report cumulative thrash cost rather than
+    only the last grade's cost.
     """
     qual = dict(version.last_qualification or {})
+    prior = qual.get(BLIND_MERGE_GRADE_KEY) or {}
+    prior_in = int(prior.get("input_tokens") or 0)
+    prior_out = int(prior.get("output_tokens") or 0)
+    if prior_in > 0 or prior_out > 0:
+        cum_in = int(qual.get("qualification_cumulative_input_tokens") or 0) + prior_in
+        cum_out = (
+            int(qual.get("qualification_cumulative_output_tokens") or 0) + prior_out
+        )
+        qual["qualification_cumulative_input_tokens"] = cum_in
+        qual["qualification_cumulative_output_tokens"] = cum_out
     qual[BLIND_MERGE_GRADE_KEY] = record
     version.last_qualification = qual
     flag_modified(version, "last_qualification")

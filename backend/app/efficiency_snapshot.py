@@ -2486,6 +2486,11 @@ def _compute_cold_start_breakdown_p50(
 def _qualification_infra_usd(versions: list[Any]) -> float | None:
     """Sum blind_merge_grade token costs across recent release versions.
 
+    Includes both the current grade's tokens and any accumulated tokens from
+    prior grades on different candidate SHAs (stored as
+    ``qualification_cumulative_input_tokens`` / ``qualification_cumulative_output_tokens``
+    in ``last_qualification`` by ``persist_blind_merge_grade``).
+
     Returns None when no grade records with token data are found (pre-tracking
     versions) so callers can distinguish "zero spend" from "no data".
     """
@@ -2497,16 +2502,19 @@ def _qualification_infra_usd(versions: list[Any]) -> float | None:
     total_usd = 0.0
     found_any = False
     for v in versions:
-        record = (getattr(v, "last_qualification", None) or {}).get(
-            BLIND_MERGE_GRADE_KEY
-        )
-        if not isinstance(record, dict):
-            continue
-        input_tok = record.get("input_tokens") or 0
-        output_tok = record.get("output_tokens") or 0
-        if input_tok > 0 or output_tok > 0:
+        qual = getattr(v, "last_qualification", None) or {}
+        record = qual.get(BLIND_MERGE_GRADE_KEY)
+        if isinstance(record, dict):
+            input_tok = record.get("input_tokens") or 0
+            output_tok = record.get("output_tokens") or 0
+            if input_tok > 0 or output_tok > 0:
+                found_any = True
+                total_usd += input_tok * input_rate + output_tok * output_rate
+        cum_in = qual.get("qualification_cumulative_input_tokens") or 0
+        cum_out = qual.get("qualification_cumulative_output_tokens") or 0
+        if cum_in > 0 or cum_out > 0:
             found_any = True
-            total_usd += input_tok * input_rate + output_tok * output_rate
+            total_usd += cum_in * input_rate + cum_out * output_rate
     return round(total_usd, 6) if found_any else None
 
 
