@@ -80,6 +80,7 @@ def test_evaluation_declarations_match_expected_assignment():
         "self_audit": "forward-quality",
         "release_audit": "forward-quality",
         "release_audit_challenge": "none",
+        "release_merge_grade": "none",
         "memo": "forward-quality",
         "verify_tests": "none",
         "compute_experiment": "artifact-delivery",

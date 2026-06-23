@@ -2636,6 +2636,9 @@ async def orchestrator_worker():
                     # reads status, context (_replaced_by_task_id / has_landed_signal /
                     # is_genuine_code_dependency / verify_pr_merged), and payloads
                     # (first_payload for _same_base_branch + task-type checks).
+                    # title is included so the cascade-cancel alert (raised from a
+                    # separate session against the DETACHED prereq row) can read
+                    # prereq_task.title without a raiseload DetachedInstanceError.
                     # Drops plan_output / status_log / depends_on and other heavy JSONB.
                     # Rows are detached (expunge_all) so loaded columns remain accessible
                     # without triggering async lazy-loads (MissingGreenlet). raiseload=True
@@ -2646,6 +2649,7 @@ async def orchestrator_worker():
                         Task.context,
                         Task.payloads,
                         Task.project_id,
+                        Task.title,
                         raiseload=True,
                     )
                     async with AsyncSessionLocal() as _dep_batch_session:

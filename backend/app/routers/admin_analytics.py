@@ -690,13 +690,18 @@ async def get_spend_burn_rate(
         total_cost += cost
         task_count += 1
 
-    daily_spend_usd = total_cost / window_days if window_days > 0 else 0.0
+    # Derive the daily rate and 30-day forecast from the SAME rounded window
+    # cost we report, so the three figures stay internally consistent (an
+    # operator can reconcile monthly ≈ daily*30 ≈ window/days*30); deriving the
+    # forecast off the un-rounded total made monthly drift from window_cost_usd.
+    window_cost_usd = round(total_cost, 2)
+    daily_spend_usd = window_cost_usd / window_days if window_days > 0 else 0.0
     monthly_forecast_usd = daily_spend_usd * 30
 
     return {
         "project_id": str(project_id) if project_id else None,
         "window_days": window_days,
-        "window_cost_usd": round(total_cost, 2),
+        "window_cost_usd": window_cost_usd,
         "task_count": task_count,
         "daily_spend_usd": round(daily_spend_usd, 2),
         "monthly_forecast_usd": round(monthly_forecast_usd, 2),

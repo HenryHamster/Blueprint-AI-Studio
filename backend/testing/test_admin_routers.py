@@ -8601,9 +8601,17 @@ class TestClearDeployFailed:
         project = await _make_project(db_session)
         await self._make_deploy_failed_version(db_session, project.id)
 
+        async def non_admin():
+            return {"user_id": "other", "email": "other@example.com", "role": "user"}
+
         async def reject_admin():
             raise HTTPException(status_code=403, detail="Admin privileges required")
 
+        # The parent admin router carries a router-level get_current_user
+        # dependency; without overriding it the bogus token is rejected at 401
+        # before require_admin runs. Override both, matching the established
+        # non-admin-rejection pattern (e.g. test_non_admin_cannot_list_users).
+        app.dependency_overrides[get_current_user] = non_admin
         app.dependency_overrides[require_admin] = reject_admin
         try:
             async with AsyncClient(
@@ -8617,6 +8625,7 @@ class TestClearDeployFailed:
                 )
             assert resp.status_code == 403
         finally:
+            app.dependency_overrides.pop(get_current_user, None)
             app.dependency_overrides.pop(require_admin, None)
 
     @pytest.mark.asyncio

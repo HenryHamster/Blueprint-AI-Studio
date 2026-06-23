@@ -107,6 +107,13 @@ def test_no_plaintext_credentials_in_env_overrides(monkeypatch):
     fake_manifest._apply_llm_env = _fake_apply_llm_env  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "google.cloud.run_v2", fake_run_v2)
+    # Also bind the fake as an attribute on the google.cloud package. The lazy
+    # `from google.cloud import run_v2` in compute_cloud_run resolves via the
+    # package attribute, which is bypassed by a sys.modules-only patch once the
+    # real submodule has been imported by an earlier test (cross-test pollution).
+    import google.cloud as _google_cloud  # noqa: PLC0415
+
+    monkeypatch.setattr(_google_cloud, "run_v2", fake_run_v2, raising=False)
     monkeypatch.setitem(sys.modules, "google.protobuf.duration_pb2", fake_duration_pb2)
     monkeypatch.setitem(sys.modules, "app.compute_manifest", fake_manifest)
     monkeypatch.setattr(ccr, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent")
@@ -238,6 +245,13 @@ def test_file_path_cred_skipped_in_overrides_but_delivered_via_manifest(monkeypa
     fake_manifest._apply_llm_env = _fake_apply_llm_env  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "google.cloud.run_v2", fake_run_v2)
+    # Also bind the fake as an attribute on the google.cloud package. The lazy
+    # `from google.cloud import run_v2` in compute_cloud_run resolves via the
+    # package attribute, which is bypassed by a sys.modules-only patch once the
+    # real submodule has been imported by an earlier test (cross-test pollution).
+    import google.cloud as _google_cloud  # noqa: PLC0415
+
+    monkeypatch.setattr(_google_cloud, "run_v2", fake_run_v2, raising=False)
     monkeypatch.setitem(sys.modules, "google.protobuf.duration_pb2", fake_duration_pb2)
     monkeypatch.setitem(sys.modules, "app.compute_manifest", fake_manifest)
     monkeypatch.setattr(ccr, "CLOUD_RUN_JOB_NAME", "projects/p/locations/us/jobs/agent")

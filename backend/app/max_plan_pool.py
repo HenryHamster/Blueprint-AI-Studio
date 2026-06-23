@@ -72,7 +72,11 @@ def get_task_llm_account_id(task_or_ctx: Any) -> str | None:
     # through this accessor, so the column-preference applies codebase-wide.
     if not isinstance(task_or_ctx, Mapping):
         col_val = getattr(task_or_ctx, "llm_account_id", None)
-        if col_val:
+        # Guard on str specifically: the column is typed ``str | None``, so a
+        # real persisted id (non-empty string) still wins, while an unset column
+        # (None) or a non-string attribute (e.g. a test MagicMock) correctly
+        # falls through to the context JSONB lookup instead of being returned.
+        if isinstance(col_val, str) and col_val:
             return col_val
     ctx = _task_context(task_or_ctx)
     return ctx.get("llm_account_id") or ctx.get("max_plan_account_id")

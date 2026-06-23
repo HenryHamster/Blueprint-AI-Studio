@@ -362,6 +362,10 @@ async def _load_recent_tasks(
                 Task.vm_dispatched_at,
                 Task.provider,
                 Task.model,
+                # Read by estimate_pool_hit_rate via get_task_llm_account_id,
+                # which prefers this promoted column over the context fallback;
+                # must be loaded so the access doesn't trip raiseload=True.
+                Task.llm_account_id,
                 Task.format_compliance_summary,
                 # payloads: required so task.first_payload can be read without
                 # triggering an async lazy-load (used by compute_llm_cost_by_task_type

@@ -10680,8 +10680,10 @@ class TestLaunchAgentCloudRunJob:
         assert env_dict.get("AGENT_SECRET_VERSION") == "projects/p/secrets/s/versions/1"
 
     @pytest.mark.asyncio
-    async def test_injects_llm_env_vars_anthropic_oauth(self, monkeypatch):
-        """CLAUDE_CODE_OAUTH_TOKEN is injected when auth_mode=oauth."""
+    async def test_oauth_token_not_plaintext_delivered_via_manifest(self, monkeypatch):
+        """OAuth auth must NOT inject CLAUDE_CODE_OAUTH_TOKEN as a plaintext env
+        override. The token is delivered via the Secret Manager manifest the agent
+        resolves from AGENT_SECRET_VERSION at startup (secure-design contract)."""
         import google.cloud.run_v2 as run_v2_mod
         from app.compute_cloud_run import launch_agent_cloud_run_job
         import app.compute_cloud_run as ccr_mod
@@ -10706,7 +10708,7 @@ class TestLaunchAgentCloudRunJob:
                 vm_id="cr-vm-2",
                 task_id="task-def",
                 payload_uri=None,
-                secret_version_name=None,
+                secret_version_name="projects/p/secrets/s/versions/1",
                 task_type="research",
                 oauth_token="sk-ant-oauth-tok",
                 provider="anthropic",
@@ -10718,9 +10720,16 @@ class TestLaunchAgentCloudRunJob:
         env_dict = {e.name: e.value for e in submitted_env}
         assert env_dict.get("PROVIDER") == "anthropic"
         assert env_dict.get("AUTH_MODE") == "oauth"
-        assert env_dict.get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oauth-tok", (
-            f"CLAUDE_CODE_OAUTH_TOKEN missing from env overrides; got {env_dict}"
+        # The OAuth token (and its raw value) must NEVER be a plaintext override —
+        # it is delivered via the Secret Manager manifest, not the RunJobRequest.
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env_dict, (
+            f"CLAUDE_CODE_OAUTH_TOKEN must not be a plaintext override; got {env_dict}"
         )
+        assert "sk-ant-oauth-tok" not in set(env_dict.values()), (
+            f"Raw OAuth token value must not appear in any env override; got {env_dict}"
+        )
+        # AGENT_SECRET_VERSION must be present so the agent can resolve the token.
+        assert env_dict.get("AGENT_SECRET_VERSION") == "projects/p/secrets/s/versions/1"
 
     @pytest.mark.asyncio
     async def test_skips_file_path_credentials(self, monkeypatch):
