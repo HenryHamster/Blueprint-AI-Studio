@@ -110,6 +110,13 @@ def blind_merge_grade_satisfied(
     ``biggest_gap`` and a ``coverage_verdict``.  A skip marker (escape hatch) or
     a record for a different SHA does NOT satisfy the gate — a new candidate
     commit must be graded afresh.
+
+    A record where every PR fetch failed (``pr_count == 0`` and
+    ``skipped_pr_count > 0``) is treated as ungraded — the diff was empty so
+    the grade is meaningless and must be recomputed.  A record where at least one
+    PR was graded (``pr_count > 0``) IS considered real even if some PRs were
+    skipped due to transient GitHub fetch failures; transient skips must not
+    force a full ~90s Opus re-grade on every qualification cycle.
     """
     if not candidate_sha:
         return False
@@ -118,7 +125,8 @@ def blind_merge_grade_satisfied(
         return False
     if record.get("candidate_sha") != candidate_sha:
         return False
-    if record.get("skipped_pr_count", 0) > 0:
+    # All PR fetches failed → grade saw an empty diff → meaningless, recompute.
+    if record.get("pr_count", 0) == 0 and record.get("skipped_pr_count", 0) > 0:
         return False
     biggest_gap = record.get("biggest_gap")
     verdict = record.get("coverage_verdict")

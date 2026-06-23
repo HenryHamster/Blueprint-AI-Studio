@@ -6198,6 +6198,65 @@ async def test_run_qualification_blind_merge_grade_escape_hatch(
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_reuses_grade_when_skipped_pr_count_nonzero(
+    db_session, mocker
+):
+    """Regression: a persisted grade with pr_count>0 and skipped_pr_count>0 must
+    satisfy blind_merge_grade_satisfied so run_qualification reuses it and does NOT
+    call compute_blind_merge_grade again.
+
+    Previously blind_merge_grade_satisfied returned False whenever skipped_pr_count>0,
+    causing a fresh ~90s Opus re-grade under the qualification lock on every cycle
+    even though a valid grade already existed.
+    """
+    from app import blind_merge_grade as bmg
+    from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.goal = "deliver cost-reduction VM substrate change"
+    candidate = "abcd" * 10
+
+    # Pre-seed a grade with pr_count=3 and skipped_pr_count=1 (partial fetch)
+    # — the grade is real and must NOT trigger a re-compute.
+    existing_grade = {
+        "candidate_sha": candidate,
+        "coverage_verdict": "partial",
+        "biggest_gap": "VM substrate not fully migrated",
+        "model": "test-model",
+        "pr_count": 3,
+        "skipped_pr_count": 1,
+        "graded_at": "2026-01-01T00:00:00+00:00",
+    }
+    version.last_qualification = {BLIND_MERGE_GRADE_KEY: existing_grade}
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    # Patch compute_blind_merge_grade — if the fix is correct it must NOT be called.
+    grade_mock = mocker.patch(
+        "app.release_qualifier.compute_blind_merge_grade",
+        new=AsyncMock(return_value=None),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Qualification proceeds (spawned) — the grade is reused, not re-computed.
+    assert result["status"] == "spawned", f"unexpected status: {result}"
+    grade_mock.assert_not_called()
+
+    await db_session.refresh(version)
+    # The prior grade is still present and satisfies the gate.
+    assert bmg.blind_merge_grade_satisfied(version, candidate) is True
+    carried = (version.last_qualification or {}).get(BLIND_MERGE_GRADE_KEY, {})
+    assert carried.get("skipped_pr_count") == 1
+    assert carried.get("pr_count") == 3
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_already_pending_is_noop(db_session, mocker):
     """A second run_qualification while a qualification is in flight (pending
     with a still-running child) early-returns already_pending and spawns

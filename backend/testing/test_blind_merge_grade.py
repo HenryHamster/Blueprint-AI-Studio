@@ -421,8 +421,12 @@ class TestBlindMergeGradeSatisfied:
 
         assert bmg.blind_merge_grade_satisfied(version, "abc123") is False
 
-    def test_not_satisfied_when_skipped_pr_count_nonzero(self):
-        """A grade with skipped_pr_count > 0 does NOT satisfy the gate."""
+    def test_satisfied_when_skipped_pr_count_nonzero_but_prs_graded(self):
+        """A partial grade (pr_count > 0, skipped_pr_count > 0) satisfies the gate.
+
+        Transient GitHub PR fetch failures must not force a fresh ~90s Opus
+        re-grade every qualification cycle when a real grade already exists.
+        """
         version = MagicMock(spec=ReleaseVersion)
         version.last_qualification = {
             "blind_merge_grade": {
@@ -432,6 +436,23 @@ class TestBlindMergeGradeSatisfied:
                 "model": "claude-opus",
                 "pr_count": 5,
                 "skipped_pr_count": 2,
+                "graded_at": "2026-01-01T00:00:00Z",
+            }
+        }
+
+        assert bmg.blind_merge_grade_satisfied(version, "abc123") is True
+
+    def test_not_satisfied_when_all_prs_skipped(self):
+        """A grade where every PR fetch failed (pr_count=0, skipped_pr_count>0) is meaningless."""
+        version = MagicMock(spec=ReleaseVersion)
+        version.last_qualification = {
+            "blind_merge_grade": {
+                "candidate_sha": "abc123",
+                "coverage_verdict": "covers",
+                "biggest_gap": "missing feature",
+                "model": "claude-opus",
+                "pr_count": 0,
+                "skipped_pr_count": 3,
                 "graded_at": "2026-01-01T00:00:00Z",
             }
         }
