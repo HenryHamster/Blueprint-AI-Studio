@@ -1144,6 +1144,47 @@ def test_set_version_goal_truncates_long_goal():
     assert len(version.goal) == rv._GOAL_MAX
 
 
+def test_set_version_goal_strategist_source_stamps_strategist_prefix():
+    """set_version_goal with source='strategist' records [strategist:id] not [operator:id]."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    rv.set_version_goal(
+        version, "Deliver the design-system token layer", editor_id="abc12345", source="strategist"
+    )
+    assert version.goal == "Deliver the design-system token layer"
+    assert version.goal_editor_info == "[strategist:abc12345]"
+    assert version.goal_updated_at is not None
+
+
+def test_set_version_goal_operator_source_default():
+    """set_version_goal default source is 'operator' (backward compatible)."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    rv.set_version_goal(version, "Operator objective", editor_id="user@example.com")
+    assert version.goal_editor_info == "[operator:user@example.com]"
+
+
+@pytest.mark.asyncio
+async def test_open_version_opens_with_null_goal(db_session):
+    """open_version now opens with goal=None; strategist will author it in the first cycle."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Versions open with no goal — the strategist sets it later.
+    assert version.goal is None
+    assert version.goal_editor_info is None
+
+
 # ===========================================================================
 # to_phase_block
 # ===========================================================================

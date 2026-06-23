@@ -3583,6 +3583,7 @@ async def _handle_strategic_completion(
     new_vision = parsed.get("vision")
     new_problem_model = parsed.get("problem_model")
     new_running_update = parsed.get("running_update")
+    new_version_goal = parsed.get("new_version_goal")
     direction_ops = parsed.get("direction_operations", [])
 
     # Lock project row to prevent concurrent direction/vision mutations.
@@ -3792,13 +3793,45 @@ async def _handle_strategic_completion(
                         )
                     )
                     flag_modified(project, "capability_adoption_verdicts")
-                # version.goal is frozen at version-open; strategic cycles
-                # must NOT overwrite it with the evolving current_focus narrative.
-                # Operator-facing updates go via admin_agent_ops or set_version_goal.
         except Exception:
             logger.exception(
                 "[STRATEGIC] Failed to apply problem_model update (non-fatal)"
             )
+
+    # Apply new_version_goal when the strategist explicitly authors the version
+    # objective (new_version_goal field in agent output).  Only applies when the
+    # open version has no goal yet (goal is None) — once set the goal is frozen;
+    # operator can override via POST /api/admin/projects/{id}/version-goal.
+    if new_version_goal and isinstance(new_version_goal, str):
+        _nvg_text = new_version_goal.strip()
+        if _nvg_text:
+            try:
+                from app.release_scoring import is_contentless_goal
+                from app.release_version import (
+                    current_open_version as _cur_open_version,
+                    set_version_goal as _set_version_goal,
+                )
+
+                if not is_contentless_goal(_nvg_text):
+                    _open_ver = await _cur_open_version(session, project.id)
+                    if _open_ver is not None and _open_ver.goal is None:
+                        _set_version_goal(
+                            _open_ver,
+                            _nvg_text,
+                            editor_id=str(task.id)[:8],
+                            source="strategist",
+                        )
+                        session.add(_open_ver)
+                        logger.info(
+                            "[STRATEGIC] authored version goal for v%d project=%s: %.80s",
+                            _open_ver.version_number,
+                            project.id,
+                            _nvg_text,
+                        )
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] Failed to apply new_version_goal (non-fatal)"
+                )
 
     # Reconcile project.running_update operator-wins via the same shared helper
     # the live set_running_update op uses, so the two write paths cannot drift.

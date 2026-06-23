@@ -53,6 +53,23 @@ def _clamp01(value: float) -> float:
 # The agent's explicit boolean is authoritative when present.
 _MERGE_GRADE_COVERAGE_THRESHOLD = 0.5
 
+# Single-word placeholder strings that convey no real version objective.
+# A goal that normalises to one of these is treated as contentless — identical
+# to an empty goal (no merge-grade spawned, not_applicable at scoring time).
+# Example: version.goal accidentally set to "test" blocked v18 promotion.
+_CONTENTLESS_GOAL_WORDS: frozenset[str] = frozenset(
+    {"test", "n/a", "na", "tbd", "todo", "placeholder", "none", "null", "empty", "unknown"}
+)
+
+
+def is_contentless_goal(goal_text: str) -> bool:
+    """Return True when *goal_text* is a placeholder string with no real objective.
+
+    Only exact single-word matches are contentless so that a real goal like
+    "test the authentication flow" is not inadvertently suppressed.
+    """
+    return goal_text.strip().lower() in _CONTENTLESS_GOAL_WORDS
+
 
 def evaluate_merge_grade(
     goal: str | None,
@@ -63,8 +80,9 @@ def evaluate_merge_grade(
     Pure / deterministic — the qualifier reads the ``RELEASE_MERGE_GRADE``
     artifact and passes (goal, artifact) here.  Semantics:
 
-      * ``goal`` empty / unset → ``status="not_applicable"`` (nothing to grade
-        against).  The gate is a no-op PASS: ``blocked`` False.
+      * ``goal`` empty / unset, or a contentless placeholder (e.g. "test",
+        "n/a") → ``status="not_applicable"`` (nothing to grade against).  The
+        gate is a no-op PASS: ``blocked`` False.
       * ``artifact`` not a usable dict, or carries neither an explicit
         ``covers_goal`` bool nor a numeric ``coverage_score`` → ``status=
         "unparseable"``.  The caller routes this to a HOLD (infra_failure) — a
@@ -79,7 +97,7 @@ def evaluate_merge_grade(
     ``unparseable``.
     """
     goal_text = (goal or "").strip()
-    if not goal_text:
+    if not goal_text or is_contentless_goal(goal_text):
         return {
             "status": "not_applicable",
             "covers_goal": None,

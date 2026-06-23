@@ -6548,8 +6548,8 @@ async def test_post_promote_handoff_hint_fires_on_fresh_version(
     db_session, mocker, _lts_split_active
 ):
     """A version that just opened from a promotion (version_number > 1, never
-    qualified) gets a prompt_suffix telling the agent to refresh problem_model
-    so the inherited goal narrative doesn't get read as current status."""
+    qualified) gets a prompt_suffix asserting the prior version promoted and
+    directing the strategist to author the new version's goal via new_version_goal."""
     from app.models import ReleaseVersion
 
     await _ensure_releaseversion_table(db_session)
@@ -6569,7 +6569,7 @@ async def test_post_promote_handoff_hint_fires_on_fresh_version(
         phase_changed_at=now,
         last_qualification=None,
         qualification_attempts=0,
-        goal="v1 milestone narrative carried forward as v2 goal",
+        goal=None,
     )
     db_session.add(version)
     await db_session.commit()
@@ -6594,11 +6594,10 @@ async def test_post_promote_handoff_hint_fires_on_fresh_version(
     assert "intent.current_focus" in suffix
     assert "v2" in suffix and "v1" in suffix
     # The hint must ASSERT the prior version promoted and FORBID re-promoting it,
-    # not merely flag the carried goal as stale — otherwise the agent re-qualifies
-    # an already-shipped version (incident 2026-06-03).
+    # then direct the strategist to author the new version goal via new_version_goal.
     assert "PROMOTED" in suffix
     assert "do NOT" in suffix
-    assert "STALE CARRY-OVER" in suffix
+    assert "new_version_goal" in suffix
 
 
 @pytest.mark.asyncio
