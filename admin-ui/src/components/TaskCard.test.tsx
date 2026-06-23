@@ -808,3 +808,42 @@ describe('TaskCard evaluation verdict pill', () => {
     expect(screen.queryByText('Approve')).toBeNull();
   });
 });
+
+describe('TaskCard approval button label', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('shows "Approve & Merge" for a non-compute approval', () => {
+    const task = makeTask({
+      status: 'EVALUATING',
+      task_type: 'create',
+      requires_approval: true,
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText(/Approve & Merge/)).toBeInTheDocument();
+  });
+
+  it('shows "Approve Spend ($X.XX)" for a compute_experiment with spend_cap_usd', () => {
+    const task = makeTask({
+      status: 'EVALUATING',
+      task_type: 'compute_experiment',
+      requires_approval: true,
+      payloads: [{ type: 'compute_experiment', spend_cap_usd: 12.5, command: 'echo hi', deadline_seconds: 3600 }],
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText(/Approve Spend \(\$12\.50\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/Approve & Merge/)).toBeNull();
+  });
+
+  it('shows "Approve Spend" for compute_experiment without spend_cap_usd in payload', () => {
+    const task = makeTask({
+      status: 'EVALUATING',
+      task_type: 'compute_experiment',
+      requires_approval: true,
+      payloads: [{ type: 'compute_experiment' }],
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText(/Approve Spend$/)).toBeInTheDocument();
+  });
+});

@@ -53,6 +53,7 @@ export interface DirectionsListProps {
   // (staging is then disabled — the backend rejects staging with no open version).
   stageTargetVersion: number | null;
   onViewFindings?: (directionId: string) => void;
+  onViewKnowledge?: (directionId: string) => void;
   onNavigateToTask?: (taskId: string) => void;
 }
 
@@ -82,6 +83,7 @@ export function DirectionsList(props: DirectionsListProps) {
     setForceConfirmId,
     stageTargetVersion,
     onViewFindings,
+    onViewKnowledge,
     onNavigateToTask,
   } = props;
 
@@ -193,6 +195,7 @@ export function DirectionsList(props: DirectionsListProps) {
                         setForceConfirmId={setForceConfirmId}
                         stageTargetVersion={stageTargetVersion}
                         onViewFindings={onViewFindings}
+                        onViewKnowledge={onViewKnowledge}
                         onNavigateToTask={onNavigateToTask}
                       />
                       </ErrorBoundary>

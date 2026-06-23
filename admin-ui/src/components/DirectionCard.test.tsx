@@ -669,6 +669,39 @@ describe('DirectionCard generalized outcome metrics', () => {
   });
 });
 
+describe('DirectionCard knowledge docs badge', () => {
+  it('renders a clickable button when knowledge_document_count > 0 and onViewKnowledge is provided', () => {
+    const onViewKnowledge = vi.fn();
+    const d = makeDirection({ knowledge_document_count: 5 });
+    const props = { ...makeProps(d), onViewKnowledge };
+    render(<DirectionCard {...props} />);
+    const btn = screen.getByRole('button', { name: '5 docs' });
+    expect(btn).toBeInTheDocument();
+    fireEvent.click(btn);
+    expect(onViewKnowledge).toHaveBeenCalledWith('d-1');
+  });
+
+  it('renders a non-interactive span when onViewKnowledge is absent', () => {
+    const d = makeDirection({ knowledge_document_count: 3 });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('3 docs')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '3 docs' })).not.toBeInTheDocument();
+  });
+
+  it('does not render the badge when knowledge_document_count is 0', () => {
+    const d = makeDirection({ knowledge_document_count: 0 });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.queryByText(/docs/)).not.toBeInTheDocument();
+  });
+
+  it('renders "1 doc" (singular) for a single document', () => {
+    const onViewKnowledge = vi.fn();
+    const d = makeDirection({ knowledge_document_count: 1 });
+    render(<DirectionCard {...{ ...makeProps(d), onViewKnowledge }} />);
+    expect(screen.getByRole('button', { name: '1 doc' })).toBeInTheDocument();
+  });
+});
+
 describe('DirectionCard staged retarget control', () => {
   function stagedProps(overrides: Partial<Direction> = {}) {
     const d = makeDirection({ status: 'staged', staged_for_version: 5, ...overrides });

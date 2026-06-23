@@ -123,6 +123,7 @@ export interface DirectionCardProps {
   stageTargetVersion?: number | null;
   // Navigation callbacks
   onViewFindings?: (directionId: string) => void;
+  onViewKnowledge?: (directionId: string) => void;
   onNavigateToTask?: (taskId: string) => void;
 }
 
@@ -139,7 +140,7 @@ function DirectionCardImpl({
   taskCounts, activeTasks, researchingIds, researchSuccessIds,
   forceConfirmId, setForceConfirmId,
   stageTargetVersion,
-  onViewFindings, onNavigateToTask,
+  onViewFindings, onViewKnowledge, onNavigateToTask,
 }: DirectionCardProps) {
   const forceConfirmRef = useRef<HTMLDivElement | null>(null);
   const [expandedNotes, setExpandedNotes] = useState<Set<number>>(new Set());
@@ -926,12 +927,23 @@ function DirectionCardImpl({
             )}
             {/* Accumulated knowledge documents (web_research output) for this direction */}
             {typeof d.knowledge_document_count === 'number' && d.knowledge_document_count > 0 && (
-              <span
-                title="Durable knowledge documents accumulated by this direction's web_research tasks"
-                className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-300"
-              >
-                {d.knowledge_document_count} doc{d.knowledge_document_count !== 1 ? 's' : ''}
-              </span>
+              onViewKnowledge ? (
+                <button
+                  data-viewport-allow-small-target
+                  onClick={() => onViewKnowledge(d.id)}
+                  title="Open Knowledge Library filtered to this direction's documents"
+                  className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-300 hover:bg-blue-900/40 transition-colors cursor-pointer"
+                >
+                  {d.knowledge_document_count} doc{d.knowledge_document_count !== 1 ? 's' : ''}
+                </button>
+              ) : (
+                <span
+                  title="Durable knowledge documents accumulated by this direction's web_research tasks"
+                  className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-300"
+                >
+                  {d.knowledge_document_count} doc{d.knowledge_document_count !== 1 ? 's' : ''}
+                </span>
+              )
             )}
             {/* Reactivate button for auto-paused directions */}
             {d.auto_paused && key === 'paused' && (

@@ -4545,6 +4545,49 @@ class TestMessages:
         assert msg.resolution == "Fixed!"
 
     @pytest.mark.asyncio
+    async def test_resolve_question_posts_question_answer_note(
+        self, client: AsyncClient, db_session
+    ):
+        """Resolving a QUESTION via PATCH /messages/{id} creates a question_answer NOTE."""
+        from sqlmodel import select
+
+        project = await _make_project(db_session)
+        question = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="agent",
+            content="What should I do?",
+            status="open",
+        )
+        db_session.add(question)
+        await db_session.commit()
+        await db_session.refresh(question)
+
+        resp = await client.patch(
+            f"/api/admin/messages/{question.id}",
+            json={"resolution": "Do X instead."},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "resolved"
+
+        # Exactly one question_answer NOTE should exist, reply_to set to the question id
+        notes = (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                    ProjectMessage.from_type == "user",
+                )
+            )
+        ).scalars().all()
+        assert len(notes) == 1
+        note = notes[0]
+        assert note.context is not None
+        assert note.context.get("event_type") == "question_answer"
+        assert note.context.get("reply_to") == str(question.id)
+        assert note.context.get("answer") == "Do X instead."
+
+    @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):
         """Can delete an existing message."""
         project = await _make_project(db_session)

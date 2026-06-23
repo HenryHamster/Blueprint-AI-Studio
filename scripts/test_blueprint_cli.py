@@ -138,6 +138,10 @@ HELP_INVOCATIONS = [
     ["envelope"],
     ["envelope", "show"],
     ["envelope", "set"],
+    ["compute"],
+    ["compute", "list"],
+    ["compute", "kill"],
+    ["compute", "analyze"],
 ]
 
 
@@ -661,6 +665,38 @@ def mock_api(monkeypatch):
                 "anomaly_tightened": False,
                 "window_minutes": 15,
                 "generated_at": "2026-06-18T00:00:00",
+            }
+        if "/compute-jobs/" in path and "/kill" in path and method == "POST":
+            job_id = path.split("/compute-jobs/")[1].split("/")[0]
+            return {"compute_job": {"id": job_id, "status": "CANCELLED"}}
+        if "/compute-jobs/" in path and "/analyze" in path and method == "POST":
+            job_id = path.split("/compute-jobs/")[1].split("/")[0]
+            return {"outcome": "success", "knowledge_document_id": "kdoc-abc123", "job_id": job_id}
+        if "/compute-jobs" in path:
+            return {
+                "compute_jobs": [
+                    {"id": "cjob-aaa0-0000-0000-000000000001",
+                     "status": "RUNNING", "task_title": "GPU benchmark alpha",
+                     "task_type": "compute_experiment",
+                     "final_cost_usd": None,
+                     "experiment": "exp-alpha",
+                     "benchmark": "bench-1",
+                     "hypothesis": "GPU is faster",
+                     "criterion_verdict": None,
+                     "success_criterion": {"metric": "latency_ms", "operator": "lt", "threshold": 100}},
+                    {"id": "cjob-bbb0-0000-0000-000000000002",
+                     "status": "SUCCEEDED", "task_title": "GPU benchmark beta",
+                     "task_type": "compute_experiment",
+                     "final_cost_usd": 12.5,
+                     "experiment": "exp-beta",
+                     "benchmark": "bench-2",
+                     "hypothesis": "Quantization works",
+                     "criterion_verdict": {"met": True, "measured_value": 80.0},
+                     "success_criterion": {"metric": "latency_ms", "operator": "lt", "threshold": 100}},
+                ],
+                "has_more": False,
+                "limit": 20,
+                "offset": 0,
             }
         if "/directions/" in path and "/unhold" in path:
             return {"status": "unheld", "direction_id": "d-abc12345", "was_held": True}
@@ -2728,3 +2764,95 @@ def test_envelope_set_patches_envelope(mock_api, monkeypatch, capsys):
         m == "PATCH" and "resource-envelope" in p
         for m, p, _ in mock_api
     )
+
+
+# ── compute command group ─────────────────────────────────────────────────────
+
+def test_compute_list_json(mock_api, capsys):
+    """compute list --json returns compute jobs with status, title, and cost fields."""
+    rc = blueprint.main(["--json", "compute", "list"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    jobs = parsed["compute_jobs"]
+    assert len(jobs) == 2
+    # running job has no cost yet
+    running = next(j for j in jobs if j["status"] == "RUNNING")
+    assert running["task_title"] == "GPU benchmark alpha"
+    assert running["experiment"] == "exp-alpha"
+    assert running["final_cost_usd"] is None
+    # succeeded job has cost and a criterion verdict
+    done = next(j for j in jobs if j["status"] == "SUCCEEDED")
+    assert done["final_cost_usd"] == 12.5
+    assert done["criterion_verdict"]["met"] is True
+    assert any("/compute-jobs" in path for _, path, _ in mock_api)
+
+
+def test_compute_list_human_render(mock_api, capsys):
+    """compute list human output shows status and job titles."""
+    rc = blueprint.main(["compute", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "COMPUTE JOBS" in out
+    assert "RUNNING" in out
+    assert "GPU benchmark alpha" in out
+    assert "SUCCEEDED" in out
+    assert "GPU benchmark beta" in out
+    assert "$12.50" in out
+    assert "met=True" in out
+
+
+def test_compute_list_defaults_to_list(mock_api, capsys):
+    """compute without a subcommand defaults to list."""
+    rc = blueprint.main(["compute"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "COMPUTE JOBS" in out
+
+
+def test_compute_kill_read_only_refused(mock_api, monkeypatch):
+    """compute kill refuses under a read-only (agent-JWT) config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["compute", "kill", "cjob-aaa0-0000-0000-000000000001", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_compute_kill_with_yes_posts_kill(mock_api, monkeypatch, capsys):
+    """compute kill --yes POSTs to the kill endpoint and reports the final status."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    job_id = "cjob-aaa0-0000-0000-000000000001"
+    rc = blueprint.main(["compute", "kill", job_id, "--yes"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "CANCELLED" in out
+    kill_calls = [(m, p) for m, p, _ in mock_api if m == "POST" and "/kill" in p]
+    assert kill_calls, "Expected a POST to the /kill endpoint"
+    assert job_id in kill_calls[0][1]
+
+
+def test_compute_analyze_with_yes_posts_analyze(mock_api, monkeypatch, capsys):
+    """compute analyze --yes POSTs to the analyze endpoint and reports outcome."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    job_id = "cjob-bbb0-0000-0000-000000000002"
+    rc = blueprint.main(["compute", "analyze", job_id, "--yes"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "success" in out
+    analyze_calls = [(m, p) for m, p, _ in mock_api if m == "POST" and "/analyze" in p]
+    assert analyze_calls, "Expected a POST to the /analyze endpoint"
+    assert job_id in analyze_calls[0][1]
+
+
+def test_compute_kill_aborts_without_yes(mock_api, monkeypatch, capsys):
+    """compute kill without --yes on non-interactive stdin aborts cleanly."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = blueprint.main(["compute", "kill", "cjob-aaa0-0000-0000-000000000001"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Aborted" in out
+    assert not any(m == "POST" and "/kill" in p for m, p, _ in mock_api)

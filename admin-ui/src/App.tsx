@@ -290,6 +290,7 @@ export default function App() {
 
   const [dismissedZoneAlertIds, setDismissedZoneAlertIds] = useState<Set<string>>(new Set());
   const [researchBrowserDirectionId, setResearchBrowserDirectionId] = useState<string | null>(null);
+  const [knowledgeBrowserDirectionId, setKnowledgeBrowserDirectionId] = useState<string | null>(null);
   const [researchFeed, setResearchFeed] = useState<Task[]>([]);
 
   // Fetch project tasks when the Findings Journal opens so findings and implementation child
@@ -928,6 +929,7 @@ export default function App() {
             cycleProgress={s.cycleProgress}
             lastCycleCompletion={s.lastCycleCompletion}
             onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
+            onViewKnowledge={(dirId) => { setKnowledgeBrowserDirectionId(dirId); s.setShowKnowledgeBrowser(true); }}
             onNavigateToTask={(taskId) => {
               const target = s.tasks.find(t => t.id === taskId);
               if (target) s.handleViewLogs(target);
@@ -1254,8 +1256,9 @@ export default function App() {
       {s.showKnowledgeBrowser && (
         <KnowledgeBrowser
           selectedProjectId={s.selectedProjectId}
-          onClose={() => s.setShowKnowledgeBrowser(false)}
+          onClose={() => { s.setShowKnowledgeBrowser(false); setKnowledgeBrowserDirectionId(null); }}
           onLaunchWebResearchTask={s.openWebResearchTaskModal}
+          initialDirectionId={knowledgeBrowserDirectionId ?? undefined}
           onNavigateToTask={(taskId) => {
             s.setShowKnowledgeBrowser(false);
             const target = s.tasks.find(t => t.id === taskId);

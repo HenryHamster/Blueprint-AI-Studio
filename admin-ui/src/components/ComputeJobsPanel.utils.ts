@@ -79,3 +79,21 @@ export function computeJobRuntimeSec(job: ComputeJob): number | null {
   if (Number.isNaN(start) || Number.isNaN(end) || end <= start) return null;
   return Math.round((end - start) / 1000);
 }
+
+/** Calculate the margin (distance from threshold to actual value).
+ *  Positive margin means the result beat the threshold; negative means it missed.
+ *  For >= / > operators: margin = value - threshold
+ *  For <= / < operators: margin = threshold - value
+ *  Returns null when value or threshold is missing. */
+export function computeJobMargin(job: ComputeJob): number | null {
+  const verdict = job.criterion_verdict;
+  if (!verdict || verdict.value === null || verdict.threshold === null) return null;
+  const op = verdict.operator;
+  if (op === '>=' || op === '>') {
+    return verdict.value - verdict.threshold;
+  }
+  if (op === '<=' || op === '<') {
+    return verdict.threshold - verdict.value;
+  }
+  return null;
+}

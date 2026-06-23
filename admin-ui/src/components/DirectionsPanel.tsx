@@ -190,7 +190,7 @@ const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'staged' | 'paused' | 
 
 const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
-export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateToTask, selectedProjectId, projects = [], fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion, pageMode = false }: { onClose?: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void; selectedProjectId: string | null; projects?: Project[]; fetchDirectionsRef?: React.MutableRefObject<() => void>; strategistActive?: boolean; cycleProgress?: import('../hooks/useLogViewer').StrategicCycleProgress | null; lastCycleCompletion?: import('../hooks/useLogViewer').StrategicCycleCompletion | null; pageMode?: boolean }) {
+export function DirectionsPanel({ onClose, addToast, onViewFindings, onViewKnowledge, onNavigateToTask, selectedProjectId, projects = [], fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion, pageMode = false }: { onClose?: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onViewKnowledge?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void; selectedProjectId: string | null; projects?: Project[]; fetchDirectionsRef?: React.MutableRefObject<() => void>; strategistActive?: boolean; cycleProgress?: import('../hooks/useLogViewer').StrategicCycleProgress | null; lastCycleCompletion?: import('../hooks/useLogViewer').StrategicCycleCompletion | null; pageMode?: boolean }) {
   // Active tab
   const [activeTab, setActiveTab] = useState<DirectionsTab>('directions');
 
@@ -396,6 +396,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             setForceConfirmId={data.setForceConfirmId}
             stageTargetVersion={data.openVersionNumber}
             onViewFindings={onViewFindings}
+            onViewKnowledge={onViewKnowledge}
             onNavigateToTask={onNavigateToTask}
           />
           </div>
@@ -621,6 +622,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             setForceConfirmId={data.setForceConfirmId}
             stageTargetVersion={data.openVersionNumber}
             onViewFindings={onViewFindings}
+            onViewKnowledge={onViewKnowledge}
             onNavigateToTask={onNavigateToTask}
           />
         </div>

@@ -7,6 +7,7 @@ import {
   computeJobTerminalLabel,
   computeJobRpcDiagnostic,
   computeJobRuntimeSec,
+  computeJobMargin,
   fmtCountdown,
   fmtDuration,
 } from './ComputeJobsPanel.utils';
@@ -124,6 +125,38 @@ describe('ComputeJobsPanel helpers', () => {
     expect(computeJobRuntimeSec(makeJob({ started_at: start.toISOString(), completed_at: end.toISOString() }))).toBe(323);
     expect(computeJobRuntimeSec(makeJob({ started_at: null, completed_at: end.toISOString() }))).toBeNull();
     expect(computeJobRuntimeSec(makeJob({ started_at: start.toISOString(), completed_at: null }))).toBeNull();
+  });
+
+  test('computeJobMargin calculates distance from threshold for >= operators', () => {
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.95, met: true, measurable: true },
+    }))).toBeCloseTo(0.05);
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.85, met: false, measurable: true },
+    }))).toBeCloseTo(-0.05);
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'accuracy', operator: '>', threshold: 0.9, value: 0.92, met: true, measurable: true },
+    }))).toBeCloseTo(0.02);
+  });
+
+  test('computeJobMargin calculates distance from threshold for <= operators', () => {
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 95, met: true, measurable: true },
+    }))).toBeCloseTo(5);
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 105, met: false, measurable: true },
+    }))).toBeCloseTo(-5);
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'latency_ms', operator: '<', threshold: 100, value: 98, met: true, measurable: true },
+    }))).toBeCloseTo(2);
+  });
+
+  test('computeJobMargin returns null when value or threshold is missing', () => {
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: null, met: false, measurable: false },
+    }))).toBeNull();
+    expect(computeJobMargin(makeJob({ criterion_verdict: null }))).toBeNull();
+    expect(computeJobMargin(makeJob())).toBeNull();
   });
 });
 
@@ -967,5 +1000,86 @@ describe('ComputeJobsPanel render + kill', () => {
     await findByText('Analysis complete');
     expect(fetchKnowledgeDocument).not.toHaveBeenCalled();
     expect(queryByTestId('compute-analysis-doc')).toBeNull();
+  });
+
+  test('terminal job with criterion verdict displays margin above threshold in green', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+        criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.95, met: true, measurable: true },
+      }),
+    ]);
+    const { findByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('criterion-verdict-row');
+    const margin = getByTestId('criterion-margin');
+    expect(margin.textContent).toBe('+0.05');
+    expect(margin.classList.contains('text-emerald-300')).toBe(true);
+  });
+
+  test('terminal job with criterion verdict displays margin below threshold in red', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+        criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.85, met: false, measurable: true },
+      }),
+    ]);
+    const { findByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('criterion-verdict-row');
+    const margin = getByTestId('criterion-margin');
+    expect(margin.textContent).toBe('-0.05');
+    expect(margin.classList.contains('text-red-300')).toBe(true);
+  });
+
+  test('terminal job with <= operator shows correct margin sign', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        success_criterion: { metric: 'latency_ms', operator: '<=', threshold: 100 },
+        criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 80, met: true, measurable: true },
+      }),
+    ]);
+    const { findByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('criterion-verdict-row');
+    const margin = getByTestId('criterion-margin');
+    expect(margin.textContent).toBe('+20.00');
+    expect(margin.classList.contains('text-emerald-300')).toBe(true);
+  });
+
+  test('terminal job without criterion_verdict does not show margin', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+        criterion_verdict: null,
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('not reported');
+    expect(queryByTestId('criterion-margin')).toBeNull();
+  });
+
+  test('terminal job with null measured value does not show margin', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+        criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: null, met: false, measurable: false },
+      }),
+    ]);
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('criterion-verdict-row');
+    expect(queryByTestId('criterion-margin')).toBeNull();
   });
 });

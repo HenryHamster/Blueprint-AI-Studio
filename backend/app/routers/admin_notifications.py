@@ -673,6 +673,22 @@ async def resolve_message(
     )
     await session.commit()
     if result.rowcount > 0:
+        if msg.message_type == MessageType.QUESTION and resolution:
+            try:
+                from app.notification_dispatch import post_question_answer as _post_qa
+
+                await _post_qa(
+                    session,
+                    msg.project_id,
+                    msg.id,
+                    resolution,
+                    from_type="user",
+                )
+                await session.commit()
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "post_question_answer failed for message %s", msg.id, exc_info=True
+                )
         return {"id": str(msg.id), "status": "resolved"}
     else:
         # Message was already resolved by a concurrent request

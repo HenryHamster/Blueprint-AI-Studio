@@ -3218,6 +3218,77 @@ def _render_playbook(data: dict) -> None:
         print(f"  {k}: {(content or '')[:120]}")
 
 
+# ── compute ───────────────────────────────────────────────────────────────────
+
+def cmd_compute(args: argparse.Namespace) -> None:
+    """Dispatch compute subcommands: list / kill / analyze."""
+    sub = getattr(args, "compute_cmd", None) or "list"
+    if sub == "kill":
+        _compute_kill(args)
+    elif sub == "analyze":
+        _compute_analyze(args)
+    else:
+        _compute_list(args)
+
+
+def _compute_list(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    finished = getattr(args, "include_finished", 360)
+    limit = getattr(args, "limit", 20)
+    resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
+               f"?include_finished_minutes={finished}&limit={limit}")
+    jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
+    has_more = resp.get("has_more", False) if isinstance(resp, dict) else False
+    _emit(args, {"compute_jobs": jobs, "has_more": has_more}, _render_compute_list)
+
+
+def _render_compute_list(data: dict) -> None:
+    jobs = data.get("compute_jobs") or []
+    print(f"=== COMPUTE JOBS ({len(jobs)}) ===")
+    if not jobs:
+        print("  (none)")
+        return
+    for j in jobs:
+        jid = (j.get("id") or "?")[:8]
+        status = j.get("status", "?")
+        title = (j.get("task_title") or "")[:50]
+        task_type = j.get("task_type") or "?"
+        cost = j.get("final_cost_usd")
+        cost_str = f"  ${cost:.2f}" if cost is not None else ""
+        verdict = (j.get("criterion_verdict") or {}).get("met") if isinstance(j.get("criterion_verdict"), dict) else None
+        verdict_str = f"  met={verdict}" if verdict is not None else ""
+        exp = (j.get("experiment") or "")[:20]
+        exp_str = f"  exp={exp}" if exp else ""
+        print(f"  {jid}  {status:12} [{task_type}]  {title}{cost_str}{verdict_str}{exp_str}")
+    if data.get("has_more"):
+        print("  (more jobs available; increase --limit or --include-finished)")
+
+
+def _compute_kill(args: argparse.Namespace) -> None:
+    _require_write_config("compute kill")
+    job_id = args.job_id
+    if not _confirm(f"Kill compute job {job_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", f"/api/admin/compute-jobs/{job_id}/kill")
+    killed_status = (result.get("compute_job") or {}).get("status", "killed")
+    _emit(args, result, lambda r: print(f"  {job_id[:8]}: {killed_status}"))
+
+
+def _compute_analyze(args: argparse.Namespace) -> None:
+    _require_write_config("compute analyze")
+    job_id = args.job_id
+    if not _confirm(f"Trigger analysis for compute job {job_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", f"/api/admin/compute-jobs/{job_id}/analyze")
+    _emit(args, result, lambda r: print(
+        f"  Analysis complete for {job_id[:8]}: "
+        f"outcome={r.get('outcome', '?')}  "
+        f"knowledge_doc={r.get('knowledge_document_id', 'none')}"
+    ))
+
+
 # ── argument parser ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3721,6 +3792,33 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Close all open cases with a matching class prefix.")
     p_rc.add_argument("--reason", help="Reason for closing (recorded on the case).")
 
+    # compute
+    p_compute = sub.add_parser(
+        "compute", parents=[common],
+        help="Launch, list, kill, and analyze compute experiments.",
+        description="Manage GPU/accelerator compute jobs. Defaults to `list` when no "
+                    "subcommand is given.")
+    compute_sub = p_compute.add_subparsers(dest="compute_cmd")
+    p_compute_list = compute_sub.add_parser("list", parents=[common],
+                                            help="List active and recent compute jobs.")
+    p_compute_list.add_argument(
+        "--include-finished", dest="include_finished", type=int, default=360,
+        help="Include jobs that finished within this many minutes (default 360).")
+    p_compute_list.add_argument("--limit", type=int, default=20,
+                                help="Max jobs to return (default 20).")
+    p_compute_kill = compute_sub.add_parser(
+        "kill", parents=[common],
+        help="Kill a running compute job (confirms before mutating).")
+    p_compute_kill.add_argument("job_id", help="Compute job id (UUID).")
+    p_compute_kill.add_argument("--yes", action="store_true",
+                                help="Skip the confirmation prompt.")
+    p_compute_analyze = compute_sub.add_parser(
+        "analyze", parents=[common],
+        help="Trigger LLM analysis for a terminal compute job (confirms before posting).")
+    p_compute_analyze.add_argument("job_id", help="Compute job id (UUID).")
+    p_compute_analyze.add_argument("--yes", action="store_true",
+                                   help="Skip the confirmation prompt.")
+
     # playbook
     p_pb = sub.add_parser("playbook", parents=[common],
                           help="List, delete, or prune playbook entries.",
@@ -3764,6 +3862,7 @@ _DISPATCH = {
     "fingerprints": cmd_fingerprints,
     "regression-cases": cmd_regression_cases,
     "playbook": cmd_playbook,
+    "compute": cmd_compute,
 }
 
 

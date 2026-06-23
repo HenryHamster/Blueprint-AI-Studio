@@ -12,6 +12,7 @@ import {
   computeJobRpcDiagnostic,
   computeJobSpent,
   computeJobRuntimeSec,
+  computeJobMargin,
   fmtUsd,
   fmtCountdown,
   fmtDuration,
@@ -653,6 +654,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const verdict = job.criterion_verdict;
                 if (!sc) return null;
                 const expr = `${sc.metric} ${sc.operator} ${sc.threshold}`;
+                const margin = computeJobMargin(job);
                 let chip: React.ReactNode;
                 if (!verdict) {
                   chip = (
@@ -681,17 +683,32 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 }
                 return (
                   <div
-                    className="mt-1.5 flex items-center gap-1.5 text-ui-sm font-mono"
+                    className="mt-1.5 flex flex-col gap-1 text-ui-sm font-mono"
                     data-testid="criterion-verdict-row"
                   >
-                    <span className="text-neutral-500 shrink-0">Criterion</span>
-                    <span className="text-neutral-300 break-words">{expr}</span>
-                    {verdict && verdict.value !== null && verdict.value !== undefined && (
-                      <span className="text-neutral-500">
-                        (measured: {verdict.value})
-                      </span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-neutral-500 shrink-0">Criterion</span>
+                      <span className="text-neutral-300 break-words">{expr}</span>
+                      {verdict && verdict.value !== null && verdict.value !== undefined && (
+                        <span className="text-neutral-500">
+                          (measured: {verdict.value})
+                        </span>
+                      )}
+                      {chip}
+                    </div>
+                    {margin !== null && (
+                      <div className="flex items-center gap-1.5 text-neutral-500">
+                        <span className="shrink-0">Margin</span>
+                        <span
+                          className={`font-semibold ${
+                            margin >= 0 ? 'text-emerald-300' : 'text-red-300'
+                          }`}
+                          data-testid="criterion-margin"
+                        >
+                          {margin >= 0 ? '+' : ''}{margin.toFixed(2)}
+                        </span>
+                      </div>
                     )}
-                    {chip}
                   </div>
                 );
               })()}

@@ -1988,18 +1988,19 @@ async def post_question_answer(
     original_msg_id: uuid.UUID,
     answer: str,
     task_id: Optional[uuid.UUID] = None,
+    from_type: str = "strategic",
 ) -> ProjectMessage:
-    """Create a strategist reply message answering a resolved QUESTION message.
+    """Create a reply message answering a resolved QUESTION message.
 
-    Uses from_type="strategic" (NOT "system") so the answer reads as a
-    first-class strategist response in the operator conversation feed.
+    Uses from_type="strategic" by default (NOT "system") so the answer reads as
+    a first-class strategist response; pass from_type="user" for operator replies.
     The event_type "question_answer" is a cross-component contract consumed
     by the frontend threading logic — use it verbatim.
     """
     msg = ProjectMessage(
         project_id=project_id,
         message_type=MessageType.NOTE,
-        from_type="strategic",
+        from_type=from_type,
         from_task_id=task_id,
         content=f"Answer: {answer}",
         context={

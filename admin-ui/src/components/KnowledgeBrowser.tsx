@@ -18,6 +18,7 @@ interface KnowledgeBrowserProps {
   onClose: () => void;
   onNavigateToTask?: (taskId: string) => void;
   onLaunchWebResearchTask?: (topic?: string) => void;
+  initialDirectionId?: string;
 }
 
 function relativeDate(dateStr: string | null): string {
@@ -401,12 +402,12 @@ function CopyableId({ id }: { id: string }) {
 
 const PAGE_SIZE = 50;
 
-export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask }: KnowledgeBrowserProps) {
+export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask, initialDirectionId }: KnowledgeBrowserProps) {
   const [query, setQuery] = useState({
     search: '',
     topicFilter: null as string | null,
     tagFilter: null as string | null,
-    directionFilter: null as string | null,
+    directionFilter: (initialDirectionId ?? null) as string | null,
     sourceKindFilter: null as string | null,
     challengeStateFilter: null as string | null,
     offset: 0,
