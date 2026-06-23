@@ -6130,14 +6130,13 @@ async def test_run_qualification_reuses_grade_when_skipped_pr_count_nonzero(
     db_session, mocker
 ):
     """Regression: a persisted grade with pr_count>0 and skipped_pr_count>0 must
-    satisfy blind_merge_grade_satisfied so run_qualification reuses it and does NOT
-    call compute_blind_merge_grade again.
+    allow run_qualification to proceed normally — spawning both audit and
+    merge_grade tasks. Grading is now done exclusively by the spawned
+    merge_grade task; there is no inline re-grade.
 
     Previously blind_merge_grade_satisfied returned False whenever skipped_pr_count>0,
-    causing a fresh ~90s Opus re-grade under the qualification lock on every cycle
-    even though a valid grade already existed.
+    causing incorrect behavior in the qualification pipeline.
     """
-    from app import blind_merge_grade as bmg
     from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -6170,12 +6169,20 @@ async def test_run_qualification_reuses_grade_when_skipped_pr_count_nonzero(
     # Qualification proceeds (spawned).
     assert result["status"] == "spawned", f"unexpected status: {result}"
 
+    # A merge_grade task was spawned for the non-empty goal.
+    assert result.get("merge_grade_task_id"), (
+        "merge_grade_task_id must be set when version.goal is non-empty"
+    )
+
     await db_session.refresh(version)
-    # The prior grade is still present and satisfies the gate.
-    assert bmg.blind_merge_grade_satisfied(version, candidate) is True
-    carried = (version.last_qualification or {}).get(BLIND_MERGE_GRADE_KEY, {})
-    assert carried.get("skipped_pr_count") == 1
-    assert carried.get("pr_count") == 3
+    assert version.last_qualification["status"] == "pending"
+    assert (
+        version.last_qualification.get("merge_grade_task_id")
+        == result["merge_grade_task_id"]
+    )
+    # Grading is now done exclusively by the spawned merge_grade task — no
+    # inline blind_merge_grade key on the pending record.
+    assert "blind_merge_grade" not in version.last_qualification
 
 
 @pytest.mark.asyncio
