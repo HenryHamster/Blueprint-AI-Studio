@@ -1015,7 +1015,7 @@ async def raise_stalled_trial_notice(
     project_id: Any,
     cap_name: str,
     entry: dict[str, Any],
-) -> None:
+) -> bool:
     """Record a durable operator notice when a capability trial is permanently stalled.
 
     Deduplicated on ``cap_name`` so repeated digest re-evaluations of the same stalled
@@ -1023,12 +1023,14 @@ async def raise_stalled_trial_notice(
     data the digest already computed: which arm is stalled, its assigned count vs
     ``min_n``, the recent accrual rates, the current ``holdback_fraction``, and the
     ``alternative_projections`` map of concrete options the operator can act on.
+
+    Returns True when a new notice was written, False when the dedupe key already existed.
     """
     from app.models import MessageType, ProjectMessage
 
     dedupe_key = f"capability_trial_stalled_{cap_name}"
     if await _check_open_message_exists(session, project_id, dedupe_key):
-        return
+        return False
 
     accrual = entry.get("accrual_projection") or {}
     with_7d = accrual.get("with_7d")
@@ -1067,6 +1069,7 @@ async def raise_stalled_trial_notice(
             },
         )
     )
+    return True
 
 
 async def persist_stalled_trial_notices_in_transaction(
@@ -1093,7 +1096,25 @@ async def persist_stalled_trial_notices_in_transaction(
     async with factory() as session:
         try:
             for cap_name, entry in stalled:
-                await raise_stalled_trial_notice(session, project_id, cap_name, entry)
+                newly_noticed = await raise_stalled_trial_notice(
+                    session, project_id, cap_name, entry
+                )
+                if newly_noticed:
+                    try:
+                        from app.strategic_trigger import request_strategic_refresh
+
+                        await request_strategic_refresh(
+                            session,
+                            project_id,
+                            f"capability_trial_stalled:{cap_name}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[CAPABILITY_TRIAL] strategic refresh failed for stalled trial "
+                            "%s on project %s (non-fatal)",
+                            cap_name,
+                            project_id,
+                        )
             await session.commit()
         except Exception:
             await session.rollback()
@@ -1149,17 +1170,19 @@ async def raise_ambiguous_lift_escalation_notice(
     project_id: Any,
     cap_name: str,
     entry: dict[str, Any],
-) -> None:
+) -> bool:
     """Record a durable operator notice when an ambiguous_lift trial exceeds the dwell threshold.
 
     Deduplicated on ``cap_name`` so repeated digest re-evaluations of the same
     long-dwelling trial emit exactly ONE open notice per capability.
+
+    Returns True when a new notice was written, False when the dedupe key already existed.
     """
     from app.models import MessageType, ProjectMessage
 
     dedupe_key = f"capability_trial_ambiguous_lift_escalation_{cap_name}"
     if await _check_open_message_exists(session, project_id, dedupe_key):
-        return
+        return False
 
     since_str = entry.get("ambiguous_lift_since")
     lift = entry.get("lift")
@@ -1191,6 +1214,7 @@ async def raise_ambiguous_lift_escalation_notice(
             },
         )
     )
+    return True
 
 
 async def persist_ambiguous_lift_escalations_in_transaction(
@@ -1217,8 +1241,89 @@ async def persist_ambiguous_lift_escalations_in_transaction(
     async with factory() as session:
         try:
             for cap_name, entry in escalated:
-                await raise_ambiguous_lift_escalation_notice(
+                newly_noticed = await raise_ambiguous_lift_escalation_notice(
                     session, project_id, cap_name, entry
+                )
+                if newly_noticed:
+                    try:
+                        from app.strategic_trigger import request_strategic_refresh
+
+                        await request_strategic_refresh(
+                            session,
+                            project_id,
+                            f"capability_trial_ambiguous_lift:{cap_name}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[CAPABILITY_TRIAL] strategic refresh failed for ambiguous-lift "
+                            "escalation %s on project %s (non-fatal)",
+                            cap_name,
+                            project_id,
+                        )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+def attach_accrual_projection_to_verdict(
+    project: Any,
+    cap_name: str,
+    accrual_projection: dict[str, Any],
+    is_stalled: bool = False,
+) -> None:
+    """Stamp accrual_projection and is_stalled onto an existing persisted verdict entry.
+
+    Supplements ``record_trial_verdict``: once the core verdict is committed, this
+    patches a fresh accrual-rate snapshot so strategic readers can see whether the
+    trial can reach min_n at current throughput.  Callers must flush/commit the session.
+    No-op when the cap has no existing verdict entry.
+    """
+    verdicts = getattr(project, "capability_adoption_verdicts", None)
+    if not isinstance(verdicts, dict):
+        return
+    entry = verdicts.get(cap_name)
+    if not isinstance(entry, dict):
+        return
+    verdicts[cap_name] = {
+        **entry,
+        "accrual_projection": accrual_projection,
+        "is_stalled": is_stalled,
+    }
+    flag_modified(project, "capability_adoption_verdicts")
+
+
+async def persist_accrual_projections_in_transaction(
+    source_session: Any,
+    project_id: Any,
+    *,
+    projections: list[tuple[str, dict[str, Any], bool]],
+) -> None:
+    """Durably persist accrual-projection snapshots onto existing verdict entries.
+
+    Opens its OWN committing AsyncSession (mirroring ``persist_trial_verdicts_in_transaction``)
+    so projection data survives regardless of whether the outer digest session commits.
+    Each tuple is (cap_name, accrual_projection, is_stalled).  Entries with no existing
+    verdict are silently skipped.  On any exception rolls back and re-raises.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.database import resolve_async_engine
+    from app.models import Project
+
+    factory = async_sessionmaker(
+        resolve_async_engine(source_session),
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with factory() as session:
+        try:
+            project = await session.get(Project, project_id)
+            if project is None:
+                return
+            for cap_name, accrual_projection, is_stalled in projections:
+                attach_accrual_projection_to_verdict(
+                    project, cap_name, accrual_projection, is_stalled
                 )
             await session.commit()
         except Exception:

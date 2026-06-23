@@ -2179,6 +2179,104 @@ async def test_agent_fetch_vm_cost_rejects_cross_project(
 
 
 @pytest.mark.asyncio
+async def test_agent_fetch_capability_trials_returns_verdicts(
+    client: AsyncClient, db_session
+):
+    """Agent endpoint returns capability-trial verdicts keyed by cap_name."""
+    project = Project(
+        name="Cap Trial Test",
+        user_id="test-user-ct",
+        capability_adoption_verdicts={
+            "repo_map": {
+                "verdict": "continue-trial",
+                "verdict_reason": "insufficient_data",
+                "lift": None,
+                "n_with": 10,
+                "n_without": 5,
+                "arm_composition": {
+                    "with_assigned": 10,
+                    "without_assigned": 5,
+                },
+                "accrual_projection": {
+                    "with_7d": 3,
+                    "without_7d": 1,
+                    "days_to_min_n": 25.0,
+                },
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-ct")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/capability-trials",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    verdicts = body["data"]["verdicts"]
+    assert "repo_map" in verdicts
+    entry = verdicts["repo_map"]
+    assert entry["verdict"] == "continue-trial"
+    assert entry["n_with"] == 10
+    assert entry["n_without"] == 5
+    assert entry["arm_composition"]["with_assigned"] == 10
+    assert entry["accrual_projection"]["days_to_min_n"] == 25.0
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_capability_trials_empty_when_no_verdicts(
+    client: AsyncClient, db_session
+):
+    """No verdicts on project → returns empty verdicts dict."""
+    project, task = await _make_project_task(db_session, vm="agent-vm-cte")
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/capability-trials",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["data"]["verdicts"] == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_capability_trials_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch capability-trials for project B (404)."""
+    project_a = Project(name="CT A", user_id="test-user-cta")
+    project_b = Project(name="CT B", user_id="test-user-ctb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(
+        project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-cta"
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-cta")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/capability-trials",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_fetch_efficiency_snapshot(client: AsyncClient, db_session):
     """Agent endpoint returns cost_per_merged_pr and vm_reuse_rate in data."""
     project, task = await _make_project_task(db_session, vm="agent-vm-eff")

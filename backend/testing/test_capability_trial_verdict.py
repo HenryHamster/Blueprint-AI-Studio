@@ -19,6 +19,7 @@ from app.capability_trial_verdict import (
     LANE_PILOT_CAP_NAME,
     LANE_PILOT_CHECKPOINT_RECEIPT_KEY,
     LANE_PILOT_WARM_RESUME_RECEIPT_KEY,
+    attach_accrual_projection_to_verdict,
     carry_adoption_verdicts_for_consolidation,
     evaluate_lane_pilot_verdict,
     evaluate_trial_verdict,
@@ -1087,6 +1088,58 @@ class TestRecordTrialVerdict:
             == "KILL"
         )
         mock_flag.assert_not_called()
+
+    def test_persisted_verdict_entry_carries_accrual_projection(self):
+        """Accrual projection is stamped onto a verdict entry after record_trial_verdict.
+
+        Validates that attach_accrual_projection_to_verdict patches accrual_projection
+        and is_stalled onto an existing persisted verdict — the fields a strategic reader
+        needs to determine whether the trial can reach min_n at current throughput.
+        Exercises a real merge-test verdict path (adopt via sufficient assigned arms).
+        """
+        project = _make_project()
+
+        comp = {
+            "with_assigned": 35,
+            "with_receipt": 5,
+            "without_assigned": 32,
+            "without_receipt": 3,
+        }
+        entry = evaluate_trial_verdict(
+            lift=0.06,
+            n_with=40,
+            n_without=35,
+            config={"min_n_per_arm": 30, "adopt_lift": 0.05, "reject_lift": -0.03},
+            arm_composition=comp,
+            accumulation_basis="cumulative_terminal_arm_tasks",
+            evaluated_at="2026-06-23T00:00:00",
+        )
+        assert entry["verdict"] == "adopt"
+
+        with patch("app.capability_trial_verdict.flag_modified"):
+            record_trial_verdict(project, "repo_map", entry)
+
+        projection = {
+            "with_7d": 14,
+            "without_7d": 7,
+            "window_days": 7,
+            "holdback_fraction": 0.1,
+            "days_to_min_n": 0.0,
+            "alternative_projections": {"0.1": 0.0, "0.3": 5.2, "0.5": 8.4},
+        }
+
+        with patch("app.capability_trial_verdict.flag_modified") as mock_flag:
+            attach_accrual_projection_to_verdict(
+                project, "repo_map", projection, is_stalled=False
+            )
+
+        stored = project.capability_adoption_verdicts["repo_map"]
+        assert stored["verdict"] == "adopt"
+        assert "accrual_projection" in stored
+        assert stored["accrual_projection"]["days_to_min_n"] == 0.0
+        assert stored["accrual_projection"]["holdback_fraction"] == 0.1
+        assert stored["is_stalled"] is False
+        mock_flag.assert_called_once()
 
 
 # ── get_trial_verdicts ────────────────────────────────────────────────────────
@@ -4031,6 +4084,95 @@ class TestPersistStalledTrialNotices:
         added_msg = mock_session.add.call_args[0][0]
         ctx = added_msg.context
         assert "alternative_projections" in ctx
+
+    @pytest.mark.asyncio
+    async def test_stalled_trial_requests_strategic_refresh_once(self):
+        """Strategic refresh is triggered exactly once on first stall detection, not on re-evaluation.
+
+        Uses a real evaluate_trial_verdict entry (real merge-test verdict) augmented with
+        an accrual_projection that marks the trial as permanently stalled.  The first call
+        to persist_stalled_trial_notices_in_transaction (no existing notice) must arm a
+        strategic refresh.  The second call (existing notice already open) must be silent.
+        """
+        import uuid
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.capability_trial_verdict import (
+            evaluate_trial_verdict,
+            persist_stalled_trial_notices_in_transaction,
+        )
+
+        # Build a real continue-trial entry via the production verdict evaluator.
+        real_entry = evaluate_trial_verdict(
+            lift=None,
+            n_with=5,
+            n_without=3,
+            config={"min_n_per_arm": 30, "adopt_lift": 0.05, "reject_lift": -0.03},
+            arm_composition={
+                "with_assigned": 5,
+                "without_assigned": 3,
+            },
+            accumulation_basis="cumulative_terminal_arm_tasks",
+            evaluated_at="2026-06-20T00:00:00",
+        )
+        assert real_entry["verdict"] == "continue-trial"
+        assert real_entry["verdict_reason"] == "insufficient_data"
+
+        # Augment with accrual_projection so is_trial_stalled() returns True.
+        real_entry["accrual_projection"] = {
+            "with_7d": 5,
+            "without_7d": 0,
+            "window_days": 7,
+            "holdback_fraction": 0.05,
+            "days_to_min_n": None,  # permanently stalled
+            "alternative_projections": {"0.1": 18.0, "0.3": 7.0},
+        }
+
+        project_id = uuid.uuid4()
+
+        # ── First call: no existing notice → refresh must be requested ────────
+        mock_session_1, mock_cm_1 = self._build_mock_db(open_messages=[])
+        mock_factory_1 = MagicMock(return_value=mock_cm_1)
+
+        with (
+            patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory_1),
+            patch("app.database.resolve_async_engine", return_value=MagicMock()),
+            patch(
+                "app.strategic_trigger.request_strategic_refresh",
+                new_callable=AsyncMock,
+            ) as mock_refresh_1,
+        ):
+            await persist_stalled_trial_notices_in_transaction(
+                MagicMock(),
+                project_id,
+                stalled=[("repo_map", real_entry)],
+            )
+
+        mock_refresh_1.assert_called_once()
+        refresh_reason = mock_refresh_1.call_args[0][2]
+        assert refresh_reason == "capability_trial_stalled:repo_map"
+
+        # ── Second call: notice already open → refresh must NOT be requested ──
+        existing_msg = MagicMock()
+        existing_msg.context = {"dedupe_key": "capability_trial_stalled_repo_map"}
+        mock_session_2, mock_cm_2 = self._build_mock_db(open_messages=[existing_msg])
+        mock_factory_2 = MagicMock(return_value=mock_cm_2)
+
+        with (
+            patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory_2),
+            patch("app.database.resolve_async_engine", return_value=MagicMock()),
+            patch(
+                "app.strategic_trigger.request_strategic_refresh",
+                new_callable=AsyncMock,
+            ) as mock_refresh_2,
+        ):
+            await persist_stalled_trial_notices_in_transaction(
+                MagicMock(),
+                project_id,
+                stalled=[("repo_map", real_entry)],
+            )
+
+        mock_refresh_2.assert_not_called()
 
 
 # ── is_stalled flag stamped on augmented verdict entries ──────────────────────

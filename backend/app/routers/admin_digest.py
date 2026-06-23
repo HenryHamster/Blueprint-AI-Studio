@@ -48,6 +48,7 @@ from app.capability_trial_verdict import (
     get_trial_definitions,
     is_ambiguous_lift_escalation_needed,
     is_trial_stalled,
+    persist_accrual_projections_in_transaction,
     persist_ambiguous_lift_escalations_in_transaction,
     persist_stalled_trial_notices_in_transaction,
     persist_trial_verdicts_in_transaction,
@@ -1821,7 +1822,7 @@ async def _compute_digest(
             )
             _persisted_verdicts = {}
 
-        # --- Per-trial accrual projection (ephemeral, NOT persisted) ---
+        # --- Per-trial accrual projection (persisted onto verdict entries) ---
         # Augment the verdict entries returned in the response with a recent
         # assigned-arm accrual rate and a projection of how many days remain until
         # BOTH arms' assigned subpopulation reaches the min-N decision threshold at
@@ -1952,6 +1953,28 @@ async def _compute_digest(
             _entry["is_stalled"] = _stalled
             if _stalled:
                 _stalled_trials.append((_cap, _entry))
+
+        # Persist accrual-projection snapshots onto the durable verdict entries so
+        # strategic readers can observe whether a trial can reach min_n at current
+        # throughput without going through the admin digest endpoint.
+        _projections_to_persist: list[tuple[str, dict, bool]] = [
+            (_cap, _entry["accrual_projection"], bool(_entry.get("is_stalled")))
+            for _cap, _entry in _augmented_verdicts.items()
+            if isinstance(_entry, dict) and "accrual_projection" in _entry
+        ]
+        if _projections_to_persist:
+            try:
+                await persist_accrual_projections_in_transaction(
+                    session,
+                    project_id,
+                    projections=_projections_to_persist,
+                )
+            except Exception:
+                logger.warning(
+                    "[CAPABILITY_TRIAL] failed to persist accrual projections",
+                    exc_info=True,
+                )
+
         if _stalled_trials:
             try:
                 await persist_stalled_trial_notices_in_transaction(

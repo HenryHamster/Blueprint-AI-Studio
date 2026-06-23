@@ -416,6 +416,33 @@ async def agent_fetch_efficiency_snapshot(
     }
 
 
+@router.get("/projects/{project_id}/capability-trials")
+@limiter.limit("60/minute")
+async def agent_fetch_capability_trials(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return all capability-trial verdict entries for the project.
+
+    Returns the full ``capability_adoption_verdicts`` dict, keyed by cap_name.
+    Each entry includes: verdict, verdict_reason, lift, n_with, n_without,
+    arm_composition, thresholds, and — when the admin digest has run —
+    accrual_projection and is_stalled. Read-only; agent-token auth only.
+    Cross-project access returns 404."""
+    project = await _resolve_agent_project(project_id, token, session)
+    from app.capability_trial_verdict import get_trial_verdicts  # noqa: PLC0415
+
+    verdicts = get_trial_verdicts(project)
+    return {
+        "status": "success",
+        "data": {
+            "verdicts": verdicts,
+        },
+    }
+
+
 @router.get("/projects/{project_id}/gaps/{gap_id}")
 @limiter.limit("60/minute")
 async def agent_fetch_gap(
