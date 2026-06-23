@@ -91,6 +91,21 @@ describe('prepareWorkspaceForRole', () => {
     expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
   });
 
+  it('cold path clone failure sets failureCategory to clone_failed', async () => {
+    const cloneError = new Error('fatal: repository not found');
+    cloneWithRetryMock.mockRejectedValueOnce(cloneError);
+
+    await expect(
+      prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'main',
+        depth: 50,
+      }),
+    ).rejects.toMatchObject({ failureCategory: 'clone_failed' });
+  });
+
   it('cold path: depth=0 → omit --depth flag (full clone semantics)', async () => {
     await prepareWorkspaceForRole({
       workspace: '/ws',

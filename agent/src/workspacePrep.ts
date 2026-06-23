@@ -22,6 +22,7 @@ import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { cloneWithRetry, log, GIT_REFERENCE_CACHE_ROOT, registerSizeCapMergeDriver } from './index.js';
+import type { FailureCategory } from './index.js';
 import { DEFAULT_CLONE_DEPTH } from './constants.js';
 import { sanitize } from './utils/sanitize.js';
 
@@ -301,7 +302,13 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
     log(`prepareWorkspaceForRole: using pre-baked git object cache at ${referenceRepo}`);
   }
   cloneArgs.push(repoUrl, workspace);
-  await cloneWithRetry(cloneArgs);
+  try {
+    await cloneWithRetry(cloneArgs);
+  } catch (e) {
+    const err = e instanceof Error ? e : new Error(String(e));
+    (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'clone_failed';
+    throw err;
+  }
   // A fresh clone does NOT carry .git/config, so the .gitattributes sizecap
   // mapping is inert until the driver command is registered here.
   registerSizeCapMergeDriver(workspace);
