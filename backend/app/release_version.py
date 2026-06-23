@@ -139,10 +139,12 @@ async def open_version(
     ``phase`` defaults to ``"build"``; pass ``"stabilize"`` to bootstrap a
     version over an already-diverged trunk that is ready to qualify.
 
-    ``goal`` is a point-in-time snapshot of ``ProblemModel.intent.current_focus``
-    — what this version is *for*.  Stored verbatim (truncated to ``_GOAL_MAX``)
-    and frozen for the version's lifetime; ``None`` when the project has no
-    current focus.
+    ``goal`` is a strategist-authored objective for this version — a 1-3
+    sentence statement of what the version is for, set by the strategic agent
+    in its first cycle after version-open.  Opens as ``None``; the strategic
+    completion handler applies ``new_version_goal`` from the agent output.
+    Stored verbatim (truncated to ``_GOAL_MAX``) and frozen once set; operator
+    can override via ``POST /api/admin/projects/{id}/version-goal``.
     """
     if phase not in _VALID_PHASES:
         raise ValueError(
@@ -1231,6 +1233,7 @@ def set_version_goal(
     goal: str | None,
     *,
     editor_id: str | None = None,
+    source: str = "operator",
 ) -> None:
     """Update the goal on an open ``ReleaseVersion`` row.
 
@@ -1241,7 +1244,8 @@ def set_version_goal(
     Caller is responsible for ``session.add(version)`` and committing.
 
     ``editor_id`` should be a user email or unique identifier; it is prefixed
-    with ``[operator:`` and suffixed with ``]`` to match phase_reasoning style.
+    with ``[{source}:`` (default ``"operator"``) to match phase_reasoning style.
+    Pass ``source="strategist"`` for strategic-agent-authored goals.
     """
     new_goal = goal[:_GOAL_MAX] if goal else None
     if version.goal == new_goal:
@@ -1256,7 +1260,7 @@ def set_version_goal(
     version.goal = new_goal
     version.goal_updated_at = _utcnow()
     if editor_id:
-        version.goal_editor_info = f"[operator:{editor_id}]"
+        version.goal_editor_info = f"[{source}:{editor_id}]"
     logger.info(
         "[RELEASE_VERSION] goal update for version v%d project=%s "
         "(old: %.50s) (new: %.50s) editor=%s",
@@ -1551,27 +1555,15 @@ async def abandon_current_version(
     resolved_head = await _resolve_integration_head_sha(session, project)
     next_base_sha = resolved_head or locked.base_sha
 
-    next_goal: str | None = None
-    try:
-        from app.problem_model import parse_problem_model
-
-        if project is not None:
-            next_goal = (
-                parse_problem_model(project.problem_model).intent.current_focus or None
-            )
-    except Exception:
-        logger.exception(
-            "[RELEASE_VERSION] abandon: could not read current_focus for the "
-            "next version goal (non-fatal)"
-        )
-
+    # goal opens as None — the strategic agent will author the objective in
+    # its first cycle after version-open (via new_version_goal output field).
     next_version = await open_version(
         session,
         project_id,
         version_number=locked.version_number + 1,
         base_sha=next_base_sha,
         phase="build",
-        goal=next_goal,
+        goal=None,
     )
     logger.info(
         "[RELEASE_VERSION] abandon: v%d abandoned by operator=%s; opened v%d "

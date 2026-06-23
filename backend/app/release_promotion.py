@@ -1848,26 +1848,14 @@ async def _record_promotion_success(
 
     # Open the next version (build phase) — base_sha is the freshly-promoted SHA
     # (the real main HEAD after the merge, not the now-superseded candidate).
-    # goal snapshots the project's current focus (see release_version.open_version).
-    _next_goal: str | None = None
-    try:
-        from app.problem_model import parse_problem_model
-
-        if _record_project is not None:
-            _next_goal = (
-                parse_problem_model(_record_project.problem_model).intent.current_focus
-                or None
-            )
-    except Exception:
-        logger.exception(
-            "[RELEASE_QUALIFIER] could not read current_focus for next version goal"
-        )
+    # goal opens as None — the strategic agent will author the objective in
+    # its first cycle after version-open (via new_version_goal output field).
     next_version = await release_version.open_version(
         session,
         version.project_id,
         version_number=version.version_number + 1,
         base_sha=effective_sha,
-        goal=_next_goal,
+        goal=None,
     )
     logger.info(
         "[RELEASE_QUALIFIER] v%d promoted (sha=%s%s); opened v%d",
