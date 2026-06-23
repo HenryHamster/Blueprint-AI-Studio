@@ -1,6 +1,7 @@
 import type WebSocket from 'ws';
 import { sendLog as _sendLog, runClaudeCode as _runClaudeCode } from '../index.js';
 import { DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
+import { getLlmTelemetry, recordFormatRepairTokens } from '../telemetry.js';
 
 type RunClaudeCodeFn = (
   prompt: string,
@@ -59,8 +60,15 @@ ${context}
 ---
 
 Output ONLY the JSON object now — no preamble, no markdown code fences, no commentary.`;
-  return runFn(
+  const tokensBefore = getLlmTelemetry();
+  const result = await runFn(
     reopenPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
     ws, statusRef, model, effort, disallowedTools,
   );
+  const tokensAfter = getLlmTelemetry();
+  recordFormatRepairTokens(
+    tokensAfter.total_input_tokens - tokensBefore.total_input_tokens,
+    tokensAfter.total_output_tokens - tokensBefore.total_output_tokens,
+  );
+  return result;
 }
