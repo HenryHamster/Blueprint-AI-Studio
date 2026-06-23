@@ -8101,3 +8101,87 @@ def test_llm_cost_by_failure_class_attributes_admin_cancel_to_own_bucket():
     assert attr_by_class["ADMIN_CANCEL"]["total_cost_usd"] == pytest.approx(cancel_cost)
     assert "MERGED" in attr_by_class
     assert attr_by_class["MERGED"]["total_cost_usd"] == pytest.approx(merge_cost)
+
+
+def test_llm_cost_by_outcome_separates_completed_no_pr_from_other():
+    """COMPLETED tasks without a merged PR (research, review, memo) must land in
+    COMPLETED_NO_PR, not OTHER, so operators can distinguish expected non-merge
+    spend from undiagnosed failure spend.
+    """
+    import uuid
+
+    from app.efficiency_snapshot import (
+        LLM_TOKEN_PRICING,
+        compute_llm_cost_by_failure_class,
+    )
+
+    project_id = uuid.uuid4()
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    # COMPLETED task with no PR (research/review/memo type).
+    completed_no_pr = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={},  # no pr_merged, no failure_category
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 600,
+            "llm_call_count": 10,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # FAILED task with no failure_category should still land in OTHER.
+    failed_no_category = make_task(
+        project_id=project_id,
+        status=TaskStatus.FAILED,
+        context={},
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+            "llm_call_count": 2,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Merged task for baseline.
+    merged_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 4,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_failure_class(
+        [completed_no_pr, failed_no_category, merged_task]
+    )
+    by_class = {r["failure_class"]: r for r in rows}
+
+    expected_no_pr_cost = round(3000 * input_rate + 600 * output_rate, 6)
+
+    assert "COMPLETED_NO_PR" in by_class, (
+        "research/memo completions must land in COMPLETED_NO_PR not OTHER"
+    )
+    assert by_class["COMPLETED_NO_PR"]["task_count"] == 1
+    assert by_class["COMPLETED_NO_PR"]["total_cost_usd"] == pytest.approx(
+        expected_no_pr_cost
+    )
+
+    # Undiagnosed failures still land in OTHER — the buckets are separate.
+    assert "OTHER" in by_class
+    assert by_class["OTHER"]["task_count"] == 1
+
+    # COMPLETED_NO_PR and OTHER must not be merged together.
+    assert (
+        by_class["COMPLETED_NO_PR"]["total_cost_usd"]
+        != by_class["OTHER"]["total_cost_usd"]
+    )
+
+    assert "MERGED" in by_class
+    assert by_class["MERGED"]["task_count"] == 1

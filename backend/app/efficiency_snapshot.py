@@ -2687,6 +2687,10 @@ def compute_llm_cost_by_failure_class(tasks: list[Task]) -> list[Dict[str, Any]]
         llm_cost, _ = _task_llm_cost(t)
         if is_merged_completion(t):
             failure_class = "MERGED"
+        elif t.status == TaskStatus.COMPLETED:
+            # COMPLETED but no merged PR — legitimate non-PR task types (research,
+            # review, memo, knowledge, strategic). Separate from undiagnosed failures.
+            failure_class = "COMPLETED_NO_PR"
         else:
             failure_class = (t.context or {}).get("failure_category") or "OTHER"
         b = buckets[failure_class]
