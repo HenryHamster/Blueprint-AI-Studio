@@ -4,6 +4,26 @@ resource "google_artifact_registry_repository" "orchestrator_repo" {
   repository_id = "blueprint-repo"
   description   = "Docker repository for the Orchestrator backend"
   format        = "DOCKER"
+
+  # Bound image-storage growth: $0.10/GB-month reclaimed on stale/untagged layers.
+  # Real saving scales with repo size — a 100 GB estate saves $10/mo; 400 GB saves $40/mo.
+  # KEEP policy runs before DELETE, so the 5 most recent tagged images are always preserved.
+  cleanup_policy_dry_run = false
+  cleanup_policy {
+    id     = "keep-recent-tagged"
+    action = "KEEP"
+    most_recent_versions {
+      keep_count = 5
+    }
+  }
+  cleanup_policy {
+    id     = "delete-untagged"
+    action = "DELETE"
+    condition {
+      tag_state  = "UNTAGGED"
+      older_than = "604800s" # 7 days
+    }
+  }
 }
 
 # Artifact Registry for Custom Agent VM OS Images (if using Packer/Docker to build them)
@@ -12,4 +32,23 @@ resource "google_artifact_registry_repository" "agent_images_repo" {
   repository_id = "agent-images-repo"
   description   = "Repository for custom Agent VM OS images or binaries"
   format        = "DOCKER"
+
+  # Bound image-storage growth: $0.10/GB-month reclaimed on stale/untagged layers.
+  # Agent VM images are less frequent; keep 3 most recent tagged to allow rollback.
+  cleanup_policy_dry_run = false
+  cleanup_policy {
+    id     = "keep-recent-tagged"
+    action = "KEEP"
+    most_recent_versions {
+      keep_count = 3
+    }
+  }
+  cleanup_policy {
+    id     = "delete-untagged"
+    action = "DELETE"
+    condition {
+      tag_state  = "UNTAGGED"
+      older_than = "604800s" # 7 days
+    }
+  }
 }
