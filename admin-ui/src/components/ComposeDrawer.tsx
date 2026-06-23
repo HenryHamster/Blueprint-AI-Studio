@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { X, Mail } from 'lucide-react';
+import { X, Mail, Send } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../api';
 import { MessagesComposer } from './MessagesComposer';
 import { parseArmingOutcome, armingToastCopy, type ArmingOutcome } from './messageArming';
@@ -64,20 +64,26 @@ export function ComposeDrawer({
     } catch { /* ignore */ }
   }, [newContent, newType, userEmail, projectId]);
 
-  useEffect(() => {
+  const loadRecentMessages = useCallback(async () => {
     if (!projectId) return;
-    const pid = projectId;
-    apiFetch(`${API_BASE_URL}/api/admin/messages?project_id=${encodeURIComponent(pid)}&status=open&limit=50`)
-      .then(async res => {
-        if (!res.ok) return;
-        const data = await res.json() as { messages?: Array<{ id: string; content: string; message_type: string; created_at: string | null; from_type: string }> };
-        const sent = (data.messages ?? [])
-          .filter(m => (m.from_type || '').toLowerCase() === 'user')
-          .slice(0, 3);
-        setRecentMessages(sent.map(m => ({ id: m.id, content: m.content, message_type: m.message_type, created_at: m.created_at })));
-      })
-      .catch(() => {});
+    try {
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?project_id=${encodeURIComponent(projectId)}&status=open&limit=50`);
+      if (!res.ok) return;
+      const data = await res.json() as { messages?: Array<{ id: string; content: string; message_type: string; created_at: string | null; from_type: string }> };
+      const sent = (data.messages ?? [])
+        .filter(m => (m.from_type || '').toLowerCase() === 'user')
+        .slice(0, 3);
+      setRecentMessages(sent.map(m => ({ id: m.id, content: m.content, message_type: m.message_type, created_at: m.created_at })));
+    } catch { /* ignore */ }
   }, [projectId]);
+
+  useEffect(() => {
+    void loadRecentMessages();
+  }, [projectId, loadRecentMessages]);
+
+  useEffect(() => {
+    setLastArming(null);
+  }, [newType]);
 
   const handleSubmit = useCallback(async () => {
     if (!projectId || !newContent.trim() || submittingRef.current) return;
@@ -109,13 +115,47 @@ export function ComposeDrawer({
       setLastArming(arming);
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
       addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
+      void loadRecentMessages();
     } catch {
       addToast('Failed to send message', 'error');
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
     }
-  }, [projectId, newType, newContent, userEmail, addToast]);
+  }, [projectId, newType, newContent, userEmail, addToast, loadRecentMessages]);
+
+  const handleResend = useCallback(async (msg: SentMessage) => {
+    if (!projectId || submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    try {
+      const idempotencyKey = generateIdempotencyKey();
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: projectId,
+          message_type: msg.message_type,
+          content: msg.content,
+          idempotency_key: idempotencyKey,
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      let arming: ArmingOutcome | null = null;
+      try {
+        const data = await res.json() as { arming?: unknown };
+        arming = parseArmingOutcome(data?.arming);
+      } catch { /* ignore */ }
+      setLastArming(arming);
+      addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
+      void loadRecentMessages();
+    } catch {
+      addToast('Failed to send message', 'error');
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
+  }, [projectId, addToast, loadRecentMessages]);
 
   return (
     <div className="fixed inset-x-0 bottom-0 z-50 flex flex-col bg-neutral-950 border-t border-neutral-800 shadow-2xl rounded-t-xl max-h-[60vh]">
@@ -146,18 +186,29 @@ export function ComposeDrawer({
         <div className="px-4 py-2 flex flex-col gap-1.5 overflow-y-auto shrink-0 border-b border-neutral-800/60">
           <span className="text-ui-sm text-neutral-500 uppercase tracking-wide font-medium">Recent</span>
           {recentMessages.map(msg => (
-            <button
-              key={msg.id}
-              type="button"
-              onClick={() => { setNewType(msg.message_type); setNewContent(msg.content); }}
-              className="flex items-start gap-2 w-full text-left hover:bg-neutral-800/50 rounded px-1 py-0.5 transition-colors min-h-[44px]"
-            >
-              <span className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 font-medium shrink-0 uppercase">{msg.message_type}</span>
-              <span className="text-xs text-neutral-300 truncate flex-1">{msg.content}</span>
-              {msg.created_at && (
-                <span className="text-ui-sm text-neutral-600 shrink-0">{timeAgo(msg.created_at)}</span>
-              )}
-            </button>
+            <div key={msg.id} className="flex items-start gap-1.5 w-full hover:bg-neutral-800/50 rounded px-1 py-0.5 transition-colors">
+              <button
+                type="button"
+                onClick={() => { setNewType(msg.message_type); setNewContent(msg.content); }}
+                className="flex items-start gap-2 flex-1 text-left min-h-[44px]"
+              >
+                <span className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 font-medium shrink-0 uppercase">{msg.message_type}</span>
+                <span className="text-xs text-neutral-300 truncate flex-1">{msg.content}</span>
+                {msg.created_at && (
+                  <span className="text-ui-sm text-neutral-600 shrink-0">{timeAgo(msg.created_at)}</span>
+                )}
+              </button>
+              {/* eslint-disable-next-line viewport/min-touch-target */}
+              <button
+                type="button"
+                onClick={() => { void handleResend(msg); }}
+                disabled={submitting}
+                className="p-1 text-neutral-500 hover:text-neutral-300 transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Resend message"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            </div>
           ))}
         </div>
       )}
