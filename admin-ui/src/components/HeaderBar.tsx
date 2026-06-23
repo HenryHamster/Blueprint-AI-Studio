@@ -628,14 +628,12 @@ export function HeaderBar(props: HeaderBarProps) {
           >
             <MessageSquare className="w-4 h-4" />
             {props.openMessageCount > 0 && (
-              // eslint-disable-next-line viewport/no-arbitrary-font-size
-              <span className="ml-0.5 bg-blue-500 text-white text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
+              <span className="ml-0.5 bg-blue-500 text-white text-ui-2xs font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
                 {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
               </span>
             )}
             {!showMessages && (props.newSinceLastVisitCount ?? 0) > 0 && (
-              // eslint-disable-next-line viewport/no-arbitrary-font-size
-              <span className="ml-0.5 bg-amber-500 text-black text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center" title={`${props.newSinceLastVisitCount} new since last visit`}>
+              <span className="ml-0.5 bg-amber-500 text-black text-ui-2xs font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center" title={`${props.newSinceLastVisitCount} new since last visit`}>
                 {(props.newSinceLastVisitCount ?? 0) > 9 ? '9+' : props.newSinceLastVisitCount}
               </span>
             )}

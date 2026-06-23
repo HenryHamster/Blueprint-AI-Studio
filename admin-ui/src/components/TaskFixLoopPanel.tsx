@@ -115,8 +115,7 @@ function AttemptRow({ attempt, index }: { attempt: FixLoopAttempt; index: number
           {index + 1}
         </div>
         {isSynth && (
-          // eslint-disable-next-line viewport/no-arbitrary-font-size
-          <span className="text-[8px] text-purple-500 leading-none">synth</span>
+          <span className="text-ui-2xs text-purple-500 leading-none">synth</span>
         )}
       </div>
 

@@ -28,6 +28,7 @@ backend/.testmondata*
 # self-repo. The static ./check delegates to it when present; operators use the
 # static file directly. Must not be committed.
 /.check-task
+/check
 /note
 /messages
 /playbook
@@ -41,6 +42,8 @@ backend/.testmondata*
 /fail
 /fetch
 /symbols
+/viewport-snapshot
+/viewport-live
 research-*.md
 *.bak
 # Repo-root self-review JSON output (agents write to /tmp; strays at the root

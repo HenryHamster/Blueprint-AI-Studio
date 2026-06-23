@@ -50,8 +50,7 @@ export function DirectionsQuickLinks({
             className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors min-h-[44px] md:min-h-auto"
           >
             <ChevronRight className="w-3.5 h-3.5 text-cyan-500/60 group-hover:text-cyan-400 transition-colors" />
-            {/* eslint-disable-next-line viewport/no-arbitrary-font-size */}
-            <span className="text-[12px] font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
+            <span className="text-xs font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
               Problem Model
             </span>
             {problemModel.last_updated && (
@@ -92,8 +91,7 @@ export function DirectionsQuickLinks({
             className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors min-h-[44px] md:min-h-auto"
           >
             <ChevronRight className="w-3.5 h-3.5 text-emerald-500/60 group-hover:text-emerald-400 transition-colors" />
-            {/* eslint-disable-next-line viewport/no-arbitrary-font-size */}
-            <span className="text-[12px] font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
+            <span className="text-xs font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
               Running Update
             </span>
             <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 ml-1" aria-label="has content" />
@@ -124,8 +122,7 @@ export function DirectionsQuickLinks({
             className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors min-h-[44px] md:min-h-auto"
           >
             <ChevronRight className="w-3.5 h-3.5 text-purple-500/60 group-hover:text-purple-400 transition-colors" />
-            {/* eslint-disable-next-line viewport/no-arbitrary-font-size */}
-            <span className="text-[12px] font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
+            <span className="text-xs font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
               Architecture
             </span>
             {typeof meta.last_updated === 'string' && (
@@ -139,8 +136,7 @@ export function DirectionsQuickLinks({
             <div className="px-1.5 mt-0.5">
               <div className="flex flex-wrap gap-1">
                 {capPages.slice(0, 8).map(cap => (
-                  // eslint-disable-next-line viewport/no-arbitrary-font-size
-                  <span key={cap.key} className={`text-[8px] px-1.5 py-0.5 rounded border ${capStatusColors[cap.status] || capStatusColors.missing}`}>
+                  <span key={cap.key} className={`text-ui-2xs px-1.5 py-0.5 rounded border ${capStatusColors[cap.status] || capStatusColors.missing}`}>
                     {cap.name}
                   </span>
                 ))}

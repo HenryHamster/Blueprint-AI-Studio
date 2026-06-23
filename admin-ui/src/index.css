@@ -11,9 +11,10 @@
   --color-status-info: var(--color-blue-400);
   --color-status-neutral: var(--color-neutral-400);
 
-  /* Font size tokens for compact UI typography (9-11px range).
-     Use text-ui-xs (9px), text-ui-sm (10px), or text-ui-md (11px) for
+  /* Font size tokens for compact UI typography (8-11px range).
+     Use text-ui-2xs (8px), text-ui-xs (9px), text-ui-sm (10px), or text-ui-md (11px) for
      dense labels, badges, and secondary meta inside cards. */
+  --text-ui-2xs: 8px;
   --text-ui-xs: 9px;
   --text-ui-sm: 10px;
   --text-ui-md: 11px;

@@ -136,15 +136,13 @@ export function OnboardingProofPanel({ project }: Props) {
           {timeToImprovement != null && (
             <div className="flex items-baseline gap-2 flex-wrap">
               <span className="text-ui-sm text-neutral-500 uppercase tracking-wide">Time to first improvement</span>
-              {/* eslint-disable-next-line viewport/no-arbitrary-font-size */}
-              <span className="text-[12px] font-semibold text-emerald-300">{timeToImprovement}</span>
+              <span className="text-xs font-semibold text-emerald-300">{timeToImprovement}</span>
             </div>
           )}
           {timeToMerge != null && (
             <div className="flex items-baseline gap-2 flex-wrap">
               <span className="text-ui-sm text-neutral-500 uppercase tracking-wide">Time to first merge</span>
-              {/* eslint-disable-next-line viewport/no-arbitrary-font-size */}
-              <span className="text-[12px] font-semibold text-emerald-300">{timeToMerge}</span>
+              <span className="text-xs font-semibold text-emerald-300">{timeToMerge}</span>
             </div>
           )}
         </div>

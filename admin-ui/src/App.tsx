@@ -980,8 +980,7 @@ export default function App() {
               <Microscope className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">Research</span>
               {pendingFindingsCount > 0 && (
-                  // eslint-disable-next-line viewport/no-arbitrary-font-size
-                <span className="ml-0.5 bg-cyan-500 text-black text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
+                <span className="ml-0.5 bg-cyan-500 text-black text-ui-2xs font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
                   {pendingFindingsCount}
                 </span>
               )}
