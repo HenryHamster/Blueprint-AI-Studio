@@ -227,6 +227,10 @@ export interface Task {
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
   child_task_ids?: string[];
   estimated_cost_usd?: number | null;
+  vm_machine_type?: string | null;
+  vm_spot?: boolean;
+  vm_cold_start_ms?: number | null;
+  vm_warm_start?: boolean | null;
   task_llm_cost_usd?: number | null;
   task_llm_cost_any_unpriced?: boolean;
   api_call_summary?: {

@@ -1962,3 +1962,38 @@ describe('DetailsTab — ViewportScreenshotsPanel', () => {
     expect(screen.getByText('Show diff')).toBeInTheDocument();
   });
 });
+
+describe('DetailsTab — parent/child task health', () => {
+  afterEach(() => cleanup());
+
+  it('renders parent and child task color-coded status + title for related tasks present in the loaded set, falling back to ID when absent', () => {
+    const parentTask = makeTask({ id: 'parent-1', title: 'Parent foundation task', status: 'COMPLETED' });
+    const childTask = makeTask({ id: 'child-1', title: 'Child implementation task', status: 'IN_PROGRESS' });
+    const task = makeTask({
+      parent_task_id: 'parent-1',
+      child_task_ids: ['child-1', 'child-missing-id'],
+    });
+
+    render(<DetailsTab task={task} tasks={[task, parentTask, childTask]} />);
+
+    // Parent task: shows title and status badge
+    expect(screen.getByText('Parent foundation task')).toBeInTheDocument();
+    const parentStatus = screen.getByText('COMPLETED');
+    expect(parentStatus.className).toContain('emerald');
+
+    // Child task present in loaded set: shows title and color-coded status
+    expect(screen.getByText('Child implementation task')).toBeInTheDocument();
+    const childStatus = screen.getByText('IN_PROGRESS');
+    expect(childStatus.className).toContain('amber');
+
+    // Missing child: falls back to ID display
+    expect(screen.getByText('child-missing-id')).toBeInTheDocument();
+  });
+
+  it('renders parent task as ID-only when not in the loaded task set', () => {
+    const task = makeTask({ parent_task_id: 'unknown-parent-id' });
+    render(<DetailsTab task={task} tasks={[task]} />);
+    expect(screen.getByText('Parent Task')).toBeInTheDocument();
+    expect(screen.getByText('unknown-parent-id')).toBeInTheDocument();
+  });
+});

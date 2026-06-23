@@ -12025,6 +12025,85 @@ class TestGetTaskWakeRegistration:
         }
 
 
+class TestGetTaskVmCostDrivers:
+    """GET /api/admin/tasks/{task_id} surfaces VM cost-driver fields
+    (vm_machine_type, vm_spot, vm_cold_start_ms, vm_warm_start) so the
+    task detail drawer can explain why a task cost what it did."""
+
+    @pytest.mark.asyncio
+    async def test_vm_cost_driver_fields_present_in_task_detail(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            vm_machine_type="n2d-standard-4",
+            vm_spot=True,
+            vm_cold_start_ms=4200,
+            vm_warm_start=False,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["vm_machine_type"] == "n2d-standard-4"
+        assert data["vm_spot"] is True
+        assert data["vm_cold_start_ms"] == 4200
+        assert data["vm_warm_start"] is False
+
+    @pytest.mark.asyncio
+    async def test_vm_cost_driver_fields_warm_start(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create"}],
+            vm_machine_type="n2d-standard-2",
+            vm_spot=False,
+            vm_cold_start_ms=None,
+            vm_warm_start=True,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["vm_machine_type"] == "n2d-standard-2"
+        assert data["vm_spot"] is False
+        assert data["vm_cold_start_ms"] is None
+        assert data["vm_warm_start"] is True
+
+    @pytest.mark.asyncio
+    async def test_vm_cost_driver_fields_null_when_unset(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["vm_machine_type"] is None
+        assert data["vm_spot"] is False
+        assert data["vm_cold_start_ms"] is None
+
+
 class TestGetAllTasksHistory:
     """GET /api/admin/tasks fetches each task's 10 most-recent TaskHistory
     entries. The fetch uses a per-task ROW_NUMBER() window, so a single

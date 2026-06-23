@@ -10,7 +10,7 @@ import { isComputeJobActive, computeJobTerminalLabel } from './ComputeJobsPanel.
 import type { AdversarialGateDiagnostic, PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
 import { deriveSpawnGateState } from '../types/task';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
-import { CopyableId, SectionHeader, DetailRow, Sparkline } from './TaskDetailDrawerPrimitives';
+import { CopyableId, SectionHeader, DetailRow, Sparkline, DependencyItem } from './TaskDetailDrawerPrimitives';
 import { humanizeUnverifiedReason, labelNoTestsReason } from '../utils/unverifiedReasonLabels';
 import { parseMergeTestVerdict, deriveMergeTestOutcome, type MergeTestVerdict, type MergeTestResult } from '../utils/mergeTestVerdict';
 import { getLogEntryColor } from './TaskDetailDrawerDiagnostics';
@@ -1644,26 +1644,15 @@ export function BaseRecutHoldSection({ task }: { task: Task }) {
   );
 }
 
-export function ChildTasksSection({ task, onNavigateToTask }: { task: Task; onNavigateToTask?: (taskId: string) => void }) {
+export function ChildTasksSection({ task, tasks, onNavigateToTask }: { task: Task; tasks?: Task[]; onNavigateToTask?: (taskId: string) => void }) {
   if (!task.child_task_ids || task.child_task_ids.length === 0) return null;
+  const taskById = new Map((tasks ?? []).map(t => [t.id, t]));
   return (
     <>
       <SectionHeader>Child Tasks</SectionHeader>
       <div className="space-y-1">
         {task.child_task_ids.map((childId) => (
-          <div key={childId} className="font-mono text-sm text-neutral-300 flex items-center gap-1.5 flex-wrap min-w-0">
-            <ChevronRight className="w-3 h-3 text-neutral-600 shrink-0" />
-            {onNavigateToTask ? (
-              <button
-                onClick={() => onNavigateToTask(childId)}
-                className="text-blue-400 hover:text-blue-300 transition-colors text-left break-all min-w-0"
-              >
-                {childId}
-              </button>
-            ) : (
-              <CopyableId value={childId} />
-            )}
-          </div>
+          <DependencyItem key={childId} dep={childId} depTask={taskById.get(childId)} onNavigateToTask={onNavigateToTask} />
         ))}
       </div>
     </>
