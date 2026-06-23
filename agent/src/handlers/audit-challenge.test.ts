@@ -594,6 +594,23 @@ describe('handleReleaseAuditChallenge — pinned candidate + diff-range pre-flig
     expect(repairPrompt).toContain('copy the listed primary finding summary exactly into "summary"');
   });
 
+  it('audit-challenge repair reopen includes prior output when no primary findings provided', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const priorText = 'some attempted JSON that failed to parse properly';
+    const priorAllOutput = 'extra context from the first run attempt';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: priorAllOutput, lastResultText: priorText })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify({ challenged_candidate_sha: CANDIDATE_SHA, verdicts: [] }) });
+
+    await handleReleaseAuditChallenge(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const repairPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairPrompt).toContain(priorText);
+    expect(repairPrompt).toContain(priorAllOutput);
+    expect(repairPrompt).toContain('Your prior release audit challenge response did not end with a parseable JSON verdict object');
+  });
+
   it('self-repair records audit_challenge schema telemetry and pins output basename', async () => {
     // Force the repair path: readHandlerOutput returns null, first run has no JSON,
     // repair run returns valid JSON → exercises all three schema-dimensioned telemetry calls.
