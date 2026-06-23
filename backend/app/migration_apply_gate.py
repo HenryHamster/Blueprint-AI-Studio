@@ -633,6 +633,33 @@ def _is_migration_source(filename: str) -> bool:
     )
 
 
+def _check_structural_defects(candidate_sources: dict[str, str]) -> Verdict | None:
+    """Detect deterministically-defective migration chains.
+
+    Dup revision ids and multi-head chains are structurally broken regardless of
+    production state or scratch-DB availability — block immediately instead of
+    auto-retrying as an infra failure.
+
+    Returns a ``('block', reason)`` verdict when a structural defect is found,
+    or ``None`` when the chain is structurally sound.
+    """
+    _chain, _duplicates, _ = build_migration_chain(candidate_sources)
+    if _duplicates:
+        return (
+            "block",
+            "candidate migration chain has duplicate revision id(s): "
+            + ", ".join(sorted(_duplicates)),
+        )
+    _heads = find_heads(_chain)
+    if len(_heads) > 1:
+        return (
+            "block",
+            "candidate migration chain has multiple heads (not a single linear chain): "
+            + ", ".join(sorted(_heads)),
+        )
+    return None
+
+
 async def _fetch_candidate_sources(
     gh_token: str,
     owner: str,
@@ -746,20 +773,9 @@ async def run_migration_apply_gate(
     # 2. Structural check: dup revision ids and multi-head chains are deterministically
     # defective regardless of production state or scratch-DB availability — block
     # immediately instead of auto-retrying the run as an infra failure.
-    _chain, _duplicates, _ = build_migration_chain(candidate_sources)
-    if _duplicates:
-        return (
-            "block",
-            "candidate migration chain has duplicate revision id(s): "
-            + ", ".join(sorted(_duplicates)),
-        )
-    _heads = find_heads(_chain)
-    if len(_heads) > 1:
-        return (
-            "block",
-            "candidate migration chain has multiple heads (not a single linear chain): "
-            + ", ".join(sorted(_heads)),
-        )
+    structural_verdict = _check_structural_defects(candidate_sources)
+    if structural_verdict is not None:
+        return structural_verdict
 
     # 3. Production's REAL recorded state (read-only).
     try:

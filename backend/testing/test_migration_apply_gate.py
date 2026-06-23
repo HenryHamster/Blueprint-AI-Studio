@@ -336,6 +336,66 @@ async def test_concurrent_applies_are_serialized():
 
 
 @pytest.mark.asyncio
+async def test_multi_head_chain_blocks_instead_of_infra_retry():
+    """Multiple migration heads (two migration files both with down_revision=None)
+    indicate a structurally broken chain — deterministically defective regardless
+    of production state or scratch-DB availability. The gate must block immediately
+    instead of deferring as an infra_failure and auto-retrying indefinitely.
+
+    This pins the multi-head structural defect symmetrically with the duplicate
+    revision case, ensuring both defect classes are independently verified."""
+    # Two migration files both with down_revision=None — two separate chain heads.
+    multi_head_sources = {
+        "a01_widget.py": """
+from alembic import op
+import sqlalchemy as sa
+
+revision = "a01"
+down_revision = None
+
+
+def upgrade():
+    op.create_table("widget", sa.Column("id", sa.Integer, primary_key=True))
+
+
+def downgrade():
+    op.drop_table("widget")
+""",
+        "a02_gadget.py": """
+from alembic import op
+import sqlalchemy as sa
+
+revision = "a02"
+down_revision = None
+
+
+def upgrade():
+    op.create_table("gadget", sa.Column("id", sa.Integer, primary_key=True))
+
+
+def downgrade():
+    op.drop_table("gadget")
+""",
+    }
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources=multi_head_sources,
+            required_metadata=_required_metadata(),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "block", detail
+    assert "multiple heads" in detail
+    # Both head revisions should be named in the error detail
+    assert "a01" in detail
+    assert "a02" in detail
+
+
+@pytest.mark.asyncio
 async def test_non_postgres_bind_defers():
     """A non-Postgres production bind cannot reproduce the deploy; the gate HOLDS
     (defer) rather than waving the release through. Runs on any harness."""
@@ -391,7 +451,9 @@ async def test_required_metadata_derived_from_candidate_reference_not_live_metad
     # The schema the candidate's OWN migration chain would produce on a fresh DB.
     candidate_reference_meta = sa.MetaData()
     sa.Table(
-        "widget", candidate_reference_meta, sa.Column("id", sa.Integer, primary_key=True)
+        "widget",
+        candidate_reference_meta,
+        sa.Column("id", sa.Integer, primary_key=True),
     )
     sa.Table(
         "computejob",
@@ -473,7 +535,9 @@ async def test_default_path_blocks_when_candidate_code_needs_missing_migration(
 
     candidate_reference_meta = sa.MetaData()
     sa.Table(
-        "widget", candidate_reference_meta, sa.Column("id", sa.Integer, primary_key=True)
+        "widget",
+        candidate_reference_meta,
+        sa.Column("id", sa.Integer, primary_key=True),
     )
 
     candidate_required_meta = sa.MetaData()
