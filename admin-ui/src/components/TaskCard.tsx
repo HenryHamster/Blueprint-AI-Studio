@@ -908,24 +908,43 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       </div>
 
       {isActive && heartbeat.text.startsWith('Stale') && (
-        <div className="bg-amber-950/40 border border-amber-900/50 text-amber-400 rounded px-2 py-1.5 text-xs flex items-center gap-1.5 mb-2">
-          <AlertTriangle className="w-3.5 h-3.5 shrink-0" style={{ width: 14, height: 14 }} />
-          <span className="flex-1 text-xs">No heartbeat for 5+ minutes — task may be stuck</span>
-          <button
-            onClick={(e) => { e.stopPropagation(); onViewLogs(task); }}
-            className="shrink-0 text-ui-md text-amber-300 hover:text-amber-100 underline transition-colors"
-            title="View logs"
-          >
-            Logs
-          </button>
-          {/* eslint-disable-next-line viewport/min-touch-target -- dense inline toolbar */}
-          <button
-            onClick={(e) => { e.stopPropagation(); handleDestructiveClick('cancel', () => onCancel(task.id)); }}
-            disabled={!!actionLoading}
-            className={`shrink-0 text-ui-md px-1.5 py-0.5 rounded transition-colors disabled:opacity-50 ${confirmAction === 'cancel' ? 'bg-amber-500/40 text-amber-200' : 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-300'}`}
-          >
-            {confirmAction === 'cancel' ? `Cancel (${confirmCountdown}s)` : 'Cancel'}
-          </button>
+        <div className="bg-amber-950/40 border border-amber-900/50 text-amber-400 rounded px-2 py-1.5 text-xs mb-2">
+          <div className="flex items-center gap-1.5">
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0" style={{ width: 14, height: 14 }} />
+            <span className="flex-1 text-xs" data-testid="stuck-silence-duration">
+              Silent {hbAgeSec !== null ? formatCompact(hbAgeSec) : '5m+'} — task may be stuck
+            </span>
+            <button
+              onClick={(e) => { e.stopPropagation(); onViewLogs(task); }}
+              className="shrink-0 text-ui-md text-amber-300 hover:text-amber-100 underline transition-colors"
+              title="View logs"
+            >
+              Logs
+            </button>
+            {/* eslint-disable-next-line viewport/min-touch-target -- dense inline toolbar */}
+            <button
+              onClick={(e) => { e.stopPropagation(); onRetry(task.id); }}
+              disabled={!!actionLoading}
+              className="shrink-0 text-ui-md px-1.5 py-0.5 rounded transition-colors disabled:opacity-50 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300"
+              data-testid="stuck-requeue-btn"
+              title="Terminate the stuck VM and re-queue this task for a fresh attempt"
+            >
+              Re-queue
+            </button>
+            {/* eslint-disable-next-line viewport/min-touch-target -- dense inline toolbar */}
+            <button
+              onClick={(e) => { e.stopPropagation(); handleDestructiveClick('cancel', () => onCancel(task.id)); }}
+              disabled={!!actionLoading}
+              className={`shrink-0 text-ui-md px-1.5 py-0.5 rounded transition-colors disabled:opacity-50 ${confirmAction === 'cancel' ? 'bg-amber-500/40 text-amber-200' : 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-300'}`}
+            >
+              {confirmAction === 'cancel' ? `Cancel (${confirmCountdown}s)` : 'Cancel'}
+            </button>
+          </div>
+          {task.latest_status_message && (
+            <p className="text-ui-sm text-amber-300/70 mt-1 pl-5 truncate" data-testid="stuck-last-activity">
+              Last: {parsePhase(task.latest_status_message)}
+            </p>
+          )}
         </div>
       )}
 

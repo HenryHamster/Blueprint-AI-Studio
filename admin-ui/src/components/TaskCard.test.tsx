@@ -760,6 +760,51 @@ describe('TaskCard merge verification badge', () => {
   });
 });
 
+describe('TaskCard stuck-task inline triage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('test_stuck_task_shows_last_activity_and_silence_duration', () => {
+    const staleHeartbeat = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const task = makeTask({
+      status: 'IN_PROGRESS',
+      last_heartbeat: staleHeartbeat,
+      latest_status_message: 'Using tool: Bash',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    // Silence duration: "Silent 10m" (or similar) should be visible
+    const silenceEl = document.querySelector('[data-testid="stuck-silence-duration"]');
+    expect(silenceEl).not.toBeNull();
+    expect(silenceEl!.textContent).toMatch(/Silent \d+m/);
+    // Last activity: parsed from latest_status_message
+    const activityEl = document.querySelector('[data-testid="stuck-last-activity"]');
+    expect(activityEl).not.toBeNull();
+    expect(activityEl!.textContent).toContain('Last: Using Bash');
+  });
+
+  it('does not show last-activity line when latest_status_message is absent', () => {
+    const staleHeartbeat = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const task = makeTask({
+      status: 'IN_PROGRESS',
+      last_heartbeat: staleHeartbeat,
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(document.querySelector('[data-testid="stuck-last-activity"]')).toBeNull();
+  });
+
+  it('stuck banner Re-queue button calls onRetry with task id', async () => {
+    const user = userEvent.setup();
+    const staleHeartbeat = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const task = makeTask({ status: 'IN_PROGRESS', last_heartbeat: staleHeartbeat });
+    render(<TaskCard task={task} {...baseProps} />);
+    const btn = document.querySelector('[data-testid="stuck-requeue-btn"]') as HTMLElement;
+    expect(btn).not.toBeNull();
+    await user.click(btn);
+    expect(baseProps.onRetry).toHaveBeenCalledWith('task-1');
+  });
+});
+
 describe('TaskCard evaluation verdict pill', () => {
   beforeEach(() => {
     vi.clearAllMocks();

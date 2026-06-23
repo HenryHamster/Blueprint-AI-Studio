@@ -14789,6 +14789,52 @@ class TestRequeueClearsStaleFailureVerdict:
         assert task.attempt_count == 0
 
 
+class TestRequeueStuckTask:
+    @pytest.mark.asyncio
+    async def test_requeue_stuck_task_terminates_vm_and_resets_to_queued(
+        self, db_session, mocker
+    ):
+        """Re-queuing a stuck IN_PROGRESS task must delete the old VM and reset
+        the task to QUEUED with a fresh vm_instance_id and cleared heartbeat."""
+        from unittest.mock import AsyncMock
+
+        from fastapi import BackgroundTasks
+
+        from app.admin_task_mutations import modify_task_apply
+
+        mock_delete_vm = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+        )
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Stuck task",
+            payloads=[{"type": "create", "prompt": "do something"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id="stuck-vm-abc123",
+            last_heartbeat=datetime(2020, 1, 1),
+            attempt_count=1,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await modify_task_apply(
+            task,
+            {"status": TaskStatus.QUEUED.value},
+            BackgroundTasks(),
+            db_session,
+        )
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id != "stuck-vm-abc123"
+        assert task.last_heartbeat is None
+        assert task.attempt_count == 0
+        mock_delete_vm.assert_awaited_once_with("stuck-vm-abc123", reason="admin_requeue")
+
+
 class TestTriggerRollup:
     @pytest.mark.asyncio
     async def test_intermediate_rollup_auto_merge_keeps_custom_staged_root_evaluating(
