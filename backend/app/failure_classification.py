@@ -444,6 +444,28 @@ def _provider_model_config_rejection(combined: str) -> bool:
     return any(kw in combined for kw in _PROVIDER_MODEL_CONFIG_PATTERNS)
 
 
+# Deterministic agent/CLI permission-flag rejections. The model CLIs refuse
+# their permission-skip flags under root/sudo:
+#   claude -p ... --dangerously-skip-permissions
+#       → "--dangerously-skip-permissions cannot be used with root/sudo
+#          privileges for security reasons"
+#   codex exec ... --dangerously-bypass-approvals-and-sandbox  (analogous)
+# These are 100% deterministic deployment/config defects (e.g. a container that
+# runs the agent as root) — they reproduce identically on every retry. They must
+# NEVER be reclassified as RATE_LIMIT by the account/pool cooldown correlation —
+# doing so requeues them into a retry storm (each retry hits the same wall, and
+# the requeue path may blacklist a perfectly healthy LLM account).
+_AGENT_CONFIG_REJECTION_PATTERNS: tuple[str, ...] = (
+    "cannot be used with root/sudo",
+    "dangerously-skip-permissions cannot be used",
+    "dangerously-bypass-approvals-and-sandbox cannot be used",
+)
+
+
+def _agent_config_rejection(combined: str) -> bool:
+    return any(kw in combined for kw in _AGENT_CONFIG_REJECTION_PATTERNS)
+
+
 # Git signatures emitted when the target branch was deleted before clone/fetch.
 # `git clone --branch <gone>` prints the "could not find remote branch" warning
 # then fails; a fetch/checkout of a deleted ref prints "couldn't find remote
@@ -2619,6 +2641,17 @@ def _classify_failure_class(
     if any(kw in combined for kw in _VIEWPORT_PATTERNS):
         record_viewport_regression_fingerprint(task)
         return VIEWPORT_REGRESSION
+
+    # Deterministic agent/CLI config rejection (e.g. a permission-skip flag
+    # refused under root). A definite code/config defect that reproduces on every
+    # retry — classify as CODE_ERROR so it fails terminally, NOT as RATE_LIMIT.
+    # Checked before BOTH the structured-report reclass (which could read a
+    # nonzero-exit/no-output run as a provider death) AND the account-correlation
+    # fallback (which would otherwise mask it as RATE_LIMIT during a cooldown
+    # window and retry-storm it). The explicit error text is the strongest signal.
+    if _agent_config_rejection(combined):
+        record_residual_fingerprint(task, logs=logs)
+        return "CODE_ERROR"
 
     # Structured agent error report — a generic failure (no keywords matched
     # above, no agent category) whose report proves a provider-layer death is

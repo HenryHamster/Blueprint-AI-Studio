@@ -8659,6 +8659,92 @@ class TestCloudRunDispatch:
             _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []
 
     @pytest.mark.asyncio
+    async def test_cloud_run_dispatch_failure_falls_back_to_gce(
+        self, orch_warm_db, mocker
+    ):
+        """When the task type is allowlisted but launch_agent_cloud_run_job()
+        returns False (CR dispatch failed), the orchestrator falls back to
+        provision_agent_vm() in the same cycle rather than recording a
+        PROVISION_FAILURE — and clears the Cloud Run sentinel machine type so the
+        task is attributed to the GCE VM it became (not left as a CR task)."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        _orch_module._runtime_config["cloud_run_task_type_allowlist"] = ["research"]
+        try:
+            prov_mock = mocker.patch(
+                "app.orchestrator.provision_agent_vm",
+                new_callable=AsyncMock,
+                return_value=True,
+            )
+            cr_mock = mocker.patch(
+                "app.orchestrator.launch_agent_cloud_run_job",
+                new_callable=AsyncMock,
+                return_value=False,  # CR dispatch fails
+            )
+            mocker.patch(
+                "app.orchestrator._sync_runtime_config_from_state",
+                new_callable=AsyncMock,
+                return_value=[],
+            )
+            mocker.patch(
+                "app.orchestrator._resolve_env_runtime_fallback",
+                return_value=(
+                    "fake-api-key",
+                    "anthropic",
+                    "api_key",
+                    "claude-opus-4-8",
+                    None,
+                    {},
+                ),
+            )
+
+            async with orch_warm_db() as session:
+                project = make_project(name="CR Fallback Test", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "research", "prompt": "Analyse the codebase"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+
+            # CR was attempted AND the GCE fallback fired.
+            assert cr_mock.called, "launch_agent_cloud_run_job must be attempted"
+            assert prov_mock.called, (
+                "provision_agent_vm must be called as a fallback when Cloud Run "
+                "dispatch returns False"
+            )
+
+            async with orch_warm_db() as verify:
+                row = (
+                    (await verify.execute(_select(Task).where(Task.id == task_id)))
+                    .scalars()
+                    .first()
+                )
+                assert row is not None
+                assert row.status == TaskStatus.PROVISIONING, (
+                    f"Task should be PROVISIONING after GCE fallback, got {row.status}"
+                )
+                # The CR sentinel must have been cleared on fallback.
+                assert not (row.vm_machine_type or "").startswith("cloud-run-"), (
+                    f"CR sentinel must be cleared on GCE fallback, got "
+                    f"{row.vm_machine_type!r}"
+                )
+        finally:
+            _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []
+
+    @pytest.mark.asyncio
     async def test_cloud_run_empty_allowlist_uses_gce_path(self, orch_warm_db, mocker):
         """When cloud_run_task_type_allowlist is empty (the default), all task
         types use the unchanged provision_agent_vm() GCE path."""

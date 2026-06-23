@@ -4351,6 +4351,7 @@ async def orchestrator_worker():
                                 _effective_cr_types = (
                                     CLOUD_RUN_CANDIDATE_TASK_TYPES & _cr_allowlist
                                 )
+                                success = False
                                 if t_type in _effective_cr_types:
                                     # Stamp the Cloud Run sentinel machine type
                                     # so cost attribution and teardown skips work.
@@ -4378,7 +4379,29 @@ async def orchestrator_worker():
                                         provider_metadata=llm_provider_metadata,
                                         provider_settings=llm_provider_settings,
                                     )
-                                else:
+                                    if not success:
+                                        # Cloud Run dispatch failed — fall back to a
+                                        # GCE VM rather than stranding/looping the task.
+                                        # The PROVISION_FAILURE path below would requeue
+                                        # it, and with the allowlist still set it would
+                                        # re-dispatch to Cloud Run and hit the same wall
+                                        # (a flap). Clear the CR sentinel first so cost
+                                        # attribution + teardown treat the task as the
+                                        # GCE VM it is about to become.
+                                        logger.warning(
+                                            f"[ORCHESTRATOR] Cloud Run dispatch failed for "
+                                            f"task {t_id} ({t_type}); falling back to GCE "
+                                            f"VM provisioning"
+                                        )
+                                        async with AsyncSessionLocal() as _cr_unstamp_session:
+                                            _cr_task = await _cr_unstamp_session.get(
+                                                Task, t_id
+                                            )
+                                            if _cr_task is not None:
+                                                _cr_task.vm_machine_type = None
+                                                _cr_unstamp_session.add(_cr_task)
+                                                await _cr_unstamp_session.commit()
+                                if not success:
                                     success = await provision_agent_vm(
                                         vm_id,
                                         t_id,
