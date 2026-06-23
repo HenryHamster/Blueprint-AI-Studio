@@ -155,6 +155,35 @@ def test_module_builds_full_parser():
     assert parser.prog == "blueprint"
 
 
+def test_no_duplicate_top_level_defs():
+    """Each CLI module must not define the same top-level name twice.
+
+    Rollup merges can silently concatenate duplicate defs; Python binds the
+    last one, so the first (often correct) definition is silently shadowed.
+    """
+    import ast
+    import pathlib
+
+    scripts_dir = pathlib.Path(__file__).parent
+    for module_name in ("blueprint.py", "blueprint_api.py"):
+        source = (scripts_dir / module_name).read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=module_name)
+        seen: dict = {}
+        dups: list = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = node.name
+                if name in seen:
+                    dups.append(
+                        f"{name} (first at line {seen[name]}, again at line {node.lineno})"
+                    )
+                else:
+                    seen[name] = node.lineno
+        assert not dups, (
+            f"{module_name} has duplicate top-level definitions: {', '.join(dups)}"
+        )
+
+
 def test_envelope_registered_once():
     """The 'envelope' subcommand is registered exactly once in the parser."""
     parser = blueprint.build_parser()

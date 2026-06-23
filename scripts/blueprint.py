@@ -635,66 +635,6 @@ def _render_evaluating_list(data: dict) -> None:
             print(f"           {msg}")
 
 
-def _tasks_cancel_all(args: argparse.Namespace) -> None:
-    """Bulk-cancel tasks filtered by status (and optional category)."""
-    cfg = load_config()
-    if cfg.get("read_only"):
-        print("ERROR: 'cancel-all' requires an admin API key.", file=sys.stderr)
-        sys.exit(1)
-    statuses = [args.status] if getattr(args, "status", None) else [
-        "QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"]
-    category = getattr(args, "category", None)
-    if not _confirm(
-        f"Cancel all tasks with status={statuses}"
-        + (f" category={category}" if category else "") + "?",
-        getattr(args, "yes", False),
-    ):
-        print("Aborted.")
-        return
-    pid = get_project_id(getattr(args, "project_id", None))
-    cancelled = skipped = 0
-    for status in statuses:
-        offset = 0
-        while True:
-            resp = api("GET", f"/api/admin/tasks?project_id={pid}&status={status}"
-                              f"&limit=500&offset={offset}")
-            batch = resp.get("tasks", resp) if isinstance(resp, dict) else resp
-            if not batch:
-                break
-            for t in batch:
-                if category and (t.get("context") or {}).get("failure_category") != category:
-                    skipped += 1
-                    continue
-                try:
-                    api("PATCH", f"/api/admin/tasks/{t['id']}", {"status": "CANCELLED"})
-                    cancelled += 1
-                except Exception:  # noqa: BLE001
-                    pass
-            offset += len(batch)
-            if len(batch) < 500:
-                break
-    suffix = f" ({skipped} skipped, category filter)" if skipped else ""
-    print(f"Cancelled {cancelled} tasks{suffix}.")
-
-
-def _tasks_set_status(args: argparse.Namespace) -> None:
-    """Force a task to an arbitrary status (power-user recovery lever)."""
-    cfg = load_config()
-    if cfg.get("read_only"):
-        print("ERROR: 'set-status' requires an admin API key.", file=sys.stderr)
-        sys.exit(1)
-    if not _confirm(
-        f"Set task {args.task_id} to {args.new_status}?", getattr(args, "yes", False)
-    ):
-        print("Aborted.")
-        return
-    body: dict = {"status": args.new_status}
-    if getattr(args, "message", None):
-        body["latest_status_message"] = args.message
-    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", body)
-    _emit(args, result, lambda d: print(f"  {args.task_id[:8]}: {d.get('status', 'ok')}"))
-
-
 def _tasks_autonomy_debug(args: argparse.Namespace) -> None:
     """Fetch autonomy-debug for a project: blocking guards, eligible directions."""
     pid = get_project_id(getattr(args, "project_id", None))
@@ -765,31 +705,6 @@ def _require_write_config(action: str) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-
-
-def _tasks_evaluating(args: argparse.Namespace) -> None:
-    pid = get_project_id(getattr(args, "project_id", None))
-    resp = api("GET", f"/api/admin/tasks?project_id={pid}&status=EVALUATING&limit=100")
-    tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
-    verbose = getattr(args, "verbose", False)
-    if not tasks:
-        print("No EVALUATING tasks.")
-        return
-    for t in tasks:
-        ctx = t.get("context") or {}
-        loop = ctx.get("review_loop") or {}
-        ci = loop.get("ci_waiting", False)
-        pr = loop.get("pr_number", "-")
-        print(f"  {(t.get('id') or '?')[:8]}  [{t.get('task_type', '?'):8}]  "
-              f"{(t.get('title') or '')[:50]:<50}  ci={ci}  pr={pr}")
-        msg = (t.get("latest_status_message") or "")[:80]
-        if msg:
-            print(f"           {msg}")
-        if verbose:
-            for key, label in [("research_question", "Q"), ("scope", "Scope")]:
-                val = ctx.get(key, "")
-                if val:
-                    print(f"           {label}: {val[:120]}")
 
 
 def _tasks_cancel_all(args: argparse.Namespace) -> None:
