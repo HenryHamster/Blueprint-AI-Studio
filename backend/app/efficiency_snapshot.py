@@ -1832,8 +1832,9 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
         "cost_per_challenge_usd": cost_per_challenge,
         "challenged_escalated": escalated,
         "challenged_degraded": degraded,
-        # None when no degraded events observed (distinguishes "0 measured" from "unknown").
-        "fail_open_rate": round(degraded / (total + degraded), 4) if degraded > 0 else None,
+        # 0.0 when gate invoked and no degraded events (confirmed-zero, distinct from no-data).
+        # None only when the window has no gate invocations at all.
+        "fail_open_rate": round(degraded / (total + degraded), 4) if (total > 0 or degraded > 0) else None,
     }
 
 

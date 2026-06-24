@@ -14,9 +14,13 @@ function DistributionBar({ confirmed, revised, rejected }: { confirmed: number; 
   );
 }
 
+const GATE_MIN_SAMPLE = 30;
+
 function GateHealthBadge({ failOpen, total }: { failOpen: number; total: number }) {
-  const rate = total + failOpen > 0 ? failOpen / (total + failOpen) : 0;
+  if (total + failOpen === 0) return <span data-testid="health-badge" className="text-neutral-500 font-mono text-ui-sm">NO DATA</span>;
+  const rate = failOpen / (total + failOpen);
   if (rate >= 0.05) return <span data-testid="health-badge" className="text-red-400 font-mono text-ui-sm">DEGRADED</span>;
+  if (total + failOpen < GATE_MIN_SAMPLE) return <span data-testid="health-badge" className="text-neutral-400 font-mono text-ui-sm">INSUFFICIENT</span>;
   if (rate >= 0.01) return <span data-testid="health-badge" className="text-amber-400 font-mono text-ui-sm">PARTIAL</span>;
   return <span data-testid="health-badge" className="text-emerald-400 font-mono text-ui-sm">HEALTHY</span>;
 }

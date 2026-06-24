@@ -7186,7 +7186,7 @@ def test_panel_review_effectiveness_escalated_fail_open():
     Expected:
       total_challenged = 3 (only the three successful gate invocations)
       challenged_escalated = 2 (safe/blocked escalations, informational)
-      fail_open_rate = None (no degraded_model_unavailable records — no true fail-opens)
+      fail_open_rate = 0.0 (gate was invoked but no degraded events — confirmed-zero, not no-data)
       overturn_rate = 1/3
     """
     from app.efficiency_snapshot import compute_panel_review_effectiveness
@@ -7223,9 +7223,10 @@ def test_panel_review_effectiveness_escalated_fail_open():
     assert result["overturn_rate"] == round(1 / 3, 4), (
         f"overturn_rate must be computed from total_challenged only, got {result['overturn_rate']}"
     )
-    # unchallenged+escalated=True records are safe (merge BLOCKED); fail_open_rate must not count them
-    assert result["fail_open_rate"] is None, (
-        f"fail_open_rate must be None when no degraded_model_unavailable records exist, got {result['fail_open_rate']}"
+    # unchallenged+escalated=True records are safe (merge BLOCKED); fail_open_rate must not count them.
+    # Gate was invoked (total=3), so fail_open_rate is confirmed-zero (0.0), not None (no-data).
+    assert result["fail_open_rate"] == 0.0, (
+        f"fail_open_rate must be 0.0 (confirmed-zero) when gate was invoked but no degraded events exist, got {result['fail_open_rate']}"
     )
     assert result.get("challenged_degraded", 0) == 0, (
         "challenged_degraded must be 0 when no degraded_model_unavailable records exist"
@@ -7351,6 +7352,61 @@ def test_panel_review_effectiveness_degraded_fail_open_rate():
     # Verify escalated records do NOT bleed into fail_open_rate numerator
     assert result["fail_open_rate"] != round(5 / 10, 4), (
         "fail_open_rate must not include challenged_escalated in the numerator"
+    )
+
+
+def test_fail_open_rate_distinguishes_confirmed_zero_from_insufficient_data():
+    """fail_open_rate=0.0 when gate was invoked and no fail-opens occurred (confirmed-zero).
+    fail_open_rate=None only when the window has no gate invocations at all (no-data).
+
+    This distinction is critical for the v18 <=5% audit: a None result means
+    'unknown' (cannot confirm or deny), while 0.0 means 'confirmed healthy'.
+
+    Setup A (confirmed-zero):
+      - 3 challenged_confirmed + 1 challenged_rejected = total=4, degraded=0
+      - Expected: fail_open_rate=0.0 (gate was invoked; zero degraded events measured)
+
+    Setup B (no-data):
+      - 0 gate invocations (only unchallenged tasks)
+      - Expected: fail_open_rate via None return (no gate invocations; rate is unknown)
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _task(recon):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    # Setup A: gate invoked with 0 degraded events → confirmed-zero
+    tasks_a = [
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_rejected"}),
+    ]
+    result_a = compute_panel_review_effectiveness(tasks_a)
+    assert result_a is not None, "must return a result when gate was invoked"
+    assert result_a["total_challenged"] == 4
+    assert result_a["challenged_degraded"] == 0
+    assert result_a["fail_open_rate"] == 0.0, (
+        f"fail_open_rate must be 0.0 (confirmed-zero) when gate invoked and no degraded events, got {result_a['fail_open_rate']}"
+    )
+
+    # Setup B: no gate invocations → no-data (None return)
+    tasks_b = [
+        _task({"state": "unchallenged"}),       # gate not invoked — ignored
+        make_task(project_id=None, status=TaskStatus.COMPLETED),  # no recon key
+    ]
+    result_b = compute_panel_review_effectiveness(tasks_b)
+    assert result_b is None, (
+        f"must return None when no gate invocations exist (fail_open_rate would be meaningless), got {result_b}"
     )
 
 
