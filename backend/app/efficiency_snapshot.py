@@ -1713,6 +1713,11 @@ def _qualification_infra_usd(versions: list[Any]) -> float | None:
 
     Returns None when no grade records with token data are found (pre-tracking
     versions) so callers can distinguish "zero spend" from "no data".
+
+    Note: ``input_rate`` is used for cache-read tokens as a deliberate
+    conservative upper bound — cache-read tokens cost less, so this
+    overstates cost slightly.  No cache-hit breakdown is stored in the
+    grade record.
     """
     from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
 
