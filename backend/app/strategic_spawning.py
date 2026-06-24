@@ -4811,6 +4811,13 @@ async def _spawn_strategic_review(
                         if _open_version.goal is None
                         else {}
                     ),
+                    # Signals the strategist to author the delivery theme this cycle.
+                    # Absent once the theme is set (null theme → action needed).
+                    **(
+                        {"theme_needed": True}
+                        if _open_version.theme is None
+                        else {}
+                    ),
                 }
             # Enrich with cross-version promotion-readiness trend.  Best-effort:
             # absent when no QualificationVerdict rows exist yet.

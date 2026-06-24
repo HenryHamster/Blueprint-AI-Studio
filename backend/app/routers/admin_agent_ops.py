@@ -2405,9 +2405,11 @@ async def strategic_operation(
         from app.problem_model import apply_agent_update, operator_owned_subset
         from app.strategic_completion import (
             NEW_VERSION_GOAL_CONTEXT_KEY,
+            NEW_VERSION_THEME_CONTEXT_KEY,
             QUALIFY_REQUEST_CONTEXT_KEY,
             VERSION_PHASE_DECISION_CONTEXT_KEY,
             extract_new_version_goal,
+            extract_new_version_theme,
             extract_qualify_request,
             extract_version_phase_decision,
         )
@@ -2433,6 +2435,9 @@ async def strategic_operation(
         qualify_request = extract_qualify_request(pm_data.pop("qualify_request", None))
         new_version_goal = extract_new_version_goal(
             pm_data.pop("new_version_goal", None)
+        )
+        new_version_theme = extract_new_version_theme(
+            pm_data.pop("new_version_theme", None)
         )
         # Resolve the cycle's baseline problem model (snapshot at spawn) so a
         # concurrent operator edit to an operator-owned field is merged
@@ -2513,6 +2518,8 @@ async def strategic_operation(
             new_ctx[QUALIFY_REQUEST_CONTEXT_KEY] = qualify_request
         if new_version_goal is not None:
             new_ctx[NEW_VERSION_GOAL_CONTEXT_KEY] = new_version_goal
+        if new_version_theme is not None:
+            new_ctx[NEW_VERSION_THEME_CONTEXT_KEY] = new_version_theme
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)

@@ -3674,11 +3674,10 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(32), nullable=False, server_default="open"),
     )
 
-    # The version's goal — a point-in-time snapshot of
-    # ProblemModel.intent.current_focus captured when this version opened.
+    # The version's goal — a concise statement of what this version is for,
+    # authored by the strategist (new_version_goal field) or an operator.
     # Frozen for the version's lifetime so each version keeps a stable record
-    # of what it was for, even after current_focus drifts on.  Nullable:
-    # pre-0111 rows and projects with no current_focus carry no goal.
+    # of its objective. Nullable: pre-0111 rows carry no goal.
     goal: str | None = Field(
         default=None,
         sa_column=Column(Text, nullable=True),
@@ -3695,6 +3694,14 @@ class ReleaseVersion(SQLModel, table=True):
     goal_editor_info: str | None = Field(
         default=None,
         sa_column=Column(String(255), nullable=True),
+    )
+
+    # Delivery theme authored by the strategist (new_version_theme field).
+    # One of: leanness | reliability | performance | feature | mixed | none.
+    # Frozen once set. Nullable: pre-0332 rows carry no theme.
+    theme: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
     )
 
     opened_at: datetime = Field(

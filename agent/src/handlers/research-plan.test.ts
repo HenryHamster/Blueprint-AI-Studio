@@ -1791,6 +1791,22 @@ describe('buildVersionPhaseSection', () => {
     expect(blank).not.toContain('Goal:');
   });
 
+  it('renders the version theme when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'build',
+      theme: 'reliability',
+    });
+    expect(result).toContain('Theme: reliability');
+  });
+
+  it('omits the Theme line when theme is absent or blank', () => {
+    const absent = buildVersionPhaseSection({ version_number: 4, phase: 'build' });
+    expect(absent).not.toContain('Theme:');
+    const blank = buildVersionPhaseSection({ version_number: 4, phase: 'build', theme: '   ' });
+    expect(blank).not.toContain('Theme:');
+  });
+
   it('instructs agent to emit version_phase_decision when flipping', () => {
     const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
     expect(result).toContain('version_phase_decision');

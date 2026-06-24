@@ -1017,6 +1017,7 @@ def to_phase_block(
         "version_number": version.version_number,
         "phase": version.phase,
         "goal": version.goal,
+        "theme": version.theme,
         "phase_changed_at": version.phase_changed_at.isoformat()
         if version.phase_changed_at
         else None,

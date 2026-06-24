@@ -14220,6 +14220,145 @@ async def test_set_problem_model_api_does_not_refresh_version_goal(client, db_se
     assert version.goal_editor_info is None
 
 
+# ===========================================================================
+# extract_new_version_theme + _apply_new_version_theme
+# ===========================================================================
+
+
+def test_extract_new_version_theme_valid_values():
+    """All allowed theme values are accepted and lowercased."""
+    from app.strategic_completion import extract_new_version_theme
+
+    for val in ("leanness", "reliability", "performance", "feature", "mixed", "none"):
+        assert extract_new_version_theme(val) == val
+    # Case-insensitive normalization
+    assert extract_new_version_theme("Leanness") == "leanness"
+    assert extract_new_version_theme("RELIABILITY") == "reliability"
+
+
+def test_extract_new_version_theme_invalid_values():
+    """Invalid theme values, non-strings, and blank are rejected."""
+    from app.strategic_completion import extract_new_version_theme
+
+    assert extract_new_version_theme(None) is None
+    assert extract_new_version_theme(42) is None
+    assert extract_new_version_theme("") is None
+    assert extract_new_version_theme("invalid_theme") is None
+    assert extract_new_version_theme("quality") is None
+
+
+@pytest.mark.asyncio
+async def test_apply_new_version_theme_sets_theme(db_session):
+    """_apply_new_version_theme sets version.theme when it is currently unset."""
+    from app.strategic_completion import _apply_new_version_theme
+    from app import release_version as rv
+
+    project = Project(
+        name="ThemeTest",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.theme is None
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _apply_new_version_theme("reliability", task, project, db_session, path="test")
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.theme == "reliability"
+
+
+@pytest.mark.asyncio
+async def test_apply_new_version_theme_frozen_once_set(db_session):
+    """_apply_new_version_theme is a no-op when theme is already set."""
+    from app.strategic_completion import _apply_new_version_theme
+    from app import release_version as rv
+
+    project = Project(
+        name="ThemeFrozen",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    version.theme = "leanness"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _apply_new_version_theme("feature", task, project, db_session, path="test")
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Theme must stay as originally set — frozen once set.
+    assert version.theme == "leanness"
+
+
+@pytest.mark.asyncio
+async def test_apply_new_version_theme_invalid_value_is_noop(db_session):
+    """Invalid theme value is silently ignored."""
+    from app.strategic_completion import _apply_new_version_theme
+    from app import release_version as rv
+
+    project = Project(
+        name="ThemeInvalid",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _apply_new_version_theme("invalid_value", task, project, db_session, path="test")
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.theme is None
+
+
 # ── _compute_model_gc_telemetry ───────────────────────────────────────────────
 
 

@@ -129,7 +129,7 @@
     "handlers/research-plan.ts": 2600,
     "handlers/strategic.ts": 1350,
     "handlers/research-direction-context.ts": 250,
-    "prompts/thinker.ts": 650,
+    "prompts/thinker.ts": 900,
     "handlers/standard.ts": 1550,
     "handlers/review-fix.ts": 1700,
     "handlers/review-fix-history.ts": 200,

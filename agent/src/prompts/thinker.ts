@@ -351,9 +351,17 @@ When describing changes in prose, be precise: "opening gap g-strategic-mem (from
 
 Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
 
-## 7. Version goal (conditional — only when the open version has no goal yet)
+## 7. Version goal + theme (conditional — only when unset)
 
-**Skip this section entirely if the version already has a goal** — the goal is frozen once set; re-emitting is silently ignored.
+**Four distinct concepts — keep them separate:**
+- \`intent.purpose\` = enduring PROJECT north star, operator-owned, spans all versions. Never touch this.
+- \`version.goal\` = THIS version's frozen objective — a derivative of purpose, authored once per version.
+- \`version.theme\` = the falsifiable DELIVERY SHAPE for this version (leanness | reliability | performance | feature | mixed | none).
+- \`intent.current_focus\` = live "working on now" status — NOT the goal, advances across cycles.
+
+**Version goal (only when the Goal shown in Version Phase is unset):**
+
+**Skip if the version already has a goal** — the goal is frozen once set; re-emitting is silently ignored.
 
 **Only when the goal is currently unset:** write one concise version objective to \`/tmp/new_version_goal_${p.taskId}.txt\` ${READ_ONLY_BASH_WRITE_NOTE}. Single line, under 500 characters.
 
@@ -364,18 +372,35 @@ Good: "Deliver autonomous cross-project coordination so Blueprint manages 3+ con
 
 Write only the goal text — no JSON, no label, no quotes. Omit the file entirely if the goal is already set.
 
+**Version theme (only when the Theme shown in Version Phase is unset):**
+
+**Skip if the version already has a theme** — the theme is frozen once set; re-emitting is silently ignored.
+
+**Only when the theme is currently unset:** write one of the following values to \`/tmp/new_version_theme_${p.taskId}.txt\` ${READ_ONLY_BASH_WRITE_NOTE}: \`leanness\` | \`reliability\` | \`performance\` | \`feature\` | \`mixed\` | \`none\`
+
+Choose the value that best describes the PRIMARY delivery shape of this version:
+- \`leanness\` — simplification, removal of dead code, reducing complexity or surface area
+- \`reliability\` — stability, correctness, error handling, test coverage, hardening
+- \`performance\` — throughput, latency, efficiency improvements
+- \`feature\` — new user-visible capabilities or significant enhancements
+- \`mixed\` — roughly equal mix of the above (use sparingly — be specific when possible)
+- \`none\` — maintenance cycle with no dominant delivery theme
+
+Write only the theme value — no JSON, no label, no quotes. Omit the file entirely if the theme is already set.
+
 ${PLAYBOOK_GUIDANCE}
 
 ${DEFAULT_TOOL_GUIDANCE}`;
 }
 
 // ── Pass-1 gate: run thinker, verify artifacts, retry once if missing ────────
-// Exported for unit testing. Returns { ok: true, analysisText, newVersionGoal? }
-// when both /tmp/problem_model_<taskId>.json and /tmp/running_update_<taskId>.md
-// exist after the thinker (or its focused retry) completes. Also reads the
-// optional /tmp/new_version_goal_<taskId>.txt (Section 7 output) and surfaces its
-// content as newVersionGoal so the caller can pre-merge it into the problem_model
-// JSON before the executor runs. On any failure path it calls
+// Exported for unit testing. Returns { ok: true, analysisText, newVersionGoal?,
+// newVersionTheme? } when both /tmp/problem_model_<taskId>.json and
+// /tmp/running_update_<taskId>.md exist after the thinker (or its focused retry)
+// completes. Also reads the optional /tmp/new_version_goal_<taskId>.txt (Section 7
+// output) and /tmp/new_version_theme_<taskId>.txt (Section 7 output) and surfaces
+// their content so the caller can pre-merge them into the problem_model JSON before
+// the executor runs. On any failure path it calls
 // persistAndPostStatus(FAILED, failure_category=strategic_thinker_artifacts_missing)
 // and returns { ok: false } so the caller can simply return.
 export async function runThinkerWithGate(
@@ -386,7 +411,7 @@ export async function runThinkerWithGate(
   model: string | undefined,
   effort: string | undefined,
   disallowedTools: string[],
-): Promise<{ ok: true; analysisText: string; newVersionGoal?: string } | { ok: false }> {
+): Promise<{ ok: true; analysisText: string; newVersionGoal?: string; newVersionTheme?: string } | { ok: false }> {
   const problemModelPath = `/tmp/problem_model_${taskId}.json`;
   const runningUpdatePath = `/tmp/running_update_${taskId}.md`;
 
@@ -614,5 +639,19 @@ export async function runThinkerWithGate(
     }
   }
 
-  return { ok: true, analysisText, newVersionGoal };
+  // Read the optional Section 7 version-theme file if the thinker wrote it.
+  const validThemeValues = new Set(['leanness', 'reliability', 'performance', 'feature', 'mixed', 'none']);
+  const newVersionThemePath = `/tmp/new_version_theme_${taskId}.txt`;
+  let newVersionTheme: string | undefined;
+  if (fs.existsSync(newVersionThemePath)) {
+    try {
+      const raw = fs.readFileSync(newVersionThemePath, 'utf8').trim().toLowerCase();
+      if (raw && validThemeValues.has(raw)) newVersionTheme = raw;
+      else if (raw) sendLog(ws, `[WARNING] Ignoring invalid new_version_theme value: "${raw}"\n`);
+    } catch (e) {
+      sendLog(ws, `[WARNING] Failed to read ${newVersionThemePath}: ${String(e)}\n`);
+    }
+  }
+
+  return { ok: true, analysisText, newVersionGoal, newVersionTheme };
 }

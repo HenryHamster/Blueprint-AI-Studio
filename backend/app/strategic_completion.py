@@ -416,6 +416,15 @@ NEW_VERSION_GOAL_CONTEXT_KEY = "_strategic_new_version_goal"
 # ReleaseVersion.goal).  Matches the display budget for version goal UI surfaces.
 _NEW_VERSION_GOAL_MAX = 500
 
+# Transient task.context key carrying an agent-emitted new_version_theme from the
+# set_problem_model endpoint to _handle_strategic_completion's API path.
+NEW_VERSION_THEME_CONTEXT_KEY = "_strategic_new_version_theme"
+
+# Valid delivery theme values the strategic agent may author.
+_VALID_THEME_VALUES: frozenset[str] = frozenset(
+    {"leanness", "reliability", "performance", "feature", "mixed", "none"}
+)
+
 # OPTIONAL agent verdict that refines the deterministic outcome-progress
 # (scaffolding) detector. For each long-running ACTIVE direction the strategic
 # agent may record one verdict — advancing | stalled | met — that raises the
@@ -1166,6 +1175,98 @@ async def _apply_new_version_goal(
     except Exception:
         logger.exception(
             "[STRATEGIC] Task %s (%s path): failed to apply new_version_goal (non-fatal)",
+            task.id,
+            path,
+        )
+
+
+def extract_new_version_theme(raw: object) -> str | None:
+    """Validate + normalize a raw ``new_version_theme`` value.
+
+    Accepts the string the strategic agent embeds as a top-level sibling in the
+    ``set-problem-model`` payload and returns a clean lowercase string, or ``None``
+    when the input is absent, not a string, or not one of the allowed theme values.
+
+    Used by the ``set_problem_model`` endpoint to lift the field out of the
+    problem_model JSON (ProblemModel is extra="forbid", which would otherwise
+    reject the whole update). ``_apply_new_version_theme`` re-checks the
+    open-version / theme-already-set guards, so a no-op is safe.
+    """
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip().lower()
+    if cleaned not in _VALID_THEME_VALUES:
+        return None
+    return cleaned
+
+
+async def _apply_new_version_theme(
+    theme: object,
+    task: Task,
+    project: Project,
+    session: AsyncSession,
+    *,
+    path: str,
+) -> None:
+    """Apply an optional ``new_version_theme`` from the strategic agent.
+
+    ``theme`` is the raw value from either:
+      - the API path: ``task.context.get(NEW_VERSION_THEME_CONTEXT_KEY)``
+      - the fallback parse path: ``parsed.get("new_version_theme")``
+
+    When valid and the open version has no theme yet, sets the theme and
+    ``session.add``s the row — the caller's surrounding ``await session.commit()``
+    persists it.
+
+    Silently no-ops when:
+      - ``theme`` is None / not a non-empty string
+      - the value is not one of the valid theme values
+      - The project has no open ``ReleaseVersion``
+      - The open version already has a theme (frozen-once-set)
+
+    All errors are logged and swallowed — a bad or absent theme must never
+    block vision/direction writes.
+    """
+    if not theme or not isinstance(theme, str):
+        return
+    _nvt_text = theme.strip().lower()
+    if _nvt_text not in _VALID_THEME_VALUES:
+        return
+    try:
+        from app.release_version import current_open_version as _cur_open_version
+
+        _open_ver = await _cur_open_version(session, project.id)
+        if _open_ver is None:
+            logger.debug(
+                "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project %s "
+                "— skipping new_version_theme",
+                task.id,
+                path,
+                project.id,
+            )
+            return
+        if _open_ver.theme is not None:
+            logger.debug(
+                "[STRATEGIC] Task %s (%s path): open version v%d already has a theme "
+                "— skipping new_version_theme (frozen once set)",
+                task.id,
+                path,
+                _open_ver.version_number,
+            )
+            return
+        _open_ver.theme = _nvt_text
+        session.add(_open_ver)
+        logger.info(
+            "[STRATEGIC] Task %s (%s path): authored version theme for v%d project=%s: %s",
+            task.id,
+            path,
+            _open_ver.version_number,
+            project.id,
+            _nvt_text,
+        )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] Task %s (%s path): failed to apply new_version_theme (non-fatal)",
             task.id,
             path,
         )
@@ -3609,6 +3710,13 @@ async def _handle_strategic_completion(
         # Sets the open version's goal with source="strategist" when null.
         _nvg_ctx = (task.context or {}).get(NEW_VERSION_GOAL_CONTEXT_KEY)
         await _apply_new_version_goal(_nvg_ctx, task, project, session, path="api")
+        # Apply new_version_theme if the agent supplied one via the API. Same
+        # transport as new_version_goal: the ``set_problem_model`` endpoint lifts
+        # the field out of the problem_model JSON and stows the validated value
+        # under ``NEW_VERSION_THEME_CONTEXT_KEY``. Sets the open version's theme
+        # (leanness|reliability|performance|feature|mixed|none) when null.
+        _nvt_ctx = (task.context or {}).get(NEW_VERSION_THEME_CONTEXT_KEY)
+        await _apply_new_version_theme(_nvt_ctx, task, project, session, path="api")
 
         # Per-cycle message post removed: the strategic agent now maintains
         # project.running_update as a living markdown document it rewrites
@@ -3707,6 +3815,7 @@ async def _handle_strategic_completion(
     new_problem_model = parsed.get("problem_model")
     new_running_update = parsed.get("running_update")
     new_version_goal = parsed.get("new_version_goal")
+    new_version_theme = parsed.get("new_version_theme")
     direction_ops = parsed.get("direction_operations", [])
 
     # Lock project row to prevent concurrent direction/vision mutations.
@@ -3926,6 +4035,10 @@ async def _handle_strategic_completion(
     # shared helper used by the API path so both paths behave identically.
     await _apply_new_version_goal(
         new_version_goal, task, project, session, path="fallback"
+    )
+    # Apply new_version_theme when the strategist authors the delivery theme.
+    await _apply_new_version_theme(
+        new_version_theme, task, project, session, path="fallback"
     )
 
     # Reconcile project.running_update operator-wins via the same shared helper

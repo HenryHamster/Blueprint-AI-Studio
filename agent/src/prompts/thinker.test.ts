@@ -481,12 +481,12 @@ describe('buildThinkerPrompt', () => {
     const prompt = buildThinkerPrompt(base);
     // The prompt must instruct the thinker to write new_version_goal
     expect(prompt).toContain('new_version_goal');
-    // Section 7 is the dedicated output section for the version goal
+    // Section 7 is the dedicated output section for the version goal and theme
     expect(prompt).toContain('## 7. Version goal');
     // Must reference the dedicated handoff file
     expect(prompt).toContain('/tmp/new_version_goal_');
     // Must explain when to write it (only when goal is unset)
-    expect(prompt).toContain('only when the open version has no goal yet');
+    expect(prompt).toContain('goal is currently unset');
     // Must note that once set, it is frozen (skip if already set)
     expect(prompt).toContain('frozen once set');
     // Must specify the character limit
@@ -501,6 +501,30 @@ describe('buildThinkerPrompt', () => {
     expect(sec6Idx).toBeGreaterThan(-1);
     expect(sec7Idx).toBeGreaterThan(-1);
     expect(sec7Idx).toBeGreaterThan(sec6Idx);
+  });
+
+  it('test_thinker_prompt_instructs_new_version_theme_emission', () => {
+    const prompt = buildThinkerPrompt(base);
+    // The prompt must instruct the thinker to write new_version_theme
+    expect(prompt).toContain('new_version_theme');
+    // Must reference the dedicated handoff file
+    expect(prompt).toContain('/tmp/new_version_theme_');
+    // Must list the valid theme values
+    expect(prompt).toContain('leanness');
+    expect(prompt).toContain('reliability');
+    expect(prompt).toContain('performance');
+    expect(prompt).toContain('feature');
+    expect(prompt).toContain('mixed');
+    expect(prompt).toContain('none');
+    // Must explain when to write it (only when theme is unset)
+    expect(prompt).toContain('theme is currently unset');
+    // Must note that once set, it is frozen
+    expect(prompt).toContain('theme is frozen once set');
+    // Must teach the 4-concept boundary
+    expect(prompt).toContain('intent.purpose');
+    expect(prompt).toContain('version.goal');
+    expect(prompt).toContain('version.theme');
+    expect(prompt).toContain('intent.current_focus');
   });
 });
 
@@ -760,6 +784,62 @@ describe('runThinkerWithGate', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.newVersionGoal).toBeUndefined();
+    }
+  });
+
+  it('(j) Section 7 new_version_theme file present with valid value → returned in newVersionTheme field (lowercased)', async () => {
+    const newVersionThemePath = `/tmp/new_version_theme_${taskId}.txt`;
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.presentFiles.add(newVersionThemePath);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === newVersionThemePath) return 'Reliability'; // mixed case → should be lowercased
+        return '{"intent":{"purpose":"ok"},"gaps":[]}';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionTheme).toBe('reliability');
+    }
+  });
+
+  it('(k) Section 7 new_version_theme file absent → newVersionTheme undefined in result', async () => {
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    // new_version_theme_<taskId>.txt NOT in presentFiles
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionTheme).toBeUndefined();
+    }
+  });
+
+  it('(l) Section 7 new_version_theme file present with invalid value → newVersionTheme undefined (invalid value rejected)', async () => {
+    const newVersionThemePath = `/tmp/new_version_theme_${taskId}.txt`;
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.presentFiles.add(newVersionThemePath);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === newVersionThemePath) return 'speed'; // not a valid theme value
+        return '{"intent":{"purpose":"ok"},"gaps":[]}';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionTheme).toBeUndefined();
     }
   });
 });
