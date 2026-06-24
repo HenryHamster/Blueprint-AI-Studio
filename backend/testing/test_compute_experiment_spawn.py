@@ -1454,7 +1454,7 @@ async def test_launch_refuses_above_threshold_unapproved_compute_job(db_session)
             deadline_seconds=300,
         )
 
-    detail = exc_info.value.args[0]
+    detail = exc_info.value.detail
     assert detail["error"] == "spend_cap_requires_approval"
     assert detail["spend_cap_usd"] == 10.0
     assert detail["threshold_usd"] == 5.0
@@ -1562,7 +1562,7 @@ async def test_launch_allows_zero_config_project_below_global_threshold(db_sessi
                 spend_cap_usd=11.0,
                 deadline_seconds=300,
             )
-        detail = exc_info.value.args[0]
+        detail = exc_info.value.detail
         assert detail["error"] == "spend_cap_requires_approval"
         assert detail["threshold_usd"] == pytest.approx(10.0)
     finally:
