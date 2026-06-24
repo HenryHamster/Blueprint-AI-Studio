@@ -33,6 +33,7 @@ from app.shared_state import (
     get_project_task_branch_namespace,
     limiter,
     resolve_task_branch as _resolve_task_branch,
+    runtime_config as _runtime_config,
 )
 from app.models import (
     Task,
@@ -60,6 +61,7 @@ from app.payload_schemas import (
 from app.task_capabilities import USER_LAUNCHABLE_TASK_TYPES
 from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
+    resolve_compute_spend_approval,
 )
 from app.vm_cost_rates import (
     get_compute_rate_per_second,
@@ -2295,6 +2297,12 @@ async def create_compute_experiment_task(
                 "is_duplicate": True,
             }
 
+    requires_approval, _ = resolve_compute_spend_approval(
+        runtime_config=_runtime_config,
+        direction=None,
+        spend_cap_usd=float(launch_contract["spend_cap_usd"]),
+    )
+
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
     new_task = Task(
         project_id=project.id,
@@ -2305,7 +2313,7 @@ async def create_compute_experiment_task(
         status=TaskStatus.QUEUED,
         created_by="USER",
         launched_by_user_id=current_user["user_id"],
-        requires_approval=False,
+        requires_approval=requires_approval,
         idempotency_key=scoped_idempotency_key,
     )
     session.add(new_task)

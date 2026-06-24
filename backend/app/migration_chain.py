@@ -7,10 +7,13 @@ divergent re-implementations. Pure string/regex logic — no DB, no I/O.
 """
 
 import glob
+import logging
 import os
 import re
 import sys
 from collections.abc import Iterable
+
+logger = logging.getLogger(__name__)
 
 # Mirrors the parsing used by the migration-chain invariant test. Alembic
 # orders migrations by these in-file values, not by filename.
@@ -117,7 +120,7 @@ def main(versions_dir: str | None = None) -> int:
 
     files = glob.glob(os.path.join(versions_dir, "[0-9]*.py"))
     if not files:
-        print(f"[migration-chain] no migration files found in {versions_dir}")
+        logger.warning("[migration-chain] no migration files found in %s", versions_dir)
         return 0
 
     errors: list[str] = []
@@ -155,12 +158,12 @@ def main(versions_dir: str | None = None) -> int:
         )
 
     if errors:
-        print("[migration-chain] FAILED — migration chain has errors:")
+        logger.error("[migration-chain] FAILED — migration chain has errors:")
         for msg in errors:
-            print(msg)
+            logger.error(msg)
         return 1
 
-    print(f"[migration-chain] OK — {len(files)} migration(s), single head")
+    logger.info("[migration-chain] OK — %d migration(s), single head", len(files))
     return 0
 
 

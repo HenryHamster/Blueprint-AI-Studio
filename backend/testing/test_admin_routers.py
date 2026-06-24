@@ -16326,11 +16326,11 @@ class TestComputeExperimentTaskLaunch:
         assert tasks == []
 
     @pytest.mark.asyncio
-    async def test_spend_above_threshold_runs_without_approval(
+    async def test_spend_above_threshold_requires_approval(
         self, client: AsyncClient, db_session
     ):
-        # compute_experiment tasks no longer gate on spend threshold approval:
-        # requires_approval is always False regardless of spend cap vs threshold.
+        # Operator-launched compute_experiment tasks above the spend threshold
+        # must be held for approval (requires_approval=True).
         await self._project_with_repo(db_session)
         from app.shared_state import runtime_config as _rc
 
@@ -16348,13 +16348,46 @@ class TestComputeExperimentTaskLaunch:
                 _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
 
         assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["requires_approval"] is True
         task = (
             await db_session.execute(
-                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        assert task.requires_approval is True
+
+    @pytest.mark.asyncio
+    async def test_spend_below_threshold_runs_without_approval(
+        self, client: AsyncClient, db_session
+    ):
+        # Operator-launched compute_experiment tasks at or below the spend
+        # threshold run immediately without approval.
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 10.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(spend_cap_usd=5.0, deadline_seconds=900),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["requires_approval"] is False
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
             )
         ).scalar_one()
         assert task.requires_approval is False
-        assert task.latest_status_message is None
 
     @pytest.mark.asyncio
     async def test_spend_at_threshold_is_runnable(
