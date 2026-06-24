@@ -7290,7 +7290,6 @@ def test_panel_review_effectiveness_fail_open_rate():
     assert result["fail_open_rate"] == expected_rate, (
         f"expected fail_open_rate={expected_rate} (degraded only), got {result['fail_open_rate']}"
     )
-
     # Zero-invocations: no tasks with gate records returns None
     assert compute_panel_review_effectiveness([]) is None
 
