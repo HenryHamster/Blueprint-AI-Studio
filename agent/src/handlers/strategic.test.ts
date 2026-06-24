@@ -1081,6 +1081,53 @@ describe('handleStrategic prompt_suffix wiring', () => {
   });
 });
 
+describe('handleStrategic executor prompt: version-signal sibling passthrough', () => {
+  it('instructs executor to carry new_version_goal/version_phase_decision/qualify_request as top-level siblings', async () => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-sibling-pass',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toBeDefined();
+
+    // All three sibling fields must be named in the executor instructions.
+    expect(executorPrompt).toContain('new_version_goal');
+    expect(executorPrompt).toContain('version_phase_decision');
+    expect(executorPrompt).toContain('qualify_request');
+
+    // The instruction must tell the executor to add them as top-level sibling keys
+    // (not nested under problem_model content).
+    expect(executorPrompt).toContain('top-level sibling');
+
+    // The instruction must reference the problem_model file edit mechanism
+    // (editing /tmp/problem_model_<id>.json IN PLACE) so the siblings reach
+    // the backend via the set-problem-model cat call.
+    expect(executorPrompt).toContain('IN PLACE');
+
+    // Each field's absence must mean skip (not fabricate).
+    expect(executorPrompt).toContain('do not fabricate');
+  });
+});
+
 describe('handleStrategic infra-error propagation (vm_config_missing)', () => {
   it('propagates a vm_config_missing death from the required-calls retry instead of swallowing it', async () => {
     // The swallowing retry-catch previously turned a vm_config_missing death into a
