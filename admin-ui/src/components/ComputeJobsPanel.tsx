@@ -531,7 +531,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               key={minutes}
               type="button"
               onClick={() => { setAllTerminal(false); setFinishedWindowMinutes(minutes); setHasMore(false); }}
-              className={`min-h-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${!allTerminal && finishedWindowMinutes === minutes ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+              className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${!allTerminal && finishedWindowMinutes === minutes ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
               data-testid={`compute-window-${label}`}
             >
               {label}
@@ -540,7 +540,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           <button
             type="button"
             onClick={() => { setAllTerminal(true); setHasMore(false); }}
-            className={`min-h-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${allTerminal ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+            className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${allTerminal ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
             data-testid="compute-window-all"
           >
             All
