@@ -2160,8 +2160,10 @@ async def strategic_operation(
         from app import strategic_cycle as _strategic_cycle
         from app.problem_model import apply_agent_update, operator_owned_subset
         from app.strategic_completion import (
+            NEW_VERSION_GOAL_CONTEXT_KEY,
             QUALIFY_REQUEST_CONTEXT_KEY,
             VERSION_PHASE_DECISION_CONTEXT_KEY,
+            extract_new_version_goal,
             extract_qualify_request,
             extract_version_phase_decision,
         )
@@ -2185,6 +2187,9 @@ async def strategic_operation(
             pm_data.pop("version_phase_decision", None)
         )
         qualify_request = extract_qualify_request(pm_data.pop("qualify_request", None))
+        new_version_goal = extract_new_version_goal(
+            pm_data.pop("new_version_goal", None)
+        )
         # Resolve the cycle's baseline problem model (snapshot at spawn) so a
         # concurrent operator edit to an operator-owned field is merged
         # operator-wins rather than silently clobbered. Mirrors the vision
@@ -2262,6 +2267,8 @@ async def strategic_operation(
             new_ctx[VERSION_PHASE_DECISION_CONTEXT_KEY] = version_phase_decision
         if qualify_request is not None:
             new_ctx[QUALIFY_REQUEST_CONTEXT_KEY] = qualify_request
+        if new_version_goal is not None:
+            new_ctx[NEW_VERSION_GOAL_CONTEXT_KEY] = new_version_goal
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
@@ -2288,6 +2295,12 @@ async def strategic_operation(
                 "the open version is in stabilize",
                 task.id,
             )
+        if new_version_goal is not None:
+            logger.info(
+                "[STRATEGIC API] new_version_goal routed to task.context for "
+                "task %s — applied to open version at strategic completion",
+                task.id,
+            )
         return _resp(
             {
                 "status": "ok",
@@ -2296,6 +2309,7 @@ async def strategic_operation(
                 "diff": pm_diff,
                 "version_phase_decision_received": version_phase_decision is not None,
                 "qualify_request_received": qualify_request is not None,
+                "new_version_goal_received": new_version_goal is not None,
             }
         )
 

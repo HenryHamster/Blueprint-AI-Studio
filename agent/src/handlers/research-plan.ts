@@ -952,7 +952,16 @@ Only request qualification from the **stabilize** phase — it is ignored in **b
 
 **Do NOT re-request while a qualification is in flight.** If the "Last qualification" line above shows \`status=pending\`, a qualification is already running for this version — the orchestrator has snapshotted a candidate and spawned the audit + smoketest. Do NOT emit \`qualify_request\` again; wait for the in-flight run to finalize (its status will change to \`promoted\`, \`not_promoted\`, \`dry_run\`, or an error). Re-requesting while \`status=pending\` is wasted work and is ignored.
 
-**Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit, smoketest) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns two agent VMs to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.`);
+**Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit, smoketest) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns two agent VMs to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.
+
+**Authoring the version goal (when none is set):**
+If the open version has no Goal shown above, you may propose one by emitting a \`new_version_goal\` field as a top-level sibling in your Section 6 problem_model update:
+\`\`\`json
+{
+  "new_version_goal": "One concise sentence stating what this version is for."
+}
+\`\`\`
+Only emit \`new_version_goal\` when the Goal is currently unset — once authored, the goal is frozen and a re-emit is silently ignored. Keep it under 500 characters and avoid placeholder or generic text. \`new_version_goal\` is independent of \`version_phase_decision\` and \`qualify_request\` — you may emit any combination.`);
 
   return parts.join('\n');
 }

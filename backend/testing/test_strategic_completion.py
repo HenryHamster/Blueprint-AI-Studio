@@ -14898,3 +14898,144 @@ async def test_handle_strategic_completion_rejects_contentless_new_version_goal(
     assert version.goal is None, (
         f"Contentless goal 'test' must not be stored; got {version.goal!r}"
     )
+
+
+# ===========================================================================
+# new_version_goal full API transport (set_problem_model → task.context → apply)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_set_problem_model_lifts_new_version_goal_api_path(
+    client, db_session, mocker
+):
+    """Full API-path regression: new_version_goal lifts past ProblemModel extra=forbid,
+    stows in task.context, and the completion handler applies it to a null-goal version.
+
+    Exercises the seam end-to-end using the real HTTP transport (not a mocked
+    context write) so that a future regression in any of the three layers
+    (endpoint strip, context stow, completion apply) will fail this test.
+    """
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app.strategic_completion import (
+        NEW_VERSION_GOAL_CONTEXT_KEY,
+        _handle_strategic_completion,
+    )
+    from app import release_version as rv
+    from app import strategic_cycle
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="NVG-E2E",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Open ReleaseVersion with no goal — the strategist should be able to author it.
+    version = await rv.open_version(db_session, project.id, version_number=1, goal=None)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal is None
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-nvg-e2e",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-nvg-e2e", task_type="strategic_review")
+
+    goal_text = "Ship the design-system token layer with zero arbitrary color literals."
+
+    # The agent embeds new_version_goal as a TOP-LEVEL SIBLING of the
+    # problem_model fields. The endpoint must strip it before ProblemModel
+    # validation (extra="forbid" would 400 if it reaches apply_agent_update).
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship the thing", "current_focus": "build"},
+                "capabilities": [],
+                "gaps": [],
+                "new_version_goal": goal_text,
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["op"] == "set_problem_model"
+    assert body["new_version_goal_received"] is True, (
+        "Response must confirm new_version_goal was received"
+    )
+
+    # The transient signal must NOT linger in the stored problem_model.
+    await db_session.refresh(project)
+    assert "new_version_goal" not in (project.problem_model or {}), (
+        "new_version_goal must be stripped before ProblemModel validation"
+    )
+    assert (project.problem_model or {}).get("intent", {}).get("purpose") == (
+        "Ship the thing"
+    )
+
+    # It must ride task.context to the completion handler.
+    await db_session.refresh(task)
+    stored = (task.context or {}).get(NEW_VERSION_GOAL_CONTEXT_KEY)
+    assert stored == goal_text, (
+        f"Expected new_version_goal stowed in task.context[{NEW_VERSION_GOAL_CONTEXT_KEY!r}]; "
+        f"got {stored!r}"
+    )
+
+    # Completion handler's API path must apply the goal to the null-goal version.
+    await _handle_strategic_completion(task, "", db_session)
+
+    await db_session.refresh(version)
+    assert version.goal == goal_text, (
+        f"Expected open version goal to be set to {goal_text!r}; got {version.goal!r}"
+    )
+    assert version.goal_editor_info is not None
+    assert version.goal_editor_info.startswith("[strategist:"), (
+        f"goal_editor_info must use source='strategist'; got {version.goal_editor_info!r}"
+    )
+
+    # A second call with a different goal must NOT clobber the already-set goal.
+    resp2 = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship the thing", "current_focus": "build"},
+                "capabilities": [],
+                "gaps": [],
+                "new_version_goal": "A different goal that must be ignored.",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200, resp2.text
+    await db_session.refresh(task)
+    await _handle_strategic_completion(task, "", db_session)
+    await db_session.refresh(version)
+    assert version.goal == goal_text, (
+        f"Goal must be frozen once authored; a second emit must not clobber it. "
+        f"Got {version.goal!r}"
+    )
