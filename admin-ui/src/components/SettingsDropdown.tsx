@@ -186,7 +186,7 @@ interface SettingsDropdownProps {
 
 
 
-export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review' | 'resource-envelope' | 'integration-branch' | 'promotion-target' | 'access';
+export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review' | 'resource-envelope' | 'branches' | 'access';
 
 type SectionEntry = { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean };
 
@@ -206,8 +206,7 @@ const SECTION_GROUPS: { group: string; sections: SectionEntry[] }[] = [
       { id: 'resource-envelope', label: 'Resource Envelope', icon: Server, projectOnly: true },
       { id: 'auto-remediation', label: 'Auto-Remediation', icon: Settings, projectOnly: true },
       { id: 'issue-implementation', label: 'Issue Implementation', icon: Tag, projectOnly: true },
-      { id: 'integration-branch', label: 'Integration Branch', icon: GitBranch, projectOnly: true },
-      { id: 'promotion-target', label: 'Promotion Target', icon: GitBranch, projectOnly: true },
+      { id: 'branches', label: 'Branches', icon: GitBranch, projectOnly: true },
     ],
   },
   {

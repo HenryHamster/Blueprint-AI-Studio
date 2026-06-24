@@ -361,7 +361,7 @@ export default function App() {
 
   const handleConfigureBranchProject = useCallback((projectId: string) => {
     s.setSelectedProjectId(projectId);
-    setSettingsInitialSection('integration-branch');
+    setSettingsInitialSection('branches');
     if (!s.showSettings) s.handleToggleSettings();
   }, [s]);
 

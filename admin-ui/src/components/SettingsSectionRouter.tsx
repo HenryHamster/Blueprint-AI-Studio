@@ -11,8 +11,7 @@ import { ProjectResourceEnvelopeSection } from './ProjectResourceEnvelopeSection
 import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
 import { ProjectAutoReviewSection } from './ProjectAutoReviewSection';
-import { ProjectIntegrationBranchSection } from './ProjectIntegrationBranchSection';
-import { ProjectPromotionTargetSection } from './ProjectPromotionTargetSection';
+import { ProjectBranchesSection } from './ProjectBranchesSection';
 import { SettingsAccountsSection } from './SettingsAccountsSection';
 import { DeploySection } from './SettingsDeploySection';
 import type {
@@ -504,22 +503,14 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           onSave={props.onUpdateIssueImplementationConfig}
         />
       );
-    case 'integration-branch':
+    case 'branches':
       return (
-        <ProjectIntegrationBranchSection
-          data={props.integrationBranchData}
+        <ProjectBranchesSection
+          integrationBranchData={props.integrationBranchData}
+          onSaveIntegrationBranch={props.onUpdateIntegrationBranch}
+          promotionTargetData={props.promotionTargetData}
+          onSavePromotionTarget={props.onUpdatePromotionTarget}
           canSave={props.selectedProjectRole === 'owner'}
-          onSave={props.onUpdateIntegrationBranch}
-          relatedPromotionTarget={props.promotionTargetData?.promotion_target}
-        />
-      );
-    case 'promotion-target':
-      return (
-        <ProjectPromotionTargetSection
-          data={props.promotionTargetData}
-          canSave={props.selectedProjectRole === 'owner'}
-          onSave={props.onUpdatePromotionTarget}
-          relatedIntegrationBranch={props.integrationBranchData?.integration_branch}
         />
       );
     case 'advanced':
