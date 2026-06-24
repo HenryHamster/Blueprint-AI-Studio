@@ -1297,6 +1297,52 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(armsBlock.textContent).toContain('val_acc:');
   });
 
+  test('arms breakdown renders non-numeric per-arm context fields (label, note, log)', async () => {
+    const armsJob = makeJob({
+      id: 'job-arms-ctx',
+      task_title: 'context fields experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-a': {
+              label: 'high lr run',
+              val_acc: 0.90,
+              note: 'converged quickly but overfit at epoch 8',
+              log: 'epoch 1: loss=0.9\nepoch 2: loss=0.5',
+            },
+            'arm-b': {
+              val_acc: 0.93,
+              status: 'best',
+            },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue([armsJob]);
+    const { findByTestId, findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const armsBlock = await findByTestId('arms-breakdown');
+    // arm names present
+    expect(armsBlock.textContent).toContain('arm-a');
+    expect(armsBlock.textContent).toContain('arm-b');
+    // numeric metric visible
+    expect(armsBlock.textContent).toContain('val_acc:');
+    // label rendered as subtitle (arm-label test id)
+    const labels = await findAllByTestId('arm-label');
+    expect(labels[0].textContent).toBe('high lr run');
+    // note rendered as text block
+    const notes = await findAllByTestId('arm-note');
+    expect(notes[0].textContent).toContain('overfit at epoch 8');
+    // log rendered as pre block
+    const logs = await findAllByTestId('arm-log');
+    expect(logs[0].textContent).toContain('epoch 1: loss=0.9');
+    // other string field shown inline
+    expect(armsBlock.textContent).toContain('status:');
+    expect(armsBlock.textContent).toContain('best');
+  });
+
   test('run comparison matrix skips arms key from scalar metric rows', async () => {
     const job1 = makeJob({
       id: 'arms-cmp-1',

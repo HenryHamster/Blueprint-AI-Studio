@@ -927,18 +927,43 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       <div className="mt-1.5" data-testid="arms-breakdown">
                         <div className="text-ui-sm text-neutral-500 font-mono mb-0.5">Arms</div>
                         <div className="flex flex-col gap-1">
-                          {arms.map((arm) => (
-                            <div key={arm.name} className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1">
-                              <div className="text-ui-sm font-semibold text-neutral-300 font-mono mb-0.5">{arm.name}</div>
-                              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-400 font-mono">
-                                {Object.entries(arm.metrics).map(([mk, mv]) => (
-                                  <span key={mk}>
+                          {arms.map((arm) => {
+                            const numericEntries = Object.entries(arm.metrics).filter(([, mv]) => typeof mv === 'number');
+                            const labelVal = typeof arm.metrics.label === 'string' ? arm.metrics.label : null;
+                            const noteVal = typeof arm.metrics.note === 'string' ? arm.metrics.note : null;
+                            const logVal = typeof arm.metrics.log === 'string' ? arm.metrics.log : null;
+                            const otherStrings = Object.entries(arm.metrics).filter(
+                              ([mk, mv]) => typeof mv === 'string' && mk !== 'label' && mk !== 'note' && mk !== 'log',
+                            );
+                            return (
+                              <div key={arm.name} className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1">
+                                <div className="text-ui-sm font-semibold text-neutral-300 font-mono">{arm.name}</div>
+                                {labelVal && (
+                                  <div className="text-ui-sm text-neutral-400 italic mt-0.5" data-testid="arm-label">{labelVal}</div>
+                                )}
+                                {numericEntries.length > 0 && (
+                                  <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-400 font-mono mt-0.5">
+                                    {numericEntries.map(([mk, mv]) => (
+                                      <span key={mk}>
+                                        <span className="text-neutral-500">{mk}:</span> {String(mv)}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                                {otherStrings.map(([mk, mv]) => (
+                                  <div key={mk} className="mt-0.5 text-ui-sm text-neutral-400 font-mono">
                                     <span className="text-neutral-500">{mk}:</span> {String(mv)}
-                                  </span>
+                                  </div>
                                 ))}
+                                {noteVal && (
+                                  <div className="mt-0.5 text-ui-sm text-neutral-400 break-words" data-testid="arm-note">{noteVal}</div>
+                                )}
+                                {logVal && (
+                                  <pre className="mt-0.5 rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-24 overflow-y-auto" data-testid="arm-log">{logVal}</pre>
+                                )}
                               </div>
-                            </div>
-                          ))}
+                            );
+                          })}
                         </div>
                       </div>
                     )}
