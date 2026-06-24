@@ -1142,3 +1142,104 @@ async def test_analyze_endpoint_persists_unavailable_cause(
     assert verdict.get("analysis_attempted_at") is not None
     # analysis_mode must not have changed.
     assert verdict.get("analysis_mode") == original_mode
+
+
+@pytest.mark.asyncio
+async def test_aggregate_summary_endpoint_returns_all_jobs(
+    client: AsyncClient, db_session
+):
+    """The /compute-jobs/summary endpoint returns totals over ALL jobs regardless of age."""
+    project = await _make_project(db_session, name="Agg Summary Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Old terminal job (would be outside any include_finished_minutes window).
+    old_task = Task(
+        project_id=project.id,
+        title="old task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "success_criterion": {"metric": "acc", "operator": ">=", "threshold": 0.9}}],
+        plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": {"met": True, "measurable": True}}},
+    )
+    db_session.add(old_task)
+    await db_session.commit()
+    await db_session.refresh(old_task)
+    old_job = ComputeJob(
+        task_id=old_task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        final_cost_usd=2.0,
+        completed_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+    )
+    db_session.add(old_job)
+    await db_session.commit()
+
+    # Recent running job.
+    new_task = Task(
+        project_id=project.id,
+        title="new task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(new_task)
+    await db_session.commit()
+    await db_session.refresh(new_task)
+    new_job = ComputeJob(
+        task_id=new_task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=0.5,
+    )
+    db_session.add(new_job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/summary")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Both jobs are included (old terminal + new running).
+    assert body["total_jobs"] == 2
+    assert body["active_jobs"] == 1
+    assert body["terminal_jobs"] == 1
+    assert body["total_spend_usd"] == pytest.approx(2.5)  # 2.0 final + 0.5 accrued
+    assert body["outcome_breakdown"][ComputeJobStatus.SUCCEEDED.value] == 1
+    assert body["outcome_breakdown"][ComputeJobStatus.RUNNING.value] == 1
+    # old_task has criterion data.
+    assert body["criterion_measured"] == 1
+    assert body["criterion_met"] == 1
+
+
+@pytest.mark.asyncio
+async def test_aggregate_summary_endpoint_non_member_returns_404(
+    client: AsyncClient, db_session
+):
+    """The summary endpoint returns 404 for users without project access."""
+    project = await _make_project(db_session, name="Agg Summary No-Access")
+    # No member row — request must be rejected.
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/summary")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_aggregate_summary_endpoint_empty_project(
+    client: AsyncClient, db_session
+):
+    """The summary endpoint returns zero-value fields when no jobs exist."""
+    project = await _make_project(db_session, name="Agg Summary Empty")
+    await _add_member(db_session, project.id, "viewer")
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/summary")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_jobs"] == 0
+    assert body["active_jobs"] == 0
+    assert body["terminal_jobs"] == 0
+    assert body["total_spend_usd"] == pytest.approx(0.0)
+    assert body["outcome_breakdown"] == {}
+    assert body["criterion_measured"] == 0
+    assert body["criterion_met"] == 0

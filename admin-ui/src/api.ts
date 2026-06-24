@@ -3131,7 +3131,7 @@ export async function fetchComputeJobs(
 export interface ComputeJobsPagedResponse {
   jobs: ComputeJob[];
   hasMore: boolean;
-  summary?: ComputeJobsSummary;
+  summary: ComputeJobsSummary;
 }
 
 export async function fetchComputeJobsPaged(
@@ -3167,6 +3167,21 @@ export async function fetchComputeJobsPaged(
     hasMore: !!data.has_more,
     summary: data.summary ?? emptySummary,
   };
+}
+
+export async function fetchComputeJobsAggregateSummary(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ComputeJobsSummary> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs/summary`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch compute jobs summary: ${res.status}`);
+  return res.json();
 }
 
 export interface BuildConfigCommandEntry {

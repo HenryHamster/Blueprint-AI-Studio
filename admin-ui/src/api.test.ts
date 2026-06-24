@@ -220,6 +220,46 @@ describe('fetchComputeJobsPaged', () => {
     expect(result.hasMore).toBe(true);
     expect(result.jobs).toEqual([]);
   });
+
+  it('forwards the summary object when present in the response', async () => {
+    const mockSummary = {
+      total_jobs: 5,
+      active_jobs: 1,
+      terminal_jobs: 4,
+      total_spend_usd: 123.45,
+      outcome_breakdown: { 'running': 1, 'succeeded': 4 },
+      criterion_measured: 4,
+      criterion_met: 3,
+    };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        compute_jobs: [],
+        has_more: false,
+        summary: mockSummary,
+      }), { status: 200 }),
+    );
+
+    const result = await fetchComputeJobsPaged('proj-1');
+
+    expect(result.summary).toEqual(mockSummary);
+    expect(result.summary?.total_jobs).toBe(5);
+    expect(result.summary?.total_spend_usd).toBe(123.45);
+    expect(result.summary?.criterion_met).toBe(3);
+    expect(result.summary?.criterion_measured).toBe(4);
+  });
+
+  it('falls back to empty summary when summary is absent in the response', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ compute_jobs: [], has_more: false }), { status: 200 }),
+    );
+
+    const result = await fetchComputeJobsPaged('proj-1');
+
+    expect(result.summary).toEqual({
+      total_jobs: 0, active_jobs: 0, terminal_jobs: 0, total_spend_usd: 0,
+      outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0,
+    });
+  });
 });
 
 describe('fetchImprovementLanes', () => {

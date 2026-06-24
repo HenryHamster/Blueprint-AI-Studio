@@ -19,6 +19,7 @@ from sqlmodel import select
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.compute_jobs import (
+    aggregate_all_compute_jobs_summary,
     aggregate_compute_jobs_summary,
     aggregate_criterion_summary,
     build_compute_result_logs,
@@ -233,6 +234,23 @@ async def get_project_compute_jobs(
         "offset": offset,
         "summary": summary,
     }
+
+
+@router.get("/projects/{project_id}/compute-jobs/summary")
+async def get_project_compute_jobs_aggregate_summary(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return aggregate summary over ALL compute jobs for a project (viewer+).
+
+    Unlike the list endpoint, this endpoint is not capped by include_finished_minutes
+    and covers the project's full history — suitable for cumulative experiment totals.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    return await aggregate_all_compute_jobs_summary(session, project_id=project_id)
 
 
 @router.get("/compute-jobs/{job_id}")
