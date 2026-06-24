@@ -657,6 +657,25 @@ prompts, schemas, tools, or orchestration.` : '';
     if (!thinkerGateResult.ok) return;
     const analysisText = thinkerGateResult.analysisText;
 
+    // If the thinker emitted a version goal (Section 7 file), pre-merge it into
+    // the problem_model JSON now so the executor's set-problem-model call carries
+    // it without needing to search prose. Non-fatal: if the merge fails (malformed
+    // JSON, write error) the executor can still proceed; the goal stays unset this
+    // cycle and the thinker can retry next cycle.
+    const { newVersionGoal } = thinkerGateResult;
+    if (newVersionGoal) {
+      const pmPath = `/tmp/problem_model_${taskId}.json`;
+      try {
+        const pmRaw = fs.readFileSync(pmPath, 'utf8');
+        const pm = JSON.parse(pmRaw) as Record<string, unknown>;
+        pm.new_version_goal = newVersionGoal;
+        fs.writeFileSync(pmPath, `${JSON.stringify(pm, null, 2)}\n`);
+        sendLog(ws, `[INFO] Pre-merged new_version_goal into problem_model JSON\n`);
+      } catch (e) {
+        sendLog(ws, `[WARNING] Failed to pre-merge new_version_goal into problem_model JSON (executor will handle it): ${String(e)}\n`);
+      }
+    }
+
     // Scan thinker analysis for cited memo handles and persist them via the API.
     // The completion handler reads task.context["_strategic_cited_memo_ids"] to
     // count memos_cited — scanning the analysis text (where memos were shown
@@ -929,9 +948,7 @@ ${strategicChallengeSection}
    \`{"qualify_request": {"reason": "..."}, ...rest_of_problem_model}\`
    If the Thinker did NOT emit \`qualify_request\`, SKIP — do not fabricate one, and do not add the field. Absence means "do not qualify this cycle."
 
-   Likewise, if the Thinker's analysis includes a \`new_version_goal\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key too:
-   \`{"new_version_goal": "...", ...rest_of_problem_model}\`
-   If the Thinker did NOT emit \`new_version_goal\`, SKIP — do not fabricate one, and do not add the field. Absence means "no version goal update this cycle." \`version_phase_decision\`, \`qualify_request\`, and \`new_version_goal\` are independent siblings; add whichever the Thinker emitted (any, all, or none).
+   Likewise, if \`new_version_goal\` is already present as a top-level key in \`/tmp/problem_model_${taskId}.json\` (pre-merged from the Thinker's Section 7 output file before this executor pass), it is already set — the \`cat\` in step 1 will carry it through automatically. Do NOT overwrite or re-add it. If it is absent from the file, the Thinker did not set a version goal this cycle; do NOT fabricate one. \`version_phase_decision\`, \`qualify_request\`, and \`new_version_goal\` are independent siblings; add whichever the Thinker emitted (any, all, or none).
 
    Because step 1 passes \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\`, editing the file here is what carries these siblings through — step 1 will re-read the file and the fields will be included. If the file is missing/malformed and you took step 1's fallback (constructing the model inline), include these siblings in that inline JSON instead.
 

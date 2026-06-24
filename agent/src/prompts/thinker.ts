@@ -344,19 +344,20 @@ Source = {type (user_message|friction_promotion|agent_observation|self_reflectio
 
 When describing changes in prose, be precise: "opening gap g-strategic-mem (from user_message msg-42)", "retiring direction d-auth-middleware (gap g-auth closed by merged PR #82)".
 
-**Optional sibling fields: new_version_goal.** If the open version has no Goal shown in the context above, you may propose one by emitting a \`new_version_goal\` field as a top-level sibling in your Section 6 problem_model update:
-
-\`\`\`json
-{
-  "new_version_goal": "One concise sentence stating what this version is for.",
-  "intent": { ... },
-  "capabilities": [ ... ]
-}
-\`\`\`
-
-Only emit \`new_version_goal\` when the Goal is currently unset — once authored, the goal is frozen and a re-emit is silently ignored. Keep it under 500 characters and avoid placeholder or generic text.
-
 Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
+
+## 7. Version goal (conditional — only when the open version has no goal yet)
+
+**Skip this section entirely if the version already has a goal** — the goal is frozen once set; re-emitting is silently ignored.
+
+**Only when the goal is currently unset:** write one concise version objective to \`/tmp/new_version_goal_${p.taskId}.txt\` ${READ_ONLY_BASH_WRITE_NOTE}. Single line, under 500 characters.
+
+The goal must be SUBSTANTIVE and DIRECTIONAL — a concrete deliverable statement that orients a new contributor reading it cold. It becomes the frozen scoring target for every merge in this version.
+
+Bad: "Fix CI, improve quality, pass audit." — feature list / status echo, rejected by the contentless-goal guard.
+Good: "Deliver autonomous cross-project coordination so Blueprint manages 3+ concurrent projects with fewer than 1 operator intervention per day." — outcome-framed, measurable, non-trivial.
+
+Write only the goal text — no JSON, no label, no quotes. Omit the file entirely if the goal is already set.
 
 ${PLAYBOOK_GUIDANCE}
 
@@ -364,10 +365,13 @@ ${DEFAULT_TOOL_GUIDANCE}`;
 }
 
 // ── Pass-1 gate: run thinker, verify artifacts, retry once if missing ────────
-// Exported for unit testing. Returns { ok: true, analysisText } when both
-// /tmp/problem_model_<taskId>.json and /tmp/running_update_<taskId>.md exist
-// after the thinker (or its focused retry) completes. On any failure path it
-// calls persistAndPostStatus(FAILED, failure_category=strategic_thinker_artifacts_missing)
+// Exported for unit testing. Returns { ok: true, analysisText, newVersionGoal? }
+// when both /tmp/problem_model_<taskId>.json and /tmp/running_update_<taskId>.md
+// exist after the thinker (or its focused retry) completes. Also reads the
+// optional /tmp/new_version_goal_<taskId>.txt (Section 7 output) and surfaces its
+// content as newVersionGoal so the caller can pre-merge it into the problem_model
+// JSON before the executor runs. On any failure path it calls
+// persistAndPostStatus(FAILED, failure_category=strategic_thinker_artifacts_missing)
 // and returns { ok: false } so the caller can simply return.
 export async function runThinkerWithGate(
   thinkerPrompt: string,
@@ -377,7 +381,7 @@ export async function runThinkerWithGate(
   model: string | undefined,
   effort: string | undefined,
   disallowedTools: string[],
-): Promise<{ ok: true; analysisText: string } | { ok: false }> {
+): Promise<{ ok: true; analysisText: string; newVersionGoal?: string } | { ok: false }> {
   const problemModelPath = `/tmp/problem_model_${taskId}.json`;
   const runningUpdatePath = `/tmp/running_update_${taskId}.md`;
 
@@ -593,5 +597,17 @@ export async function runThinkerWithGate(
     }
   }
 
-  return { ok: true, analysisText };
+  // Read the optional Section 7 version-goal file if the thinker wrote it.
+  const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+  let newVersionGoal: string | undefined;
+  if (fs.existsSync(newVersionGoalPath)) {
+    try {
+      const raw = fs.readFileSync(newVersionGoalPath, 'utf8').trim();
+      if (raw) newVersionGoal = raw;
+    } catch (e) {
+      sendLog(ws, `[WARNING] Failed to read ${newVersionGoalPath}: ${String(e)}\n`);
+    }
+  }
+
+  return { ok: true, analysisText, newVersionGoal };
 }

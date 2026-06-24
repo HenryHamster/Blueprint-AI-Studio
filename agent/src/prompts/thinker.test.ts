@@ -441,14 +441,16 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('/tmp/problem_model_abc-456.json');
     expect(prompt).toContain('/tmp/running_update_abc-456.md');
     expect(prompt).toContain('/tmp/research_progress_abc-456.md');
+    expect(prompt).toContain('/tmp/new_version_goal_abc-456.txt');
   });
 
   it('includes READ_ONLY_BASH_WRITE_NOTE next to each /tmp output path', () => {
     const prompt = buildThinkerPrompt({ ...base, taskId: 'abc-789' });
     expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
-    // Note should appear multiple times (once per output file path)
+    // Note should appear multiple times (once per output file path):
+    // running_update, problem_model, research_progress, new_version_goal
     const count = prompt.split(READ_ONLY_BASH_WRITE_NOTE).length - 1;
-    expect(count).toBeGreaterThanOrEqual(3);
+    expect(count).toBeGreaterThanOrEqual(4);
   });
 
   it('includes PLAYBOOK_GUIDANCE (structural invariant: strategic_review class)', () => {
@@ -477,18 +479,28 @@ describe('buildThinkerPrompt', () => {
 
   it('test_thinker_prompt_instructs_new_version_goal_emission', () => {
     const prompt = buildThinkerPrompt(base);
-    // The prompt must instruct the thinker that it can emit new_version_goal
+    // The prompt must instruct the thinker to write new_version_goal
     expect(prompt).toContain('new_version_goal');
-    // The instruction must be in Section 6 (Problem model output)
-    expect(prompt).toContain('Optional sibling fields: new_version_goal');
-    // Must explain when to emit it (when Goal is unset)
-    expect(prompt).toContain('when the Goal is currently unset');
-    // Must show example JSON format
-    expect(prompt).toContain('"new_version_goal":');
-    // Must note that once set, it is frozen
-    expect(prompt).toContain('frozen');
+    // Section 7 is the dedicated output section for the version goal
+    expect(prompt).toContain('## 7. Version goal');
+    // Must reference the dedicated handoff file
+    expect(prompt).toContain('/tmp/new_version_goal_');
+    // Must explain when to write it (only when goal is unset)
+    expect(prompt).toContain('only when the open version has no goal yet');
+    // Must note that once set, it is frozen (skip if already set)
+    expect(prompt).toContain('frozen once set');
     // Must specify the character limit
     expect(prompt).toContain('500 characters');
+    // Must steer toward substantive/directional goals (operator requirement)
+    expect(prompt).toContain('SUBSTANTIVE and DIRECTIONAL');
+    // Must explain what a bad goal looks like
+    expect(prompt).toContain('contentless-goal guard');
+    // Section 7 must appear AFTER Section 6 in the prompt
+    const sec6Idx = prompt.indexOf('## 6. Problem model');
+    const sec7Idx = prompt.indexOf('## 7. Version goal');
+    expect(sec6Idx).toBeGreaterThan(-1);
+    expect(sec7Idx).toBeGreaterThan(-1);
+    expect(sec7Idx).toBeGreaterThan(sec6Idx);
   });
 });
 
@@ -692,6 +704,63 @@ describe('runThinkerWithGate', () => {
     const statusArg = mockPersistAndPostStatus.mock.calls[0][1];
     expect(statusArg.status).toBe('FAILED');
     expect(statusArg.failure_category).toBe('strategic_thinker_artifacts_missing');
+  });
+
+  it('(g) Section 7 new_version_goal file present → returned in newVersionGoal field', async () => {
+    const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+    const goalText = 'Deliver autonomous cross-project coordination so Blueprint manages 3+ projects with fewer than 1 operator intervention per day.';
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.presentFiles.add(newVersionGoalPath);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === newVersionGoalPath) return goalText;
+        return '{"intent":{"purpose":"ok"},"gaps":[]}';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionGoal).toBe(goalText);
+    }
+  });
+
+  it('(h) Section 7 new_version_goal file absent → newVersionGoal undefined in result', async () => {
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    // new_version_goal_<taskId>.txt NOT in presentFiles
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionGoal).toBeUndefined();
+    }
+  });
+
+  it('(i) Section 7 file present but empty → newVersionGoal undefined (empty content rejected)', async () => {
+    const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.presentFiles.add(newVersionGoalPath);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === newVersionGoalPath) return '   \n  '; // whitespace only
+        return '{"intent":{"purpose":"ok"},"gaps":[]}';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionGoal).toBeUndefined();
+    }
   });
 });
 
