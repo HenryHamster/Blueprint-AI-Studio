@@ -13603,7 +13603,7 @@ def test_one_time_spawnable_registry_set_is_implementation_types():
         STRATEGIST_SPAWNABLE_TASK_TYPES,
     )
 
-    assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES == {"create", "refactor", "fix", "qa"}
+    assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES == {"create", "refactor", "qa"}
     # The two lanes are mutually exclusive: a one-time fix is direction-free and
     # PR-producing; a spawn_task spawn is a read-only investigation.
     assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES.isdisjoint(
@@ -13676,10 +13676,10 @@ async def test_spawn_fix_rejects_direction_only_investigation_type(db_session):
 
 @pytest.mark.asyncio
 async def test_spawn_fix_fix_type_without_pr_context_fails_cleanly(db_session):
-    """``fix`` is in the one-time-spawnable allowlist, but its FixPayload requires
-    pr_number + branch — a prompt-only one-time spawn cannot supply them. The
-    handler must surface that as a clean 400 (not an opaque 500), and create NO
-    task."""
+    """``fix`` requires pr_number + branch a prompt-only one-time spawn cannot
+    supply, so it is not in STRATEGIST_ONE_TIME_SPAWNABLE_TYPES. The handler must
+    reject it at the allowlist check with a clean 400 (not an opaque 500), and
+    create NO task."""
     from sqlalchemy import func as _f
 
     _project, review_id = await _make_strategic_review_task(db_session)
@@ -13693,7 +13693,7 @@ async def test_spawn_fix_fix_type_without_pr_context_fails_cleanly(db_session):
         expect_status=400,
     )
     detail = body["error"]["message"]
-    assert "cannot build a valid 'fix' payload" in detail
+    assert "must be one of" in detail
 
     # No task was created by the failed validation.
     count = (

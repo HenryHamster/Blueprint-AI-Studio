@@ -2156,7 +2156,7 @@ async def strategic_operation(
         # isolated cleanup) with NO strategic direction. Unlike spawn_task — which
         # is restricted to read-only investigation/knowledge types that flow into
         # a direction — spawn_fix accepts the PR-producing implementation types
-        # (STRATEGIST_ONE_TIME_SPAWNABLE_TYPES = create/refactor/fix/qa, derived
+        # (STRATEGIST_ONE_TIME_SPAWNABLE_TYPES = create/refactor/qa, derived
         # from the registry, not a hardcoded literal) and produces a task that
         # carries NO direction_id, so it never lands in project.directions /
         # staged_directions / any direction portfolio logic. It fires once and

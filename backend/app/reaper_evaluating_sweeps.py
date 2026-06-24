@@ -477,7 +477,7 @@ async def sweep_orphaned_direction_provider_tasks(session) -> int:
                     continue
 
                 # Check if the task has an open PR in its first payload.
-                pr_number = (task.payloads or [{}])[0].get("pr_number")
+                pr_number = task.first_payload.get("pr_number")
                 if pr_number:
                     # Task has an open PR — orphan it by clearing direction_id
                     # so the PR can land independently.

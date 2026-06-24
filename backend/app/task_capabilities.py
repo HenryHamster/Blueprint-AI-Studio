@@ -220,7 +220,7 @@ class TaskCapability:
     # operation. SINGLE source of truth for the strategist one-time-fix allowlist
     # (routers/admin_agent_ops.py) — see STRATEGIST_ONE_TIME_SPAWNABLE_TYPES.
     # Intentionally limited to the PR-producing implementation types that can fire
-    # once and land a fix without a direction lifecycle (create, refactor, fix,
+    # once and land a fix without a direction lifecycle (create, refactor,
     # qa). It is DELIBERATELY DISJOINT from strategist_spawnable (the
     # investigation/knowledge types): a one-time fix produces a branch/PR and
     # carries NO direction_id, whereas a strategist_spawnable spawn is a read-only
@@ -287,7 +287,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="review",
         user_launchable=True,
         delivers_product=True,
-        strategist_one_time_spawnable=True,
+        strategist_one_time_spawnable=False,
         description="Fix a PR from review feedback or CI failures.",
         run_shape="workflow",
         output_kind="pr",
@@ -827,7 +827,7 @@ STRATEGIST_SPAWNABLE_TASK_TYPES: frozenset[str] = frozenset(
 # frozenset rather than a hardcoded literal, so a newly registered
 # fire-once-and-land implementation type becomes spawn_fix-eligible by declaring
 # ``strategist_one_time_spawnable=True`` alone. Currently the PR-producing
-# implementation types {create, refactor, fix, qa}. This set is DELIBERATELY
+# implementation types {create, refactor, qa}. This set is DELIBERATELY
 # DISJOINT from STRATEGIST_SPAWNABLE_TASK_TYPES (the investigation/knowledge types
 # spawn_task accepts): a one-time fix carries NO direction_id and produces a
 # branch/PR, whereas a spawn_task spawn is a read-only investigation that may
