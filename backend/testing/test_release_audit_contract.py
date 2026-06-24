@@ -266,10 +266,10 @@ class TestAuditChallengeTsContract:
 
 @pytest.mark.asyncio
 async def test_spawn_release_audit_challenge_defaults_to_opus_quality_tier(db_session):
-    """``_spawn_release_audit_challenge_task`` must NOT set quality_tier in the
-    spawned task's payload, so it defaults to Opus via DEFAULT_QUALITY_TIER —
-    regression guard against a cost-saving edit silently downgrading this
-    binding adversarial second-opinion gate below Opus."""
+    """``_spawn_release_audit_challenge_task`` MUST explicitly set quality_tier
+    to Opus in the spawned task's payload — regression guard against a
+    cost-saving edit silently downgrading this binding adversarial
+    second-opinion gate below Opus."""
     from app import release_qualifier as rq
     from app.models import Project
 
@@ -297,18 +297,18 @@ async def test_spawn_release_audit_challenge_defaults_to_opus_quality_tier(db_se
     await db_session.commit()
     await db_session.refresh(task)
 
-    assert (task.first_payload or {}).get("quality_tier") is None, (
-        "Spawned release_audit_challenge must NOT carry an explicit quality_tier "
-        "— it must fall back to DEFAULT_QUALITY_TIER (Opus)"
+    assert (task.first_payload or {}).get("quality_tier") == "opus", (
+        "Spawned release_audit_challenge must explicitly carry quality_tier='opus' "
+        "— regression guard against silent downgrade"
     )
 
 
 @pytest.mark.asyncio
 async def test_spawn_release_audit_task_defaults_to_opus_quality_tier(db_session):
-    """``_spawn_release_audit_task`` must NOT set quality_tier in the spawned
-    task's payload, so it defaults to Opus via DEFAULT_QUALITY_TIER —
-    regression guard against a cost-saving edit silently downgrading the
-    primary release-audit judgment gate below Opus."""
+    """``_spawn_release_audit_task`` MUST explicitly set quality_tier to Opus
+    in the spawned task's payload — regression guard against a cost-saving
+    edit silently downgrading the primary release-audit judgment gate below
+    Opus."""
     from app import release_qualifier as rq
     from app.models import Project
 
@@ -336,9 +336,9 @@ async def test_spawn_release_audit_task_defaults_to_opus_quality_tier(db_session
     await db_session.commit()
     await db_session.refresh(task)
 
-    assert (task.first_payload or {}).get("quality_tier") is None, (
-        "Spawned release_audit must NOT carry an explicit quality_tier "
-        "— it must fall back to DEFAULT_QUALITY_TIER (Opus)"
+    assert (task.first_payload or {}).get("quality_tier") == "opus", (
+        "Spawned release_audit must explicitly carry quality_tier='opus' "
+        "— regression guard against silent downgrade"
     )
 
 
@@ -454,4 +454,94 @@ async def test_get_latest_release_audit_challenge_scoped_by_sha(db_session):
             db_session, project.id, candidate_sha=None
         )
         is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_audit_resolves_to_opus_end_to_end(db_session):
+    """Spawned release_audit gates resolve to Opus tier end-to-end via
+    resolve_task_quality_tier, confirming the explicit quality_tier='opus'
+    payload value is honored."""
+    from app import release_qualifier as rq
+    from app.max_plan_pool import resolve_task_quality_tier
+    from app.models import Project
+
+    project = Project(
+        name="RQ-Audit-Resolve",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "aabbccdd" * 5  # 40-char placeholder SHA
+    task = await rq._spawn_release_audit_task(
+        db_session,
+        project.id,
+        version_id=uuid.uuid4(),
+        base_branch="main",
+        diff_range=f"main...{candidate}",
+        candidate_sha=candidate,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resolved_tier = resolve_task_quality_tier(task, {})
+    assert resolved_tier == "opus", (
+        f"release_audit must resolve to Opus tier end-to-end, got {resolved_tier!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_audit_challenge_resolves_to_opus_end_to_end(db_session):
+    """Spawned release_audit_challenge gates resolve to Opus tier end-to-end via
+    resolve_task_quality_tier, confirming the explicit quality_tier='opus'
+    payload value is honored."""
+    from app import release_qualifier as rq
+    from app.max_plan_pool import resolve_task_quality_tier
+    from app.models import Project
+
+    project = Project(
+        name="RQ-Challenge-Resolve",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "eeff0011" * 5  # 40-char placeholder SHA
+    task = await rq._spawn_release_audit_challenge_task(
+        db_session,
+        project.id,
+        version_id=uuid.uuid4(),
+        base_branch="main",
+        diff_range=f"main...{candidate}",
+        candidate_sha=candidate,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resolved_tier = resolve_task_quality_tier(task, {})
+    assert resolved_tier == "opus", (
+        f"release_audit_challenge must resolve to Opus tier end-to-end, got {resolved_tier!r}"
+    )
+
+
+def test_default_quality_tier_is_opus():
+    """DEFAULT_QUALITY_TIER must be Opus — regression guard against a
+    cost-saving edit downgrading all quality_tier fallbacks."""
+    from app.max_plan_pool import DEFAULT_QUALITY_TIER
+
+    assert DEFAULT_QUALITY_TIER == "opus", (
+        f"DEFAULT_QUALITY_TIER downgrade detected: {DEFAULT_QUALITY_TIER!r} "
+        "— release gates rely on opus-tier fallback; "
+        "explicit quality_tier='opus' payloads will be overridden if default changes"
     )

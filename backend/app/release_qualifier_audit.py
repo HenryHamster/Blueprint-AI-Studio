@@ -208,6 +208,8 @@ async def _spawn_release_audit_task(
         # Audit C4: pin the audit to the exact qualified commit.  The agent
         # reads this from the payload and checks out this SHA.
         "candidate_sha": candidate_sha,
+        # Explicitly pin to Opus — regression guard against silent downgrade.
+        "quality_tier": "opus",
     }
     if version_goal:
         payload["version_goal"] = version_goal
@@ -285,6 +287,8 @@ async def _spawn_release_audit_challenge_task(
         "base_branch": base_branch,
         "diff_range": diff_range,
         "candidate_sha": candidate_sha,
+        # Explicitly pin to Opus — regression guard against silent downgrade.
+        "quality_tier": "opus",
     }
     if version_goal:
         payload["version_goal"] = version_goal
