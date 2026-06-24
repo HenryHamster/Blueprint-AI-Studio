@@ -802,6 +802,75 @@ async def test_list_compute_jobs_all_terminal_returns_old_jobs(
     assert str(old_job.id) in ids, "old terminal job must appear with all_terminal=true"
 
 
+@pytest.mark.asyncio
+async def test_list_compute_jobs_all_terminal_summary_matches_list(
+    client: AsyncClient, db_session
+):
+    """When ?all_terminal=true, the summary totals must match the returned job list.
+
+    Seeds one old terminal job (30 days ago, outside any default window) plus one
+    active job, then asserts:
+    - Default request: old terminal job excluded from both list AND summary.
+    - ?all_terminal=true: old terminal job counted in summary terminal_jobs/total_jobs
+      and total_spend_usd matches the combined spend of the full returned list.
+    """
+    project = await _make_project(db_session, name="Summary Alignment Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Old terminal job completed 30 days ago with a known cost.
+    _task_old, old_job, _art = await _make_job(
+        db_session, project, status=ComputeJobStatus.SUCCEEDED
+    )
+    old_job.completed_at = datetime.now(tz=timezone.utc) - timedelta(days=30)
+    old_job.final_cost_usd = 3.0
+    db_session.add(old_job)
+    await db_session.commit()
+
+    # Active job (still running, no final_cost).
+    _task_run, running_job, _art2 = await _make_job(
+        db_session, project, status=ComputeJobStatus.RUNNING
+    )
+    running_job.accrued_cost_usd = 1.0
+    db_session.add(running_job)
+    await db_session.commit()
+
+    # --- Default request: old terminal job must NOT appear in list or summary ---
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    body = resp.json()
+    default_ids = {j["id"] for j in body["compute_jobs"]}
+    assert str(old_job.id) not in default_ids, "old job excluded from default list"
+    default_summary = body["summary"]
+    # Only the running job is in scope; terminal_jobs count must not include the old one.
+    assert default_summary["terminal_jobs"] == 0, (
+        f"default summary must exclude old terminal job; got {default_summary}"
+    )
+
+    # --- ?all_terminal=true: summary totals must align with the returned list ---
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs?all_terminal=true"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    all_ids = {j["id"] for j in body["compute_jobs"]}
+    assert str(old_job.id) in all_ids, "old job must appear with all_terminal=true"
+
+    summary = body["summary"]
+    returned_jobs = body["compute_jobs"]
+    # Summary total_jobs must equal the number of jobs in the list.
+    assert summary["total_jobs"] == len(returned_jobs), (
+        f"summary total_jobs={summary['total_jobs']} != list len={len(returned_jobs)}"
+    )
+    # Old terminal job must be counted in terminal_jobs.
+    assert summary["terminal_jobs"] >= 1, (
+        f"terminal_jobs must include old job; got {summary['terminal_jobs']}"
+    )
+    # total_spend_usd must include the old job's cost (3.0) plus running accrued (1.0).
+    assert summary["total_spend_usd"] == pytest.approx(4.0), (
+        f"expected spend=4.0 (old 3.0 + running 1.0), got {summary['total_spend_usd']}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # GET /api/admin/compute-jobs/{job_id} — single-job detail endpoint tests
 # ---------------------------------------------------------------------------

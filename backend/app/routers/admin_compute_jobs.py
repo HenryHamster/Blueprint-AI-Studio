@@ -19,12 +19,14 @@ from sqlmodel import select
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.compute_jobs import (
-    aggregate_all_compute_jobs_summary,
-    aggregate_compute_jobs_summary,
-    aggregate_criterion_summary,
     build_compute_result_logs,
     kill_compute_job,
     list_compute_jobs,
+)
+from app.compute_jobs_aggregation import (
+    aggregate_all_compute_jobs_summary,
+    aggregate_compute_jobs_summary,
+    aggregate_criterion_summary,
 )
 from app.database import get_session
 from app.models import Artifact, ComputeJob, ComputeJobStatus, Task
@@ -216,11 +218,13 @@ async def get_project_compute_jobs(
         session,
         project_id=project_id,
         include_finished_within=window,
+        all_terminal=all_terminal,
     )
     criterion_stats = await aggregate_criterion_summary(
         session,
         project_id=project_id,
         include_finished_within=window,
+        all_terminal=all_terminal,
     )
     summary = {
         **agg_summary,
