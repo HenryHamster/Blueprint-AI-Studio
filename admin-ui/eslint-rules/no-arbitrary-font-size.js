@@ -18,7 +18,7 @@
  * Per-line opt-out: // eslint-disable-next-line viewport/no-arbitrary-font-size — reason
  */
 
-const ARBITRARY_FONT_SIZE_RE = /(?:^|\s)(text-\[(\d+)px\])/g
+const ARBITRARY_FONT_SIZE_RE = /(?:^|\s|:)(text-\[(\d+)px\])/g
 
 function checkTailwindString(context, node, str) {
   ARBITRARY_FONT_SIZE_RE.lastIndex = 0

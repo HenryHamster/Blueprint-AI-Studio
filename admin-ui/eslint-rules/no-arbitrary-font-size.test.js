@@ -102,5 +102,27 @@ tester.run('viewport/no-arbitrary-font-size', rule, {
         },
       ],
     },
+    // Variant-prefixed arbitrary font sizes
+    {
+      code: '<div className="sm:text-[14px]" />',
+      errors: [{ messageId: 'arbitraryFontSize' }],
+    },
+    {
+      code: '<div className="hover:text-[12px]" />',
+      errors: [{ messageId: 'arbitraryFontSize' }],
+    },
+    {
+      code: '<div className="md:text-[16px]" />',
+      errors: [{ messageId: 'arbitraryFontSize' }],
+    },
+    {
+      code: '<div className="dark:text-[10px]" />',
+      errors: [{ messageId: 'arbitraryFontSize' }],
+    },
+    // Multiple variant-prefixed sizes
+    {
+      code: '<div className="sm:text-[14px] md:text-[16px]" />',
+      errors: [{ messageId: 'arbitraryFontSize' }, { messageId: 'arbitraryFontSize' }],
+    },
   ],
 })
