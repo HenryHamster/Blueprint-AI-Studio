@@ -70,8 +70,8 @@ export function TaskComputeJobsSection({ task }: { task: Task }) {
     if (!projectId) return;
     let cancelled = false;
     fetchComputeJobs(projectId, undefined, WIDE_FINISHED_WINDOW_MINUTES)
-      .then(all => {
-        if (!cancelled) setJobs(all.filter(j => j.task_id === taskId));
+      .then(result => {
+        if (!cancelled) setJobs(result.jobs.filter(j => j.task_id === taskId));
       })
       .catch(() => { /* compute jobs are optional context */ });
     return () => { cancelled = true; };

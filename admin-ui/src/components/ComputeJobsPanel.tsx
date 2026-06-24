@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobsPaged, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, fetchComputeJobsPaged, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -360,11 +360,12 @@ interface ComputeJobsPanelProps {
 
 export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onDuplicateTask }: ComputeJobsPanelProps) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [summary, setSummary] = useState<ComputeJobsSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [finishedWindowMinutes, setFinishedWindowMinutes] = useState(360);
   const [allTerminal, setAllTerminal] = useState(false);
-  const [hasMore, setHasMore] = useState(false);
   const [killingId, setKillingId] = useState<string | null>(null);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
@@ -397,6 +398,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           setJobs((prev) => [...prev, ...result.jobs]);
         } else {
           setJobs(result.jobs);
+          if (result.summary) setSummary(result.summary);
         }
         setHasMore(result.hasMore);
         setError(null);
@@ -546,6 +548,34 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         </div>
       </div>
 
+      {summary && summary.total_jobs > 0 && (
+        <div
+          className="mb-3 flex flex-wrap gap-x-4 gap-y-0.5 text-ui-sm font-mono text-neutral-400"
+          data-testid="compute-jobs-summary"
+        >
+          <span>
+            <span className="text-neutral-500">total</span> {summary.total_jobs}
+          </span>
+          {summary.active_jobs > 0 && (
+            <span>
+              <span className="text-neutral-500">active</span>{' '}
+              <span className="text-sky-300">{summary.active_jobs}</span>
+            </span>
+          )}
+          {summary.total_spend_usd > 0 && (
+            <span>
+              <span className="text-neutral-500">spend</span> {fmtUsd(summary.total_spend_usd)}
+            </span>
+          )}
+          {summary.criterion_measured > 0 && (
+            <span>
+              <span className="text-neutral-500">criterion</span>{' '}
+              {summary.criterion_met}/{summary.criterion_measured} met
+            </span>
+          )}
+        </div>
+      )}
+
       {error && (
         <p className="text-ui-sm text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 mb-2 break-words flex items-start gap-1.5">
           <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
@@ -577,7 +607,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
       <ExperimentSweepSummary jobs={jobs} />
 
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-2" data-testid="compute-jobs-list">
         {jobs.map((job) => {
           const active = isComputeJobActive(job);
           const cap = job.spend_cap_usd ?? 0;

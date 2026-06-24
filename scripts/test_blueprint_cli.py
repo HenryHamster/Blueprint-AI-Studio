@@ -747,6 +747,15 @@ def mock_api(monkeypatch):
                 "has_more": False,
                 "limit": 20,
                 "offset": 0,
+                "summary": {
+                    "total_jobs": 2,
+                    "active_jobs": 1,
+                    "terminal_jobs": 1,
+                    "total_spend_usd": 12.5,
+                    "criterion_measured": 1,
+                    "criterion_met": 1,
+                    "outcome_breakdown": {"success": 1},
+                },
             }
         if "/directions/" in path and "/unhold" in path:
             return {"status": "unheld", "direction_id": "d-abc12345", "was_held": True}
@@ -2923,6 +2932,44 @@ def test_compute_list_defaults_to_list(mock_api, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "COMPUTE JOBS" in out
+
+
+def test_compute_list_summary_line(mock_api, capsys):
+    """compute list human output shows aggregate summary line with total, active, spend, and criteria counts."""
+    rc = blueprint.main(["compute", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "2 jobs" in out
+    assert "1 active" in out
+    assert "$12.50 total spend" in out
+    assert "1/1 criteria met" in out
+
+
+def test_compute_list_shows_measured_metric_value(mock_api, capsys):
+    """compute list shows the measured criterion metric and value for each job that has a verdict."""
+    rc = blueprint.main(["compute", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # SUCCEEDED job has criterion_verdict with metric=latency_ms, value=80.0
+    assert "latency_ms=80.0" in out
+
+
+def test_compute_list_status_filter(mock_api, capsys):
+    """compute list --status RUNNING shows only jobs with that status."""
+    rc = blueprint.main(["compute", "list", "--status", "RUNNING"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "GPU benchmark alpha" in out
+    assert "GPU benchmark beta" not in out
+
+
+def test_compute_list_status_filter_case_insensitive(mock_api, capsys):
+    """compute list --status is case-insensitive."""
+    rc = blueprint.main(["compute", "list", "--status", "succeeded"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "GPU benchmark beta" in out
+    assert "GPU benchmark alpha" not in out
 
 
 def test_compute_kill_read_only_refused(mock_api, monkeypatch):

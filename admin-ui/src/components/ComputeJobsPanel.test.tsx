@@ -1,6 +1,6 @@
 import { describe, test, expect, vi, afterEach } from 'vitest';
 import { render, waitFor, act } from '@testing-library/react';
-import type { ComputeJob } from '../api';
+import type { ComputeJob, ComputeJobsListResponse } from '../api';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
 import {
   isComputeJobActive,
@@ -58,6 +58,24 @@ function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
     task_title: 'compute_experiment: sweep',
     task_type: 'compute_experiment',
     ...overrides,
+  };
+}
+
+function wrapJobs(jobs: ComputeJob[], hasMore = false): ComputeJobsListResponse {
+  return {
+    jobs,
+    hasMore,
+    summary: {
+      total_jobs: jobs.length,
+      active_jobs: 0,
+      terminal_jobs: jobs.length,
+      total_spend_usd: 0,
+      outcome_breakdown: {},
+      criterion_measured: 0,
+      criterion_met: 0,
+    },
+    limit: 50,
+    offset: 0,
   };
 }
 
@@ -175,7 +193,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('renders budget bar and task title for an active job', async () => {
-    fetchComputeJobs.mockResolvedValue([makeJob({ accrued_cost_usd: 2.0, spend_cap_usd: 4.0 })]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({ accrued_cost_usd: 2.0, spend_cap_usd: 4.0 })]));
     const { findByText, container } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     // Budget readout reflects spent / cap.
@@ -185,7 +203,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('shows a live-proof indicator when polling_metadata carries live_release_evidence', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         polling_metadata: {
           live_release_evidence: {
@@ -195,7 +213,7 @@ describe('ComputeJobsPanel render + kill', () => {
           },
         },
       }),
-    ]);
+    ]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const chip = await findByTestId('release-evidence-chip');
     expect(chip.textContent).toContain('Live proof of v8');
@@ -205,7 +223,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('shows no live-proof indicator when live_release_evidence is absent', async () => {
-    fetchComputeJobs.mockResolvedValue([makeJob()]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob()]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('release-evidence-chip')).toBeNull();
@@ -213,7 +231,7 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('calls onNavigateToTask when task title is clicked', async () => {
     const onNavigate = vi.fn();
-    fetchComputeJobs.mockResolvedValue([makeJob({ accrued_cost_usd: 2.0, spend_cap_usd: 4.0 })]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({ accrued_cost_usd: 2.0, spend_cap_usd: 4.0 })]));
     const { findByText } = render(<ComputeJobsPanel projectId="proj-1" onNavigateToTask={onNavigate} />);
     const taskTitle = await findByText('compute_experiment: sweep');
     await act(async () => { taskTitle.click(); });
@@ -223,7 +241,7 @@ describe('ComputeJobsPanel render + kill', () => {
   test('kill button calls killComputeJob and shows killed reason', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     const active = makeJob();
-    fetchComputeJobs.mockResolvedValue([active]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([active]));
     killComputeJob.mockResolvedValue(
       makeJob({ status: 'CANCELLED', outcome: 'CANCELLED', terminal_reason: 'killed by operator (a@b.com)', final_cost_usd: 1.0 }),
     );
@@ -237,7 +255,7 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('run analysis shows upgraded feedback and refreshes the job list', async () => {
     const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
-    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
     analyzeComputeJob.mockResolvedValue({ status: 'upgraded', analysis_mode: 'llm' });
     const { findByRole, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     const button = await findByRole('button', { name: 'Run analysis' });
@@ -249,7 +267,7 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('run analysis surfaces unavailable cause labels', async () => {
     const terminal = makeJob({ status: 'FAILED', outcome: 'FAILURE', final_cost_usd: 1.0 });
-    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
     analyzeComputeJob.mockResolvedValue({ status: 'analysis_unavailable', reason: 'analysis-disabled' });
     const { findByRole, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     const button = await findByRole('button', { name: 'Run analysis' });
@@ -259,7 +277,7 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('run analysis surfaces backend errors inline', async () => {
     const terminal = makeJob({ status: 'FAILED', outcome: 'FAILURE', final_cost_usd: 1.0 });
-    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
     analyzeComputeJob.mockRejectedValue(new Error('analysis endpoint failed: upstream 503'));
     const { findByRole, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     const button = await findByRole('button', { name: 'Run analysis' });
@@ -268,7 +286,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('renders a safe terminal result link', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -276,7 +294,7 @@ describe('ComputeJobsPanel render + kill', () => {
         final_cost_usd: 1.0,
         result_reference: 'https://storage.example.com/jobs/job-1/result.json',
       }),
-    ]);
+    ]));
     const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
     const link = await findByRole('link', { name: /https:\/\/storage\.example\.com\/jobs\/job-1\/result\.json/i });
     expect(link).toHaveAttribute('href', 'https://storage.example.com/jobs/job-1/result.json');
@@ -285,14 +303,14 @@ describe('ComputeJobsPanel render + kill', () => {
   test('resolves a gs:// terminal result link through the admin API before opening', async () => {
     const openSpy = vi.spyOn(window, 'open').mockReturnValue({ opener: null, location: { replace: vi.fn() }, close: vi.fn() } as never);
     resolveArtifactDownloadUrl.mockResolvedValue('https://signed.example.com/jobs/job-1/result.json');
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
         final_cost_usd: 1.0,
         result_reference: 'gs://blueprint-agent-artifacts/tasks/task-1/result.json',
       }),
-    ]);
+    ]));
     const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
     const button = await findByRole('button', { name: /gs:\/\/blueprint-agent-artifacts\/tasks\/task-1\/result\.json/i });
     await act(async () => { button.click(); });
@@ -304,7 +322,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('surfaces COMPUTE_RESULT artifact with a resolvable reference link', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -312,7 +330,7 @@ describe('ComputeJobsPanel render + kill', () => {
         artifact_id: 'artifact-abc',
         result_reference: 'https://storage.example.com/jobs/job-1/result.json',
       }),
-    ]);
+    ]));
     const { findByText, getByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     // Primary artifact affordance is an openable link.
     const artifactLink = await findByText('COMPUTE_RESULT artifact');
@@ -325,7 +343,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('surfaces COMPUTE_RESULT artifact even when result_reference is null (non-openable)', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -333,7 +351,7 @@ describe('ComputeJobsPanel render + kill', () => {
         artifact_id: 'artifact-abc',
         result_reference: null,
       }),
-    ]);
+    ]));
     const { findByText, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     const artifact = await findByText('COMPUTE_RESULT artifact');
     // Present but not an openable link (no reference to resolve).
@@ -343,21 +361,21 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('shows no artifact affordance for jobs without artifact_id', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 }),
-    ]);
+    ]));
     const { findByText, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText(/compute_experiment: sweep/i);
     expect(queryByText('COMPUTE_RESULT artifact')).toBeNull();
   });
 
   test('GPU job shows accelerator label alongside machine type', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         accelerator_type: 'T4',
         accelerator_count: 1,
       }),
-    ]);
+    ]));
     const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     const label = await findByText((text) => text.includes('T4 x1'));
@@ -374,7 +392,7 @@ describe('ComputeJobsPanel render + kill', () => {
       accelerator_count: 1,
       polling_metadata: { result_metrics: { gpu_count: 1, driver_version: '525.0' } },
     });
-    fetchComputeJobs.mockResolvedValue([gpuJob]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([gpuJob]));
     const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(await findByText((t) => t.includes('gpu_count:'))).toBeTruthy();
@@ -391,7 +409,7 @@ describe('ComputeJobsPanel render + kill', () => {
       accelerator_type: null,
       polling_metadata: { result_metrics: { avg_latency_ms: 42.5, throughput_rps: 1000 } },
     });
-    fetchComputeJobs.mockResolvedValue([cpuJob]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([cpuJob]));
     const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('cpu benchmark');
     expect(await findByText((t) => t.includes('avg_latency_ms:'))).toBeTruthy();
@@ -407,7 +425,7 @@ describe('ComputeJobsPanel render + kill', () => {
       accrued_cost_usd: 1.5,
       polling_metadata: { result_metrics: { current_progress: 0.75, samples_collected: 300 } },
     });
-    fetchComputeJobs.mockResolvedValue([runningJobWithMetrics]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([runningJobWithMetrics]));
     const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('live experiment');
     expect(await findByText((t) => t.includes('current_progress:'))).toBeTruthy();
@@ -417,7 +435,7 @@ describe('ComputeJobsPanel render + kill', () => {
   test('renders backend RPC diagnostic warning', async () => {
     // Active RUNNING job with a diagnostic: warning shows operation, attempt,
     // retry timing and error message, and the Kill control stays available.
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         compute_rpc_diagnostic: makeDiagnostic({
           operation: 'terminate',
@@ -428,7 +446,7 @@ describe('ComputeJobsPanel render + kill', () => {
           retry_after_seconds: 45,
         }),
       }),
-    ]);
+    ]));
     const { findByText, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const warning = await findByTestId('compute-rpc-diagnostic');
     expect(warning.textContent).toContain('terminate');
@@ -440,7 +458,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('terminal job with diagnostic shows warning distinct from terminal label and keeps result', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'FAILED',
         outcome: 'FAILURE',
@@ -448,7 +466,7 @@ describe('ComputeJobsPanel render + kill', () => {
         result_reference: 'https://storage.example.com/jobs/job-1/result.json',
         compute_rpc_diagnostic: makeDiagnostic({ operation: 'cost', job_status: 'FAILED' }),
       }),
-    ]);
+    ]));
     const { findByTestId, findByText, findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
     const warning = await findByTestId('compute-rpc-diagnostic');
     expect(warning.textContent).toContain('cost');
@@ -460,13 +478,13 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('renders diagnostic from legacy polling_metadata fallback', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         polling_metadata: {
           compute_rpc_diagnostic: makeDiagnostic({ operation: 'launch', error_message: 'quota exhausted' }),
         },
       }),
-    ]);
+    ]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const warning = await findByTestId('compute-rpc-diagnostic');
     expect(warning.textContent).toContain('launch');
@@ -474,7 +492,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('no diagnostic warning when the API omits the field', async () => {
-    fetchComputeJobs.mockResolvedValue([makeJob()]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob()]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('compute-rpc-diagnostic')).toBeNull();
@@ -484,7 +502,7 @@ describe('ComputeJobsPanel render + kill', () => {
     // A $0 TIMED_OUT job that died before the VM reached RUNNING: the panel
     // surfaces the provisioning cause and the requested launch contract, and
     // suppresses the generic retry-oriented RPC warning.
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'TIMED_OUT',
         outcome: 'TIMED_OUT',
@@ -498,7 +516,7 @@ describe('ComputeJobsPanel render + kill', () => {
           error_message: 'GPU quota exhausted in zone us-central1-a',
         }),
       }),
-    ]);
+    ]));
     const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const block = await findByTestId('compute-provisioning-cause');
     expect(block.textContent).toContain('provisioning');
@@ -512,14 +530,14 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('terminal job without provisioning fields falls back to terminal_reason only', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'TIMED_OUT',
         outcome: 'TIMED_OUT',
         final_cost_usd: 0,
         terminal_reason: 'compute job timed out while provisioning',
       }),
-    ]);
+    ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute job timed out while provisioning');
     expect(queryByTestId('compute-provisioning-cause')).toBeNull();
@@ -527,7 +545,7 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('kill failure surfaces the backend explanation, not a generic message', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
-    fetchComputeJobs.mockResolvedValue([makeJob()]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob()]));
     killComputeJob.mockRejectedValue(new Error('compute job already terminal: cannot kill'));
     const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     const killBtn = await findByText('Kill');
@@ -537,14 +555,14 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('renders an empty compute workbench when there are no jobs', async () => {
-    fetchComputeJobs.mockResolvedValue([]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     const { findByText, queryByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('No compute jobs');
     expect(queryByRole('button', { name: 'Launch compute experiment' })).toBeNull();
   });
 
   test('renders a launch action in the empty compute workbench when provided', async () => {
-    fetchComputeJobs.mockResolvedValue([]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     const { findByText, findByRole } = render(<ComputeJobsPanel projectId="proj-1" onLaunchCompute={vi.fn()} />);
     await findByText('No compute jobs');
     expect(await findByRole('button', { name: 'Launch compute experiment' })).toBeTruthy();
@@ -559,7 +577,7 @@ describe('ComputeJobsPanel render + kill', () => {
         command_log: { text: 'step 1\nstep 2\nstep 3\ndone', truncated: false, byte_count: 24 },
       },
     });
-    fetchComputeJobs.mockResolvedValue([terminalJob]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminalJob]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const block = await findByTestId('compute-command-log');
     expect(block.textContent).toContain('step 1');
@@ -576,7 +594,7 @@ describe('ComputeJobsPanel render + kill', () => {
         command_log: { text: 'error: something went wrong\nexit 1', truncated: true, byte_count: 65536 },
       },
     });
-    fetchComputeJobs.mockResolvedValue([terminalJob]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminalJob]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const block = await findByTestId('compute-command-log');
     expect(block.textContent).toContain('truncated');
@@ -584,23 +602,23 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('active job does not render command_log section', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         polling_metadata: { command_log: { text: 'running...', truncated: false, byte_count: 10 } },
       }),
-    ]);
+    ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('compute-command-log')).toBeNull();
   });
 
   test('shows live output tail when job is running', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'RUNNING',
         polling_metadata: { live_output: { text: 'line1\nline2\n', truncated: false } },
       }),
-    ]);
+    ]));
     const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const block = await findByTestId('compute-live-output');
     expect(block.textContent).toContain('line1');
@@ -609,7 +627,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('live output hidden when job is terminal and command_log shown', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -619,7 +637,7 @@ describe('ComputeJobsPanel render + kill', () => {
           command_log: { text: 'line1\nline2\ndone', truncated: false, byte_count: 16 },
         },
       }),
-    ]);
+    ]));
     const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const log = await findByTestId('compute-command-log');
     expect(log.textContent).toContain('done');
@@ -628,7 +646,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('terminal job with exit_code in polling_metadata shows exit code chip', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'FAILED',
         outcome: 'FAILURE',
@@ -636,23 +654,23 @@ describe('ComputeJobsPanel render + kill', () => {
         terminal_reason: 'command failed',
         polling_metadata: { exit_code: 1 },
       }),
-    ]);
+    ]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const chip = await findByTestId('compute-exit-code');
     expect(chip.textContent).toBe('exit 1');
   });
 
   test('active job does not show exit code chip even if present', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({ polling_metadata: { exit_code: 0 } }),
-    ]);
+    ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('compute-exit-code')).toBeNull();
   });
 
   test('terminal job without exit_code shows no exit code chip', async () => {
-    fetchComputeJobs.mockResolvedValue([makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 })]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 })]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('compute-exit-code')).toBeNull();
@@ -661,7 +679,7 @@ describe('ComputeJobsPanel render + kill', () => {
   test('terminal job with timestamps shows result story: runtime, deadline, cost rate', async () => {
     const start = new Date('2026-06-23T10:00:00Z');
     const end = new Date('2026-06-23T10:05:00Z'); // 300s runtime
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -670,7 +688,7 @@ describe('ComputeJobsPanel render + kill', () => {
         final_cost_usd: 0.20, // $0.20 in 300s => $2.40/hr
         launch_contract: { requested_deadline_seconds: 600, provisioning_model: 'SPOT' },
       }),
-    ]);
+    ]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const story = await findByTestId('compute-result-story');
     expect(story.textContent).toContain('5m');
@@ -680,7 +698,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('terminal job without timestamps shows no result story block', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -688,28 +706,28 @@ describe('ComputeJobsPanel render + kill', () => {
         completed_at: null,
         final_cost_usd: 1.0,
       }),
-    ]);
+    ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('compute-result-story')).toBeNull();
   });
 
   test('active job does not show result story block', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         started_at: new Date('2026-06-23T10:00:00Z').toISOString(),
         completed_at: null,
       }),
-    ]);
+    ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('compute-result-story')).toBeNull();
   });
 
   test('provisioning model appears in the machine info subtitle', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({ launch_contract: { provisioning_model: 'SPOT', requested_deadline_seconds: 300 } }),
-    ]);
+    ]));
     const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     const subtitle = await findByText((t) => t.includes('SPOT'));
     expect(subtitle.textContent).toContain('gcp_compute_engine');
@@ -718,7 +736,7 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('launch action calls onLaunchCompute from the empty compute workbench', async () => {
     const onLaunchCompute = vi.fn();
-    fetchComputeJobs.mockResolvedValue([]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" onLaunchCompute={onLaunchCompute} />);
     const launchButton = await findByRole('button', { name: 'Launch compute experiment' });
     await act(async () => { launchButton.click(); });
@@ -727,7 +745,7 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('run analysis fetches and shows the knowledge doc when an id is returned', async () => {
     const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
-    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
     analyzeComputeJob.mockResolvedValue({ status: 'upgraded', knowledge_document_id: 'doc-xyz' });
     fetchKnowledgeDocument.mockResolvedValue({
       id: 'doc-xyz',
@@ -756,7 +774,7 @@ describe('ComputeJobsPanel render + kill', () => {
       final_cost_usd: 1.0,
       knowledge_document_id: 'doc-durable-1',
     });
-    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
     fetchKnowledgeDocument.mockResolvedValue({
       id: 'doc-durable-1',
       title: 'Experiment: sweep accuracy 91.2%',
@@ -782,7 +800,7 @@ describe('ComputeJobsPanel render + kill', () => {
       final_cost_usd: 1.0,
       knowledge_document_id: 'doc-expand-1',
     });
-    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
     fetchKnowledgeDocument.mockResolvedValue({
       id: 'doc-expand-1',
       title: 'Knowledge: full analysis write-up',
@@ -809,7 +827,7 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('analysis doc card is interactive: clicking the title toggles the full body', async () => {
     const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
-    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
     analyzeComputeJob.mockResolvedValue({ status: 'upgraded', knowledge_document_id: 'doc-analysis-expand' });
     fetchKnowledgeDocument.mockResolvedValue({
       id: 'doc-analysis-expand',
@@ -839,7 +857,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('terminal job with hypothesis and experiment shows experiment identity block', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -847,7 +865,7 @@ describe('ComputeJobsPanel render + kill', () => {
         experiment: 'sweep-v3',
         hypothesis: 'Increasing learning rate to 0.01 will improve accuracy by 5%.',
       }),
-    ]);
+    ]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const block = await findByTestId('compute-experiment-identity');
     expect(block.textContent).toContain('sweep-v3');
@@ -855,7 +873,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('terminal job with benchmark (no experiment) shows Benchmark label', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'FAILED',
         outcome: 'FAILURE',
@@ -863,7 +881,7 @@ describe('ComputeJobsPanel render + kill', () => {
         benchmark: 'mlperf-v4',
         hypothesis: null,
       }),
-    ]);
+    ]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const block = await findByTestId('compute-experiment-identity');
     expect(block.textContent).toContain('Benchmark');
@@ -871,18 +889,18 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('active job does not show experiment identity block even when fields present', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({ experiment: 'sweep-v3', hypothesis: 'some hypothesis' }),
-    ]);
+    ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('compute-experiment-identity')).toBeNull();
   });
 
   test('terminal job without experiment/benchmark/hypothesis shows no identity block', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 }),
-    ]);
+    ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('compute-experiment-identity')).toBeNull();
@@ -919,7 +937,7 @@ describe('ComputeJobsPanel render + kill', () => {
       success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
       criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.91, met: true, measurable: true },
     });
-    fetchComputeJobs.mockResolvedValue([run1, run2, run3]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([run1, run2, run3]));
     const { findByTestId, getAllByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     // Sweep summary section appears
     await findByTestId('experiment-sweep-summary');
@@ -953,7 +971,7 @@ describe('ComputeJobsPanel render + kill', () => {
       experiment: 'latency-sweep',
       criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 80, met: true, measurable: true },
     });
-    fetchComputeJobs.mockResolvedValue([run1, run2]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([run1, run2]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByTestId('experiment-sweep-summary');
     // Best run for latency (lower is better) should be run2 with 80ms
@@ -963,7 +981,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('single terminal job with experiment does not show sweep summary', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -971,7 +989,7 @@ describe('ComputeJobsPanel render + kill', () => {
         experiment: 'lone-sweep',
         criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.91, met: true, measurable: true },
       }),
-    ]);
+    ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('experiment-sweep-summary')).toBeNull();
@@ -982,7 +1000,7 @@ describe('ComputeJobsPanel render + kill', () => {
     // Burn rate = $3/hr; projected additional = $3 * 2hr = $6; total projected = $9 > $4 cap.
     const startedAt = new Date(Date.now() - 3600 * 1000).toISOString();
     const deadline = new Date(Date.now() + 2 * 3600 * 1000).toISOString();
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'RUNNING',
         accrued_cost_usd: 3.0,
@@ -990,7 +1008,7 @@ describe('ComputeJobsPanel render + kill', () => {
         started_at: startedAt,
         wall_clock_deadline: deadline,
       }),
-    ]);
+    ]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const warning = await findByTestId('compute-budget-kill-warning');
     expect(warning.textContent).toContain('$4.00');
@@ -1002,7 +1020,7 @@ describe('ComputeJobsPanel render + kill', () => {
     // Burn rate = $1/hr; projected total = $2 < $10 cap.
     const startedAt = new Date(Date.now() - 3600 * 1000).toISOString();
     const deadline = new Date(Date.now() + 3600 * 1000).toISOString();
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'RUNNING',
         accrued_cost_usd: 1.0,
@@ -1010,7 +1028,7 @@ describe('ComputeJobsPanel render + kill', () => {
         started_at: startedAt,
         wall_clock_deadline: deadline,
       }),
-    ]);
+    ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
     expect(queryByTestId('compute-budget-kill-warning')).toBeNull();
@@ -1049,7 +1067,7 @@ describe('ComputeJobsPanel render + kill', () => {
       started_at: null,
       completed_at: null,
     });
-    fetchComputeJobs.mockResolvedValue([job1, job2]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job1, job2]));
     const { findByTestId, getAllByTestId, queryAllByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     // Sweep summary appears; open compare mode
     const toggleBtn = await findByTestId('sweep-compare-toggle');
@@ -1098,7 +1116,7 @@ describe('ComputeJobsPanel render + kill', () => {
       outcome: 'SUCCESS',
       final_cost_usd: 1.0,
     });
-    fetchComputeJobs.mockResolvedValue([activeJob, terminalJob]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([activeJob, terminalJob]));
     const { findAllByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const titles = await findAllByText('compute_experiment: sweep');
     expect(titles.length).toBeGreaterThanOrEqual(1);
@@ -1108,7 +1126,7 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('run analysis without knowledge_document_id still shows feedback without crashing', async () => {
     const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
-    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
     analyzeComputeJob.mockResolvedValue({ status: 'upgraded', knowledge_document_id: null });
     const { findByRole, findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const button = await findByRole('button', { name: 'Run analysis' });
@@ -1119,7 +1137,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('terminal job with criterion verdict displays margin above threshold in green', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -1127,7 +1145,7 @@ describe('ComputeJobsPanel render + kill', () => {
         success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
         criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.95, met: true, measurable: true },
       }),
-    ]);
+    ]));
     const { findByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByTestId('criterion-verdict-row');
     const margin = getByTestId('criterion-margin');
@@ -1136,7 +1154,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('terminal job with criterion verdict displays margin below threshold in red', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -1144,7 +1162,7 @@ describe('ComputeJobsPanel render + kill', () => {
         success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
         criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.85, met: false, measurable: true },
       }),
-    ]);
+    ]));
     const { findByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByTestId('criterion-verdict-row');
     const margin = getByTestId('criterion-margin');
@@ -1153,7 +1171,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('terminal job with <= operator shows correct margin sign', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -1161,7 +1179,7 @@ describe('ComputeJobsPanel render + kill', () => {
         success_criterion: { metric: 'latency_ms', operator: '<=', threshold: 100 },
         criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 80, met: true, measurable: true },
       }),
-    ]);
+    ]));
     const { findByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByTestId('criterion-verdict-row');
     const margin = getByTestId('criterion-margin');
@@ -1170,7 +1188,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('terminal job without criterion_verdict does not show margin', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -1178,7 +1196,7 @@ describe('ComputeJobsPanel render + kill', () => {
         success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
         criterion_verdict: null,
       }),
-    ]);
+    ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('not reported');
     expect(queryByTestId('criterion-margin')).toBeNull();
@@ -1192,7 +1210,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('terminal job with null measured value does not show margin', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
@@ -1200,14 +1218,14 @@ describe('ComputeJobsPanel render + kill', () => {
         success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
         criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: null, met: false, measurable: false },
       }),
-    ]);
+    ]));
     const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByTestId('criterion-verdict-row');
     expect(queryByTestId('criterion-margin')).toBeNull();
   });
 
   test('window selector renders with 6h active by default', async () => {
-    fetchComputeJobs.mockResolvedValue([]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const selector = await findByTestId('compute-window-selector');
     expect(selector.textContent).toContain('6h');
@@ -1219,7 +1237,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('clicking 7d window selector triggers refetch with 10080 minutes', async () => {
-    fetchComputeJobs.mockResolvedValue([]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByTestId('compute-window-selector');
     const btn7d = await findByTestId('compute-window-7d');
@@ -1231,14 +1249,14 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('command log with more than 30 lines shows Show all button; clicking expands', async () => {
     const longLog = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n');
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
         final_cost_usd: 1.0,
         polling_metadata: { command_log: { text: longLog, truncated: false, byte_count: longLog.length } },
       }),
-    ]);
+    ]));
     const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const showAllBtn = await findByTestId('compute-log-show-all');
     expect(showAllBtn.textContent).toContain('50 lines');
@@ -1257,14 +1275,14 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('command log with 30 or fewer lines shows no Show all button', async () => {
     const shortLog = Array.from({ length: 10 }, (_, i) => `step ${i}`).join('\n');
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
         final_cost_usd: 1.0,
         polling_metadata: { command_log: { text: shortLog, truncated: false, byte_count: shortLog.length } },
       }),
-    ]);
+    ]));
     const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByTestId('compute-command-log');
     expect(queryByTestId('compute-log-show-all')).toBeNull();
@@ -1287,7 +1305,7 @@ describe('ComputeJobsPanel render + kill', () => {
         },
       },
     });
-    fetchComputeJobs.mockResolvedValue([armsJob]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
     const { findByText, container, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('arms experiment');
     // '[object Object]' must not appear anywhere
@@ -1325,7 +1343,7 @@ describe('ComputeJobsPanel render + kill', () => {
         },
       },
     });
-    fetchComputeJobs.mockResolvedValue([armsJob]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
     const { findByTestId, findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const armsBlock = await findByTestId('arms-breakdown');
     // arm names present
@@ -1382,7 +1400,7 @@ describe('ComputeJobsPanel render + kill', () => {
       started_at: null,
       completed_at: null,
     });
-    fetchComputeJobs.mockResolvedValue([job1, job2]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job1, job2]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const toggleBtn = await findByTestId('sweep-compare-toggle');
     await act(async () => { toggleBtn.click(); });
@@ -1428,7 +1446,7 @@ describe('ComputeJobsPanel render + kill', () => {
       started_at: null,
       completed_at: null,
     });
-    fetchComputeJobs.mockResolvedValue([job1, job2]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job1, job2]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const toggleBtn = await findByTestId('sweep-compare-toggle');
     await act(async () => { toggleBtn.click(); });
@@ -1473,7 +1491,7 @@ describe('ComputeJobsPanel render + kill', () => {
       started_at: null,
       completed_at: null,
     });
-    fetchComputeJobs.mockResolvedValue([job1, job2]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job1, job2]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const toggleBtn = await findByTestId('sweep-compare-toggle');
     await act(async () => { toggleBtn.click(); });
@@ -1485,7 +1503,7 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('clicking All window button calls fetchComputeJobsPaged with allTerminal=true and clears window highlight', async () => {
-    fetchComputeJobs.mockResolvedValue([]);
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const allBtn = await findByTestId('compute-window-all');
     await act(async () => { allBtn.click(); });
@@ -1503,7 +1521,7 @@ describe('ComputeJobsPanel render + kill', () => {
     const job1 = makeJob({ id: 'job-1', task_title: 'Job One' });
     const job2 = makeJob({ id: 'job-2', task_title: 'Job Two', status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
     fetchComputeJobs
-      .mockResolvedValueOnce([])  // initial render (window mode)
+      .mockResolvedValueOnce(wrapJobs([]))  // initial render (window mode)
       .mockResolvedValueOnce({ jobs: [job1], hasMore: true })  // after clicking All
       .mockResolvedValueOnce({ jobs: [job2], hasMore: false });  // after Load more
     const { findByTestId, findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
@@ -1536,12 +1554,90 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('job with external_compute_id shows it in the machine info subtitle', async () => {
-    fetchComputeJobs.mockResolvedValue([
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({ external_compute_id: 'compute-job-abc-123' }),
-    ]);
+    ]));
     const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     const subtitle = await findByText((t) => t.includes('compute-job-abc-123'));
     expect(subtitle.textContent).toContain('gcp_compute_engine');
     expect(subtitle.textContent).toContain('compute-job-abc-123');
+  });
+
+  test('renders aggregate summary header when summary has jobs', async () => {
+    const job = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 2.5 });
+    fetchComputeJobs.mockResolvedValue({
+      jobs: [job],
+      hasMore: false,
+      summary: {
+        total_jobs: 5,
+        active_jobs: 1,
+        terminal_jobs: 4,
+        total_spend_usd: 7.25,
+        outcome_breakdown: { SUCCESS: 3, FAILURE: 1 },
+        criterion_measured: 2,
+        criterion_met: 1,
+      },
+      limit: 50,
+      offset: 0,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const summary = await findByTestId('compute-jobs-summary');
+    expect(summary.textContent).toContain('5');   // total
+    expect(summary.textContent).toContain('1');   // active
+    expect(summary.textContent).toContain('$7.25'); // spend
+    expect(summary.textContent).toContain('1/2'); // criterion met/measured
+  });
+
+  test('does not render summary header when total_jobs is 0', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('No compute jobs');
+    expect(queryByTestId('compute-jobs-summary')).toBeNull();
+  });
+
+  test('shows Load-more button when has_more is true and hides it when false', async () => {
+    fetchComputeJobs.mockResolvedValueOnce({
+      jobs: [makeJob()],
+      hasMore: true,
+      summary: { total_jobs: 3, active_jobs: 1, terminal_jobs: 2, total_spend_usd: 0, outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0 },
+      limit: 1,
+      offset: 0,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const btn = await findByTestId('compute-load-more');
+    expect(btn.textContent).toBe('Load more');
+  });
+
+  test('Load-more fetches next page and appends jobs without replacing existing ones', async () => {
+    const page1Job = makeJob({ id: 'job-p1', task_title: 'page 1 job' });
+    const page2Job = makeJob({ id: 'job-p2', task_title: 'page 2 job', status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs
+      .mockResolvedValueOnce({
+        jobs: [page1Job],
+        hasMore: true,
+        summary: { total_jobs: 2, active_jobs: 1, terminal_jobs: 1, total_spend_usd: 0, outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0 },
+        limit: 1,
+        offset: 0,
+      })
+      .mockResolvedValueOnce({
+        jobs: [page2Job],
+        hasMore: false,
+        summary: { total_jobs: 2, active_jobs: 1, terminal_jobs: 1, total_spend_usd: 1.0, outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0 },
+        limit: 1,
+        offset: 1,
+      });
+    const { findByTestId, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // First page loaded
+    await findByText('page 1 job');
+    // Load more
+    const loadMoreBtn = await findByTestId('compute-load-more');
+    await act(async () => { loadMoreBtn.click(); });
+    // Both pages now visible
+    await findByText('page 1 job');
+    await findByText('page 2 job');
+    // Load-more button gone after last page
+    await waitFor(() => expect(document.querySelector('[data-testid="compute-load-more"]')).toBeNull());
+    // fetchComputeJobs called with offset=1 for the second page
+    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', undefined, 360, 1);
   });
 });

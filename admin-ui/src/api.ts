@@ -3074,15 +3074,35 @@ export interface ComputeJob {
   hypothesis?: string | null;
 }
 
+export interface ComputeJobsSummary {
+  total_jobs: number;
+  active_jobs: number;
+  terminal_jobs: number;
+  total_spend_usd: number;
+  outcome_breakdown: Record<string, number>;
+  criterion_measured: number;
+  criterion_met: number;
+}
+
+export interface ComputeJobsListResponse {
+  jobs: ComputeJob[];
+  hasMore: boolean;
+  summary: ComputeJobsSummary;
+  limit: number;
+  offset: number;
+}
+
 export async function fetchComputeJobs(
   projectId: string,
   signal?: AbortSignal,
   includeFinishedMinutes?: number,
-): Promise<ComputeJob[]> {
+  offset = 0,
+): Promise<ComputeJobsListResponse> {
   const query = new URLSearchParams();
   if (typeof includeFinishedMinutes === 'number') {
     query.set('include_finished_minutes', String(includeFinishedMinutes));
   }
+  if (offset > 0) query.set('offset', String(offset));
   const suffix = query.toString() ? `?${query.toString()}` : '';
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs${suffix}`,
@@ -3093,12 +3113,23 @@ export async function fetchComputeJobs(
   );
   if (!res.ok) throw new Error(`Failed to fetch compute jobs: ${res.status}`);
   const data = await res.json();
-  return Array.isArray(data.compute_jobs) ? data.compute_jobs : [];
+  const emptySummary: ComputeJobsSummary = {
+    total_jobs: 0, active_jobs: 0, terminal_jobs: 0, total_spend_usd: 0,
+    outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0,
+  };
+  return {
+    jobs: Array.isArray(data.compute_jobs) ? data.compute_jobs : [],
+    hasMore: data.has_more ?? false,
+    summary: data.summary ?? emptySummary,
+    limit: data.limit ?? 50,
+    offset: data.offset ?? offset,
+  };
 }
 
 export interface ComputeJobsPagedResponse {
   jobs: ComputeJob[];
   hasMore: boolean;
+  summary?: ComputeJobsSummary;
 }
 
 export async function fetchComputeJobsPaged(
@@ -3125,9 +3156,14 @@ export async function fetchComputeJobsPaged(
   );
   if (!res.ok) throw new Error(`Failed to fetch compute jobs: ${res.status}`);
   const data = await res.json();
+  const emptySummary: ComputeJobsSummary = {
+    total_jobs: 0, active_jobs: 0, terminal_jobs: 0, total_spend_usd: 0,
+    outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0,
+  };
   return {
     jobs: Array.isArray(data.compute_jobs) ? data.compute_jobs : [],
     hasMore: !!data.has_more,
+    summary: data.summary ?? emptySummary,
   };
 }
 

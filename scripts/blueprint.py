@@ -3400,6 +3400,7 @@ def cmd_compute(args: argparse.Namespace) -> None:
 def _compute_list(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
     limit = getattr(args, "limit", 20)
+    status_filter = getattr(args, "status_filter", None)
     if getattr(args, "all_terminal", False):
         resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
                    f"?all_terminal=true&limit={limit}")
@@ -3409,7 +3410,10 @@ def _compute_list(args: argparse.Namespace) -> None:
                    f"?include_finished_minutes={finished}&limit={limit}")
     jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
     has_more = resp.get("has_more", False) if isinstance(resp, dict) else False
-    _emit(args, {"compute_jobs": jobs, "has_more": has_more}, _render_compute_list)
+    summary = resp.get("summary") if isinstance(resp, dict) else None
+    if status_filter:
+        jobs = [j for j in jobs if j.get("status", "").upper() == status_filter.upper()]
+    _emit(args, {"compute_jobs": jobs, "has_more": has_more, "summary": summary}, _render_compute_list)
 
 
 def _render_compute_list(data: dict) -> None:
@@ -3426,8 +3430,16 @@ def _render_compute_list(data: dict) -> None:
         task_type = j.get("task_type") or "?"
         cost = j.get("final_cost_usd")
         cost_str = f"  ${cost:.2f}" if cost is not None else ""
-        verdict = (j.get("criterion_verdict") or {}).get("met") if isinstance(j.get("criterion_verdict"), dict) else None
-        verdict_str = f"  met={verdict}" if verdict is not None else ""
+        cv = j.get("criterion_verdict") if isinstance(j.get("criterion_verdict"), dict) else None
+        if cv is not None:
+            metric = cv.get("metric")
+            value = cv.get("value")
+            if metric and value is not None:
+                verdict_str = f"  met={cv.get('met')} ({metric}={value})"
+            else:
+                verdict_str = f"  met={cv.get('met')}"
+        else:
+            verdict_str = ""
         exp = (j.get("experiment") or "")[:20]
         exp_str = f"  exp={exp}" if exp else ""
         burn = _compute_job_burn_rate(j, now)
@@ -3435,6 +3447,14 @@ def _render_compute_list(data: dict) -> None:
         print(f"  {jid}  {status:12} [{task_type}]  {title}{cost_str}{verdict_str}{exp_str}{burn_str}")
     if data.get("has_more"):
         print("  (more jobs available; increase --limit, --include-finished, or use --all-terminal)")
+    summary = data.get("summary") or {}
+    if summary:
+        total = summary.get("total_jobs", len(jobs))
+        active = summary.get("active_jobs", 0)
+        spend = summary.get("total_spend_usd", 0.0)
+        measured = summary.get("criterion_measured", 0)
+        met = summary.get("criterion_met", 0)
+        print(f"  --- {total} jobs | {active} active | ${spend:.2f} total spend | {met}/{measured} criteria met ---")
 
 
 def _compute_kill(args: argparse.Namespace) -> None:
@@ -4093,6 +4113,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="List all terminal jobs regardless of age (bypasses the 7-day window limit).")
     p_compute_list.add_argument("--limit", type=int, default=20,
                                 help="Max jobs to return (default 20).")
+    p_compute_list.add_argument("--status", dest="status_filter", default=None,
+                                help="Filter rows by status (e.g. RUNNING, SUCCEEDED, FAILED).")
     p_compute_show = compute_sub.add_parser(
         "show", parents=[common],
         help="Show full details for one compute job (metrics, verdict, knowledge doc). "

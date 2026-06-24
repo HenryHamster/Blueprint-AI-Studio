@@ -19,6 +19,8 @@ from sqlmodel import select
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.compute_jobs import (
+    aggregate_compute_jobs_summary,
+    aggregate_criterion_summary,
     build_compute_result_logs,
     kill_compute_job,
     list_compute_jobs,
@@ -180,37 +182,6 @@ async def _build_compute_job_payload(
     return payload
 
 
-def _build_compute_jobs_summary(payload: list[Dict[str, Any]]) -> Dict[str, Any]:
-    """Compute aggregate roll-up over a page of built compute-job dicts."""
-    total_spend = 0.0
-    criterion_met = 0
-    measured = 0
-    outcome_breakdown: Dict[str, int] = {}
-    for job in payload:
-        final = job.get("final_cost_usd")
-        accrued = job.get("accrued_cost_usd")
-        if final is not None:
-            total_spend += float(final)
-        elif accrued is not None:
-            total_spend += float(accrued)
-        verdict = job.get("criterion_verdict")
-        if isinstance(verdict, dict):
-            if verdict.get("met") is True:
-                criterion_met += 1
-            if verdict.get("measurable") is True:
-                measured += 1
-        status = job.get("status")
-        if status is not None:
-            outcome_breakdown[status] = outcome_breakdown.get(status, 0) + 1
-    return {
-        "job_count": len(payload),
-        "total_spend_usd": total_spend,
-        "criterion_met_count": criterion_met,
-        "measured_count": measured,
-        "outcome_breakdown": outcome_breakdown,
-    }
-
-
 @router.get("/projects/{project_id}/compute-jobs")
 async def get_project_compute_jobs(
     project_id: uuid.UUID,
@@ -230,21 +201,37 @@ async def get_project_compute_jobs(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
+    window = timedelta(minutes=include_finished_minutes)
     jobs, has_more = await list_compute_jobs(
         session,
         project_id=project_id,
-        include_finished_within=timedelta(minutes=include_finished_minutes),
+        include_finished_within=window,
         limit=limit,
         offset=offset,
         all_terminal=all_terminal,
     )
     built_payload = await _build_compute_job_payload(session, jobs)
+    agg_summary = await aggregate_compute_jobs_summary(
+        session,
+        project_id=project_id,
+        include_finished_within=window,
+    )
+    criterion_stats = await aggregate_criterion_summary(
+        session,
+        project_id=project_id,
+        include_finished_within=window,
+    )
+    summary = {
+        **agg_summary,
+        "criterion_met": criterion_stats["criterion_met"],
+        "criterion_measured": criterion_stats["criterion_measured"],
+    }
     return {
         "compute_jobs": built_payload,
         "has_more": has_more,
         "limit": limit,
         "offset": offset,
-        "summary": _build_compute_jobs_summary(built_payload),
+        "summary": summary,
     }
 
 

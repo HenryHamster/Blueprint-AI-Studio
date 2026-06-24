@@ -939,13 +939,13 @@ async def test_list_compute_jobs_includes_summary(client: AsyncClient, db_sessio
     assert len(body["compute_jobs"]) == 3
 
     summary = body["summary"]
-    assert summary["job_count"] == 3
+    assert summary["total_jobs"] == 3
     # total_spend: job1 final=1.5, job2 final=0.8, job3 accrued=0.3 (no final)
     assert summary["total_spend_usd"] == pytest.approx(2.6)
-    # criterion_met: only job1
-    assert summary["criterion_met_count"] == 1
-    # measured: job1 (measurable=True) + job2 (measurable=True)
-    assert summary["measured_count"] == 2
+    # criterion_met: only job1 (plan_output.compute_result.criterion.met = true)
+    assert summary["criterion_met"] == 1
+    # measured: job1 + job2 (both have plan_output.compute_result.criterion set)
+    assert summary["criterion_measured"] == 2
     breakdown = summary["outcome_breakdown"]
     assert breakdown[ComputeJobStatus.SUCCEEDED.value] == 1
     assert breakdown[ComputeJobStatus.FAILED.value] == 1

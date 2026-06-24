@@ -3368,6 +3368,68 @@ class TestComputeJobsPanel:
         data = resp.json()["compute_jobs"][0]
         assert data.get("vm_phase") == "runtime"
 
+    @pytest.mark.asyncio
+    async def test_compute_jobs_summary_across_window_boundary(
+        self, client: AsyncClient, db_session
+    ):
+        """Summary block counts/spend/criterion are correct for mixed active+terminal
+        jobs, and jobs outside the time window are excluded from totals."""
+        from datetime import timezone
+        from app.models import ComputeJobStatus, ComputeJobOutcome
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        # Active job — always included regardless of time window
+        active_job = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.RUNNING,
+        )
+        # Terminal job inside the default 360-minute window
+        terminal_in = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.SUCCEEDED,
+            outcome=ComputeJobOutcome.SUCCESS,
+            final_cost_usd=2.50,
+            completed_at=now - timedelta(minutes=60),
+        )
+        # Terminal job outside the window (>360 min ago) — must be excluded
+        terminal_out = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.FAILED,
+            outcome=ComputeJobOutcome.FAILURE,
+            final_cost_usd=1.00,
+            completed_at=now - timedelta(minutes=500),
+        )
+        for obj in (active_job, terminal_in, terminal_out):
+            db_session.add(obj)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "summary" in body, "response must include a 'summary' block"
+        s = body["summary"]
+
+        assert s["total_jobs"] == 2, f"expected 2 in-window jobs, got {s['total_jobs']}"
+        assert s["active_jobs"] == 1, f"expected 1 active job, got {s['active_jobs']}"
+        assert s["terminal_jobs"] == 1, f"expected 1 terminal job, got {s['terminal_jobs']}"
+        assert abs(s["total_spend_usd"] - 2.50) < 0.01, (
+            f"expected spend $2.50, got {s['total_spend_usd']}"
+        )
+        assert s["outcome_breakdown"].get("SUCCEEDED") == 1, (
+            f"outcome_breakdown must show SUCCEEDED=1; got {s['outcome_breakdown']}"
+        )
+        assert "FAILED" not in s["outcome_breakdown"], (
+            "out-of-window FAILED job must not appear in outcome_breakdown"
+        )
+        # criterion_measured/met: no tasks with criteria in this fixture → both 0
+        assert s["criterion_measured"] == 0
+        assert s["criterion_met"] == 0
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_notifications.py — Alerts, Messages, Playbook
