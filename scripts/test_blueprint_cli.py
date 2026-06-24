@@ -675,8 +675,8 @@ def mock_api(monkeypatch):
                 "window_minutes": 15,
                 "generated_at": "2026-06-18T00:00:00",
             }
-        if "/knowledge/" in path and method == "GET":
-            doc_id = path.split("/knowledge/")[1].split("?")[0]
+        if "/knowledge-documents/" in path and method == "GET":
+            doc_id = path.split("/knowledge-documents/")[1].split("?")[0]
             return {
                 "id": doc_id,
                 "title": "Research on test coverage",
@@ -685,7 +685,7 @@ def mock_api(monkeypatch):
                 "created_at": "2026-06-15T00:00:00Z",
                 "body": "## Findings\n\nTest coverage is important for reliability.",
             }
-        if "/knowledge" in path and method == "GET":
+        if "/knowledge-documents" in path and method == "GET":
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(path).query)
             docs = [
@@ -694,7 +694,7 @@ def mock_api(monkeypatch):
                 {"id": "kdoc-002", "title": "Design Patterns", "source_kind": "design",
                  "direction_id": "d-def67890", "created_at": "2026-06-14T00:00:00Z"},
             ]
-            direction_f = qs.get("direction_id", [None])[0]
+            direction_f = qs.get("direction", [None])[0]
             source_kind_f = qs.get("source_kind", [None])[0]
             q_f = qs.get("q", [None])[0]
             if direction_f:
@@ -2849,8 +2849,9 @@ def test_knowledge_list_applies_filters(mock_api, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "KNOWLEDGE LIBRARY" in out
-    # Both filter params must appear in the request URL
-    assert any("direction_id=d-abc12345" in path for _, path, _ in mock_api)
+    # Both filter params must appear in the request URL using the correct backend param names
+    assert any("/knowledge-documents" in path for _, path, _ in mock_api)
+    assert any("direction=d-abc12345" in path for _, path, _ in mock_api)
     assert any("source_kind=web_research" in path for _, path, _ in mock_api)
     # The matching document is rendered; the design doc (different direction) is not
     assert "API Rate Limiting" in out

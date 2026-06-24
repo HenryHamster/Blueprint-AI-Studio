@@ -3251,9 +3251,9 @@ def cmd_knowledge(args: argparse.Namespace) -> None:
 
 def _knowledge_list(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
-    path = f"/api/admin/projects/{pid}/knowledge?limit={getattr(args, 'limit', 20)}"
+    path = f"/api/admin/projects/{pid}/knowledge-documents?limit={getattr(args, 'limit', 20)}"
     if getattr(args, "direction", None):
-        path += f"&direction_id={args.direction}"
+        path += f"&direction={args.direction}"
     if getattr(args, "source_kind", None):
         path += f"&source_kind={args.source_kind}"
     if getattr(args, "q", None):
@@ -3288,7 +3288,7 @@ def _render_knowledge_list(data: dict) -> None:
 
 def _knowledge_show(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
-    doc = api("GET", f"/api/admin/projects/{pid}/knowledge/{args.doc_id}")
+    doc = api("GET", f"/api/admin/projects/{pid}/knowledge-documents/{args.doc_id}")
     _emit(args, doc, _render_knowledge_doc)
 
 
