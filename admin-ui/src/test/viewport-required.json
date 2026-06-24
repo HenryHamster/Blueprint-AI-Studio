@@ -2,7 +2,6 @@
   "requiredWidths": [375],
   "components": [
     "DashboardHome",
-    "ProjectDashboard",
     "DirectionsPanel",
     "TaskDetailDrawer",
     "ResearchBrowser",
