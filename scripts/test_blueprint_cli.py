@@ -740,7 +740,8 @@ def mock_api(monkeypatch):
                      "experiment": "exp-beta",
                      "benchmark": "bench-2",
                      "hypothesis": "Quantization works",
-                     "criterion_verdict": {"met": True, "measured_value": 80.0},
+                     "criterion_verdict": {"met": True, "metric": "latency_ms", "operator": "lt", "threshold": 100, "value": 80.0, "measurable": True},
+                     "polling_metadata": {"result_metrics": {"latency_ms": 80.0, "arms": {"arm_a": {"latency_ms": 75.0}, "arm_b": {"latency_ms": 85.0}}}},
                      "success_criterion": {"metric": "latency_ms", "operator": "lt", "threshold": 100}},
                 ],
                 "has_more": False,
@@ -2962,7 +2963,7 @@ def test_compute_analyze_with_yes_posts_analyze(mock_api, monkeypatch, capsys):
 
 
 def test_compute_show_renders_result_and_tolerates_missing_fields(mock_api, capsys):
-    """compute show <id-prefix> renders metrics, verdict, and knowledge doc; missing fields are omitted."""
+    """compute show <id-prefix> renders metrics, verdict, per-arm results, and verdict margin; missing fields are omitted."""
     # Full-match job id for the SUCCEEDED job in mock_api fixture
     job_id = "cjob-bbb0-0000-0000-000000000002"
     rc = blueprint.main(["compute", "show", job_id])
@@ -2974,10 +2975,19 @@ def test_compute_show_renders_result_and_tolerates_missing_fields(mock_api, caps
     assert "GPU benchmark beta" in out
     # Cost rendered
     assert "12.5" in out
-    # Criterion verdict rendered
+    # Criterion verdict rendered with metric, value, threshold, and margin
     assert "met=True" in out
+    assert "latency_ms lt 100" in out
+    assert "got 80.0" in out
+    assert "margin=" in out
     # Hypothesis rendered
     assert "Quantization works" in out
+    # result_metrics from polling_metadata rendered (scalar)
+    assert "latency_ms" in out
+    # Per-arm breakdown rendered
+    assert "per-arm results" in out
+    assert "arm_a" in out
+    assert "arm_b" in out
     # Test prefix-match: short prefix also resolves
     rc2 = blueprint.main(["compute", "show", "cjob-bbb0"])
     assert rc2 == 0

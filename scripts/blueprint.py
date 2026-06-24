@@ -3496,14 +3496,32 @@ def _render_compute_show(data: dict) -> None:
     exit_code = (j.get("polling_metadata") or {}).get("exit_code")
     if exit_code is not None:
         print(f"  exit_code : {exit_code}")
-    metrics = j.get("result_metrics")
+    metrics = (j.get("polling_metadata") or {}).get("result_metrics") or j.get("result_metrics")
     if metrics:
-        print(f"  metrics   : {metrics}")
+        arms = metrics.get("arms") if isinstance(metrics, dict) else None
+        scalar_items = {k: v for k, v in metrics.items() if k != "arms"} if isinstance(metrics, dict) else {}
+        if scalar_items:
+            print(f"  metrics   : {scalar_items}")
+        if arms:
+            print("  per-arm results:")
+            for arm_name, arm_metrics in (arms.items() if isinstance(arms, dict) else []):
+                print(f"    [{arm_name}] {arm_metrics}")
     verdict = j.get("criterion_verdict")
     if isinstance(verdict, dict):
         met = verdict.get("met")
-        reason = verdict.get("reason") or ""
-        print(f"  criterion : met={met}  {reason}")
+        metric = verdict.get("metric", "")
+        value = verdict.get("value")
+        threshold = verdict.get("threshold")
+        op = verdict.get("operator", "")
+        margin_str = ""
+        if value is not None and threshold is not None:
+            try:
+                margin = float(value) - float(threshold)
+                margin_str = f"  margin={margin:+.4g}"
+            except (TypeError, ValueError):
+                pass
+        val_str = f"  {metric} {op} {threshold} (got {value})" if metric else ""
+        print(f"  criterion : met={met}{val_str}{margin_str}")
     ref = j.get("result_reference")
     if ref:
         print(f"  result_ref: {ref}")
