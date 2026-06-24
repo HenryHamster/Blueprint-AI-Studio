@@ -6197,7 +6197,7 @@ async def test_run_qualification_reuses_grade_when_skipped_pr_count_nonzero(
     Previously blind_merge_grade_satisfied returned False whenever skipped_pr_count>0,
     causing incorrect behavior in the qualification pipeline.
     """
-    from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
+    BLIND_MERGE_GRADE_KEY = "blind_merge_grade"
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     version.goal = "deliver cost-reduction VM substrate change"

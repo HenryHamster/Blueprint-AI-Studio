@@ -1706,45 +1706,6 @@ def _compute_cold_start_breakdown_p50(
     }
 
 
-def _qualification_infra_usd(versions: list[Any]) -> float | None:
-    """Sum blind_merge_grade token costs across recent release versions.
-
-    Includes both the current grade's tokens and any accumulated tokens from
-    prior grades on different candidate SHAs (stored as
-    ``qualification_cumulative_input_tokens`` / ``qualification_cumulative_output_tokens``
-    in ``last_qualification`` by ``persist_blind_merge_grade``).
-
-    Returns None when no grade records with token data are found (pre-tracking
-    versions) so callers can distinguish "zero spend" from "no data".
-
-    Note: ``input_rate`` is used for cache-read tokens as a deliberate
-    conservative upper bound — cache-read tokens cost less, so this
-    overstates cost slightly.  No cache-hit breakdown is stored in the
-    grade record.
-    """
-    from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
-
-    input_rate, output_rate = LLM_TOKEN_PRICING.get(
-        ("anthropic", "claude-opus-4-8"), (0.0, 0.0)
-    )
-    total_usd = 0.0
-    found_any = False
-    for v in versions:
-        qual = getattr(v, "last_qualification", None) or {}
-        record = qual.get(BLIND_MERGE_GRADE_KEY)
-        if isinstance(record, dict):
-            input_tok = record.get("input_tokens") or 0
-            output_tok = record.get("output_tokens") or 0
-            if input_tok > 0 or output_tok > 0:
-                found_any = True
-                total_usd += input_tok * input_rate + output_tok * output_rate
-        cum_in = qual.get("qualification_cumulative_input_tokens") or 0
-        cum_out = qual.get("qualification_cumulative_output_tokens") or 0
-        if cum_in > 0 or cum_out > 0:
-            found_any = True
-            total_usd += cum_in * input_rate + cum_out * output_rate
-    return round(total_usd, 6) if found_any else None
-
 
 def compute_panel_review_effectiveness(
     tasks: list[Task], *, since_dt: datetime | None = None
@@ -2185,8 +2146,6 @@ async def compute_current_axes(
         compute_dominant_reuse_dropout,
     )
 
-    from app.models import ReleaseVersion  # noqa: PLC0415 — avoid circular import at module load
-
     tasks = await _load_recent_tasks(session, project_id)
     lanes = await _load_project_lanes(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
@@ -2197,21 +2156,6 @@ async def compute_current_axes(
     # first snapshot under the current build. Shared with the agent fetch surface
     # via _resolve_deploy_since so both derive the boundary identically.
     _deploy_since: datetime | None = await _resolve_deploy_since(session, project_id)
-
-    axis_cutoff_pre = _utcnow() - timedelta(days=_AXIS_WINDOW_DAYS)
-    _recent_versions = (
-        (
-            await session.execute(
-                select(ReleaseVersion).where(
-                    ReleaseVersion.project_id == project_id,
-                    ReleaseVersion.opened_at >= axis_cutoff_pre,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    _qual_infra_usd = _qualification_infra_usd(_recent_versions)
 
     # Honest net-cost companion: fold the project's warm-pool idle cost into the
     # cost_per_merged_pr numerator so pre-warming a pool can't make the headline
@@ -2313,9 +2257,7 @@ async def compute_current_axes(
         # drove the change — without relying on the on-demand live endpoint
         # (which only covers the current window). Reconciles with the scalar
         # llm_cost_per_merged_pr axis via the shared _task_llm_attempts path.
-        "llm_cost_attribution": _compact_llm_cost_attribution(
-            tasks, qualification_infra_usd=_qual_infra_usd
-        ),
+        "llm_cost_attribution": _compact_llm_cost_attribution(tasks),
         # VM cost by-task-type attribution: compact breakdown of total VM dollars
         # by task type so operators can see how much of cost_per_merged_pr drift
         # comes from primary tasks (review, create) vs quality-gate side-cars
