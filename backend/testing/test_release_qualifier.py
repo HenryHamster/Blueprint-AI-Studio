@@ -14738,6 +14738,91 @@ async def test_auto_stale_idempotent_skips_existing_ledger_rows(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_auto_stale_clears_keyless_challenger_independent_blocker(
+    db_session, mocker
+):
+    """Auto-stale sweep clears a keyless challenger_independent not_promoted
+    finding after HEAD advances, flipping requalification_ready to True.
+
+    Acceptance evidence: auto-stale sweep writes a sentinel ledger row for the
+    keyless finding (key=_KEYLESS_FINDING_SENTINEL), compute_requalification_readiness
+    reads it as stale → requalification_ready=True, and the re-drive spawns a
+    fresh qualification (version moves to pending).
+    """
+    from app.models import AuditFindingResolution
+    from app.release_readiness import (
+        _KEYLESS_FINDING_SENTINEL,
+        compute_requalification_readiness,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "oldsha0" * 5 + "0000000"
+    # Seed: challenger-confirmed independent blocker — stored WITHOUT a key
+    # (as _handle_independent_blocker does).
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "audit_challenge_independent_blocker",
+        "candidate_sha": old_sha,
+        "audit_findings": [
+            {
+                # No 'key' — mimics the keyless findings from challenger
+                "severity": "high",
+                "summary": "Challenger confirmed independent blocker (no key)",
+            },
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # Before HEAD advances: requalification_ready must be False (keyless finding unresolved).
+    before_readiness = await compute_requalification_readiness(
+        db_session, project.id
+    )
+    assert not before_readiness["requalification_ready"], (
+        "expected requalification_ready=False before auto-stale — "
+        f"got: {before_readiness}"
+    )
+
+    # automain HEAD has advanced past the candidate SHA.
+    new_sha = "automn0" * 5 + "00000"
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Sentinel stale row was written for the keyless finding.
+    ledger_rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(ledger_rows) == 1
+    assert ledger_rows[0].finding_key == _KEYLESS_FINDING_SENTINEL
+    assert ledger_rows[0].state == "stale"
+
+    # Re-drive fired: version moved to pending (fresh qualification spawned).
+    assert count == 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+    # Verify the sentinel row is present and stale — the authoritative proof that
+    # the keyless finding was auto-staled (unblocking requalification_ready).
+    assert ledger_rows[0].state == "stale", (
+        "sentinel row should be stale — the keyless finding was auto-staled"
+    )
+
+
+@pytest.mark.asyncio
 async def test_redrive_requalifies_zero_gating_ready_version(db_session, mocker):
     """A stabilize-phase version with not_promoted verdict, a non-audit blocker,
     ZERO carried high/medium audit findings, and automain advanced to a new SHA

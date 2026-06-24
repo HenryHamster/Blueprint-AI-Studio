@@ -447,6 +447,7 @@ async def _auto_stale_not_promoted_findings(
     """
     from app import github, release_qualifier
     from app.release_readiness import (
+        _KEYLESS_FINDING_SENTINEL,
         _REQUALIFICATION_GATING_SEVERITIES,
         _latest_carried_audit_findings,
         apply_finding_resolution,
@@ -519,7 +520,6 @@ async def _auto_stale_not_promoted_findings(
             if isinstance(f, dict)
             and str(f.get("severity") or "").lower()
             in _REQUALIFICATION_GATING_SEVERITIES
-            and f.get("key")
         ]
         if not gating_findings:
             return 0
@@ -542,7 +542,10 @@ async def _auto_stale_not_promoted_findings(
 
         written = 0
         for f in gating_findings:
-            key = f["key"]
+            # Findings without a content key (e.g. challenger-independent blockers
+            # persisted by _handle_independent_blocker) use a sentinel so they can
+            # be tracked in the ledger and resolved by the readiness check.
+            key = f.get("key") or _KEYLESS_FINDING_SENTINEL
             if key in existing_keys:
                 continue
             await apply_finding_resolution(
