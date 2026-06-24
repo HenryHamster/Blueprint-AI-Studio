@@ -17,6 +17,7 @@ transition. The old entry is replaced, not appended.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, TypedDict
 
@@ -41,6 +42,12 @@ _DEFAULT_FUTILITY_MIN_DELIVERY_RATE = 0.50
 # can manufacture a false null/negative verdict for a capability that was never
 # cleanly suppressed.
 _DEFAULT_FUTILITY_MAX_HOLDBACK_CONTAMINATION_RATE = 0.20
+# Significance gate: minimum z-score (|lift| / SE) required before issuing a
+# durable adopt or reject verdict.  Uses a conservative SE estimate assuming
+# p=0.5 (maximum binomial variance).  None disables the gate (opt-in per trial).
+# At n=30 per arm, a +0.05 lift yields z≈0.39 — well below 1.65 — so a trial
+# using this threshold cannot adopt on sampling noise alone.
+_DEFAULT_MIN_SIGNIFICANCE_Z: float | None = None
 
 
 def _default_config() -> dict[str, Any]:
@@ -51,6 +58,7 @@ def _default_config() -> dict[str, Any]:
         "futility_n": _DEFAULT_MIN_N_PER_ARM * _DEFAULT_FUTILITY_N_MULTIPLIER,
         "futility_min_delivery_rate": _DEFAULT_FUTILITY_MIN_DELIVERY_RATE,
         "futility_max_holdback_contamination_rate": _DEFAULT_FUTILITY_MAX_HOLDBACK_CONTAMINATION_RATE,
+        "min_significance_z": _DEFAULT_MIN_SIGNIFICANCE_Z,
     }
 
 
@@ -100,7 +108,9 @@ LANE_PILOT_CHECKPOINT_RECEIPT_KEY = "_review_fix_checkpoint"
 
 _DECIDED_VERDICTS = frozenset({"adopt", "reject", "no_effect", "ADOPT", "KILL"})
 _CONTINUE_VERDICTS = frozenset({"continue-trial", "CONTINUE"})
-_SUFFICIENT_DATA_CONTINUE_REASONS = frozenset({"ambiguous_lift", "receipt_only_trial"})
+_SUFFICIENT_DATA_CONTINUE_REASONS = frozenset(
+    {"ambiguous_lift", "receipt_only_trial", "insignificant_lift"}
+)
 
 
 class LanePilotAggregates(TypedDict, total=False):
@@ -438,6 +448,7 @@ def evaluate_trial_verdict(
     accumulation_basis: str | None = None,
     arm_composition: dict | None = None,
     receipt_only_trial: bool = False,
+    per_arm_cost: dict | None = None,
 ) -> dict[str, Any]:
     """Return a verdict dict for a capability trial based on measured lift and sample sizes.
 
@@ -507,6 +518,8 @@ def evaluate_trial_verdict(
         entry["evaluated_at"] = evaluated_at
     if arm_composition is not None:
         entry["arm_composition"] = arm_composition
+    if per_arm_cost is not None:
+        entry["per_arm_cost"] = per_arm_cost
 
     if lift is None or n_with < min_n or n_without < min_n:
         entry["verdict"] = "continue-trial"
@@ -544,6 +557,23 @@ def evaluate_trial_verdict(
         else:
             verdict = "continue-trial"
             verdict_reason = "ambiguous_lift"
+
+    # Significance gate: a durable adopt/reject verdict requires the measured lift
+    # to exceed the noise floor implied by arm sample sizes.  Uses a conservative
+    # SE estimate with p=0.5 (maximum binomial variance); trial operators can
+    # lower or disable the threshold via config["min_significance_z"].
+    # no_effect (futility bound) is intentionally excluded — it is a structural
+    # bound, not a precision claim.
+    min_significance_z = cfg.get("min_significance_z")
+    if (
+        verdict in ("adopt", "reject")
+        and min_significance_z is not None
+        and lift is not None
+    ):
+        se = math.sqrt(0.25 * (1.0 / n_with + 1.0 / n_without))
+        if se > 0 and abs(lift) / se < float(min_significance_z):
+            verdict = "continue-trial"
+            verdict_reason = "insignificant_lift"
 
     # Receipt-only guard: trials with no assignment key accumulate only receipt
     # context — the arms are structurally confounded and must never produce a
@@ -1015,7 +1045,7 @@ async def raise_stalled_trial_notice(
     project_id: Any,
     cap_name: str,
     entry: dict[str, Any],
-) -> None:
+) -> bool:
     """Record a durable operator notice when a capability trial is permanently stalled.
 
     Deduplicated on ``cap_name`` so repeated digest re-evaluations of the same stalled
@@ -1023,12 +1053,14 @@ async def raise_stalled_trial_notice(
     data the digest already computed: which arm is stalled, its assigned count vs
     ``min_n``, the recent accrual rates, the current ``holdback_fraction``, and the
     ``alternative_projections`` map of concrete options the operator can act on.
+
+    Returns True when a new notice was written, False when the dedupe key already existed.
     """
     from app.models import MessageType, ProjectMessage
 
     dedupe_key = f"capability_trial_stalled_{cap_name}"
     if await _check_open_message_exists(session, project_id, dedupe_key):
-        return
+        return False
 
     accrual = entry.get("accrual_projection") or {}
     with_7d = accrual.get("with_7d")
@@ -1067,6 +1099,7 @@ async def raise_stalled_trial_notice(
             },
         )
     )
+    return True
 
 
 async def persist_stalled_trial_notices_in_transaction(
@@ -1093,7 +1126,25 @@ async def persist_stalled_trial_notices_in_transaction(
     async with factory() as session:
         try:
             for cap_name, entry in stalled:
-                await raise_stalled_trial_notice(session, project_id, cap_name, entry)
+                newly_noticed = await raise_stalled_trial_notice(
+                    session, project_id, cap_name, entry
+                )
+                if newly_noticed:
+                    try:
+                        from app.strategic_trigger import request_strategic_refresh
+
+                        await request_strategic_refresh(
+                            session,
+                            project_id,
+                            f"capability_trial_stalled:{cap_name}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[CAPABILITY_TRIAL] strategic refresh failed for stalled trial "
+                            "%s on project %s (non-fatal)",
+                            cap_name,
+                            project_id,
+                        )
             await session.commit()
         except Exception:
             await session.rollback()
@@ -1149,17 +1200,19 @@ async def raise_ambiguous_lift_escalation_notice(
     project_id: Any,
     cap_name: str,
     entry: dict[str, Any],
-) -> None:
+) -> bool:
     """Record a durable operator notice when an ambiguous_lift trial exceeds the dwell threshold.
 
     Deduplicated on ``cap_name`` so repeated digest re-evaluations of the same
     long-dwelling trial emit exactly ONE open notice per capability.
+
+    Returns True when a new notice was written, False when the dedupe key already existed.
     """
     from app.models import MessageType, ProjectMessage
 
     dedupe_key = f"capability_trial_ambiguous_lift_escalation_{cap_name}"
     if await _check_open_message_exists(session, project_id, dedupe_key):
-        return
+        return False
 
     since_str = entry.get("ambiguous_lift_since")
     lift = entry.get("lift")
@@ -1191,6 +1244,7 @@ async def raise_ambiguous_lift_escalation_notice(
             },
         )
     )
+    return True
 
 
 async def persist_ambiguous_lift_escalations_in_transaction(
@@ -1217,8 +1271,89 @@ async def persist_ambiguous_lift_escalations_in_transaction(
     async with factory() as session:
         try:
             for cap_name, entry in escalated:
-                await raise_ambiguous_lift_escalation_notice(
+                newly_noticed = await raise_ambiguous_lift_escalation_notice(
                     session, project_id, cap_name, entry
+                )
+                if newly_noticed:
+                    try:
+                        from app.strategic_trigger import request_strategic_refresh
+
+                        await request_strategic_refresh(
+                            session,
+                            project_id,
+                            f"capability_trial_ambiguous_lift:{cap_name}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[CAPABILITY_TRIAL] strategic refresh failed for ambiguous-lift "
+                            "escalation %s on project %s (non-fatal)",
+                            cap_name,
+                            project_id,
+                        )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+def attach_accrual_projection_to_verdict(
+    project: Any,
+    cap_name: str,
+    accrual_projection: dict[str, Any],
+    is_stalled: bool = False,
+) -> None:
+    """Stamp accrual_projection and is_stalled onto an existing persisted verdict entry.
+
+    Supplements ``record_trial_verdict``: once the core verdict is committed, this
+    patches a fresh accrual-rate snapshot so strategic readers can see whether the
+    trial can reach min_n at current throughput.  Callers must flush/commit the session.
+    No-op when the cap has no existing verdict entry.
+    """
+    verdicts = getattr(project, "capability_adoption_verdicts", None)
+    if not isinstance(verdicts, dict):
+        return
+    entry = verdicts.get(cap_name)
+    if not isinstance(entry, dict):
+        return
+    verdicts[cap_name] = {
+        **entry,
+        "accrual_projection": accrual_projection,
+        "is_stalled": is_stalled,
+    }
+    flag_modified(project, "capability_adoption_verdicts")
+
+
+async def persist_accrual_projections_in_transaction(
+    source_session: Any,
+    project_id: Any,
+    *,
+    projections: list[tuple[str, dict[str, Any], bool]],
+) -> None:
+    """Durably persist accrual-projection snapshots onto existing verdict entries.
+
+    Opens its OWN committing AsyncSession (mirroring ``persist_trial_verdicts_in_transaction``)
+    so projection data survives regardless of whether the outer digest session commits.
+    Each tuple is (cap_name, accrual_projection, is_stalled).  Entries with no existing
+    verdict are silently skipped.  On any exception rolls back and re-raises.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.database import resolve_async_engine
+    from app.models import Project
+
+    factory = async_sessionmaker(
+        resolve_async_engine(source_session),
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with factory() as session:
+        try:
+            project = await session.get(Project, project_id)
+            if project is None:
+                return
+            for cap_name, accrual_projection, is_stalled in projections:
+                attach_accrual_projection_to_verdict(
+                    project, cap_name, accrual_projection, is_stalled
                 )
             await session.commit()
         except Exception:

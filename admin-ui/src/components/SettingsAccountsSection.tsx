@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react';
-import { AlertTriangle, ChevronDown, ChevronUp, FileDown, GitBranch, HelpCircle, Loader2, Pencil, Plus, RefreshCw, Sliders, Trash2, Users, X } from 'lucide-react';
+import { AlertTriangle, ChevronDown, ChevronUp, FileDown, GitBranch, HelpCircle, Loader2, Pencil, Plus, RefreshCw, Sliders, Trash2, X } from 'lucide-react';
 import { parseTimestamp, timeAgo } from '../utils/time';
 import type { AccountMutationResult, AccountMutationReturn, AccountUpdatePayload, AuthMode, MaxPlanAccount, ProviderCatalogEntry, ProviderName } from '../types/settings';
 
@@ -123,7 +123,6 @@ function useClockNow() {
 interface SettingsAccountsSectionProps {
   githubAccount: string | null;
   onConnectGitHub: () => void;
-  isAdmin: boolean;
   maxPlanAccounts: MaxPlanAccount[];
   onToggleAccount: (id: string, enabled: boolean) => void;
   onRemoveAccount: (id: string, force?: boolean) => AccountMutationReturn;
@@ -131,13 +130,6 @@ interface SettingsAccountsSectionProps {
   onRefreshAccountModels: (id: string) => void;
   onUpdateAccount: (id: string, payload: AccountUpdatePayload) => AccountMutationReturn;
   onUpdateAccountCaps: (id: string, caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null }) => void;
-  showUserManagement: boolean;
-  onToggleUserManagement: () => void;
-  showProjectMembers: boolean;
-  onToggleProjectMembers: () => void;
-  selectedProjectId: string | null;
-  selectedProjectMyRole: string | null;
-  onToggleSettings: () => void;
   providers: Record<string, ProviderCatalogEntry>;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
@@ -206,7 +198,7 @@ function AccountAvailabilityLine({ account, onRefresh }: { account: MaxPlanAccou
   }
 
   return (
-    <div className="text-[11px] font-mono flex items-center gap-1.5 mt-0.5">
+    <div className="text-ui-md font-mono flex items-center gap-1.5 mt-0.5">
       {body}
       <button
         type="button"
@@ -335,17 +327,17 @@ function AccountRow({
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 min-w-0 flex-wrap">
             <div className="text-sm text-neutral-200 truncate">{account.name}</div>
-            <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700">{account.provider}</span>
-            <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700">{account.auth_mode}</span>
+            <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700">{account.provider}</span>
+            <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700">{account.auth_mode}</span>
             {(dailyCap !== null || concurrentCap !== null || autoDisableAfter !== null) && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50" title="Usage caps configured">
+              <span className="text-ui-sm px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50" title="Usage caps configured">
                 {dailyCap !== null && <>{dailyCount}/{dailyCap} today</>}
                 {dailyCap !== null && concurrentCap !== null && <> &middot; </>}
                 {concurrentCap !== null && <>max {concurrentCap}</>}
               </span>
             )}
           </div>
-          <div className="text-[11px] text-neutral-500 font-mono">
+          <div className="text-ui-md text-neutral-500 font-mono">
             {account.active_tasks} active
             {tokenAge && <span className={`ml-2 ${isExpiring ? 'text-amber-400' : ''}`}>&middot; token {tokenAge}</span>}
             {account.provider_metadata?.project && typeof account.provider_metadata.project === 'string' && <span className="ml-2">&middot; {account.provider_metadata.project}</span>}
@@ -402,18 +394,18 @@ function AccountRow({
       {deleteState.confirming && (
         <div className="mt-2 pt-2 border-t border-red-900/40 space-y-1.5">
           {deleteState.conflictDetail ? (
-            <div className="text-[11px] text-amber-400 flex items-start gap-1.5">
+            <div className="text-ui-md text-amber-400 flex items-start gap-1.5">
               <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
               <span>{deleteState.conflictDetail}</span>
             </div>
           ) : (
-            <div className="text-[11px] text-neutral-400">Delete <span className="text-neutral-200">{account.name}</span>? This revokes its stored secret.</div>
+            <div className="text-ui-md text-neutral-400">Delete <span className="text-neutral-200">{account.name}</span>? This revokes its stored secret.</div>
           )}
           <div className="flex items-center gap-2">
             <button
               onClick={() => handleConfirmDelete(Boolean(deleteState.conflictDetail))}
               disabled={isBusy}
-              className="bg-red-950/50 hover:bg-red-900/50 disabled:opacity-40 text-red-300 text-[11px] py-1 px-3 rounded border border-red-900/60 inline-flex items-center gap-1.5"
+              className="bg-red-950/50 hover:bg-red-900/50 disabled:opacity-40 text-red-300 text-ui-md py-1 px-3 rounded border border-red-900/60 inline-flex items-center gap-1.5"
             >
               {busy === 'delete' && <Loader2 className="w-3 h-3 animate-spin" />}
               {deleteState.conflictDetail ? 'Force delete' : 'Delete'}
@@ -421,7 +413,7 @@ function AccountRow({
             <button
               onClick={() => setDeleteState({ confirming: false, conflictDetail: null })}
               disabled={isBusy}
-              className="text-[11px] text-neutral-500 hover:text-neutral-300 disabled:opacity-40"
+              className="text-ui-md text-neutral-500 hover:text-neutral-300 disabled:opacity-40"
             >
               Cancel
             </button>
@@ -438,7 +430,7 @@ function AccountRow({
         />
       )}
       {account.disabled_reason && (
-        <div className="mt-2 pt-2 border-t border-red-900/40 text-[11px] text-red-400 flex items-center justify-between gap-2">
+        <div className="mt-2 pt-2 border-t border-red-900/40 text-ui-md text-red-400 flex items-center justify-between gap-2">
           <span>&#9888; {account.disabled_reason}</span>
           <button data-viewport-allow-small-target disabled={isBusy} onClick={() => run('toggle', () => onToggleAccount(account.id, true))} className="text-red-300 hover:text-red-200 disabled:opacity-40 underline">Re-enable</button>
         </div>
@@ -452,7 +444,7 @@ function AccountRow({
             const remaining = recoveryAt ? Math.max(0, Math.round((recoveryAt.getTime() - now) / 60000)) : null;
             const shortModel = model.replace('claude-', '').replace('-4-6', '');
             return (
-              <div key={model} className="flex items-center justify-between text-[11px] text-amber-400/80">
+              <div key={model} className="flex items-center justify-between text-ui-md text-amber-400/80">
                 <span className="font-mono">{shortModel} <span className="text-amber-500/60">hit #{info.hits}</span></span>
                 <span className="text-amber-500/60">{remaining !== null && remaining > 0 ? `${remaining}m left` : 'recovering'}</span>
               </div>
@@ -462,7 +454,7 @@ function AccountRow({
             onClick={() => run('reset', () => onResetRateLimits(account.id))}
             disabled={isBusy}
             data-viewport-allow-small-target
-            className="mt-1.5 w-full text-[11px] text-amber-400/70 hover:text-amber-300 disabled:opacity-40 bg-amber-950/30 hover:bg-amber-950/50 rounded-lg px-2 py-1 transition-colors"
+            className="mt-1.5 w-full text-ui-md text-amber-400/70 hover:text-amber-300 disabled:opacity-40 bg-amber-950/30 hover:bg-amber-950/50 rounded-lg px-2 py-1 transition-colors"
           >
             {busy === 'reset' ? 'Clearing…' : 'Clear rate limits'}
           </button>
@@ -470,10 +462,10 @@ function AccountRow({
       )}
       {isCapExpanded && (
         <div className="mt-2 pt-2 border-t border-neutral-800/50 space-y-2">
-          <div className="text-[10px] uppercase tracking-wider text-neutral-500">Usage caps</div>
+          <div className="text-ui-sm uppercase tracking-wider text-neutral-500">Usage caps</div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
             <label className="block">
-              <div className="text-[10px] text-neutral-500 mb-1">Tasks/day</div>
+              <div className="text-ui-sm text-neutral-500 mb-1">Tasks/day</div>
               <input
                 type="number"
                 min={1}
@@ -484,7 +476,7 @@ function AccountRow({
               />
             </label>
             <label className="block">
-              <div className="text-[10px] text-neutral-500 mb-1">Max concurrent</div>
+              <div className="text-ui-sm text-neutral-500 mb-1">Max concurrent</div>
               <input
                 type="number"
                 min={1}
@@ -495,7 +487,7 @@ function AccountRow({
               />
             </label>
             <label className="block">
-              <div className="text-[10px] text-neutral-500 mb-1">Auto-disable after N RL</div>
+              <div className="text-ui-sm text-neutral-500 mb-1">Auto-disable after N RL</div>
               <input
                 type="number"
                 min={1}
@@ -522,17 +514,17 @@ function AccountRow({
                 });
                 setExpandedAccountCaps(null);
               }}
-              className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-[11px] py-1 px-3 rounded border border-neutral-700"
+              className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-ui-md py-1 px-3 rounded border border-neutral-700"
             >
               Save caps
             </button>
             <button
               onClick={() => setExpandedAccountCaps(null)}
-              className="text-[11px] text-neutral-500 hover:text-neutral-300"
+              className="text-ui-md text-neutral-500 hover:text-neutral-300"
             >
               Cancel
             </button>
-            <span className="text-[10px] text-neutral-600 ml-auto">Leave a field empty for unlimited/off.</span>
+            <span className="text-ui-sm text-neutral-600 ml-auto">Leave a field empty for unlimited/off.</span>
           </div>
         </div>
       )}
@@ -639,9 +631,9 @@ function AccountEditForm({
 
   return (
     <div className="mt-2 pt-3 border-t border-neutral-800/60 bg-neutral-950/40 rounded-lg p-3 space-y-3">
-      <div className="text-[10px] font-semibold text-neutral-300 uppercase tracking-wider">Edit account</div>
+      <div className="text-ui-sm font-semibold text-neutral-300 uppercase tracking-wider">Edit account</div>
       <div>
-        <div className="text-[10px] text-neutral-500 mb-1 uppercase">Name</div>
+        <div className="text-ui-sm text-neutral-500 mb-1 uppercase">Name</div>
         <input aria-label="Account name" value={name} onChange={e => setName(e.target.value)} className={inputCls} />
       </div>
       <label className="flex items-center gap-2 text-xs text-neutral-300 cursor-pointer">
@@ -650,7 +642,7 @@ function AccountEditForm({
       </label>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
         <div>
-          <div className="text-[10px] text-neutral-500 mb-1 uppercase">Provider</div>
+          <div className="text-ui-sm text-neutral-500 mb-1 uppercase">Provider</div>
           <select
             aria-label="Provider"
             value={provider}
@@ -667,7 +659,7 @@ function AccountEditForm({
           </select>
         </div>
         <div>
-          <div className="text-[10px] text-neutral-500 mb-1 uppercase">Auth mode</div>
+          <div className="text-ui-sm text-neutral-500 mb-1 uppercase">Auth mode</div>
           <select aria-label="Auth mode" value={authMode} onChange={e => setAuthMode(e.target.value as AuthMode)} className={inputCls}>
             {authModes.map(m => <option key={m} value={m}>{m}</option>)}
           </select>
@@ -679,7 +671,7 @@ function AccountEditForm({
             const hint = METADATA_HINTS[field];
             return (
               <div key={field}>
-                <div className="text-[10px] text-neutral-500 mb-1 uppercase">{field}{requiredFields.includes(field) && <span className="text-red-400"> *</span>}</div>
+                <div className="text-ui-sm text-neutral-500 mb-1 uppercase">{field}{requiredFields.includes(field) && <span className="text-red-400"> *</span>}</div>
                 <input
                   aria-label={`metadata ${field}`}
                   value={metaDraft[field] ?? ''}
@@ -693,7 +685,7 @@ function AccountEditForm({
         </div>
       )}
       <div>
-        <div className="text-[10px] text-neutral-500 mb-1 uppercase flex items-center gap-1">
+        <div className="text-ui-sm text-neutral-500 mb-1 uppercase flex items-center gap-1">
           New token / secret
           {identityChanged && <span className="text-red-400 normal-case">(required — provider/auth changed)</span>}
         </div>
@@ -720,7 +712,7 @@ function AccountEditForm({
       </div>
       {targetIsAnthropicOauth && (
         <div>
-          <div className="text-[10px] text-neutral-500 mb-1 uppercase">claude_config_json <span className="normal-case text-neutral-600">(optional)</span></div>
+          <div className="text-ui-sm text-neutral-500 mb-1 uppercase">claude_config_json <span className="normal-case text-neutral-600">(optional)</span></div>
           <textarea
             aria-label="claude_config_json"
             value={claudeConfigJson}
@@ -730,7 +722,7 @@ function AccountEditForm({
             placeholder='Leave blank to keep current; paste JSON to replace'
             className={`${inputCls} font-mono resize-none disabled:opacity-40`}
           />
-          <label className="flex items-center gap-2 text-[11px] text-neutral-500 mt-1 cursor-pointer">
+          <label className="flex items-center gap-2 text-ui-md text-neutral-500 mt-1 cursor-pointer">
             <input type="checkbox" checked={clearClaudeConfig} onChange={e => setClearClaudeConfig(e.target.checked)} className="accent-red-500" />
             Clear stored claude_config_json
           </label>
@@ -738,15 +730,15 @@ function AccountEditForm({
       )}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
         <label className="block">
-          <div className="text-[10px] text-neutral-500 mb-1">Tasks/day</div>
+          <div className="text-ui-sm text-neutral-500 mb-1">Tasks/day</div>
           <input aria-label="Tasks per day cap" type="number" min={1} value={dailyTaskCap} placeholder="unlimited" onChange={e => setDailyTaskCap(e.target.value)} className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600" />
         </label>
         <label className="block">
-          <div className="text-[10px] text-neutral-500 mb-1">Max concurrent</div>
+          <div className="text-ui-sm text-neutral-500 mb-1">Max concurrent</div>
           <input aria-label="Max concurrent cap" type="number" min={1} value={maxConcurrent} placeholder="unlimited" onChange={e => setMaxConcurrent(e.target.value)} className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600" />
         </label>
         <label className="block">
-          <div className="text-[10px] text-neutral-500 mb-1">Auto-disable</div>
+          <div className="text-ui-sm text-neutral-500 mb-1">Auto-disable</div>
           <input aria-label="Auto-disable cap" type="number" min={1} value={autoDisable} placeholder="off" onChange={e => setAutoDisable(e.target.value)} className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600" />
         </label>
       </div>
@@ -760,7 +752,7 @@ function AccountEditForm({
           Save changes
         </button>
         <button onClick={onCancel} data-viewport-allow-small-target className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors">Cancel</button>
-        {tokenMissing && <span className="text-[11px] text-amber-400 ml-auto">New token required</span>}
+        {tokenMissing && <span className="text-ui-md text-amber-400 ml-auto">New token required</span>}
       </div>
     </div>
   );
@@ -853,7 +845,7 @@ function AccountAddForm({
       <div className="text-xs font-semibold text-neutral-200 uppercase tracking-wider">New account</div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
         <div>
-          <div className="text-[10px] text-neutral-500 mb-1 uppercase">Provider</div>
+          <div className="text-ui-sm text-neutral-500 mb-1 uppercase">Provider</div>
           <select
             value={newAccountProvider}
             onChange={e => setNewAccountProvider(e.target.value as ProviderName)}
@@ -865,7 +857,7 @@ function AccountAddForm({
           </select>
         </div>
         <div>
-          <div className="text-[10px] text-neutral-500 mb-1 uppercase">Auth mode</div>
+          <div className="text-ui-sm text-neutral-500 mb-1 uppercase">Auth mode</div>
           <select
             value={newAccountAuthMode}
             onChange={e => setNewAccountAuthMode(e.target.value as AuthMode)}
@@ -882,7 +874,7 @@ function AccountAddForm({
           <HelpCircle className="w-4 h-4 text-cyan-400/80 shrink-0 mt-0.5" />
           <div className="min-w-0 flex-1">
             <div className="text-xs text-neutral-300">{guide.summary}</div>
-            <ol className="list-decimal list-inside mt-1.5 space-y-0.5 text-[11px] text-neutral-400">
+            <ol className="list-decimal list-inside mt-1.5 space-y-0.5 text-ui-md text-neutral-400">
               {guide.steps.map((step, i) => (
                 <li key={i}>{renderGuideText(step)}</li>
               ))}
@@ -891,7 +883,7 @@ function AccountAddForm({
         </div>
       )}
       <div>
-        <div className="text-[10px] text-neutral-500 mb-1 uppercase">Name</div>
+        <div className="text-ui-sm text-neutral-500 mb-1 uppercase">Name</div>
         <input
           value={newAccountName}
           onChange={e => setNewAccountName(e.target.value)}
@@ -905,21 +897,21 @@ function AccountAddForm({
             const hint = METADATA_HINTS[field];
             return (
               <div key={field}>
-                <div className="text-[10px] text-neutral-500 mb-1 uppercase">{field}</div>
+                <div className="text-ui-sm text-neutral-500 mb-1 uppercase">{field}</div>
                 <input
                   value={newAccountProviderMetadata[field] ?? ''}
                   onChange={e => setNewAccountProviderMetadata({ ...newAccountProviderMetadata, [field]: e.target.value })}
                   placeholder={hint?.placeholder ?? field}
                   className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
                 />
-                {hint && <div className="text-[10px] text-neutral-600 mt-0.5">{hint.label}</div>}
+                {hint && <div className="text-ui-sm text-neutral-600 mt-0.5">{hint.label}</div>}
               </div>
             );
           })}
         </div>
       )}
       <div>
-        <div className="text-[10px] text-neutral-500 mb-1 uppercase">{secretLabel}</div>
+        <div className="text-ui-sm text-neutral-500 mb-1 uppercase">{secretLabel}</div>
         {((newAccountProvider === 'openai' && newAccountAuthMode === 'oauth') || (newAccountProvider === 'gemini' && newAccountAuthMode === 'service_account')) ? (
           <div className="space-y-1.5">
             <textarea
@@ -929,7 +921,7 @@ function AccountAddForm({
               placeholder={`Paste ${secretLabel} or upload a .json file below`}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
             />
-            <label className="flex items-center gap-2 text-[11px] text-neutral-500 hover:text-neutral-300 cursor-pointer transition-colors">
+            <label className="flex items-center gap-2 text-ui-md text-neutral-500 hover:text-neutral-300 cursor-pointer transition-colors">
               <span className="inline-flex items-center gap-1 bg-neutral-800 border border-neutral-700 rounded px-2 py-1 hover:bg-neutral-700">
                 <FileDown className="w-3 h-3" /> Upload .json file
               </span>
@@ -964,12 +956,12 @@ function AccountAddForm({
       </div>
       {newAccountProvider === 'anthropic' && newAccountAuthMode === 'oauth' && (
         <div>
-          <div className="text-[10px] text-neutral-500 mb-1 uppercase flex items-center gap-1">
+          <div className="text-ui-sm text-neutral-500 mb-1 uppercase flex items-center gap-1">
             claude_config_json
             <span className="text-neutral-600" title="Optional. Contents of ~/.claude.json - lets the agent skip onboarding screens on first run. Not required for most setups.">
               <HelpCircle className="w-3 h-3" />
             </span>
-            <span className="text-[10px] text-neutral-600 normal-case">(optional)</span>
+            <span className="text-ui-sm text-neutral-600 normal-case">(optional)</span>
           </div>
           <textarea
             value={newAccountClaudeConfigJson}
@@ -983,7 +975,7 @@ function AccountAddForm({
       <button
         onClick={() => setShowAddAccountCaps(!showAddAccountCaps)}
         data-viewport-allow-small-target
-        className="flex items-center gap-1.5 text-[11px] text-neutral-500 hover:text-neutral-300 transition-colors"
+        className="flex items-center gap-1.5 text-ui-md text-neutral-500 hover:text-neutral-300 transition-colors"
       >
         {showAddAccountCaps ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
         Usage limits (optional)
@@ -991,7 +983,7 @@ function AccountAddForm({
       {showAddAccountCaps && (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-2 bg-neutral-950 border border-neutral-800 rounded-lg p-3">
           <label className="block">
-            <div className="text-[10px] text-neutral-500 mb-1 flex items-center gap-1">
+            <div className="text-ui-sm text-neutral-500 mb-1 flex items-center gap-1">
               Tasks/day
               <span title="Hard cap on tasks dispatched to this account per rolling 24h window. Empty = unlimited.">
                 <HelpCircle className="w-3 h-3 text-neutral-600" />
@@ -1007,7 +999,7 @@ function AccountAddForm({
             />
           </label>
           <label className="block">
-            <div className="text-[10px] text-neutral-500 mb-1 flex items-center gap-1">
+            <div className="text-ui-sm text-neutral-500 mb-1 flex items-center gap-1">
               Max concurrent
               <span title="Maximum number of tasks running on this account at once. Empty = unlimited.">
                 <HelpCircle className="w-3 h-3 text-neutral-600" />
@@ -1023,7 +1015,7 @@ function AccountAddForm({
             />
           </label>
           <label className="block">
-            <div className="text-[10px] text-neutral-500 mb-1 flex items-center gap-1">
+            <div className="text-ui-sm text-neutral-500 mb-1 flex items-center gap-1">
               Auto-disable
               <span title="Disable the account (needs manual re-enable) after this many consecutive rate-limit hits. Empty = off.">
                 <HelpCircle className="w-3 h-3 text-neutral-600" />
@@ -1056,7 +1048,7 @@ function AccountAddForm({
         >
           Cancel
         </button>
-        <span className="text-[11px] text-neutral-600 ml-auto">Missing: {missing.join(', ')}</span>
+        <span className="text-ui-md text-neutral-600 ml-auto">Missing: {missing.join(', ')}</span>
       </div>
     </div>
   );
@@ -1065,7 +1057,6 @@ function AccountAddForm({
 export function SettingsAccountsSection({
   githubAccount,
   onConnectGitHub,
-  isAdmin,
   maxPlanAccounts,
   onToggleAccount,
   onRemoveAccount,
@@ -1073,13 +1064,6 @@ export function SettingsAccountsSection({
   onRefreshAccountModels,
   onUpdateAccount,
   onUpdateAccountCaps,
-  showUserManagement,
-  onToggleUserManagement,
-  showProjectMembers,
-  onToggleProjectMembers,
-  selectedProjectId,
-  selectedProjectMyRole,
-  onToggleSettings,
   providers,
   newAccountName,
   setNewAccountName,
@@ -1121,41 +1105,6 @@ export function SettingsAccountsSection({
 
   return (
     <div className="space-y-6">
-      {isAdmin && (
-        <div>
-          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">User Management</h3>
-          <button
-            onClick={() => { onToggleUserManagement(); onToggleSettings(); }}
-            className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
-              showUserManagement
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
-            }`}
-          >
-            <Users className="w-3.5 h-3.5" />
-            {showUserManagement ? 'Close User Management' : 'Open User Management'}
-          </button>
-        </div>
-      )}
-
-      {selectedProjectId && (selectedProjectMyRole === 'owner' || isAdmin) && (
-        <div>
-          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Project Members</h3>
-          <button
-            data-testid="toggle-project-members"
-            onClick={() => { onToggleProjectMembers(); onToggleSettings(); }}
-            className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
-              showProjectMembers
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
-            }`}
-          >
-            <Users className="w-3.5 h-3.5" />
-            {showProjectMembers ? 'Close Project Members' : 'Manage Project Members'}
-          </button>
-        </div>
-      )}
-
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">GitHub</h3>
         {githubAccount ? (
@@ -1182,7 +1131,7 @@ export function SettingsAccountsSection({
           return (
             <div className={`flex items-center justify-between text-xs mb-3 px-3 py-2 rounded-lg border ${warn ? 'bg-amber-950/30 border-amber-900/50 text-amber-400' : 'bg-neutral-900 border-neutral-800 text-neutral-400'}`}>
               <span>Pool: <span className={warn ? 'text-amber-300 font-medium' : 'text-neutral-200 font-medium'}>{available}/{total}</span> available</span>
-              {warn && <span className="text-amber-500 text-[11px]">degraded</span>}
+              {warn && <span className="text-amber-500 text-ui-md">degraded</span>}
             </div>
           );
         })()}

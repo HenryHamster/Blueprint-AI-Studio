@@ -380,10 +380,11 @@ async def list_messages(
     status: Optional[str] = Query("open"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    q: Optional[str] = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """List project messages, optionally filtered by project and status."""
+    """List project messages, optionally filtered by project, status, and content search."""
     user_pids = _user_project_ids(current_user["user_id"])
     filters = [ProjectMessage.project_id.in_(user_pids)]
     if project_id:
@@ -398,6 +399,11 @@ async def list_messages(
                 detail="Invalid status filter. Must be 'open', 'resolved', or 'all'",
             )
         filters.append(ProjectMessage.status == status)
+    q_stripped = (q or "").strip()
+    if q_stripped:
+        q_escaped = q_stripped.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        q_pattern = f"%{q_escaped}%"
+        filters.append(ProjectMessage.content.ilike(q_pattern, escape="\\"))
 
     total = (
         await session.execute(
@@ -415,26 +421,29 @@ async def list_messages(
         # high. Clients should treat the returned list as "up to 100 most recent" rather
         # than a guaranteed-complete set.
         _HS_LIMIT = 100
+        hs_filters = [
+            ProjectMessage.project_id.in_(user_pids),
+            ProjectMessage.status == "open",
+            or_(
+                ProjectMessage.from_type == "user",
+                ProjectMessage.message_type.in_(
+                    ["FEEDBACK", "BLOCKER", "BUG_REPORT"]
+                ),
+                and_(
+                    ProjectMessage.message_type == MessageType.NOTE,
+                    ProjectMessage.from_type == "system",
+                    ProjectMessage.context["event_type"]
+                    .as_string()
+                    .in_(list(HIGH_SIGNAL_NOTE_EVENT_TYPES)),
+                ),
+            ),
+            *([ProjectMessage.project_id == pid_uuid] if pid_uuid else []),
+        ]
+        if q_stripped:
+            hs_filters.append(ProjectMessage.content.ilike(q_pattern, escape="\\"))
         hs_q = (
             select(ProjectMessage)
-            .where(
-                ProjectMessage.project_id.in_(user_pids),
-                ProjectMessage.status == "open",
-                or_(
-                    ProjectMessage.from_type == "user",
-                    ProjectMessage.message_type.in_(
-                        ["FEEDBACK", "BLOCKER", "BUG_REPORT"]
-                    ),
-                    and_(
-                        ProjectMessage.message_type == MessageType.NOTE,
-                        ProjectMessage.from_type == "system",
-                        ProjectMessage.context["event_type"]
-                        .as_string()
-                        .in_(list(HIGH_SIGNAL_NOTE_EVENT_TYPES)),
-                    ),
-                ),
-                *([ProjectMessage.project_id == pid_uuid] if pid_uuid else []),
-            )
+            .where(*hs_filters)
             .order_by(ProjectMessage.created_at.desc())
             .limit(_HS_LIMIT)
         )
@@ -673,6 +682,22 @@ async def resolve_message(
     )
     await session.commit()
     if result.rowcount > 0:
+        if msg.message_type == MessageType.QUESTION and resolution:
+            try:
+                from app.notification_dispatch import post_question_answer as _post_qa
+
+                await _post_qa(
+                    session,
+                    msg.project_id,
+                    msg.id,
+                    resolution,
+                    from_type="user",
+                )
+                await session.commit()
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "post_question_answer failed for message %s", msg.id, exc_info=True
+                )
         return {"id": str(msg.id), "status": "resolved"}
     else:
         # Message was already resolved by a concurrent request

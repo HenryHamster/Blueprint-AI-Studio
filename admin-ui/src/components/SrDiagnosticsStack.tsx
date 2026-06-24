@@ -76,7 +76,7 @@ export function SrDiagnosticsStack({
       {/* SR Recent Misses */}
       {!loading && srRecentMisses && srRecentMisses.length > 0 && (
         <section>
-          <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+          <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">
             Recent SR Misses
             <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srRecentMissesTotal} task{srRecentMissesTotal !== 1 ? 's' : ''}</span>
           </p>
@@ -97,7 +97,7 @@ export function SrDiagnosticsStack({
       {/* SR Blind Spots aggregation */}
       {!loading && blindSpots && blindSpots.themes.length > 0 && (
         <section>
-          <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+          <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">
             SR Blind Spots
             <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {blindSpots.total_distinct_themes} themes · {blindSpots.window_days}d</span>
           </p>
@@ -108,7 +108,7 @@ export function SrDiagnosticsStack({
                 <div key={i} className="flex flex-col gap-0.5 min-w-0">
                   <button
                     onClick={() => onToggleBlindSpotTheme(t.theme)}
-                    className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/20 cursor-pointer hover:bg-violet-500/20 transition-colors min-h-[44px]"
+                    className="inline-flex items-center gap-1.5 text-ui-sm font-semibold px-2 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/20 cursor-pointer hover:bg-violet-500/20 transition-colors min-h-[44px]"
                     title={t.theme}
                   >
                     <span className="truncate max-w-[160px]">{t.theme}</span>
@@ -117,7 +117,7 @@ export function SrDiagnosticsStack({
                   {isExpanded && t.examples && t.examples.length > 0 && (
                     <div className="flex flex-col gap-1 ml-1 border-l border-violet-500/20 pl-2">
                       {t.examples.map((ex, exIdx) => (
-                        <div key={exIdx} className="text-[9px] text-neutral-300">
+                        <div key={exIdx} className="text-ui-xs text-neutral-300">
                           <span className="text-neutral-500 block mb-0.5">{ex.text}</span>
                           <button
                             onClick={() => onViewTaskById(ex.task_id)}
@@ -136,7 +136,7 @@ export function SrDiagnosticsStack({
                         .map(([layer, cnt]) => (
                           <span
                             key={layer}
-                            className="inline-flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded border bg-neutral-500/10 text-neutral-400 border-neutral-500/20 max-w-[140px]"
+                            className="inline-flex items-center gap-0.5 text-ui-xs px-1.5 py-0.5 rounded border bg-neutral-500/10 text-neutral-400 border-neutral-500/20 max-w-[140px]"
                           >
                             <span className="truncate">{layer}</span>
                             <span className="shrink-0">×{cnt}</span>
@@ -154,7 +154,7 @@ export function SrDiagnosticsStack({
       {/* SR Reviewer Disagreements */}
       {!loading && srReviewerDisagreements && srReviewerDisagreements.disagreements.length > 0 && (
         <section>
-          <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+          <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">
             SR ↔ Reviewer Disagreements
             <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srReviewerDisagreements.window_days}d · {
               srReviewerDisagreements.total_distinct_categories !== undefined
@@ -172,7 +172,7 @@ export function SrDiagnosticsStack({
       {/* Per-Direction SR Catch-Rate */}
       {!loading && directionSrBreakdown && directionSrBreakdown.directions.length > 0 && (
         <section data-testid="direction-sr-breakdown">
-          <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+          <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">
             SR Catch-Rate by Direction
             <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">
               · {directionSrBreakdown.directions.length} direction{directionSrBreakdown.directions.length !== 1 ? 's' : ''} · worst-first
@@ -189,7 +189,7 @@ export function SrDiagnosticsStack({
       {/* Prompt Fingerprint SR Quality */}
       {!loading && fingerprintAnalytics && fingerprintAnalytics.fingerprints.length > 0 && (
         <section data-testid="prompt-fingerprint-sr-quality">
-          <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+          <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">
             Prompt Fingerprint SR Quality
             <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">
               · {fingerprintAnalytics.fingerprints.length} regime{fingerprintAnalytics.fingerprints.length !== 1 ? 's' : ''} · {fingerprintAnalytics.window_days}d
@@ -202,12 +202,12 @@ export function SrDiagnosticsStack({
               const delta = fp.sr_catch_rate_delta_vs_project_mean;
               const deltaColor = delta == null ? '' : delta >= 0 ? 'text-emerald-400' : 'text-red-400';
               return (
-                <div key={fp.fingerprint} className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[11px]">
+                <div key={fp.fingerprint} className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-md">
                   <div className="flex items-center gap-2 mb-0.5">
-                    <span className="font-mono text-neutral-400 text-[10px]">{fp.fingerprint.slice(0, 12)}…</span>
-                    <span className="text-neutral-600 text-[10px]">n={fp.sample_size}</span>
+                    <span className="font-mono text-neutral-400 text-ui-sm">{fp.fingerprint.slice(0, 12)}…</span>
+                    <span className="text-neutral-600 text-ui-sm">n={fp.sample_size}</span>
                   </div>
-                  <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-neutral-500">
+                  <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-500">
                     <span>catch <span className={`font-semibold ${catchColor}`}>{catchRate != null ? `${Math.round(catchRate * 100)}%` : '--'}</span>{' '}<span className="text-neutral-600">n={fp.sr_catch_sample_size}</span>{delta != null && <span className={`ml-1 ${deltaColor}`}>({delta >= 0 ? '+' : ''}{Math.round(delta * 100)}pp)</span>}</span>
                     <span>rescue <span className="font-semibold text-neutral-300">{fp.reviewer_rescue_rate != null ? `${Math.round(fp.reviewer_rescue_rate * 100)}%` : '--'}</span>{' '}<span className="text-neutral-600">n={fp.reviewer_rescue_sample_size}</span></span>
                     {fp.sr_false_positive_rate != null && <span>FP <span className="font-semibold text-neutral-300">{Math.round(fp.sr_false_positive_rate * 100)}%</span>{' '}<span className="text-neutral-600">n={fp.sr_false_positive_sample_size}</span></span>}
@@ -215,7 +215,7 @@ export function SrDiagnosticsStack({
                   {fp.sr_reviewer_disagreement_top_categories.length > 0 && (
                     <div className="flex flex-wrap gap-1 mt-1">
                       {fp.sr_reviewer_disagreement_top_categories.slice(0, 3).map((d) => (
-                        <span key={d.category} className="text-[9px] px-1 py-0.5 rounded bg-neutral-800/60 text-neutral-400 border border-neutral-700/40">
+                        <span key={d.category} className="text-ui-xs px-1 py-0.5 rounded bg-neutral-800/60 text-neutral-400 border border-neutral-700/40">
                           {d.category}
                         </span>
                       ))}

@@ -3,6 +3,7 @@ import { SettingsGeneralSection } from './SettingsGeneralSection';
 import { SettingsOrchestratorSection } from './SettingsOrchestratorSection';
 import { SettingsNotificationsSection } from './SettingsNotificationsSection';
 import type { NotificationConfig } from './SettingsNotificationsSection';
+import { Users } from 'lucide-react';
 import { ProviderSettingsPanel } from './ProviderSettingsPanel';
 import { ProviderCategoriesPanel } from './ProviderCategoriesPanel';
 import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
@@ -363,7 +364,6 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
         <SettingsAccountsSection
           githubAccount={props.githubAccount}
           onConnectGitHub={props.onConnectGitHub}
-          isAdmin={props.isAdmin}
           maxPlanAccounts={props.maxPlanAccounts}
           onToggleAccount={props.onToggleAccount}
           onRemoveAccount={props.onRemoveAccount}
@@ -371,13 +371,6 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           onRefreshAccountModels={props.onRefreshAccountModels}
           onUpdateAccount={props.onUpdateAccount}
           onUpdateAccountCaps={props.onUpdateAccountCaps}
-          showUserManagement={props.showUserManagement}
-          onToggleUserManagement={props.onToggleUserManagement}
-          showProjectMembers={props.showProjectMembers}
-          onToggleProjectMembers={props.onToggleProjectMembers}
-          selectedProjectId={props.selectedProjectId}
-          selectedProjectMyRole={props.selectedProjectMyRole}
-          onToggleSettings={props.onToggleSettings}
           providers={props.providers}
           newAccountName={props.newAccountName}
           setNewAccountName={props.setNewAccountName}
@@ -399,6 +392,49 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           setNewAccountAutoDisableAfterRateLimits={props.setNewAccountAutoDisableAfterRateLimits}
           onAddAccount={props.onAddAccount}
         />
+      );
+    case 'access':
+      return (
+        <div className="space-y-6">
+          {props.isAdmin && (
+            <div>
+              <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">User Management</h3>
+              <p className="text-xs text-neutral-500 mb-3">Manage which users can access this Blueprint instance and their roles.</p>
+              <button
+                onClick={() => { props.onToggleUserManagement(); props.onToggleSettings(); }}
+                className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
+                  props.showUserManagement
+                    ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+                    : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+                }`}
+              >
+                <Users className="w-3.5 h-3.5" />
+                {props.showUserManagement ? 'Close User Management' : 'Manage Users'}
+              </button>
+            </div>
+          )}
+          {props.selectedProjectId && (props.selectedProjectMyRole === 'owner' || props.isAdmin) && (
+            <div>
+              <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Project Members</h3>
+              <p className="text-xs text-neutral-500 mb-3">Control who has access to this project and their roles.</p>
+              <button
+                data-testid="toggle-project-members"
+                onClick={() => { props.onToggleProjectMembers(); props.onToggleSettings(); }}
+                className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
+                  props.showProjectMembers
+                    ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+                    : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+                }`}
+              >
+                <Users className="w-3.5 h-3.5" />
+                {props.showProjectMembers ? 'Close Project Members' : 'Manage Project Members'}
+              </button>
+            </div>
+          )}
+          {!props.isAdmin && !(props.selectedProjectId && props.selectedProjectMyRole === 'owner') && (
+            <p className="text-xs text-neutral-500">No access management options are available for your current role.</p>
+          )}
+        </div>
       );
     case 'notifications':
       return (

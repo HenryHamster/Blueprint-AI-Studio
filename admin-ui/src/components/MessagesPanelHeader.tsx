@@ -154,7 +154,7 @@ export function MessagesPanelHeader({
             </span>
           )}
           {mutedCount > 0 && (
-            <button onClick={onOpenMutedPrefs} className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors">
+            <button onClick={onOpenMutedPrefs} className="text-ui-md text-neutral-600 hover:text-neutral-400 transition-colors">
               {mutedCount} muted
             </button>
           )}
@@ -163,7 +163,7 @@ export function MessagesPanelHeader({
               <button
                 onClick={() => setShowWebhookDetail(v => !v)}
                 title="Webhook delivery health"
-                className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold transition-colors min-h-[44px] md:min-h-[28px] flex items-center ${
+                className={`text-ui-md px-2 py-0.5 rounded-full border font-semibold transition-colors min-h-[44px] md:min-h-[28px] flex items-center ${
                   webhookStats.total_failed > 0
                     ? 'bg-amber-500/20 text-amber-400 border-amber-500/40'
                     : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40'
@@ -174,7 +174,7 @@ export function MessagesPanelHeader({
               {showWebhookDetail && (
                 <>
                   <div className="fixed inset-0 z-40" onClick={() => setShowWebhookDetail(false)} />
-                  <div className="absolute left-0 top-full mt-1 z-50 w-52 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-3 space-y-1 text-[11px]">
+                  <div className="absolute left-0 top-full mt-1 z-50 w-52 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-3 space-y-1 text-ui-md">
                     <p className="text-neutral-300 font-medium mb-1.5">Webhook delivery</p>
                     <div className="flex justify-between text-neutral-400"><span>Delivered</span><span className="text-emerald-400">{webhookStats.total_delivered}</span></div>
                     <div className="flex justify-between text-neutral-400"><span>Failed</span><span className={webhookStats.total_failed > 0 ? 'text-amber-400' : 'text-neutral-500'}>{webhookStats.total_failed}</span></div>

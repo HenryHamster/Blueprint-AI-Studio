@@ -54,7 +54,7 @@ export function ProviderCostPanel({
     if (pollError) {
       return (
         <section>
-          <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Provider Cost &amp; Success</h2>
+          <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Provider Cost &amp; Success</h2>
           <div className="text-xs text-red-400 px-1">Cost data unavailable — fetch failed.</div>
         </section>
       );
@@ -67,14 +67,14 @@ export function ProviderCostPanel({
 
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Provider Cost &amp; Success</h2>
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Provider Cost &amp; Success</h2>
       {pollError && (
-        <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+        <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-ui-sm text-amber-300">
           Data may be stale — last poll failed.
         </div>
       )}
       {efficiency && (
-        <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 px-1">
+        <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-ui-sm text-neutral-400 px-1">
           <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">Pipeline Efficiency</span>
           <EffMetric label="cold-start p50" value={fmtEffSecs(w24?.setup_p50_secs)} delta={w24?.vs_prior_setup_p50_delta} lowerIsBetter />
           <EffMetric label="reuse rate" value={fmtEffRate(w24?.warm_reuse_rate)} delta={w24?.vs_prior_warm_reuse_rate_delta} lowerIsBetter={false} />
@@ -95,7 +95,7 @@ export function ProviderCostPanel({
               : row.cost_per_merged_pr <= 15 ? 'text-amber-400'
               : 'text-red-400';
             return (
-              <div key={i} className="px-3 py-2 text-[10px]">
+              <div key={i} className="px-3 py-2 text-ui-sm">
                 <div className="flex items-start justify-between gap-2 mb-1">
                   <span className="font-medium text-neutral-200 break-words">{row.account_name}</span>
                   <span className="text-neutral-500 shrink-0">{row.provider}</span>
@@ -113,7 +113,7 @@ export function ProviderCostPanel({
         {/* Desktop: table layout */}
         <table className="hidden sm:table w-full text-xs">
           <thead>
-            <tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50">
+            <tr className="text-ui-sm text-neutral-500 border-b border-neutral-800/50">
               <th className="text-left px-3 py-2 font-medium">Provider / Account</th>
               <th className="text-right px-3 py-2 font-medium">Tasks</th>
               <th className="text-right px-3 py-2 font-medium">Success</th>
@@ -135,7 +135,7 @@ export function ProviderCostPanel({
                 <tr key={i}>
                   <td className="px-3 py-2">
                     <span className="font-medium text-neutral-200">{row.account_name}</span>
-                    <span className="text-neutral-500 ml-1.5 text-[10px]">{row.provider}</span>
+                    <span className="text-neutral-500 ml-1.5 text-ui-sm">{row.provider}</span>
                   </td>
                   <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{row.total_tasks}</td>
                   <td className={`text-right px-3 py-2 tabular-nums ${srColor}`}>

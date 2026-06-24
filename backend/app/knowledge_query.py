@@ -375,9 +375,7 @@ def build_knowledge_documents_stmt(
                 or_(
                     KnowledgeDocument.origin_state
                     == ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED,
-                    KnowledgeDocument.source_kind.not_in(
-                        _LEGACY_UNKNOWN_SOURCE_KINDS
-                    ),
+                    KnowledgeDocument.source_kind.not_in(_LEGACY_UNKNOWN_SOURCE_KINDS),
                 )
             )
         else:
@@ -393,9 +391,7 @@ def build_knowledge_documents_stmt(
                 or_(
                     KnowledgeDocument.origin_state
                     == ORIGIN_STATE_NOT_RESEARCH_FINDING_DERIVED,
-                    KnowledgeDocument.source_kind.not_in(
-                        _LEGACY_UNKNOWN_SOURCE_KINDS
-                    ),
+                    KnowledgeDocument.source_kind.not_in(_LEGACY_UNKNOWN_SOURCE_KINDS),
                 )
             )
         else:
@@ -585,6 +581,46 @@ async def build_knowledge_index(
     # Project-wide fill (also the sole pass when no direction is scoped).
     await _collect(None)
     return entries
+
+
+_DIRECTION_KNOWLEDGE_CAP = 5
+
+
+async def fetch_direction_knowledge_index(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_ids: list[str],
+    *,
+    summary_chars: int = _KNOWLEDGE_INDEX_SUMMARY_CHARS,
+) -> dict[str, list[dict]]:
+    """Bulk-fetch compact knowledge entries grouped by direction_id.
+
+    Returns ``{direction_id: [entry, ...]}`` (newest-first, capped at
+    ``_DIRECTION_KNOWLEDGE_CAP`` per direction) for every direction that has at
+    least one document.  Directions with no documents are absent from the result.
+    Uses a single query to avoid N per-direction round-trips.
+    """
+    if not direction_ids:
+        return {}
+    stmt = (
+        select(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.project_id == project_id,
+            KnowledgeDocument.direction_id.in_(direction_ids),
+        )
+        .order_by(KnowledgeDocument.direction_id, KnowledgeDocument.created_at.desc())
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    by_dir: dict[str, list[dict]] = {}
+    counts: dict[str, int] = {}
+    for doc in rows:
+        did = str(doc.direction_id)
+        n = counts.get(did, 0)
+        if n >= _DIRECTION_KNOWLEDGE_CAP:
+            continue
+        by_dir.setdefault(did, []).append(_knowledge_index_entry(doc, summary_chars))
+        counts[did] = n + 1
+    return by_dir
 
 
 async def get_knowledge_document(

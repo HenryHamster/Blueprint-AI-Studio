@@ -74,7 +74,7 @@ export function RetrospectivePagination({
   if (totalPages <= 1) return null;
 
   return (
-    <div className="flex flex-wrap items-center gap-2 mt-2 text-[10px] text-neutral-400">
+    <div className="flex flex-wrap items-center gap-2 mt-2 text-ui-sm text-neutral-400">
       {/* eslint-disable-next-line viewport/min-touch-target -- compact pagination, consistent with adjacent panels */}
       <button
         type="button"
@@ -146,7 +146,7 @@ export function SrCatchRateHealthBanner({
 
   return (
     <div
-      className={`flex items-center gap-1.5 mb-2 px-2 py-1 rounded border text-[10px] ${colorClass}`}
+      className={`flex items-center gap-1.5 mb-2 px-2 py-1 rounded border text-ui-sm ${colorClass}`}
       role="status"
       data-testid="sr-health-banner"
       title={HEALTH_TOOLTIP[health.status]}

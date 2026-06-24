@@ -119,7 +119,7 @@ const ScopeBreakdownPills = memo(function ScopeBreakdownPills({ scope_breakdown 
           <span
             key={sz}
             title={`${sz}: ${s.merged} merged / ${s.failed} failed${subtypeStr} (${Math.round(rate * 100)}%)`}
-            className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}
+            className={`text-ui-xs leading-none px-1 py-0.5 rounded border ${color}`}
           >
             {sz[0].toUpperCase()} {s.merged}/{s.failed}
           </span>
@@ -169,12 +169,12 @@ function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
       {open && hasBreakdown && (
         // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
         <div
-          className="absolute z-20 top-full mt-1 left-0 w-56 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg text-[10px] text-neutral-300 space-y-1.5"
+          className="absolute z-20 top-full mt-1 left-0 w-56 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg text-ui-sm text-neutral-300 space-y-1.5"
           onClick={e => e.stopPropagation()}
         >
           {byScope && Object.keys(byScope).length > 0 && (
             <div>
-              <p className="text-neutral-500 uppercase tracking-wide text-[9px] mb-0.5">By scope</p>
+              <p className="text-neutral-500 uppercase tracking-wide text-ui-xs mb-0.5">By scope</p>
               {(['small', 'medium', 'large'] as const).map(s => byScope[s] != null ? (
                 <div key={s} className="flex justify-between"><span>{s}</span><span className="font-mono">${byScope[s].toFixed(2)}</span></div>
               ) : null)}
@@ -182,7 +182,7 @@ function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
           )}
           {byType && Object.keys(byType).length > 0 && (
             <div>
-              <p className="text-neutral-500 uppercase tracking-wide text-[9px] mb-0.5">By type</p>
+              <p className="text-neutral-500 uppercase tracking-wide text-ui-xs mb-0.5">By type</p>
               {sortedByTypeEntries.map(([t, v]) => (
                 <div key={t} className="flex justify-between"><span>{t}</span><span className="font-mono">${v.toFixed(2)}</span></div>
               ))}
@@ -190,7 +190,7 @@ function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
           )}
           {spot != null && onDemand != null && (spot > 0 || onDemand > 0) && (
             <div>
-              <p className="text-neutral-500 uppercase tracking-wide text-[9px] mb-0.5">VM type</p>
+              <p className="text-neutral-500 uppercase tracking-wide text-ui-xs mb-0.5">VM type</p>
               <div className="flex justify-between"><span>spot</span><span className="font-mono">${spot.toFixed(2)}</span></div>
               <div className="flex justify-between"><span>on-demand</span><span className="font-mono">${onDemand.toFixed(2)}</span></div>
             </div>
@@ -220,7 +220,7 @@ function CalibrationChip({ factor, note, sampleCount }: { factor: number | null 
   }
   return (
     <span
-      className={`text-[9px] font-medium px-1.5 py-0.5 rounded border ${colorClass} cursor-default`}
+      className={`text-ui-xs font-medium px-1.5 py-0.5 rounded border ${colorClass} cursor-default`}
       title={note ?? undefined}
     >
       {label}
@@ -271,7 +271,7 @@ function DirectionSrPill({ entry }: { entry: DirectionSrEntry }) {
   const trendArrow = trend === 'increasing' ? '↓' : trend === 'decreasing' ? '↑' : null;
   const trendColor = trend === 'increasing' ? 'text-red-400' : trend === 'decreasing' ? 'text-emerald-400' : null;
   return (
-    <div className="mt-1 text-[9px]">
+    <div className="mt-1 text-ui-xs">
       <button type="button" className={`${catchColor} hover:underline cursor-pointer`} title={`SR catch rate (n=${entry.sample_size})`} onClick={e => { e.stopPropagation(); setOpen(v => !v); }}>{label}</button>
       {trendArrow && trendColor && (
         <span className={`ml-1 font-mono ${trendColor}`} title={prevCatchPct != null ? `Prev: ${prevCatchPct}%` : 'trend direction'}>
@@ -304,18 +304,18 @@ function QuietDirectionCard({ direction }: { direction: DirectionPortfolioCompos
   return (
     <div className="min-w-[200px] max-w-[220px] shrink-0 rounded-lg border border-dashed border-neutral-800 bg-neutral-950/50 p-3 opacity-80">
       <div className="flex items-center gap-1.5 mb-1.5">
-        <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border bg-neutral-800/70 text-neutral-300 border-neutral-700">
+        <span className="text-ui-xs font-bold uppercase px-1.5 py-0.5 rounded border bg-neutral-800/70 text-neutral-300 border-neutral-700">
           Quiet
         </span>
-        <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${priorityBadge(direction.priority)}`}>
+        <span className={`text-ui-xs font-bold uppercase px-1.5 py-0.5 rounded border ${priorityBadge(direction.priority)}`}>
           {direction.priority}
         </span>
-        <span className="text-[9px] font-medium uppercase tracking-wide text-neutral-500">
+        <span className="text-ui-xs font-medium uppercase tracking-wide text-neutral-500">
           {direction.status ?? 'active'}
         </span>
       </div>
       <p className="text-xs text-neutral-300 line-clamp-2 mb-2">{direction.direction_text}</p>
-      <div className="text-[10px] text-neutral-500">
+      <div className="text-ui-sm text-neutral-500">
         Quiet this window · no cycles or new tasks
       </div>
     </div>
@@ -519,7 +519,7 @@ export function DirectionPortfolioSection({
   return (
     <>
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Direction Portfolio</h2>
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Direction Portfolio</h2>
       {loading ? (
         <SectionSkeleton />
       ) : activeDirectionCount === 0 ? (
@@ -626,14 +626,14 @@ export function DirectionPortfolioSection({
                   onClick={() => onDirectionClick?.(d.direction_id)}
                 >
                   <div className="flex items-center gap-1.5 mb-1.5">
-                    <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${priorityBadge(d.priority)}`}>{d.priority}</span>
-                    {d.possibly_saturated && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30">Saturated</span>}
-                    {d.needs_manual_intervention && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-red-500/20 text-red-400 border border-red-500/30">Needs Intervention</span>}
-                    {d.auto_paused && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30" title={d.paused_reason ?? undefined}>Paused</span>}
-                    {d.retirement_eligible && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" title="Direction is eligible for retirement">Retirement Eligible</span>}
+                    <span className={`text-ui-xs font-bold uppercase px-1.5 py-0.5 rounded border ${priorityBadge(d.priority)}`}>{d.priority}</span>
+                    {d.possibly_saturated && <span className="text-ui-xs font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30">Saturated</span>}
+                    {d.needs_manual_intervention && <span className="text-ui-xs font-bold uppercase px-1.5 py-0.5 rounded bg-red-500/20 text-red-400 border border-red-500/30">Needs Intervention</span>}
+                    {d.auto_paused && <span className="text-ui-xs font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30" title={d.paused_reason ?? undefined}>Paused</span>}
+                    {d.retirement_eligible && <span className="text-ui-xs font-bold uppercase px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" title="Direction is eligible for retirement">Retirement Eligible</span>}
                   </div>
                   <p className="text-xs text-neutral-200 line-clamp-2 mb-2">{d.direction_text}</p>
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-neutral-500">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-ui-sm text-neutral-500">
                     {cvr != null && <span className={cvrColor}>{cvr}% conversion</span>}
                     {acc != null && <span className={accColor} title="PRs merged / (merged + rejected)">{acc}% acc</span>}
                     {fas != null && <span className={fasColor} title={`First-attempt success rate${d.first_attempt_sample_size != null ? ` (n=${d.first_attempt_sample_size})` : ''}`}>{fas}% 1st</span>}
@@ -664,7 +664,7 @@ export function DirectionPortfolioSection({
                       // eslint-disable-next-line viewport/min-touch-target -- dense inline badge inside compact direction card
                       <button
                         type="button"
-                        className="text-[9px] leading-none px-1.5 py-0.5 rounded border border-violet-500/20 bg-violet-500/10 text-violet-300 hover:bg-violet-500/20"
+                        className="text-ui-xs leading-none px-1.5 py-0.5 rounded border border-violet-500/20 bg-violet-500/10 text-violet-300 hover:bg-violet-500/20"
                         title="View evicted findings for this direction"
                         aria-label="View evicted findings for this direction"
                         onClick={e => { e.stopPropagation(); openEvictedDrawer(d); }}
@@ -700,14 +700,14 @@ export function DirectionPortfolioSection({
                         <div className="h-1 w-full rounded bg-neutral-800 overflow-hidden">
                           <div className={`h-full ${barColor}`} style={{ width: `${clamped}%` }} />
                         </div>
-                        <div className="flex justify-between text-[9px] text-neutral-500 mt-0.5">
+                        <div className="flex justify-between text-ui-xs text-neutral-500 mt-0.5">
                           <span>Budget</span>
                           <span className={pct > 80 ? 'text-red-400' : pct >= 60 ? 'text-amber-400' : 'text-emerald-400'}>{Math.round(pct)}%{d.budget_exceeded ? ' · over' : ''}</span>
                         </div>
                       </div>
                     );
                   })()}
-                  {taxonomyVisibleKeysByDir.has(d.direction_id) && <div className="flex gap-1 mt-1 flex-wrap">{(taxonomyVisibleKeysByDir.get(d.direction_id) ?? []).map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span>; })}</div>}
+                  {taxonomyVisibleKeysByDir.has(d.direction_id) && <div className="flex gap-1 mt-1 flex-wrap">{(taxonomyVisibleKeysByDir.get(d.direction_id) ?? []).map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-ui-xs leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span>; })}</div>}
                   {d.scope_breakdown && Object.keys(d.scope_breakdown).length > 0 && <ScopeBreakdownPills scope_breakdown={d.scope_breakdown} />}
                   {showGeneralized && (
                     <div className="flex gap-1 mt-1 flex-wrap">
@@ -718,7 +718,7 @@ export function DirectionPortfolioSection({
                           <span
                             key={row.kind}
                             title={`${row.label}: ${row.success} success / ${row.neutral} neutral / ${row.failure} failure (${Math.round(rate * 100)}%)`}
-                            className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}
+                            className={`text-ui-xs leading-none px-1 py-0.5 rounded border ${color}`}
                           >
                             {row.label} {row.success}/{row.terminal}
                           </span>
@@ -728,16 +728,16 @@ export function DirectionPortfolioSection({
                   )}
                   {d.review_quality && (d.review_quality.reviews_dismissed || d.review_quality.reviews_overridden || d.review_quality.user_issues_caught) ? (
                     <div className="flex gap-1 mt-1 flex-wrap">
-                      {d.review_quality.reviews_dismissed ? <span title="Automated reviews dismissed by the system" className="text-[9px] leading-none px-1 py-0.5 rounded border border-amber-700 bg-amber-900/40 text-amber-300">{d.review_quality.reviews_dismissed} dismissed</span> : null}
-                      {d.review_quality.reviews_overridden ? <span title="Reviews overridden by an operator" className="text-[9px] leading-none px-1 py-0.5 rounded border border-red-700 bg-red-900/40 text-red-300">{d.review_quality.reviews_overridden} overridden</span> : null}
-                      {d.review_quality.user_issues_caught ? <span title="Real issues caught by review" className="text-[9px] leading-none px-1 py-0.5 rounded border border-emerald-700 bg-emerald-900/40 text-emerald-300">{d.review_quality.user_issues_caught} caught</span> : null}
+                      {d.review_quality.reviews_dismissed ? <span title="Automated reviews dismissed by the system" className="text-ui-xs leading-none px-1 py-0.5 rounded border border-amber-700 bg-amber-900/40 text-amber-300">{d.review_quality.reviews_dismissed} dismissed</span> : null}
+                      {d.review_quality.reviews_overridden ? <span title="Reviews overridden by an operator" className="text-ui-xs leading-none px-1 py-0.5 rounded border border-red-700 bg-red-900/40 text-red-300">{d.review_quality.reviews_overridden} overridden</span> : null}
+                      {d.review_quality.user_issues_caught ? <span title="Real issues caught by review" className="text-ui-xs leading-none px-1 py-0.5 rounded border border-emerald-700 bg-emerald-900/40 text-emerald-300">{d.review_quality.user_issues_caught} caught</span> : null}
                     </div>
                   ) : null}
-                  {sortedStageDropoutsByDir.has(d.direction_id) && <div className="flex gap-1 mt-1 flex-wrap">{(sortedStageDropoutsByDir.get(d.direction_id) ?? []).map(([stage, v]) => <span key={stage} title={`Failed at ${stage}: ${v}`} className="text-[9px] leading-none px-1 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-300">{STAGE_DROPOUT_LABELS[stage] ?? stage} {v}</span>)}</div>}
+                  {sortedStageDropoutsByDir.has(d.direction_id) && <div className="flex gap-1 mt-1 flex-wrap">{(sortedStageDropoutsByDir.get(d.direction_id) ?? []).map(([stage, v]) => <span key={stage} title={`Failed at ${stage}: ${v}`} className="text-ui-xs leading-none px-1 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-300">{STAGE_DROPOUT_LABELS[stage] ?? stage} {v}</span>)}</div>}
                   {d.recent_failure_titles && d.recent_failure_titles.length > 0 && (
                     <ul className="mt-1 space-y-0.5">
                       {d.recent_failure_titles.slice(0, 3).map((t, i) => (
-                        <li key={i} className="text-[10px] text-red-300/80 truncate" title={t}>• {t}</li>
+                        <li key={i} className="text-ui-sm text-red-300/80 truncate" title={t}>• {t}</li>
                       ))}
                     </ul>
                   )}
@@ -749,7 +749,7 @@ export function DirectionPortfolioSection({
 
           {directionPortfolio && quietDirectionCount > 0 && (
             <div className="space-y-2">
-              <div className="text-[10px] font-bold uppercase tracking-widest text-neutral-500">Quiet this window</div>
+              <div className="text-ui-sm font-bold uppercase tracking-widest text-neutral-500">Quiet this window</div>
               <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-hide" style={{ scrollbarWidth: 'none' }}>
                 {quietDirections.map(direction => (
                   <QuietDirectionCard key={direction.direction_id} direction={direction} />
@@ -769,9 +769,9 @@ export function DirectionPortfolioSection({
         <div className="w-full max-w-[720px] bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl">
           <div className="flex items-start justify-between gap-3 p-4 border-b border-neutral-800 shrink-0">
             <div className="min-w-0">
-              <p className="text-[9px] uppercase tracking-widest text-neutral-500">Evicted findings</p>
+              <p className="text-ui-xs uppercase tracking-widest text-neutral-500">Evicted findings</p>
               <h3 className="text-sm font-semibold text-neutral-100 truncate">{evictedDrawer.directionText}</h3>
-              <p className="text-[10px] text-neutral-500 mt-0.5">
+              <p className="text-ui-sm text-neutral-500 mt-0.5">
                 {evictedTotal === 0
                   ? 'No evicted findings stored for this direction'
                   : `${evictedTotal} total · showing ${evictedStart}–${evictedEnd}`}
@@ -809,7 +809,7 @@ export function DirectionPortfolioSection({
               <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2" role="status">
                 <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
                 <span>Error fetching evicted findings</span>
-                <span className="text-[10px] text-neutral-600 truncate" title={evictedError}>{evictedError}</span>
+                <span className="text-ui-sm text-neutral-600 truncate" title={evictedError}>{evictedError}</span>
               </div>
             ) : evictedTotal === 0 ? (
               <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2" role="status">
@@ -823,7 +823,7 @@ export function DirectionPortfolioSection({
                     <div className="flex flex-wrap items-start gap-2">
                       <div className="min-w-0 flex-1">
                         <h4 className="text-sm text-neutral-100 font-medium break-words">{finding.title}</h4>
-                        <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-neutral-500">
+                        <div className="mt-1 flex flex-wrap items-center gap-2 text-ui-sm text-neutral-500">
                           <span className="px-1.5 py-0.5 rounded border border-neutral-700/60 bg-neutral-900 text-neutral-300 uppercase tracking-wide">{finding.status}</span>
                           <span title={finding.evicted_at}>{timeAgo(finding.evicted_at)}</span>
                         </div>
@@ -832,8 +832,8 @@ export function DirectionPortfolioSection({
 
                     {finding.claims.length > 0 && (
                       <div className="mt-2">
-                        <div className="text-[10px] uppercase tracking-wide text-neutral-500 mb-0.5">Claims</div>
-                        <ul className="list-disc list-inside text-[11px] text-neutral-300 space-y-0.5">
+                        <div className="text-ui-sm uppercase tracking-wide text-neutral-500 mb-0.5">Claims</div>
+                        <ul className="list-disc list-inside text-ui-md text-neutral-300 space-y-0.5">
                           {finding.claims.map((claim, claimIndex) => (
                             <li key={claimIndex}>{claim}</li>
                           ))}
@@ -843,8 +843,8 @@ export function DirectionPortfolioSection({
 
                     {finding.source_refs.length > 0 && (
                       <div className="mt-2">
-                        <div className="text-[10px] uppercase tracking-wide text-neutral-500 mb-0.5">Source refs</div>
-                        <ul className="space-y-0.5 text-[11px]">
+                        <div className="text-ui-sm uppercase tracking-wide text-neutral-500 mb-0.5">Source refs</div>
+                        <ul className="space-y-0.5 text-ui-md">
                           {finding.source_refs.map((ref, refIndex) => (
                             <li key={refIndex} className="leading-snug break-all">
                               {/^https?:\/\//i.test(ref) && isSafeUrl(ref) ? (
@@ -863,7 +863,7 @@ export function DirectionPortfolioSection({
                 ))}
 
                 {evictedTotalPages > 1 && (
-                  <div className="flex flex-wrap items-center gap-2 mt-1 text-[10px] text-neutral-400">
+                  <div className="flex flex-wrap items-center gap-2 mt-1 text-ui-sm text-neutral-400">
                     {/* eslint-disable-next-line viewport/min-touch-target -- compact pager in dense drawer footer */}
                     <button
                       type="button"

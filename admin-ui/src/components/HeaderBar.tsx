@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Network, Compass, Microscope, BookOpen, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare, CalendarClock } from 'lucide-react';
+import { Activity, Compass, Microscope, BookOpen, Archive, Plus, MoreHorizontal, Settings, MessageSquare, Bell } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
@@ -34,6 +34,10 @@ export interface HeaderBarProps {
   openMessageCount: number;
   newSinceLastVisitCount?: number;
   needsAttentionCount?: number;
+  alertCount?: number;
+  alertMaxSeverity?: 'ERROR' | 'WARNING' | 'INFO' | null;
+  showAlertsPopover?: boolean;
+  onToggleAlertsPopover?: () => void;
   onOpenNewTaskModal: () => void;
   onShowDirections: () => void;
   onSignOut: () => void;
@@ -333,9 +337,6 @@ export function HeaderBar(props: HeaderBarProps) {
     anyAutonomousEnabled,
     onPauseAllAutonomous,
   } = props;
-  const currentViewMode = viewMode;
-  const setViewMode = onSetViewMode;
-
   const [showMobileMenu, setShowMobileMenu] = useState(false);
   const [showMobileShortcuts, setShowMobileShortcuts] = useState(false);
   const mobileMenuRef = useRef<HTMLDivElement>(null);
@@ -401,7 +402,7 @@ export function HeaderBar(props: HeaderBarProps) {
         />
         {/* API connection problem — only visible when API is unreachable */}
         {!apiHealthy && (
-          <div className="flex items-center gap-2 text-[10px] px-2 py-1 rounded bg-red-950/30 border border-red-900/30">
+          <div className="flex items-center gap-2 text-ui-sm px-2 py-1 rounded bg-red-950/30 border border-red-900/30">
             <div className="flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
               <span className="text-red-400">API down</span>
@@ -413,40 +414,6 @@ export function HeaderBar(props: HeaderBarProps) {
       {/* Right: buttons */}
       <div className="flex items-center gap-1.5 ml-auto">
         <div className="hidden md:flex items-center gap-1">
-          <div className="flex items-center rounded-md overflow-hidden">
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-            <button
-              onClick={() => onSetViewMode('home')}
-              className={`p-2 text-xs transition-colors ${viewMode === 'home' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
-              title="Dashboard home"
-            >
-              <LayoutDashboard className="w-4 h-4" />
-            </button>
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-            <button
-              onClick={() => onSetViewMode('kanban')}
-              className={`p-2 text-xs transition-colors ${viewMode === 'kanban' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
-              title="Kanban view"
-            >
-              <LayoutGrid className="w-4 h-4" />
-            </button>
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-            <button
-              onClick={() => onSetViewMode('pipeline')}
-              className={`p-2 text-xs transition-colors ${viewMode === 'pipeline' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
-              title="Pipeline view"
-            >
-              <Network className="w-4 h-4" />
-            </button>
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-            <button
-              onClick={() => setViewMode('timeline')}
-              className={`p-2 text-xs transition-colors ${currentViewMode === 'timeline' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
-              title="Timeline view"
-            >
-              <CalendarClock className="w-4 h-4" />
-            </button>
-          </div>
           {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
           <button
             onClick={onShowDirections}
@@ -619,6 +586,28 @@ export function HeaderBar(props: HeaderBarProps) {
 
         {/* More secondary buttons — desktop only */}
         <div className="hidden md:flex items-center gap-1">
+          {/* Alerts badge — only shown when there are active alerts */}
+          {(props.alertCount ?? 0) > 0 && (
+            /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
+            <button
+              onClick={props.onToggleAlertsPopover}
+              className={`p-2 rounded-md text-xs transition-colors flex items-center gap-1 ${
+                props.showAlertsPopover
+                  ? (props.alertMaxSeverity === 'ERROR' ? 'text-red-400 bg-red-500/10'
+                    : props.alertMaxSeverity === 'WARNING' ? 'text-amber-400 bg-amber-500/10'
+                    : 'text-blue-400 bg-blue-500/10')
+                  : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
+              }`}
+              title={`${props.alertCount} alert${(props.alertCount ?? 0) > 1 ? 's' : ''}`}
+            >
+              <span className={`w-2 h-2 rounded-full ${
+                props.alertMaxSeverity === 'ERROR' ? 'bg-red-500' :
+                props.alertMaxSeverity === 'WARNING' ? 'bg-amber-500' : 'bg-blue-500'
+              }`} />
+              <Bell className="w-3.5 h-3.5" />
+              <span>{props.alertCount}</span>
+            </button>
+          )}
           {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
           <button
             onClick={onToggleArchive}
@@ -635,16 +624,16 @@ export function HeaderBar(props: HeaderBarProps) {
             className={`p-2 rounded-md text-xs transition-colors relative flex items-center ${
               showMessages ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
             }`}
-            title="Messages"
+            title="Compose message"
           >
             <MessageSquare className="w-4 h-4" />
             {props.openMessageCount > 0 && (
-              <span className="ml-0.5 bg-blue-500 text-white text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
+              <span className="ml-0.5 bg-blue-500 text-white text-ui-2xs font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
                 {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
               </span>
             )}
             {!showMessages && (props.newSinceLastVisitCount ?? 0) > 0 && (
-              <span className="ml-0.5 bg-amber-500 text-black text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center" title={`${props.newSinceLastVisitCount} new since last visit`}>
+              <span className="ml-0.5 bg-amber-500 text-black text-ui-2xs font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center" title={`${props.newSinceLastVisitCount} new since last visit`}>
                 {(props.newSinceLastVisitCount ?? 0) > 9 ? '9+' : props.newSinceLastVisitCount}
               </span>
             )}
@@ -662,31 +651,6 @@ export function HeaderBar(props: HeaderBarProps) {
               </button>
             </>
           )}
-          {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-          <button
-            onClick={onToggleResearchBrowser}
-            className={`p-2 rounded-md text-xs transition-colors relative flex items-center ${
-              showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
-            }`}
-            title="Research Findings"
-          >
-            <Microscope className="w-4 h-4" />
-            {pendingFindingsCount > 0 && (
-              <span className="ml-0.5 bg-cyan-500 text-black text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
-                {pendingFindingsCount}
-              </span>
-            )}
-          </button>
-          {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-          <button
-            onClick={onToggleKnowledgeBrowser}
-            className={`p-2 rounded-md text-xs transition-colors flex items-center ${
-              showKnowledgeBrowser ? 'text-violet-400 bg-violet-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
-            }`}
-            title="Knowledge Library"
-          >
-            <BookOpen className="w-4 h-4" />
-          </button>
         </div>
 
         {/* Mobile-only autonomy control — full MetricsBar is desktop-only, but autonomy on/off must be reachable on mobile */}
@@ -710,41 +674,13 @@ export function HeaderBar(props: HeaderBarProps) {
           {showMobileMenu && (
             <div className="absolute right-0 top-full mt-2 w-56 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-2 z-50">
               <button
-                onClick={() => { onSetViewMode('home'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${viewMode === 'home' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-              >
-                <LayoutDashboard className="w-4 h-4 shrink-0" />
-                <span>Dashboard</span>
-              </button>
-              <button
-                onClick={() => { onSetViewMode('kanban'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${viewMode === 'kanban' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-              >
-                <LayoutGrid className="w-4 h-4 shrink-0" />
-                <span>Kanban view</span>
-              </button>
-              <button
-                onClick={() => { onSetViewMode('pipeline'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${viewMode === 'pipeline' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-              >
-                <Network className="w-4 h-4 shrink-0" />
-                <span>Pipeline view</span>
-              </button>
-              <button
-                onClick={() => { setViewMode('timeline'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${currentViewMode === 'timeline' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-              >
-                <CalendarClock className="w-4 h-4 shrink-0" />
-                <span>Timeline view</span>
-              </button>
-              <button
                 onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
                 className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
               >
                 <Microscope className="w-4 h-4 shrink-0" />
                 <span>Research Browser</span>
                 {pendingFindingsCount > 0 && (
-                  <span className="ml-auto bg-cyan-500 text-black text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                  <span className="ml-auto bg-cyan-500 text-black text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
                     {pendingFindingsCount}
                   </span>
                 )}
@@ -771,12 +707,12 @@ export function HeaderBar(props: HeaderBarProps) {
                 <MessageSquare className="w-4 h-4 shrink-0" />
                 <span>Messages</span>
                 {props.openMessageCount > 0 && (
-                  <span className="ml-auto bg-blue-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                  <span className="ml-auto bg-blue-500 text-white text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
                     {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
                   </span>
                 )}
                 {!showMessages && (props.newSinceLastVisitCount ?? 0) > 0 && (
-                  <span className="ml-auto bg-amber-500 text-black text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                  <span className="ml-auto bg-amber-500 text-black text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
                     {(props.newSinceLastVisitCount ?? 0) > 9 ? '9+' : props.newSinceLastVisitCount} new
                   </span>
                 )}
@@ -813,7 +749,7 @@ export function HeaderBar(props: HeaderBarProps) {
                       ['R', 'Refresh tasks'],
                       ['1', 'Kanban view'],
                       ['2', 'Pipeline view'],
-                      ['3', 'Timeline view'],
+                      ['3', 'Home view'],
                       ['D', 'Toggle directions'],
                       ['S', 'Toggle settings'],
                       ['M', 'Toggle metrics'],
@@ -827,7 +763,7 @@ export function HeaderBar(props: HeaderBarProps) {
                     ].map(([key, desc]) => (
                       <div key={key} className="flex items-center justify-between">
                         <span className="text-neutral-400">{desc}</span>
-                        <kbd className="bg-neutral-800 border border-neutral-700 text-neutral-300 px-1.5 py-0.5 rounded text-[10px] font-mono min-w-[24px] text-center">{key}</kbd>
+                        <kbd className="bg-neutral-800 border border-neutral-700 text-neutral-300 px-1.5 py-0.5 rounded text-ui-sm font-mono min-w-[24px] text-center">{key}</kbd>
                       </div>
                     ))}
                   </div>

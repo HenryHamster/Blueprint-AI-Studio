@@ -323,19 +323,22 @@ if __name__ == "__main__":
         parser.print_help()
         sys.exit(1)
 
-    if args.command == "create_task":
-        # fix and review types require --branch and --pr-number (they operate on existing PRs)
-        if args.task_type in ("fix", "review") and not args.branch:
-            print(f"Error: --branch is required for task type '{args.task_type}'", file=sys.stderr)
-            sys.exit(1)
-        if args.task_type in ("fix", "review") and not args.pr_number:
-            print(f"Error: --pr-number is required for task type '{args.task_type}'", file=sys.stderr)
-            sys.exit(1)
-        result = create_task(
-            title=args.title, prompt=args.prompt, task_type=args.task_type,
-            base_branch=args.base_branch, pr_number=args.pr_number, branch=args.branch,
-        )
-        print(json.dumps(result, indent=2))
-    elif args.command == "list_tasks":
-        for t in list_tasks(limit=args.limit, status=args.status):
-            print(fmt_task(t, verbose=True))
+    try:
+        if args.command == "create_task":
+            # fix and review types require --branch and --pr-number (they operate on existing PRs)
+            if args.task_type in ("fix", "review") and not args.branch:
+                print(f"Error: --branch is required for task type '{args.task_type}'", file=sys.stderr)
+                sys.exit(1)
+            if args.task_type in ("fix", "review") and not args.pr_number:
+                print(f"Error: --pr-number is required for task type '{args.task_type}'", file=sys.stderr)
+                sys.exit(1)
+            result = create_task(
+                title=args.title, prompt=args.prompt, task_type=args.task_type,
+                base_branch=args.base_branch, pr_number=args.pr_number, branch=args.branch,
+            )
+            print(json.dumps(result, indent=2))
+        elif args.command == "list_tasks":
+            for t in list_tasks(limit=args.limit, status=args.status):
+                print(fmt_task(t, verbose=True))
+    except APIError:
+        sys.exit(1)

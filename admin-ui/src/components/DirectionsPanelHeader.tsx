@@ -59,7 +59,7 @@ export function DirectionsPanelHeader({
             <span className="text-xs text-neutral-500 truncate max-w-[140px]">{projects.find(p => p.id === selectedProjectId)?.name || selectedProjectId}</span>
           )}
           {proposedCount > 0 && activeTab === 'directions' && (
-            <span className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold bg-purple-950/60 text-purple-400 border border-purple-900/50">
+            <span className="text-ui-sm px-1.5 py-0.5 rounded-full font-semibold bg-purple-950/60 text-purple-400 border border-purple-900/50">
               {proposedCount} pending
             </span>
           )}
@@ -125,7 +125,7 @@ export function DirectionsPanelHeader({
             return gapCount > 0 ? <span className="ml-1.5 text-xs text-neutral-500">({gapCount})</span> : null;
           })()}
           {sizeHealth && (
-            <span className={`ml-1.5 align-middle text-[10px] px-1.5 py-0.5 rounded border font-semibold whitespace-nowrap ${getStatusColor(sizeHealth.model_size_status)}`}>
+            <span className={`ml-1.5 align-middle text-ui-sm px-1.5 py-0.5 rounded border font-semibold whitespace-nowrap ${getStatusColor(sizeHealth.model_size_status)}`}>
               {sizeHealth.model_size_status} · {Math.round(sizeHealth.serialized_bytes / 1024)}KB
             </span>
           )}

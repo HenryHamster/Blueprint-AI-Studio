@@ -321,12 +321,12 @@ function ColdStartBreakdown({ breakdown }: { breakdown: Record<string, number | 
   if (!hasAny) return null;
   return (
     <div className="mt-2 pt-2 border-t border-neutral-700/50">
-      <div className="text-[10px] text-neutral-500 mb-1 uppercase tracking-wide">Cold-start stage breakdown (p50)</div>
+      <div className="text-ui-sm text-neutral-500 mb-1 uppercase tracking-wide">Cold-start stage breakdown (p50)</div>
       <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
         {COLD_START_STAGE_LABELS.map(([key, label, isQueueWait]) => {
           const val = breakdown[key];
           return (
-            <div key={key} className="flex justify-between items-center text-[10px]">
+            <div key={key} className="flex justify-between items-center text-ui-sm">
               <span className={isQueueWait ? 'text-amber-400/80' : 'text-neutral-500'}>{label}</span>
               <span className={`font-mono ${isQueueWait ? 'text-amber-400' : 'text-neutral-400'}`}>
                 {val != null ? `${val.toFixed(0)}ms` : '—'}
@@ -398,20 +398,20 @@ function DigestLatencyWidget() {
     <div className="space-y-2 text-xs">
       <div className="grid grid-cols-3 gap-2">
         <div className="rounded bg-neutral-800/50 px-3 py-2">
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500">p50</div>
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">p50</div>
           <div className="font-mono text-neutral-100">{formatSeconds(data.latency_percentiles.p50_seconds)}</div>
         </div>
         <div className="rounded bg-neutral-800/50 px-3 py-2">
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500">p95</div>
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">p95</div>
           <div className="font-mono text-neutral-100">{formatSeconds(data.latency_percentiles.p95_seconds)}</div>
         </div>
         <div className="rounded bg-neutral-800/50 px-3 py-2">
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Samples</div>
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Samples</div>
           <div className="font-mono text-neutral-100">{data.latency_percentiles.sample_n}</div>
         </div>
       </div>
       <div className="rounded bg-neutral-800/50 px-3 py-2">
-        <div className="mb-1 text-[10px] uppercase tracking-wide text-neutral-500">Serve mix</div>
+        <div className="mb-1 text-ui-sm uppercase tracking-wide text-neutral-500">Serve mix</div>
         <div className="space-y-1">
           {tiers.map((tier) => (
             <div key={tier.key} className="flex items-center justify-between gap-3">
@@ -423,7 +423,7 @@ function DigestLatencyWidget() {
           ))}
         </div>
       </div>
-      <div data-testid="digest-latency-caveat" className="text-[10px] text-amber-400/80">
+      <div data-testid="digest-latency-caveat" className="text-ui-sm text-amber-400/80">
         {data.instance_note}
       </div>
     </div>
@@ -503,7 +503,7 @@ function formatAxisDisplay(axis: Pick<EfficiencyAxis, 'current' | 'baseline' | '
 function NestedAxisLine({ label, axis, unit, favorableDirection, percent = false }: { label: string; axis: Pick<EfficiencyAxis, 'current' | 'baseline' | 'drift_pct'>; unit: string; favorableDirection: 'lower' | 'higher'; percent?: boolean; }) {
   const { current, baseline, driftColor, driftDisplay } = formatAxisDisplay(axis, unit, favorableDirection, percent);
   return (
-    <div className="flex items-center justify-between gap-3 text-[10px]">
+    <div className="flex items-center justify-between gap-3 text-ui-sm">
       <span className="text-neutral-500">{label}</span>
       <div className="flex items-center gap-3 text-neutral-300 font-mono">
         <span>{current}</span>
@@ -518,7 +518,7 @@ function ChallengerSampleRateRow({ rec }: { rec: ChallengerSampleRateRecommendat
   const statusColor = rec.status === 'reduce' ? 'text-amber-400' : rec.status === 'gate_earning' ? 'text-emerald-400' : 'text-neutral-500';
   const rateLabel = rec.recommended_sample_rate != null ? rec.recommended_sample_rate.toFixed(2) : '—';
   return (
-    <div data-testid="challenger-sample-rate-recommendation" className="mt-1.5 text-[10px] border-t border-neutral-700/50 pt-1.5">
+    <div data-testid="challenger-sample-rate-recommendation" className="mt-1.5 text-ui-sm border-t border-neutral-700/50 pt-1.5">
       <div className="flex items-center justify-between gap-2">
         <span className="text-neutral-400">recommended sample_rate</span>
         <span className={`font-mono font-semibold ${statusColor}`}>{rateLabel}</span>
@@ -593,7 +593,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
               </div>
             </div>
             {reseedDate && (
-              <div data-testid={`axis-reseed-provenance-${axisDef.key}`} className="mt-0.5 text-[10px] text-neutral-500">
+              <div data-testid={`axis-reseed-provenance-${axisDef.key}`} className="mt-0.5 text-ui-sm text-neutral-500">
                 baseline re-seeded {new Date(reseedDate).toLocaleDateString()}
                 {baseline_seed_snapshot_at && (
                   <span className="ml-1">(snapshot: {new Date(baseline_seed_snapshot_at).toLocaleDateString()})</span>
@@ -607,7 +607,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
               <ColdStartBreakdown breakdown={data.vm_cold_start_breakdown} />
             )}
             {axisDef.key === 'vm_reuse_rate' && data.warm_start_origin_breakdown && (
-              <div className="mt-2 pt-2 border-t border-neutral-700/50 text-[10px]">
+              <div className="mt-2 pt-2 border-t border-neutral-700/50 text-ui-sm">
                 <div data-testid="vm-reuse-aggregate-caveat" className="text-amber-400/80 mb-1">
                   Aggregate conflates warm-pool, backlog-reuse, and chain-continuity starts — read the per-origin split (esp. pool share) below, not the headline rate.
                 </div>
@@ -635,7 +635,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
               />
             </div>
           </div>
-          <div className="mt-1 text-[10px] text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
+          <div className="mt-1 text-ui-sm text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
             <span>challenged confirmed: {data.panel_review_effectiveness.challenged_confirmed ?? '—'}</span>
             <span>revised: {data.panel_review_effectiveness.challenged_revised ?? '—'}</span>
             <span>rejected: {data.panel_review_effectiveness.challenged_rejected ?? '—'}</span>
@@ -675,7 +675,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           })()}
           <div className="space-y-1">
             {data.vm_cost_attribution.by_task_type.map((row) => (
-              <div key={row.task_type} className="flex items-center justify-between gap-3 text-[10px]">
+              <div key={row.task_type} className="flex items-center justify-between gap-3 text-ui-sm">
                 <span className="text-neutral-500">{row.task_type}</span>
                 <div className="flex items-center gap-2 text-neutral-400 font-mono">
                   <span>${row.total_cost_usd.toFixed(2)}</span>
@@ -684,6 +684,25 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
                   {row.cost_per_merge != null && (
                     <span className="text-neutral-600">· ${row.cost_per_merge.toFixed(4)}/merge</span>
                   )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {data.llm_cost_attribution && data.llm_cost_attribution.by_failure_class.length > 0 && (
+        <div data-testid="llm-cost-by-outcome-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+          <div className="flex justify-between items-center gap-4 mb-2">
+            <span className="text-neutral-400">LLM cost by terminal outcome</span>
+            <span className="text-neutral-500 font-mono">${data.llm_cost_attribution.total_llm_usd.toFixed(2)} total</span>
+          </div>
+          <div className="space-y-1">
+            {data.llm_cost_attribution.by_failure_class.map((row) => (
+              <div key={row.failure_class} className="flex items-center justify-between gap-3 text-ui-sm">
+                <span className={row.failure_class === 'MERGED' ? 'text-emerald-400/80' : 'text-neutral-500'}>{row.failure_class}</span>
+                <div className="flex items-center gap-2 font-mono">
+                  <span className={row.failure_class === 'MERGED' ? 'text-emerald-400' : 'text-neutral-400'}>${row.total_cost_usd.toFixed(2)}</span>
+                  <span className="text-neutral-600">· {row.task_count}</span>
                 </div>
               </div>
             ))}
@@ -711,7 +730,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
               />
             </div>
           </div>
-          <div className="mt-1 text-[10px] text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
+          <div className="mt-1 text-ui-sm text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
             <span>tasks measured: {data.format_compliance.tasks_measured ?? '—'}</span>
             <span>well formed: {data.format_compliance.well_formed_tasks ?? '—'}</span>
             <span>format errors: {data.format_compliance.format_error_total ?? '—'}</span>
@@ -720,10 +739,10 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           </div>
           {data.format_compliance_by_type && Object.keys(data.format_compliance_by_type).length > 0 && (
             <div data-testid="format-compliance-by-type-block" className="mt-2 pt-2 border-t border-neutral-700/50">
-              <div className="text-[10px] text-neutral-500 mb-1 uppercase tracking-wide">By task type</div>
+              <div className="text-ui-sm text-neutral-500 mb-1 uppercase tracking-wide">By task type</div>
               <div className="space-y-0.5">
                 {Object.entries(data.format_compliance_by_type).sort(([a], [b]) => a.localeCompare(b)).map(([taskType, entry]: [string, FormatComplianceByTypeEntry]) => (
-                  <div key={taskType} className="flex items-center justify-between gap-3 text-[10px]">
+                  <div key={taskType} className="flex items-center justify-between gap-3 text-ui-sm">
                     <span className="text-neutral-500">{taskType}</span>
                     <div className="flex items-center gap-2 text-neutral-400 font-mono">
                       <span>{entry.format_compliance_rate != null ? `${(entry.format_compliance_rate * 100).toFixed(0)}%` : '—'}</span>
@@ -739,10 +758,10 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           )}
           {data.format_compliance?.by_schema && Object.keys(data.format_compliance.by_schema).length > 0 && (
             <div data-testid="format-compliance-by-schema-block" className="mt-2 pt-2 border-t border-neutral-700/50">
-              <div className="text-[10px] text-neutral-500 mb-1 uppercase tracking-wide">By schema</div>
+              <div className="text-ui-sm text-neutral-500 mb-1 uppercase tracking-wide">By schema</div>
               <div className="space-y-0.5">
                 {Object.entries(data.format_compliance.by_schema).sort(([, a]: [string, FormatComplianceBySchemaEntry], [, b]: [string, FormatComplianceBySchemaEntry]) => (b.format_miss ?? 0) - (a.format_miss ?? 0)).map(([schema, entry]: [string, FormatComplianceBySchemaEntry]) => (
-                  <div key={schema} className="flex items-center justify-between gap-3 text-[10px]">
+                  <div key={schema} className="flex items-center justify-between gap-3 text-ui-sm">
                     <span className="text-neutral-500">{schema}</span>
                     <div className="flex items-center gap-2 text-neutral-400 font-mono">
                       {entry.format_miss > 0 && (
@@ -772,12 +791,12 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
                 favorableDirection="lower"
                 percent
               />
-              <div className="text-[10px] text-neutral-500 text-right font-mono">
+              <div className="text-ui-sm text-neutral-500 text-right font-mono">
                 dominant subtype: {data.agent_timeout_rate.dominant_subtype ?? '—'}
               </div>
             </div>
           </div>
-          <div className="mt-1 text-[10px] text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
+          <div className="mt-1 text-ui-sm text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
             <span>share: {data.agent_timeout_rate.dominant_share != null ? `${(data.agent_timeout_rate.dominant_share * 100).toFixed(0)}%` : '—'}</span>
             <span>timeouts: {data.agent_timeout_rate.timeout_count ?? '—'}</span>
             <span>denominator: {data.agent_timeout_rate.denominator ?? '—'}</span>
@@ -823,14 +842,14 @@ function SpendBurnRateWidget({ projectId }: { projectId?: string }) {
   return (
     <div data-testid="spend-burn-rate-widget" className="flex flex-wrap gap-6 items-end">
       <div>
-        <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Daily spend (7d avg)</div>
+        <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Daily spend (7d avg)</div>
         <div className="text-2xl font-mono text-neutral-100">${data.daily_spend_usd.toFixed(2)}<span className="text-sm text-neutral-400">/day</span></div>
       </div>
       <div>
-        <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Monthly forecast</div>
+        <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Monthly forecast</div>
         <div className="text-2xl font-mono text-emerald-400">${data.monthly_forecast_usd.toFixed(2)}<span className="text-sm text-neutral-400">/mo</span></div>
       </div>
-      <div className="text-[10px] text-neutral-500 font-mono ml-auto self-end">
+      <div className="text-ui-sm text-neutral-500 font-mono ml-auto self-end">
         {data.task_count} tasks · ${data.window_cost_usd.toFixed(2)} over {data.window_days}d
       </div>
     </div>
@@ -889,13 +908,13 @@ function TaskCostBreakdownWidget({ projectId, window }: { projectId: string; win
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-[11px] text-neutral-400 uppercase tracking-wide">Selected project spend</div>
+        <div className="text-ui-md text-neutral-400 uppercase tracking-wide">Selected project spend</div>
         <div className="text-xs font-mono text-neutral-300">${data.total_estimated_cost_usd.toFixed(2)} across {data.task_count} tasks</div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
         <div className={sectionCard}>
-          <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">By task type</div>
+          <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">By task type</div>
           <div className="space-y-1">
             {data.task_type_breakdown.map((row) => (
               <div key={row.task_type} className="flex items-center justify-between gap-3 text-xs min-w-0">
@@ -907,7 +926,7 @@ function TaskCostBreakdownWidget({ projectId, window }: { projectId: string; win
         </div>
 
         <div className={sectionCard}>
-          <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">By research direction</div>
+          <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">By research direction</div>
           <div className="space-y-1">
             {data.direction_breakdown.map((row) => (
               <div key={row.direction_id ?? 'unassigned'} className="flex items-center justify-between gap-3 text-xs min-w-0">
@@ -920,13 +939,13 @@ function TaskCostBreakdownWidget({ projectId, window }: { projectId: string; win
       </div>
 
       <div className={sectionCard}>
-        <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Top expensive tasks</div>
+        <div className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">Top expensive tasks</div>
         <div className="space-y-2">
           {data.top_tasks.map((row) => (
             <div key={row.task_id} className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 items-start text-xs">
               <div className="min-w-0">
                 <div className="text-neutral-200 break-all">{row.task_title}</div>
-                <div className="mt-0.5 text-[10px] text-neutral-500 break-all">
+                <div className="mt-0.5 text-ui-sm text-neutral-500 break-all">
                   <span className="font-mono">{row.task_type}</span>
                   {' · '}
                   <span className="font-mono">{row.direction_id ?? 'No direction'}</span>
@@ -1066,47 +1085,47 @@ export default function MetricsDashboard({
 
         {/* VM-Hours card */}
         <div className={cardClass}>
-          <div className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+          <div className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
             Total VM-Hours
           </div>
           <div className="text-lg font-semibold text-neutral-100 font-mono">
             {cumulativeVmHours.toFixed(2)}
           </div>
-          <div className="text-[10px] text-neutral-500 mt-1">
+          <div className="text-ui-sm text-neutral-500 mt-1">
             Cumulative VM Cost: <span className="text-neutral-300 font-mono">${cumulativeCost.toFixed(2)}</span>
           </div>
-          <div className="text-[10px] text-neutral-500">since session start</div>
+          <div className="text-ui-sm text-neutral-500">since session start</div>
         </div>
 
         {/* Task Throughput card */}
         <div className={cardClass}>
-          <div className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+          <div className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
             Tasks Completed
           </div>
           <div className="grid grid-cols-3 gap-2 text-center">
-            <div><div className="text-lg font-semibold text-neutral-100 font-mono">{count1h}</div><div className="text-[10px] text-neutral-500">1h</div></div>
-            <div><div className="text-lg font-semibold text-neutral-100 font-mono">{count6h}</div><div className="text-[10px] text-neutral-500">6h</div></div>
-            <div><div className="text-lg font-semibold text-neutral-100 font-mono">{count24h}</div><div className="text-[10px] text-neutral-500">24h</div></div>
+            <div><div className="text-lg font-semibold text-neutral-100 font-mono">{count1h}</div><div className="text-ui-sm text-neutral-500">1h</div></div>
+            <div><div className="text-lg font-semibold text-neutral-100 font-mono">{count6h}</div><div className="text-ui-sm text-neutral-500">6h</div></div>
+            <div><div className="text-lg font-semibold text-neutral-100 font-mono">{count24h}</div><div className="text-ui-sm text-neutral-500">24h</div></div>
           </div>
         </div>
 
         {/* Success Rate card */}
         <div className={cardClass}>
-          <div className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+          <div className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
             Success Rate
           </div>
           <div className="grid grid-cols-3 gap-2 text-center">
             <div>
               <div className={`text-lg font-semibold font-mono ${successRateColor(count1h, failed1h)}`}>{successRate(count1h, failed1h)}</div>
-              <div className="text-[10px] text-neutral-500">1h</div>
+              <div className="text-ui-sm text-neutral-500">1h</div>
             </div>
             <div>
               <div className={`text-lg font-semibold font-mono ${successRateColor(count6h, failed6h)}`}>{successRate(count6h, failed6h)}</div>
-              <div className="text-[10px] text-neutral-500">6h</div>
+              <div className="text-ui-sm text-neutral-500">6h</div>
             </div>
             <div>
               <div className={`text-lg font-semibold font-mono ${successRateColor(count24h, failed24h)}`}>{successRate(count24h, failed24h)}</div>
-              <div className="text-[10px] text-neutral-500">24h</div>
+              <div className="text-ui-sm text-neutral-500">24h</div>
             </div>
           </div>
         </div>
@@ -1115,7 +1134,7 @@ export default function MetricsDashboard({
         <div className={`${cardClass} sm:col-span-2`}>
           <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
             <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide">Digest Latency</div>
-            <div className="text-[10px] text-neutral-500">Shared visibility-aware poll, 60s cadence</div>
+            <div className="text-ui-sm text-neutral-500">Shared visibility-aware poll, 60s cadence</div>
           </div>
           <DigestLatencyWidget />
         </div>

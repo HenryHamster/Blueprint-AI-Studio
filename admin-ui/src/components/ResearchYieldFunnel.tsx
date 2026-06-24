@@ -22,8 +22,8 @@ export function ResearchYieldFunnel({ digest }: { digest: DigestData | null }) {
   const topDrop = drops[0];
   return (
     <section>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-neutral-400">
-        <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Research yield</span>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-ui-md text-neutral-400">
+        <span className="text-ui-sm text-neutral-500 uppercase tracking-wide">Research yield</span>
         <span>
           <span className="font-semibold text-neutral-200">{created}</span>
           <span className="text-neutral-500"> / {produced} findings &rarr; tasks </span>
@@ -37,7 +37,7 @@ export function ResearchYieldFunnel({ digest }: { digest: DigestData | null }) {
         {drops.length > 1 && (
           <span className="flex flex-wrap gap-1">
             {drops.slice(1).map(d => (
-              <span key={d.key} className="text-[10px] text-neutral-500" title={d.label}>
+              <span key={d.key} className="text-ui-sm text-neutral-500" title={d.label}>
                 {d.label} <span className="font-mono text-neutral-400">-{d.v}</span>
               </span>
             ))}

@@ -6,15 +6,17 @@
 // for that mapping — TaskCard, ResearchBrowser, and TaskDetailDrawerMeta all
 // consume it so the styling stays in lockstep.
 
+import { statusBadgeClasses, type StatusTone } from './projectStatus';
+
 type VerdictTone = 'positive' | 'blocking' | 'neutral' | 'info';
 
-// Reuse the EXACT class strings already used by TaskDetailDrawerMeta's
-// EvaluationSummarySection so the styling is byte-for-byte consistent.
-const TONE_BADGE_CLASS: Record<VerdictTone, string> = {
-  positive: 'bg-emerald-900/40 text-emerald-300 border-emerald-800/40',
-  blocking: 'bg-red-900/40 text-red-300 border-red-800/40',
-  neutral: 'bg-neutral-800/50 text-neutral-300 border-neutral-700/50',
-  info: 'bg-cyan-900/40 text-cyan-300 border-cyan-800/40',
+// Maps verdict tones to the canonical StatusTone so both verdict and project
+// badges resolve through the single token-backed mapper in projectStatus.ts.
+const VERDICT_TO_STATUS_TONE: Record<VerdictTone, StatusTone> = {
+  positive: 'success',
+  blocking: 'blocking',
+  neutral:  'neutral',
+  info:     'info',
 };
 
 // Known verdict tokens (case-insensitive). `approve`/`pass`/`clean`/`success`
@@ -56,7 +58,7 @@ function verdictTone(verdict: string): VerdictTone {
 }
 
 export function verdictToneBadgeClass(tone: VerdictTone): string {
-  return TONE_BADGE_CLASS[tone];
+  return statusBadgeClasses(VERDICT_TO_STATUS_TONE[tone]);
 }
 
 export function formatVerdict(verdict: string): { label: string; tone: VerdictTone } {

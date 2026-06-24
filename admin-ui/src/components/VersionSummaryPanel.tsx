@@ -40,12 +40,12 @@ function TaskRow({ entry }: { entry: ChangelogEntry }): JSX.Element {
         href={entry.pr_url}
         target="_blank"
         rel="noopener noreferrer"
-        className="font-mono text-[10px] text-slate-500 hover:text-slate-300 shrink-0 pt-px"
+        className="font-mono text-ui-sm text-slate-500 hover:text-slate-300 shrink-0 pt-px"
       >
         #{entry.pr_number}
       </a>
     ) : (
-      <span className="font-mono text-[10px] text-slate-500 shrink-0 pt-px">
+      <span className="font-mono text-ui-sm text-slate-500 shrink-0 pt-px">
         #{entry.pr_number}
       </span>
     )
@@ -78,11 +78,11 @@ function TypeSection({
         className="flex items-center gap-1 w-full text-left min-h-[44px] py-0.5 group"
         aria-expanded={open}
       >
-        <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 group-hover:text-slate-400 transition-colors">
+        <span className="text-ui-sm font-semibold uppercase tracking-wide text-slate-500 group-hover:text-slate-400 transition-colors">
           {taskType}
         </span>
-        <span className="text-slate-600 font-normal text-[10px]">({entries.length})</span>
-        <span className="ml-auto text-[10px] text-slate-600 group-hover:text-slate-400 transition-colors">
+        <span className="text-slate-600 font-normal text-ui-sm">({entries.length})</span>
+        <span className="ml-auto text-ui-sm text-slate-600 group-hover:text-slate-400 transition-colors">
           {open ? '▾' : '▸'}
         </span>
       </button>
@@ -99,7 +99,7 @@ function TypeSection({
 
 function TypeCountBadge({ taskType, count }: { taskType: string; count: number }): JSX.Element {
   return (
-    <span className="inline-flex items-center gap-0.5 rounded bg-slate-700/60 px-1.5 py-0.5 text-[10px] text-slate-400">
+    <span className="inline-flex items-center gap-0.5 rounded bg-slate-700/60 px-1.5 py-0.5 text-ui-sm text-slate-400">
       <span className="font-medium">{count}</span>
       <span className="text-slate-500">{taskType}</span>
     </span>
@@ -120,7 +120,7 @@ function AcceptanceBucketBreakdown({ aggregate }: { aggregate: Record<string, nu
     .filter(e => e.count > 0);
   if (entries.length === 0) return null;
   return (
-    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] mb-2" data-testid="acceptance-bucket-breakdown">
+    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm mb-2" data-testid="acceptance-bucket-breakdown">
       {entries.map(e => (
         <span key={e.key} className={e.className}>
           {e.count} {e.label}
@@ -150,7 +150,7 @@ export function VersionSummaryPanel({
         data-testid="version-summary-panel-empty"
         className="mt-3 rounded border border-slate-700/60 bg-slate-800/40 px-3 py-2"
       >
-        <div className="text-[11px] text-slate-500 italic">No tasks merged into this version yet.</div>
+        <div className="text-ui-md text-slate-500 italic">No tasks merged into this version yet.</div>
       </div>
     );
   }
@@ -183,13 +183,13 @@ export function VersionSummaryPanel({
       className="mt-3 rounded border border-slate-700/60 bg-slate-800/40 px-3 py-2"
     >
       <div className="flex items-center justify-between mb-2">
-        <div className="text-[11px] font-semibold text-slate-400">
+        <div className="text-ui-md font-semibold text-slate-400">
           {heading ?? 'What shipped'} ({tasksMerged.length} task{tasksMerged.length !== 1 ? 's' : ''})
         </div>
         <button
           onClick={handleCopyMarkdown}
           data-testid="copy-markdown-button"
-          className="text-[10px] text-slate-500 hover:text-slate-300 transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center"
+          className="text-ui-sm text-slate-500 hover:text-slate-300 transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center"
           title="Copy changelog as Markdown"
         >
           {copied ? 'Copied!' : 'Copy markdown'}
@@ -208,12 +208,12 @@ export function VersionSummaryPanel({
         placeholder="Filter by title or PR…"
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
-        className="w-full mb-2 rounded bg-slate-700/50 border border-slate-600/50 px-2 py-1 text-[11px] text-slate-300 placeholder-slate-500 outline-none focus:border-slate-500"
+        className="w-full mb-2 rounded bg-slate-700/50 border border-slate-600/50 px-2 py-1 text-ui-md text-slate-300 placeholder-slate-500 outline-none focus:border-slate-500"
         aria-label="Filter changelog entries"
       />
       <div className="max-h-64 overflow-y-auto pr-1">
         {filteredEntries.length === 0 ? (
-          <div data-testid="changelog-filter-no-results" className="text-[11px] text-slate-500 italic py-1">
+          <div data-testid="changelog-filter-no-results" className="text-ui-md text-slate-500 italic py-1">
             No entries match &ldquo;{filter}&rdquo;.
           </div>
         ) : (

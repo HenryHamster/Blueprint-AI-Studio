@@ -97,7 +97,7 @@ export default function TaskStreamPanel({ trackedTaskIds, trackedLogs, tasks, on
                 return (
                   // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <button key={id} onClick={() => { setSelectedTab(id); setAutoScroll(true); }}
-                    className={`flex items-center gap-1.5 px-2 py-1 rounded text-[10px] whitespace-nowrap shrink-0 transition-colors ${isActive ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-900'}`}>
+                    className={`flex items-center gap-1.5 px-2 py-1 rounded text-ui-sm whitespace-nowrap shrink-0 transition-colors ${isActive ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-900'}`}>
                     <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDotColor(t?.status)}`} />
                     <span className="max-w-[100px] truncate">{title}</span>
                     <button onClick={(e) => { e.stopPropagation(); onUntrack(id); }}
@@ -113,12 +113,12 @@ export default function TaskStreamPanel({ trackedTaskIds, trackedLogs, tasks, on
           {/* Single-tab header with untrack */}
           {ids.length === 1 && activeTask && (
             <div className="flex items-center justify-between px-3 py-1.5 border-b border-neutral-800 shrink-0">
-              <div className="flex items-center gap-1.5 text-[11px] text-neutral-400 min-w-0">
+              <div className="flex items-center gap-1.5 text-ui-md text-neutral-400 min-w-0">
                 <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDotColor(activeTask.status)}`} />
                 <span className="truncate">{activeTask.title || activeTab.slice(0, 8)}</span>
               </div>
               <button onClick={() => onUntrack(activeTab)}
-                className="text-neutral-600 hover:text-red-400 text-[10px] transition-colors shrink-0">
+                className="text-neutral-600 hover:text-red-400 text-ui-sm transition-colors shrink-0">
                 Untrack
               </button>
             </div>
@@ -126,7 +126,7 @@ export default function TaskStreamPanel({ trackedTaskIds, trackedLogs, tasks, on
 
           {/* Log Stream */}
           <div ref={scrollRef} onScroll={handleScroll}
-            className="flex-1 overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed custom-scrollbar">
+            className="flex-1 overflow-y-auto px-3 py-2 font-mono text-ui-md leading-relaxed custom-scrollbar">
             {activeEntries.length === 0 && (
               <div className="text-neutral-600 text-center py-8">Waiting for events...</div>
             )}
@@ -139,7 +139,7 @@ export default function TaskStreamPanel({ trackedTaskIds, trackedLogs, tasks, on
           </div>
 
           {/* Footer */}
-          <div className="flex items-center justify-between px-3 py-1 border-t border-neutral-800 text-[10px] text-neutral-600 shrink-0">
+          <div className="flex items-center justify-between px-3 py-1 border-t border-neutral-800 text-ui-sm text-neutral-600 shrink-0">
             <span>{activeEntries.length} entries</span>
             {!autoScroll && (
               <button onClick={() => { setAutoScroll(true); scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' }); }}

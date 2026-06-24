@@ -51,6 +51,7 @@ from app.models import (
     ComputeJobStatus,
     KnowledgeDocument,
     Project,
+    ProjectMember,
     ReleaseDeployArtifact,
     ReleaseVersion,
     Task,
@@ -10871,3 +10872,523 @@ class TestLaunchAgentCloudRunJob:
 
         assert result is True
         assert not api_called, "Cloud Run API must not be called in LOCAL_MODE"
+
+
+# ---------------------------------------------------------------------------
+# Hardware policy enforcement in create_compute_job
+# ---------------------------------------------------------------------------
+
+
+def _make_project_with_hardware_policy(
+    *,
+    allowed_machine_types: list | None = None,
+    allowed_accelerator_types: list | None = None,
+) -> Project:
+    envelope = {}
+    if allowed_machine_types is not None:
+        envelope["allowed_machine_types"] = allowed_machine_types
+    if allowed_accelerator_types is not None:
+        envelope["allowed_accelerator_types"] = allowed_accelerator_types
+    return Project(
+        name="Hardware Policy Project",
+        user_id="test-user",
+        build_config={"resource_envelope": envelope},
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_disallowed_machine_type(db_session):
+    """allowed_machine_types set, request uses a disallowed type → ComputeLaunchPreconditionFailed."""
+    project = _make_project_with_hardware_policy(
+        allowed_machine_types=["e2-standard-2"]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc_info:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo test",
+            machine_type="e2-standard-4",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+
+    detail = exc_info.value.detail
+    assert detail["error"] == "project_hardware_policy_violated"
+    assert "e2-standard-4" in detail["message"]
+    assert detail["requested"] == "e2-standard-4"
+    assert detail["allowed"] == ["e2-standard-2"]
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_disallowed_accelerator(
+    db_session, monkeypatch
+):
+    """allowed_accelerator_types set, request uses a disallowed accelerator → ComputeLaunchPreconditionFailed."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+
+    project = _make_project_with_hardware_policy(allowed_accelerator_types=["T4"])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc_info:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo gpu test",
+            accelerator="L4",
+            backend_name="gcp",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+        )
+
+    detail = exc_info.value.detail
+    assert detail["error"] == "project_hardware_policy_violated"
+    assert "L4" in detail["message"]
+    assert detail["requested"] == "L4"
+    assert detail["allowed"] == ["T4"]
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_allows_matching_hardware_policy(db_session):
+    """allowed_machine_types set, request matches the allowed type → job created."""
+    project = _make_project_with_hardware_policy(
+        allowed_machine_types=["e2-standard-2"]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo allowed",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    assert job.status == ComputeJobStatus.QUEUED
+    assert job.machine_type == "e2-standard-2"
+
+
+# Compute-experiment preflight endpoint and at-launch hardware policy gate
+# ---------------------------------------------------------------------------
+
+_PREFLIGHT_TEST_USER_ID = "test-user-123"
+
+
+async def _make_preflight_project(
+    session,
+    *,
+    repo: str = "acme/preflight-repo",
+    hardware_policy: dict | None = None,
+) -> Project:
+    owner, name = repo.split("/", 1)
+    build_config: dict = {}
+    if hardware_policy is not None:
+        build_config["resource_envelope"] = hardware_policy
+    project = Project(
+        name=repo,
+        user_id=_PREFLIGHT_TEST_USER_ID,
+        github_owner=owner,
+        github_repo=name,
+        autonomous_enabled=False,
+        build_config=build_config,
+    )
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    session.add(
+        ProjectMember(
+            project_id=project.id,
+            user_id=_PREFLIGHT_TEST_USER_ID,
+            role="owner",
+        )
+    )
+    await session.commit()
+    return project
+
+
+class TestComputeExperimentPreflight:
+    """Tests for POST /api/admin/tasks/compute-experiment/preflight."""
+
+    def _headers(self):
+        return {"x-user-id": _PREFLIGHT_TEST_USER_ID}
+
+    @pytest.mark.asyncio
+    async def test_cpu_shape_returns_cost_projection(self, client, db_session):
+        """CPU shape returns rate, projected_cost, and max_runtime."""
+        from app.vm_cost_rates import get_compute_rate_per_second
+
+        await _make_preflight_project(db_session)
+        spend_cap = 5.0
+        deadline = 3600
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment/preflight",
+            json={
+                "github_repo": "acme/preflight-repo",
+                "machine_type": "e2-standard-2",
+                "spend_cap_usd": spend_cap,
+                "deadline_seconds": deadline,
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        expected_rate = get_compute_rate_per_second(machine_type="e2-standard-2")
+        assert data["rate_per_second"] == pytest.approx(expected_rate, rel=1e-6)
+        assert data["rate_per_hour"] == pytest.approx(expected_rate * 3600, rel=1e-6)
+        assert data["projected_cost_usd"] == pytest.approx(expected_rate * deadline, rel=1e-6)
+        assert data["max_runtime_seconds"] == int(spend_cap / expected_rate)
+        assert data["in_policy"] is True
+        assert data["reason"] is None
+        assert data["shape_rejection"] is None
+
+    @pytest.mark.asyncio
+    async def test_gpu_l4_spot_returns_correct_rate(self, client, db_session):
+        """GPU L4 spot request returns the bundled spot rate."""
+        from app.vm_cost_rates import get_compute_rate_per_second
+
+        await _make_preflight_project(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment/preflight",
+            json={
+                "github_repo": "acme/preflight-repo",
+                "accelerator": "L4",
+                "machine_type": "g2-standard-4",
+                "spend_cap_usd": 10.0,
+                "deadline_seconds": 1800,
+                "provisioning_model": "SPOT",
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        expected_rate = get_compute_rate_per_second(
+            machine_type="g2-standard-4", accelerator="L4", spot=True
+        )
+        assert data["rate_per_second"] == pytest.approx(expected_rate, rel=1e-6)
+        assert data["projected_cost_usd"] == pytest.approx(expected_rate * 1800, rel=1e-6)
+        assert data["in_policy"] is True
+        assert data["shape_rejection"] is None
+
+    @pytest.mark.asyncio
+    async def test_policy_violation_returns_out_of_policy(self, client, db_session):
+        """Accelerator disallowed by project policy → in_policy=False with reason."""
+        await _make_preflight_project(
+            db_session,
+            hardware_policy={"allowed_accelerator_types": ["T4"]},
+        )
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment/preflight",
+            json={
+                "github_repo": "acme/preflight-repo",
+                "accelerator": "L4",
+                "machine_type": "g2-standard-4",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["in_policy"] is False
+        assert "L4" in data["reason"]
+        assert data["allowed_accelerator_types"] == ["T4"]
+        assert data["shape_rejection"] is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_accelerator_returns_shape_rejection(self, client, db_session):
+        """Unknown accelerator name → shape_rejection set, in_policy still True."""
+        await _make_preflight_project(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment/preflight",
+            json={
+                "github_repo": "acme/preflight-repo",
+                "accelerator": "A100",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["shape_rejection"] is not None
+        assert "A100" in data["shape_rejection"]
+        assert data["rate_per_second"] is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_project_returns_unlimited_policy(self, client, db_session):
+        """Project not yet created → preflight succeeds with unlimited policy."""
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment/preflight",
+            json={
+                "github_repo": "acme/no-such-repo",
+                "machine_type": "e2-standard-2",
+                "spend_cap_usd": 2.0,
+                "deadline_seconds": 600,
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["in_policy"] is True
+        assert data["allowed_machine_types"] is None
+        assert data["allowed_accelerator_types"] is None
+
+
+class TestComputeExperimentLaunchPolicyGate:
+    """Tests that create_compute_experiment_task enforces hardware policy."""
+
+    def _headers(self):
+        return {"x-user-id": _PREFLIGHT_TEST_USER_ID}
+
+    @pytest.mark.asyncio
+    async def test_disallowed_accelerator_rejected_at_launch(self, client, db_session):
+        """Accelerator outside project allowed_accelerator_types → 422 before task is persisted."""
+        await _make_preflight_project(
+            db_session,
+            repo="acme/policy-launch-repo",
+            hardware_policy={"allowed_accelerator_types": ["T4"]},
+        )
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={
+                "github_repo": "acme/policy-launch-repo",
+                "title": "GPU test",
+                "prompt": "Run benchmark",
+                "command": "python bench.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+                "accelerator": "L4",
+                "machine_type": "g2-standard-4",
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["error"]["message"]
+        assert detail["error"] == "project_hardware_policy_violated"
+        assert "L4" in detail["message"]
+        assert detail["requested"] == "L4"
+        assert detail["allowed"] == ["T4"]
+
+    @pytest.mark.asyncio
+    async def test_allowed_accelerator_proceeds_at_launch(self, client, db_session):
+        """Accelerator in project allowed_accelerator_types → task created successfully."""
+        await _make_preflight_project(
+            db_session,
+            repo="acme/policy-launch-allowed-repo",
+            hardware_policy={"allowed_accelerator_types": ["L4"]},
+        )
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={
+                "github_repo": "acme/policy-launch-allowed-repo",
+                "title": "GPU test",
+                "prompt": "Run benchmark",
+                "command": "python bench.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+                "accelerator": "L4",
+                "machine_type": "g2-standard-4",
+            },
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["requires_approval"] is False
+
+
+# ---------------------------------------------------------------------------
+# Live output tail: heartbeat delivery and local backend reading
+# ---------------------------------------------------------------------------
+
+
+def _make_live_tail_b64(text: str, truncated: bool = False) -> str:
+    """Build the base64-encoded JSON payload the VM runner writes to live_tail.b64."""
+    payload = json.dumps({"text": text, "truncated": truncated}).encode("utf-8")
+    return base64.b64encode(payload).decode("ascii")
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_stores_live_output(
+    client, db_session, monkeypatch
+):
+    """Heartbeat with live_output_tail body stores decoded text in polling_metadata."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="Live Tail HB Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hello",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    tail_text = "experiment output line 1\nexperiment output line 2"
+    tail_b64 = _make_live_tail_b64(tail_text)
+    body = json.dumps({"live_output_tail": tail_b64}).encode()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={
+            "Authorization": f"Bearer {job.id}",
+            "Content-Type": "application/json",
+        },
+        content=body,
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    live_output = meta.get("live_output")
+    assert isinstance(live_output, dict), "live_output must be stored in polling_metadata"
+    assert live_output.get("text") == tail_text, (
+        f"live_output text must match: {live_output.get('text')!r}"
+    )
+    assert live_output.get("truncated") is False
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_empty_body_unchanged(
+    client, db_session, monkeypatch
+):
+    """Heartbeat with no body must remain backward-compatible (no live_output stored)."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Empty Body Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hello",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    assert "live_output" not in meta, "no live_output should be stored for empty body"
+
+
+def test_gcp_startup_script_passes_live_tail_path_to_command_runner():
+    """The GCP startup script must pass live_tail.b64 as a 4th arg to command_runner.py."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "live_tail.b64" in script, "live_tail.b64 path must appear in startup script"
+    assert "blueprint_command_runner.py" in script
+    runner_idx = script.index("python3 /tmp/blueprint_command_runner.py")
+    runner_invocation = script[runner_idx : runner_idx + 400]
+    assert "live_tail.b64" in runner_invocation, (
+        "live_tail.b64 path must be passed as an argument to command_runner.py"
+    )
+
+
+def test_gcp_startup_script_heartbeat_reads_live_tail():
+    """The _compute_heartbeat function in the startup script must read live_tail.b64."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    hb_func_start = script.index("_compute_heartbeat() {")
+    hb_func_body = script[hb_func_start : hb_func_start + 600]
+    assert "live_tail.b64" in hb_func_body, (
+        "_compute_heartbeat must reference live_tail.b64"
+    )
+    assert "live_output_tail" in hb_func_body, (
+        "_compute_heartbeat must include live_output_tail in the POST body"
+    )
+
+
+def test_local_backend_live_tail_read_on_poll(tmp_path):
+    """poll_status returns live_output when live_tail.b64 exists in the artifact dir."""
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    tail_text = "partial output so far"
+    tail_b64 = _make_live_tail_b64(tail_text)
+    (artifact_dir / "live_tail.b64").write_text(tail_b64)
+
+    job = ComputeJob(
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"artifact_dir": str(artifact_dir)},
+    )
+    result = compute_backends_module._read_local_live_tail(job)
+    assert result is not None, "_read_local_live_tail must return a dict when file exists"
+    assert result["text"] == tail_text
+    assert result["truncated"] is False

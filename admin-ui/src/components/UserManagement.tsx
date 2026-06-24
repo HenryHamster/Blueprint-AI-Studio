@@ -92,7 +92,7 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
       {/* Add user form */}
       <div className="px-4 py-3 border-b border-neutral-800 flex gap-2 items-end">
         <div className="flex-1">
-          <label className="block text-[10px] text-neutral-500 mb-1">Email</label>
+          <label className="block text-ui-sm text-neutral-500 mb-1">Email</label>
           <input
             type="email"
             value={newEmail}
@@ -103,7 +103,7 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
           />
         </div>
         <div>
-          <label className="block text-[10px] text-neutral-500 mb-1">Role</label>
+          <label className="block text-ui-sm text-neutral-500 mb-1">Role</label>
           <select
             value={newRole}
             onChange={e => setNewRole(e.target.value as 'user' | 'admin')}
@@ -130,7 +130,7 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
         ) : (
           <table className="w-full text-xs">
             <thead>
-              <tr className="text-neutral-500 text-[10px] uppercase tracking-wider border-b border-neutral-800">
+              <tr className="text-neutral-500 text-ui-sm uppercase tracking-wider border-b border-neutral-800">
                 <th className="text-left px-4 py-2">Email</th>
                 <th className="text-left px-4 py-2">Role</th>
                 <th className="text-left px-4 py-2 hidden sm:table-cell">Last Login</th>
@@ -144,15 +144,15 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
                   <tr key={u.id} className="border-b border-neutral-800/50 hover:bg-neutral-800/30">
                     <td className="px-4 py-2.5">
                       <div className="text-neutral-200">{u.display_name || u.email}</div>
-                      {u.display_name && <div className="text-neutral-500 text-[10px]">{u.email}</div>}
-                      {isSelf && <span className="text-[10px] text-cyan-500 ml-1">(you)</span>}
+                      {u.display_name && <div className="text-neutral-500 text-ui-sm">{u.email}</div>}
+                      {isSelf && <span className="text-ui-sm text-cyan-500 ml-1">(you)</span>}
                     </td>
                     <td className="px-4 py-2.5">
                       {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                       <button
                         onClick={() => handleToggleRole(u)}
                         disabled={isSelf || loading === u.id}
-                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium transition-colors ${
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-ui-sm font-medium transition-colors ${
                           u.role === 'admin'
                             ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
                             : 'bg-neutral-700/50 text-neutral-400 border border-neutral-600/30'

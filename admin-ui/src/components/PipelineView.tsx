@@ -5,21 +5,10 @@ import { TASK_TYPE_STYLES, useElapsedTime, getHeartbeatStatus } from './TaskCard
 import { parseTimestamp } from '../utils/time';
 import { getSidecarBackref, deriveSidecarBadge, SIDECAR_TONE_CLASSES, type SidecarBadge } from '../utils/sidecarTasks';
 import { buildForest, type TreeNode } from './PipelineView.utils';
+import { taskStatusDotColor } from '../utils/taskStatus';
 
 const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
 const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'CANCELLED'];
-
-const STATUS_COLORS: Record<string, string> = {
-  COMPLETED: 'bg-emerald-500',
-  IN_PROGRESS: 'bg-yellow-500',
-  PROVISIONING: 'bg-sky-700/50',
-  EVALUATING: 'bg-indigo-600/50',
-  FAILED: 'bg-red-500',
-  CANCELLED: 'bg-neutral-600',
-  QUEUED: 'bg-neutral-500',
-  BLOCKED: 'bg-amber-500',
-  PARKED: 'bg-purple-600/50',
-};
 
 type FilterType = 'All' | 'Active' | 'Blocked' | 'Failed' | 'Needs Review';
 
@@ -56,7 +45,7 @@ interface PipelineViewProps {
 function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveParent, activeFilter, blockingCount, sidecarBadges, isSidecar, isSidecarFallback }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void; onUnarchiveParent?: (parentTaskId: string) => void; activeFilter: FilterType; blockingCount?: number; sidecarBadges?: SidecarBadge[]; isSidecar?: boolean; isSidecarFallback?: boolean }) {
   const style = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
   const Icon = style?.icon;
-  const statusColor = STATUS_COLORS[task.status] || 'bg-neutral-500';
+  const statusColor = taskStatusDotColor(task.status);
   const isRunning = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
   const heartbeat = isRunning && task.last_heartbeat ? getHeartbeatStatus(task.last_heartbeat) : null;
 
@@ -106,7 +95,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
         <>
           <button
             onClick={e => { e.stopPropagation(); onNavigateToParent?.(parentId); }}
-            className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-[9px] text-amber-500/80 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+            className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-ui-xs text-amber-500/80 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
             title={`Copy parent task ID: ${parentId}`}
           >
             ↑ Parent on another page
@@ -114,7 +103,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
           {onUnarchiveParent && (
             <button
               onClick={e => { e.stopPropagation(); onUnarchiveParent(parentId); }}
-              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-[9px] text-emerald-500/80 border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 hover:text-emerald-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-ui-xs text-emerald-500/80 border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 hover:text-emerald-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
               title="Unarchive parent task (idempotent if already unarchived)"
             >
               ↪ Unarchive parent
@@ -133,7 +122,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
         return (
           <>
             <span
-              className="text-[9px] text-violet-400 bg-violet-500/10 border border-violet-500/30 px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider whitespace-nowrap shrink-0"
+              className="text-ui-xs text-violet-400 bg-violet-500/10 border border-violet-500/30 px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider whitespace-nowrap shrink-0"
               title={`Side-car (${backref.kind}) for task ${backref.primaryTaskId}`}
             >
               ↳ side-car
@@ -141,7 +130,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
             {isSidecarFallback && (
               <button
                 onClick={e => { e.stopPropagation(); onNavigateToParent?.(backref.primaryTaskId); }}
-                className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-[9px] text-amber-500/80 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+                className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-ui-xs text-amber-500/80 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
                 title={`Copy primary task ID: ${backref.primaryTaskId}`}
               >
                 ↑ Primary on another page
@@ -153,14 +142,14 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
 
       {/* Type badge */}
       {style && Icon && (
-        <span className={`${style.bg} ${style.text} border text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-0.5 shrink-0`}>
+        <span className={`${style.bg} ${style.text} border text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-0.5 shrink-0`}>
           <Icon className="w-2.5 h-2.5" />{style.label}
         </span>
       )}
 
       {/* Retry badge */}
       {task.attempt_count != null && task.attempt_count > 0 && (
-        <span className="text-orange-400 bg-orange-500/10 border border-orange-500/20 text-[9px] px-1.5 py-0.5 rounded font-semibold whitespace-nowrap shrink-0" title={`Attempt ${task.attempt_count + 1}`}>
+        <span className="text-orange-400 bg-orange-500/10 border border-orange-500/20 text-ui-xs px-1.5 py-0.5 rounded font-semibold whitespace-nowrap shrink-0" title={`Attempt ${task.attempt_count + 1}`}>
           ↺{task.attempt_count + 1}
         </span>
       )}
@@ -172,7 +161,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
           target="_blank"
           rel="noopener noreferrer"
           onClick={e => e.stopPropagation()}
-          className="min-h-[44px] min-w-[44px] text-[9px] text-sky-400/80 border border-sky-500/30 bg-sky-500/10 hover:bg-sky-500/20 hover:text-sky-300 px-1.5 rounded font-medium whitespace-nowrap flex items-center justify-center gap-0.5 shrink-0 transition-colors"
+          className="min-h-[44px] min-w-[44px] text-ui-xs text-sky-400/80 border border-sky-500/30 bg-sky-500/10 hover:bg-sky-500/20 hover:text-sky-300 px-1.5 rounded font-medium whitespace-nowrap flex items-center justify-center gap-0.5 shrink-0 transition-colors"
         >
           PR #{prNumberFromUrl(task.pr_url)}<ExternalLink className="w-2.5 h-2.5" />
         </a>
@@ -183,7 +172,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
         const prCount = task.artifacts?.filter(a => a.artifact_type === 'PULL_REQUEST').length ?? 0;
         return prCount > 1 ? (
           <span
-            className="bg-orange-500/10 border border-orange-500/20 text-orange-400 text-[9px] font-mono px-1.5 py-0.5 rounded whitespace-nowrap shrink-0"
+            className="bg-orange-500/10 border border-orange-500/20 text-orange-400 text-ui-xs font-mono px-1.5 py-0.5 rounded whitespace-nowrap shrink-0"
             title={`This task required ${prCount} PR iterations`}
           >
             ×{prCount} iters
@@ -193,7 +182,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
 
       {/* Blocking badge */}
       {(blockingCount ?? 0) > 0 && (task.status === 'FAILED' || task.status === 'CANCELLED') && (
-        <span className="inline-flex items-center gap-1 text-[9px] font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded whitespace-nowrap shrink-0">
+        <span className="inline-flex items-center gap-1 text-ui-xs font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded whitespace-nowrap shrink-0">
           <AlertTriangle className="w-2.5 h-2.5" />
           Blocking {blockingCount}
         </span>
@@ -204,7 +193,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
       {sidecarBadges?.map((b, i) => (
         <span
           key={`${b.kind}-${i}`}
-          className={`text-[9px] border px-1.5 py-0.5 rounded font-semibold whitespace-nowrap shrink-0 ${SIDECAR_TONE_CLASSES[b.tone]}`}
+          className={`text-ui-xs border px-1.5 py-0.5 rounded font-semibold whitespace-nowrap shrink-0 ${SIDECAR_TONE_CLASSES[b.tone]}`}
           title={b.title}
         >
           {b.text}
@@ -217,14 +206,14 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
           {task.title}
         </span>
         {task.latest_status_message && task.status !== 'COMPLETED' && task.status !== 'CANCELLED' && (
-          <span className="text-[10px] text-neutral-500 truncate">
+          <span className="text-ui-sm text-neutral-500 truncate">
             {task.latest_status_message}
           </span>
         )}
       </div>
 
       {/* Duration */}
-      <span className="text-[10px] text-neutral-500 font-mono shrink-0">
+      <span className="text-ui-sm text-neutral-500 font-mono shrink-0">
         {task.status === 'QUEUED' ? 'Waiting' : duration}
       </span>
     </div>
@@ -315,7 +304,7 @@ function TreeBranch({
               return (
                 <div key={dep.id} className="flex items-center gap-1.5 min-w-0">
                   <div className="w-4 border-t-2 border-dashed border-neutral-600 shrink-0" />
-                  <span className="text-[9px] text-neutral-500 font-mono truncate max-w-[120px] sm:max-w-[200px]" title={`Depends on: ${dep.title}`}>
+                  <span className="text-ui-xs text-neutral-500 font-mono truncate max-w-[120px] sm:max-w-[200px]" title={`Depends on: ${dep.title}`}>
                     &#8594; {depStyle ? <span className={depStyle.text}>[{depStyle.label}]</span> : null} {dep.title}
                   </span>
                 </div>
@@ -324,7 +313,7 @@ function TreeBranch({
             {offPageDepIds.map(id => (
               <div key={id} className="flex items-center gap-1.5 min-w-0">
                 <div className="w-4 border-t-2 border-dashed border-amber-500/40 shrink-0" />
-                <span className="text-[9px] text-amber-500/70 font-mono truncate max-w-[120px] sm:max-w-[200px]" title={`Depends on task ${id} (not on this page)`}>
+                <span className="text-ui-xs text-amber-500/70 font-mono truncate max-w-[120px] sm:max-w-[200px]" title={`Depends on task ${id} (not on this page)`}>
                   &#8594; depends on task not on this page ({id.slice(0, 8)})
                 </span>
               </div>
@@ -336,10 +325,10 @@ function TreeBranch({
         {linkedCreateTask && (
           <div className="mb-1 ml-1 flex items-center gap-1.5 min-w-0">
             <div className={`w-4 border-t-2 border-dashed ${chainColor} shrink-0`} />
-            <span className={`text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded border ${chainBadgeBg} shrink-0`}>
+            <span className={`text-ui-xs font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded border ${chainBadgeBg} shrink-0`}>
               {chainLabel}
             </span>
-            <span className="text-[9px] text-neutral-500 font-mono truncate max-w-[100px] sm:max-w-[200px]" title={`${node.task.task_type === 'fix' ? 'Fixes' : 'Reviews'} PR from: ${linkedCreateTask.title}`}>
+            <span className="text-ui-xs text-neutral-500 font-mono truncate max-w-[100px] sm:max-w-[200px]" title={`${node.task.task_type === 'fix' ? 'Fixes' : 'Reviews'} PR from: ${linkedCreateTask.title}`}>
               ↳ {node.task.task_type === 'fix' ? 'Fixes' : 'Reviews'} PR from: {linkedCreateTask.title}
             </span>
           </div>
@@ -369,7 +358,7 @@ function TreeBranch({
             <div style={{ paddingLeft: 20 }}>
               <button
                 onClick={e => { e.stopPropagation(); setSidecarsExpanded(v => !v); }}
-                className="min-h-[44px] inline-flex items-center gap-1 text-[10px] text-violet-400/80 hover:text-violet-300 transition-colors"
+                className="min-h-[44px] inline-flex items-center gap-1 text-ui-sm text-violet-400/80 hover:text-violet-300 transition-colors"
                 title={sidecarsExpanded ? 'Collapse side-cars' : 'Expand side-cars'}
               >
                 {sidecarsExpanded
@@ -532,7 +521,7 @@ function RootGroup({
             <ChevronDown
               className={`w-3.5 h-3.5 shrink-0 text-neutral-500 transition-transform duration-150 ${expanded ? '' : '-rotate-90'}`}
             />
-            <h3 className={`text-[11px] font-bold uppercase tracking-widest truncate ${isSynthetic ? 'text-neutral-500' : 'text-neutral-400'}`}>
+            <h3 className={`text-ui-md font-bold uppercase tracking-widest truncate ${isSynthetic ? 'text-neutral-500' : 'text-neutral-400'}`}>
               {root.task.title}
             </h3>
           </div>
@@ -541,7 +530,7 @@ function RootGroup({
             return (
             <button
               onClick={() => onNavigateToParent?.(parentId)}
-              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-[9px] text-amber-500/70 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-ui-xs text-amber-500/70 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
               title={`Copy parent task ID: ${root.task.parent_task_id}`}
             >
               ↑ Parent on another page
@@ -553,37 +542,37 @@ function RootGroup({
           {onArchiveGroup && runningInGroup === 0 && !isSynthetic && (
             <button
               onClick={e => { e.stopPropagation(); onArchiveGroup(collectAllIds(root).filter(id => !id.startsWith('synthetic-'))); }}
-              className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity text-[10px] text-neutral-500 hover:text-neutral-300 min-h-[44px] min-w-[44px] flex items-center justify-center gap-1 px-2 rounded border border-neutral-700 hover:border-neutral-600 mr-1"
+              className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity text-ui-sm text-neutral-500 hover:text-neutral-300 min-h-[44px] min-w-[44px] flex items-center justify-center gap-1 px-2 rounded border border-neutral-700 hover:border-neutral-600 mr-1"
               title="Archive this group"
             >
               <Archive className="w-3 h-3" />
             </button>
           )}
           {runningInGroup > 0 && (
-            <span className="flex items-center gap-1 text-[10px] bg-yellow-500/10 text-yellow-400 px-2 py-0.5 rounded-full font-medium border border-yellow-500/30">
+            <span className="flex items-center gap-1 text-ui-sm bg-yellow-500/10 text-yellow-400 px-2 py-0.5 rounded-full font-medium border border-yellow-500/30">
               <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 shrink-0" />
               {runningInGroup}
             </span>
           )}
           {blockedInGroup > 0 && (
-            <span className="flex items-center gap-1 text-[10px] bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-full font-medium border border-amber-500/30" title={`${blockedInGroup} blocked`}>
+            <span className="flex items-center gap-1 text-ui-sm bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-full font-medium border border-amber-500/30" title={`${blockedInGroup} blocked`}>
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
               {blockedInGroup}
             </span>
           )}
           {parkedInGroup > 0 && (
-            <span className="flex items-center gap-1 text-[10px] bg-purple-500/10 text-purple-400 px-2 py-0.5 rounded-full font-medium border border-purple-500/30" title={`${parkedInGroup} parked`}>
+            <span className="flex items-center gap-1 text-ui-sm bg-purple-500/10 text-purple-400 px-2 py-0.5 rounded-full font-medium border border-purple-500/30" title={`${parkedInGroup} parked`}>
               <span className="w-1.5 h-1.5 rounded-full bg-purple-400 shrink-0" />
               {parkedInGroup}
             </span>
           )}
           {failedInGroup > 0 && (
-            <span className="flex items-center gap-1 text-[10px] bg-red-500/10 text-red-400 px-2 py-0.5 rounded-full font-medium border border-red-500/30">
+            <span className="flex items-center gap-1 text-ui-sm bg-red-500/10 text-red-400 px-2 py-0.5 rounded-full font-medium border border-red-500/30">
               <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0" />
               {failedInGroup}
             </span>
           )}
-          <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
+          <span className="text-ui-sm bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
             {completedInGroup}/{totalInGroup - cancelledInGroup} done
           </span>
         </div>
@@ -592,14 +581,14 @@ function RootGroup({
       {/* Progress bar */}
       {(() => {
         const segments = [
-          { count: queuedInGroup, color: 'bg-neutral-700' },
-          { count: parkedInGroup, color: 'bg-purple-600/50' },
-          { count: blockedInGroup, color: 'bg-amber-500' },
-          { count: provisioningInGroup, color: 'bg-sky-700/50' },
-          { count: inProgressInGroup, color: 'bg-yellow-500' },
-          { count: evaluatingInGroup, color: 'bg-indigo-600/50' },
-          { count: failedInGroup, color: 'bg-red-500' },
-          { count: completedInGroup, color: 'bg-emerald-500' },
+          { count: queuedInGroup, color: taskStatusDotColor('QUEUED') },
+          { count: parkedInGroup, color: taskStatusDotColor('PARKED') },
+          { count: blockedInGroup, color: taskStatusDotColor('BLOCKED') },
+          { count: provisioningInGroup, color: taskStatusDotColor('PROVISIONING') },
+          { count: inProgressInGroup, color: taskStatusDotColor('IN_PROGRESS') },
+          { count: evaluatingInGroup, color: taskStatusDotColor('EVALUATING') },
+          { count: failedInGroup, color: taskStatusDotColor('FAILED') },
+          { count: completedInGroup, color: taskStatusDotColor('COMPLETED') },
         ].filter(s => s.count > 0);
         return (
           <div className="flex w-full h-1 rounded-full overflow-hidden mt-2">

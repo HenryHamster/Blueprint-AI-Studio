@@ -2736,6 +2736,100 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
   });
 });
 
+// ── handlePlan — structured-output self-repair ───────────────────────────────
+// When the initial Claude Code output doesn't produce valid plan JSON, the
+// repair prompt must include prior analysis context (planProgress) so the
+// reopen has enough detail to recover. This mirrors the pattern in design.ts
+// and audit handlers: repair calls without prior context have ~44% failure rate.
+describe('handlePlan — structured-output self-repair', () => {
+  const SR_TASK_ID = 'sr-plan-001';
+  const SR_GH_TOKEN = 'gh-token';
+  const SR_OWNER = 'owner';
+  const SR_REPO = 'repo';
+  const SR_WS = null;
+  const SR_STATUS_REF = () => ({ value: '' });
+  const SR_TASK = { title: 'Plan task', description: 'planning', context: {}, project_context: {} };
+  const SR_PAYLOAD = { base_branch: 'main', prompt: 'create a plan' };
+
+  const VALID_PLAN_JSON = '{"subtasks":[{"title":"First step","prompt":"Implement feature","type":"create","scope":"small","related_files":["src/app.ts"],"depends_on_indices":[]}]}';
+  const PLAN_PROGRESS_CONTENT = '## Analysis Notes\n\nExamined the codebase and identified key areas to focus on for this implementation.';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('includes prior analysis in repair prompt when initial output is malformed', async () => {
+    // Initial run produces no valid JSON
+    const initialOutput = 'I started planning but did not emit valid JSON.';
+    // Repair call returns valid plan JSON
+    const repairOutput = VALID_PLAN_JSON;
+
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: initialOutput, lastResultText: initialOutput })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: repairOutput, lastResultText: repairOutput });
+
+    // Mock plan_progress file to exist and contain analysis
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockImplementation((path: string) => {
+      // Return true for plan_progress read but false for plan_output (to trigger repair path)
+      if (path === `/tmp/plan_progress_${SR_TASK_ID}.md`) return true;
+      if (path === `/tmp/plan_output_${SR_TASK_ID}.json`) return false;
+      return false;
+    });
+
+    vi.mocked(fs.readFileSync as (p: string | number) => string).mockImplementation((path) => {
+      if (typeof path === 'string' && path === `/tmp/plan_progress_${SR_TASK_ID}.md`) {
+        return PLAN_PROGRESS_CONTENT;
+      }
+      return '';
+    });
+
+    await handlePlan(SR_TASK_ID, SR_PAYLOAD, SR_TASK, SR_GH_TOKEN, SR_OWNER, SR_REPO, SR_WS, SR_STATUS_REF());
+
+    // Verify two runClaudeCode calls: initial + repair
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+
+    // Verify the repair prompt includes prior analysis context
+    const repairCall = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairCall).toContain('## Pre-Implementation Analysis');
+    expect(repairCall).toContain('Analysis Notes');
+
+    // Verify task completed successfully
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+    const parsed = JSON.parse(posted.logs as string) as Record<string, unknown>;
+    expect(Array.isArray(parsed.subtasks)).toBe(true);
+    expect((parsed.subtasks as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it('handles missing plan_progress file gracefully in repair prompt', async () => {
+    const initialOutput = 'Planning incomplete without valid JSON.';
+    const repairOutput = VALID_PLAN_JSON;
+
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: initialOutput, lastResultText: initialOutput })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: repairOutput, lastResultText: repairOutput });
+
+    // Mock existsSync to return false for both plan_output and plan_progress
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+
+    await handlePlan(SR_TASK_ID, SR_PAYLOAD, SR_TASK, SR_GH_TOKEN, SR_OWNER, SR_REPO, SR_WS, SR_STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+
+    // Repair prompt should still be valid even without prior analysis
+    const repairCall = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairCall).toContain('You did not emit the plan JSON in the required schema');
+    expect(repairCall).toContain('subtasks');
+
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
+  });
+});
+
 // ── handleResearch — prior-knowledge injection ───────────────────────────────
 // Research must read accumulated knowledge documents back at launch (the same
 // way web-research does) and inject the most relevant ones as a Prior Knowledge
@@ -3066,7 +3160,6 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
   const EXECUTOR_MARKERS_NO_JSON =
     './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\n' +
     'I prepared the "problem_model" and "direction_operations" but never emitted the JSON object.';
-  const REPAIRED_STRATEGIC_JSON = '{"problem_model":{"revision":1},"direction_operations":[]}';
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -3084,72 +3177,44 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
     return calls[calls.length - 1][1];
   }
 
-  it('re-asks exactly once and COMPLETES with the recovered inline strategic JSON', async () => {
+  it('does NOT re-ask a command-based executor that cites markers in prose (command-mode gate prevents extraction)', async () => {
+    // With the fix, executor outputs containing ./strategic commands skip legacy extraction
+    // entirely, even when prose mentions the marker keys. This prevents false-positive
+    // format misses that trigger unnecessary self-repair LLM calls.
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
       .mockResolvedValueOnce(CHALLENGE_MOCK)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: '' })
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: REPAIRED_STRATEGIC_JSON, lastResultText: REPAIRED_STRATEGIC_JSON });
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: 'Executed.' });
 
     await handleStrategic(
       SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
     );
 
-    // thinker + challenge + executor + exactly one bounded re-ask = 4 invocations.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(4);
-    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
-
-    const posted = lastPostedStatus();
-    expect(posted.status).toBe('COMPLETED');
-    const parsed = JSON.parse(posted.logs as string) as { problem_model: { revision: number } };
-    expect(parsed.problem_model.revision).toBe(1);
-  });
-
-  it('does NOT record repair success when the re-ask still yields no inline JSON', async () => {
-    vi.mocked(runClaudeCode)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
-      .mockResolvedValueOnce(CHALLENGE_MOCK)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: 'fallback summary' })
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'still no parseable json here', lastResultText: '' });
-
-    await handleStrategic(
-      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
-    );
-
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(4);
-    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(recordFormatRepairAttempt)).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(recordFormatRepairSuccess)).not.toHaveBeenCalled();
-    // Still COMPLETED (clean exit) with the fallback logs.
+    // Only thinker + challenge + executor — no re-ask despite prose markers, thanks to command-mode gate.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
+    expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
     expect(lastPostedStatus().status).toBe('COMPLETED');
   });
 
-  it('counts repair success when the retry delivers JSON only in lastResultText (JSON-stream provider)', async () => {
-    // Simulate a JSON-stream provider: allOutput is the raw stream with escaped JSON,
-    // lastResultText is the clean final answer with the parseable JSON.
-    const STREAM_RAW = './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\n' +
-      '{"type":"content_block_delta","delta":{"type":"text_delta","text":"{\\"problem_model\\":{\\"revision\\":2},\\"direction_operations\\":[]}"}}';
-    // allOutput has the keys only as escaped substrings; lastResultText has the literal keys.
-    const CLEAN_JSON = '{"problem_model":{"revision":2},"direction_operations":[]}';
-
+  it('does NOT record repair success when a command-based executor cites markers in prose', async () => {
+    // Command-mode runs with ./strategic signals skip legacy extraction, so no format miss is recorded
+    // even if the output mentions marker keys. This validates the core fix preventing false-positive
+    // format misses from causing LLM waste.
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
       .mockResolvedValueOnce(CHALLENGE_MOCK)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: '' })
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: STREAM_RAW, lastResultText: CLEAN_JSON });
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: 'Commands executed.' });
 
     await handleStrategic(
       SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
     );
 
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(4);
-    expect(vi.mocked(recordFormatRepairSuccess)).toHaveBeenCalledTimes(1);
-    const posted = lastPostedStatus();
-    expect(posted.status).toBe('COMPLETED');
-    const parsed = JSON.parse(posted.logs as string) as { problem_model: { revision: number } };
-    expect(parsed.problem_model.revision).toBe(2);
+    // Only thinker + challenge + executor; no format telemetry due to command-mode gate.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
+    expect(vi.mocked(recordFormatRepairSuccess)).not.toHaveBeenCalled();
+    expect(lastPostedStatus().status).toBe('COMPLETED');
   });
 
   it('does NOT re-ask a command-based run that emits no inline strategic JSON (no warning gate)', async () => {
@@ -3167,6 +3232,30 @@ describe('handleStrategic — bounded self-repair on legacy strategic JSON forma
     );
 
     // Only thinker + challenge + executor — no re-ask, no format telemetry.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
+    expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
+    expect(lastPostedStatus().status).toBe('COMPLETED');
+  });
+
+  it('does NOT re-ask a command-based run even when prose mentions marker keys (command-mode gate)', async () => {
+    // This validates the core fix: buildStrategicCompletionLogs skips legacy extraction
+    // when ./strategic commands are present, even if marker names appear in prose.
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
+      .mockResolvedValueOnce(CHALLENGE_MOCK)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: EXECUTOR_MARKERS_NO_JSON, // Has commands + prose markers but no JSON
+        lastResultText: 'Commands executed.',
+      });
+
+    await handleStrategic(
+      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Only thinker + challenge + executor — no re-ask despite prose markers.
+    // The command-mode signal gates legacy extraction off, preventing false-positive format miss.
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
     expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
     expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();

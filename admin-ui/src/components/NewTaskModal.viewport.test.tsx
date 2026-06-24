@@ -12,6 +12,7 @@ vi.mock('../api', () => ({
   authHeaders: vi.fn(async () => ({})),
   fetchTaskTypeCatalog: vi.fn(async () => []),
   createComputeExperiment: vi.fn(async () => ({ id: 'compute-experiment-test' })),
+  computeExperimentPreflight: vi.fn(async () => ({})),
 }));
 
 const LAUNCHABLE_OPTIONS = [

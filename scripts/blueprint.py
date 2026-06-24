@@ -635,66 +635,6 @@ def _render_evaluating_list(data: dict) -> None:
             print(f"           {msg}")
 
 
-def _tasks_cancel_all(args: argparse.Namespace) -> None:
-    """Bulk-cancel tasks filtered by status (and optional category)."""
-    cfg = load_config()
-    if cfg.get("read_only"):
-        print("ERROR: 'cancel-all' requires an admin API key.", file=sys.stderr)
-        sys.exit(1)
-    statuses = [args.status] if getattr(args, "status", None) else [
-        "QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"]
-    category = getattr(args, "category", None)
-    if not _confirm(
-        f"Cancel all tasks with status={statuses}"
-        + (f" category={category}" if category else "") + "?",
-        getattr(args, "yes", False),
-    ):
-        print("Aborted.")
-        return
-    pid = get_project_id(getattr(args, "project_id", None))
-    cancelled = skipped = 0
-    for status in statuses:
-        offset = 0
-        while True:
-            resp = api("GET", f"/api/admin/tasks?project_id={pid}&status={status}"
-                              f"&limit=500&offset={offset}")
-            batch = resp.get("tasks", resp) if isinstance(resp, dict) else resp
-            if not batch:
-                break
-            for t in batch:
-                if category and (t.get("context") or {}).get("failure_category") != category:
-                    skipped += 1
-                    continue
-                try:
-                    api("PATCH", f"/api/admin/tasks/{t['id']}", {"status": "CANCELLED"})
-                    cancelled += 1
-                except Exception:  # noqa: BLE001
-                    pass
-            offset += len(batch)
-            if len(batch) < 500:
-                break
-    suffix = f" ({skipped} skipped, category filter)" if skipped else ""
-    print(f"Cancelled {cancelled} tasks{suffix}.")
-
-
-def _tasks_set_status(args: argparse.Namespace) -> None:
-    """Force a task to an arbitrary status (power-user recovery lever)."""
-    cfg = load_config()
-    if cfg.get("read_only"):
-        print("ERROR: 'set-status' requires an admin API key.", file=sys.stderr)
-        sys.exit(1)
-    if not _confirm(
-        f"Set task {args.task_id} to {args.new_status}?", getattr(args, "yes", False)
-    ):
-        print("Aborted.")
-        return
-    body: dict = {"status": args.new_status}
-    if getattr(args, "message", None):
-        body["latest_status_message"] = args.message
-    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", body)
-    _emit(args, result, lambda d: print(f"  {args.task_id[:8]}: {d.get('status', 'ok')}"))
-
-
 def _tasks_autonomy_debug(args: argparse.Namespace) -> None:
     """Fetch autonomy-debug for a project: blocking guards, eligible directions."""
     pid = get_project_id(getattr(args, "project_id", None))
@@ -765,31 +705,6 @@ def _require_write_config(action: str) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-
-
-def _tasks_evaluating(args: argparse.Namespace) -> None:
-    pid = get_project_id(getattr(args, "project_id", None))
-    resp = api("GET", f"/api/admin/tasks?project_id={pid}&status=EVALUATING&limit=100")
-    tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
-    verbose = getattr(args, "verbose", False)
-    if not tasks:
-        print("No EVALUATING tasks.")
-        return
-    for t in tasks:
-        ctx = t.get("context") or {}
-        loop = ctx.get("review_loop") or {}
-        ci = loop.get("ci_waiting", False)
-        pr = loop.get("pr_number", "-")
-        print(f"  {(t.get('id') or '?')[:8]}  [{t.get('task_type', '?'):8}]  "
-              f"{(t.get('title') or '')[:50]:<50}  ci={ci}  pr={pr}")
-        msg = (t.get("latest_status_message") or "")[:80]
-        if msg:
-            print(f"           {msg}")
-        if verbose:
-            for key, label in [("research_question", "Q"), ("scope", "Scope")]:
-                val = ctx.get(key, "")
-                if val:
-                    print(f"           {label}: {val[:120]}")
 
 
 def _tasks_cancel_all(args: argparse.Namespace) -> None:
@@ -1907,10 +1822,12 @@ def _render_envelope(data: dict) -> None:
 # ── messages ─────────────────────────────────────────────────────────────────
 
 def cmd_messages(args: argparse.Namespace) -> None:
-    """Dispatch messages subcommands: list / send."""
+    """Dispatch messages subcommands: list / send / answer."""
     sub = getattr(args, "messages_cmd", None) or "list"
     if sub == "send":
         _messages_send(args)
+    elif sub == "answer":
+        _messages_answer(args)
     else:
         _messages_list(args)
 
@@ -1957,6 +1874,24 @@ def _messages_send(args: argparse.Namespace) -> None:
         "message_type": getattr(args, "type", "FEEDBACK"),
     })
     _emit(args, result, lambda d: print(f"  Message sent: {d.get('id', '?')}"))
+
+
+def _messages_answer(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'answer' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    pid = get_project_id(getattr(args, "project_id", None))
+    message_id = args.message_id
+    result = api("POST", f"/api/admin/projects/{pid}/messages/{message_id}/answer", {
+        "content": args.content,
+    })
+    _emit(args, result, lambda d: print(f"  Answer sent: {d.get('id', '?')}"))
 
 
 # ── fleet (pool / warm / accounts / zones) ────────────────────────────────────
@@ -2931,6 +2866,566 @@ def _render_analytics_failing_types(data: dict) -> None:
         print(f"  {tt:20}  failure_rate={rate:.1%}  n={n}")
 
 
+# ── vision ────────────────────────────────────────────────────────────────────
+
+def cmd_vision(args: argparse.Namespace) -> None:
+    """Show product vision and design document."""
+    pid = get_project_id(getattr(args, "project_id", None))
+    data = api("GET", f"/api/admin/projects/{pid}/directions")
+
+    design_doc_key = getattr(args, "design_doc_key", None)
+    if design_doc_key is not None:
+        doc = data.get("design_doc") or {}
+        if not doc:
+            print("No design document yet.")
+            return
+        if design_doc_key:
+            page = doc.get(design_doc_key)
+            if page is None:
+                print(f"Page not found: {design_doc_key}")
+                print(f"Available pages: {', '.join(sorted(doc.keys()))}")
+                return
+            print(f"=== DESIGN DOC: {design_doc_key} ===")
+            _emit(args, page, lambda p: print(json.dumps(p, indent=2)))
+        else:
+            _emit(args, doc, _render_design_doc)
+        return
+
+    vision = data.get("vision") or {}
+    if not vision:
+        print("No vision set yet.")
+        return
+    _emit(args, vision, _render_vision)
+
+
+def _render_design_doc(doc: dict) -> None:
+    print(f"=== DESIGN DOCUMENT ({len(doc)} pages) ===")
+    for key in sorted(doc.keys()):
+        page = doc[key]
+        if isinstance(page, dict):
+            summary = page.get("summary", page.get("description", str(page)[:120]))
+            status = page.get("status", "")
+            status_str = f" [{status}]" if status else ""
+            print(f"  {key}{status_str} — {str(summary)[:100]}")
+        else:
+            print(f"  {key} — {str(page)[:100]}")
+
+
+def _render_vision(vision: dict) -> None:
+    print("=== PRODUCT VISION ===")
+    print(f"  Purpose:  {vision.get('purpose', '(not set)')}")
+    focus = vision.get("focus")
+    if focus:
+        if isinstance(focus, list):
+            print(f"  Focus ({len(focus)} active):")
+            for f in focus:
+                print(f"    - {f}")
+        else:
+            print(f"  Focus:    {focus}")
+    print(f"  Revision: {vision.get('revision', '?')}")
+    print(f"  Updated:  {(vision.get('last_updated') or '?')[:19]}")
+    criteria = vision.get("success_criteria", [])
+    if criteria:
+        print(f"\n  Success criteria ({len(criteria)}):")
+        for c in criteria:
+            print(f"    - {c}")
+    context = vision.get("context", "")
+    if context:
+        print(f"\n  Context:\n    {context[:500]}")
+    cycles = vision.get("_strategic_cycle_count", 0)
+    spawns = vision.get("_research_spawn_count", 0)
+    if cycles or spawns:
+        print(f"\n  Stats: {spawns} research spawns, {cycles} strategic cycles")
+
+
+# ── strategic-cycle ───────────────────────────────────────────────────────────
+
+def cmd_strategic_cycle(args: argparse.Namespace) -> None:
+    """Manually trigger a strategic cycle."""
+    _require_write_config("strategic-cycle")
+    phase = getattr(args, "phase", "design_doc") or "design_doc"
+    pid = get_project_id(getattr(args, "project_id", None))
+    if not _confirm(f"Trigger strategic-cycle (phase={phase})?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", f"/api/admin/projects/{pid}/strategic-cycle?phase={phase}")
+    out = {"phase": phase, **result}
+    _emit(args, out, _render_strategic_cycle)
+
+
+def _render_strategic_cycle(d: dict) -> None:
+    phase = d.get("phase", "?")
+    task_id = d.get("task_id") or d.get("id") or "?"
+    print(f"Spawned {phase} task: {task_id}")
+    print(f"  Title: {d.get('title', '?')}")
+    if phase == "design_doc":
+        print("  Phase 1 will chain into strategic_review (Phase 2) on completion.")
+
+
+# ── trim-playbook-archive ─────────────────────────────────────────────────────
+
+def cmd_trim_playbook_archive(args: argparse.Namespace) -> None:
+    """Trim design_doc.playbook_archive to the last N entries."""
+    _require_write_config("trim-playbook-archive")
+    keep = getattr(args, "keep", 50) or 50
+    dry_run = getattr(args, "dry_run", False)
+    pid = get_project_id(getattr(args, "project_id", None))
+
+    data = api("GET", f"/api/admin/projects/{pid}/directions")
+    doc = data.get("design_doc") or {}
+    archive = doc.get("playbook_archive") or []
+    before_bytes = len(json.dumps(archive).encode())
+
+    print(f"Current playbook_archive: {len(archive)} entries ({before_bytes:,} bytes)")
+    if len(archive) <= keep:
+        print(f"Already within cap of {keep} — nothing to trim.")
+        return
+
+    trimmed = archive[-keep:]
+    after_bytes = len(json.dumps(trimmed).encode())
+    dropped = len(archive) - len(trimmed)
+    print(f"Would drop {dropped} oldest -> {len(trimmed)} remain ({after_bytes:,} bytes)")
+
+    if dry_run:
+        print("(dry-run — no changes written)")
+        return
+
+    new_doc = {**doc, "playbook_archive": trimmed}
+    api("PATCH", f"/api/admin/projects/{pid}", {"design_doc": new_doc})
+    print(f"Trimmed archive to {len(trimmed)} entries ({before_bytes - after_bytes:,} bytes freed)")
+
+
+# ── fingerprints ──────────────────────────────────────────────────────────────
+
+def _resolve_fingerprint(query: str, project_id: str | None = None) -> dict | None:
+    """Find a residual case by fingerprint substring (case-insensitive)."""
+    path = "/api/admin/residual-cases?limit=200"
+    if project_id:
+        path += f"&project_id={project_id}"
+    cases = api("GET", path).get("cases", [])
+    needle = query.lower()
+    matches = [c for c in cases if needle in (c.get("fingerprint") or "").lower()]
+    if not matches:
+        print(f"No open residual case matches: {query!r}")
+        return None
+    if len(matches) > 1:
+        print(f"Ambiguous — {len(matches)} cases match {query!r}:")
+        for c in matches[:5]:
+            print(f"  - {c['fingerprint'][:120]}")
+        print("Use a longer substring to disambiguate.")
+        return None
+    return matches[0]
+
+
+def cmd_fingerprints(args: argparse.Namespace) -> None:
+    """List or manage residual remediation cases."""
+    from urllib.parse import quote
+    pid = get_project_id(getattr(args, "project_id", None))
+    ignore = getattr(args, "ignore", None)
+    unignore = getattr(args, "unignore", None)
+    clear = getattr(args, "clear", False)
+
+    if ignore:
+        _require_write_config("fingerprints --ignore")
+        case = _resolve_fingerprint(ignore, pid)
+        if not case:
+            return
+        result = api("POST", f"/api/admin/residual-cases/{quote(case['fingerprint'], safe='')}/ignore?project_id={pid}")
+        _emit(args, result, lambda r: print(
+            f"Ignored: {r.get('fingerprint', '')[:100]} → status={r.get('status')}"
+        ))
+        return
+
+    if unignore:
+        _require_write_config("fingerprints --unignore")
+        ignored_path = f"/api/admin/residual-cases?status=IGNORED&limit=200&project_id={pid}"
+        cases = api("GET", ignored_path).get("cases", [])
+        needle = unignore.lower()
+        matches = [c for c in cases if needle in (c.get("fingerprint") or "").lower()]
+        if not matches:
+            print(f"No IGNORED case matches: {unignore!r}")
+            return
+        if len(matches) > 1:
+            print(f"Ambiguous — {len(matches)} IGNORED cases match. Use a longer substring.")
+            return
+        result = api("POST", f"/api/admin/residual-cases/{quote(matches[0]['fingerprint'], safe='')}/unignore?project_id={pid}")
+        _emit(args, result, lambda r: print(
+            f"Unignored: {r.get('fingerprint', '')[:100]} → status={r.get('status')}"
+        ))
+        return
+
+    if clear:
+        _require_write_config("fingerprints --clear")
+        result = api("POST", "/api/admin/residual-fingerprints/clear")
+        _emit(args, result, lambda r: print(f"Cleared in-memory store: {r}"))
+        return
+
+    show_all = getattr(args, "all_statuses", False)
+    statuses = getattr(args, "status", None) or []
+    path = "/api/admin/residual-cases?limit=100"
+    _ALL_FP_STATUSES = ("ACTIVE", "REMEDIATING", "SUSPENDED", "IGNORED",
+                        "RESOLVED", "CLOSED_ORGANICALLY", "MERGED", "FAILED")
+    if show_all:
+        for s in _ALL_FP_STATUSES:
+            path += f"&status={s}"
+    else:
+        for s in statuses:
+            path += f"&status={s}"
+    result = api("GET", path)
+    cases = result.get("cases", [])
+    filt = result.get("status_filter", [])
+    _emit(args, {"cases": cases, "status_filter": filt}, _render_fingerprints)
+
+
+def _render_fingerprints(data: dict) -> None:
+    cases = data.get("cases") or []
+    filt = data.get("status_filter") or []
+    print(f"=== RESIDUAL CASES ({len(cases)}) status={','.join(filt)} ===")
+    if not cases:
+        print("(none)")
+        return
+    for c in cases:
+        fp = (c.get("fingerprint") or "").replace("\n", " ")
+        print(f"  [{c['status']:18}] hits={c['hit_count']:<3} "
+              f"consec={c.get('consecutive_failure_count', 0)}  "
+              f"last_seen={(c.get('last_seen_at') or '')[:19]}  "
+              f"pr={c.get('last_spawned_pr_number') or '-'}")
+        print(f"    fp: {fp[:200]}")
+
+
+# ── regression-cases ──────────────────────────────────────────────────────────
+
+def cmd_regression_cases(args: argparse.Namespace) -> None:
+    """List or close regression remediation cases."""
+    from urllib.parse import quote
+    pid = get_project_id(getattr(args, "project_id", None))
+
+    def _build_close_path(cls: str, reason: str | None) -> str:
+        p = (f"/api/admin/regression-cases/close?project_id={pid}"
+             f"&regression_class={quote(cls, safe='')}")
+        if reason:
+            p += f"&reason={quote(reason, safe='')}"
+        return p
+
+    close = getattr(args, "close", None)
+    close_prefix = getattr(args, "close_prefix", None)
+    reason = getattr(args, "reason", None)
+
+    if close:
+        _require_write_config("regression-cases --close")
+        try:
+            result = api("POST", _build_close_path(close, reason))
+            _emit(args, result, lambda r: print(
+                f"Closed: {r.get('regression_class', '')[:120]} → "
+                f"{r.get('prior_status')} → {r.get('status')}"
+            ))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error closing {close!r}: {exc}", file=sys.stderr)
+        return
+
+    if close_prefix:
+        _require_write_config("regression-cases --close-prefix")
+        path = f"/api/admin/regression-cases?project_id={pid}&limit=200"
+        for s in ("ACTIVE", "REMEDIATING", "NEEDS_MANUAL_INTERVENTION"):
+            path += f"&status={s}"
+        result = api("GET", path)
+        cases = result.get("cases", [])
+        matches = [c for c in cases
+                   if c.get("regression_class", "").startswith(close_prefix)]
+        if not matches:
+            print(f"No open cases match prefix {close_prefix!r}")
+            return
+        print(f"Closing {len(matches)} case(s) matching prefix {close_prefix!r}:")
+        for c in matches:
+            cls = c["regression_class"]
+            try:
+                r = api("POST", _build_close_path(cls, reason))
+                print(f"  {r.get('prior_status'):28} → {r.get('status'):8}  {cls[:80]}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ERROR  {cls[:80]}: {exc}")
+        return
+
+    show_all = getattr(args, "all_statuses", False)
+    statuses = getattr(args, "status", None) or []
+    path = f"/api/admin/regression-cases?project_id={pid}&limit=200"
+    if show_all:
+        for s in ("ACTIVE", "REMEDIATING", "NEEDS_MANUAL_INTERVENTION", "CLOSED", "MERGED"):
+            path += f"&status={s}"
+    else:
+        for s in statuses:
+            path += f"&status={s}"
+    result = api("GET", path)
+    cases = result.get("cases", [])
+    filt = result.get("status_filter", [])
+    _emit(args, {"cases": cases, "status_filter": filt}, _render_regression_cases)
+
+
+def _render_regression_cases(data: dict) -> None:
+    cases = data.get("cases") or []
+    filt = data.get("status_filter") or []
+    print(f"=== REGRESSION CASES ({len(cases)}) status={','.join(filt)} ===")
+    if not cases:
+        print("(none)")
+        return
+    for c in cases:
+        cls = (c.get("regression_class") or "").replace("\n", " ")
+        print(f"  [{c['status']:28}] attempts={c.get('attempts', 0)}  "
+              f"hits={c.get('hit_count', 0)}  "
+              f"last_seen={(c.get('last_seen_at') or '')[:19]}  "
+              f"pr={c.get('last_remediation_pr_number') or '-'}")
+        print(f"    class: {cls[:200]}")
+
+
+# ── playbook ──────────────────────────────────────────────────────────────────
+
+def cmd_playbook(args: argparse.Namespace) -> None:
+    """List, show, or delete playbook entries."""
+    pid = get_project_id(getattr(args, "project_id", None))
+    url = f"/api/admin/projects/{pid}/playbook"
+    sub = getattr(args, "playbook_cmd", None)
+
+    if sub == "delete":
+        _require_write_config("playbook delete")
+        key = args.key
+        api("DELETE", f"{url}/{key}")
+        _emit(args, {"key": key}, lambda r: print(f"Deleted: {key}"))
+        return
+
+    if sub == "prune":
+        import re
+        _require_write_config("playbook prune")
+        pattern_str = args.pattern
+        try:
+            pattern = re.compile(pattern_str, re.IGNORECASE)
+        except re.error as exc:
+            print(f"Invalid pattern {pattern_str!r}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        data = api("GET", url)
+        entries = data.get("entries", {})
+        matched = []
+        for k, v in entries.items():
+            content = v if isinstance(v, str) else (v or {}).get("content", "")
+            if pattern.search(k) or pattern.search(content):
+                matched.append((k, content))
+        if not matched:
+            print(f"No entries matching '{pattern_str}'.")
+            return
+        if not _confirm(
+            f"Delete {len(matched)} entries matching '{pattern_str}'?",
+            getattr(args, "yes", False),
+        ):
+            print("Aborted.")
+            return
+        for k, _ in matched:
+            api("DELETE", f"{url}/{k}")
+            print(f"  Deleted: {k}")
+        print("Done.")
+        return
+
+    data = api("GET", url)
+    entries = data.get("entries", {})
+    _emit(args, {"entries": entries}, _render_playbook)
+
+
+def _render_playbook(data: dict) -> None:
+    entries = data.get("entries") or {}
+    if not entries:
+        print("No playbook entries.")
+        return
+    print(f"Playbook entries ({len(entries)}):")
+    for k, v in sorted(entries.items()):
+        content = v if isinstance(v, str) else (v or {}).get("content", "")
+        print(f"  {k}: {(content or '')[:120]}")
+
+
+# ── knowledge ────────────────────────────────────────────────────────────────
+
+def cmd_knowledge(args: argparse.Namespace) -> None:
+    """Dispatch knowledge subcommands: list / show."""
+    sub = getattr(args, "knowledge_cmd", None) or "list"
+    if sub == "show":
+        _knowledge_show(args)
+    else:
+        _knowledge_list(args)
+
+
+def _knowledge_list(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    path = f"/api/admin/projects/{pid}/knowledge?limit={getattr(args, 'limit', 20)}"
+    if getattr(args, "direction", None):
+        path += f"&direction_id={args.direction}"
+    if getattr(args, "source_kind", None):
+        path += f"&source_kind={args.source_kind}"
+    if getattr(args, "q", None):
+        from urllib.parse import quote
+        path += f"&q={quote(args.q)}"
+    if getattr(args, "topic", None):
+        from urllib.parse import quote
+        path += f"&topic={quote(args.topic)}"
+    resp = api("GET", path)
+    docs = resp.get("documents", resp) if isinstance(resp, dict) else resp
+    total = resp.get("total") if isinstance(resp, dict) else None
+    _emit(args, {"documents": docs, "total": total}, _render_knowledge_list)
+
+
+def _render_knowledge_list(data: dict) -> None:
+    docs = data.get("documents") or []
+    total = data.get("total")
+    suffix = f" / {total} total" if total is not None else ""
+    print(f"=== KNOWLEDGE LIBRARY ({len(docs)} shown{suffix}) ===")
+    if not docs:
+        print("  (none)")
+        return
+    for d in docs:
+        did = (d.get("id") or "?")[:12]
+        kind = d.get("source_kind", "?")
+        title = (d.get("title") or "")[:60]
+        direction = (d.get("direction_id") or "")[:12]
+        created = (d.get("created_at") or "")[:10]
+        dir_str = f"  dir={direction}" if direction else ""
+        print(f"  {did}  [{kind:12}] {created}  {title}{dir_str}")
+
+
+def _knowledge_show(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    doc = api("GET", f"/api/admin/projects/{pid}/knowledge/{args.doc_id}")
+    _emit(args, doc, _render_knowledge_doc)
+
+
+def _render_knowledge_doc(doc: dict) -> None:
+    print(f"=== KNOWLEDGE: {doc.get('id', '?')} ===")
+    print(f"  Title:       {doc.get('title', '?')}")
+    print(f"  Source kind: {doc.get('source_kind', '?')}")
+    created = (doc.get("created_at") or "")[:19]
+    if created:
+        print(f"  Created:     {created}")
+    direction = doc.get("direction_id")
+    if direction:
+        print(f"  Direction:   {direction}")
+    body = doc.get("body") or doc.get("content") or ""
+    if body:
+        print(f"\n{body}")
+
+
+# ── compute ───────────────────────────────────────────────────────────────────
+
+def cmd_compute(args: argparse.Namespace) -> None:
+    """Dispatch compute subcommands: list / show / kill / analyze."""
+    sub = getattr(args, "compute_cmd", None) or "list"
+    if sub == "kill":
+        _compute_kill(args)
+    elif sub == "analyze":
+        _compute_analyze(args)
+    elif sub == "show":
+        _compute_show(args)
+    else:
+        _compute_list(args)
+
+
+def _compute_list(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    finished = getattr(args, "include_finished", 360)
+    limit = getattr(args, "limit", 20)
+    resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
+               f"?include_finished_minutes={finished}&limit={limit}")
+    jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
+    has_more = resp.get("has_more", False) if isinstance(resp, dict) else False
+    _emit(args, {"compute_jobs": jobs, "has_more": has_more}, _render_compute_list)
+
+
+def _render_compute_list(data: dict) -> None:
+    jobs = data.get("compute_jobs") or []
+    print(f"=== COMPUTE JOBS ({len(jobs)}) ===")
+    if not jobs:
+        print("  (none)")
+        return
+    for j in jobs:
+        jid = (j.get("id") or "?")[:8]
+        status = j.get("status", "?")
+        title = (j.get("task_title") or "")[:50]
+        task_type = j.get("task_type") or "?"
+        cost = j.get("final_cost_usd")
+        cost_str = f"  ${cost:.2f}" if cost is not None else ""
+        verdict = (j.get("criterion_verdict") or {}).get("met") if isinstance(j.get("criterion_verdict"), dict) else None
+        verdict_str = f"  met={verdict}" if verdict is not None else ""
+        exp = (j.get("experiment") or "")[:20]
+        exp_str = f"  exp={exp}" if exp else ""
+        print(f"  {jid}  {status:12} [{task_type}]  {title}{cost_str}{verdict_str}{exp_str}")
+    if data.get("has_more"):
+        print("  (more jobs available; increase --limit or --include-finished)")
+
+
+def _compute_kill(args: argparse.Namespace) -> None:
+    _require_write_config("compute kill")
+    job_id = args.job_id
+    if not _confirm(f"Kill compute job {job_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", f"/api/admin/compute-jobs/{job_id}/kill")
+    killed_status = (result.get("compute_job") or {}).get("status", "killed")
+    _emit(args, result, lambda r: print(f"  {job_id[:8]}: {killed_status}"))
+
+
+def _compute_show(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    job_id = args.job_id
+    resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs?include_finished_minutes=10080&limit=200")
+    jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
+    job = next((j for j in jobs if j.get("id", "").startswith(job_id) or j.get("id") == job_id), None)
+    if job is None:
+        print(f"No compute job found matching '{job_id}'.")
+        return
+    _emit(args, {"compute_job": job}, _render_compute_show)
+
+
+def _render_compute_show(data: dict) -> None:
+    j = data.get("compute_job") or {}
+    print(f"=== COMPUTE JOB: {j.get('id', '?')} ===")
+    print(f"  status    : {j.get('status', '?')}")
+    print(f"  title     : {j.get('task_title') or j.get('title') or '—'}")
+    print(f"  type      : {j.get('task_type', '?')}")
+    experiment = j.get("experiment")
+    if experiment:
+        print(f"  experiment: {experiment}")
+    hypothesis = j.get("hypothesis")
+    if hypothesis:
+        print(f"  hypothesis: {hypothesis}")
+    cost = j.get("final_cost_usd")
+    if cost is not None:
+        print(f"  cost      : ${cost:.4f}")
+    exit_code = (j.get("polling_metadata") or {}).get("exit_code")
+    if exit_code is not None:
+        print(f"  exit_code : {exit_code}")
+    metrics = j.get("result_metrics")
+    if metrics:
+        print(f"  metrics   : {metrics}")
+    verdict = j.get("criterion_verdict")
+    if isinstance(verdict, dict):
+        met = verdict.get("met")
+        reason = verdict.get("reason") or ""
+        print(f"  criterion : met={met}  {reason}")
+    ref = j.get("result_reference")
+    if ref:
+        print(f"  result_ref: {ref}")
+    doc = j.get("knowledge_document_id")
+    if doc:
+        print(f"  knowledge : {doc}")
+
+
+def _compute_analyze(args: argparse.Namespace) -> None:
+    _require_write_config("compute analyze")
+    job_id = args.job_id
+    if not _confirm(f"Trigger analysis for compute job {job_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", f"/api/admin/compute-jobs/{job_id}/analyze")
+    _emit(args, result, lambda r: print(
+        f"  Analysis complete for {job_id[:8]}: "
+        f"outcome={r.get('outcome', '?')}  "
+        f"knowledge_doc={r.get('knowledge_document_id', 'none')}"
+    ))
+
+
 # ── argument parser ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3253,6 +3748,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--type", default="FEEDBACK",
         help="Message type: FEEDBACK|NOTE|BUG_REPORT|QUESTION|BLOCKER (default FEEDBACK).",
     )
+    p_msgs_answer = msgs_sub.add_parser("answer", parents=[common],
+                                        help="Answer a QUESTION message with a threaded reply.")
+    p_msgs_answer.add_argument("message_id", help="ID of the message to answer.")
+    p_msgs_answer.add_argument("content", help="Answer content.")
 
     # logs
     p_logs = sub.add_parser("logs", parents=[common], help="Read Cloud Run logs via gcloud.",
@@ -3364,22 +3863,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_env_set.add_argument("--yes", action="store_true",
                            help="Skip the confirmation prompt (for scripting).")
 
-    # analytics
-    p_envelope = sub.add_parser(
-        "envelope", parents=[common],
-        help="View or update a project's resource envelope (VM caps, spend ceilings).",
-        description="Per-project resource envelope management.",
-    )
-    envelope_sub = p_envelope.add_subparsers(dest="envelope_cmd")
-    envelope_sub.add_parser("show", parents=[common],
-                            help="Show the resource envelope and live usage.")
-    p_env_set = envelope_sub.add_parser("set", parents=[common],
-                                        help="Update resource envelope fields.")
-    p_env_set.add_argument("assignments", nargs="+", metavar="KEY=VALUE",
-                           help="Fields to update, e.g. max_concurrent_vms=4 spend_ceiling_usd=10.0")
-    p_env_set.add_argument("-y", "--yes", action="store_true",
-                           help="Skip confirmation prompt.")
-
     p_analytics = sub.add_parser(
         "analytics", parents=[common],
         help="Pipeline analytics: cost, duration, pause-stats, failing-types.",
@@ -3398,6 +3881,124 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="Lookback window in hours (default 24).")
     analytics_sub.add_parser("failing-types", parents=[common],
                              help="Task types currently gated by high failure rate.")
+
+    # vision
+    p_vision = sub.add_parser("vision", parents=[common],
+                              help="Show product vision and design document.")
+    p_vision.add_argument(
+        "--design-doc", dest="design_doc_key", nargs="?", const="",
+        help="Show design document pages; optionally pass a page KEY to show one page.",
+    )
+
+    # strategic-cycle
+    p_sc = sub.add_parser("strategic-cycle", parents=[common],
+                          help="Manually trigger a strategic cycle.")
+    p_sc.add_argument("--phase", default="design_doc",
+                      choices=["design_doc", "strategic_review"],
+                      help="Cycle phase (default: design_doc, chains to strategic_review).")
+    p_sc.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
+
+    # trim-playbook-archive
+    p_tpa = sub.add_parser("trim-playbook-archive", parents=[common],
+                           help="Trim design_doc.playbook_archive to the last N entries.")
+    p_tpa.add_argument("--keep", type=int, default=50,
+                       help="Number of entries to keep (default 50).")
+    p_tpa.add_argument("--dry-run", dest="dry_run", action="store_true",
+                       help="Report size without writing changes.")
+
+    # fingerprints
+    p_fp = sub.add_parser("fingerprints", parents=[common],
+                          help="List or manage residual remediation cases.")
+    p_fp.add_argument("--all", dest="all_statuses", action="store_true",
+                      help="Show cases in every status.")
+    p_fp.add_argument("--status", action="append", default=[], metavar="STATUS",
+                      help="Filter by status (repeatable).")
+    p_fp.add_argument("--ignore", metavar="FP_SUBSTRING",
+                      help="Ignore a residual case by fingerprint substring.")
+    p_fp.add_argument("--unignore", metavar="FP_SUBSTRING",
+                      help="Unignore a residual case by fingerprint substring.")
+    p_fp.add_argument("--clear", action="store_true",
+                      help="Wipe the in-memory residual store.")
+
+    # regression-cases
+    p_rc = sub.add_parser("regression-cases", parents=[common],
+                          help="List or close regression remediation cases.")
+    p_rc.add_argument("--all", dest="all_statuses", action="store_true",
+                      help="Show cases in every status.")
+    p_rc.add_argument("--status", action="append", default=[], metavar="STATUS",
+                      help="Filter by status (repeatable).")
+    p_rc.add_argument("--close", metavar="CLASS",
+                      help="Close a regression case by class name.")
+    p_rc.add_argument("--close-prefix", dest="close_prefix", metavar="PREFIX",
+                      help="Close all open cases with a matching class prefix.")
+    p_rc.add_argument("--reason", help="Reason for closing (recorded on the case).")
+
+    # knowledge
+    p_knowledge = sub.add_parser(
+        "knowledge", parents=[common],
+        help="Browse the knowledge library (web_research / design documents).",
+        description="List and show knowledge documents accumulated across research cycles. "
+                    "Defaults to `list` when no subcommand is given.")
+    knowledge_sub = p_knowledge.add_subparsers(dest="knowledge_cmd")
+    p_kl = knowledge_sub.add_parser("list", parents=[common],
+                                    help="List knowledge documents with optional filters.")
+    p_kl.add_argument("--direction", help="Filter by direction id.")
+    p_kl.add_argument("--source-kind", dest="source_kind",
+                      help="Filter by source kind (e.g. web_research, design).")
+    p_kl.add_argument("--q", help="Full-text search query.")
+    p_kl.add_argument("--topic", help="Filter by topic.")
+    p_kl.add_argument("--limit", type=int, default=20,
+                      help="Max documents to return (default 20).")
+    p_ks = knowledge_sub.add_parser("show", parents=[common],
+                                    help="Show a knowledge document with its full body.")
+    p_ks.add_argument("doc_id", help="Knowledge document id.")
+
+    # compute
+    p_compute = sub.add_parser(
+        "compute", parents=[common],
+        help="Launch, list, kill, and analyze compute experiments.",
+        description="Manage GPU/accelerator compute jobs. Defaults to `list` when no "
+                    "subcommand is given.")
+    compute_sub = p_compute.add_subparsers(dest="compute_cmd")
+    p_compute_list = compute_sub.add_parser("list", parents=[common],
+                                            help="List active and recent compute jobs.")
+    p_compute_list.add_argument(
+        "--include-finished", dest="include_finished", type=int, default=360,
+        help="Include jobs that finished within this many minutes (default 360).")
+    p_compute_list.add_argument("--limit", type=int, default=20,
+                                help="Max jobs to return (default 20).")
+    p_compute_show = compute_sub.add_parser(
+        "show", parents=[common],
+        help="Show full details for one compute job (metrics, verdict, knowledge doc).")
+    p_compute_show.add_argument("job_id", help="Compute job id prefix or full UUID.")
+    p_compute_kill = compute_sub.add_parser(
+        "kill", parents=[common],
+        help="Kill a running compute job (confirms before mutating).")
+    p_compute_kill.add_argument("job_id", help="Compute job id (UUID).")
+    p_compute_kill.add_argument("--yes", action="store_true",
+                                help="Skip the confirmation prompt.")
+    p_compute_analyze = compute_sub.add_parser(
+        "analyze", parents=[common],
+        help="Trigger LLM analysis for a terminal compute job (confirms before posting).")
+    p_compute_analyze.add_argument("job_id", help="Compute job id (UUID).")
+    p_compute_analyze.add_argument("--yes", action="store_true",
+                                   help="Skip the confirmation prompt.")
+
+    # playbook
+    p_pb = sub.add_parser("playbook", parents=[common],
+                          help="List, delete, or prune playbook entries.",
+                          description="Inspect or manage project playbook entries. "
+                                      "Defaults to listing all entries.")
+    pb_sub = p_pb.add_subparsers(dest="playbook_cmd")
+    pb_sub.add_parser("list", parents=[common], help="List all playbook entries.")
+    p_pb_delete = pb_sub.add_parser("delete", parents=[common],
+                                    help="Delete a playbook entry by key.")
+    p_pb_delete.add_argument("key", help="Playbook entry key.")
+    p_pb_prune = pb_sub.add_parser("prune", parents=[common],
+                                   help="Delete entries matching a pattern.")
+    p_pb_prune.add_argument("pattern", help="Case-insensitive regex pattern.")
+    p_pb_prune.add_argument("--yes", action="store_true",
+                            help="Skip the confirmation prompt.")
 
     return parser
 
@@ -3420,7 +4021,14 @@ _DISPATCH = {
     "envelope": cmd_envelope,
     "health": cmd_health,
     "analytics": cmd_analytics,
-    "envelope": cmd_envelope,
+    "vision": cmd_vision,
+    "strategic-cycle": cmd_strategic_cycle,
+    "trim-playbook-archive": cmd_trim_playbook_archive,
+    "fingerprints": cmd_fingerprints,
+    "regression-cases": cmd_regression_cases,
+    "playbook": cmd_playbook,
+    "knowledge": cmd_knowledge,
+    "compute": cmd_compute,
 }
 
 

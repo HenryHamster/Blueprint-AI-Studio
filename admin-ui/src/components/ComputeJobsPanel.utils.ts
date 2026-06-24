@@ -1,5 +1,6 @@
 import type { ComputeJob, ComputeRpcDiagnostic } from '../api';
 import { parseTimestamp } from '../utils/time';
+export { formatDurationSec as fmtDuration } from '../utils/time';
 
 const ACTIVE_STATUSES: ReadonlySet<ComputeJob['status']> = new Set([
   'QUEUED',
@@ -67,4 +68,63 @@ export function computeJobRpcDiagnostic(job: ComputeJob): ComputeRpcDiagnostic |
 export function computeJobSpent(job: ComputeJob): number {
   if (isComputeJobActive(job)) return job.accrued_cost_usd ?? 0;
   return job.final_cost_usd ?? job.accrued_cost_usd ?? 0;
+}
+
+/** Actual wall-clock runtime in seconds for a job that has both timestamps.
+ *  Returns null when either timestamp is absent or unparseable. */
+export function computeJobRuntimeSec(job: ComputeJob): number | null {
+  if (!job.started_at || !job.completed_at) return null;
+  const start = parseTimestamp(job.started_at).getTime();
+  const end = parseTimestamp(job.completed_at).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end) || end <= start) return null;
+  return Math.round((end - start) / 1000);
+}
+
+/** Burn rate in $/hr for an active job. Returns null when elapsed time is too
+ *  short (<60s) or data is missing. */
+export function computeJobBurnRate(
+  job: ComputeJob,
+  nowMs: number,
+): number | null {
+  if (!job.started_at) return null;
+  const accrued = job.accrued_cost_usd;
+  if (accrued == null || accrued <= 0) return null;
+  const startMs = parseTimestamp(job.started_at).getTime();
+  if (Number.isNaN(startMs)) return null;
+  const elapsedSec = (nowMs - startMs) / 1000;
+  if (elapsedSec < 60) return null;
+  return (accrued / elapsedSec) * 3600;
+}
+
+/** Projected total spend at the wall-clock deadline, given the current burn
+ *  rate. Returns null when burn rate or deadline is unavailable. */
+export function computeJobProjectedSpend(
+  job: ComputeJob,
+  burnRatePerHr: number | null,
+  nowMs: number,
+): number | null {
+  if (burnRatePerHr == null || !job.wall_clock_deadline) return null;
+  const deadlineMs = parseTimestamp(job.wall_clock_deadline).getTime();
+  if (Number.isNaN(deadlineMs)) return null;
+  const remainingSec = Math.max(0, (deadlineMs - nowMs) / 1000);
+  const accrued = job.accrued_cost_usd ?? 0;
+  return accrued + burnRatePerHr * (remainingSec / 3600);
+}
+
+/** Calculate the margin (distance from threshold to actual value).
+ *  Positive margin means the result beat the threshold; negative means it missed.
+ *  For >= / > operators: margin = value - threshold
+ *  For <= / < operators: margin = threshold - value
+ *  Returns null when value or threshold is missing. */
+export function computeJobMargin(job: ComputeJob): number | null {
+  const verdict = job.criterion_verdict;
+  if (!verdict || verdict.value === null || verdict.threshold === null) return null;
+  const op = verdict.operator;
+  if (op === '>=' || op === '>') {
+    return verdict.value - verdict.threshold;
+  }
+  if (op === '<=' || op === '<') {
+    return verdict.threshold - verdict.value;
+  }
+  return null;
 }

@@ -130,10 +130,10 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
   return (
     <section>
       <div className="flex items-center gap-2 mb-2">
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Provider Account Health</h2>
+        <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest">Provider Account Health</h2>
         {showStale && (
           <span
-            className="text-[9px] font-semibold px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/15 text-amber-300"
+            className="text-ui-xs font-semibold px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/15 text-amber-300"
             title={`This whole panel is a cached fallback — the backend could not recompute it on the last poll${freshness.asOfLabel ? `; data is from ${freshness.asOfLabel}` : ''}`}
           >
             stale{freshness.asOfLabel ? ` · as of ${freshness.asOfLabel}` : ''}
@@ -159,26 +159,26 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
                 onClick={() => setExpandedId(expanded ? null : acct.account_id)}
               >
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className={`shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded border uppercase ${stateBadge}`}>
+                  <span className={`shrink-0 text-ui-xs font-semibold px-1.5 py-0.5 rounded border uppercase ${stateBadge}`}>
                     {acct.state}
                   </span>
                   <span className="text-xs text-neutral-200 font-medium">{acct.label}</span>
-                  <span className="text-[10px] text-neutral-500">{acct.provider}</span>
-                  <span className={`text-[10px] font-mono font-bold ${scoreColor}`} title="Health score">
+                  <span className="text-ui-sm text-neutral-500">{acct.provider}</span>
+                  <span className={`text-ui-sm font-mono font-bold ${scoreColor}`} title="Health score">
                     {Math.round(acct.health_score * 100)}%
                   </span>
                   {sr7d != null && (
-                    <span className={`text-[10px] font-mono ${sr7dColor}`} title="7-day success rate">
+                    <span className={`text-ui-sm font-mono ${sr7dColor}`} title="7-day success rate">
                       {Math.round(sr7d * 100)}% 7d
                     </span>
                   )}
-                  <span className="text-[10px] text-neutral-400" title="24h completions · rate-limit events">
+                  <span className="text-ui-sm text-neutral-400" title="24h completions · rate-limit events">
                     {acct.completions_24h}c {acct.rl_events_24h}rl
                   </span>
                   {acct.usage_snapshot && (
                     acct.usage_snapshot.known ? (
                       <span
-                        className={`flex items-center gap-1 text-[10px] font-mono${acct.usage_snapshot.stale ? ' opacity-60' : ''}`}
+                        className={`flex items-center gap-1 text-ui-sm font-mono${acct.usage_snapshot.stale ? ' opacity-60' : ''}`}
                         title={`Usage headroom — 5h / 7d window utilization${acct.usage_snapshot.stale ? ' (stale)' : ''}`}
                       >
                         <span className={usageColor(acct.usage_snapshot.five_hour_utilization)}>
@@ -195,7 +195,7 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
                       </span>
                     ) : (
                       <span
-                        className="text-[10px] font-mono text-neutral-500"
+                        className="text-ui-sm font-mono text-neutral-500"
                         title="No usage probe available for this provider/account"
                       >
                         usage ?
@@ -205,7 +205,7 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
                   {totalFailures > 0 && (
                     <div className="flex flex-col items-end gap-0.5 ml-auto">
                       {acct.failure_class_buckets && (
-                        <div className="flex items-center gap-1.5 text-[9px]">
+                        <div className="flex items-center gap-1.5 text-ui-xs">
                           <span className="text-yellow-400/80" title="provider: rate-limit + external API">
                             <span className="inline-block w-1.5 h-1.5 rounded-sm bg-yellow-400/70 align-middle mr-0.5" />
                             {acct.failure_class_buckets.provider ?? 0}p
@@ -222,7 +222,7 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
                       )}
                       <div className="flex items-center gap-1">
                         {dominantEntry && (
-                          <span className="text-[9px] text-neutral-400" title="Dominant failure class (24h)">
+                          <span className="text-ui-xs text-neutral-400" title="Dominant failure class (24h)">
                             {FAILURE_CLASS_SHORT[dominantEntry[0]] ?? dominantEntry[0].toLowerCase()}:{dominantEntry[1]}
                           </span>
                         )}
@@ -241,21 +241,21 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
                   )}
                 </div>
                 {acct.disabled_reason && (
-                  <p className="text-[10px] text-red-400/80 mt-0.5 truncate">{acct.disabled_reason}</p>
+                  <p className="text-ui-sm text-red-400/80 mt-0.5 truncate">{acct.disabled_reason}</p>
                 )}
                 {acct.rate_limited_models.filter(m => m.cooldown_type === 'regression' && m.regression_stats).map(m => {
                   const rs = m.regression_stats;
                   if (!rs) return null;
                   const modelLabel = m.model.includes('/') ? (m.model.split('/').pop() ?? m.model) : m.model;
                   return (
-                    <p key={m.model} className="text-[10px] text-amber-400/80 mt-0.5">
+                    <p key={m.model} className="text-ui-sm text-amber-400/80 mt-0.5">
                       regression on {modelLabel}: {Math.round(rs.account_rate * 100)}% vs project median {Math.round(rs.project_median * 100)}% (n={rs.sample_size} over {rs.distinct_accounts} accounts)
                     </p>
                   );
                 })}
               </button>
               {expanded && acct.usage_snapshot && (
-                <div className="mt-2 pt-2 border-t border-neutral-800/50 text-[10px] text-neutral-400 space-y-0.5" title="Usage headroom detail">
+                <div className="mt-2 pt-2 border-t border-neutral-800/50 text-ui-sm text-neutral-400 space-y-0.5" title="Usage headroom detail">
                   {acct.usage_snapshot.known ? (
                     <>
                       <div className="flex items-center gap-3">
@@ -292,7 +292,7 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
                     const modelLabel = m.model.includes('/') ? (m.model.split('/').pop() ?? m.model) : m.model;
                     const durLabel = isQuota ? '24h quota' : `${Math.ceil(m.cooldown_seconds_remaining / 60)}m`;
                     return (
-                      <span key={m.model} className={`text-[9px] font-mono px-1.5 py-0.5 rounded border ${badge}`}>
+                      <span key={m.model} className={`text-ui-xs font-mono px-1.5 py-0.5 rounded border ${badge}`}>
                         {modelLabel} · {durLabel}
                       </span>
                     );

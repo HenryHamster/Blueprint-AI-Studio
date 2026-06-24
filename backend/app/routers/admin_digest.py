@@ -48,6 +48,7 @@ from app.capability_trial_verdict import (
     get_trial_definitions,
     is_ambiguous_lift_escalation_needed,
     is_trial_stalled,
+    persist_accrual_projections_in_transaction,
     persist_ambiguous_lift_escalations_in_transaction,
     persist_stalled_trial_notices_in_transaction,
     persist_trial_verdicts_in_transaction,
@@ -66,6 +67,7 @@ from app.digest_metrics import (
     compute_dependency_health_signals,
     compute_trial_arm_accumulation,
     compute_trial_arm_accrual,
+    compute_trial_arm_cost_delta,
     compute_park_wake_health,
     compute_merge_gate_fleet_health,
     compute_digest_cost_economics,
@@ -1677,6 +1679,12 @@ async def _compute_digest(
                 context_key=_td["context_key"],
                 assignment_key=_td.get("assignment_key"),
             )
+            _cost = await compute_trial_arm_cost_delta(
+                session,
+                project_id=project_id,
+                context_key=_td["context_key"],
+                assignment_key=_td.get("assignment_key"),
+            )
             _verdict_entry = evaluate_trial_verdict(
                 lift=_accum["lift"],
                 n_with=_accum["with_n"],
@@ -1687,6 +1695,7 @@ async def _compute_digest(
                 accumulation_basis="cumulative_terminal_arm_tasks",
                 arm_composition=_accum.get("arm_composition"),
                 receipt_only_trial=(_td.get("assignment_key") is None),
+                per_arm_cost=_cost,
             )
             _pending_trial_verdicts.append((_cap, _verdict_entry))
 
@@ -1821,7 +1830,7 @@ async def _compute_digest(
             )
             _persisted_verdicts = {}
 
-        # --- Per-trial accrual projection (ephemeral, NOT persisted) ---
+        # --- Per-trial accrual projection (persisted onto verdict entries) ---
         # Augment the verdict entries returned in the response with a recent
         # assigned-arm accrual rate and a projection of how many days remain until
         # BOTH arms' assigned subpopulation reaches the min-N decision threshold at
@@ -1952,6 +1961,28 @@ async def _compute_digest(
             _entry["is_stalled"] = _stalled
             if _stalled:
                 _stalled_trials.append((_cap, _entry))
+
+        # Persist accrual-projection snapshots onto the durable verdict entries so
+        # strategic readers can observe whether a trial can reach min_n at current
+        # throughput without going through the admin digest endpoint.
+        _projections_to_persist: list[tuple[str, dict, bool]] = [
+            (_cap, _entry["accrual_projection"], bool(_entry.get("is_stalled")))
+            for _cap, _entry in _augmented_verdicts.items()
+            if isinstance(_entry, dict) and "accrual_projection" in _entry
+        ]
+        if _projections_to_persist:
+            try:
+                await persist_accrual_projections_in_transaction(
+                    session,
+                    project_id,
+                    projections=_projections_to_persist,
+                )
+            except Exception:
+                logger.warning(
+                    "[CAPABILITY_TRIAL] failed to persist accrual projections",
+                    exc_info=True,
+                )
+
         if _stalled_trials:
             try:
                 await persist_stalled_trial_notices_in_transaction(

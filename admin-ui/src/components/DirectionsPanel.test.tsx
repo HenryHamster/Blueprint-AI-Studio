@@ -393,6 +393,40 @@ describe('DirectionsPanel', () => {
     expect(screen.getByText(/"Focus on reliability"/)).toBeInTheDocument();
   });
 
+  it('shows cycle-completion receipt when lastCycleCompletion is set and strategist is idle', async () => {
+    mockFetch(baseResponses);
+    render(
+      <DirectionsPanel
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+        selectedProjectId="proj1"
+        projects={TEST_PROJECTS}
+        strategistActive={false}
+        lastCycleCompletion={{ status: 'completed', created_count: 2, tasks_spawned: 3 }}
+      />
+    );
+    await screen.findByPlaceholderText('New direction...');
+    expect(screen.getByText('Cycle complete')).toBeInTheDocument();
+    expect(screen.getByText(/\+2 direction/)).toBeInTheDocument();
+    expect(screen.getByText(/3 tasks spawned/)).toBeInTheDocument();
+  });
+
+  it('hides cycle-completion receipt while strategist is still active', async () => {
+    mockFetch(baseResponses);
+    render(
+      <DirectionsPanel
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+        selectedProjectId="proj1"
+        projects={TEST_PROJECTS}
+        strategistActive
+        lastCycleCompletion={{ status: 'completed', created_count: 1 }}
+      />
+    );
+    await screen.findByPlaceholderText('New direction...');
+    expect(screen.queryByText('Cycle complete')).toBeNull();
+  });
+
   it('clicking the close backdrop fires onClose', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();

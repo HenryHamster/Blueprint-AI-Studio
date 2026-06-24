@@ -64,7 +64,7 @@ export function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurem
 
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Medium Scope Conversion Rate</h2>
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Medium Scope Conversion Rate</h2>
       {loading ? (
         <Skeleton className="h-40 w-full" />
       ) : data == null || rate == null ? (
@@ -76,9 +76,9 @@ export function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurem
           {/* Headline rate */}
           <div className="flex flex-wrap items-center gap-4 min-w-0">
             <div className="min-w-0">
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-0.5">Overall Rate</p>
+              <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-0.5">Overall Rate</p>
               <p className={`text-3xl font-bold font-mono ${rateColor}`}>{Math.round(rate * 100)}%</p>
-              <p className="text-[10px] text-neutral-500 mt-0.5">{data.total_merged} merged / {data.total_created} created</p>
+              <p className="text-ui-sm text-neutral-500 mt-0.5">{data.total_merged} merged / {data.total_created} created</p>
             </div>
             {/* Pre/Post comparison */}
             {(data.pre_investment || data.post_investment) && (() => {
@@ -92,11 +92,11 @@ export function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurem
                 <div className="flex flex-wrap gap-4 items-center min-w-0">
                   {data.pre_investment && (
                     <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Pre-investment</p>
+                      <p className="text-ui-sm text-neutral-500 mb-0.5">Pre-investment</p>
                       <p className="text-lg font-bold font-mono text-neutral-300">
                         {preRate != null ? `${Math.round(preRate * 100)}%` : '--'}
                       </p>
-                      <p className="text-[9px] text-neutral-600">{data.pre_investment.merged}/{data.pre_investment.created}</p>
+                      <p className="text-ui-xs text-neutral-600">{data.pre_investment.merged}/{data.pre_investment.created}</p>
                     </div>
                   )}
                   {data.pre_investment && data.post_investment && (
@@ -104,7 +104,7 @@ export function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurem
                   )}
                   {data.post_investment && (
                     <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Post-investment</p>
+                      <p className="text-ui-sm text-neutral-500 mb-0.5">Post-investment</p>
                       <p className={`text-lg font-bold font-mono ${
                         postRate != null && preRate != null
                           ? postRate > preRate ? 'text-emerald-400' : 'text-red-400'
@@ -112,48 +112,48 @@ export function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurem
                       }`}>
                         {postRate != null ? `${Math.round(postRate * 100)}%` : '--'}
                       </p>
-                      <p className="text-[9px] text-neutral-600">{data.post_investment.merged}/{data.post_investment.created}</p>
+                      <p className="text-ui-xs text-neutral-600">{data.post_investment.merged}/{data.post_investment.created}</p>
                     </div>
                   )}
                   {data.recent_24h && (
                     <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 24h</p>
+                      <p className="text-ui-sm text-neutral-500 mb-0.5">Recent 24h</p>
                       <p className="text-lg font-bold font-mono text-neutral-300">
                         {data.recent_24h.merge_rate != null ? `${Math.round(data.recent_24h.merge_rate * 100)}%` : '--'}
                       </p>
-                      <p className="text-[9px] text-neutral-600">{data.recent_24h.merged}/{data.recent_24h.created}</p>
+                      <p className="text-ui-xs text-neutral-600">{data.recent_24h.merged}/{data.recent_24h.created}</p>
                     </div>
                   )}
                   {data.recent_3d && (
                     <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 3d</p>
+                      <p className="text-ui-sm text-neutral-500 mb-0.5">Recent 3d</p>
                       <p className="text-lg font-bold font-mono text-neutral-300">
                         {data.recent_3d.merge_rate != null ? `${Math.round(data.recent_3d.merge_rate * 100)}%` : '--'}
                       </p>
-                      <p className="text-[9px] text-neutral-600">{data.recent_3d.merged}/{data.recent_3d.created}</p>
+                      <p className="text-ui-xs text-neutral-600">{data.recent_3d.merged}/{data.recent_3d.created}</p>
                     </div>
                   )}
                   {data.recent_7d && (
                     <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 7d</p>
+                      <p className="text-ui-sm text-neutral-500 mb-0.5">Recent 7d</p>
                       <p className="text-lg font-bold font-mono text-neutral-300">
                         {data.recent_7d.merge_rate != null ? `${Math.round(data.recent_7d.merge_rate * 100)}%` : '--'}
                       </p>
-                      <p className="text-[9px] text-neutral-600">{data.recent_7d.merged}/{data.recent_7d.created}</p>
+                      <p className="text-ui-xs text-neutral-600">{data.recent_7d.merged}/{data.recent_7d.created}</p>
                     </div>
                   )}
                   {data.recent_30d && (
                     <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 30d</p>
+                      <p className="text-ui-sm text-neutral-500 mb-0.5">Recent 30d</p>
                       <p className="text-lg font-bold font-mono text-neutral-300">
                         {data.recent_30d.merge_rate != null ? `${Math.round(data.recent_30d.merge_rate * 100)}%` : '--'}
                       </p>
-                      <p className="text-[9px] text-neutral-600">{data.recent_30d.merged}/{data.recent_30d.created}</p>
+                      <p className="text-ui-xs text-neutral-600">{data.recent_30d.merged}/{data.recent_30d.created}</p>
                     </div>
                   )}
                   {deltaPp != null && (
                     <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Delta</p>
+                      <p className="text-ui-sm text-neutral-500 mb-0.5">Delta</p>
                       <p className={`text-lg font-bold font-mono ${deltaColor}`}>
                         {deltaPp > 0 ? '+' : ''}{deltaPp}pp
                       </p>
@@ -172,7 +172,7 @@ export function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurem
               : deltaPp > 0
                 ? `Medium-scope conversion rate improved by ${deltaPp} percentage points since investment began`
                 : `Medium-scope conversion rate declined by ${Math.abs(deltaPp)} percentage points since investment began`;
-            return <p className={`text-[11px] ${color}`}>{text}</p>;
+            return <p className={`text-ui-md ${color}`}>{text}</p>;
           })()}
 
           {/* Daily trend chart (swapped from weekly 2026-04-17) — weekly buckets
@@ -216,13 +216,13 @@ export function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurem
           {/* Correlated changes */}
           {data.correlated_changes.length > 0 && (
             <div>
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">Correlated Changes</p>
+              <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1.5">Correlated Changes</p>
               <div className="space-y-1">
                 {data.correlated_changes.slice(0, 5).map((c, i) => {
                   const delta = c.merge_rate_delta;
                   const deltaColor = delta == null ? 'text-neutral-500' : delta > 0 ? 'text-emerald-400' : 'text-red-400';
                   return (
-                    <div key={i} className="flex items-center gap-2 text-[10px]">
+                    <div key={i} className="flex items-center gap-2 text-ui-sm">
                       <span className="text-neutral-500 font-mono shrink-0">{c.week.slice(5)}</span>
                       <span className="text-neutral-300 truncate flex-1">{c.title}</span>
                       {delta != null && (

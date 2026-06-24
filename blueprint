@@ -1,0 +1,8 @@
+#!/bin/bash
+# ./blueprint — operator CLI entrypoint.
+# Forwards all arguments to scripts/blueprint.py via python3.
+# Usage: ./blueprint [--json] <subcommand> [args...]
+# Examples: ./blueprint status, ./blueprint --help, ./blueprint tasks list
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$REPO_ROOT/scripts/blueprint.py" "$@"

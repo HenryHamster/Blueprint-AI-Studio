@@ -64,8 +64,8 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
           onClick={() => setExpanded(!expanded)}
           className="flex items-center justify-center gap-1.5 group min-h-11 px-2"
         >
-          <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Open PRs</h2>
-          <span className="text-[10px] text-neutral-500 font-mono">{visiblePRs.length}</span>
+          <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest">Open PRs</h2>
+          <span className="text-ui-sm text-neutral-500 font-mono">{visiblePRs.length}</span>
           <ChevronRight className={`w-3 h-3 text-neutral-500 transition-transform ${expanded ? 'rotate-90' : ''}`} />
         </button>
         {hasProject && (
@@ -82,7 +82,7 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
           <span
             data-testid="open-prs-stale-badge"
             title={staleBadgeTitle}
-            className="flex items-center gap-1 text-[10px] text-amber-400"
+            className="flex items-center gap-1 text-ui-sm text-amber-400"
           >
             <AlertTriangle className="w-3 h-3" />
             {staleBadgeLabel}
@@ -108,22 +108,22 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
                     <div className="flex items-center gap-1.5">
                       <span className="text-xs text-neutral-300 font-mono">#{pr.pr_number}</span>
                       <p className="text-xs text-neutral-200 truncate">{pr.pr_title}</p>
-                      <span className="text-[10px] text-neutral-500 ml-auto">{timeAgo(pr.pr_created_at)}</span>
+                      <span className="text-ui-sm text-neutral-500 ml-auto">{timeAgo(pr.pr_created_at)}</span>
                     </div>
                     <div className="flex items-center gap-1 mt-0.5 flex-wrap">
-                      <span className="text-[9px] text-neutral-600 font-mono truncate">{pr.pr_branch}</span>
+                      <span className="text-ui-xs text-neutral-600 font-mono truncate">{pr.pr_branch}</span>
                       {pr.pr_base_branch && (
                         <>
-                          <span className="text-[9px] text-neutral-700">→</span>
-                          <span className="text-[9px] text-neutral-600 font-mono truncate">{pr.pr_base_branch}</span>
+                          <span className="text-ui-xs text-neutral-700">→</span>
+                          <span className="text-ui-xs text-neutral-600 font-mono truncate">{pr.pr_base_branch}</span>
                         </>
                       )}
                       {pr.pr_base_branch && integrationBranch && pr.pr_base_branch !== integrationBranch && pr.pr_base_branch !== (promotionTarget ?? '') && (
-                        <span className="text-[9px] text-amber-400 border border-amber-500/30 rounded px-1 py-0 ml-0.5">drift</span>
+                        <span className="text-ui-xs text-amber-400 border border-amber-500/30 rounded px-1 py-0 ml-0.5">drift</span>
                       )}
                     </div>
                     {pr.is_orphaned ? (
-                      <div className="mt-1.5 text-[9px] text-red-400 font-medium">No active task</div>
+                      <div className="mt-1.5 text-ui-xs text-red-400 font-medium">No active task</div>
                     ) : (
                       <div className="mt-1.5 space-y-1">
                         {pr.tasks.map(t => {
@@ -132,10 +132,10 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
                           const fullTask = tasksById.get(t.task_id);
                           const row = (
                             <div className="flex items-center gap-1.5 flex-wrap">
-                              <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${typeCls}`}>{t.task_type}</span>
-                              <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${statusCls}`}>{t.task_status}</span>
+                              <span className={`px-1.5 py-0.5 rounded text-ui-xs font-medium ${typeCls}`}>{t.task_type}</span>
+                              <span className={`px-1.5 py-0.5 rounded text-ui-xs font-medium ${statusCls}`}>{t.task_status}</span>
                               {t.task_title && (
-                                <span className="text-[10px] text-neutral-400 truncate min-w-0 flex-1">{t.task_title}</span>
+                                <span className="text-ui-sm text-neutral-400 truncate min-w-0 flex-1">{t.task_title}</span>
                               )}
                             </div>
                           );

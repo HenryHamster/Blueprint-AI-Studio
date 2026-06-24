@@ -452,7 +452,7 @@ Rules:
   } else {
     const reopenPrompt = primaryFindings.length > 0
       ? `${primaryFindingsSection}Your prior release audit challenge response did not end with a parseable JSON verdict object.\nOutput ONLY the JSON object now — with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, no code fences, no prose.`
-      : `Your prior release audit challenge response did not end with a parseable JSON verdict object.
+      : `${lastResultText || ''}\n${allOutput || ''}\n\nYour prior release audit challenge response did not end with a parseable JSON verdict object.
 Output ONLY the JSON object now — with top-level "challenged_candidate_sha" and "verdicts". Each verdict must include "severity", "summary", "file", "verdict" (one of confirmed | refuted_false_positive | uncertain), and "reason". If the original prompt supplied a numbered primary finding list, also include "primary_finding_index", copy the listed primary finding summary exactly into "summary", and copy its listed severity exactly into "severity". Use {"challenged_candidate_sha": "${candidateSha}", "verdicts": []} if there is nothing to challenge. No markdown, no code fences, no prose.`;
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',

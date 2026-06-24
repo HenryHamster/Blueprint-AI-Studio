@@ -37,6 +37,7 @@ vi.mock('../prompt.js', () => ({
   configureAgentPermissions: () => [],
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),
+  DEFAULT_TOOL_GUIDANCE: 'Tool guidance: ...',
 }));
 
 // Default challenge record the mocked runStrategicChallenge resolves with. Tests
@@ -164,6 +165,7 @@ vi.mock('./strategic-sections.js', () => ({
   buildClockAndRecentWorkSection: () => ({ clockHeader: '', recentWorkSection: '' }),
   buildConversationThreadSection: () => '',
   buildFeedbackSection: () => '',
+  buildQuestionSection: () => '',
   buildOpenMessagesText: () => '',
   // Echo the authoritative count args so wiring tests can assert the handler
   // threads payload.direction_counts through to these builders.
@@ -176,6 +178,19 @@ vi.mock('./strategic-sections.js', () => ({
   ) => `DIRHEALTH(max=${maxActiveDirections},auth=${authoritative ? authoritative.active : undefined})`,
 }));
 
+vi.mock('../telemetry.js', () => ({
+  recordFormatMiss: vi.fn(),
+  recordFormatRepairAttempt: vi.fn(),
+  recordFormatRepairSuccess: vi.fn(),
+  recordFormatRepairTokens: vi.fn(),
+  getLlmTelemetry: vi.fn().mockReturnValue({
+    llm_call_count: 0,
+    total_input_tokens: 100,
+    total_output_tokens: 50,
+    viewport_screenshot_forwarded_count: 0,
+  }),
+}));
+
 import {
   renderStrategicPromptSuffix,
   buildStagedDirectionsSection,
@@ -186,6 +201,7 @@ import { runClaudeCode, apiPost } from '../index.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 import { runThinkerWithGate } from '../prompts/thinker.js';
 import { runStrategicChallenge } from './strategic-helpers.js';
+import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairTokens, getLlmTelemetry } from '../telemetry.js';
 
 describe('buildStagedDirectionsSection', () => {
   it('returns empty string when nothing is staged', () => {
@@ -490,6 +506,70 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
     const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
     expect(executorPrompt).toContain('if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen');
   });
+
+  it('records format misses and repair attempts with schemaLabel="strategic"', async () => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(recordFormatMiss).mockClear();
+    vi.mocked(recordFormatRepairAttempt).mockClear();
+    vi.mocked(recordFormatRepairTokens).mockClear();
+    vi.mocked(getLlmTelemetry).mockClear();
+
+    // Mock the thinker analysis pass to return ok=true
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+
+    // Executor run 1: missing JSON (format miss) → triggers repair
+    // Executor run 2: repair attempt (returns still-unparseable)
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'some text without JSON markers',
+        lastResultText: '',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'repaired response',
+        lastResultText: 'repaired',
+      });
+
+    // Mock buildStrategicCompletionLogs to return warning on first call (triggers repair)
+    // then return clean result on second call (repair succeeded)
+    const researchPlanModule = await import('./research-plan.js');
+    const mockBuildStrategicCompletionLogs = vi.spyOn(researchPlanModule, 'buildStrategicCompletionLogs');
+    mockBuildStrategicCompletionLogs
+      .mockReturnValueOnce({ logs: '', warning: 'no_json_found', missReason: 'no_matching_candidate' })
+      .mockReturnValueOnce({ logs: '', warning: '' });
+
+    // Mock the token telemetry snapshots for before/after repair
+    vi.mocked(getLlmTelemetry)
+      .mockReturnValueOnce({ llm_call_count: 1, total_input_tokens: 100, total_output_tokens: 50, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 })
+      .mockReturnValueOnce({ llm_call_count: 2, total_input_tokens: 200, total_output_tokens: 100, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-format-repair',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    // Verify recordFormatMiss is called with schemaLabel='strategic'
+    expect(recordFormatMiss).toHaveBeenCalledWith(expect.any(String), 'strategic');
+
+    // Verify recordFormatRepairAttempt is called with schemaLabel='strategic'
+    expect(recordFormatRepairAttempt).toHaveBeenCalledWith('strategic');
+
+    // Verify recordFormatRepairTokens is called with correct delta and schemaLabel='strategic'
+    expect(recordFormatRepairTokens).toHaveBeenCalledWith(100, 50, 'strategic');
+
+    mockBuildStrategicCompletionLogs.mockRestore();
+  });
 });
 
 describe('handleStrategic strategic challenge gate', () => {
@@ -648,11 +728,11 @@ describe('handleStrategic strategic challenge gate', () => {
       ],
     } as unknown as Awaited<ReturnType<typeof runStrategicChallenge>>);
     // Only the set_strategic_challenge persist fails; later strategic POSTs succeed.
-    vi.mocked(apiPost).mockImplementation(async (_path: string, body?: Record<string, unknown>) => {
+    vi.mocked(apiPost).mockImplementation((_path: string, body?: Record<string, unknown>) => {
       if (body && (body as { op?: string }).op === 'set_strategic_challenge') {
         throw new Error('challenge store failed');
       }
-      return {};
+      return Promise.resolve({});
     });
 
     const statusRef = { value: '' };

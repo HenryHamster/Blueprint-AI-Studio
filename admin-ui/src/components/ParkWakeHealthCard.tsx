@@ -12,9 +12,9 @@ export function ParkWakeHealthCard({ data, stale }: { data?: ParkWakeHealth | nu
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 opacity-50">
         <div className="flex items-center gap-2 mb-2">
           <CircleParking className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
-          <h3 className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest">Park/Wake Health</h3>
+          <h3 className="text-ui-md font-bold text-neutral-500 uppercase tracking-widest">Park/Wake Health</h3>
         </div>
-        <div className="text-[10px] text-neutral-600">Data unavailable</div>
+        <div className="text-ui-sm text-neutral-600">Data unavailable</div>
       </div>
     );
   }
@@ -33,17 +33,17 @@ export function ParkWakeHealthCard({ data, stale }: { data?: ParkWakeHealth | nu
         ) : (
           <CircleParking className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
         )}
-        <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Park/Wake Health</h3>
+        <h3 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest">Park/Wake Health</h3>
       </div>
 
       <div className="flex items-baseline gap-2">
         <span className={`text-2xl font-bold ${stalled ? 'text-red-400' : 'text-emerald-400'}`}>
           {data.parked_task_count}
         </span>
-        <span className="text-[10px] text-neutral-500">currently parked</span>
+        <span className="text-ui-sm text-neutral-500">currently parked</span>
       </div>
 
-      <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
+      <div className="mt-2 grid grid-cols-2 gap-2 text-ui-sm">
         <div className="rounded border border-neutral-800/60 bg-neutral-950/40 px-2 py-1.5">
           <div className="text-neutral-500">Oldest parked</div>
           <div className="font-mono text-neutral-200">{ageLabel(data.oldest_parked_age_seconds)}</div>
@@ -54,7 +54,7 @@ export function ParkWakeHealthCard({ data, stale }: { data?: ParkWakeHealth | nu
         </div>
       </div>
 
-      <div className="mt-2 flex items-center justify-between text-[11px]">
+      <div className="mt-2 flex items-center justify-between text-ui-md">
         <span className="flex items-center gap-1 text-neutral-400">
           <RadioTower className="w-3 h-3" />
           Fired, undelivered
@@ -64,7 +64,7 @@ export function ParkWakeHealthCard({ data, stale }: { data?: ParkWakeHealth | nu
         </span>
       </div>
 
-      <div className={`mt-2 text-[10px] ${stalled ? 'text-red-300' : 'text-emerald-400'}`}>
+      <div className={`mt-2 text-ui-sm ${stalled ? 'text-red-300' : 'text-emerald-400'}`}>
         {stalled ? 'Warning: ' : ''}
         {statusText}
       </div>

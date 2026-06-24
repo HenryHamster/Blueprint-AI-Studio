@@ -1,0 +1,114 @@
+import { afterEach, describe, test, vi } from 'vitest';
+import { createRoot, type Root } from 'react-dom/client';
+import { act } from 'react';
+import { ConsoleHome } from './ConsoleHome';
+import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
+import type { Task } from '../types/task';
+
+// ConsoleHome (via useDashboardDigest and fetchFleetUtilization) imports apiFetch
+// from '../api', which transitively pulls in Firebase. Mock it so the test does
+// not require real auth and fetch calls resolve immediately.
+vi.mock('../api', () => ({
+  apiFetch: vi.fn(async (url: string) => {
+    if (url.includes('/digest')) {
+      return new Response(
+        JSON.stringify({
+          failed_count: 2,
+          pending_approval_count: 1,
+          direction_progress: [],
+          recent_completions: [],
+          failure_groups: [],
+          success_rate: 0.88,
+          trend: 'stable',
+          trend_history: [],
+          completed_count: 10,
+          needs_attention: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url.includes('/fleet-utilization')) {
+      return new Response(JSON.stringify({ pools: [] }), { status: 200 });
+    }
+    return new Response('{}', { status: 200 });
+  }),
+  fetchFleetUtilization: vi.fn(async () => ({ pools: [] })),
+  API_BASE_URL: '',
+  authGet: vi.fn(async () => ({})),
+}));
+
+const TASKS: Task[] = [
+  {
+    id: 'task-1',
+    title: 'feat: add mobile-responsive layout for operator panels across all screen sizes',
+    status: 'IN_PROGRESS',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(Date.now() - 3_600_000).toISOString(),
+    started_at: new Date(Date.now() - 3_500_000).toISOString(),
+  },
+  {
+    id: 'task-2',
+    title: 'fix: viewport overflow in kanban card when title exceeds two lines',
+    status: 'QUEUED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(Date.now() - 1_800_000).toISOString(),
+  },
+];
+
+describe('ConsoleHome — viewport regression', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+  });
+
+  function render(r: Root) {
+    r.render(
+      <ConsoleHome
+        selectedProjectId={null}
+        scopedActiveCount={null}
+        scopedQueuedCount={null}
+        globalActiveCount={1}
+        globalQueuedCount={2}
+        tasks={TASKS}
+        onViewTask={() => {}}
+        onShowAnalytics={() => {}}
+      />,
+    );
+  }
+
+  test('renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { render(root!); });
+    });
+  });
+
+  test('operator text is not silently clipped at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { render(root!); });
+    });
+  });
+
+  test('action buttons meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { render(root!); });
+    });
+  });
+});

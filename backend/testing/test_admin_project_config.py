@@ -1782,3 +1782,45 @@ async def test_patch_resource_envelope_rejects_invalid_compute_job_cap(
         assert resp.status_code == 422, (
             f"Expected 422 for value {bad_val}, got {resp.status_code}"
         )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_resource_envelope_hardware_policy_round_trip(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH allowed_machine_types/allowed_accelerator_types persists and GET returns them."""
+    project = project_owner
+
+    # Verify GET returns null for both fields when not set.
+    resp = await client.get(f"/api/admin/projects/{project.id}/resource-envelope")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["allowed_machine_types"] is None
+    assert data["allowed_accelerator_types"] is None
+
+    # PATCH sets both hardware policy fields.
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/resource-envelope",
+        json={
+            "allowed_machine_types": ["e2-standard-2", "e2-standard-4"],
+            "allowed_accelerator_types": ["T4", "L4"],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["allowed_machine_types"] == ["e2-standard-2", "e2-standard-4"]
+    assert data["allowed_accelerator_types"] == ["T4", "L4"]
+
+    # Verify persisted in build_config.
+    await db_session.refresh(project)
+    envelope = (project.build_config or {}).get("resource_envelope", {})
+    assert envelope["allowed_machine_types"] == ["e2-standard-2", "e2-standard-4"]
+    assert envelope["allowed_accelerator_types"] == ["T4", "L4"]
+
+    # Verify GET also returns the persisted values.
+    resp2 = await client.get(f"/api/admin/projects/{project.id}/resource-envelope")
+    assert resp2.status_code == 200, resp2.text
+    data2 = resp2.json()
+    assert data2["allowed_machine_types"] == ["e2-standard-2", "e2-standard-4"]
+    assert data2["allowed_accelerator_types"] == ["T4", "L4"]

@@ -184,7 +184,7 @@ function ChangesTabContent({
             </button>
             {file.patch && expandedPatches.has(file.filename) && (
               <div className="px-4 pb-3 bg-neutral-950">
-                <pre className="text-[11px] font-mono overflow-x-auto leading-relaxed whitespace-pre">
+                <pre className="text-ui-md font-mono overflow-x-auto leading-relaxed whitespace-pre">
                   {file.patch.split('\n').map((line, i) => (
                     <div
                       key={i}

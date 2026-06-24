@@ -17541,6 +17541,67 @@ async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_sessi
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_persists_cache_input_token_breakdown(
+    client: AsyncClient, db_session
+):
+    """Heartbeat persists the optional cache-creation/cache-read input sub-counts
+    into api_call_summary; total_input_tokens stays the inclusive total. When a
+    heartbeat omits them, the keys are absent (byte-for-byte unchanged)."""
+    project = Project(name="Cache Token Breakdown", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-cache-tokens",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cache-tokens")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 4,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+            "total_cache_creation_input_tokens": 200,
+            "total_cache_read_input_tokens": 300,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.api_call_summary
+    assert summary["total_input_tokens"] == 1000
+    assert summary["total_cache_creation_input_tokens"] == 200
+    assert summary["total_cache_read_input_tokens"] == 300
+
+    # A heartbeat that omits the cache fields leaves the keys absent — the
+    # optional fields are backwards-compatible (no key written when not sent).
+    resp2 = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 5,
+            "total_input_tokens": 1100,
+            "total_output_tokens": 450,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task)
+    assert "total_cache_creation_input_tokens" not in task.api_call_summary
+    assert "total_cache_read_input_tokens" not in task.api_call_summary
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_omits_api_call_summary_when_fields_absent(
     client: AsyncClient, db_session
 ):
@@ -23504,9 +23565,7 @@ async def test_admin_viewport_shots_download_url_agent_token_cross_task_allowed(
     await db_session.refresh(task_a)
     await db_session.refresh(task_b)
 
-    fake_url = (
-        "https://storage.googleapis.com/bucket/admin-vp-shot-dl-cross?X-Goog-Signature=cross"
-    )
+    fake_url = "https://storage.googleapis.com/bucket/admin-vp-shot-dl-cross?X-Goog-Signature=cross"
     mocker.patch(
         "app.storage.generate_download_signed_url",
         new=AsyncMock(return_value=fake_url),

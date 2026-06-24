@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
+from testing.conftest import USE_POSTGRES
 
 from app.efficiency_snapshot import (
     ALL_AXES,
@@ -20,6 +21,8 @@ from app.efficiency_snapshot import (
     AXIS_PROMPT_STATIC_BYTES,
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
+    CACHE_CREATION_INPUT_RATE_MULTIPLIER,
+    CACHE_READ_INPUT_RATE_MULTIPLIER,
     DESIGN_DOC_KEY,
     FORMAT_COMPLIANCE_KEY,
     FORMAT_COMPLIANCE_RATE_KEY,
@@ -1410,6 +1413,168 @@ async def test_llm_token_pricing_no_token_data(db_session):
 
 
 @pytest.mark.asyncio
+async def test_llm_cost_prices_cache_classes_separately(db_session):
+    """An api_call_summary carrying the cache breakdown prices cache_read at ~0.1x
+    base and cache_creation at ~1.25x base, with the uncached remainder at base.
+
+    total_input_tokens stays the INCLUSIVE input total (uncached + cache-creation
+    + cache-read), so the breakdown does not change the token volume — only how
+    each input class is priced.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    # 1000 inclusive input = 200 cache-creation + 300 cache-read + 500 uncached.
+    task = _make_efficient_task(
+        project.id,
+        api_call_summary={
+            "llm_call_count": 10,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+            "total_cache_creation_input_tokens": 200,
+            "total_cache_read_input_tokens": 300,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    expected = round(
+        500 * input_rate
+        + 200 * input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
+        + 300 * input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
+        + 400 * output_rate,
+        6,
+    )
+    axes = await compute_current_axes(db_session, project.id)
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] == pytest.approx(expected)
+
+    # The split must be strictly cheaper than pricing the whole inclusive input at
+    # the base rate — proving the cache classes are no longer collapsed into the
+    # uncached counter (cache-read at 0.1x dominates the saving).
+    legacy_full_input = round(1000 * input_rate + 400 * output_rate, 6)
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] < legacy_full_input
+
+    # The truthful cache split is surfaced in the breakdown dicts (totals + by_model),
+    # mirroring how total_input_tokens is surfaced.
+    breakdown = compute_llm_cost_breakdown([task])
+    totals = breakdown["totals"]
+    assert totals["total_input_tokens"] == 1000
+    assert totals["total_cache_creation_input_tokens"] == 200
+    assert totals["total_cache_read_input_tokens"] == 300
+    assert totals["total_cost_usd"] == pytest.approx(expected)
+    row = breakdown["by_model"][0]
+    assert row["total_cache_creation_input_tokens"] == 200
+    assert row["total_cache_read_input_tokens"] == 300
+    assert row["total_cost_usd"] == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_without_cache_breakdown_falls_back_to_base_rate(db_session):
+    """A row WITHOUT the cache breakdown prices the full inclusive input at the
+    base rate — current behavior, unchanged for legacy / pre-tracking rows."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    task = _make_efficient_task(
+        project.id,
+        api_call_summary={
+            "llm_call_count": 10,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    expected = round(1000 * input_rate + 400 * output_rate, 6)
+    axes = await compute_current_axes(db_session, project.id)
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] == pytest.approx(expected)
+
+    breakdown = compute_llm_cost_breakdown([task])
+    totals = breakdown["totals"]
+    # No breakdown present -> cache sub-counts are zero and cost is the legacy value.
+    assert totals["total_cache_creation_input_tokens"] == 0
+    assert totals["total_cache_read_input_tokens"] == 0
+    assert totals["total_input_tokens"] == 1000
+    assert totals["total_cost_usd"] == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_banked_attempt_carries_cache_breakdown_for_per_attempt_pricing(
+    db_session,
+):
+    """bank_task_current_attempt carries the cache sub-counts into attempt_history
+    so per-attempt pricing prices the cache classes after a retry bank.
+
+    The inclusive banked scalar (llm_input_tokens_banked) keeps its meaning.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"pr_merged": True},
+        vm_provisioned_at=_utcnow() - timedelta(minutes=5),
+        vm_stopped_at=_utcnow(),
+        api_call_summary={
+            "llm_call_count": 3,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+            "total_cache_creation_input_tokens": 200,
+            "total_cache_read_input_tokens": 300,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    bank_task_current_attempt(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Cache sub-counts banked into the per-attempt history entry...
+    assert task.attempt_history[0]["llm_cache_creation_input_tokens"] == 200
+    assert task.attempt_history[0]["llm_cache_read_input_tokens"] == 300
+    # ...while the inclusive banked scalar keeps its existing meaning.
+    assert task.llm_input_tokens_banked == 1000
+    assert task.api_call_summary is None
+
+    task.status = TaskStatus.COMPLETED
+    await db_session.commit()
+
+    refreshed = await db_session.get(type(task), task.id)
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected = round(
+        500 * input_rate
+        + 200 * input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
+        + 300 * input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
+        + 400 * output_rate,
+        6,
+    )
+    breakdown = compute_llm_cost_breakdown([refreshed])
+    assert breakdown["totals"]["total_cost_usd"] == pytest.approx(expected)
+    assert breakdown["totals"]["total_cache_creation_input_tokens"] == 200
+    assert breakdown["totals"]["total_cache_read_input_tokens"] == 300
+
+
+@pytest.mark.asyncio
 async def test_retry_banked_vm_and_llm_costs_count_across_attempts(db_session):
     project = make_project()
     db_session.add(project)
@@ -1976,23 +2141,23 @@ def test_task_llm_attempts_resolves_provider_model_pair_atomically():
     assert len(result) == 4
 
     # Attempt 1: full pair → uses attempt's own pair, not task's anthropic pair.
-    p0, m0, _in0, _out0, _c0 = result[0]
+    p0, m0, _in0, _out0, _c0, *_cache0 = result[0]
     assert (p0, m0) == ("openai", "gpt-5.4"), f"expected openai:gpt-5.4, got {p0}:{m0}"
 
     # Attempt 2: provider-only half-filled → (None, None); no chimera with task.model.
-    p1, m1, _in1, _out1, _c1 = result[1]
+    p1, m1, _in1, _out1, _c1, *_cache1 = result[1]
     assert (p1, m1) == (None, None), (
         f"expected (None, None) for provider-only row, got {p1}:{m1}"
     )
 
     # Attempt 3: model-only half-filled → (None, None); no chimera with task.provider.
-    p2, m2, _in2, _out2, _c2 = result[2]
+    p2, m2, _in2, _out2, _c2, *_cache2 = result[2]
     assert (p2, m2) == (None, None), (
         f"expected (None, None) for model-only row, got {p2}:{m2}"
     )
 
     # Attempt 4: neither field → falls back to task's pair as a whole.
-    p3, m3, _in3, _out3, _c3 = result[3]
+    p3, m3, _in3, _out3, _c3, *_cache3 = result[3]
     assert (p3, m3) == ("anthropic", "claude-sonnet-4-6"), (
         f"expected task fallback anthropic:claude-sonnet-4-6, got {p3}:{m3}"
     )
@@ -2029,7 +2194,7 @@ def test_task_llm_attempts_no_chimera_half_filled_provider_only():
 
     result = _task_llm_attempts(task)
     assert len(result) == 1
-    p, m, _in, _out, _c = result[0]
+    p, m, _in, _out, _c, *_cache = result[0]
     assert (p, m) == (None, None), (
         f"provider-only row must yield (None, None), got {p}:{m}"
     )
@@ -2060,7 +2225,7 @@ def test_task_llm_attempts_no_chimera_half_filled_model_only():
 
     result = _task_llm_attempts(task)
     assert len(result) == 1
-    p, m, _in, _out, _c = result[0]
+    p, m, _in, _out, _c, *_cache = result[0]
     assert (p, m) == (None, None), (
         f"model-only row must yield (None, None), got {p}:{m}"
     )
@@ -2091,7 +2256,7 @@ def test_task_llm_attempts_full_pair_used_atomically():
 
     result = _task_llm_attempts(task)
     assert len(result) == 1
-    p, m, in_tok, out_tok, calls = result[0]
+    p, m, in_tok, out_tok, calls, *_cache = result[0]
     assert p == "openai" and m == "gpt-5.4", f"expected openai:gpt-5.4, got {p}:{m}"
     assert in_tok == 500 and out_tok == 200 and calls == 3
 
@@ -2117,7 +2282,7 @@ def test_task_llm_attempts_neither_field_falls_back_to_task():
 
     result = _task_llm_attempts(task)
     assert len(result) == 1
-    p, m, in_tok, out_tok, calls = result[0]
+    p, m, in_tok, out_tok, calls, *_cache = result[0]
     assert p == "anthropic" and m == "claude-haiku-4-5", (
         f"expected task fallback anthropic:claude-haiku-4-5, got {p}:{m}"
     )
@@ -4446,6 +4611,105 @@ def test_compact_llm_cost_attribution():
     assert create_row["cost_usd"] > 0
 
 
+def test_compact_llm_cost_attribution_includes_qualification_infra_usd():
+    """_compact_llm_cost_attribution includes qualification_infra_usd when passed."""
+    from app.efficiency_snapshot import _compact_llm_cost_attribution
+
+    result = _compact_llm_cost_attribution([], qualification_infra_usd=0.023)
+    assert result["qualification_infra_usd"] == pytest.approx(0.023)
+
+
+def test_compact_llm_cost_attribution_qualification_infra_usd_none_by_default():
+    """qualification_infra_usd is None when not provided (pre-tracking versions)."""
+    from app.efficiency_snapshot import _compact_llm_cost_attribution
+
+    result = _compact_llm_cost_attribution([])
+    assert result["qualification_infra_usd"] is None
+
+
+def test_qualification_infra_usd_sums_token_costs():
+    """_qualification_infra_usd computes cost from blind_merge_grade token records."""
+    from unittest.mock import MagicMock
+
+    from app.efficiency_snapshot import _qualification_infra_usd
+
+    v1 = MagicMock()
+    v1.last_qualification = {
+        "blind_merge_grade": {"input_tokens": 1000, "output_tokens": 100}
+    }
+    v2 = MagicMock()
+    v2.last_qualification = {
+        "blind_merge_grade": {"input_tokens": 500, "output_tokens": 50}
+    }
+    v_no_tokens = MagicMock()
+    v_no_tokens.last_qualification = {
+        "blind_merge_grade": {"coverage_verdict": "covers", "biggest_gap": "gap"}
+    }
+
+    result = _qualification_infra_usd([v1, v2, v_no_tokens])
+    # claude-opus-4-8: $15/MTok input, $75/MTok output
+    expected = (1500 * 15e-6) + (150 * 75e-6)
+    assert result == pytest.approx(expected, rel=1e-5)
+
+
+def test_qualification_infra_usd_returns_none_when_no_token_data():
+    """_qualification_infra_usd returns None when no grade records carry token data."""
+    from unittest.mock import MagicMock
+
+    from app.efficiency_snapshot import _qualification_infra_usd
+
+    v = MagicMock()
+    v.last_qualification = {
+        "blind_merge_grade": {"coverage_verdict": "covers", "biggest_gap": "gap"}
+    }
+    assert _qualification_infra_usd([v]) is None
+    assert _qualification_infra_usd([]) is None
+
+
+def test_qualification_infra_usd_accumulates_across_regrades():
+    """qualification_infra_usd counts tokens from all grade attempts, not just the last.
+
+    Each requalification on a new candidate SHA overwrites the blind_merge_grade
+    record but persist_blind_merge_grade folds prior token counts into cumulative
+    accumulators so _qualification_infra_usd reports the true total Opus spend.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from app.blind_merge_grade import persist_blind_merge_grade
+    from app.efficiency_snapshot import _qualification_infra_usd
+
+    v = MagicMock()
+    v.last_qualification = None
+
+    grade1 = {
+        "candidate_sha": "sha1abc",
+        "coverage_verdict": "partial",
+        "biggest_gap": "missing test coverage",
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "model": "claude-opus-4-8",
+    }
+    grade2 = {
+        "candidate_sha": "sha2def",
+        "coverage_verdict": "covers",
+        "biggest_gap": "minor doc gap",
+        "input_tokens": 800,
+        "output_tokens": 90,
+        "model": "claude-opus-4-8",
+    }
+
+    with patch("app.blind_merge_grade.flag_modified"):
+        persist_blind_merge_grade(v, grade1)
+        persist_blind_merge_grade(v, grade2)
+
+    # Both attempts' tokens must be counted: grade1 is in the cumulative
+    # accumulators and grade2 is in the current blind_merge_grade record.
+    result = _qualification_infra_usd([v])
+    # claude-opus-4-8: $15/MTok input, $75/MTok output
+    expected = (1800 * 15e-6) + (190 * 75e-6)
+    assert result == pytest.approx(expected, rel=1e-5)
+
+
 @pytest.mark.asyncio
 async def test_llm_cost_breakdown_endpoint_includes_by_task_type(
     client: AsyncClient, db_session
@@ -5950,6 +6214,8 @@ async def test_agent_format_compliance_snapshot_endpoint(
     assert "research" in by_type
     assert by_type["create"]["format_compliance_rate"] == 1.0
     assert by_type["research"]["format_compliance_rate"] == 0.0
+    # by_schema is exposed at the top level for direct access
+    assert "by_schema" in data
 
 
 # ---------------------------------------------------------------------------
@@ -7514,6 +7780,10 @@ async def _self_repair_burn_share_alerts(db_session, project_id):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="SQLite StaticPool reads stale state after DELETE in same session",
+)
 async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
     """Alert fires when self_repair_burn_share exceeds threshold.
 
@@ -7624,3 +7894,294 @@ async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
         LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY
     )
     assert marker == "healthy"
+
+
+def test_llm_cost_attribution_strategic_cycle_cost_per_event():
+    """llm_cost_attribution block includes strategic_cycle_cost_per_event with
+    cycle_count, total_usd, and per_event_usd when StrategicCycle rows exist.
+
+    Uses two tasks tied to the same cycle (design_doc_update + strategic_review)
+    and one unrelated create task. Verifies the aggregation is isolated to the
+    strategic-cycle types and the per_event_usd is total / cycle_count.
+    """
+    import uuid
+
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING, _compact_llm_cost_attribution
+
+    project_id = uuid.uuid4()
+    cycle_id = str(uuid.uuid4())
+
+    # design_doc_update (phase 1) — 1000 input + 200 output sonnet tokens
+    phase1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": False},
+        payloads=[{"type": "design_doc_update"}],
+        strategic_cycle_id=cycle_id,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 3,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # strategic_review (phase 2) — 500 input + 100 output sonnet tokens
+    phase2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": False},
+        payloads=[{"type": "strategic_review"}],
+        strategic_cycle_id=cycle_id,
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+            "llm_call_count": 2,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Unrelated create task (should NOT appear in strategic_cycle_cost_per_event)
+    unrelated = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 8,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    result = _compact_llm_cost_attribution([phase1, phase2, unrelated])
+    sc = result["strategic_cycle_cost_per_event"]
+
+    assert sc is not None, (
+        "strategic_cycle_cost_per_event must be non-None when cycles exist"
+    )
+    assert sc["cycle_count"] == 1
+    # 1500 input + 300 output at claude-sonnet-4-6 rates (3e-6 in, 15e-6 out)
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_usd = round(1500 * input_rate + 300 * output_rate, 6)
+    assert sc["total_usd"] == pytest.approx(expected_usd)
+    assert sc["per_event_usd"] == pytest.approx(expected_usd / 1)
+
+
+def test_llm_cost_attribution_no_strategic_cycle_cost_when_no_cycles():
+    """strategic_cycle_cost_per_event is None when no strategic cycle tasks exist."""
+    import uuid
+
+    from app.efficiency_snapshot import _compact_llm_cost_attribution
+
+    project_id = uuid.uuid4()
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 4,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    result = _compact_llm_cost_attribution([task])
+    assert result["strategic_cycle_cost_per_event"] is None
+
+
+def test_llm_cost_attribution_strategic_cycle_counts_distinct_cycles():
+    """strategic_cycle_cost_per_event.cycle_count reflects distinct cycle IDs."""
+    import uuid
+
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING, _compact_llm_cost_attribution
+
+    project_id = uuid.uuid4()
+    cycle_a = str(uuid.uuid4())
+    cycle_b = str(uuid.uuid4())
+
+    def _sr_task(cycle_id: str) -> object:
+        return make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            payloads=[{"type": "strategic_review"}],
+            strategic_cycle_id=cycle_id,
+            api_call_summary={
+                "total_input_tokens": 400,
+                "total_output_tokens": 80,
+                "llm_call_count": 2,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+
+    result = _compact_llm_cost_attribution([_sr_task(cycle_a), _sr_task(cycle_b)])
+    sc = result["strategic_cycle_cost_per_event"]
+
+    assert sc is not None
+    assert sc["cycle_count"] == 2
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_total = round(2 * (400 * input_rate + 80 * output_rate), 6)
+    assert sc["total_usd"] == pytest.approx(expected_total)
+    assert sc["per_event_usd"] == pytest.approx(expected_total / 2)
+
+
+def test_llm_cost_by_failure_class_attributes_admin_cancel_to_own_bucket():
+    """LLM cost of an ADMIN_CANCEL/cancelled task is attributed to the ADMIN_CANCEL
+    bucket and a merged task's cost lands in MERGED — end-to-end through
+    _compact_llm_cost_attribution so the by_failure_class key is validated at the
+    seam that writes the durable daily snapshot.
+    """
+    import uuid
+
+    from app.efficiency_snapshot import (
+        LLM_TOKEN_PRICING,
+        _compact_llm_cost_attribution,
+        compute_llm_cost_by_failure_class,
+    )
+
+    project_id = uuid.uuid4()
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    # ADMIN_CANCEL task: CANCELLED status, failure_category = ADMIN_CANCEL, has LLM cost.
+    cancelled_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.CANCELLED,
+        context={"failure_category": "ADMIN_CANCEL"},
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 8,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Merged task: COMPLETED + pr_merged, no failure_category.
+    merged_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 4,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    tasks = [cancelled_task, merged_task]
+
+    # Verify the pure helper directly.
+    rows = compute_llm_cost_by_failure_class(tasks)
+    by_class = {r["failure_class"]: r for r in rows}
+
+    cancel_cost = round(2000 * input_rate + 400 * output_rate, 6)
+    merge_cost = round(1000 * input_rate + 200 * output_rate, 6)
+
+    assert "ADMIN_CANCEL" in by_class
+    assert by_class["ADMIN_CANCEL"]["task_count"] == 1
+    assert by_class["ADMIN_CANCEL"]["total_cost_usd"] == pytest.approx(cancel_cost)
+
+    assert "MERGED" in by_class
+    assert by_class["MERGED"]["task_count"] == 1
+    assert by_class["MERGED"]["total_cost_usd"] == pytest.approx(merge_cost)
+
+    # Verify it flows through _compact_llm_cost_attribution (the snapshot seam).
+    attribution = _compact_llm_cost_attribution(tasks)
+    assert "by_failure_class" in attribution
+    attr_by_class = {r["failure_class"]: r for r in attribution["by_failure_class"]}
+    assert "ADMIN_CANCEL" in attr_by_class
+    assert attr_by_class["ADMIN_CANCEL"]["total_cost_usd"] == pytest.approx(cancel_cost)
+    assert "MERGED" in attr_by_class
+    assert attr_by_class["MERGED"]["total_cost_usd"] == pytest.approx(merge_cost)
+
+
+def test_llm_cost_by_outcome_separates_completed_no_pr_from_other():
+    """COMPLETED tasks without a merged PR (research, review, memo) must land in
+    COMPLETED_NO_PR, not OTHER, so operators can distinguish expected non-merge
+    spend from undiagnosed failure spend.
+    """
+    import uuid
+
+    from app.efficiency_snapshot import (
+        LLM_TOKEN_PRICING,
+        compute_llm_cost_by_failure_class,
+    )
+
+    project_id = uuid.uuid4()
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    # COMPLETED task with no PR (research/review/memo type).
+    completed_no_pr = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={},  # no pr_merged, no failure_category
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 600,
+            "llm_call_count": 10,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # FAILED task with no failure_category should still land in OTHER.
+    failed_no_category = make_task(
+        project_id=project_id,
+        status=TaskStatus.FAILED,
+        context={},
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+            "llm_call_count": 2,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Merged task for baseline.
+    merged_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 4,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_failure_class(
+        [completed_no_pr, failed_no_category, merged_task]
+    )
+    by_class = {r["failure_class"]: r for r in rows}
+
+    expected_no_pr_cost = round(3000 * input_rate + 600 * output_rate, 6)
+
+    assert "COMPLETED_NO_PR" in by_class, (
+        "research/memo completions must land in COMPLETED_NO_PR not OTHER"
+    )
+    assert by_class["COMPLETED_NO_PR"]["task_count"] == 1
+    assert by_class["COMPLETED_NO_PR"]["total_cost_usd"] == pytest.approx(
+        expected_no_pr_cost
+    )
+
+    # Undiagnosed failures still land in OTHER — the buckets are separate.
+    assert "OTHER" in by_class
+    assert by_class["OTHER"]["task_count"] == 1
+
+    # COMPLETED_NO_PR and OTHER must not be merged together.
+    assert (
+        by_class["COMPLETED_NO_PR"]["total_cost_usd"]
+        != by_class["OTHER"]["total_cost_usd"]
+    )
+
+    assert "MERGED" in by_class
+    assert by_class["MERGED"]["task_count"] == 1

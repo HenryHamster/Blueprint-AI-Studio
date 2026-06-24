@@ -82,7 +82,7 @@ function ByTaskTypeRow({ ttype, cats }: { ttype: string; cats: Record<string, Sr
   const sorted = Object.entries(cats).sort(([, a], [, b]) => b.miss_rate - a.miss_rate);
   const openExamples = openCat ? cats[openCat]?.examples ?? [] : [];
   return (
-    <div className="text-[10px] mb-0.5">
+    <div className="text-ui-sm mb-0.5">
       <div className="flex items-start gap-1">
         <span className="text-neutral-400 w-12 shrink-0 font-medium">{ttype}</span>
         <span className="text-neutral-500 flex flex-wrap gap-x-1.5 gap-y-0">
@@ -136,7 +136,7 @@ function ByTaskTypeSection({ byTaskType }: { byTaskType: Record<string, Record<s
   if (types.length === 0) return null;
   return (
     <div className="mt-1.5 pt-1.5 border-t border-neutral-800/60">
-      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-1">By Task Type</p>
+      <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-1">By Task Type</p>
       {types.map(ttype => (
         <ByTaskTypeRow key={ttype} ttype={ttype} cats={byTaskType[ttype]} />
       ))}
@@ -159,7 +159,7 @@ function ByFixIterationRow({
   const sorted = Object.entries(cats).sort(([, a], [, b]) => b.miss_rate - a.miss_rate);
   const openExamples = openCat ? cats[openCat]?.examples ?? [] : [];
   return (
-    <div className="text-[10px] mb-0.5">
+    <div className="text-ui-sm mb-0.5">
       <div className="flex items-start gap-1">
         <span className="text-neutral-400 w-12 shrink-0 font-medium" title={`Fix iteration ${bucket}`}>{`iter ${bucket}`}</span>
         <span className="text-neutral-500 flex flex-wrap gap-x-1.5 gap-y-0">
@@ -179,7 +179,7 @@ function ByFixIterationRow({
                 )}
                 {delta != null && Math.abs(delta) >= 0.05 && (
                   <span
-                    className={`font-mono tabular-nums text-[9px] ml-0.5 ${deltaColorClass(delta)}`}
+                    className={`font-mono tabular-nums text-ui-xs ml-0.5 ${deltaColorClass(delta)}`}
                     title={`vs iter 1: ${formatDelta(delta)}`}
                   >
                     {formatDelta(delta)}
@@ -218,7 +218,7 @@ function ByFixIterationSection({ byFixIteration }: { byFixIteration: Record<stri
         type="button"
         onClick={() => setOpen(o => !o)}
         aria-expanded={open}
-        className="flex items-center gap-1 text-[9px] text-neutral-500 uppercase tracking-wide mb-1 hover:text-neutral-300"
+        className="flex items-center gap-1 text-ui-xs text-neutral-500 uppercase tracking-wide mb-1 hover:text-neutral-300"
       >
         {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
         By Fix Iteration
@@ -246,7 +246,7 @@ function ByScopeSection({ byScope, onScopeClick }: { byScope: Record<string, Rec
   if (scopes.length === 0) return null;
   return (
     <div data-testid="sr-trend-by-scope" className="mt-1.5 pt-1.5 border-t border-neutral-800/60">
-      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-1">By Scope</p>
+      <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-1">By Scope</p>
       {scopes.map(scope => (
         onScopeClick ? (
           <div
@@ -301,7 +301,7 @@ function SeverityBucketItem({ sev, bucket }: { sev: string; bucket: SrSeverityBu
   const trendColor = sevTrendColorClass(bucket.trend);
   const tooSmall = isSampleTooSmall(bucket.current_sample);
   return (
-    <div className="flex items-center gap-1 text-[10px]">
+    <div className="flex items-center gap-1 text-ui-sm">
       <span className={`font-mono shrink-0 font-medium ${sevLabelColor(sev)}`} title={sev}>
         {sev[0]}
       </span>
@@ -315,7 +315,7 @@ function SeverityBucketItem({ sev, bucket }: { sev: string; bucket: SrSeverityBu
         </span>
       )}
       {delta != null && !tooSmall && (
-        <span className={`font-mono tabular-nums text-[9px] ${deltaColorClass(delta)}`}>
+        <span className={`font-mono tabular-nums text-ui-xs ${deltaColorClass(delta)}`}>
           {formatDelta(delta)}
         </span>
       )}
@@ -333,8 +333,8 @@ function SeveritySection({ bySeverity, inline }: { bySeverity: Record<string, Sr
 
   if (inline) {
     return (
-      <div className="flex items-center gap-2 text-[10px] ml-1">
-        <span className="text-neutral-600 text-[9px] uppercase tracking-wide shrink-0">sev</span>
+      <div className="flex items-center gap-2 text-ui-sm ml-1">
+        <span className="text-neutral-600 text-ui-xs uppercase tracking-wide shrink-0">sev</span>
         {visible.map(sev => (
           <SeverityBucketItem key={sev} sev={sev} bucket={bySeverity[sev]} />
         ))}
@@ -344,7 +344,7 @@ function SeveritySection({ bySeverity, inline }: { bySeverity: Record<string, Sr
 
   return (
     <div className="mb-1.5 pb-1.5 border-b border-neutral-800/60">
-      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">By Severity</p>
+      <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">By Severity</p>
       <div className="flex gap-3 flex-wrap">
         {visible.map(sev => (
           <SeverityBucketItem key={sev} sev={sev} bucket={bySeverity[sev]} />
@@ -397,7 +397,7 @@ function TargetHealthSummaryCard({ stats }: { stats: TargetHealthStats }) {
   return (
     <div
       data-testid="target-health-summary"
-      className={`flex items-center gap-3 px-2 py-1 rounded mb-1.5 text-[10px] font-mono border ${
+      className={`flex items-center gap-3 px-2 py-1 rounded mb-1.5 text-ui-sm font-mono border ${
         allHealthy
           ? 'bg-emerald-950/40 border-emerald-800/30 text-emerald-400'
           : 'bg-red-950/30 border-red-800/30 text-red-400'
@@ -509,7 +509,7 @@ function CategoryRow({
       : quadrant === 'noisy_shift' ? 'Self-review is flagging more things reviewers don\'t confirm, indicating over-flagging. Review false-positive patterns or tighten flagging criteria.'
       : 'Both precision and recall have degraded, indicating the category needs recalibration. Investigate root cause of accuracy loss.';
     const tip = `${explanation}\n\n${numericDelta}`;
-    return <span className={`font-mono text-[9px] ${cls}`} title={tip}>{label}</span>;
+    return <span className={`font-mono text-ui-xs ${cls}`} title={tip}>{label}</span>;
   })();
   const examples = c.examples ?? [];
   const hasExamples = examples.length > 0;
@@ -567,7 +567,7 @@ function CategoryRow({
   };
   const investigateButton = onSpawnSrInvestigation && activeSignals.length > 0 && !sampleTooSmall && (
     activeTaskId ? (
-      <span className="font-mono text-[9px] text-cyan-600 shrink-0 tabular-nums" title={`SR investigation: ${activeTaskId}`}>{activeTaskId.slice(0, 8)}</span>
+      <span className="font-mono text-ui-xs text-cyan-600 shrink-0 tabular-nums" title={`SR investigation: ${activeTaskId}`}>{activeTaskId.slice(0, 8)}</span>
     ) : (
       <button type="button" onClick={handleSpawn} disabled={spawning} title={`Investigate ${cat}: ${activeSignals.join(', ')}`} className="shrink-0 text-neutral-500 hover:text-amber-400 disabled:opacity-40" aria-label={`Spawn SR investigation for ${cat}`}>
         {spawning ? <Loader2 className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />}
@@ -699,7 +699,7 @@ function CategoryRow({
     );
     return (
       <div>
-        <div className="flex items-center gap-2 text-[10px] min-w-0">
+        <div className="flex items-center gap-2 text-ui-sm min-w-0">
           {chevron}
           {clickable ? (
             <div
@@ -849,7 +849,7 @@ function CategoryRow({
 
   return (
     <div>
-      <div className="flex items-center gap-1.5 text-[10px]">
+      <div className="flex items-center gap-1.5 text-ui-sm">
         <span className="text-neutral-500">·</span>
         {chevron}
         {clickable ? (
@@ -900,20 +900,20 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClic
         className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]"
       >
         <div className="flex items-baseline gap-2 mb-1">
-          <p className="text-[9px] text-neutral-500 uppercase tracking-wide">
+          <p className="text-ui-xs text-neutral-500 uppercase tracking-wide">
             SR Miss Rate by Category
           </p>
           {cycleLabel && (
-            <span className="text-[9px] text-neutral-600 font-mono">{cycleLabel}</span>
+            <span className="text-ui-xs text-neutral-600 font-mono">{cycleLabel}</span>
           )}
           {promptVersionLabel && (
-            <span className="text-[9px] text-amber-600 font-mono" title="SR prompt version for this window">{promptVersionLabel}</span>
+            <span className="text-ui-xs text-amber-600 font-mono" title="SR prompt version for this window">{promptVersionLabel}</span>
           )}
           <SrCatchRateFreshnessPill health={srCatchRateHealth} />
           {trends?.mixed_prompt_versions && (
             <span
               data-testid="mixed-prompt-versions-badge"
-              className="text-[9px] text-amber-400 font-mono ml-auto"
+              className="text-ui-xs text-amber-400 font-mono ml-auto"
               title="This window contains tasks from multiple SR prompt regimes — attribution is unreliable"
             >
               mixed versions
@@ -922,7 +922,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClic
           {!trends?.mixed_prompt_versions && trends?.prompt_version_changed && (
             <span
               data-testid="prompt-version-changed-badge"
-              className="text-[9px] text-amber-600 font-mono ml-auto"
+              className="text-ui-xs text-amber-600 font-mono ml-auto"
               title="SR prompt version changed since the previous window — cycle-over-cycle delta may reflect guidance change, not genuine catch-rate shift"
             >
               version changed
@@ -931,7 +931,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClic
           {trends?.is_stale && (
             <span
               data-testid="sr-trend-stale-badge"
-              className="text-[9px] text-amber-400 font-mono ml-auto"
+              className="text-ui-xs text-amber-400 font-mono ml-auto"
               title={`Trend data is stale — last computed ${trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : 'unknown'}. Numbers may not reflect current production.`}
             >
               stale · as of {trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : '?'}
@@ -943,7 +943,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClic
             return (
               <span
                 data-testid="sr-trend-insufficient-badge"
-                className="text-[9px] text-amber-500 font-mono ml-auto"
+                className="text-ui-xs text-amber-500 font-mono ml-auto"
                 title="Most recent measurement windows had insufficient reviewer-finding data — displayed numbers are frozen and may not reflect current production."
               >
                 frozen · last real data {lastRealDate}
@@ -952,7 +952,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClic
           })()}
         </div>
         {!srCatchRateTargets || Object.keys(srCatchRateTargets).length === 0 ? (
-          <p className="text-[11px] text-neutral-400 hover:text-neutral-200 mb-1">
+          <p className="text-ui-md text-neutral-400 hover:text-neutral-200 mb-1">
             <button
               onClick={onConfigureTargets}
               className="hover:underline cursor-pointer"
@@ -968,7 +968,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClic
         {skipRate != null && (
           <p
             data-testid="sr-skip-rate-line"
-            className={`text-[9px] mb-1 font-mono ${skipRate >= SKIP_RATE_AMBER_THRESHOLD ? 'text-amber-400' : 'text-neutral-500'}`}
+            className={`text-ui-xs mb-1 font-mono ${skipRate >= SKIP_RATE_AMBER_THRESHOLD ? 'text-amber-400' : 'text-neutral-500'}`}
           >
             {`Skipped ${Math.round(skipRate * 100)}%`}
             {topSkipReason && skipDist && ` (top: ${topSkipReason[0]} ${Math.round(topSkipReason[1] / Object.values(skipDist).reduce((a, b) => a + b, 0) * 100)}%)`}
@@ -989,7 +989,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClic
               </div>
               {execEntries.length > 0 && (
                 <div className="mt-1.5 pt-1.5 border-t border-neutral-800/60" data-testid="execution-evidence-section">
-                  <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Execution Evidence</p>
+                  <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">Execution Evidence</p>
                   <div className="flex flex-col gap-0.5">
                     {execEntries.map(([cat, c]) => (
                       <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} targetHitRate={srCatchRateTargets?.[cat] ?? null} onSpawnSrInvestigation={onSpawnSrInvestigation} existingInvestigationTaskId={activeInvestigationTaskIds?.[cat] ?? null} />
@@ -1021,7 +1021,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClic
       {trends?.is_stale && (
         <span
           data-testid="sr-trend-stale-badge"
-          className="text-[9px] text-amber-400 font-mono"
+          className="text-ui-xs text-amber-400 font-mono"
           title={`Trend data is stale — last computed ${trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : 'unknown'}`}
         >
           [stale]
@@ -1033,7 +1033,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClic
         return (
           <span
             data-testid="sr-trend-insufficient-badge"
-            className="text-[9px] text-amber-500 font-mono"
+            className="text-ui-xs text-amber-500 font-mono"
             title="Most recent measurement windows had insufficient reviewer-finding data — displayed numbers are frozen."
           >
             [frozen · last real data {lastRealDate}]

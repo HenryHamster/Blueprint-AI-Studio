@@ -340,7 +340,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
         <div className="lg:col-span-2 space-y-4">
           {/* Section 1: Task Status Overview */}
           <section>
-            <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Task Status</h2>
+            <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Task Status</h2>
             {!loading && digest?.tasks_truncated && (
               <div
                 data-testid="tasks-truncated-banner"
@@ -393,7 +393,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
                   <button
                     key={d}
                     onClick={() => setFixLoopTrendDays(d)}
-                    className={`text-[10px] px-3 py-2 rounded transition-colors min-h-11 min-w-11 ${fixLoopTrendDays === d ? 'bg-neutral-700 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
+                    className={`text-ui-sm px-3 py-2 rounded transition-colors min-h-11 min-w-11 ${fixLoopTrendDays === d ? 'bg-neutral-700 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
                   >
                     {d}d
                   </button>
@@ -437,7 +437,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
             <div
               role="alert"
               data-testid="sr-drill-through-error"
-              className="flex items-start gap-2 rounded border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-red-300"
+              className="flex items-start gap-2 rounded border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-ui-md text-red-300"
             >
               <span className="flex-1">{srDrillThroughError.message}</span>
               <button

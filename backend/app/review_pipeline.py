@@ -31,6 +31,7 @@ from app.shared_state import (
 )
 from app.broadcast import broadcast_to_project
 from app.time_utils import _utcnow
+from app import vm_lifecycle
 from app.spawn_calibration import (
     _compute_scope_budget_utilization,
     _compute_scope_overflow_warning,
@@ -1398,8 +1399,8 @@ def task_counts_toward_review_cap(task: Task) -> bool:
         mirroring the manual iteration-cap reset path;
       * it is FAILED/CANCELLED with an infra-class ``failure_category`` — it
         never actually ran a review (provisioning / rate limit / agent timeout
-        / external API / supersede-cancel), so counting it would trip the cap
-        with zero real reviews on the PR; or
+        / external API / admin-cancel supersede), so counting it would trip the
+        cap with zero real reviews on the PR; or
       * it is a stale-head discard (``_review_stale_head``) — a review that ran
         against an older head than the live PR head, discarded and respawned;
         counting it would penalise the chain for a verdict it couldn't act on.
@@ -1690,6 +1691,11 @@ async def _spawn_pipeline_task(
 
     await acquire_pr_spawn_lock(session, pr_number)
 
+    # Collect VMs to delete when tasks are superseded or churn-halted.
+    # VMs are deleted after the session commits to avoid holding the
+    # transaction open during long GCP operations.
+    vms_to_delete: list[tuple[str, str]] = []  # (vm_id, reason)
+
     # C2 lock-window fix: the scope-overflow PR signal is GitHub network I/O
     # and is deferred out of the advisory-lock-held section to a post-commit
     # fire-and-forget block (see the spawn commit near the end of this
@@ -1940,7 +1946,7 @@ async def _spawn_pipeline_task(
             and _is_pipeline_task_stale(t)
         ):
             from app.failure_classification import (
-                AGENT_TIMEOUT,
+                ADMIN_CANCEL,
                 persist_failure_category,
             )
             from sqlalchemy.orm.attributes import flag_modified
@@ -1959,10 +1965,13 @@ async def _spawn_pipeline_task(
                 f"Superseded by new {task_type} for PR #{pr_number}: "
                 f"no heartbeat for >{PIPELINE_TASK_STALE_MINUTES}min"
             )
-            persist_failure_category(t, AGENT_TIMEOUT)
+            persist_failure_category(t, ADMIN_CANCEL)
             flag_modified(t, "context")
             session.add(t)
             superseded_stale_task = True
+            # Collect VM for deletion after commit
+            if t.vm_instance_id:
+                vms_to_delete.append((t.vm_instance_id, "superseded_stale_task"))
             supersede_churn_last_snapshot = t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY]
             if orig_task is not None:
                 orig_ctx = dict(orig_task.context or {})
@@ -1993,6 +2002,12 @@ async def _spawn_pipeline_task(
                 )
                 _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
                 session.add(source_task)
+                await session.commit()
+                # Delete VMs for cancelled task
+                for vm_id, reason in vms_to_delete:
+                    await vm_lifecycle._ensure_vm_deleted(
+                        vm_id, reason=f"review_pipeline_{reason}"
+                    )
                 return (None, False)
             logger.warning(
                 f"[PIPELINE] Superseding stale {t_type} task {t.id} "
@@ -2016,7 +2031,7 @@ async def _spawn_pipeline_task(
 
         if task_type == "fix" and t_type == "review":
             from app.failure_classification import (
-                AGENT_TIMEOUT,
+                ADMIN_CANCEL,
                 persist_failure_category,
             )
             from sqlalchemy.orm.attributes import flag_modified
@@ -2035,10 +2050,15 @@ async def _spawn_pipeline_task(
                 f"Superseded by fix on PR #{pr_number}: review was scoped to "
                 f"a pre-conflict / pre-CI-failure snapshot"
             )
-            persist_failure_category(t, AGENT_TIMEOUT)
+            persist_failure_category(t, ADMIN_CANCEL)
             flag_modified(t, "context")
             session.add(t)
             superseded_stale_task = True
+            # Collect VM for deletion after commit
+            if t.vm_instance_id:
+                vms_to_delete.append(
+                    (t.vm_instance_id, "superseded_fix_replaces_review")
+                )
             supersede_churn_last_snapshot = t_ctx[_REVIEW_SUPERSEDE_CHURN_LAST_KEY]
             if orig_task is not None:
                 orig_ctx = dict(orig_task.context or {})
@@ -2069,6 +2089,12 @@ async def _spawn_pipeline_task(
                 )
                 _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
                 session.add(source_task)
+                await session.commit()
+                # Delete VMs for cancelled task
+                for vm_id, reason in vms_to_delete:
+                    await vm_lifecycle._ensure_vm_deleted(
+                        vm_id, reason=f"review_pipeline_{reason}"
+                    )
                 return (None, False)
             logger.warning(
                 f"[PIPELINE] Cancelling in-flight review {t.id} on PR #{pr_number} "
@@ -2151,7 +2177,7 @@ async def _spawn_pipeline_task(
         # Cancel any remaining in-flight review/fix tasks on this PR chain so
         # they don't fail later with "PR closed without being merged" / BRANCH_GONE.
         from app.failure_classification import (
-            AGENT_TIMEOUT,
+            ADMIN_CANCEL,
             persist_failure_category,
         )
 
@@ -2177,9 +2203,14 @@ async def _spawn_pipeline_task(
                 f"Cancelled: review/fix loop terminated (churn halt) "
                 f"for PR #{pr_number}"
             )
-            persist_failure_category(_inflight, AGENT_TIMEOUT)
+            persist_failure_category(_inflight, ADMIN_CANCEL)
             flag_modified(_inflight, "context")
             session.add(_inflight)
+            # Collect VM for deletion after commit
+            if _inflight.vm_instance_id:
+                vms_to_delete.append(
+                    (_inflight.vm_instance_id, "cancelled_by_churn_halt")
+                )
             logger.info(
                 f"[PIPELINE] Cancelled in-flight {_inflight_type} task {_inflight.id} "
                 f"for PR #{pr_number} (churn halt)"
@@ -2221,6 +2252,12 @@ async def _spawn_pipeline_task(
             logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}")
         _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
         session.add(source_task)
+        await session.commit()
+        # Delete VMs for all cancelled tasks after commit
+        for vm_id, reason in vms_to_delete:
+            await vm_lifecycle._ensure_vm_deleted(
+                vm_id, reason=f"review_pipeline_{reason}"
+            )
         return (None, False)
 
     # Mid-retry defer: when spawning a review, treat the chain as busy if a
@@ -4051,5 +4088,9 @@ async def _spawn_pipeline_task(
     # token + label + comment best-effort, lock-free).
     if _deferred_scope_overflow_signal is not None:
         await _emit_scope_overflow_pr_signal(session, _deferred_scope_overflow_signal)
+
+    # Delete VMs for all superseded/churn-halted tasks after successful spawn
+    for vm_id, reason in vms_to_delete:
+        await vm_lifecycle._ensure_vm_deleted(vm_id, reason=f"review_pipeline_{reason}")
 
     return (new_task, True)

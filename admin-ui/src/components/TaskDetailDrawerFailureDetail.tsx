@@ -73,7 +73,7 @@ function ParkWakeTimeoutDiagnosticsPanel({ context }: { context: Task['context']
 
   return (
     <div className="mt-2 pt-2 border-t border-neutral-800">
-      <div className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider mb-1.5">Park/Wake Diagnostics</div>
+      <div className="text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-1.5">Park/Wake Diagnostics</div>
       <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs">
         {jobStatus && (
           <>
@@ -123,7 +123,7 @@ export function TeardownForensicsPanel({ task }: { task: Task }) {
   return (
     <div className="bg-neutral-900/50 rounded-lg border border-neutral-800 p-3 mb-2">
       <div className="flex items-center gap-2 mb-2">
-        <span className="inline-block text-[10px] px-1.5 py-0.5 rounded font-semibold bg-orange-900/60 text-orange-300 border border-orange-800">
+        <span className="inline-block text-ui-sm px-1.5 py-0.5 rounded font-semibold bg-orange-900/60 text-orange-300 border border-orange-800">
           VM Teardown
         </span>
         <span className="text-xs text-neutral-400 truncate" title={forensics.reason}>{forensics.reason}</span>
@@ -143,7 +143,7 @@ export function FailureDetailPanel({ task }: { task: Task }) {
   return (
     <div className="bg-neutral-900/50 rounded-lg border border-neutral-800 p-3 mb-2">
       <div className="flex items-center gap-2 mb-1">
-        <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded font-semibold ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}>
+        <span className={`inline-block text-ui-sm px-1.5 py-0.5 rounded font-semibold ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}>
           {FAILURE_CLASS_CONFIG[task.failure_class].label}
         </span>
         <span className="text-xs text-neutral-400">{FAILURE_CLASS_CONFIG[task.failure_class].suggestion}</span>

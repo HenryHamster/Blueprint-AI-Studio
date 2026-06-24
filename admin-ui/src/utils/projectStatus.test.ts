@@ -22,14 +22,14 @@ describe('projectStatusBadge', () => {
     });
 
     it('carries color classes for known statuses', () => {
-      expect(projectStatusBadge('FAILED').classes).toContain('text-red-400');
-      expect(projectStatusBadge('COMPLETED').classes).toContain('text-emerald-400');
-      expect(projectStatusBadge('DEPLOYING').classes).toContain('text-emerald-400');
+      expect(projectStatusBadge('FAILED').classes).toContain('text-status-blocking');
+      expect(projectStatusBadge('COMPLETED').classes).toContain('text-status-success');
+      expect(projectStatusBadge('DEPLOYING').classes).toContain('text-status-success');
     });
 
     it('falls back to the raw value for unknown statuses', () => {
       expect(projectStatusBadge('WEIRD_STATE').label).toBe('WEIRD_STATE');
-      expect(projectStatusBadge('WEIRD_STATE').classes).toContain('text-neutral-400');
+      expect(projectStatusBadge('WEIRD_STATE').classes).toContain('text-status-neutral');
     });
 
     it('falls back to Unknown for empty/missing statuses', () => {
@@ -48,24 +48,24 @@ describe('projectStatusBadge', () => {
 
     it('shows archived state for archived projects', () => {
       expect(projectStatusBadge({ status: 'DEPLOYING', archived: true }).label).toBe('Archived');
-      expect(projectStatusBadge({ status: 'DEPLOYING', archived: true }).classes).toContain('text-neutral-400');
+      expect(projectStatusBadge({ status: 'DEPLOYING', archived: true }).classes).toContain('text-status-neutral');
     });
 
     it('shows paused state when paused flag is true', () => {
       expect(projectStatusBadge({ status: 'DEPLOYING', paused: true }).label).toBe('Paused');
-      expect(projectStatusBadge({ status: 'DEPLOYING', paused: true }).classes).toContain('text-amber-400');
+      expect(projectStatusBadge({ status: 'DEPLOYING', paused: true }).classes).toContain('text-status-warning');
     });
 
     it('shows Bootstrapping for recently created projects', () => {
       const oneMinuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
       expect(projectStatusBadge({ status: 'DEPLOYING', created_at: oneMinuteAgo }).label).toBe('Bootstrapping');
-      expect(projectStatusBadge({ status: 'DEPLOYING', created_at: oneMinuteAgo }).classes).toContain('text-blue-400');
+      expect(projectStatusBadge({ status: 'DEPLOYING', created_at: oneMinuteAgo }).classes).toContain('text-status-info');
     });
 
     it('shows Running for long-running projects', () => {
       const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
       expect(projectStatusBadge({ status: 'DEPLOYING', created_at: twoHoursAgo }).label).toBe('Running');
-      expect(projectStatusBadge({ status: 'DEPLOYING', created_at: twoHoursAgo }).classes).toContain('text-emerald-400');
+      expect(projectStatusBadge({ status: 'DEPLOYING', created_at: twoHoursAgo }).classes).toContain('text-status-success');
     });
 
     it('interprets naive UTC timestamps correctly (no trailing Z)', () => {
@@ -120,10 +120,10 @@ describe('projectStatusBadge', () => {
     });
 
     it('preserves the base color classes alongside the dimming', () => {
-      // A stale "Running" reading keeps its emerald base but is visibly dimmed,
+      // A stale "Running" reading keeps its success token but is visibly dimmed,
       // so it can never read as a live authoritative green badge.
       const badge = projectStatusBadge({ status: 'DEPLOYING', stale: true });
-      expect(badge.classes).toContain('text-emerald-400');
+      expect(badge.classes).toContain('text-status-success');
       expect(badge.classes).toContain('opacity-60');
     });
 

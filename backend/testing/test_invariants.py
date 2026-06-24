@@ -4872,9 +4872,6 @@ class TestFrontendSizeGuardrails:
     def test_sr_trend_breakdown(self):
         self._check_frontend("components/SrTrendBreakdown.tsx")
 
-    def test_sr_missed_retrospectives_panel(self):
-        self._check_frontend("components/SrMissedRetrospectivesPanel.tsx")
-
     def test_sr_unhandled_edges_retrospectives_panel(self):
         self._check_frontend("components/SrUnhandledEdgesRetrospectivesPanel.tsx")
 
@@ -9941,4 +9938,89 @@ def test_deleted_test_file_classification_fails_closed_without_authorization():
     assert erosion_authorized is not None, (
         "A dead_code_removal-classified deletion must pass (non-None erosion). "
         "This is the non-deadlock escape hatch replacing the old allowlist."
+    )
+
+
+# ── TaskType evaluation registry consistency (always-on smoke invariant) ───────
+
+
+def test_task_type_evaluation_registry_is_consistent():
+    """Mirror DB-free registry assertions into always-on smoke suite.
+
+    The TaskType<->evaluation-strategy registry consistency and 'lock the spec'
+    assertions previously ran only in the DB-backed full CI matrix, allowing
+    vocabulary changes to break them and stay green on the contributing PR,
+    failing only at the promotion gate. This invariant brings the pure,
+    DB-free checks into the smoke suite so drift is caught at PR time.
+
+    Checks:
+    1. All TaskType enum values have entries in EVALUATION_STRATEGY_BY_TASK_TYPE
+    2. All TASK_CAPABILITIES have valid evaluation values (in the closed vocabulary)
+    3. The actual registry matches the expected hardcoded mapping (lock the spec)
+    """
+    from app.task_capabilities import (
+        EVALUATION_STRATEGY_BY_TASK_TYPE,
+        TASK_CAPABILITIES,
+        TaskType,
+    )
+
+    # Check 1: Every TaskType has a registry entry
+    assert set(EVALUATION_STRATEGY_BY_TASK_TYPE) == {t.value for t in TaskType}, (
+        "All TaskType enum values must have entries in EVALUATION_STRATEGY_BY_TASK_TYPE. "
+        "If you added a new task type, declare its evaluation strategy in task_capabilities.py."
+    )
+
+    # Check 2: All TASK_CAPABILITIES have valid evaluation values
+    valid_evaluation_keys = {
+        "code-ci-review",
+        "forward-quality",
+        "metric",
+        "artifact-delivery",
+        "structured-verdict",
+        "none",
+    }
+    for cap in TASK_CAPABILITIES:
+        assert cap.evaluation in valid_evaluation_keys, (
+            f"TaskCapability {cap.id} has invalid evaluation {cap.evaluation!r}. "
+            f"Must be one of: {valid_evaluation_keys}"
+        )
+
+    # Check 3: Lock the per-type strategy assignment (spec freeze for every-PR visibility)
+    # This hardcoded mapping is the 'lock the spec' assertion that prevents silent
+    # evaluation-strategy drift. If you genuinely need to change a mapping, update
+    # this dict AND update TASK_CAPABILITIES to match.
+    expected_registry = {
+        "create": "code-ci-review",
+        "review": "none",
+        "panel_review": "structured-verdict",
+        "fix": "code-ci-review",
+        "plan": "none",
+        "research": "forward-quality",
+        "strategic_review": "forward-quality",
+        "design_doc_update": "forward-quality",
+        "security_audit": "forward-quality",
+        "qa": "code-ci-review",
+        "deps": "code-ci-review",
+        "docs": "code-ci-review",
+        "migrate": "code-ci-review",
+        "smoketest": "none",
+        "refactor": "code-ci-review",
+        "debug": "forward-quality",
+        "perf": "metric",
+        "investigate": "forward-quality",
+        "self_audit": "forward-quality",
+        "release_audit": "forward-quality",
+        "release_audit_challenge": "none",
+        "release_merge_grade": "none",
+        "memo": "forward-quality",
+        "verify_tests": "none",
+        "compute_experiment": "artifact-delivery",
+        "web_research": "forward-quality",
+        "design": "forward-quality",
+        "repo_bootstrap": "none",
+    }
+    assert EVALUATION_STRATEGY_BY_TASK_TYPE == expected_registry, (
+        "TaskType evaluation registry has drifted from the locked spec. "
+        "This invariant is always-on (every PR) to catch vocabulary changes early. "
+        "If the drift is intentional, update both task_capabilities.py AND this assertion."
     )

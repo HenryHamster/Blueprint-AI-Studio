@@ -567,7 +567,7 @@ describe('useTaskModal', () => {
 
   // --- Duplicate-task flow: non-launchable types must not be re-emitted ---
 
-  it('openDuplicateTaskModal collapses a non-launchable task_type to create', () => {
+  it('openDuplicateTaskModal preserves compute_experiment task_type so it can be re-run', () => {
     const { result } = renderHook(() =>
       useTaskModal('create', vi.fn(), { current: vi.fn() }),
     );
@@ -580,10 +580,9 @@ describe('useTaskModal', () => {
         payloads: [{ base_branch: 'main' }],
       } as unknown as Parameters<typeof result.current.openDuplicateTaskModal>[0]);
     });
-    // A non-launchable source type must not be re-submitted verbatim; it
-    // collapses to the launchable 'create' default so the duplicate can never
-    // emit a doomed compute_experiment.
-    expect(result.current.newTaskType).toBe('create');
+    // compute_experiment is operator-contract-launchable, so it should be
+    // preserved so the operator can re-run the same experiment.
+    expect(result.current.newTaskType).toBe('compute_experiment');
   });
 
   it('openDuplicateTaskModal preserves a launchable task_type', () => {
@@ -846,6 +845,77 @@ describe('useTaskModal', () => {
       useTaskModal('research', vi.fn(), { current: vi.fn() }),
     );
     expect(result.current.getDefaultEffortForType('research')).toBe('high');
+  });
+
+  // --- duplicating a compute experiment prefills the launch contract ---
+
+  it('duplicating a compute experiment prefills the launch contract', () => {
+    mockFetchTaskTypeCatalog.mockResolvedValue([
+      catalogEntry({
+        id: 'compute_experiment',
+        label: 'Compute Experiment',
+        user_launchable: false,
+        operator_contract_launchable: true,
+      }),
+    ]);
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.openDuplicateTaskModal({
+        id: 'task-ce-duplicate',
+        title: 'Original compute experiment',
+        description: 'Rerun this experiment',
+        task_type: 'compute_experiment',
+        payloads: [
+          {
+            github_repo: 'owner/repo',
+            base_branch: 'main',
+            command: 'python train.py --epochs 5',
+            cwd: '/workspace/train',
+            env: { BATCH_SIZE: '32', LR: '0.001' },
+            accelerator: 'T4',
+            machine_type: 'n1-standard-1',
+            spend_cap_usd: 10.5,
+            deadline_seconds: 3600,
+            experiment: 'lora-sweep',
+            benchmark: 'mmlu',
+            hypothesis: 'Accuracy improves with LoRA',
+            metric: 'accuracy',
+            success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.85 },
+            require_live_release: true,
+            require_durable_artifact: false,
+            provisioning_model: 'SPOT',
+          },
+        ] as unknown as Record<string, unknown>[],
+      } as unknown as Parameters<typeof result.current.openDuplicateTaskModal>[0]);
+    });
+    // Verify modal opens with compute_experiment type
+    expect(result.current.showNewTaskModal).toBe(true);
+    expect(result.current.newTaskType).toBe('compute_experiment');
+    // Verify compute experiment form is prefilled from the payload
+    expect(result.current.computeExperiment.command).toBe('python train.py --epochs 5');
+    expect(result.current.computeExperiment.cwd).toBe('/workspace/train');
+    expect(result.current.computeExperiment.envVars).toBe('BATCH_SIZE=32\nLR=0.001');
+    expect(result.current.computeExperiment.accelerator).toBe('T4');
+    expect(result.current.computeExperiment.machineType).toBe('n1-standard-1');
+    expect(result.current.computeExperiment.spendCapUsd).toBe('10.5');
+    expect(result.current.computeExperiment.deadlineSeconds).toBe('3600');
+    expect(result.current.computeExperiment.experiment).toBe('lora-sweep');
+    expect(result.current.computeExperiment.benchmark).toBe('mmlu');
+    expect(result.current.computeExperiment.hypothesis).toBe('Accuracy improves with LoRA');
+    expect(result.current.computeExperiment.metric).toBe('accuracy');
+    expect(result.current.computeExperiment.successMetric).toBe('accuracy');
+    expect(result.current.computeExperiment.successOperator).toBe('>=');
+    expect(result.current.computeExperiment.successThreshold).toBe('0.85');
+    expect(result.current.computeExperiment.requireLiveRelease).toBe(true);
+    expect(result.current.computeExperiment.requireDurableArtifact).toBe(false);
+    expect(result.current.computeExperiment.provisioningModel).toBe('SPOT');
+    // Verify general task fields are prefilled
+    expect(result.current.newTaskRepo).toBe('owner/repo');
+    expect(result.current.newTaskBranch).toBe('main');
+    expect(result.current.newTaskTitle).toBe('Original compute experiment');
+    expect(result.current.newTaskPrompt).toBe('Rerun this experiment');
   });
 
   // --- compute_experiment dedicated launch contract ---
@@ -1227,5 +1297,59 @@ describe('useTaskModal', () => {
     expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
     const body = mockCreateComputeExperiment.mock.calls[0][0];
     expect(body).not.toHaveProperty('require_durable_artifact');
+  });
+
+  it('handleCreateTask sends cwd and parsed env when set', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+        cwd: '/workspace/project',
+        envVars: 'BATCH_SIZE=32\nLR=0.001\n# comment\n\nDEBUG=true',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body.cwd).toBe('/workspace/project');
+    expect(body.env).toEqual({ BATCH_SIZE: '32', LR: '0.001', DEBUG: 'true' });
+  });
+
+  it('handleCreateTask omits cwd and env when blank', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body).not.toHaveProperty('cwd');
+    expect(body).not.toHaveProperty('env');
   });
 });

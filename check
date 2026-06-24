@@ -1,0 +1,264 @@
+#!/bin/bash
+# ./check — run lint/build (and optionally tests) for changed paths.
+# Usage:
+#   ./check         # lint+build only — fast, run before each iteration
+#   ./check test    # also run tests (slow; mainly before ./pr open)
+#   ./check full    # run repo-wide lint (eslint .) + full viewport suite
+#                   # WITHOUT scoping. Skips the baseline recheck on
+#                   # failure (because the result IS the new baseline).
+#                   # Use sparingly — when you're confident your edits
+#                   # affect a shared rule / config / global selector
+#                   # whose effect a scoped check can't surface, OR
+#                   # when a baseline-warned WARN is hiding a real
+#                   # regression you want to confirm. Combine with
+#                   # 'test' (./check full test) to also run tests.
+# Exits 0 on green, non-zero on any failure. Output is the actual error tail
+# so you can act on it. Re-run after edits.
+
+set -uo pipefail
+WORKSPACE="${WORKSPACE:-/tmp/workspace}"
+cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
+
+# Sanity: make sure we're in a git repo. Without this, the diff commands
+# below silently swallow errors and CHANGED becomes empty -> all stack
+# blocks skipped -> "PASS" with zero actual checks.
+git rev-parse --git-dir >/dev/null 2>&1 || {
+  echo "Error: $WORKSPACE is not a git repo (missing .git)" >&2
+  exit 2
+}
+
+WITH_TESTS=0
+FULL_SCOPE=0
+for arg in "$@"; do
+  case "$arg" in
+    test|--tests) WITH_TESTS=1 ;;
+    full|--full)  FULL_SCOPE=1  ;;
+  esac
+done
+
+# Fresh GATE-ENVIRONMENT marker per run: cleared here, re-written by the
+# config-driven pytest gate below only if this environment still cannot run
+# the suite faithfully. ./pr surfaces it after a passing `./check test`.
+rm -f /tmp/check_gate_env_6867e9ef-f0d6-41cb-8b9d-1be50b02c806.txt
+
+# Determine changed paths: committed since base + uncommitted. Verify at
+# least one diff source actually worked — silently-empty CHANGED used to
+# fall through to "PASS — all checks green" without running anything.
+BASE="automain"
+COMMITTED=""
+if git rev-parse --verify "origin/$BASE" >/dev/null 2>&1; then
+  COMMITTED=$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null || true)
+elif git rev-parse --verify "$BASE" >/dev/null 2>&1; then
+  COMMITTED=$(git diff --name-only "$BASE...HEAD" 2>/dev/null || true)
+else
+  echo "[check] WARNING: neither origin/$BASE nor $BASE exists locally — falling back to working-tree diff only" >&2
+fi
+UNCOMMITTED=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
+CHANGED=$(printf '%s\n%s\n' "$COMMITTED" "$UNCOMMITTED" | sort -u | grep -v '^$' || true)
+
+touches() { printf '%s\n' "$CHANGED" | grep -q "^$1"; }
+
+admin_ui_runtime_touched() {
+  printf '%s\n' "$CHANGED" | grep -Eq '^(admin-ui/src/|admin-ui/(package\.json|package-lock\.json|vite\.config\.ts|vitest(\.viewport)?\.config\.ts|eslint\.config\.js|eslint-rules/))'
+}
+
+FAILED=()
+
+run() {
+  local label="$1"; shift
+  echo "[check] $label..."
+  if "$@"; then
+    echo "[check] $label OK"
+  else
+    echo "[check] $label FAILED"
+    FAILED+=("$label")
+  fi
+}
+
+# Idempotent npm install guarded by package-lock IDENTITY, not the mere
+# existence of node_modules. A warm/reused VM carries a populated
+# node_modules from a prior task; a bare `[ -d node_modules ] || npm ci`
+# then skips the install even when package-lock.json changed on this branch,
+# leaving STALE deps that mask or fake build/lint/test results. We hash
+# package-lock.json and stash the hash in a sentinel inside node_modules,
+# reinstalling only when it's absent or mismatched.
+#
+# NOTE: the sentinel guards lockfile IDENTITY (did the resolved dep set
+# change?), NOT node_modules tree-integrity (is every package actually on
+# disk and intact?). A matching hash means "this node_modules was last
+# installed from THIS lockfile", not "node_modules is provably complete".
+# That's the right tradeoff here: the warm-VM failure we're closing is a
+# CHANGED lockfile being ignored, and `git clean` at role handoff already
+# resets a corrupted tree. Call from within the target directory.
+npm_ci_if_lock_changed() {
+  local want sentinel=node_modules/.pkg-lock-hash
+  want=$(sha256sum package-lock.json 2>/dev/null | cut -d' ' -f1)
+  # Fail-safe: if we can't compute a hash (missing/unreadable lockfile or no
+  # sha256sum), install unconditionally rather than trust a stale tree.
+  if [ -n "$want" ] && [ -f "$sentinel" ] && [ "$(cat "$sentinel" 2>/dev/null)" = "$want" ]; then
+    return 0
+  fi
+  npm ci || return 1
+  # Write the sentinel ONLY after a zero-exit `npm ci`, so a killed/partial
+  # install never leaves a false-positive hash that suppresses a real retry.
+  # Recompute `want` post-install in case the lockfile was (re)written.
+  want=$(sha256sum package-lock.json 2>/dev/null | cut -d' ' -f1)
+  [ -n "$want" ] && printf '%s\n' "$want" > "$sentinel"
+}
+
+# Config-driven checks: project supplied a build_config, so run its
+# per-directory install/lint/build commands (tests under `./check test`)
+# for changed directories. Mirrors runProjectLintChecks in index.ts.
+if touches "./"; then
+  run ". install" bash -c 'cd "." && npm ci'
+  if [ "$FULL_SCOPE" = "1" ]; then
+    run ". lint" bash -c 'cd "." && npx eslint .'
+  else
+    : > /tmp/check_._lint.txt
+    printf '%s\n' "$CHANGED" | grep -E '^./.*\.(ts|tsx|js|jsx|cjs|mjs)$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\0' "${f#./}" >> /tmp/check_._lint.txt
+    done
+    if [ -s /tmp/check_._lint.txt ]; then
+      run ". lint (changed)" bash -c 'cd "." && xargs -0 -a /tmp/check_._lint.txt npx eslint 2>&1'
+    else
+      echo "[check] no changed JS/TS files in ., skipping lint"
+    fi
+  fi
+  run ". build" bash -c 'cd "." && npm run build'
+  if [ "$WITH_TESTS" = "1" ]; then
+    run ". test" bash -c 'cd "." && npm test'
+  fi
+fi
+
+if touches "admin-ui/"; then
+  run "admin-ui install" bash -c 'cd "admin-ui" && npm ci'
+  if [ "$FULL_SCOPE" = "1" ]; then
+    run "admin-ui lint" bash -c 'cd "admin-ui" && npx eslint .'
+  else
+    : > /tmp/check_admin-ui_lint.txt
+    printf '%s\n' "$CHANGED" | grep -E '^admin-ui/.*\.(ts|tsx|js|jsx|cjs|mjs)$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\0' "${f#admin-ui/}" >> /tmp/check_admin-ui_lint.txt
+    done
+    if [ -s /tmp/check_admin-ui_lint.txt ]; then
+      run "admin-ui lint (changed)" bash -c 'cd "admin-ui" && xargs -0 -a /tmp/check_admin-ui_lint.txt npx eslint 2>&1'
+    else
+      echo "[check] no changed JS/TS files in admin-ui, skipping lint"
+    fi
+  fi
+  run "admin-ui build" bash -c 'cd "admin-ui" && npm run build'
+fi
+
+if touches "agent/"; then
+  run "agent install" bash -c 'cd "agent" && npm ci'
+  if [ "$FULL_SCOPE" = "1" ]; then
+    run "agent lint" bash -c 'cd "agent" && npx eslint .'
+  else
+    : > /tmp/check_agent_lint.txt
+    printf '%s\n' "$CHANGED" | grep -E '^agent/.*\.(ts|tsx|js|jsx|cjs|mjs)$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\0' "${f#agent/}" >> /tmp/check_agent_lint.txt
+    done
+    if [ -s /tmp/check_agent_lint.txt ]; then
+      run "agent lint (changed)" bash -c 'cd "agent" && xargs -0 -a /tmp/check_agent_lint.txt npx eslint 2>&1'
+    else
+      echo "[check] no changed JS/TS files in agent, skipping lint"
+    fi
+  fi
+  run "agent build" bash -c 'cd "agent" && npm run build'
+fi
+
+if touches "backend/"; then
+  if [ "$FULL_SCOPE" = "1" ]; then
+    run "backend lint" bash -c 'cd "backend" && ruff check .'
+  else
+    : > /tmp/check_backend_lint.txt
+    printf '%s\n' "$CHANGED" | grep -E '^backend/.*\.py$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\0' "${f#backend/}" >> /tmp/check_backend_lint.txt
+    done
+    if [ -s /tmp/check_backend_lint.txt ]; then
+      run "backend lint (changed)" bash -c 'cd "backend" && xargs -0 -a /tmp/check_backend_lint.txt python3 -m ruff check --select E,F,W --ignore E501 2>&1'
+    else
+      echo "[check] no changed Python files in backend, skipping lint"
+    fi
+  fi
+  if [ "$WITH_TESTS" = "1" ]; then
+    # Honest pytest gate: prefer the sanctioned Docker harness; if only an
+    # unfaithful SQLite fallback is available, emit GATE-ENVIRONMENT instead
+    # of blocking on pre-existing environment-only failures. CI remains the
+    # authoritative Postgres run either way.
+    _GATE_MODE="bare"
+    _PG_ENV_OK=0
+    case "${DATABASE_URL:-}" in
+      postgresql*) [ "$(printf '%s' "${USE_TEST_POSTGRES:-}" | tr '[:upper:]' '[:lower:]')" = "true" ] && _PG_ENV_OK=1 ;;
+    esac
+    if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1; then
+      _AVAIL_MB=$(awk '/^MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 99999)
+      if [ -n "${ALLOW_LOW_MEM:-}" ]; then
+        # Explicit opt-in: force the full sanctioned harness regardless of memory.
+        _GATE_MODE="harness"
+      elif grep -qs -- '--standalone' scripts/test-backend.sh; then
+        # Default on the agent VM: the local gate is a SMOKE CHECK; the full
+        # Docker/Postgres suite is CI's job (and OOMs the 8 GB agent VM, exit
+        # 137). When the harness offers its sanctioned standalone partial, always
+        # prefer it — do NOT run the full suite just because memory happens to be
+        # free at gate-start (the old "_AVAIL_MB >= 4096 -> full" rule fired the
+        # full suite on exactly the VMs too small to survive it).
+        _GATE_MODE="harness-standalone"
+      elif [ "${_AVAIL_MB:-99999}" -ge 4096 ]; then
+        # Harness has no standalone mode — only then run the full harness, and
+        # only with memory headroom for it.
+        _GATE_MODE="harness"
+      fi
+    fi
+    if [ "$_GATE_MODE" = "bare" ] && [ "$_PG_ENV_OK" = "0" ] && grep -qs USE_TEST_POSTGRES "backend/conftest.py" "backend"/*/conftest.py; then
+      # The suite selects Postgres-vs-SQLite from env, the Postgres test env
+      # is absent, and the sanctioned harness cannot run here — a bare run
+      # would be the unfaithful SQLite fallback.
+      _GATE_MODE="gate-env"
+    fi
+    case "$_GATE_MODE" in
+      harness)
+        run "backend test (sanctioned harness)" bash -c 'set -o pipefail; bash scripts/test-backend.sh 2>&1 | tail -200' ;;
+      harness-standalone)
+        echo "[check] note: local gate is a smoke check — full Docker/Postgres suite runs in CI; running the harness standalone mode"
+        run "backend test (harness standalone)" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200' ;;
+      bare)
+        run "backend test" bash -c 'cd "backend" && pytest' ;;
+      gate-env)
+        echo "[check] GATE-ENVIRONMENT: backend test gate cannot run faithfully on this VM."
+        echo "[check]   A bare pytest here would select the in-memory SQLite fallback (no Postgres test env, no Docker for the sanctioned harness), where pre-existing Postgres-only tests fail regardless of your diff."
+        echo "[check]   Skipping the unfaithful run instead of blocking on an environment artifact. This is NOT a verdict on your change:"
+        echo "[check]   - Validate the diff where the suite CAN faithfully run (the project's Docker/Postgres harness, or targeted single-file runs) and record that evidence in the PR body."
+        echo "[check]   - CI runs the authoritative Postgres suite on the PR after ./pr open."
+        echo "[check]   - If you have NO faithful test evidence for a test-relevant change, call ./blocked \"<reason>\" --needs-capability \"postgres test environment\" instead of shipping blind."
+        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "backend: pytest gate skipped — no Docker for the sanctioned harness and no Postgres test env; a bare run would be an unfaithful SQLite fallback" >> /tmp/check_gate_env_6867e9ef-f0d6-41cb-8b9d-1be50b02c806.txt ;;
+    esac
+  fi
+fi
+
+if touches "local-domexception/"; then
+  run "local-domexception install" bash -c 'cd "local-domexception" && npm ci'
+  if [ "$FULL_SCOPE" = "1" ]; then
+    run "local-domexception lint" bash -c 'cd "local-domexception" && npx eslint .'
+  else
+    : > /tmp/check_local-domexception_lint.txt
+    printf '%s\n' "$CHANGED" | grep -E '^local-domexception/.*\.(ts|tsx|js|jsx|cjs|mjs)$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\0' "${f#local-domexception/}" >> /tmp/check_local-domexception_lint.txt
+    done
+    if [ -s /tmp/check_local-domexception_lint.txt ]; then
+      run "local-domexception lint (changed)" bash -c 'cd "local-domexception" && xargs -0 -a /tmp/check_local-domexception_lint.txt npx eslint 2>&1'
+    else
+      echo "[check] no changed JS/TS files in local-domexception, skipping lint"
+    fi
+  fi
+  run "local-domexception build" bash -c 'cd "local-domexception" && npm run build'
+fi
+
+if [ ${#FAILED[@]} -eq 0 ]; then
+  echo ""
+  echo "[check] PASS — all checks green"
+  exit 0
+else
+  echo ""
+  echo "[check] FAIL — ${#FAILED[@]} check(s) failed: ${FAILED[*]}"
+  exit 1
+fi

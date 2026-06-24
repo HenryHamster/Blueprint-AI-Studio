@@ -33,6 +33,7 @@ from app.compute_backends import (
     validate_backend_name,
 )
 from app.resource_envelope import (
+    resolve_project_hardware_policy,
     resolve_project_spend_ceiling,
     resolve_project_spend_window_days,
 )
@@ -285,6 +286,12 @@ async def create_compute_job(
                 await session.refresh(existing)
             return existing
         raise ValueError("task already has an active compute job")
+    await _check_project_hardware_policy(
+        session,
+        project_id=locked_task.project_id,
+        machine_type=resolved_machine_type,
+        accelerator=persisted_accelerator,
+    )
     await _check_project_compute_job_concurrency_cap(
         session,
         project_id=locked_task.project_id,
@@ -556,6 +563,51 @@ async def _check_project_spend_ceiling(
                 "ceiling_usd": ceiling_usd,
             }
         )
+
+
+async def _check_project_hardware_policy(
+    session,
+    *,
+    project_id: uuid.UUID,
+    machine_type: str | None,
+    accelerator: str | None,
+) -> None:
+    """Raise ComputeLaunchPreconditionFailed when the job violates the project hardware policy.
+
+    GPU jobs (accelerator is not None) are checked against allowed_accelerator_types;
+    CPU jobs (accelerator is None) are checked against allowed_machine_types.
+    The check is skipped when the relevant policy list is None (unlimited).
+    """
+    project = await session.get(Project, project_id)
+    if project is None:
+        return
+    allowed_machines, allowed_accels = resolve_project_hardware_policy(project)
+    if accelerator is not None:
+        if allowed_accels is not None and accelerator not in allowed_accels:
+            raise ComputeLaunchPreconditionFailed(
+                {
+                    "error": "project_hardware_policy_violated",
+                    "message": (
+                        f"accelerator {accelerator!r} is not in the project's "
+                        f"allowed_accelerator_types {allowed_accels!r}"
+                    ),
+                    "requested": accelerator,
+                    "allowed": allowed_accels,
+                }
+            )
+    else:
+        if allowed_machines is not None and machine_type not in allowed_machines:
+            raise ComputeLaunchPreconditionFailed(
+                {
+                    "error": "project_hardware_policy_violated",
+                    "message": (
+                        f"machine type {machine_type!r} is not in the project's "
+                        f"allowed_machine_types {allowed_machines!r}"
+                    ),
+                    "requested": machine_type,
+                    "allowed": allowed_machines,
+                }
+            )
 
 
 async def _check_project_compute_job_concurrency_cap(
@@ -1625,6 +1677,8 @@ async def _apply_polled_compute_job_result(
             live.status = ComputeJobStatus.RUNNING
             if status.message:
                 _set_meta(live, status_message=status.message)
+            if status.live_output is not None:
+                _set_meta(live, live_output=dict(status.live_output))
         await session.commit()
         return True
 

@@ -32,6 +32,22 @@ export interface ProjectStatusInput {
 // dim so a last-known reading never reads as a live, authoritative one.
 const STALE_CLASSES = 'opacity-60 saturate-50';
 
+/** Semantic tone for status/verdict badges — maps to @theme status tokens. */
+export type StatusTone = 'success' | 'blocking' | 'warning' | 'info' | 'neutral';
+
+const STATUS_TONE_CLASSES: Record<StatusTone, string> = {
+  success:  'bg-status-success/15 text-status-success border border-status-success/20',
+  blocking: 'bg-status-blocking/15 text-status-blocking border border-status-blocking/20',
+  warning:  'bg-status-warning/15 text-status-warning border border-status-warning/20',
+  info:     'bg-status-info/15 text-status-info border border-status-info/20',
+  neutral:  'bg-status-neutral/15 text-status-neutral border border-status-neutral/20',
+};
+
+/** Canonical token-backed badge class string for a given semantic tone. */
+export function statusBadgeClasses(tone: StatusTone): string {
+  return STATUS_TONE_CLASSES[tone];
+}
+
 /**
  * Determine if a project is actively running (not paused, not archived, with a
  * DEPLOYING/ACTIVE status). Used to count "active" projects in the dashboard summary.
@@ -104,28 +120,28 @@ function resolveBaseBadge(
 
   // Terminal states: show them regardless of other signals
   if (statusUpper === 'COMPLETED') {
-    return { label: 'Completed', classes: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20' };
+    return { label: 'Completed', classes: statusBadgeClasses('success') };
   }
   if (statusUpper === 'FAILED') {
-    return { label: 'Failed', classes: 'bg-red-500/15 text-red-400 border border-red-500/20' };
+    return { label: 'Failed', classes: statusBadgeClasses('blocking') };
   }
   if (statusUpper === 'CANCELLED') {
-    return { label: 'Cancelled', classes: 'bg-neutral-500/15 text-neutral-400 border border-neutral-500/20' };
+    return { label: 'Cancelled', classes: statusBadgeClasses('neutral') };
   }
 
   // Archived: show archived state
   if (archived) {
-    return { label: 'Archived', classes: 'bg-neutral-500/15 text-neutral-400 border border-neutral-500/20' };
+    return { label: 'Archived', classes: statusBadgeClasses('neutral') };
   }
 
   // Paused: show paused state
   if (paused) {
-    return { label: 'Paused', classes: 'bg-amber-500/15 text-amber-400 border border-amber-500/20' };
+    return { label: 'Paused', classes: statusBadgeClasses('warning') };
   }
 
   // DRAFT: show draft state
   if (statusUpper === 'DRAFT') {
-    return { label: 'Draft', classes: 'bg-amber-500/15 text-amber-400 border border-amber-500/20' };
+    return { label: 'Draft', classes: statusBadgeClasses('warning') };
   }
 
   // Active projects: distinguish between bootstrapping and running
@@ -136,23 +152,23 @@ function resolveBaseBadge(
         const createdMs = parseTimestamp(createdAt).getTime();
         const oneHourAgo = Date.now() - 60 * 60 * 1000;
         if (createdMs > oneHourAgo) {
-          return { label: 'Bootstrapping', classes: 'bg-blue-500/15 text-blue-400 border border-blue-500/20' };
+          return { label: 'Bootstrapping', classes: statusBadgeClasses('info') };
         }
       } catch {
         // If date parsing fails, fall through to "Running"
       }
     }
-    return { label: 'Running', classes: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20' };
+    return { label: 'Running', classes: statusBadgeClasses('success') };
   }
 
   // Legacy paused state (preserved for older rows)
   if (statusUpper === 'PAUSED') {
-    return { label: 'Paused', classes: 'bg-amber-500/15 text-amber-400 border border-amber-500/20' };
+    return { label: 'Paused', classes: statusBadgeClasses('warning') };
   }
 
   // Unknown: fallback that echoes the raw value
   return {
     label: status ? String(status) : 'Unknown',
-    classes: 'bg-neutral-500/15 text-neutral-400 border border-neutral-500/20',
+    classes: statusBadgeClasses('neutral'),
   };
 }

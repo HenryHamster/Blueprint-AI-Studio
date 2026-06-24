@@ -760,6 +760,51 @@ describe('TaskCard merge verification badge', () => {
   });
 });
 
+describe('TaskCard stuck-task inline triage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('test_stuck_task_shows_last_activity_and_silence_duration', () => {
+    const staleHeartbeat = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const task = makeTask({
+      status: 'IN_PROGRESS',
+      last_heartbeat: staleHeartbeat,
+      latest_status_message: 'Using tool: Bash',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    // Silence duration: "Silent 10m" (or similar) should be visible
+    const silenceEl = document.querySelector('[data-testid="stuck-silence-duration"]');
+    expect(silenceEl).not.toBeNull();
+    expect(silenceEl!.textContent).toMatch(/Silent \d+m/);
+    // Last activity: parsed from latest_status_message
+    const activityEl = document.querySelector('[data-testid="stuck-last-activity"]');
+    expect(activityEl).not.toBeNull();
+    expect(activityEl!.textContent).toContain('Last: Using Bash');
+  });
+
+  it('does not show last-activity line when latest_status_message is absent', () => {
+    const staleHeartbeat = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const task = makeTask({
+      status: 'IN_PROGRESS',
+      last_heartbeat: staleHeartbeat,
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(document.querySelector('[data-testid="stuck-last-activity"]')).toBeNull();
+  });
+
+  it('stuck banner Re-queue button calls onRetry with task id', async () => {
+    const user = userEvent.setup();
+    const staleHeartbeat = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const task = makeTask({ status: 'IN_PROGRESS', last_heartbeat: staleHeartbeat });
+    render(<TaskCard task={task} {...baseProps} />);
+    const btn = document.querySelector('[data-testid="stuck-requeue-btn"]') as HTMLElement;
+    expect(btn).not.toBeNull();
+    await user.click(btn);
+    expect(baseProps.onRetry).toHaveBeenCalledWith('task-1');
+  });
+});
+
 describe('TaskCard evaluation verdict pill', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -777,7 +822,7 @@ describe('TaskCard evaluation verdict pill', () => {
     });
     render(<TaskCard task={task} {...baseProps} />);
     const pill = screen.getByText('Request Changes');
-    expect(pill.className).toContain('red');
+    expect(pill.className).toContain('status-blocking');
     // The raw machine token must never leak to operators.
     expect(screen.queryByText('request_changes')).toBeNull();
   });
@@ -789,7 +834,7 @@ describe('TaskCard evaluation verdict pill', () => {
     });
     render(<TaskCard task={task} {...baseProps} />);
     const pill = screen.getByText('Approve');
-    expect(pill.className).toContain('emerald');
+    expect(pill.className).toContain('status-success');
   });
 
   it('renders no verdict pill when evaluation_summary is absent', () => {
@@ -806,5 +851,44 @@ describe('TaskCard evaluation verdict pill', () => {
     });
     render(<TaskCard task={task} {...baseProps} />);
     expect(screen.queryByText('Approve')).toBeNull();
+  });
+});
+
+describe('TaskCard approval button label', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('shows "Approve & Merge" for a non-compute approval', () => {
+    const task = makeTask({
+      status: 'EVALUATING',
+      task_type: 'create',
+      requires_approval: true,
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText(/Approve & Merge/)).toBeInTheDocument();
+  });
+
+  it('shows "Approve Spend ($X.XX)" for a compute_experiment with spend_cap_usd', () => {
+    const task = makeTask({
+      status: 'EVALUATING',
+      task_type: 'compute_experiment',
+      requires_approval: true,
+      payloads: [{ type: 'compute_experiment', spend_cap_usd: 12.5, command: 'echo hi', deadline_seconds: 3600 }],
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText(/Approve Spend \(\$12\.50\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/Approve & Merge/)).toBeNull();
+  });
+
+  it('shows "Approve Spend" for compute_experiment without spend_cap_usd in payload', () => {
+    const task = makeTask({
+      status: 'EVALUATING',
+      task_type: 'compute_experiment',
+      requires_approval: true,
+      payloads: [{ type: 'compute_experiment' }],
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText(/Approve Spend$/)).toBeInTheDocument();
   });
 });

@@ -73,6 +73,7 @@ describe('buildThinkerPrompt', () => {
     driftSection: '',
     recentWorkSection: '',
     feedbackSection: '',
+    questionSection: '',
     threadSection: '',
     taskId: 'test-task-123',
     versionPhaseSection: '',
@@ -619,6 +620,51 @@ describe('runThinkerWithGate', () => {
     expect(statusArg.failure_category).toBe('strategic_thinker_artifacts_missing');
   });
 
+  it('(e) command-mode thinker output (contains ./strategic) skips repairStructuredOutput and returns ok when files are present', async () => {
+    // Thinker applied state via ./strategic commands — no inline JSON expected.
+    // Both handoff files are present (written by the thinker via bash or the API).
+    const commandModeOutput = './strategic set-problem-model ...\n./strategic set-running-update ...';
+    mockRunClaudeCode.mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: commandModeOutput,
+      lastResultText: commandModeOutput,
+    });
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    // Only 1 runClaudeCode call: the thinker itself. No repair session.
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ ok: true, analysisText: commandModeOutput });
+    expect(mockPersistAndPostStatus).not.toHaveBeenCalled();
+  });
+
+  it('(f) command-mode thinker output skips repair but still fires focused retry when handoff files are missing', async () => {
+    // Thinker used ./strategic commands but did not write the handoff files to disk.
+    // Repair must be skipped (no format miss), but the focused retry must still run.
+    const commandModeOutput = './strategic set-problem-model ...\n./strategic set-running-update ...';
+    mockRunClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: commandModeOutput,
+        lastResultText: commandModeOutput,
+      })
+      // focused retry — files still absent after retry
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'retry output', lastResultText: '' });
+    // No files present at all
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    // 2 calls: thinker + focused retry (no repair session in between)
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
+    // Returns ok:false because files still missing after retry
+    expect(result).toEqual({ ok: false });
+    expect(mockPersistAndPostStatus).toHaveBeenCalledOnce();
+    const statusArg = mockPersistAndPostStatus.mock.calls[0][1];
+    expect(statusArg.failure_category).toBe('strategic_thinker_artifacts_missing');
+  });
+
   it('(d) thinker exits non-zero → FAILED posted, no repair reopen, returns ok: false', async () => {
     mockRunClaudeCode.mockResolvedValueOnce(failThinkerResult);
 
@@ -732,6 +778,25 @@ describe('runThinkerWithGate validateParsedValue guard', () => {
     expect(fsMockState.presentFiles.has(problemModelPath)).toBe(true);
     expect(result).toEqual({ ok: true, analysisText: 'analysis without JSON' });
   });
+
+  it('accepts partial problem_model update omitting intent (non-destructive merge) — no repair, file written', async () => {
+    // The prompt explicitly permits partial updates: "entries you omit are preserved".
+    // A legitimate partial update might omit intent entirely (only changing gaps or capabilities).
+    fsMockState.presentFiles.add(runningUpdatePath);
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"gaps":[{"id":"g-new","name":"new gap","priority":"high"}],"capabilities":[]}',
+        lastResultText: '{"gaps":[{"id":"g-new","name":"new gap","priority":"high"}],"capabilities":[]}',
+      });
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
+    expect(fsMockState.presentFiles.has(problemModelPath)).toBe(true);
+    expect(result).toEqual({ ok: true, analysisText: 'analysis without JSON' });
+  });
 });
 
 describe('buildThinkerPrompt on_automain annotation', () => {
@@ -765,6 +830,7 @@ describe('buildThinkerPrompt on_automain annotation', () => {
     driftSection: '',
     recentWorkSection: '',
     feedbackSection: '',
+    questionSection: '',
     threadSection: '',
     taskId: 'test-task',
     versionPhaseSection: '',
@@ -823,6 +889,7 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
     driftSection: '',
     recentWorkSection: '',
     feedbackSection: '',
+    questionSection: '',
     threadSection: '',
     taskId: 'test-task-123',
     versionPhaseSection: '',

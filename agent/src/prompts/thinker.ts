@@ -105,6 +105,7 @@ export interface ThinkerPromptParams {
   driftSection: string;
   recentWorkSection: string;
   feedbackSection: string;
+  questionSection: string;
   threadSection: string;
   taskId: string;
   versionPhaseSection: string;
@@ -184,7 +185,7 @@ ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPa
 ## Portfolio Composition
 ${p.portfolioCompositionText}
 ${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
-${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
+${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
 You operate on a **problem model** — a structured representation of what the user wants (intent), what the project can do (capabilities), and what's between those (gaps). Directions are *moves* toward specific gaps. Friction is *obstacles* in the way.
@@ -423,8 +424,14 @@ export async function runThinkerWithGate(
     }
   }
 
+  // Command-mode signal: thinker applied state via ./strategic commands rather
+  // than writing inline JSON. Skip repair to avoid false-positive format misses
+  // under the 'thinker' schema label. The filesPresent() check below still runs
+  // and fires the focused retry if the handoff files were not written to disk.
+  const isCommandMode = thinkerResult.allOutput.includes('./strategic ');
+
   let problemModelRepair: RepairStructuredOutputResult<Record<string, unknown>> | null = null;
-  if (!problemModelParseable) {
+  if (!problemModelParseable && !isCommandMode) {
     // Embed the thinker's prior analysis in the repair prompt so the fresh
     // session can extract the real problem_model JSON rather than echoing
     // schema-template placeholders (incident: a repair with no prior context
@@ -438,16 +445,23 @@ export async function runThinkerWithGate(
 
     problemModelRepair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
-      requiredKeys: ['intent'],
+      requiredKeys: [],
       schemaLabel: 'thinker',
       // Reject schema-template placeholder echoes (BUG_REPORT 8154c2d3 / PR #7435):
       // a repair session with insufficient context may echo back the schema reminder
       // text as actual values (e.g. purpose="<from analysis>" or purpose="..." or
       // empty string). Routing the guard here ensures recordFormatRepairSuccess only
       // fires when the value is actually accepted, not merely parseable.
+      // Accept partial problem_model updates that omit intent (entries omitted are
+      // preserved by non-destructive merge); validate intent.purpose when present.
       validateParsedValue: (value) => {
         const intent = (value as Record<string, unknown>).intent as Record<string, unknown> | undefined;
-        const purpose = typeof intent?.purpose === 'string' ? intent.purpose.trim() : '';
+        // Partial updates may omit intent entirely — that's legitimate. Only validate
+        // when intent is present.
+        if (intent == null) {
+          return { ok: true };
+        }
+        const purpose = typeof intent.purpose === 'string' ? intent.purpose.trim() : '';
         // Reject empty-string, '...', or a full XML/schema-tag value like
         // '<from analysis>'. A legitimate purpose starting with '<' but not
         // ending with '>' won't match the full-tag regex, so real values are safe.

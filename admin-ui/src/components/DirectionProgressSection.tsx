@@ -149,16 +149,16 @@ const DirectionCostBreakdown = memo(function DirectionCostBreakdown({ dp }: { dp
 
   return (
     <>
-      <span className="text-[9px] text-neutral-500 font-mono">
+      <span className="text-ui-xs text-neutral-500 font-mono">
         Cost: ${total.toFixed(2)}{breakdown ? ` — ${breakdown}` : ''}
       </span>
       {typeBreakdown && (
-        <span className="text-[9px] text-neutral-500 font-mono">
+        <span className="text-ui-xs text-neutral-500 font-mono">
           By type: {typeBreakdown}
         </span>
       )}
       {statusEntries.length > 0 && (
-        <span className="text-[9px] text-neutral-500 font-mono">
+        <span className="text-ui-xs text-neutral-500 font-mono">
           By status:{' '}
           {statusEntries.map(([status, v], i) => {
             const isFailed = status === 'FAILED';
@@ -221,11 +221,11 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center justify-between mb-0.5">
-        <div className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest">Directions</div>
+        <div className="text-ui-md font-bold text-neutral-500 uppercase tracking-widest">Directions</div>
         <select
           value={sortKey}
           onChange={e => setSortKey(e.target.value as DirectionSortKey)}
-          className="text-[10px] bg-neutral-950 border border-neutral-800/80 text-neutral-400 rounded px-1.5 py-0.5 cursor-pointer hover:bg-neutral-800/30"
+          className="text-ui-sm bg-neutral-950 border border-neutral-800/80 text-neutral-400 rounded px-1.5 py-0.5 cursor-pointer hover:bg-neutral-800/30"
           aria-label="Sort directions"
           title="Sort directions"
         >
@@ -256,99 +256,99 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
               </span>
               <div className="flex flex-wrap items-center gap-1 min-w-0">
                 {dp.cycles_in_window > 0 && (
-                  <span className="text-[9px] bg-neutral-700/30 text-neutral-500 border border-neutral-700/30 px-1.5 py-0.5 rounded">
+                  <span className="text-ui-xs bg-neutral-700/30 text-neutral-500 border border-neutral-700/30 px-1.5 py-0.5 rounded">
                     {dp.cycles_in_window} cycle{dp.cycles_in_window !== 1 ? 's' : ''}
                   </span>
                 )}
                 {dp.tasks_created > 0 && (
-                  <span className="text-[9px] bg-neutral-700/30 text-neutral-500 border border-neutral-700/30 px-1.5 py-0.5 rounded">
+                  <span className="text-ui-xs bg-neutral-700/30 text-neutral-500 border border-neutral-700/30 px-1.5 py-0.5 rounded">
                     {dp.tasks_created} task{dp.tasks_created !== 1 ? 's' : ''}
                   </span>
                 )}
                 {dp.prs_merged > 0 && (
-                  <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded">
+                  <span className="text-ui-xs bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded">
                     {dp.prs_merged} PR{dp.prs_merged !== 1 ? 's' : ''}
                   </span>
                 )}
                 {showProofSplit && (
-                  <span className="text-[9px] bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 px-1.5 py-0.5 rounded" title="Machine-proven merged PRs">
+                  <span className="text-ui-xs bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 px-1.5 py-0.5 rounded" title="Machine-proven merged PRs">
                     {provenMerged} proven
                   </span>
                 )}
                 {consumedMerged > 0 && (
-                  <span className="text-[9px] bg-sky-500/10 text-sky-300 border border-sky-500/20 px-1.5 py-0.5 rounded" title="Downstream-artifact proof-by-consumption subset of proven merges">
+                  <span className="text-ui-xs bg-sky-500/10 text-sky-300 border border-sky-500/20 px-1.5 py-0.5 rounded" title="Downstream-artifact proof-by-consumption subset of proven merges">
                     {consumedMerged} consumed
                   </span>
                 )}
                 {verifiedMerged != null && verifiedMerged > 0 && (
-                  <span className="text-[9px] bg-teal-500/10 text-teal-300 border border-teal-500/20 px-1.5 py-0.5 rounded" title="Verification-aware subset of merged PRs driving the conversion rate">
+                  <span className="text-ui-xs bg-teal-500/10 text-teal-300 border border-teal-500/20 px-1.5 py-0.5 rounded" title="Verification-aware subset of merged PRs driving the conversion rate">
                     {verifiedMerged} verified
                   </span>
                 )}
                 {declCoverage != null && (
                   <span
-                    className={`text-[9px] px-1.5 py-0.5 rounded border ${declCoverage >= 0.7 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : declCoverage >= 0.4 ? 'bg-amber-500/10 text-amber-500 border-amber-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}
+                    className={`text-ui-xs px-1.5 py-0.5 rounded border ${declCoverage >= 0.7 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : declCoverage >= 0.4 ? 'bg-amber-500/10 text-amber-500 border-amber-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}
                     title="Fraction of merged write-PRs that committed acceptance evidence (acceptance-declaration coverage)"
                   >
                     {Math.round(declCoverage * 100)}% decl
                   </span>
                 )}
                 {typeof dp.prs_rejected === 'number' && dp.prs_rejected > 0 && (
-                  <span className="text-[9px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded" title="PRs rejected">
+                  <span className="text-ui-xs bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded" title="PRs rejected">
                     {dp.prs_rejected} rejected
                   </span>
                 )}
                 {hasNonCodeMergeOutcomes(dp.outcome_kind_breakdown) && (
                   <span
-                    className={`text-[9px] bg-neutral-700/30 border border-neutral-700/30 px-1.5 py-0.5 rounded ${healthRateColorClass(dp.generalized_health_rate)}`}
+                    className={`text-ui-xs bg-neutral-700/30 border border-neutral-700/30 px-1.5 py-0.5 rounded ${healthRateColorClass(dp.generalized_health_rate)}`}
                     title="Generalized success across task types (code merges + research/audit/memo/verification), distinct from PR merges"
                   >
                     {dp.generalized_successes ?? 0} eval{typeof dp.generalized_health_rate === 'number' ? ` · ${Math.round(dp.generalized_health_rate * 100)}%` : ''}
                   </span>
                 )}
                 {dp.possibly_saturated && (
-                  <span className="text-[9px] bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded">
+                  <span className="text-ui-xs bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded">
                     saturated
                   </span>
                 )}
                 {dp.auto_paused && (
-                  <span className="text-[9px] bg-red-500/20 text-red-400 border border-red-500/30 px-1.5 py-0.5 rounded" title={dp.paused_reason || "Direction auto-paused"}>
+                  <span className="text-ui-xs bg-red-500/20 text-red-400 border border-red-500/30 px-1.5 py-0.5 rounded" title={dp.paused_reason || "Direction auto-paused"}>
                     paused
                   </span>
                 )}
                 {dp.needs_manual_intervention && (
-                  <span className="text-[9px] bg-red-500/20 text-red-400 border border-red-500/30 px-1.5 py-0.5 rounded" title="Needs manual intervention: repeated failures or remediation cap hit">
+                  <span className="text-ui-xs bg-red-500/20 text-red-400 border border-red-500/30 px-1.5 py-0.5 rounded" title="Needs manual intervention: repeated failures or remediation cap hit">
                     needs intervention
                   </span>
                 )}
                 {dp.possibly_complete && (
-                  <span className="text-[9px] bg-sky-500/10 text-sky-400 border border-sky-500/20 px-1.5 py-0.5 rounded" title={dp.completion_suggestion || "Direction may be complete"}>
+                  <span className="text-ui-xs bg-sky-500/10 text-sky-400 border border-sky-500/20 px-1.5 py-0.5 rounded" title={dp.completion_suggestion || "Direction may be complete"}>
                     possibly complete
                   </span>
                 )}
                 {dp.retirement_eligible && (
-                  <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded" title="Direction is eligible for retirement">
+                  <span className="text-ui-xs bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded" title="Direction is eligible for retirement">
                     retirement eligible
                   </span>
                 )}
                 {dp.priority && (
-                  <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="Direction priority">
+                  <span className="text-ui-xs bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="Direction priority">
                     {dp.priority}
                   </span>
                 )}
                 {typeof dp.acceptance_rate === 'number' && (
-                  <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="Operator acceptance rate">
+                  <span className="text-ui-xs bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="Operator acceptance rate">
                     {Math.round(dp.acceptance_rate * 100)}% acc
                   </span>
                 )}
                 {typeof dp.first_attempt_success_rate === 'number' && (
-                  <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="First-attempt success rate">
+                  <span className="text-ui-xs bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="First-attempt success rate">
                     {Math.round(dp.first_attempt_success_rate * 100)}% 1st
                   </span>
                 )}
                 {typeof dp.quality_score === 'number' && (
                   <span
-                    className={`text-[9px] px-1.5 py-0.5 rounded border ${
+                    className={`text-ui-xs px-1.5 py-0.5 rounded border ${
                       dp.quality_score >= 0.6
                         ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
                         : dp.quality_score >= 0.3
@@ -362,7 +362,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 )}
                 {typeof dp.cost_per_merged_pr === 'number' && dp.cost_per_merged_pr > 0 && (
                   <span
-                    className={`text-[9px] px-1.5 py-0.5 rounded font-mono border ${dp.cost_per_merge_exceeds_threshold ? 'bg-red-900/30 text-red-400 border-red-500/30' : 'bg-neutral-700/30 text-neutral-400 border-neutral-700/30'}`}
+                    className={`text-ui-xs px-1.5 py-0.5 rounded font-mono border ${dp.cost_per_merge_exceeds_threshold ? 'bg-red-900/30 text-red-400 border-red-500/30' : 'bg-neutral-700/30 text-neutral-400 border-neutral-700/30'}`}
                     title={dp.cost_per_merge_exceeds_threshold
                       ? `Cost per autonomous merge exceeds threshold${medianCostPerMergedPr != null ? ` (project median: $${medianCostPerMergedPr.toFixed(2)})` : ''}`
                       : 'Cost per autonomous merge — operator-assisted merges are excluded from the denominator'}
@@ -371,7 +371,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                   </span>
                 )}
                 {typeof dp.avg_time_to_merge_hours === 'number' && dp.avg_time_to_merge_hours > 0 && (
-                  <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded font-mono" title="Average hours from PR creation to merge">
+                  <span className="text-ui-xs bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded font-mono" title="Average hours from PR creation to merge">
                     {dp.avg_time_to_merge_hours < 1
                       ? `${Math.round(dp.avg_time_to_merge_hours * 60)}m/merge`
                       : `${dp.avg_time_to_merge_hours.toFixed(1)}h/merge`}
@@ -387,27 +387,27 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                     const tooltip = `${spendStr} / $${budget.toFixed(2)} budget (${Math.round(utilPct)}% utilized)`;
                     if (exceeded) {
                       return (
-                        <span className="text-[9px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded font-mono" title={tooltip}>
+                        <span className="text-ui-xs bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded font-mono" title={tooltip}>
                           over budget
                         </span>
                       );
                     }
                     if (utilPct >= 80) {
                       return (
-                        <span className="text-[9px] bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded font-mono" title={tooltip}>
+                        <span className="text-ui-xs bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded font-mono" title={tooltip}>
                           {Math.round(utilPct)}% budget
                         </span>
                       );
                     }
                     return (
-                      <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded font-mono" title={tooltip}>
+                      <span className="text-ui-xs bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded font-mono" title={tooltip}>
                         {Math.round(utilPct)}% budget
                       </span>
                     );
                   }
                   if (typeof spend === 'number' && spend > 0) {
                     return (
-                      <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded font-mono" title="Estimated cost this window (no budget set)">
+                      <span className="text-ui-xs bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded font-mono" title="Estimated cost this window (no budget set)">
                         ${spend.toFixed(2)}
                       </span>
                     );
@@ -419,39 +419,39 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
             {isExpanded && (
               <div className="mt-1 ml-5 flex flex-col gap-1">
                 {dp.completion_criteria && (
-                  <span className="text-[10px] text-neutral-400">Completion: {dp.completion_criteria}</span>
+                  <span className="text-ui-sm text-neutral-400">Completion: {dp.completion_criteria}</span>
                 )}
                 {dp.completion_suggestion && (
-                  <span className="text-[10px] text-neutral-500 italic">{dp.completion_suggestion}</span>
+                  <span className="text-ui-sm text-neutral-500 italic">{dp.completion_suggestion}</span>
                 )}
                 {dp.recent_finding_titles && dp.recent_finding_titles.length > 0 && (
                   <div className="flex flex-col gap-0.5">
                     {dp.recent_finding_titles.slice(0, 3).map((title, i) => (
-                      <span key={i} className="text-[10px] text-neutral-400">· {title}</span>
+                      <span key={i} className="text-ui-sm text-neutral-400">· {title}</span>
                     ))}
                   </div>
                 )}
                 {dp.recent_failure_titles && dp.recent_failure_titles.length > 0 && (
                   <div className="flex flex-col gap-0.5">
-                    <span className="text-[9px] text-red-400 uppercase tracking-wide">recent failures:</span>
+                    <span className="text-ui-xs text-red-400 uppercase tracking-wide">recent failures:</span>
                     {dp.recent_failure_titles.slice(0, 3).map((title, i) => (
-                      <span key={i} className="text-[10px] text-red-300">· {title}</span>
+                      <span key={i} className="text-ui-sm text-red-300">· {title}</span>
                     ))}
                   </div>
                 )}
                 {dp.latest_insights && dp.latest_insights.length > 0 && (
                   <div className="flex flex-col gap-0.5">
                     {dp.latest_insights.slice(0, 2).map((insight, i) => (
-                      <span key={i} className="text-[10px] text-neutral-500 italic">{insight}</span>
+                      <span key={i} className="text-ui-sm text-neutral-500 italic">{insight}</span>
                     ))}
                   </div>
                 )}
                 {dp.latest_research_at && (
-                  <span className="text-[9px] text-neutral-600">Last researched: {timeAgo(dp.latest_research_at)}</span>
+                  <span className="text-ui-xs text-neutral-600">Last researched: {timeAgo(dp.latest_research_at)}</span>
                 )}
                 {dp.scope_breakdown && Object.keys(dp.scope_breakdown).length > 0 && (
                   <div className="flex flex-wrap items-center gap-1">
-                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">scope:</span>
+                    <span className="text-ui-xs text-neutral-600 uppercase tracking-wide">scope:</span>
                     {Object.entries(dp.scope_breakdown).map(([scope, stats]) => {
                       const merged = stats?.merged ?? 0;
                       const created = stats?.created ?? 0;
@@ -469,7 +469,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                         detail.push(`exp ${m}/${f}`);
                       }
                       return (
-                        <span key={scope} className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded">
+                        <span key={scope} className="text-ui-xs bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded">
                           {scope} {merged}/{created}
                           {detail.length > 0 && <span className="text-neutral-500"> ({detail.join(', ')})</span>}
                         </span>
@@ -479,13 +479,13 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 )}
                 {dp.type_breakdown && Object.keys(dp.type_breakdown).length > 0 && (
                   <div className="flex flex-wrap items-center gap-1">
-                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">type:</span>
+                    <span className="text-ui-xs text-neutral-600 uppercase tracking-wide">type:</span>
                     {Object.entries(dp.type_breakdown).map(([ttype, stats]) => {
                       const merged = stats?.merged ?? 0;
                       const created = stats?.created ?? 0;
                       if (!created && !merged) return null;
                       return (
-                        <span key={ttype} className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded">
+                        <span key={ttype} className="text-ui-xs bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded">
                           {ttype} {merged}/{created}
                         </span>
                       );
@@ -494,11 +494,11 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 )}
                 {hasNonCodeMergeOutcomes(dp.outcome_kind_breakdown) && (
                   <div className="flex flex-wrap items-center gap-1">
-                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">outcomes:</span>
+                    <span className="text-ui-xs text-neutral-600 uppercase tracking-wide">outcomes:</span>
                     {summarizeOutcomeKinds(dp.outcome_kind_breakdown).map(row => (
                       <span
                         key={row.kind}
-                        className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded"
+                        className="text-ui-xs bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded"
                         title={`${row.label}: ${row.success} success / ${row.neutral} neutral / ${row.failure} failure`}
                       >
                         {row.label} {row.success}/{row.terminal}
@@ -508,12 +508,12 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 )}
                 {dp.taxonomy_summary && Object.keys(dp.taxonomy_summary).length > 0 && (
                   <div className="flex flex-wrap items-center gap-1">
-                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">failures:</span>
+                    <span className="text-ui-xs text-neutral-600 uppercase tracking-wide">failures:</span>
                     {TAXONOMY_ORDER.map(cat => {
                       const cnt = dp.taxonomy_summary?.[cat];
                       if (!cnt) return null;
                       return (
-                        <span key={cat} className={`text-[9px] px-1.5 py-0.5 rounded border ${TAXONOMY_COLORS[cat]}`} title={TAXONOMY_LABELS[cat]}>
+                        <span key={cat} className={`text-ui-xs px-1.5 py-0.5 rounded border ${TAXONOMY_COLORS[cat]}`} title={TAXONOMY_LABELS[cat]}>
                           {TAXONOMY_LABELS[cat]} {cnt}
                         </span>
                       );
@@ -522,12 +522,12 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 )}
                 {dp.stage_dropout && Object.keys(dp.stage_dropout).length > 0 && (
                   <div className="flex flex-wrap items-center gap-1">
-                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">stages:</span>
+                    <span className="text-ui-xs text-neutral-600 uppercase tracking-wide">stages:</span>
                     {STAGE_ORDER.map(stage => {
                       const cnt = dp.stage_dropout?.[stage];
                       if (!cnt) return null;
                       return (
-                        <span key={stage} className={`text-[9px] px-1.5 py-0.5 rounded border ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'}`}>
+                        <span key={stage} className={`text-ui-xs px-1.5 py-0.5 rounded border ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'}`}>
                           {stage} {cnt}
                         </span>
                       );
@@ -553,7 +553,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                     ? ` · ${Math.round(lifetimeDeclCoverage * 100)}% decl (lifetime)`
                     : '';
                   return (
-                    <span className="text-[9px] text-neutral-500">
+                    <span className="text-ui-xs text-neutral-500">
                       Lifetime: {cycles} cycle{cycles !== 1 ? 's' : ''} · {merged} merged{proofSuffix} · {failed} failed · {conv} conversion{lifetimeDeclSuffix}
                     </span>
                   );
@@ -570,7 +570,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                   if (overridden) parts.push(`${overridden} overridden`);
                   if (caught) parts.push(`${caught} issues caught`);
                   return (
-                    <span className="text-[9px] text-neutral-500">
+                    <span className="text-ui-xs text-neutral-500">
                       Review feedback: {parts.join(' · ')}
                     </span>
                   );
@@ -589,7 +589,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                   ].filter(boundary => boundary.count > 0);
                   const failClosed = ch.fail_closed_unparseable ?? 0;
                   if (!challenged && !agrees && !disagrees && !indeterminate && boundaries.length === 0 && !failClosed) return null;
-                  return <span className="text-[9px] text-neutral-500">Challenge: {challenged} findings{boundaries.length > 0 ? ` · boundaries: ${boundaries.map(boundary => `${boundary.name} ${boundary.count}`).join(' · ')}` : ''}{` · confirmed/not-confirmed/indeterminate: ${agrees}/${disagrees}/${indeterminate}`}{failClosed > 0 ? ` · fail-closed ${failClosed}` : ''}</span>;
+                  return <span className="text-ui-xs text-neutral-500">Challenge: {challenged} findings{boundaries.length > 0 ? ` · boundaries: ${boundaries.map(boundary => `${boundary.name} ${boundary.count}`).join(' · ')}` : ''}{` · confirmed/not-confirmed/indeterminate: ${agrees}/${disagrees}/${indeterminate}`}{failClosed > 0 ? ` · fail-closed ${failClosed}` : ''}</span>;
                 })()}
                 {(() => {
                   const ff = dp.filter_funnel;
@@ -606,7 +606,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                   if (ff.batch_cap) filters.push(`${ff.batch_cap} cap`);
                   const conv = produced > 0 ? ` (${Math.round((created / produced) * 100)}%)` : '';
                   return (
-                    <span className="text-[9px] text-neutral-500">
+                    <span className="text-ui-xs text-neutral-500">
                       Funnel: {produced} findings → {created} tasks{conv}
                       {filters.length > 0 ? ` · filtered: ${filters.join(' · ')}` : ''}
                     </span>
@@ -614,10 +614,10 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 })()}
                 {(typeof dp.format_compliance_rate === 'number' || typeof dp.self_repair_success_rate === 'number') && (
                   <div className="flex flex-wrap items-center gap-1">
-                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">output quality:</span>
+                    <span className="text-ui-xs text-neutral-600 uppercase tracking-wide">output quality:</span>
                     {typeof dp.format_compliance_rate === 'number' && (
                       <span
-                        className={`text-[9px] px-1.5 py-0.5 rounded border ${dp.format_compliance_rate >= 0.9 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : dp.format_compliance_rate >= 0.7 ? 'bg-amber-500/10 text-amber-500 border-amber-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}
+                        className={`text-ui-xs px-1.5 py-0.5 rounded border ${dp.format_compliance_rate >= 0.9 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : dp.format_compliance_rate >= 0.7 ? 'bg-amber-500/10 text-amber-500 border-amber-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}
                         title="Share of tasks that produced well-formed structured output (no parse errors)"
                       >
                         {Math.round(dp.format_compliance_rate * 100)}% fmt
@@ -625,7 +625,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                     )}
                     {typeof dp.self_repair_success_rate === 'number' && (
                       <span
-                        className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded"
+                        className="text-ui-xs bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded"
                         title="Share of self-repair re-asks that produced parseable output"
                       >
                         {Math.round(dp.self_repair_success_rate * 100)}% repair
@@ -659,7 +659,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                     .filter(([, count]) => typeof count === 'number' && count > 0)
                     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
                   return (
-                    <span className="text-[9px] text-neutral-500 flex flex-col gap-0.5">
+                    <span className="text-ui-xs text-neutral-500 flex flex-col gap-0.5">
                       <span>
                         Spawn gate: {challenged} challenged · {survived} survived ({explicitPass} explicit-pass · {failOpen} fail-open) · {refuted} refuted ({unresolved} unresolved)
                         {manifestExcluded ? ` · ${manifestExcluded} manifest-excluded fail-closed` : ''}
@@ -686,7 +686,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                   );
                 })()}
                 {dp.prompt_quality_hint && (
-                  <span className="text-[10px] text-neutral-500 italic" title="Synthesized from merged vs failed prompt telemetry">
+                  <span className="text-ui-sm text-neutral-500 italic" title="Synthesized from merged vs failed prompt telemetry">
                     Prompt quality: {dp.prompt_quality_hint}
                   </span>
                 )}
@@ -698,7 +698,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                     : '—';
                   const count = typeof ds.avg_subtask_count === 'number' ? ds.avg_subtask_count : null;
                   return (
-                    <span className="text-[9px] text-neutral-500">
+                    <span className="text-ui-xs text-neutral-500">
                       Plan quality: {rate} subtask merge rate across {ds.plans_assessed} plan{ds.plans_assessed !== 1 ? 's' : ''}
                       {count !== null ? ` · avg ${count} subtasks` : ''}
                     </span>
@@ -707,9 +707,9 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
                 <DirectionCostBreakdown dp={dp} />
                 {dp.rejection_reasons && dp.rejection_reasons.length > 0 && (
                   <div className="flex flex-col gap-0.5">
-                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">rejections:</span>
+                    <span className="text-ui-xs text-neutral-600 uppercase tracking-wide">rejections:</span>
                     {dp.rejection_reasons.slice(0, 3).map((r, i) => (
-                      <span key={i} className="text-[10px] text-neutral-500 italic truncate" title={r.rejection_note || ''}>
+                      <span key={i} className="text-ui-sm text-neutral-500 italic truncate" title={r.rejection_note || ''}>
                         · {(r.rejection_note || r.title || '').slice(0, 120)}
                       </span>
                     ))}

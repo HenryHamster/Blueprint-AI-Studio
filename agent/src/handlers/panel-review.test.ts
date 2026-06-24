@@ -78,6 +78,23 @@ vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../telemetry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../telemetry.js')>();
+  return {
+    ...actual,
+    recordFormatMiss: vi.fn(),
+    recordFormatRepairAttempt: vi.fn(),
+    recordFormatRepairSuccess: vi.fn(),
+    recordFormatRepairTokens: vi.fn(),
+    recordFormatRepairMiss: vi.fn(),
+    recordFormatRepairInfraFailure: vi.fn(),
+    getLlmTelemetry: vi.fn().mockReturnValue({
+      llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
+    }),
+  };
+});
+
 vi.mock('../prompt.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../prompt.js')>();
   return {
@@ -114,6 +131,7 @@ import {
   readHandlerOutput,
   runClaudeCode,
 } from '../index.js';
+import { recordFormatMiss } from '../telemetry.js';
 import { handlePanelReview, PANEL_REVIEW_LENSES } from './panel-review.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
@@ -263,9 +281,9 @@ describe('handlePanelReview', () => {
   });
 
   it('parallel path: fails closed when any lens produces no usable verdict', async () => {
-    // security lens returns null → fail closed, no silent APPROVE. Under the
-    // parallel path all lenses launch from ONE pass; synthesis still fails
-    // closed because one lens verdict is unusable.
+    // security lens returns null → repair is attempted, then fail closed. Under the
+    // parallel path all lenses launch from ONE orchestrating pass; after repair the
+    // panel still fails closed because the security lens verdict remains unusable.
     vi.mocked(readHandlerOutput).mockImplementation((_taskId: string, outputType: string) => {
       if (outputType === 'panel_review_lens_correctness') {
         return { verdict: 'APPROVE', summary: 'Correctness is fine.', issues: [] };
@@ -279,8 +297,8 @@ describe('handlePanelReview', () => {
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
     expect(call.failure_category).toBe('panel_review_lens_failed');
-    // Single orchestrating pass (no serial short-circuit in the parallel path).
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    // 1 orchestrating pass + 1 repair reopen for the first failing lens (security).
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
   });
 
   it('serial fallback: stops at the first unusable lens', async () => {
@@ -298,9 +316,10 @@ describe('handlePanelReview', () => {
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
     expect(call.failure_category).toBe('panel_review_lens_failed');
-    // Serial fan-out short-circuits at the first unusable lens (correctness ok,
-    // security null) — only two passes ran.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    // Serial fan-out: correctness pass + security pass + security repair reopen = 3.
+    // Repair is attempted before failing closed, but security readHandlerOutput
+    // still returns null after repair so the panel fails at the security lens.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
   });
 
   it('parallel path: fails closed when the orchestrating pass exits non-zero', async () => {
@@ -332,6 +351,105 @@ describe('handlePanelReview', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('panel_review_lens_failed');
+  });
+
+  it('serial fallback: malformed lens verdict triggers repair and records format miss telemetry', async () => {
+    vi.mocked(providerSupportsNativeSubagents).mockReturnValue(false);
+
+    // Security lens: runClaudeCode returns non-JSON text so repairStructuredOutput
+    // has a source to try (non-empty allOutput → tryExtract records no_json_start
+    // → recordFormatMiss is called). On the repair reopen, the file is valid.
+    let runClaudeCodeCallCount = 0;
+    vi.mocked(runClaudeCode).mockImplementation(() => {
+      runClaudeCodeCallCount++;
+      // Second call is the security lens pass — return non-JSON text so the
+      // extraction layer records a format miss before reopening.
+      const allOutput = runClaudeCodeCallCount === 2 ? 'lens review complete (no json)' : '';
+      return Promise.resolve({ exitCode: 0, allOutput, lastResultText: '' });
+    });
+
+    // Security lens: first readHandlerOutput returns null; after the repair reopen
+    // (third runClaudeCode call), return a valid verdict so the panel completes.
+    let securityReadCount = 0;
+    vi.mocked(readHandlerOutput).mockImplementation((_taskId: string, outputType: string) => {
+      if (outputType === 'panel_review_lens_correctness') {
+        return { verdict: 'APPROVE', summary: 'Correctness is fine.', issues: [] };
+      }
+      if (outputType === 'panel_review_lens_security') {
+        securityReadCount++;
+        if (securityReadCount === 1) return null; // first pass: unusable verdict
+        return { verdict: 'APPROVE', summary: 'No security regressions after repair.', issues: [] };
+      }
+      if (outputType === 'panel_review_lens_code_quality') {
+        return { verdict: 'APPROVE', summary: 'Code quality fine.', issues: [] };
+      }
+      if (outputType === 'panel_review_lens_test_coverage') {
+        return { verdict: 'APPROVE', summary: 'Test coverage fine.', issues: [] };
+      }
+      return null;
+    });
+
+    await runHandler();
+
+    // Panel should complete successfully (verdict recovered via repair).
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+
+    // repairStructuredOutput records a format miss when text extraction fails
+    // (no_json_start for non-JSON allOutput). Verifies the telemetry is not swallowed.
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalled();
+
+    // Serial path: 4 lens passes + 1 repair reopen for the security lens = 5 total.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(PANEL_REVIEW_LENSES.length + 1);
+  });
+
+  it('parallel path: malformed lens verdict triggers repair and records format miss telemetry', async () => {
+    // providerSupportsNativeSubagents returns true (default) — parallel path.
+    // First runClaudeCode call: orchestrating pass returns non-JSON allOutput so
+    // repairStructuredOutput records a format miss (no_json_start) when the security
+    // lens is null. Second call: repair reopen returns success exit.
+    let runClaudeCodeCallCount = 0;
+    vi.mocked(runClaudeCode).mockImplementation(() => {
+      runClaudeCodeCallCount++;
+      // First call is the orchestrating pass — return non-JSON text so the extraction
+      // layer records a format miss when the security lens verdict is missing.
+      const allOutput = runClaudeCodeCallCount === 1 ? 'orchestrating review complete (no json)' : '';
+      return Promise.resolve({ exitCode: 0, allOutput, lastResultText: '' });
+    });
+
+    // Security lens: first readHandlerOutput returns null; after the repair reopen
+    // (second runClaudeCode call), return a valid verdict so the panel completes.
+    let securityReadCount = 0;
+    vi.mocked(readHandlerOutput).mockImplementation((_taskId: string, outputType: string) => {
+      if (outputType === 'panel_review_lens_correctness') {
+        return { verdict: 'APPROVE', summary: 'Correctness is fine.', issues: [] };
+      }
+      if (outputType === 'panel_review_lens_security') {
+        securityReadCount++;
+        if (securityReadCount === 1) return null; // first read: unusable verdict
+        return { verdict: 'APPROVE', summary: 'No security regressions after repair.', issues: [] };
+      }
+      if (outputType === 'panel_review_lens_code_quality') {
+        return { verdict: 'APPROVE', summary: 'Code quality fine.', issues: [] };
+      }
+      if (outputType === 'panel_review_lens_test_coverage') {
+        return { verdict: 'APPROVE', summary: 'Test coverage fine.', issues: [] };
+      }
+      return null;
+    });
+
+    await runHandler();
+
+    // Panel should complete successfully (verdict recovered via repair).
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+
+    // repairStructuredOutput records a format miss when text extraction fails
+    // (no_json_start for non-JSON allOutput). Verifies the telemetry is not swallowed.
+    expect(vi.mocked(recordFormatMiss)).toHaveBeenCalled();
+
+    // Parallel path: 1 orchestrating pass + 1 repair reopen for the security lens = 2 total.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
   });
 
   it('serial fallback: a lens pass crashing on dead provider auth rethrows AuthFailureError, never failing the panel closed', async () => {

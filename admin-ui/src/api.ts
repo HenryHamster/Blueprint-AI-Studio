@@ -218,6 +218,7 @@ export interface ComputeExperimentLaunchRequest {
   success_criterion?: ComputeSuccessCriterion;
   require_live_release?: boolean;
   require_durable_artifact?: boolean;
+  provisioning_model?: string;
   model?: string;
   effort?: string;
 }
@@ -244,6 +245,59 @@ export async function createComputeExperiment(
     method: 'POST',
     body: JSON.stringify(body),
   });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.error?.message || data?.detail || `Error ${res.status}`;
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+/**
+ * Request body for the compute-experiment preflight projection endpoint.
+ * Mirrors `ComputeExperimentPreflightPayload` in backend/app/admin.py.
+ */
+export interface ComputeExperimentPreflightRequest {
+  github_repo: string;
+  accelerator?: string;
+  machine_type?: string;
+  spend_cap_usd: number;
+  deadline_seconds: number;
+  provisioning_model?: string;
+}
+
+/**
+ * Response from the preflight endpoint — projected cost, rate, and hardware-policy verdict.
+ * Kept loose/additive so backend-additive fields don't force a frontend change.
+ */
+export interface ComputeExperimentPreflightResponse {
+  resolved_machine_type: string;
+  rate_per_second: number | null;
+  rate_per_hour: number | null;
+  projected_cost_usd: number | null;
+  max_runtime_seconds: number | null;
+  allowed_accelerator_types: string[] | null;
+  allowed_machine_types: string[] | null;
+  in_policy: boolean;
+  reason: string | null;
+  shape_rejection: string | null;
+  [key: string]: unknown;
+}
+
+/**
+ * Run a pre-launch cost/policy preflight check for a compute experiment.
+ * Returns projected cost for the full deadline and max runtime under the spend cap,
+ * plus a hardware-policy verdict for the selected accelerator/machine type.
+ * Throws on non-2xx (caller should degrade gracefully on error, not block submission).
+ */
+export async function computeExperimentPreflight(
+  body: ComputeExperimentPreflightRequest,
+  signal?: AbortSignal,
+): Promise<ComputeExperimentPreflightResponse> {
+  const res = await apiFetch('/api/admin/tasks/compute-experiment/preflight', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }, 0, 15000, signal);
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     const msg = data?.error?.message || data?.detail || `Error ${res.status}`;
@@ -1477,6 +1531,17 @@ export interface VmCostAttributionTrendEntry {
   total_vm_usd: number | null;
 }
 
+export interface LlmCostByFailureClassEntry {
+  failure_class: string;
+  task_count: number;
+  total_cost_usd: number;
+}
+
+export interface LlmCostAttribution {
+  by_failure_class: LlmCostByFailureClassEntry[];
+  total_llm_usd: number;
+}
+
 export interface EfficiencyAxesResponse {
   axes: Record<string, EfficiencyAxis>;
   baseline_captured_at: string | null;
@@ -1517,6 +1582,9 @@ export interface EfficiencyAxesResponse {
   // by task type; each entry mirrors FormatComplianceByTypeEntry. Optional/null
   // for older snapshots.
   format_compliance_by_type?: Record<string, FormatComplianceByTypeEntry> | null;
+  // LLM cost attribution from the latest snapshot: per-terminal-outcome
+  // (MERGED vs each failure class) breakdown. Null on older snapshots.
+  llm_cost_attribution?: LlmCostAttribution | null;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {
@@ -1918,9 +1986,11 @@ export interface CurrentVersion {
   // this version outside the normal qualification flow.
   out_of_band_promotion?: OutOfBandPromotion | null;
   /** Per-task changelog for this version window: type, title, and PR number for
-   *  each merged task, newest-first. Allows operators to see what shipped without
-   *  manual release notes. */
+   *  each merged task, newest-first. Capped at 50 newest; tasks_merged_has_more
+   *  is true when the version has additional older tasks beyond the limit. */
   tasks_merged?: ChangelogEntry[];
+  /** True when the version has more merged tasks than the 50 returned. */
+  tasks_merged_has_more?: boolean;
   /** Acceptance-criteria bucket counts for all merged tasks in this version. */
   acceptance_aggregate?: Record<string, number> | null;
 }
@@ -2653,6 +2723,18 @@ export async function fetchArchivedProjects(
   return Array.isArray(data?.items) ? data.items : [];
 }
 
+export async function purgeArchive(olderThanDays?: number): Promise<{ deleted_count: number; has_more: boolean }> {
+  const body: Record<string, number> = {};
+  if (olderThanDays !== undefined) body.older_than_days = olderThanDays;
+  const res = await apiFetch('/api/admin/tasks/purge-archive', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Failed to purge archive: ${res.status}`);
+  return res.json();
+}
+
 export interface NullBranchConfigEntry {
   id: string;
   name: string;
@@ -2768,6 +2850,17 @@ export interface ComputeRpcDiagnostic {
   reason?: string | null;
 }
 
+export interface ComputeJobCommandLog {
+  text: string;
+  truncated: boolean;
+  byte_count: number;
+}
+
+export interface ComputeJobLiveOutput {
+  text: string;
+  truncated: boolean;
+}
+
 export interface ComputeJob {
   id: string;
   project_id: string;
@@ -2832,6 +2925,14 @@ export interface ComputeJob {
     met: boolean;
     measurable: boolean;
   } | null;
+  // Durable KnowledgeDocument auto-persisted on task completion for all
+  // measured terminal jobs. Surfaced from task.plan_output.knowledge_document.id.
+  knowledge_document_id?: string | null;
+  // Compute experiment identity fields from the task launch payload.
+  // Absent on legacy rows or non-compute-experiment tasks.
+  experiment?: string | null;
+  benchmark?: string | null;
+  hypothesis?: string | null;
 }
 
 export async function fetchComputeJobs(

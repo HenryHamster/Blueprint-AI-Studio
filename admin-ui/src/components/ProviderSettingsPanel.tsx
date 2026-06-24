@@ -237,7 +237,7 @@ export function ProviderSettingsPanel({
       )}
 
       {scope === 'overrides' && Object.keys(effectiveBag).length === 0 && (
-        <div className="text-[11px] text-neutral-500 italic">
+        <div className="text-ui-md text-neutral-500 italic">
           No overrides for {selectedTaskType} / {selectedProvider}. Fields below
           will create an override when you set them.
         </div>
@@ -393,7 +393,7 @@ function FieldRow({ label, schema, value, present, allowInherit, lockReason, dis
         </label>
         {schema.description && (
           <span
-            className="inline-flex items-center justify-center w-4 h-4 rounded-full border border-neutral-700 text-[9px] text-neutral-500 hover:text-neutral-200 hover:border-neutral-500 cursor-help select-none"
+            className="inline-flex items-center justify-center w-4 h-4 rounded-full border border-neutral-700 text-ui-xs text-neutral-500 hover:text-neutral-200 hover:border-neutral-500 cursor-help select-none"
             title={schema.description}
             aria-label={`Help: ${schema.description}`}
           >
@@ -404,22 +404,22 @@ function FieldRow({ label, schema, value, present, allowInherit, lockReason, dis
       <div className={`${effectiveDisabled ? 'opacity-40 pointer-events-none' : ''}`}>
         <Field schema={schema} value={value} onChange={onChange} disabledEnumValues={disabledEnumValues} />
         {lockReason && (
-          <div className="mt-1 text-[11px] text-amber-400 leading-snug italic">
+          <div className="mt-1 text-ui-md text-amber-400 leading-snug italic">
             {lockReason}
           </div>
         )}
         {!lockReason && currentValueDisabledReason && (
-          <div className="mt-1 text-[11px] text-amber-400 leading-snug italic">
+          <div className="mt-1 text-ui-md text-amber-400 leading-snug italic">
             {currentValueDisabledReason} This value will be dropped at dispatch.
           </div>
         )}
       </div>
       {allowInherit && !locked && (
-        // reason: inline inherit/override toggle in compact schema form row; text-[10px] py-1 matches field row density
+        // reason: inline inherit/override toggle in compact schema form row; text-ui-sm py-1 matches field row density
         <button
           data-viewport-allow-small-target
           onClick={toggleOverride}
-          className={`text-[10px] px-2 py-1 rounded border ${
+          className={`text-ui-sm px-2 py-1 rounded border ${
             overridden
               ? 'border-emerald-700 text-emerald-300 bg-emerald-950/30'
               : 'border-neutral-700 text-neutral-500 hover:text-neutral-300'
@@ -611,7 +611,7 @@ function PreviewFallbackBanner({
   const nameList = (accts: MaxPlanAccount[]) => accts.map(a => a.name).join(', ');
 
   return (
-    <div className="border border-amber-900/60 bg-amber-950/20 rounded p-3 text-[11px] space-y-1.5">
+    <div className="border border-amber-900/60 bg-amber-950/20 rounded p-3 text-ui-md space-y-1.5">
       <div className="text-amber-300 font-medium">
         {selectedModel} is a preview model — dispatcher will fall back to{' '}
         <span className="font-mono">{ga}</span> for accounts without preview access.

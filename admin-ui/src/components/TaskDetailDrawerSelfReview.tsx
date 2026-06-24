@@ -85,7 +85,7 @@ function CheckResultReasoningDisplay({ result }: { result: SelfReviewCheckResult
         </button>
       )}
       {result.severity && (
-        <span className={`ml-1.5 inline-block text-[9px] px-1.5 py-0.5 rounded font-semibold ${
+        <span className={`ml-1.5 inline-block text-ui-xs px-1.5 py-0.5 rounded font-semibold ${
           result.severity === 'CRITICAL' ? 'bg-red-950/40 text-red-400'
           : result.severity === 'HIGH' ? 'bg-orange-950/40 text-orange-400'
           : result.severity === 'MEDIUM' ? 'bg-yellow-950/40 text-yellow-400'
@@ -157,7 +157,7 @@ export function SelfReviewPanel({ task }: { task: Task }) {
       >
         {open ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
         Self-Review
-        <span className={`ml-auto text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded border ${verdictBorderBg} ${isSoftFallback ? 'text-neutral-500' : verdictColor}`}>
+        <span className={`ml-auto text-ui-sm font-semibold uppercase px-1.5 py-0.5 rounded border ${verdictBorderBg} ${isSoftFallback ? 'text-neutral-500' : verdictColor}`}>
           {isSoftFallback ? 'no data' : verdict}
         </span>
       </button>
@@ -199,7 +199,7 @@ export function SelfReviewPanel({ task }: { task: Task }) {
                           <div className="flex items-center gap-1.5">
                             <span className={`w-2 h-2 rounded-full shrink-0 ${isFromReviewer ? 'bg-orange-500' : 'bg-red-500'}`} />
                             <span className={`font-mono ${isFromReviewer ? 'text-orange-300' : 'text-red-300'}`}>{cat}</span>
-                            {isFromReviewer && <span className="text-[9px] px-1 py-0.5 rounded bg-orange-950/40 text-orange-300 font-semibold">from reviewer</span>}
+                            {isFromReviewer && <span className="text-ui-xs px-1 py-0.5 rounded bg-orange-950/40 text-orange-300 font-semibold">from reviewer</span>}
                           </div>
                           {result.issue && <p className="text-neutral-400 ml-3.5 mt-0.5 break-words">{result.issue.startsWith('[reviewer]') ? result.issue.slice(10) : result.issue}</p>}
                           <CheckResultReasoningDisplay result={result} />
@@ -221,7 +221,7 @@ export function SelfReviewPanel({ task }: { task: Task }) {
                         <div key={cat}>
                           <div className="flex items-center gap-1.5">
                             <span className={`w-2 h-2 rounded-full shrink-0 ${isThinReasoning ? 'bg-amber-500/60' : 'bg-emerald-500'}`} />
-                            <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                            <span className={`text-ui-sm font-mono px-1.5 py-0.5 rounded border ${
                               isThinReasoning
                                 ? 'bg-amber-950/30 border-amber-800/30 text-amber-400'
                                 : 'bg-emerald-950/30 border-emerald-800/30 text-emerald-400'
@@ -257,7 +257,7 @@ export function SelfReviewPanel({ task }: { task: Task }) {
                   <p className="text-xs text-amber-400">
                     Agent emitted {outcome._filtered_blind_spots_count} disallowed blind-spot pattern{outcome._filtered_blind_spots_count !== 1 ? 's' : ''} — filtered before aggregation
                   </p>
-                  <p className="text-[10px] text-amber-500/70 mt-0.5">
+                  <p className="text-ui-sm text-amber-500/70 mt-0.5">
                     Disallowed categories: {DISALLOWED_BLIND_SPOT_LABELS.join(', ')}
                   </p>
                 </div>
@@ -266,7 +266,7 @@ export function SelfReviewPanel({ task }: { task: Task }) {
               {outcome.edges_considered && outcome.edges_considered.length > 0 && (
                 <div>
                   <p className="text-xs text-neutral-400 font-medium mb-1.5">Edges considered ({outcome.edges_considered.length})</p>
-                  <div className="rounded border border-neutral-700 overflow-hidden text-[10px]">
+                  <div className="rounded border border-neutral-700 overflow-hidden text-ui-sm">
                     <div className="grid grid-cols-[1fr_auto] bg-neutral-800/60 px-2 py-1 font-semibold text-neutral-400 uppercase tracking-wide gap-2">
                       <span>Case</span>
                       <span>Handled</span>
@@ -299,10 +299,10 @@ export function SelfReviewPanel({ task }: { task: Task }) {
                       return (
                         <div key={i} className={`text-xs rounded border px-2 py-1.5 ${getSeverityColor(finding.severity)}`}>
                           <div className="flex items-center gap-2 mb-0.5 flex-wrap">
-                            <span className="font-semibold uppercase text-[9px] tracking-wide">{finding.severity}</span>
-                            <span className="font-mono text-[10px]">{finding.category}</span>
+                            <span className="font-semibold uppercase text-ui-xs tracking-wide">{finding.severity}</span>
+                            <span className="font-mono text-ui-sm">{finding.category}</span>
                             {srBadge && (
-                              <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border inline-block ml-auto ${srBadge.color}`}>
+                              <span className={`text-ui-xs font-semibold px-1.5 py-0.5 rounded border inline-block ml-auto ${srBadge.color}`}>
                                 {srBadge.icon} {srBadge.label}
                               </span>
                             )}
@@ -318,7 +318,7 @@ export function SelfReviewPanel({ task }: { task: Task }) {
               {humanCats && allCategories.length > 0 && (
                 <div>
                   <p className="text-xs text-neutral-400 font-medium mb-1.5">Agent vs. Human review categories</p>
-                  <div className="rounded border border-neutral-700 overflow-hidden text-[10px]">
+                  <div className="rounded border border-neutral-700 overflow-hidden text-ui-sm">
                     <div className="grid grid-cols-3 bg-neutral-800/60 px-2 py-1 font-semibold text-neutral-400 uppercase tracking-wide">
                       <span>Category</span>
                       <span className="text-center">Agent</span>
@@ -346,7 +346,7 @@ export function SelfReviewPanel({ task }: { task: Task }) {
                     })}
                   </div>
                   {missedCount > 0 && (
-                    <p className="text-[10px] text-amber-400 mt-1.5">
+                    <p className="text-ui-sm text-amber-400 mt-1.5">
                       {missedCount} human-flagged {missedCount === 1 ? 'category' : 'categories'} not caught by agent
                     </p>
                   )}

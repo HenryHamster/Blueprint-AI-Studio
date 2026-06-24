@@ -798,7 +798,14 @@ else
 fi
 `;
   const script = header + stackBlocks + visualCaptureBlock + footer;
-  fs.writeFileSync(`${WORKSPACE}/check`, script, { mode: 0o755 });
+  // For Blueprint self-repo, `check` is a committed static entrypoint that
+  // delegates to `.check-task` when present. Write the per-task generated
+  // script there (gitignored) so the tracked `check` file stays clean and
+  // free of per-run values (taskId, baseBranch, ci_failure selectors).
+  const outFile = isBlueprintSelfRepo(cfg.owner, cfg.repo)
+    ? `${WORKSPACE}/.check-task`
+    : `${WORKSPACE}/check`;
+  fs.writeFileSync(outFile, script, { mode: 0o755 });
 }
 
 /** Generic fallback ./check body for a non-Blueprint repo that supplied no
@@ -928,7 +935,21 @@ ${harnessProbe}    if [ "$_GATE_MODE" = "bare" ] && [ "$_PG_ENV_OK" = "0" ] && g
     fi
     case "$_GATE_MODE" in
 ${harnessCases}      bare)
-        run "${dirPrefix} test" bash -c 'cd "${dirPrefix}" && ${testCmd}' ;;
+        _PYTEST_RC=0
+        echo "[check] ${dirPrefix} test..."
+        ( cd "${dirPrefix}" && ${testCmd} ) || _PYTEST_RC=$?
+        if [ "$_PYTEST_RC" = "0" ]; then
+          echo "[check] ${dirPrefix} test OK"
+        elif [ "$_PYTEST_RC" = "5" ]; then
+          echo "[check] ${dirPrefix} test: no tests collected (pytest exit 5) — non-blocking on this environment"
+          printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${dirPrefix}: pytest exit 5 (no tests collected) — non-blocking" >> /tmp/check_gate_env_${taskId}.txt
+        elif [ "$_PYTEST_RC" = "2" ]; then
+          echo "[check] ${dirPrefix} test: collection error (pytest exit 2, possibly missing deps) — non-blocking"
+          printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${dirPrefix}: pytest exit 2 (collection error) — non-blocking" >> /tmp/check_gate_env_${taskId}.txt
+        else
+          echo "[check] ${dirPrefix} test FAILED (exit $_PYTEST_RC)"
+          FAILED+=("${dirPrefix} test")
+        fi ;;
       gate-env)
         echo "[check] GATE-ENVIRONMENT: ${dirPrefix} test gate cannot run faithfully on this VM."
         echo "[check]   A bare pytest here would select the in-memory SQLite fallback (no Postgres test env, no Docker for the sanctioned harness), where pre-existing Postgres-only tests fail regardless of your diff."

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ResearchBrowser } from './ResearchBrowser';
 import type { Task, ResearchFinding } from '../types/task';
@@ -198,8 +198,8 @@ describe('ResearchBrowser evidence panel', () => {
     await user.click(screen.getByText('Finding A'));
     const verdictPill = screen.getByText('Pass');
     expect(verdictPill).toBeInTheDocument();
-    // Humanized label + positive (emerald) tone, not the raw token or always-cyan.
-    expect(verdictPill.className).toContain('emerald');
+    // Humanized label + positive (status-success) tone, not the raw token or always-cyan.
+    expect(verdictPill.className).toContain('status-success');
     expect(verdictPill.className).not.toContain('cyan');
     expect(screen.getByText(/full suite green/)).toBeInTheDocument();
   });
@@ -226,7 +226,7 @@ describe('ResearchBrowser evidence panel', () => {
     await user.click(screen.getByText('Finding B'));
     const verdictPill = screen.getByText('Request Changes');
     expect(verdictPill).toBeInTheDocument();
-    expect(verdictPill.className).toContain('red');
+    expect(verdictPill.className).toContain('status-blocking');
     expect(screen.queryByText('request_changes')).not.toBeInTheDocument();
   });
 });
@@ -595,6 +595,77 @@ describe('ResearchBrowser BLOCKED/PARKED outcome styling', () => {
     await user.click(screen.getByRole('button', { name: 'In Progress' }));
     expect(screen.getByText('Finding Blocked')).toBeInTheDocument();
     expect(screen.getByText('Finding Parked')).toBeInTheDocument();
+  });
+});
+
+describe('ResearchBrowser quality card interactivity', () => {
+  it('grade filter narrows the listed findings to the selected grade', async () => {
+    const user = userEvent.setup();
+    vi.mocked(fetchRecentFindings).mockResolvedValueOnce({
+      findings: [
+        { task_id: 't1', title: 'High finding', type: 'bug', scope: 'small', priority: 'high', actionability_grade: 'HIGH', direction_id: null, researched_at: null },
+        { task_id: 't2', title: 'Low finding', type: 'observation', scope: 'small', priority: 'low', actionability_grade: 'LOW', direction_id: null, researched_at: null },
+      ],
+      grade_distribution: { HIGH: 1, MEDIUM: 0, LOW: 1 },
+      grade_distribution_pct: { HIGH: 50, MEDIUM: 0, LOW: 50 },
+      total: 2,
+    });
+    render(
+      <ResearchBrowser tasks={[]} selectedProjectId="proj-1" onClose={() => {}} />,
+    );
+    await waitFor(() => expect(screen.getByText('Research quality')).toBeInTheDocument());
+
+    // Both findings visible initially
+    expect(screen.getByText('High finding')).toBeInTheDocument();
+    expect(screen.getByText('Low finding')).toBeInTheDocument();
+
+    // Click the HIGH grade-filter chip. Both the filter chip ("1 HIGH (50%)")
+    // and the finding row ("HIGH High finding") expose "HIGH" in their
+    // accessible name, so scope by the chip's distribution-percentage text.
+    const highFilterChip = () => screen.getByRole('button', { name: /HIGH \(\d+%\)/ });
+    await user.click(highFilterChip());
+
+    // Only HIGH finding visible; LOW hidden
+    expect(screen.getByText('High finding')).toBeInTheDocument();
+    expect(screen.queryByText('Low finding')).not.toBeInTheDocument();
+
+    // Clicking again clears the filter
+    await user.click(highFilterChip());
+    expect(screen.getByText('Low finding')).toBeInTheDocument();
+  });
+
+  it('clicking a quality card row expands that finding\'s detail in the main list', async () => {
+    const user = userEvent.setup();
+    const finding = makeFinding({ title: 'Actionable finding', description: 'important detail here' });
+    const researchTask = makeResearchTask([finding]);
+    vi.mocked(fetchRecentFindings).mockResolvedValueOnce({
+      findings: [
+        { task_id: 'research-1', title: 'Actionable finding', type: 'bug', scope: 'small', priority: 'high', actionability_grade: 'HIGH', direction_id: null, researched_at: null },
+      ],
+      grade_distribution: { HIGH: 1, MEDIUM: 0, LOW: 0 },
+      grade_distribution_pct: { HIGH: 100, MEDIUM: 0, LOW: 0 },
+      total: 1,
+    });
+    render(
+      <ResearchBrowser
+        tasks={[researchTask]}
+        selectedProjectId="proj-1"
+        onClose={() => {}}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText('Research quality')).toBeInTheDocument());
+
+    // Description not visible yet
+    expect(screen.queryByText('important detail here')).not.toBeInTheDocument();
+
+    // Click the finding row in the quality card. The same title also renders as
+    // a row in the main findings list, so scope the query to the quality card
+    // (the container holding the "Research quality" header) to target the right one.
+    const qualityCard = screen.getByText('Research quality').closest('div') as HTMLElement;
+    await user.click(within(qualityCard).getByRole('button', { name: /Actionable finding/ }));
+
+    // Finding detail (description) is now expanded
+    await waitFor(() => expect(screen.getByText('important detail here')).toBeInTheDocument());
   });
 });
 

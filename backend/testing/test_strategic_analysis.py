@@ -3294,3 +3294,68 @@ def test_code_only_direction_success_and_generalized_success_match():
     assert entry["generalized_success"] is True
     # When they match, no extra aggregate fields added
     assert "created_generalized_successful" not in da
+
+
+# ── knowledge_by_direction in _build_outcome_evaluation ─────────────────────
+
+
+def test_direction_knowledge_injected_into_outcome():
+    """direction_knowledge appears in the per-direction outcome when
+    knowledge_by_direction contains entries for that direction."""
+    directions = [
+        {
+            "id": "d-with-knowledge",
+            "status": "active",
+            "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+        },
+        {
+            "id": "d-no-knowledge",
+            "status": "active",
+            "research_history": [],
+        },
+    ]
+    knowledge_entry = {
+        "id": "kd-1",
+        "title": "Auth research",
+        "summary": "Key findings about auth.",
+        "topic": "auth",
+        "direction_id": "d-with-knowledge",
+        "source_kind": "web_research",
+    }
+    knowledge_by_direction = {"d-with-knowledge": [knowledge_entry]}
+    result = _real_build_outcome_evaluation(
+        _make_project(directions=directions),
+        [],
+        knowledge_by_direction=knowledge_by_direction,
+    )
+    dirs_by_id = {d["id"]: d for d in result["directions"]}
+    assert "direction_knowledge" in dirs_by_id["d-with-knowledge"]
+    assert dirs_by_id["d-with-knowledge"]["direction_knowledge"][0]["title"] == "Auth research"
+    assert "direction_knowledge" not in dirs_by_id["d-no-knowledge"]
+
+
+def test_direction_knowledge_absent_when_param_not_passed():
+    """direction_knowledge is never present when knowledge_by_direction is None."""
+    directions = [
+        {
+            "id": "d-abc",
+            "status": "active",
+            "research_history": [],
+        }
+    ]
+    result = _real_build_outcome_evaluation(_make_project(directions=directions), [])
+    for d in result["directions"]:
+        assert "direction_knowledge" not in d
+
+
+def test_direction_knowledge_capped_at_five():
+    """No more than 5 knowledge entries are injected per direction."""
+    entries = [{"id": f"kd-{i}", "title": f"Doc {i}"} for i in range(8)]
+    knowledge_by_direction = {"d-cap": entries}
+    directions = [{"id": "d-cap", "status": "active", "research_history": []}]
+    result = _real_build_outcome_evaluation(
+        _make_project(directions=directions),
+        [],
+        knowledge_by_direction=knowledge_by_direction,
+    )
+    assert len(result["directions"][0]["direction_knowledge"]) == 5

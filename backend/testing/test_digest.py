@@ -9820,10 +9820,12 @@ async def test_digest_exposes_accrual_projection_for_assignment_trial(db_session
     assert "accrual_projection" in verdicts["module_interfaces"]
     assert "accrual_projection" not in verdicts["review_fix_lane"]
 
-    # The ephemeral projection is NOT persisted back to the DB entry.
+    # The accrual projection is durably persisted onto the verdict entry so
+    # strategic readers can observe it without hitting the admin digest endpoint.
     await db_session.refresh(project)
     stored = project.capability_adoption_verdicts["repo_map"]
-    assert "accrual_projection" not in stored
+    assert "accrual_projection" in stored
+    assert stored["accrual_projection"]["window_days"] == 7
 
 
 @pytest.mark.asyncio

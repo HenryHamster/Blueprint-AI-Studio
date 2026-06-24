@@ -2179,6 +2179,104 @@ async def test_agent_fetch_vm_cost_rejects_cross_project(
 
 
 @pytest.mark.asyncio
+async def test_agent_fetch_capability_trials_returns_verdicts(
+    client: AsyncClient, db_session
+):
+    """Agent endpoint returns capability-trial verdicts keyed by cap_name."""
+    project = Project(
+        name="Cap Trial Test",
+        user_id="test-user-ct",
+        capability_adoption_verdicts={
+            "repo_map": {
+                "verdict": "continue-trial",
+                "verdict_reason": "insufficient_data",
+                "lift": None,
+                "n_with": 10,
+                "n_without": 5,
+                "arm_composition": {
+                    "with_assigned": 10,
+                    "without_assigned": 5,
+                },
+                "accrual_projection": {
+                    "with_7d": 3,
+                    "without_7d": 1,
+                    "days_to_min_n": 25.0,
+                },
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-ct")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/capability-trials",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    verdicts = body["data"]["verdicts"]
+    assert "repo_map" in verdicts
+    entry = verdicts["repo_map"]
+    assert entry["verdict"] == "continue-trial"
+    assert entry["n_with"] == 10
+    assert entry["n_without"] == 5
+    assert entry["arm_composition"]["with_assigned"] == 10
+    assert entry["accrual_projection"]["days_to_min_n"] == 25.0
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_capability_trials_empty_when_no_verdicts(
+    client: AsyncClient, db_session
+):
+    """No verdicts on project → returns empty verdicts dict."""
+    project, task = await _make_project_task(db_session, vm="agent-vm-cte")
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/capability-trials",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["data"]["verdicts"] == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_capability_trials_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch capability-trials for project B (404)."""
+    project_a = Project(name="CT A", user_id="test-user-cta")
+    project_b = Project(name="CT B", user_id="test-user-ctb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(
+        project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-cta"
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-cta")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/capability-trials",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_fetch_efficiency_snapshot(client: AsyncClient, db_session):
     """Agent endpoint returns cost_per_merged_pr and vm_reuse_rate in data."""
     project, task = await _make_project_task(db_session, vm="agent-vm-eff")
@@ -2196,6 +2294,76 @@ async def test_fetch_efficiency_snapshot(client: AsyncClient, db_session):
     assert "llm_cost_per_merged_pr" in data
     assert "format_compliance" in data
     assert data["window_days"] == 7
+
+
+@pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot_includes_llm_cost_attribution(
+    client: AsyncClient, db_session
+):
+    """Efficiency snapshot includes llm_cost_attribution with by_task_type rows
+    and strategic_cycle_cost_per_event, and panel_review_effectiveness."""
+    from datetime import datetime, timezone
+
+    from app.models import TaskStatus
+
+    project = Project(name="LLM Attribution Test", user_id="test-user-llmattr")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token_task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-llmattr",
+    )
+    db_session.add(token_task)
+
+    # A completed create task with LLM cost data
+    create_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        updated_at=datetime.now(timezone.utc),
+        vm_provisioned_at=datetime.now(timezone.utc),
+        vm_stopped_at=datetime.now(timezone.utc),
+        context={
+            "llm_cost_usd": 0.05,
+            "llm_input_tokens": 1000,
+            "llm_output_tokens": 200,
+        },
+    )
+    db_session.add(create_task)
+
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-llmattr")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+
+    # Existing scalar fields still present
+    assert "cost_per_merged_pr" in data
+    assert "llm_cost_per_merged_pr" in data
+    assert "format_compliance" in data
+    assert data["window_days"] == 7
+
+    # New llm_cost_attribution block present with required sub-fields
+    assert "llm_cost_attribution" in data
+    attr = data["llm_cost_attribution"]
+    assert "by_task_type" in attr
+    assert "strategic_cycle_cost_per_event" in attr
+    assert "self_repair_burn_share" in attr
+    assert "total_llm_usd" in attr
+    assert isinstance(attr["by_task_type"], list)
+
+    # panel_review_effectiveness key present (may be None when no gate invocations)
+    assert "panel_review_effectiveness" in data
 
 
 @pytest.mark.asyncio
@@ -2223,3 +2391,58 @@ async def test_fetch_efficiency_snapshot_rejects_cross_project(
         headers={"x-agent-token": token},
     )
     assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_strategic_resolve_question_posts_answer_note(
+    client: AsyncClient, db_session
+):
+    """resolve_message on a QUESTION-type message posts a question_answer NOTE."""
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="What is the current approach?",
+        status="open",
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "resolve_message",
+            "data": {
+                "message_id": str(msg.id),
+                "resolution": "We use an iterative approach with weekly cycles.",
+            },
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "ok"
+
+    from sqlalchemy import select
+    from app.models import ProjectMessage
+
+    notes = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.message_type == MessageType.NOTE,
+                ProjectMessage.from_type == "strategic",
+            )
+        )
+    ).scalars().all()
+    matching = [
+        n
+        for n in notes
+        if isinstance(n.context, dict)
+        and n.context.get("event_type") == "question_answer"
+        and n.context.get("reply_to") == str(msg.id)
+    ]
+    assert len(matching) == 1, f"Expected 1 question_answer NOTE, got {len(matching)}"

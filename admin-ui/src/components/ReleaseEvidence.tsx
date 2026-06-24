@@ -27,10 +27,10 @@ export function ReleaseEvidencePanel({ evidence }: { evidence?: LiveReleaseEvide
   const status = evidence.aggregate_serving_status ?? null;
   return (
     <div
-      className="rounded border border-neutral-800 bg-neutral-900/40 px-2 py-1.5 text-[11px] space-y-1"
+      className="rounded border border-neutral-800 bg-neutral-900/40 px-2 py-1.5 text-ui-md space-y-1"
       data-testid="release-evidence-panel"
     >
-      <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-neutral-500">
+      <div className="flex items-center gap-1.5 text-ui-sm uppercase tracking-wide text-neutral-500">
         <ShieldCheck className="w-3 h-3 shrink-0 text-emerald-400" />
         Live Proof Context
       </div>
@@ -52,7 +52,7 @@ export function ReleaseEvidencePanel({ evidence }: { evidence?: LiveReleaseEvide
       </div>
       {requiredArtifacts.length > 0 && (
         <div className="space-y-1 pt-1">
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Required artifacts</div>
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Required artifacts</div>
           <div className="space-y-1">
             {requiredArtifacts.map((artifact) => {
               const kind = artifact.artifact_kind ?? 'unknown';
@@ -94,7 +94,7 @@ export function ReleaseEvidenceChip({ evidence }: { evidence?: LiveReleaseEviden
   const status = evidence.aggregate_serving_status ?? null;
   return (
     <span
-      className={`${servingStatusClass(status)} border text-[10px] rounded inline-flex flex-col items-start gap-1 px-1.5 py-0.5`}
+      className={`${servingStatusClass(status)} border text-ui-sm rounded inline-flex flex-col items-start gap-1 px-1.5 py-0.5`}
       data-testid="release-evidence-chip"
       title={status ? `Aggregate serving status: ${status}` : undefined}
     >

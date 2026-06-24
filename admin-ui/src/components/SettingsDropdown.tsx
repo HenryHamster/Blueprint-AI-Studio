@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import type { NotificationConfig } from './SettingsNotificationsSection';
 import { SettingsSectionRouter } from './SettingsSectionRouter';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig, ProjectResourceEnvelopeResponse, ResourceEnvelopeConfig } from '../types/project';
-import { Settings, GitBranch, Shield, X, Sliders, ListChecks, Server, User, LogOut, Bell, Wrench, Tag, HelpCircle, FileDown } from 'lucide-react';
+import { Settings, GitBranch, Shield, X, Sliders, ListChecks, Server, User, LogOut, Bell, Wrench, Tag, HelpCircle, FileDown, Users } from 'lucide-react';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
 export type { MaxPlanAccount } from '../types/settings';
@@ -186,24 +186,47 @@ interface SettingsDropdownProps {
 
 
 
-export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review' | 'resource-envelope' | 'integration-branch' | 'promotion-target';
+export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review' | 'resource-envelope' | 'integration-branch' | 'promotion-target' | 'access';
 
-const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
-  { id: 'general', label: 'General', icon: Sliders },
-  { id: 'provider-routing', label: 'Provider Routing', icon: GitBranch, adminOnly: true },
-  { id: 'provider-settings', label: 'Provider Settings', icon: ListChecks, adminOnly: true },
-  { id: 'orchestrator', label: 'Orchestrator', icon: Server, adminOnly: true },
-  { id: 'deploy', label: 'Deploy & Health', icon: Shield, adminOnly: true },
-  { id: 'accounts', label: 'Accounts', icon: User },
-  { id: 'notifications', label: 'Notifications', icon: Bell },
-  { id: 'build-config', label: 'Build Config', icon: Wrench, projectOnly: true },
-  { id: 'auto-review', label: 'Auto-Review', icon: HelpCircle, projectOnly: true },
-  { id: 'resource-envelope', label: 'Resource Envelope', icon: Server, projectOnly: true },
-  { id: 'auto-remediation', label: 'Auto-Remediation', icon: Settings, projectOnly: true },
-  { id: 'issue-implementation', label: 'Issue Implementation', icon: Tag, projectOnly: true },
-  { id: 'integration-branch', label: 'Integration Branch', icon: GitBranch, projectOnly: true },
-  { id: 'promotion-target', label: 'Promotion Target', icon: GitBranch, projectOnly: true },
-  { id: 'advanced', label: 'Advanced', icon: FileDown },
+type SectionEntry = { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean };
+
+const SECTION_GROUPS: { group: string; sections: SectionEntry[] }[] = [
+  {
+    group: 'Personal',
+    sections: [
+      { id: 'general', label: 'General', icon: Sliders },
+      { id: 'notifications', label: 'Notifications', icon: Bell },
+    ],
+  },
+  {
+    group: 'Project',
+    sections: [
+      { id: 'build-config', label: 'Build Config', icon: Wrench, projectOnly: true },
+      { id: 'auto-review', label: 'Auto-Review', icon: HelpCircle, projectOnly: true },
+      { id: 'resource-envelope', label: 'Resource Envelope', icon: Server, projectOnly: true },
+      { id: 'auto-remediation', label: 'Auto-Remediation', icon: Settings, projectOnly: true },
+      { id: 'issue-implementation', label: 'Issue Implementation', icon: Tag, projectOnly: true },
+      { id: 'integration-branch', label: 'Integration Branch', icon: GitBranch, projectOnly: true },
+      { id: 'promotion-target', label: 'Promotion Target', icon: GitBranch, projectOnly: true },
+    ],
+  },
+  {
+    group: 'Infrastructure',
+    sections: [
+      { id: 'orchestrator', label: 'Orchestrator', icon: Server, adminOnly: true },
+      { id: 'deploy', label: 'Deploy & Health', icon: Shield, adminOnly: true },
+      { id: 'provider-routing', label: 'Provider Routing', icon: GitBranch, adminOnly: true },
+      { id: 'provider-settings', label: 'Provider Settings', icon: ListChecks, adminOnly: true },
+      { id: 'accounts', label: 'Accounts', icon: User },
+      { id: 'access', label: 'Access', icon: Users },
+    ],
+  },
+  {
+    group: 'Advanced',
+    sections: [
+      { id: 'advanced', label: 'Advanced', icon: FileDown },
+    ],
+  },
 ];
 
 export function SettingsDropdown({
@@ -389,9 +412,6 @@ export function SettingsDropdown({
   }, [showSettings, onToggleSettings]);
 
   const isAdmin = userRole === 'admin';
-  const visibleSections = SECTIONS.filter(s =>
-    (!s.adminOnly || isAdmin) && (!s.projectOnly || selectedProjectId !== null)
-  );
   const allModelOptions = Array.from(new Set([
     ...Object.values(providerTierModelMap).flatMap(providerMap => Object.values(providerMap || {})),
     ...Object.values(taskTypeModelPreferences).flatMap(prefs => prefs.map(pref => pref.model)),
@@ -424,29 +444,44 @@ export function SettingsDropdown({
                   Settings
                 </h2>
               </div>
-              <div className="flex-1 py-2 space-y-0.5 px-2">
-                {visibleSections.map(section => {
-                  const Icon = section.icon;
-                  const isActive = activeSection === section.id;
+              <div className="flex-1 py-2 overflow-y-auto px-2 custom-scrollbar">
+                {SECTION_GROUPS.map(group => {
+                  const visibleGroupSections = group.sections.filter(s =>
+                    (!s.adminOnly || isAdmin) && (!s.projectOnly || selectedProjectId !== null)
+                  );
+                  if (visibleGroupSections.length === 0) return null;
                   return (
-                    <button
-                      key={section.id}
-                      onClick={() => setActiveSection(section.id)}
-                      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-left text-xs transition-colors ${
-                        isActive
-                          ? 'bg-neutral-800 text-neutral-100'
-                          : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50'
-                      }`}
-                    >
-                      <Icon className="w-3.5 h-3.5 shrink-0" />
-                      {section.label}
-                    </button>
+                    <div key={group.group} className="mb-2">
+                      <div className="px-3 py-1.5">
+                        <span className="text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider">{group.group}</span>
+                      </div>
+                      <div className="space-y-0.5">
+                        {visibleGroupSections.map(section => {
+                          const Icon = section.icon;
+                          const isActive = activeSection === section.id;
+                          return (
+                            <button
+                              key={section.id}
+                              onClick={() => setActiveSection(section.id)}
+                              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-left text-xs transition-colors ${
+                                isActive
+                                  ? 'bg-neutral-800 text-neutral-100'
+                                  : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50'
+                              }`}
+                            >
+                              <Icon className="w-3.5 h-3.5 shrink-0" />
+                              {section.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
                   );
                 })}
               </div>
               <div className="px-2 py-3 border-t border-neutral-800">
                 <div className="px-3 mb-2">
-                  <span className="text-[11px] text-neutral-500 truncate block" title={userEmail}>{userEmail}</span>
+                  <span className="text-ui-md text-neutral-500 truncate block" title={userEmail}>{userEmail}</span>
                 </div>
                 <button
                   onClick={onSignOut}
@@ -468,12 +503,22 @@ export function SettingsDropdown({
                     onChange={e => setActiveSection(e.target.value as SectionId)}
                     className="md:hidden w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
                   >
-                    {visibleSections.map(section => (
-                      <option key={section.id} value={section.id}>{section.label}</option>
-                    ))}
+                    {SECTION_GROUPS.map(group => {
+                      const visibleGroupSections = group.sections.filter(s =>
+                        (!s.adminOnly || isAdmin) && (!s.projectOnly || selectedProjectId !== null)
+                      );
+                      if (visibleGroupSections.length === 0) return null;
+                      return (
+                        <optgroup key={group.group} label={group.group}>
+                          {visibleGroupSections.map(section => (
+                            <option key={section.id} value={section.id}>{section.label}</option>
+                          ))}
+                        </optgroup>
+                      );
+                    })}
                   </select>
                   <h3 className="hidden md:block text-sm font-semibold text-neutral-100">
-                    {visibleSections.find(s => s.id === activeSection)?.label}
+                    {SECTION_GROUPS.flatMap(g => g.sections).find(s => s.id === activeSection)?.label}
                   </h3>
                 </div>
                 <button
@@ -640,7 +685,7 @@ export function SettingsDropdown({
               </div>
               {/* Mobile footer with user info and Sign Out */}
               <div className="md:hidden px-4 py-3 border-t border-neutral-800 bg-neutral-900/50 flex items-center justify-between gap-3">
-                <span className="text-[11px] text-neutral-500 truncate flex-1" title={userEmail}>{userEmail}</span>
+                <span className="text-ui-md text-neutral-500 truncate flex-1" title={userEmail}>{userEmail}</span>
                 <button
                   onClick={onSignOut}
                   className="flex items-center gap-1.5 px-3 py-3.5 rounded-lg text-xs text-neutral-400 hover:text-red-400 hover:bg-red-950/20 transition-colors whitespace-nowrap"

@@ -194,6 +194,23 @@ export function buildStrategicCompletionLogs(
   lastResultText: string | null | undefined,
 ): { logs: string; warning?: string; missReason?: import('../json-extract.js').JsonExtractionMissReason } {
   const fallbackLogs = sanitize(lastResultText || allOutput.slice(-50_000));
+
+  // Command-mode signal: presence of strategist `./strategic` commands in the
+  // OUTPUT means no inline JSON is expected. Skip legacy extraction entirely to
+  // avoid false-positive format misses on prose markers.
+  //
+  // NOTE: the marker is assembled from fragments rather than written as a single
+  // literal on purpose. This is an output detector for the strategic handler
+  // (which consumes buildStrategicCompletionLogs), NOT a prompt advertisement —
+  // research/plan share this file but never tell their agent to run that helper.
+  // A contiguous literal would be mis-read as a `./<helper>` advertisement by the
+  // per-handler provisioning-parity invariant (prompt-helper-refs.test.ts) and
+  // wrongly demand research/plan provision a strategist-only helper.
+  const STRATEGIC_COMMAND_MARKER = './' + 'strategic ';
+  if (allOutput.includes(STRATEGIC_COMMAND_MARKER)) {
+    return { logs: fallbackLogs };
+  }
+
   const hasDirectionOperations = allOutput.includes('"direction_operations"');
   const hasProblemModel = allOutput.includes('"problem_model"');
   const hasVision = allOutput.includes('"vision"');
@@ -1639,13 +1656,15 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   } catch {
     sendLog(ws, `Failed to read ${planPath}, falling back to output parsing\n`);
   }
+  const planProgress = readProgressArtifact(taskId, 'plan');
   if (!logs) {
+    const priorAnalysisSection = planProgress ? `${planProgress.slice(-8000)}\n\n` : '';
     const repair = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: ['subtasks'],
       schemaLabel: 'research_plan',
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `You did not emit the plan JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required field: subtasks (array). Schema:\n\n{"subtasks":[{"title":"...","prompt":"...","type":"create","scope":"medium","related_files":["path/to/file.ts"],"depends_on_indices":[]}]}\n\nOutput ONLY the JSON object.`,
+      reopenPrompt: `${priorAnalysisSection}You did not emit the plan JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required field: subtasks (array). Schema:\n\n{"subtasks":[{"title":"...","prompt":"...","type":"create","scope":"medium","related_files":["path/to/file.ts"],"depends_on_indices":[]}]}\n\nOutput ONLY the JSON object.`,
       ws,
       statusRef,
       model,
@@ -1670,7 +1689,6 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   // creation) and misreading it as failure silently dropped valid plans.
 
   const finalStatus = exitCode === 0 ? 'COMPLETED' : 'FAILED';
-  const planProgress = readProgressArtifact(taskId, 'plan');
   try {
     await persistAndPostStatus(taskId, {
       task_id: taskId,

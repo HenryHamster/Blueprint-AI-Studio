@@ -15,7 +15,7 @@ function fmtBytes(b: number): string {
 function DecisionCard({ label, decision }: { label: string; decision: Record<string, unknown> | null }) {
   return (
     <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800 min-w-0">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wider mb-1 truncate">{label}</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1 truncate">{label}</p>
       {decision == null ? (
         <p className="text-xs text-neutral-600 italic">No decision yet</p>
       ) : (
@@ -85,15 +85,15 @@ export function StructuralHealthObservabilityPanel() {
             <>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                 <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
-                  <p className="text-[10px] text-neutral-500 uppercase tracking-wider mb-1">Audit Cycles</p>
+                  <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Audit Cycles</p>
                   <p className="text-lg font-mono text-neutral-100">{data.cycles}</p>
                 </div>
                 <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
-                  <p className="text-[10px] text-neutral-500 uppercase tracking-wider mb-1">Enrolled Total</p>
+                  <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Enrolled Total</p>
                   <p className="text-lg font-mono text-neutral-100">{data.enrolled_total}</p>
                 </div>
                 <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
-                  <p className="text-[10px] text-neutral-500 uppercase tracking-wider mb-1">Largest Rows</p>
+                  <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Largest Rows</p>
                   <p className="text-lg font-mono text-neutral-100">{largestRows.length}</p>
                 </div>
               </div>
@@ -104,7 +104,7 @@ export function StructuralHealthObservabilityPanel() {
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs">
                       <thead>
-                        <tr className="text-left text-[10px] text-neutral-500 border-b border-neutral-800">
+                        <tr className="text-left text-ui-sm text-neutral-500 border-b border-neutral-800">
                           <th className="pb-1 pr-3 font-medium">Size</th>
                           <th className="pb-1 pr-3 font-medium">Task ID</th>
                           <th className="pb-1 font-medium">Project</th>
@@ -114,8 +114,8 @@ export function StructuralHealthObservabilityPanel() {
                         {largestRows.map((r, i) => (
                           <tr key={i} className="border-b border-neutral-800/50 last:border-0">
                             <td className="py-1 pr-3 font-mono text-neutral-300">{fmtBytes(r.bytes)}</td>
-                            <td className="py-1 pr-3 text-neutral-400 font-mono text-[10px]">{r.task_id.slice(0, 8)}…</td>
-                            <td className="py-1 text-neutral-600 font-mono text-[10px]">{r.project_id.slice(0, 8)}…</td>
+                            <td className="py-1 pr-3 text-neutral-400 font-mono text-ui-sm">{r.task_id.slice(0, 8)}…</td>
+                            <td className="py-1 text-neutral-600 font-mono text-ui-sm">{r.project_id.slice(0, 8)}…</td>
                           </tr>
                         ))}
                       </tbody>
@@ -130,7 +130,7 @@ export function StructuralHealthObservabilityPanel() {
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs">
                       <thead>
-                        <tr className="text-left text-[10px] text-neutral-500 border-b border-neutral-800">
+                        <tr className="text-left text-ui-sm text-neutral-500 border-b border-neutral-800">
                           <th className="pb-1 pr-3 font-medium">Action</th>
                           <th className="pb-1 pr-3 font-medium">Check</th>
                           <th className="pb-1 font-medium">Enrolled</th>

@@ -57,7 +57,7 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion }: Di
       </div>
       <div className="mt-1.5 bg-neutral-900 border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center focus-within:ring-1 focus-within:ring-neutral-600">
         {form.newPathTags.map(tag => (
-          <span key={tag} className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-[10px] font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
+          <span key={tag} className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-ui-sm font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
             {tag}
             <button
               type="button"
@@ -95,7 +95,7 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion }: Di
       {/* Acceptance-evidence contract: the same success_evidence /
           retirement_condition fields the system expects directions to carry,
           authored directly. 500-char limit mirrors the backend create endpoint. */}
-      <label className="block mt-1.5 text-[10px] text-neutral-500">Success evidence</label>
+      <label className="block mt-1.5 text-ui-sm text-neutral-500">Success evidence</label>
       <textarea
         value={form.newSuccessEvidence}
         onChange={e => form.setNewSuccessEvidence(e.target.value)}
@@ -104,7 +104,7 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion }: Di
         maxLength={500}
         className="mt-0.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
       />
-      <label className="block mt-1.5 text-[10px] text-neutral-500">Retirement condition</label>
+      <label className="block mt-1.5 text-ui-sm text-neutral-500">Retirement condition</label>
       <textarea
         value={form.newRetirementCondition}
         onChange={e => form.setNewRetirementCondition(e.target.value)}
@@ -132,11 +132,11 @@ export function DirectionsAddForm({ form, addDirection, stageTargetVersion }: Di
         Stage for next version
       </label>
       {!canStage ? (
-        <p className="mt-1 text-[10px] text-neutral-500 leading-relaxed">
+        <p className="mt-1 text-ui-sm text-neutral-500 leading-relaxed">
           No open release version to stage against.
         </p>
       ) : staged && (
-        <p className="mt-1 text-[10px] text-sky-400/80 leading-relaxed">
+        <p className="mt-1 text-ui-sm text-sky-400/80 leading-relaxed">
           Will stage to begin after v{stageTargetVersion} promotes and the next version opens.
         </p>
       )}

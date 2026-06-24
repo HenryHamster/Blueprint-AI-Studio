@@ -22,7 +22,7 @@ export function FailureTaxonomyBreakdown({
   return (
     <section>
       <div className="flex flex-wrap gap-1.5 items-center">
-        <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Taxonomy</span>
+        <span className="text-ui-sm text-neutral-500 uppercase tracking-wide mr-1">Taxonomy</span>
         {TAXONOMY_ORDER.map(k => {
           const tax = digest.failure_taxonomy_distribution;
           if (!tax) return null;
@@ -35,7 +35,7 @@ export function FailureTaxonomyBreakdown({
           const taxSpark = taxSparkMap[k] ?? [];
           const hasSpark = taxSpark.length >= 3;
           return (
-            <span key={k} className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${cls}`} title={`${TAXONOMY_LABELS[k]}: ${cat.count} (${cat.percentage}%)${isDominant ? ' — dominant' : ''}`}>
+            <span key={k} className={`inline-flex items-center gap-1.5 text-ui-sm font-semibold px-2 py-0.5 rounded border ${cls}`} title={`${TAXONOMY_LABELS[k]}: ${cat.count} (${cat.percentage}%)${isDominant ? ' — dominant' : ''}`}>
               {TAXONOMY_LABELS[k]}
               <span className="font-bold">{cat.count}</span>
               <span className="opacity-70">{cat.percentage}%</span>

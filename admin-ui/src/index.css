@@ -1,5 +1,25 @@
 @import "tailwindcss";
 
+@theme {
+  /* Semantic status badge color tokens — resolved through the canonical StatusTone
+     mapper in utils/projectStatus.ts. Component classes reference these tokens
+     (bg-status-success/15, text-status-blocking, etc.) instead of ad-hoc palette
+     literals, so palette changes are one-edit. */
+  --color-status-success: var(--color-emerald-400);
+  --color-status-blocking: var(--color-red-400);
+  --color-status-warning: var(--color-amber-400);
+  --color-status-info: var(--color-blue-400);
+  --color-status-neutral: var(--color-neutral-400);
+
+  /* Font size tokens for compact UI typography (8-11px range).
+     Use text-ui-2xs (8px), text-ui-xs (9px), text-ui-sm (10px), or text-ui-md (11px) for
+     dense labels, badges, and secondary meta inside cards. */
+  --text-ui-2xs: 8px;
+  --text-ui-xs: 9px;
+  --text-ui-sm: 10px;
+  --text-ui-md: 11px;
+}
+
 @layer base {
   html, body {
     scrollbar-width: none;

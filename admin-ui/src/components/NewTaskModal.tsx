@@ -3,7 +3,7 @@ import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, CheckSquare, Aler
 import type { LaunchableTaskTypeOption } from '../taskCapabilities';
 import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import { COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator } from '../hooks/useTaskModal';
-import type { ComputeSuccessOperator } from '../api';
+import type { ComputeSuccessOperator, ComputeExperimentPreflightResponse } from '../api';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   create: Plus,
@@ -62,6 +62,9 @@ interface NewTaskModalProps {
   taskBranchDefaultsLoading: boolean;
   taskBranchDefaultsError: string | null;
   integrationBranch?: string;
+  preflightResult: ComputeExperimentPreflightResponse | null;
+  preflightLoading: boolean;
+  preflightError: string | null;
   onRepoChange: (value: string) => void;
   onSubmit: (e: React.FormEvent) => Promise<void>;
   onClose: () => void;
@@ -106,6 +109,9 @@ export function NewTaskModal({
   taskBranchDefaultsLoading,
   taskBranchDefaultsError,
   integrationBranch,
+  preflightResult,
+  preflightLoading,
+  preflightError,
   onRepoChange,
   onSubmit,
   onClose,
@@ -149,6 +155,11 @@ export function NewTaskModal({
   const computeDeadline = Number(computeExperiment.deadlineSeconds);
   const computeDeadlineInvalid = !(Number.isInteger(computeDeadline) && computeDeadline > 0);
 
+  // Block submission only when a successful preflight explicitly reports the
+  // hardware is outside policy. A missing result (error / still loading) degrades
+  // gracefully — the server still enforces policy on the actual launch.
+  const isPreflightBlocking = !!(preflightResult && !preflightResult.in_policy);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitAttempted(true);
@@ -161,6 +172,10 @@ export function NewTaskModal({
     }
     if (isComputeExperiment && (computeCommandInvalid || computeSpendInvalid || computeDeadlineInvalid)) {
       // Inline errors render via submitAttempted; don't round-trip a doomed launch.
+      return;
+    }
+    if (isComputeExperiment && isPreflightBlocking) {
+      // Policy panel shows the reason inline; just prevent the submit.
       return;
     }
     setSubmitting(true);
@@ -187,7 +202,7 @@ export function NewTaskModal({
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
             <div>
               <div className="flex items-center justify-between mb-2">
-                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Repository</label>
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">Repository</label>
                 {!repoLoading && (
                   <button
                     type="button"
@@ -212,7 +227,7 @@ export function NewTaskModal({
                     className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && repoError ? 'border-red-500' : 'border-neutral-800'}`}
                     placeholder="owner/repo"
                   />
-                  {repoError && <p className="text-[10px] text-amber-500 mt-1">{repoError}</p>}
+                  {repoError && <p className="text-ui-sm text-amber-500 mt-1">{repoError}</p>}
                 </>
               ) : (
                 <select
@@ -230,7 +245,7 @@ export function NewTaskModal({
             </div>
             <div>
               <div className="flex items-center justify-between mb-2">
-                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Base Branch</label>
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">Base Branch</label>
                 {!branchLoading && branchOptions.length > 0 && (
                   <button
                     type="button"
@@ -254,7 +269,7 @@ export function NewTaskModal({
                     className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'}`}
                     placeholder={integrationBranch || "main"}
                   />
-                  {branchError && <p className="text-[10px] text-amber-500 mt-1">{branchError}</p>}
+                  {branchError && <p className="text-ui-sm text-amber-500 mt-1">{branchError}</p>}
                 </>
               ) : (
                 <select
@@ -270,7 +285,7 @@ export function NewTaskModal({
             </div>
           </div>
           <div className="mb-4">
-            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Type</label>
+            <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Type</label>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
               {launchableTaskTypeOptions.map(opt => {
                 const Icon = TASK_TYPE_OPTION_ICONS[opt.value] ?? DEFAULT_TASK_TYPE_ICON;
@@ -288,7 +303,7 @@ export function NewTaskModal({
                     <Icon className="w-3.5 h-3.5 shrink-0" />
                     <div className="text-left min-w-0">
                       <div className="truncate">{opt.label}</div>
-                      <div className="text-[10px] text-neutral-500 font-normal truncate">{opt.description}</div>
+                      <div className="text-ui-sm text-neutral-500 font-normal truncate">{opt.description}</div>
                     </div>
                   </button>
                 );
@@ -298,7 +313,7 @@ export function NewTaskModal({
           <div className={`transition-all duration-150 ${(newTaskType === 'review' || newTaskType === 'panel_review' || newTaskType === 'fix') ? 'opacity-100 h-auto mb-4' : 'opacity-0 h-0 overflow-hidden'}`}>
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Number</label>
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Number</label>
                 <input
                   ref={prNumberRef}
                   type="number"
@@ -309,10 +324,10 @@ export function NewTaskModal({
                   className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${prNumberError ? 'border-red-500' : 'border-neutral-800'}`}
                   placeholder="e.g., 15"
                 />
-                {prNumberError && <p className="text-[10px] text-red-500 mt-1">PR number must be a positive integer.</p>}
+                {prNumberError && <p className="text-ui-sm text-red-500 mt-1">PR number must be a positive integer.</p>}
               </div>
               <div>
-                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Branch</label>
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Branch</label>
                 <input
                   type="text"
                   value={newTaskPrBranch}
@@ -325,23 +340,44 @@ export function NewTaskModal({
           </div>
           {isComputeExperiment && (
             <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
-              <div className="flex items-center gap-1.5 mb-3 text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
+              <div className="flex items-center gap-1.5 mb-3 text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">
                 <Cpu className="w-3.5 h-3.5 text-neutral-500" />
                 Compute Experiment Contract
               </div>
               <div className="mb-3">
-                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Command</label>
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Command</label>
                 <textarea
                   value={computeExperiment.command}
                   onChange={e => updateCompute('command', e.target.value)}
                   className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600 ${submitAttempted && computeCommandInvalid ? 'border-red-500' : 'border-neutral-800'}`}
                   placeholder="python train.py --epochs 3"
                 />
-                {submitAttempted && computeCommandInvalid && <p className="text-[10px] text-red-500 mt-1">Command is required.</p>}
+                {submitAttempted && computeCommandInvalid && <p className="text-ui-sm text-red-500 mt-1">Command is required.</p>}
               </div>
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Accelerator <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Working Dir <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                  <input
+                    type="text"
+                    value={computeExperiment.cwd}
+                    onChange={e => updateCompute('cwd', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    placeholder="/workspace/myproject"
+                  />
+                </div>
+                <div>
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Env Vars <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional, KEY=VALUE)</span></label>
+                  <textarea
+                    value={computeExperiment.envVars}
+                    onChange={e => updateCompute('envVars', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[48px] transition-all placeholder:text-neutral-600"
+                    placeholder={"BATCH_SIZE=32\nLR=0.001"}
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <div>
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Accelerator <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
                   <select
                     value={computeExperiment.accelerator}
                     onChange={e => handleComputeAcceleratorChange(e.target.value)}
@@ -357,7 +393,7 @@ export function NewTaskModal({
                 </div>
                 {selectedCanonicalMachineType ? (
                   <div>
-                    <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Machine Type <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                    <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Machine Type <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
                     <select
                       value={computeExperiment.machineType}
                       onChange={e => updateCompute('machineType', e.target.value)}
@@ -369,16 +405,27 @@ export function NewTaskModal({
                   </div>
                 ) : (
                   <div>
-                    <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Machine Type <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                    <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Machine Type <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
                     <div className="w-full bg-neutral-950 border border-neutral-800 text-neutral-600 rounded-lg px-3 py-2 text-base md:text-sm font-mono">
                       Default CPU
                     </div>
                   </div>
                 )}
               </div>
+              <div className="mb-3">
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Provisioning <span className="text-neutral-600 normal-case font-normal tracking-normal">(SPOT saves ~60–90% for preemption-tolerant workloads)</span></label>
+                <select
+                  value={computeExperiment.provisioningModel}
+                  onChange={e => updateCompute('provisioningModel', e.target.value as 'STANDARD' | 'SPOT')}
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                >
+                  <option value="STANDARD">STANDARD (on-demand)</option>
+                  <option value="SPOT">SPOT (preemptible, ~60–90% cheaper)</option>
+                </select>
+              </div>
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Spend Cap (USD)</label>
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Spend Cap (USD)</label>
                   <input
                     type="number"
                     min="0"
@@ -388,10 +435,10 @@ export function NewTaskModal({
                     className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && computeSpendInvalid ? 'border-red-500' : 'border-neutral-800'}`}
                     placeholder="e.g., 5.00"
                   />
-                  {submitAttempted && computeSpendInvalid && <p className="text-[10px] text-red-500 mt-1">Spend cap must be positive.</p>}
+                  {submitAttempted && computeSpendInvalid && <p className="text-ui-sm text-red-500 mt-1">Spend cap must be positive.</p>}
                 </div>
                 <div>
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Deadline (seconds)</label>
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Deadline (seconds)</label>
                   <input
                     type="number"
                     min="1"
@@ -401,12 +448,60 @@ export function NewTaskModal({
                     className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && computeDeadlineInvalid ? 'border-red-500' : 'border-neutral-800'}`}
                     placeholder="e.g., 1800"
                   />
-                  {submitAttempted && computeDeadlineInvalid && <p className="text-[10px] text-red-500 mt-1">Deadline must be a positive integer.</p>}
+                  {submitAttempted && computeDeadlineInvalid && <p className="text-ui-sm text-red-500 mt-1">Deadline must be a positive integer.</p>}
                 </div>
               </div>
+              {/* Preflight cost & policy panel */}
+              {isComputeExperiment && (preflightLoading || preflightResult || (preflightError && false)) && (
+                <div className={`mb-3 rounded-md px-3 py-2 text-ui-sm border ${isPreflightBlocking ? 'bg-red-950/40 border-red-800/60' : 'bg-neutral-900 border-neutral-800'}`}>
+                  {preflightLoading && (
+                    <span className="flex items-center gap-1.5 text-neutral-500">
+                      <Loader2 className="animate-spin" style={{ width: 11, height: 11 }} />
+                      Checking rates…
+                    </span>
+                  )}
+                  {!preflightLoading && preflightResult && (
+                    <div className="space-y-1">
+                      {preflightResult.rate_per_hour != null && (
+                        <div className="flex justify-between text-neutral-400">
+                          <span>Rate</span>
+                          <span className="font-mono text-neutral-300">${preflightResult.rate_per_hour.toFixed(3)}/hr</span>
+                        </div>
+                      )}
+                      {preflightResult.projected_cost_usd != null && (
+                        <div className={`flex justify-between ${preflightResult.projected_cost_usd > computeSpendCap && computeSpendCap > 0 ? 'text-amber-400' : 'text-neutral-400'}`}>
+                          <span>Full-deadline cost</span>
+                          <span className="font-mono">${preflightResult.projected_cost_usd.toFixed(3)}{preflightResult.projected_cost_usd > computeSpendCap && computeSpendCap > 0 ? ' ⚠ exceeds cap' : ''}</span>
+                        </div>
+                      )}
+                      {preflightResult.max_runtime_seconds != null && (
+                        <div className="flex justify-between text-neutral-400">
+                          <span>Cap buys</span>
+                          <span className="font-mono text-neutral-300">
+                            {preflightResult.max_runtime_seconds >= 3600
+                              ? `~${(preflightResult.max_runtime_seconds / 3600).toFixed(1)} hr`
+                              : `~${Math.round(preflightResult.max_runtime_seconds / 60)} min`}
+                          </span>
+                        </div>
+                      )}
+                      {!preflightResult.in_policy && (
+                        <div className="mt-1 pt-1 border-t border-red-800/50 text-red-400">
+                          <span className="font-semibold">Policy violation — </span>
+                          {preflightResult.reason || 'hardware not allowed for this project.'}
+                          {(preflightResult.allowed_accelerator_types || preflightResult.allowed_machine_types) && (
+                            <div className="mt-0.5 text-red-500">
+                              Allowed: {(preflightResult.allowed_accelerator_types || preflightResult.allowed_machine_types)?.join(', ')}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Experiment <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Experiment <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
                   <input
                     type="text"
                     value={computeExperiment.experiment}
@@ -416,7 +511,7 @@ export function NewTaskModal({
                   />
                 </div>
                 <div>
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Benchmark <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Benchmark <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
                   <input
                     type="text"
                     value={computeExperiment.benchmark}
@@ -427,7 +522,7 @@ export function NewTaskModal({
                 </div>
               </div>
               <div className="mb-3">
-                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Hypothesis <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Hypothesis <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
                 <input
                   type="text"
                   value={computeExperiment.hypothesis}
@@ -437,7 +532,7 @@ export function NewTaskModal({
                 />
               </div>
               <div>
-                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Success Criterion <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Success Criterion <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
                 <div className="grid grid-cols-[1fr_auto_1fr] gap-2 items-center">
                   <input
                     type="text"
@@ -464,7 +559,7 @@ export function NewTaskModal({
                     placeholder="threshold"
                   />
                 </div>
-                <p className="text-[10px] text-neutral-600 mt-1">Leave blank to launch without a machine-checkable goal.</p>
+                <p className="text-ui-sm text-neutral-600 mt-1">Leave blank to launch without a machine-checkable goal.</p>
               </div>
               <div className="mt-3">
                 <label className="flex items-center gap-2 cursor-pointer select-none">
@@ -474,8 +569,8 @@ export function NewTaskModal({
                     onChange={e => setComputeExperiment(f => ({ ...f, requireLiveRelease: e.target.checked }))}
                     className="w-4 h-4 rounded border-neutral-700 bg-neutral-950 accent-neutral-400"
                   />
-                  <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Require live release</span>
-                  <span className="text-[11px] text-neutral-600 normal-case font-normal tracking-normal">(block until promoted release is serving-confirmed)</span>
+                  <span className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">Require live release</span>
+                  <span className="text-ui-md text-neutral-600 normal-case font-normal tracking-normal">(block until promoted release is serving-confirmed)</span>
                 </label>
                 <label className="mt-2 flex items-center gap-2 cursor-pointer select-none">
                   <input
@@ -489,8 +584,8 @@ export function NewTaskModal({
                     }
                     className="w-4 h-4 rounded border-neutral-700 bg-neutral-950 accent-neutral-400"
                   />
-                  <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Require durable artifact</span>
-                  <span className="text-[11px] text-neutral-600 normal-case font-normal tracking-normal">
+                  <span className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">Require durable artifact</span>
+                  <span className="text-ui-md text-neutral-600 normal-case font-normal tracking-normal">
                     (block completion unless a durable-class gs://, s3://, az://,
                     or file: COMPUTE_RESULT artifact is delivered)
                   </span>
@@ -499,7 +594,7 @@ export function NewTaskModal({
             </div>
           )}
           <div className="mb-4">
-            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+            <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">
               Task Title{newTaskType === 'panel_review' && <span className="ml-1 text-neutral-600 normal-case font-normal tracking-normal">(optional)</span>}
             </label>
             <input
@@ -513,7 +608,7 @@ export function NewTaskModal({
             />
           </div>
           <div className="mb-6">
-            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+            <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">
               Prompt / Instructions{newTaskType === 'panel_review' && <span className="ml-1 text-neutral-600 normal-case font-normal tracking-normal">(optional — fixed workflow)</span>}
             </label>
             <div className="relative">
@@ -524,14 +619,14 @@ export function NewTaskModal({
                 className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[160px] max-h-[400px] transition-all placeholder:text-neutral-600"
                 placeholder="Describe what Claude Code should do in this repository. Be specific about files, patterns, and expected outcomes..."
               />
-              <span className="text-[10px] text-neutral-600 absolute bottom-2 right-2 pointer-events-none">{newTaskPrompt.length} chars</span>
+              <span className="text-ui-sm text-neutral-600 absolute bottom-2 right-2 pointer-events-none">{newTaskPrompt.length} chars</span>
             </div>
           </div>
           <div className="mb-4">
             <button
               type="button"
               onClick={() => setAdvancedOpen(o => !o)}
-              className="min-h-[44px] sm:min-h-0 flex items-center gap-1 text-[11px] font-semibold text-neutral-500 hover:text-neutral-300 uppercase tracking-wider transition-colors"
+              className="min-h-[44px] sm:min-h-0 flex items-center gap-1 text-ui-md font-semibold text-neutral-500 hover:text-neutral-300 uppercase tracking-wider transition-colors"
             >
               <ChevronDown className={`w-3 h-3 transition-transform ${advancedOpen ? 'rotate-180' : ''}`} />
               Advanced
@@ -539,7 +634,7 @@ export function NewTaskModal({
             {advancedOpen && (
               <div className="grid grid-cols-2 gap-3 mt-3">
                 <div>
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Model</label>
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">Model</label>
                   <select
                     value={newTaskModel}
                     onChange={e => setNewTaskModel(e.target.value)}
@@ -553,7 +648,7 @@ export function NewTaskModal({
                   </select>
                 </div>
                 <div>
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Effort</label>
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">Effort</label>
                   <select
                     value={newTaskEffort}
                     onChange={e => setNewTaskEffort(e.target.value)}
@@ -571,10 +666,10 @@ export function NewTaskModal({
           </div>
           <div className="flex justify-end gap-2 items-center">
             {submitAttempted && (repoError || branchError || taskBranchDefaultsError) && (
-              <span className="text-[11px] text-red-400 mr-auto">Fix errors above before launching.</span>
+              <span className="text-ui-md text-red-400 mr-auto">Fix errors above before launching.</span>
             )}
             {!taskBranchDefaultsReady && (
-              <span className="text-[11px] text-amber-400 mr-auto">
+              <span className="text-ui-md text-amber-400 mr-auto">
                 {taskBranchDefaultsLoading ? 'Loading project branch config...' : taskBranchDefaultsError || 'Project branch config unavailable.'}
               </span>
             )}
@@ -587,11 +682,11 @@ export function NewTaskModal({
             </button>
             <button
               type="submit"
-              disabled={submitting || !taskBranchDefaultsReady}
+              disabled={submitting || !taskBranchDefaultsReady || (isComputeExperiment && isPreflightBlocking)}
               className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
             >
               {submitting && <Loader2 className="animate-spin" style={{ width: 14, height: 14 }} />}
-              Launch
+              {isComputeExperiment && isPreflightBlocking ? 'Policy violation' : 'Launch'}
             </button>
           </div>
         </form>

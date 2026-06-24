@@ -6,19 +6,24 @@ import {
   isComputeJobActive,
   computeJobTerminalLabel,
   computeJobRpcDiagnostic,
+  computeJobRuntimeSec,
+  computeJobMargin,
   fmtCountdown,
+  fmtDuration,
 } from './ComputeJobsPanel.utils';
 import type { ComputeRpcDiagnostic } from '../api';
 
 const fetchComputeJobs = vi.fn();
 const killComputeJob = vi.fn();
 const analyzeComputeJob = vi.fn();
+const fetchKnowledgeDocument = vi.fn();
 const resolveArtifactDownloadUrl = vi.fn();
 
 vi.mock('../api', () => ({
   fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
   killComputeJob: (...args: unknown[]) => killComputeJob(...args),
   analyzeComputeJob: (...args: unknown[]) => analyzeComputeJob(...args),
+  fetchKnowledgeDocument: (...args: unknown[]) => fetchKnowledgeDocument(...args),
   resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
 }));
 
@@ -106,6 +111,53 @@ describe('ComputeJobsPanel helpers', () => {
     expect(fmtCountdown(new Date(now - 1000).toISOString(), now)).toBe('expired');
     expect(fmtCountdown(null, now)).toBe('—');
   });
+
+  test('fmtDuration formats seconds, minutes, and hours', () => {
+    expect(fmtDuration(45)).toBe('45s');
+    expect(fmtDuration(90)).toBe('1m 30s');
+    expect(fmtDuration(3600)).toBe('1h');
+    expect(fmtDuration(3660)).toBe('1h 1m');
+  });
+
+  test('computeJobRuntimeSec returns elapsed seconds between started_at and completed_at', () => {
+    const start = new Date('2026-06-23T10:00:00Z');
+    const end = new Date('2026-06-23T10:05:23Z');
+    expect(computeJobRuntimeSec(makeJob({ started_at: start.toISOString(), completed_at: end.toISOString() }))).toBe(323);
+    expect(computeJobRuntimeSec(makeJob({ started_at: null, completed_at: end.toISOString() }))).toBeNull();
+    expect(computeJobRuntimeSec(makeJob({ started_at: start.toISOString(), completed_at: null }))).toBeNull();
+  });
+
+  test('computeJobMargin calculates distance from threshold for >= operators', () => {
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.95, met: true, measurable: true },
+    }))).toBeCloseTo(0.05);
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.85, met: false, measurable: true },
+    }))).toBeCloseTo(-0.05);
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'accuracy', operator: '>', threshold: 0.9, value: 0.92, met: true, measurable: true },
+    }))).toBeCloseTo(0.02);
+  });
+
+  test('computeJobMargin calculates distance from threshold for <= operators', () => {
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 95, met: true, measurable: true },
+    }))).toBeCloseTo(5);
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 105, met: false, measurable: true },
+    }))).toBeCloseTo(-5);
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'latency_ms', operator: '<', threshold: 100, value: 98, met: true, measurable: true },
+    }))).toBeCloseTo(2);
+  });
+
+  test('computeJobMargin returns null when value or threshold is missing', () => {
+    expect(computeJobMargin(makeJob({
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: null, met: false, measurable: false },
+    }))).toBeNull();
+    expect(computeJobMargin(makeJob({ criterion_verdict: null }))).toBeNull();
+    expect(computeJobMargin(makeJob())).toBeNull();
+  });
 });
 
 describe('ComputeJobsPanel render + kill', () => {
@@ -113,6 +165,7 @@ describe('ComputeJobsPanel render + kill', () => {
     fetchComputeJobs.mockReset();
     killComputeJob.mockReset();
     analyzeComputeJob.mockReset();
+    fetchKnowledgeDocument.mockReset();
     resolveArtifactDownloadUrl.mockReset();
     vi.restoreAllMocks();
   });
@@ -185,7 +238,7 @@ describe('ComputeJobsPanel render + kill', () => {
     const { findByRole, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     const button = await findByRole('button', { name: 'Run analysis' });
     await act(async () => { button.click(); });
-    await findByText('Analysis upgraded');
+    await findByText('Analysis complete');
     await waitFor(() => expect(analyzeComputeJob).toHaveBeenCalledWith('job-1'));
     await waitFor(() => expect(fetchComputeJobs).toHaveBeenCalledTimes(2));
   });
@@ -493,6 +546,172 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(await findByRole('button', { name: 'Launch compute experiment' })).toBeTruthy();
   });
 
+  test('terminal job with command_log renders log text and truncated badge when truncated', async () => {
+    const terminalJob = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      polling_metadata: {
+        command_log: { text: 'step 1\nstep 2\nstep 3\ndone', truncated: false, byte_count: 24 },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue([terminalJob]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-command-log');
+    expect(block.textContent).toContain('step 1');
+    expect(block.textContent).toContain('done');
+    expect(block.textContent).not.toContain('truncated');
+  });
+
+  test('terminal job with truncated command_log shows truncated badge', async () => {
+    const terminalJob = makeJob({
+      status: 'FAILED',
+      outcome: 'FAILURE',
+      final_cost_usd: 0.5,
+      polling_metadata: {
+        command_log: { text: 'error: something went wrong\nexit 1', truncated: true, byte_count: 65536 },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue([terminalJob]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-command-log');
+    expect(block.textContent).toContain('truncated');
+    expect(block.textContent).toContain('error: something went wrong');
+  });
+
+  test('active job does not render command_log section', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        polling_metadata: { command_log: { text: 'running...', truncated: false, byte_count: 10 } },
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-command-log')).toBeNull();
+  });
+
+  test('shows live output tail when job is running', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'RUNNING',
+        polling_metadata: { live_output: { text: 'line1\nline2\n', truncated: false } },
+      }),
+    ]);
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-live-output');
+    expect(block.textContent).toContain('line1');
+    // While the job is still active, the terminal command-log block is absent.
+    expect(queryByTestId('compute-command-log')).toBeNull();
+  });
+
+  test('live output hidden when job is terminal and command_log shown', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        polling_metadata: {
+          live_output: { text: 'line1\nline2\n', truncated: false },
+          command_log: { text: 'line1\nline2\ndone', truncated: false, byte_count: 16 },
+        },
+      }),
+    ]);
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const log = await findByTestId('compute-command-log');
+    expect(log.textContent).toContain('done');
+    // Once terminal, the live-output section disappears.
+    expect(queryByTestId('compute-live-output')).toBeNull();
+  });
+
+  test('terminal job with exit_code in polling_metadata shows exit code chip', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'FAILED',
+        outcome: 'FAILURE',
+        final_cost_usd: 0.5,
+        terminal_reason: 'command failed',
+        polling_metadata: { exit_code: 1 },
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const chip = await findByTestId('compute-exit-code');
+    expect(chip.textContent).toBe('exit 1');
+  });
+
+  test('active job does not show exit code chip even if present', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({ polling_metadata: { exit_code: 0 } }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-exit-code')).toBeNull();
+  });
+
+  test('terminal job without exit_code shows no exit code chip', async () => {
+    fetchComputeJobs.mockResolvedValue([makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 })]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-exit-code')).toBeNull();
+  });
+
+  test('terminal job with timestamps shows result story: runtime, deadline, cost rate', async () => {
+    const start = new Date('2026-06-23T10:00:00Z');
+    const end = new Date('2026-06-23T10:05:00Z'); // 300s runtime
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        started_at: start.toISOString(),
+        completed_at: end.toISOString(),
+        final_cost_usd: 0.20, // $0.20 in 300s => $2.40/hr
+        launch_contract: { requested_deadline_seconds: 600, provisioning_model: 'SPOT' },
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const story = await findByTestId('compute-result-story');
+    expect(story.textContent).toContain('5m');
+    expect(story.textContent).toContain('10m');
+    expect(story.textContent).toContain('budget');
+    expect(story.textContent).toContain('$2.40/hr');
+  });
+
+  test('terminal job without timestamps shows no result story block', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        started_at: null,
+        completed_at: null,
+        final_cost_usd: 1.0,
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-result-story')).toBeNull();
+  });
+
+  test('active job does not show result story block', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        started_at: new Date('2026-06-23T10:00:00Z').toISOString(),
+        completed_at: null,
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-result-story')).toBeNull();
+  });
+
+  test('provisioning model appears in the machine info subtitle', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({ launch_contract: { provisioning_model: 'SPOT', requested_deadline_seconds: 300 } }),
+    ]);
+    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const subtitle = await findByText((t) => t.includes('SPOT'));
+    expect(subtitle.textContent).toContain('gcp_compute_engine');
+    expect(subtitle.textContent).toContain('SPOT');
+  });
+
   test('launch action calls onLaunchCompute from the empty compute workbench', async () => {
     const onLaunchCompute = vi.fn();
     fetchComputeJobs.mockResolvedValue([]);
@@ -500,5 +719,479 @@ describe('ComputeJobsPanel render + kill', () => {
     const launchButton = await findByRole('button', { name: 'Launch compute experiment' });
     await act(async () => { launchButton.click(); });
     expect(onLaunchCompute).toHaveBeenCalledTimes(1);
+  });
+
+  test('run analysis fetches and shows the knowledge doc when an id is returned', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    analyzeComputeJob.mockResolvedValue({ status: 'upgraded', knowledge_document_id: 'doc-xyz' });
+    fetchKnowledgeDocument.mockResolvedValue({
+      id: 'doc-xyz',
+      title: 'Sweep result: 87.3% accuracy',
+      summary: 'The experiment achieved 87.3% accuracy at epoch 50.',
+      tags: [],
+      source_citations: [],
+      source_task_id: 'task-1',
+      created_at: null,
+      updated_at: null,
+      forward_quality_verdict: null,
+    });
+    const { findByRole, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const button = await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { button.click(); });
+    const docBlock = await findByTestId('compute-analysis-doc');
+    expect(docBlock.textContent).toContain('Sweep result: 87.3% accuracy');
+    expect(docBlock.textContent).toContain('87.3% accuracy at epoch 50');
+    expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-xyz');
+  });
+
+  test('renders knowledge document link for terminal experiment', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      knowledge_document_id: 'doc-durable-1',
+    });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchKnowledgeDocument.mockResolvedValue({
+      id: 'doc-durable-1',
+      title: 'Experiment: sweep accuracy 91.2%',
+      summary: 'Achieved 91.2% accuracy at epoch 40.',
+      tags: [],
+      source_citations: [],
+      source_task_id: 'task-1',
+      created_at: null,
+      updated_at: null,
+      forward_quality_verdict: null,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-knowledge-doc-link');
+    expect(block.textContent).toContain('Experiment: sweep accuracy 91.2%');
+    expect(block.textContent).toContain('Achieved 91.2% accuracy at epoch 40.');
+    expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-durable-1');
+  });
+
+  test('knowledge doc card is interactive: clicking the title toggles the full body', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      knowledge_document_id: 'doc-expand-1',
+    });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    fetchKnowledgeDocument.mockResolvedValue({
+      id: 'doc-expand-1',
+      title: 'Knowledge: full analysis write-up',
+      summary: 'Short preview summary.',
+      body: '# Full Document Body\n\nThis is the complete analysis with all the details that were previously inaccessible to the operator.',
+      tags: [],
+      source_citations: [],
+      source_task_id: 'task-1',
+      created_at: null,
+      updated_at: null,
+      forward_quality_verdict: null,
+    });
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Initially collapsed — full body not shown
+    await findByTestId('compute-knowledge-doc-toggle');
+    expect(queryByTestId('compute-knowledge-doc-body')).toBeNull();
+    // Click to expand
+    const toggle = await findByTestId('compute-knowledge-doc-toggle');
+    await act(async () => { toggle.click(); });
+    // Full body is now visible
+    const body = await findByTestId('compute-knowledge-doc-body');
+    expect(body.textContent).toContain('This is the complete analysis with all the details');
+  });
+
+  test('analysis doc card is interactive: clicking the title toggles the full body', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    analyzeComputeJob.mockResolvedValue({ status: 'upgraded', knowledge_document_id: 'doc-analysis-expand' });
+    fetchKnowledgeDocument.mockResolvedValue({
+      id: 'doc-analysis-expand',
+      title: 'Analysis: LLM grounded write-up',
+      summary: 'Truncated preview.',
+      body: '# Full Analysis\n\nThe complete LLM-grounded analysis body that the operator needs to read.',
+      tags: [],
+      source_citations: [],
+      source_task_id: 'task-1',
+      created_at: null,
+      updated_at: null,
+      forward_quality_verdict: null,
+    });
+    const { findByRole, findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const button = await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { button.click(); });
+    // Doc card appears after analysis completes
+    await findByTestId('compute-analysis-doc');
+    // Initially collapsed — full body not shown
+    expect(queryByTestId('compute-analysis-doc-body')).toBeNull();
+    // Click to expand
+    const toggle = await findByTestId('compute-analysis-doc-toggle');
+    await act(async () => { toggle.click(); });
+    // Full body is now visible
+    const body = await findByTestId('compute-analysis-doc-body');
+    expect(body.textContent).toContain('The complete LLM-grounded analysis body');
+  });
+
+  test('terminal job with hypothesis and experiment shows experiment identity block', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        experiment: 'sweep-v3',
+        hypothesis: 'Increasing learning rate to 0.01 will improve accuracy by 5%.',
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-experiment-identity');
+    expect(block.textContent).toContain('sweep-v3');
+    expect(block.textContent).toContain('Increasing learning rate to 0.01');
+  });
+
+  test('terminal job with benchmark (no experiment) shows Benchmark label', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'FAILED',
+        outcome: 'FAILURE',
+        final_cost_usd: 0.5,
+        benchmark: 'mlperf-v4',
+        hypothesis: null,
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-experiment-identity');
+    expect(block.textContent).toContain('Benchmark');
+    expect(block.textContent).toContain('mlperf-v4');
+  });
+
+  test('active job does not show experiment identity block even when fields present', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({ experiment: 'sweep-v3', hypothesis: 'some hypothesis' }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-experiment-identity')).toBeNull();
+  });
+
+  test('terminal job without experiment/benchmark/hypothesis shows no identity block', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-experiment-identity')).toBeNull();
+  });
+
+  test('groups terminal jobs sharing an experiment identity into a sweep summary with best run highlighted and criterion count', async () => {
+    const run1 = makeJob({
+      id: 'job-run1',
+      task_title: 'sweep run 1',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'lr-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.85, met: false, measurable: true },
+    });
+    const run2 = makeJob({
+      id: 'job-run2',
+      task_title: 'sweep run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'lr-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.93, met: true, measurable: true },
+    });
+    const run3 = makeJob({
+      id: 'job-run3',
+      task_title: 'sweep run 3',
+      status: 'FAILED',
+      outcome: 'FAILURE',
+      final_cost_usd: 0.5,
+      experiment: 'lr-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.91, met: true, measurable: true },
+    });
+    fetchComputeJobs.mockResolvedValue([run1, run2, run3]);
+    const { findByTestId, getAllByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Sweep summary section appears
+    await findByTestId('experiment-sweep-summary');
+    // 2/3 met criterion
+    expect(getByTestId('sweep-criterion-count').textContent).toBe('2/3 met criterion');
+    // Best run (highest accuracy = 0.93 = run2) is highlighted
+    const bestRow = getByTestId('sweep-best-run');
+    expect(bestRow.textContent).toContain('sweep run 2');
+    expect(bestRow.textContent).toContain('0.93');
+    // Other runs appear as non-best rows
+    const otherRows = getAllByTestId('sweep-run-row');
+    expect(otherRows).toHaveLength(2);
+  });
+
+  test('sweep summary shows lower-is-better best run when operator is <=', async () => {
+    const run1 = makeJob({
+      id: 'job-lat1',
+      task_title: 'latency run 1',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'latency-sweep',
+      criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 95, met: true, measurable: true },
+    });
+    const run2 = makeJob({
+      id: 'job-lat2',
+      task_title: 'latency run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'latency-sweep',
+      criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 80, met: true, measurable: true },
+    });
+    fetchComputeJobs.mockResolvedValue([run1, run2]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('experiment-sweep-summary');
+    // Best run for latency (lower is better) should be run2 with 80ms
+    const bestRow = await findByTestId('sweep-best-run');
+    expect(bestRow.textContent).toContain('latency run 2');
+    expect(bestRow.textContent).toContain('80');
+  });
+
+  test('single terminal job with experiment does not show sweep summary', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        experiment: 'lone-sweep',
+        criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.91, met: true, measurable: true },
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('experiment-sweep-summary')).toBeNull();
+  });
+
+  test('running job projected to exceed spend cap before deadline shows a budget-kill warning', async () => {
+    // Job started 1 hour ago, has accrued $3 of a $4 cap, deadline is 2h away.
+    // Burn rate = $3/hr; projected additional = $3 * 2hr = $6; total projected = $9 > $4 cap.
+    const startedAt = new Date(Date.now() - 3600 * 1000).toISOString();
+    const deadline = new Date(Date.now() + 2 * 3600 * 1000).toISOString();
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'RUNNING',
+        accrued_cost_usd: 3.0,
+        spend_cap_usd: 4.0,
+        started_at: startedAt,
+        wall_clock_deadline: deadline,
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const warning = await findByTestId('compute-budget-kill-warning');
+    expect(warning.textContent).toContain('$4.00');
+    expect(warning.textContent).toContain('/hr');
+  });
+
+  test('running job on track to finish within budget shows no budget-kill warning', async () => {
+    // Job started 1 hour ago, accrued $1 of $10 cap, deadline 1hr away.
+    // Burn rate = $1/hr; projected total = $2 < $10 cap.
+    const startedAt = new Date(Date.now() - 3600 * 1000).toISOString();
+    const deadline = new Date(Date.now() + 3600 * 1000).toISOString();
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'RUNNING',
+        accrued_cost_usd: 1.0,
+        spend_cap_usd: 10.0,
+        started_at: startedAt,
+        wall_clock_deadline: deadline,
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-budget-kill-warning')).toBeNull();
+  });
+
+  test('renders run comparison matrix with per-metric best highlight', async () => {
+    // job1: accuracy=0.85 (unmet), loss=0.3, cost=$1.00
+    // job2: accuracy=0.93 (met), loss=0.2, cost=$2.00
+    // criterion: accuracy >= 0.9 → higher-better → job2 is best
+    // loss: no direction (unknown result_metric) → no best highlight
+    // cost (__cost__): lower-better → job1 ($1.00) is best
+    // runtime: both null (no timestamps) → no best highlight
+    const job1 = makeJob({
+      id: 'cmp-job1',
+      task_title: 'run A',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'comparison-test',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.85, met: false, measurable: true },
+      polling_metadata: { result_metrics: { accuracy: 0.85, loss: 0.3 } },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'cmp-job2',
+      task_title: 'run B',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.0,
+      experiment: 'comparison-test',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.93, met: true, measurable: true },
+      polling_metadata: { result_metrics: { accuracy: 0.93, loss: 0.2 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue([job1, job2]);
+    const { findByTestId, getAllByTestId, queryAllByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Sweep summary appears; open compare mode
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    // Matrix is shown
+    const matrix = await findByTestId('run-comparison-matrix');
+    expect(matrix).toBeTruthy();
+    // Matrix unions metric keys across runs (accuracy from criterion + loss from result_metrics)
+    expect(matrix.textContent).toContain('accuracy');
+    expect(matrix.textContent).toContain('loss');
+    // Cost row is present (known direction: lower-better)
+    expect(matrix.textContent).toContain('Cost');
+    // Best-per-metric cells: accuracy → run B (0.93), cost → run A ($1.00)
+    const bestCells = getAllByTestId('matrix-best-cell');
+    const bestTexts = bestCells.map((c) => c.textContent);
+    // accuracy best = 0.93 (job2)
+    expect(bestTexts).toContain('0.93');
+    // cost best = $1.00 (job1)
+    expect(bestTexts.some((t) => t?.includes('$1.00'))).toBe(true);
+    // loss has no best-cell (unknown direction)
+    // All matrix-best-cell entries should be for accuracy or cost, not loss
+    // Get loss row: find the row containing 'loss' label and verify no matrix-best-cell in it
+    const allRows = matrix.querySelectorAll('tbody tr');
+    let lossRowHasBest = false;
+    for (const row of allRows) {
+      if (row.textContent?.includes('loss')) {
+        lossRowHasBest = row.querySelector('[data-testid="matrix-best-cell"]') !== null;
+      }
+    }
+    expect(lossRowHasBest).toBe(false);
+    // Met/missed summary
+    const verdictSummary = getByTestId('matrix-verdict-summary');
+    expect(verdictSummary.textContent).toContain('met');
+    expect(verdictSummary.textContent).toContain('missed');
+    // Both runs appear as verdict chips
+    const chips = queryAllByTestId('matrix-verdict-chip');
+    expect(chips).toHaveLength(2);
+  });
+
+  test('active jobs are excluded from sweep summary groups', async () => {
+    const activeJob = makeJob({ experiment: 'active-sweep', status: 'RUNNING', outcome: null });
+    const terminalJob = makeJob({
+      id: 'job-terminal',
+      experiment: 'active-sweep',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+    });
+    fetchComputeJobs.mockResolvedValue([activeJob, terminalJob]);
+    const { findAllByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const titles = await findAllByText('compute_experiment: sweep');
+    expect(titles.length).toBeGreaterThanOrEqual(1);
+    // Only one terminal job in the group — no summary shown
+    expect(queryByTestId('experiment-sweep-summary')).toBeNull();
+  });
+
+  test('run analysis without knowledge_document_id still shows feedback without crashing', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue([terminal]);
+    analyzeComputeJob.mockResolvedValue({ status: 'upgraded', knowledge_document_id: null });
+    const { findByRole, findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const button = await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { button.click(); });
+    await findByText('Analysis complete');
+    expect(fetchKnowledgeDocument).not.toHaveBeenCalled();
+    expect(queryByTestId('compute-analysis-doc')).toBeNull();
+  });
+
+  test('terminal job with criterion verdict displays margin above threshold in green', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+        criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.95, met: true, measurable: true },
+      }),
+    ]);
+    const { findByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('criterion-verdict-row');
+    const margin = getByTestId('criterion-margin');
+    expect(margin.textContent).toBe('+0.05');
+    expect(margin.classList.contains('text-emerald-300')).toBe(true);
+  });
+
+  test('terminal job with criterion verdict displays margin below threshold in red', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+        criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.85, met: false, measurable: true },
+      }),
+    ]);
+    const { findByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('criterion-verdict-row');
+    const margin = getByTestId('criterion-margin');
+    expect(margin.textContent).toBe('-0.05');
+    expect(margin.classList.contains('text-red-300')).toBe(true);
+  });
+
+  test('terminal job with <= operator shows correct margin sign', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        success_criterion: { metric: 'latency_ms', operator: '<=', threshold: 100 },
+        criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 80, met: true, measurable: true },
+      }),
+    ]);
+    const { findByTestId, getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('criterion-verdict-row');
+    const margin = getByTestId('criterion-margin');
+    expect(margin.textContent).toBe('+20.00');
+    expect(margin.classList.contains('text-emerald-300')).toBe(true);
+  });
+
+  test('terminal job without criterion_verdict does not show margin', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+        criterion_verdict: null,
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('not reported');
+    expect(queryByTestId('criterion-margin')).toBeNull();
+  });
+
+  test('terminal job with null measured value does not show margin', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+        criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: null, met: false, measurable: false },
+      }),
+    ]);
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('criterion-verdict-row');
+    expect(queryByTestId('criterion-margin')).toBeNull();
   });
 });

@@ -38,12 +38,12 @@ export function AnomalyThrottleBanner({ digest, onRestored }: { digest: DigestDa
           <div className="text-xs font-semibold text-amber-300">
             Pipeline auto-throttled
             {adj.adjusted_at && (
-              <span className="ml-2 text-[10px] font-normal text-amber-400/70">
+              <span className="ml-2 text-ui-sm font-normal text-amber-400/70">
                 {timeAgo(adj.adjusted_at)}
               </span>
             )}
           </div>
-          <div className="text-[11px] text-amber-200/80 mt-1 space-y-0.5">
+          <div className="text-ui-md text-amber-200/80 mt-1 space-y-0.5">
             {triggers.length > 0 && (
               <div>
                 <span className="text-amber-400/60">Triggers: </span>
@@ -75,15 +75,15 @@ export function AnomalyThrottleBanner({ digest, onRestored }: { digest: DigestDa
               type="button"
               onClick={handleRestore}
               disabled={restoring}
-              className="text-[11px] font-medium px-2 py-1 rounded border border-amber-500/40 text-amber-200 hover:bg-amber-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="text-ui-md font-medium px-2 py-1 rounded border border-amber-500/40 text-amber-200 hover:bg-amber-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {restoring ? 'Restoring…' : 'Clear throttle / Restore now'}
             </button>
             {restoreError && (
-              <span className="text-[11px] text-red-400">{restoreError}</span>
+              <span className="text-ui-md text-red-400">{restoreError}</span>
             )}
           </div>
-          <div className="text-[10px] text-amber-400/60 mt-1">
+          <div className="text-ui-sm text-amber-400/60 mt-1">
             Otherwise auto-restores once the triggering anomalies clear — this is an early restore, not the only path.
           </div>
         </div>

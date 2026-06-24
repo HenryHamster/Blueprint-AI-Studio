@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.failure_classification import _CRED_FIELD_RE, _CRED_REDACT_SUBS
 from app.models import ArtifactType, ComputeJobOutcome, ComputeJobStatus, TaskStatus
+from app.vm_cost_rates import SUPPORTED_ACCELERATORS, supported_machine_types
 from app.payload_schemas import RepoDomainOverview, RepoBootstrapOverview
 from app.task_blocked import (
     NEED_KINDS,
@@ -399,6 +400,14 @@ class HeartbeatRequest(BaseModel):
     llm_call_count: int | None = Field(None, ge=0)
     total_input_tokens: int | None = Field(None, ge=0)
     total_output_tokens: int | None = Field(None, ge=0)
+    # Optional cache-class sub-counts of total_input_tokens (which stays the
+    # INCLUSIVE sum of uncached + cache-creation + cache-read input). Anthropic
+    # prices cache-read input at ~0.1x and cache-creation at ~1.25x the base input
+    # rate, so breaking them out lets the cost snapshot price each class truthfully.
+    # Backwards-compatible: older agents omit these; absent them persistence is
+    # byte-for-byte unchanged and pricing falls back to the base input rate.
+    total_cache_creation_input_tokens: int | None = Field(None, ge=0)
+    total_cache_read_input_tokens: int | None = Field(None, ge=0)
     # Cumulative per-task structured-output format-compliance telemetry, sibling
     # to the LLM fields above. Optional/backwards-compatible — older agents that
     # don't emit these leave Task.format_compliance_summary NULL. format_miss_by_reason
@@ -598,14 +607,19 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
         for key in _POLLING_METADATA_LAUNCH_SPEC_KEYS:
             metadata.pop(key, None)
 
-    # Redact credential-bearing patterns from command_log text so raw stdout/stderr
-    # captured on the VM never reaches operator-facing API responses.
+    # Redact credential-bearing patterns from command_log and live_output text so
+    # raw stdout/stderr captured on the VM never reaches operator-facing API responses.
     if isinstance(metadata, dict):
         command_log = metadata.get("command_log")
         if isinstance(command_log, dict) and isinstance(command_log.get("text"), str):
             command_log = dict(command_log)
             command_log["text"] = redact_command_log_text(command_log["text"])
             metadata["command_log"] = command_log
+        live_output = metadata.get("live_output")
+        if isinstance(live_output, dict) and isinstance(live_output.get("text"), str):
+            live_output = dict(live_output)
+            live_output["text"] = redact_command_log_text(live_output["text"])
+            metadata["live_output"] = live_output
 
     # Sanitize the promoted diagnostic — may carry raw provider exception text
     # with signed URLs or credential values.  Overwrite both the top-level
@@ -826,6 +840,42 @@ class ResourceEnvelope(BaseModel):
     # Fraction of spend_ceiling_usd at which to fire a proactive approaching-ceiling alert.
     # e.g. 0.8 fires when rolling spend reaches 80% of the ceiling. Default 0.8 when absent.
     spend_warning_fraction: float | None = Field(None, gt=0, le=1)
+    # If set, CPU compute jobs must use one of these machine types.
+    # GPU machine types are determined by the accelerator and are not checked here.
+    allowed_machine_types: list[str] | None = Field(None)
+    # If set, GPU compute jobs must use one of these accelerators (e.g. ["T4", "L4"]).
+    # An empty list blocks all GPU jobs. CPU jobs (no accelerator) are never blocked by this field.
+    allowed_accelerator_types: list[str] | None = Field(None)
+
+    @field_validator("allowed_machine_types", mode="before")
+    @classmethod
+    def _validate_allowed_machine_types(cls, v: object) -> object:
+        if v is None:
+            return v
+        if not isinstance(v, list):
+            raise ValueError("must be a list of strings")
+        valid = supported_machine_types()
+        for item in v:
+            if item not in valid:
+                raise ValueError(
+                    f"unknown machine type {item!r}: must be one of {sorted(valid)}"
+                )
+        return v
+
+    @field_validator("allowed_accelerator_types", mode="before")
+    @classmethod
+    def _validate_allowed_accelerator_types(cls, v: object) -> object:
+        if v is None:
+            return v
+        if not isinstance(v, list):
+            raise ValueError("must be a list of strings")
+        valid = set(SUPPORTED_ACCELERATORS.keys())
+        for item in v:
+            if item not in valid:
+                raise ValueError(
+                    f"unknown accelerator type {item!r}: must be one of {sorted(valid)}"
+                )
+        return v
 
 
 class BuildConfig(BaseModel):

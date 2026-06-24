@@ -82,23 +82,11 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       {task.created_by && (
         <DetailRow label="Created By"><span className="text-sm">{formatCreatedBy(task.created_by)}</span></DetailRow>
       )}
-      {task.parent_task_id && (() => {
-        const parentId = task.parent_task_id;
-        return (
-          <DetailRow label="Parent Task">
-            {onNavigateToTask ? (
-              <button
-                onClick={() => onNavigateToTask(parentId)}
-                className="font-mono text-sm text-blue-400 hover:text-blue-300 hover:underline cursor-pointer"
-              >
-                {task.parent_task_id}
-              </button>
-            ) : (
-              <CopyableId value={parentId} />
-            )}
-          </DetailRow>
-        );
-      })()}
+      {task.parent_task_id && (
+        <DetailRow label="Parent Task">
+          <DependencyItem dep={task.parent_task_id} depTask={taskById.get(task.parent_task_id)} onNavigateToTask={onNavigateToTask} />
+        </DetailRow>
+      )}
       <ResearchOriginSection task={task} tasks={tasks} onNavigateToTask={onNavigateToTask} />
       {task.context?.adversarial_gate_diagnostic && (
         <AdversarialGateDiagnosticSection diag={task.context.adversarial_gate_diagnostic as AdversarialGateDiagnostic} onNavigateToTask={onNavigateToTask} />
@@ -227,6 +215,22 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                 <span className="font-mono text-sm text-neutral-400">${vmCost.toFixed(2)}</span>
               </DetailRow>
             )}
+            {(task.vm_machine_type != null || task.vm_warm_start != null) && (
+              <DetailRow label="VM Type">
+                <span className="font-mono text-sm flex flex-wrap gap-x-2 gap-y-0.5">
+                  {task.vm_machine_type && <span className="text-neutral-300">{task.vm_machine_type}</span>}
+                  {task.vm_spot && <span className="text-amber-400">spot</span>}
+                  {task.vm_warm_start != null && (
+                    <span className={task.vm_warm_start ? 'text-emerald-400' : 'text-sky-400'}>
+                      {task.vm_warm_start ? 'warm' : 'cold'}
+                      {!task.vm_warm_start && task.vm_cold_start_ms != null && (
+                        <span className="text-neutral-400"> ({task.vm_cold_start_ms.toLocaleString()}ms)</span>
+                      )}
+                    </span>
+                  )}
+                </span>
+              </DetailRow>
+            )}
           </>
         );
       })()}
@@ -352,7 +356,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
 
       <BaseRecutHoldSection task={task} />
 
-      <ChildTasksSection task={task} onNavigateToTask={onNavigateToTask} />
+      <ChildTasksSection task={task} tasks={tasks} onNavigateToTask={onNavigateToTask} />
     </div>
   );
 }

@@ -1433,21 +1433,25 @@ async def _apply_deadlock_classification(
     True cycles and satisfied-dead deps get ``depends_on`` cleared and become
     dispatchable; a dependent whose real prerequisite genuinely failed is
     cascade-cancelled (NOT dispatched) via the same policy the main check uses.
-    Returns the number of tasks acted on.
+    Emits a deduplicated operator alert per distinct failed prerequisite (same
+    contract as the main dispatch loop). Returns the number of tasks acted on.
     """
     if not classified:
         return 0
+    # Each item is (task_id, reason) or (task_id, reason, failed_prereq).
     cancels: list[tuple] = []
     acted = 0
-    all_ids = [tid for tid, _ in classified]
+    all_ids = [item[0] for item in classified]
     async with AsyncSessionLocal() as fix_session:
         rows = await fix_session.execute(select(Task).where(Task.id.in_(all_ids)))
         tasks_by_id = {t.id: t for t in rows.scalars().all()}
-        for task_id, reason in classified:
+        for item in classified:
+            task_id, reason = item[0], item[1]
+            failed_prereq = item[2] if len(item) > 2 else None
             fix_task = tasks_by_id.get(task_id)
             if reason == "cascade_cancel":
                 if fix_task:
-                    cancels.append((task_id, fix_task.project_id))
+                    cancels.append((task_id, fix_task.project_id, failed_prereq))
                     acted += 1
                 continue
             if reason == "stranded_parked":
@@ -1484,8 +1488,36 @@ async def _apply_deadlock_classification(
             acted += 1
         await fix_session.commit()
     # Cascade-cancel after the clear-commit so each cancel manages its own session.
-    for task_id, project_id in cancels:
-        await _cascade_cancel_dependent(task_id, project_id, broadcast_to_project)
+    # Accumulate counts per prereq to emit ONE deduplicated operator alert each.
+    from app.alert_dispatch import _maybe_create_cascade_cancel_alert
+
+    _cancel_by_prereq: dict[uuid.UUID, dict] = {}
+    for task_id, project_id, failed_prereq in cancels:
+        _count = await _cascade_cancel_dependent(
+            task_id, project_id, broadcast_to_project
+        )
+        if failed_prereq is not None and _count > 0:
+            _entry = _cancel_by_prereq.setdefault(
+                failed_prereq.id,
+                {"prereq_task": failed_prereq, "count": 0},
+            )
+            _entry["count"] += _count
+    if _cancel_by_prereq:
+        async with AsyncSessionLocal() as _alert_session:
+            for _entry in _cancel_by_prereq.values():
+                try:
+                    await _maybe_create_cascade_cancel_alert(
+                        _alert_session,
+                        _entry["prereq_task"].project_id,
+                        _entry["prereq_task"],
+                        _entry["count"],
+                    )
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Failed to raise cascade-cancel alert "
+                        "for prereq %s (deadlock-breaker path)",
+                        _entry["prereq_task"].id,
+                    )
     return acted
 
 
@@ -2677,7 +2709,7 @@ async def orchestrator_worker():
                 # than one alert per cancelled dependent.
                 _cascade_cancel_by_prereq: dict[uuid.UUID, dict] = {}
                 from app.failure_classification import (
-                    SCOPE_EMPTY as _SCOPE_EMPTY,
+                    is_non_death_cancellation as _is_non_death_cancellation,
                 )
 
                 for task in candidate_tasks:
@@ -2786,9 +2818,9 @@ async def orchestrator_worker():
                         # so a single deduplicated operator alert is raised once
                         # after this dispatch pass. Re-derive the failed
                         # prerequisite locally (mirrors _check_candidate_task_deps'
-                        # cancel decision: first terminal-failed dep that is not a
-                        # deliberate SCOPE_EMPTY no-op exit) so the heavily-tested
-                        # helper signature is untouched.
+                        # cancel decision: first terminal-failed dep that is a
+                        # genuine death — not SCOPE_EMPTY, co-deferred, or
+                        # requeue-replaced).
                         _failed_prereq = next(
                             (
                                 dt
@@ -2798,8 +2830,7 @@ async def orchestrator_worker():
                                     TaskStatus.FAILED,
                                     TaskStatus.CANCELLED,
                                 )
-                                and (dt.context or {}).get("failure_category")
-                                != _SCOPE_EMPTY
+                                and not _is_non_death_cancellation(dt)
                             ),
                             None,
                         )

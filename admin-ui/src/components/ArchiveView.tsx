@@ -1,4 +1,5 @@
-import { X, Search, ExternalLink, Eye, Loader2, Archive, ArchiveRestore, ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
+import { X, Search, ExternalLink, Eye, Loader2, Archive, ArchiveRestore, ChevronLeft, ChevronRight, RefreshCw, Trash2 } from 'lucide-react';
+import { useState } from 'react';
 import type { Task } from './TaskCard';
 import { TASK_TYPE_STYLES, isSafeUrl } from './TaskCard';
 import { timeAgo } from '../utils/time';
@@ -23,6 +24,7 @@ interface ArchiveViewProps {
   onUnarchiveTask?: (taskId: string) => void;
   archiveSortOrder: 'desc' | 'asc';
   setArchiveSortOrder: (order: 'desc' | 'asc') => void;
+  onPurgeArchive?: (olderThanDays?: number) => Promise<void>;
 }
 
 const STATUS_FILTERS: { value: string; label: string }[] = [
@@ -52,6 +54,12 @@ const DATE_RANGES: { value: string; label: string }[] = [
   { value: 'all', label: 'All Time' },
 ];
 
+const PURGE_AGE_OPTIONS: { label: string; days?: number }[] = [
+  { label: 'Older than 30 days', days: 30 },
+  { label: 'Older than 90 days', days: 90 },
+  { label: 'All archived tasks', days: undefined },
+];
+
 export default function ArchiveView({
   archiveTasks,
   archiveLoading,
@@ -72,7 +80,26 @@ export default function ArchiveView({
   onUnarchiveTask,
   archiveSortOrder,
   setArchiveSortOrder,
+  onPurgeArchive,
 }: ArchiveViewProps) {
+  const [purgeConfirm, setPurgeConfirm] = useState<{ days?: number } | null>(null);
+  const [purgeLoading, setPurgeLoading] = useState(false);
+
+  const handlePurgeClick = (days?: number) => {
+    setPurgeConfirm({ days });
+  };
+
+  const confirmPurge = async () => {
+    if (!onPurgeArchive || purgeConfirm === null) return;
+    setPurgeLoading(true);
+    try {
+      await onPurgeArchive(purgeConfirm.days);
+    } finally {
+      setPurgeLoading(false);
+      setPurgeConfirm(null);
+    }
+  };
+
   const showingFrom = (archivePage - 1) * archivePageSize + 1;
   const showingTo = showingFrom + archiveTasks.length - 1;
   const totalPages = Math.max(1, Math.ceil(archiveTotalTasks / archivePageSize));
@@ -89,14 +116,74 @@ export default function ArchiveView({
             <Loader2 className="w-4 h-4 text-neutral-500 animate-spin" />
           )}
         </div>
-        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-        <button
-          onClick={() => setShowArchive(false)}
-          className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
-        >
-          <X className="w-5 h-5" />
-        </button>
+        <div className="flex items-center gap-2">
+          {onPurgeArchive && (
+            <div className="relative group">
+              {/* eslint-disable-next-line viewport/min-touch-target -- dense UI */}
+              <button
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-neutral-800 text-red-400 hover:bg-red-900/30 hover:text-red-300 border border-neutral-700 hover:border-red-800 transition-colors"
+                title="Permanently delete archived tasks"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Clear Archive
+              </button>
+              {/* Dropdown */}
+              <div className="absolute right-0 top-full mt-1 w-48 bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl z-20 hidden group-focus-within:block group-hover:block">
+                {PURGE_AGE_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.label}
+                    onClick={() => handlePurgeClick(opt.days)}
+                    className="w-full text-left px-3 py-2 text-xs text-neutral-300 hover:bg-neutral-800 hover:text-red-300 first:rounded-t-lg last:rounded-b-lg transition-colors"
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+          <button
+            onClick={() => setShowArchive(false)}
+            className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
       </div>
+
+      {/* Purge confirmation dialog */}
+      {purgeConfirm !== null && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-neutral-900 border border-neutral-700 rounded-xl shadow-2xl p-6 max-w-sm w-full mx-4">
+            <div className="flex items-center gap-3 mb-3">
+              <Trash2 className="w-5 h-5 text-red-400 shrink-0" />
+              <h3 className="text-base font-semibold text-neutral-100">Permanently delete?</h3>
+            </div>
+            <p className="text-sm text-neutral-400 mb-5">
+              {purgeConfirm.days
+                ? `All archived tasks older than ${purgeConfirm.days} days will be permanently deleted. This cannot be undone.`
+                : 'All archived tasks will be permanently deleted. This cannot be undone.'}
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setPurgeConfirm(null)}
+                disabled={purgeLoading}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-neutral-800 text-neutral-300 hover:bg-neutral-700 border border-neutral-700 transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmPurge}
+                disabled={purgeLoading}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-red-700 text-white hover:bg-red-600 transition-colors disabled:opacity-50"
+              >
+                {purgeLoading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                Delete permanently
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Filter bar */}
       <div className="px-6 py-3 border-b border-neutral-800 flex flex-wrap items-center gap-3 shrink-0">

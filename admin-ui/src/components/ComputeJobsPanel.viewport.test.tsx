@@ -107,6 +107,48 @@ const criterionJobs: ComputeJob[] = [
   },
 ];
 
+const commandLogJobs: ComputeJob[] = [
+  {
+    id: 'job-log-aaaa',
+    project_id: 'proj-1',
+    task_id: 'task-log-1',
+    backend: 'gcp_compute_engine',
+    external_compute_id: null,
+    machine_type: 'e2-standard-4',
+    status: 'SUCCEEDED',
+    terminal_reason: 'experiment completed',
+    outcome: 'SUCCESS',
+    spend_cap_usd: 10.0,
+    wall_clock_deadline: null,
+    created_at: new Date(Date.now() - 900_000).toISOString(),
+    updated_at: new Date(Date.now() - 300_000).toISOString(),
+    started_at: new Date(Date.now() - 890_000).toISOString(),
+    completed_at: new Date(Date.now() - 300_000).toISOString(),
+    last_polled_at: new Date(Date.now() - 300_000).toISOString(),
+    accrued_cost_usd: 3.14,
+    final_cost_usd: 3.14,
+    result_reference: null,
+    task_title: 'compute_experiment: benchmark accuracy on held-out eval set',
+    task_type: 'compute_experiment',
+    success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+    criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.93, met: true, measurable: true },
+    polling_metadata: {
+      command_log: {
+        text: [
+          'Epoch 1/5: loss=1.234 acc=0.721',
+          'Epoch 2/5: loss=0.876 acc=0.803',
+          'Epoch 3/5: loss=0.612 acc=0.851',
+          'Epoch 4/5: loss=0.441 acc=0.882',
+          'Epoch 5/5: loss=0.318 acc=0.931',
+          'Eval complete. accuracy=0.93',
+        ].join('\n'),
+        truncated: false,
+        byte_count: 148,
+      },
+    },
+  },
+];
+
 let jobsToReturn: ComputeJob[] = stressJobs;
 
 vi.mock('../api', async (importOriginal) => {
@@ -135,6 +177,25 @@ describe('ComputeJobsPanel — viewport regression', () => {
     jobsToReturn = stressJobs;
     await expectFullViewportAt(
       375,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+      },
+      { waitMs: 60 },
+    );
+  });
+
+  test('renders command log for a terminal job at 1280px', async () => {
+    jobsToReturn = commandLogJobs;
+    await expectFullViewportAt(
+      1280,
       async () => {
         host = document.createElement('div');
         host.style.padding = '12px';

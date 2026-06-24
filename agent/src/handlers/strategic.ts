@@ -60,6 +60,7 @@ import {
   buildClockAndRecentWorkSection,
   buildConversationThreadSection,
   buildFeedbackSection,
+  buildQuestionSection,
   buildOpenMessagesText,
   buildDirSummaryText,
   buildDirHealthSummary,
@@ -285,6 +286,7 @@ export async function handleStrategic(
       : [];
     const threadSection = buildConversationThreadSection(conversationThread);
     const feedbackSection = buildFeedbackSection(openMessages);
+    const questionSection = buildQuestionSection(openMessages);
     const openMessagesText = buildOpenMessagesText(openMessages);
 
     const dirSummaryText = buildDirSummaryText(directionsSummary, authoritativeActive);
@@ -629,6 +631,7 @@ prompts, schemas, tools, or orchestration.` : '';
       driftSection,
       recentWorkSection,
       feedbackSection,
+      questionSection,
       threadSection,
       taskId,
       versionPhaseSection: buildVersionPhaseSection(versionPhase),
@@ -878,7 +881,7 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # Existing directions (for update/retire operations)
 ${dirSummaryText}
 
-${feedbackSection}${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\nA message tagged \`⚠ STALE\` is a BUG_REPORT/BLOCKER citing code that no longer exists on HEAD — treat it as discounted/unproven: do NOT spawn a fix or investigation to chase it. Resolve/close it as already-fixed, or re-verify the defect still reproduces on HEAD before acting.\n${openMessagesText}\n` : ''}
+${questionSection}${feedbackSection}${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\nA message tagged \`⚠ STALE\` is a BUG_REPORT/BLOCKER citing code that no longer exists on HEAD — treat it as discounted/unproven: do NOT spawn a fix or investigation to chase it. Resolve/close it as already-fixed, or re-verify the defect still reproduces on HEAD before acting.\n${openMessagesText}\n` : ''}
 # Strategic analysis to execute
 
 ${analysisText.slice(0, 50_000)}
@@ -1054,13 +1057,16 @@ ${strategicChallengeSection}
       // path, with a clean exit, re-ask ONCE for the JSON only and re-extract.
       // Mirrors handleMemo / the audit handlers (see structured-repair.ts).
       if (completionLogs.warning && exitCode === 0) {
-        recordFormatMiss(completionLogs.missReason ?? 'no_matching_candidate');
-        recordFormatRepairAttempt();
+        recordFormatMiss(completionLogs.missReason ?? 'no_matching_candidate', 'strategic');
+        recordFormatRepairAttempt('strategic');
+        // attemptStructuredRepair is the single recorder of repair-call token
+        // deltas (recordFormatRepairTokens) — passing schemaLabel keeps the
+        // per-schema attribution. Do NOT re-snapshot here or tokens double-count.
         const retryRun = await attemptStructuredRepair(
           lastResultText || allOutput, STRATEGIC_COMPLETION_SCHEMA_HINT,
           'Running strategic execution (retry: emitting decisions)...',
           ws, statusRef, model, effort, disallowedTools,
-          runClaudeCode, sendLog,
+          runClaudeCode, sendLog, 'strategic',
         );
         // For JSON-stream providers, lastResultText is the clean final answer
         // while allOutput is the raw provider stream where JSON keys may be
@@ -1076,7 +1082,7 @@ ${strategicChallengeSection}
         const retryHasMarkers = retryEffective.includes('"direction_operations"')
           && (retryEffective.includes('"problem_model"') || retryEffective.includes('"vision"'));
         if (retryHasMarkers && !retryLogs.warning) {
-          recordFormatRepairSuccess();
+          recordFormatRepairSuccess('strategic');
           completionLogs = retryLogs;
         } else {
           sendLog(ws, `[WARNING] Strategic self-repair re-ask did not yield parseable inline JSON; keeping fallback.\n`);

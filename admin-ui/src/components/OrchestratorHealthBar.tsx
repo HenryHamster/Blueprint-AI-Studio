@@ -199,8 +199,10 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
   // The threshold matches the backend's slow-cycle contract (>=120s) so a
   // 60-119s progressing cycle never shows contradictory states across surfaces.
   const cycleSlow = cycleAge !== null && cycleAge >= SLOW_CYCLE_THRESHOLD_SEC;
+  // cold-start: alive=false but stalled=false means the first cycle hasn't
+  // completed yet — not a genuine hang. Show green until stalled fires.
   const cycleDown = hasLiveness
-    ? orchestratorHung || !orchestratorAlive
+    ? orchestratorHung
     : cycleAge !== null && cycleAge >= SLOW_CYCLE_THRESHOLD_SEC;
   // Legacy fallback (payload predates progress liveness) keeps the original
   // cycle-age-only band: degraded at 60-119s, down at >=120s. That older
@@ -211,6 +213,11 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
     : cycleAge !== null && cycleAge >= 60 && cycleAge < SLOW_CYCLE_THRESHOLD_SEC;
 
   const cycleTitle = (() => {
+    // Cold-start: alive=false, stalled=false, no cycle data yet — must come
+    // before the null-data early return so boot doesn't show "No cycle data".
+    if (hasLiveness && !orchestratorAlive && !orchestratorHung) {
+      return `Orchestrator starting — no cycle recorded yet`;
+    }
     if (cycleAge === null && progressAge === null) return 'No cycle data';
     if (hasLiveness) {
       const progressStr =
@@ -444,7 +451,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                 })}
               </div>
               {providerApis.fallback_enabled && (
-                <span className="text-[10px] text-blue-400 border border-blue-900/50 bg-blue-950/20 rounded px-1.5 py-0.5">
+                <span className="text-ui-sm text-blue-400 border border-blue-900/50 bg-blue-950/20 rounded px-1.5 py-0.5">
                   fallback
                 </span>
               )}
@@ -545,7 +552,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
                   <span className={textColor}>{label}{isRed && ratio >= 1 ? ' ⚠' : ''}</span>
                   {digestStaleSuffix && (
-                    <span className="text-[10px] text-amber-300">as of {digestAsOfLabel}</span>
+                    <span className="text-ui-sm text-amber-300">as of {digestAsOfLabel}</span>
                   )}
                 </button>
               );
@@ -563,7 +570,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
           >
             ⚠ {staleHeartbeatCount} stale
             {staleHeartbeatIsDigestStale && digestAsOfLabel && (
-              <span className="ml-1 text-[10px] text-amber-300">as of {digestAsOfLabel}</span>
+              <span className="ml-1 text-ui-sm text-amber-300">as of {digestAsOfLabel}</span>
             )}
           </span>
         )}

@@ -1572,6 +1572,24 @@ def get_task_current_attempt_llm_totals(task: Task) -> tuple[int, int, int]:
     )
 
 
+def get_task_current_attempt_cache_input_tokens(task: Task) -> tuple[int, int]:
+    """Cache-creation / cache-read input sub-counts for the live attempt.
+
+    Reads the two optional cumulative counters the agent forwards on heartbeat
+    (``total_cache_creation_input_tokens`` / ``total_cache_read_input_tokens``)
+    out of ``api_call_summary``. ``total_input_tokens`` remains the INCLUSIVE sum
+    of all three Anthropic input classes, so these are sub-counts of it. Returns
+    ``(0, 0)`` when the summary carries no breakdown (older agents / pre-tracking
+    rows) so callers fall back to pricing the full inclusive input total at the
+    base rate.
+    """
+    summary = task.api_call_summary or {}
+    return (
+        _coerce_nonnegative_int(summary.get("total_cache_creation_input_tokens")),
+        _coerce_nonnegative_int(summary.get("total_cache_read_input_tokens")),
+    )
+
+
 def get_task_total_llm_totals(task: Task) -> tuple[int, int, int]:
     input_tokens, output_tokens, call_count = get_task_current_attempt_llm_totals(task)
     return (
@@ -1743,6 +1761,9 @@ def bank_task_current_attempt(
     effective_stop = stopped_at or task.vm_stopped_at
     vm_cost = get_task_current_attempt_vm_cost_usd(task, stopped_at=effective_stop)
     input_tokens, output_tokens, call_count = get_task_current_attempt_llm_totals(task)
+    cache_creation_tokens, cache_read_tokens = (
+        get_task_current_attempt_cache_input_tokens(task)
+    )
     has_attempt_data = (
         task.vm_provisioned_at is not None
         or task.api_call_summary is not None
@@ -1783,6 +1804,13 @@ def bank_task_current_attempt(
         "llm_output_tokens": output_tokens,
         "llm_call_count": call_count,
     }
+    # Carry the cache-class sub-counts only when the live attempt actually had a
+    # breakdown, so banked rows that predate cache tracking stay free of the keys
+    # and downstream pricing falls back to the base-rate valuation for them.
+    # llm_input_tokens above stays the INCLUSIVE input total (unchanged meaning).
+    if cache_creation_tokens > 0 or cache_read_tokens > 0:
+        snapshot["llm_cache_creation_input_tokens"] = cache_creation_tokens
+        snapshot["llm_cache_read_input_tokens"] = cache_read_tokens
     history = list(task.attempt_history or [])
     history.append(snapshot)
     task.attempt_history = history
@@ -2430,6 +2458,8 @@ class Alert(SQLModel, table=True):
 # knowing the exact key strings.
 CYCLE_META_MEMOS_AVAILABLE = "memos_available"
 CYCLE_META_MEMOS_CITED = "memos_cited"
+CYCLE_META_KNOWLEDGE_AVAILABLE = "knowledge_available"
+CYCLE_META_KNOWLEDGE_CITED = "knowledge_cited"
 
 
 class StrategicCycle(SQLModel, table=True):

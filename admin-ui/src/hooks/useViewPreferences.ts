@@ -1,7 +1,7 @@
 import { usePersistedState } from './usePersistedState';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 
-export type ViewMode = 'kanban' | 'pipeline' | 'timeline' | 'home';
+export type ViewMode = 'kanban' | 'pipeline' | 'home';
 
 export function useViewPreferences() {
   const [viewMode, setViewMode] = usePersistedState<ViewMode>('viewMode', 'kanban');

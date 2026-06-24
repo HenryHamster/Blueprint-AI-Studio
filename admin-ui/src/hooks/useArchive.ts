@@ -1,6 +1,6 @@
 import { useState, useRef } from 'react';
 import type { Task } from '../types/task';
-import { API_BASE_URL, authGet } from '../api';
+import { API_BASE_URL, authGet, purgeArchive } from '../api';
 import { usePersistedState } from './usePersistedState';
 import { parseTimestamp } from '../utils/time';
 
@@ -134,6 +134,20 @@ export function useArchive(addToast: (msg: string, type: 'success' | 'error') =>
     fetchArchiveTasks(1, undefined, undefined, undefined, undefined, order);
   };
 
+  const handlePurgeArchive = async (olderThanDays?: number) => {
+    try {
+      const result = await purgeArchive(olderThanDays);
+      const label = olderThanDays ? `older than ${olderThanDays} days` : 'all';
+      addToast(`Deleted ${result.deleted_count} archived task(s) (${label})`, 'success');
+      // Refresh after purge so the list reflects the deletion
+      setArchivePageState(1);
+      await fetchArchiveTasks(1);
+    } catch (err) {
+      console.error('Failed to purge archive:', err);
+      addToast('Failed to purge archive', 'error');
+    }
+  };
+
   return {
     showArchive, setShowArchive, archiveTasks, archiveLoading,
     archivePage, setArchivePage, archivePageSize, setArchivePageSize,
@@ -142,5 +156,6 @@ export function useArchive(addToast: (msg: string, type: 'success' | 'error') =>
     archiveDateRange, setArchiveDateRange,
     archiveTotalTasks, fetchArchiveTasks,
     archiveSortOrder, setArchiveSortOrder,
+    handlePurgeArchive,
   };
 }

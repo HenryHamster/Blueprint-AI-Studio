@@ -6,7 +6,7 @@ export function OpenResidualCasesSection({ digest }: { digest: DigestData | null
   if (!groups.length) return null;
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Open Residual Cases</h2>
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Open Residual Cases</h2>
       <div className="space-y-2">
         {groups.map((group) => (
           <div key={group.error_class} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2">
@@ -16,7 +16,7 @@ export function OpenResidualCasesSection({ digest }: { digest: DigestData | null
             </div>
             <div className="space-y-1">
               {group.cases.slice(0, 8).map((c) => (
-                <div key={c.fingerprint} className="text-[11px] text-neutral-400 border border-neutral-800/60 rounded px-2 py-1">
+                <div key={c.fingerprint} className="text-ui-md text-neutral-400 border border-neutral-800/60 rounded px-2 py-1">
                   <div className="flex items-center justify-between gap-2">
                     <span className="font-mono truncate min-w-0">{c.fingerprint.slice(0, 18)}…</span>
                     <span className="text-neutral-500 shrink-0">{c.status} · {c.hit_count} hits · {c.last_seen_at ? timeAgo(c.last_seen_at) : 'unknown age'}</span>

@@ -566,6 +566,110 @@ async def test_list_compute_jobs_no_criterion_returns_null(
     assert jobs[0]["criterion_verdict"] is None
 
 
+@pytest.mark.asyncio
+async def test_list_compute_jobs_criterion_verdict_recovered_from_job_row(
+    client: AsyncClient, db_session
+):
+    """Terminal job with result_metrics but task not yet finalized (no plan_output
+    compute_result.criterion) — verdict is computed on-the-fly from the job row."""
+    project = await _make_project(db_session, name="Unfinalized Criterion")
+    await _add_member(db_session, project.id, "viewer")
+
+    criterion = {"metric": "accuracy", "operator": ">=", "threshold": 0.9}
+    task = Task(
+        project_id=project.id,
+        title="unfinalized task",
+        status=TaskStatus.IN_PROGRESS,  # task not yet finalized
+        payloads=[{"type": "compute_experiment", "success_criterion": criterion}],
+        plan_output={},  # no compute_result.criterion yet
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        accrued_cost_usd=1.0,
+        final_cost_usd=1.0,
+        completed_at=datetime.utcnow(),
+        polling_metadata={"result_metrics": {"accuracy": 0.95}},
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert len(jobs) == 1
+
+    assert jobs[0]["success_criterion"] == criterion
+    verdict = jobs[0]["criterion_verdict"]
+    assert verdict is not None, "criterion_verdict must be computed from the job row"
+    assert verdict["metric"] == "accuracy"
+    assert verdict["met"] is True
+    assert verdict["value"] == pytest.approx(0.95)
+    assert verdict["measurable"] is True
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_criterion_verdict_recovered_from_stdout(
+    client: AsyncClient, db_session
+):
+    """Terminal job with metrics only in command_log stdout (no result_metrics),
+    task not yet finalized — verdict recovered via the stdout-JSON fallback."""
+    project = await _make_project(db_session, name="Stdout Criterion")
+    await _add_member(db_session, project.id, "viewer")
+
+    criterion = {"metric": "f1", "operator": ">=", "threshold": 0.8}
+    task = Task(
+        project_id=project.id,
+        title="stdout fallback task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "success_criterion": criterion}],
+        plan_output={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        accrued_cost_usd=0.5,
+        final_cost_usd=0.5,
+        completed_at=datetime.utcnow(),
+        polling_metadata={
+            "command_log": {"text": 'run complete\n{"f1": 0.88}\n', "truncated": False}
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert len(jobs) == 1
+
+    assert jobs[0]["success_criterion"] == criterion
+    verdict = jobs[0]["criterion_verdict"]
+    assert verdict is not None, "criterion_verdict must be recovered from stdout JSON"
+    assert verdict["metric"] == "f1"
+    assert verdict["met"] is True
+    assert verdict["value"] == pytest.approx(0.88)
+    assert verdict["measurable"] is True
+
+
 # ---------------------------------------------------------------------------
 # Analyze endpoint tests
 # ---------------------------------------------------------------------------

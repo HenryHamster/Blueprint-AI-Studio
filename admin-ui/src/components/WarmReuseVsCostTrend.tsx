@@ -126,7 +126,7 @@ export function WarmReuseVsCostTrend({ projectId }: { projectId: string | null }
   if (!projectId) return null;
 
   const title = (
-    <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+    <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
       Warm Reuse vs Cost / Merged PR
     </h2>
   );
@@ -171,7 +171,7 @@ export function WarmReuseVsCostTrend({ projectId }: { projectId: string | null }
     hasCostIncl && costInclDrift !== null ? (
       <span
         data-testid="cost-incl-drift"
-        className={`ml-2 text-[10px] font-semibold normal-case tracking-normal ${
+        className={`ml-2 text-ui-sm font-semibold normal-case tracking-normal ${
           costInclDrift > 0 ? 'text-red-400' : 'text-emerald-400'
         }`}
       >
@@ -182,7 +182,7 @@ export function WarmReuseVsCostTrend({ projectId }: { projectId: string | null }
 
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
         Warm Reuse vs Cost / Merged PR
         {driftReadout}
       </h2>
@@ -263,7 +263,7 @@ export function WarmReuseVsCostTrend({ projectId }: { projectId: string | null }
             line: buckets warm starts into pool/backlog/chain + pool-origin
             share so the headline reuse trend is never read in isolation.
             Renders nothing when the backend omits the breakdown. */}
-        <div className="mt-2 pt-2 border-t border-neutral-800 text-[10px] flex">
+        <div className="mt-2 pt-2 border-t border-neutral-800 text-ui-sm flex">
           <WarmStartOriginRow breakdown={data?.warm_start_origin_breakdown} />
         </div>
       </div>

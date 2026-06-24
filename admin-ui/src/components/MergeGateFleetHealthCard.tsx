@@ -15,9 +15,9 @@ export function MergeGateFleetHealthCard({ data, stale }: { data?: MergeGateFlee
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 opacity-50">
         <div className="flex items-center gap-2 mb-2">
           <ShieldCheck className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
-          <h3 className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest">Merge Gate Health</h3>
+          <h3 className="text-ui-md font-bold text-neutral-500 uppercase tracking-widest">Merge Gate Health</h3>
         </div>
-        <div className="text-[10px] text-neutral-600">Data unavailable</div>
+        <div className="text-ui-sm text-neutral-600">Data unavailable</div>
       </div>
     );
   }
@@ -39,15 +39,15 @@ export function MergeGateFleetHealthCard({ data, stale }: { data?: MergeGateFlee
         ) : (
           <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
         )}
-        <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Merge Gate Health</h3>
+        <h3 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest">Merge Gate Health</h3>
       </div>
 
       <div className="flex items-baseline gap-2">
         <span className={`text-2xl font-bold ${rateColor}`}>{ratePct != null ? `${ratePct}%` : '—'}</span>
-        <span className="text-[10px] text-neutral-500">verified across {project_count} project{project_count === 1 ? '' : 's'}</span>
+        <span className="text-ui-sm text-neutral-500">verified across {project_count} project{project_count === 1 ? '' : 's'}</span>
       </div>
 
-      <div className="flex items-center gap-3 mt-1.5 text-[10px] text-neutral-400">
+      <div className="flex items-center gap-3 mt-1.5 text-ui-sm text-neutral-400">
         <span className="text-emerald-400/90">{verified_count} verified</span>
         <span className="text-amber-400/90">{fell_open_count} fell open</span>
         {degraded && (
@@ -56,7 +56,7 @@ export function MergeGateFleetHealthCard({ data, stale }: { data?: MergeGateFlee
       </div>
 
       {most_common_reason && fell_open_count > 0 && (
-        <div className="mt-2 text-[10px] text-neutral-500">
+        <div className="mt-2 text-ui-sm text-neutral-500">
           <span className="text-neutral-400">Top fall-open reason:</span>{' '}
           <span className="text-amber-400/80">{humanizeUnverifiedReason(most_common_reason)}</span>
         </div>

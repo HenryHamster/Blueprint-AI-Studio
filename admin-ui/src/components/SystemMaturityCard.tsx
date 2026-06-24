@@ -30,7 +30,7 @@ export function SystemMaturityCard({ rows, loading }: { rows: SystemMaturityRow[
   const [expandedId, setExpandedId] = useState<string | null>(null);
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">System Maturity</h2>
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">System Maturity</h2>
       {loading || rows === null ? (
         <Skeleton className="h-16 w-full" />
       ) : rows.length === 0 ? (
@@ -53,7 +53,7 @@ export function SystemMaturityCard({ rows, loading }: { rows: SystemMaturityRow[
                     <div className="flex items-center gap-2 mb-1.5">
                       <span className="text-xs font-medium text-neutral-200 truncate">{row.system_id}</span>
                       {modeStyle && (
-                        <span className={`shrink-0 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${modeStyle}`}>
+                        <span className={`shrink-0 text-ui-xs font-bold uppercase px-1.5 py-0.5 rounded border ${modeStyle}`}>
                           {row.recommended_mode}
                         </span>
                       )}
@@ -62,14 +62,14 @@ export function SystemMaturityCard({ rows, loading }: { rows: SystemMaturityRow[
                       <div className="flex-1 h-1.5 rounded-full bg-neutral-800 overflow-hidden">
                         <div className={`h-full rounded-full ${scoreColor}`} style={{ width: `${row.score}%` }} />
                       </div>
-                      <span className="shrink-0 text-[10px] font-mono text-neutral-400">{row.score}</span>
-                      <span className="shrink-0 text-[10px] text-neutral-500">{timeAgo(row.last_audited_at)}</span>
+                      <span className="shrink-0 text-ui-sm font-mono text-neutral-400">{row.score}</span>
+                      <span className="shrink-0 text-ui-sm text-neutral-500">{timeAgo(row.last_audited_at)}</span>
                     </div>
                   </div>
                   {hasIssues && (
                     <button
                       type="button"
-                      className="shrink-0 text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors ml-1"
+                      className="shrink-0 text-ui-sm text-neutral-500 hover:text-neutral-300 transition-colors ml-1"
                       onClick={() => setExpandedId(isExpanded ? null : row.system_id)}
                     >
                       {isExpanded ? 'hide' : `${row.top_issues.length} issues`}
@@ -81,7 +81,7 @@ export function SystemMaturityCard({ rows, loading }: { rows: SystemMaturityRow[
                     {row.top_issues.map((issue, i) => {
                       const desc = (issue.description as string | undefined) ?? JSON.stringify(issue);
                       return (
-                        <div key={i} className="text-[10px] text-neutral-400 flex items-start gap-1.5">
+                        <div key={i} className="text-ui-sm text-neutral-400 flex items-start gap-1.5">
                           <span className="shrink-0 text-neutral-600">•</span>
                           <span>{desc}</span>
                         </div>

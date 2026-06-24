@@ -36,7 +36,7 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
       type="button"
       onClick={() => count > 0 && toggle(id)}
       disabled={count === 0}
-      className={`flex items-center justify-between w-full text-left text-[11px] py-1 ${count > 0 ? 'hover:text-neutral-200' : 'cursor-default'}`}
+      className={`flex items-center justify-between w-full text-left text-ui-md py-1 ${count > 0 ? 'hover:text-neutral-200' : 'cursor-default'}`}
     >
       <span className="flex items-center gap-1 text-neutral-400">
         {count > 0 ? (
@@ -54,12 +54,12 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
       <div className="flex items-center gap-2 mb-2">
         <GitBranch className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-        <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Dependency Health</h3>
+        <h3 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest">Dependency Health</h3>
       </div>
 
       {/* Affirmative health line — always shown so a clean fleet reads as healthy,
           not invisible. Green when there are no failures, neutral otherwise. */}
-      <div className={`text-[11px] mb-2 ${anyFailure ? 'text-neutral-400' : 'text-emerald-400'}`}>
+      <div className={`text-ui-md mb-2 ${anyFailure ? 'text-neutral-400' : 'text-emerald-400'}`}>
         {anyFailure ? '' : '✓ '}
         <span className="font-bold">{blocked}</span> blocked &amp; waiting
         {' · '}
@@ -69,7 +69,7 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
       {/* Currently-blocked population with age bucketing on expand. */}
       {row('blocked', 'Currently blocked', blocked, 'text-neutral-300')}
       {open === 'blocked' && data.live_blocked && (
-        <ul className="ml-4 mb-1 space-y-0.5 text-[10px] text-neutral-500">
+        <ul className="ml-4 mb-1 space-y-0.5 text-ui-sm text-neutral-500">
           {Object.entries(data.live_blocked.by_age ?? {}).map(([bucket, n]) => (
             <li key={bucket}>
               <span className="text-neutral-400">{bucket}</span>: {n}
@@ -81,7 +81,7 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
       {/* Successful resumes over the window with edge/completed breakdown. */}
       {row('resumes', 'Resumed this window', resumed, 'text-emerald-400')}
       {open === 'resumes' && data.resumes && (
-        <ul className="ml-4 mb-1 space-y-0.5 text-[10px] text-neutral-500">
+        <ul className="ml-4 mb-1 space-y-0.5 text-ui-sm text-neutral-500">
           {Object.entries(data.resumes.by_resolved_by ?? {}).map(([kind, n]) => (
             <li key={kind}>
               <span className="text-neutral-400">{kind}</span>: {n}
@@ -92,7 +92,7 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
 
       {row('parked', 'Parked blockers', parked)}
       {open === 'parked' && (
-        <ul className="ml-4 mb-1 space-y-0.5 text-[10px] text-neutral-500">
+        <ul className="ml-4 mb-1 space-y-0.5 text-ui-sm text-neutral-500">
           {data.parked_blockers.tasks.map((t) => (
             <li key={t.task_id} className="truncate">
               <span className="text-neutral-400">{t.title}</span>
@@ -104,7 +104,7 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
 
       {row('dupes', 'Duplicate foundations', dupes)}
       {open === 'dupes' && (
-        <ul className="ml-4 mb-1 space-y-0.5 text-[10px] text-neutral-500">
+        <ul className="ml-4 mb-1 space-y-0.5 text-ui-sm text-neutral-500">
           {data.duplicate_foundation_candidates.candidates.map((c) => (
             <li key={c.task_ids.join('-')} className="truncate">
               <span className="text-neutral-400">{Math.round(c.overlap_ratio * 100)}% overlap</span>
@@ -116,7 +116,7 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
 
       {row('cancels', 'Unresumable cancels', cancels)}
       {open === 'cancels' && (
-        <ul className="ml-4 mb-1 space-y-0.5 text-[10px] text-neutral-500">
+        <ul className="ml-4 mb-1 space-y-0.5 text-ui-sm text-neutral-500">
           {data.unresumable_cancellations.tasks.map((t) => (
             <li key={t.task_id} className="truncate">
               <span className="text-neutral-400">{t.title}</span>
@@ -128,7 +128,7 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
 
       {row('giveups', 'Structural give-ups', giveUps)}
       {open === 'giveups' && data.finding_structural_give_up && (
-        <div className="ml-4 mb-1 space-y-1 text-[10px] text-neutral-500">
+        <div className="ml-4 mb-1 space-y-1 text-ui-sm text-neutral-500">
           {Object.entries(data.finding_structural_give_up.by_reason).map(([reason, n]) => (
             <div key={reason}>
               <span className="text-neutral-400">{reason}</span>: {n}
@@ -149,7 +149,7 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
 
       {row('missingcap', 'Stranded prerequisites', missingCap)}
       {open === 'missingcap' && data.missing_capability_demand && (
-        <div className="ml-4 mb-1 space-y-1 text-[10px] text-neutral-500">
+        <div className="ml-4 mb-1 space-y-1 text-ui-sm text-neutral-500">
           <div>
             <span className="text-neutral-400">still blocked</span>: {data.missing_capability_demand.still_blocked}
             {' · '}

@@ -2601,6 +2601,225 @@ class TestArchiveProject:
         assert archived.id not in ids
 
 
+class TestPurgeArchive:
+    """POST /api/admin/tasks/purge-archive permanently deletes archived tasks."""
+
+    @pytest.mark.asyncio
+    async def test_purge_deletes_archived_tasks(self, client: AsyncClient, db_session):
+        """Purging the archive permanently removes archived tasks."""
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+        task = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["deleted_count"] >= 1
+
+        # Task must no longer exist in the database
+        result = await db_session.execute(select(Task).where(Task.id == task_id))
+        assert result.scalars().first() is None
+
+    @pytest.mark.asyncio
+    async def test_purge_only_removes_archived_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """Purge must not touch live (non-archived) tasks."""
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+        live = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=False
+        )
+        archived = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(live)
+        db_session.add(archived)
+        await db_session.commit()
+        live_id, archived_id = live.id, archived.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200
+
+        # Live task survives
+        live_row = (
+            (await db_session.execute(select(Task).where(Task.id == live_id)))
+            .scalars()
+            .first()
+        )
+        assert live_row is not None
+
+        # Archived task is gone
+        gone = (
+            (await db_session.execute(select(Task).where(Task.id == archived_id)))
+            .scalars()
+            .first()
+        )
+        assert gone is None
+
+    @pytest.mark.asyncio
+    async def test_purge_older_than_days_filter(self, client: AsyncClient, db_session):
+        """older_than_days skips recently archived tasks."""
+        from testing.factories import make_task
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+
+        project = await _make_project(db_session)
+        old_ts = _utcnow() - timedelta(days=60)
+        recent_ts = _utcnow() - timedelta(days=1)
+
+        old = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            archived=True,
+            created_at=old_ts,
+        )
+        recent = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            archived=True,
+            created_at=recent_ts,
+        )
+        db_session.add(old)
+        db_session.add(recent)
+        await db_session.commit()
+        old_id, recent_id = old.id, recent.id
+
+        resp = await client.post(
+            "/api/admin/tasks/purge-archive", json={"older_than_days": 30}
+        )
+        assert resp.status_code == 200
+
+        # Old task deleted, recent task survives
+        assert (
+            await db_session.execute(select(Task).where(Task.id == old_id))
+        ).scalars().first() is None
+        assert (
+            await db_session.execute(select(Task).where(Task.id == recent_id))
+        ).scalars().first() is not None
+
+    @pytest.mark.asyncio
+    async def test_purge_returns_zero_when_nothing_to_delete(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns deleted_count=0 when no archived tasks exist."""
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200
+        assert resp.json()["deleted_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_purge_rejects_invalid_older_than_days(
+        self, client: AsyncClient, db_session
+    ):
+        """older_than_days=0 is rejected with 400."""
+        resp = await client.post(
+            "/api/admin/tasks/purge-archive", json={"older_than_days": 0}
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_purge_does_not_delete_other_users_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """Purge is scoped to the caller's projects only."""
+        from testing.factories import make_task
+
+        foreign = Project(name="foreign-project", user_id="other-user-999")
+        db_session.add(foreign)
+        await db_session.commit()
+        await db_session.refresh(foreign)
+
+        task = make_task(
+            project_id=foreign.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200
+
+        # Foreign project's archived task must survive
+        row = (
+            (await db_session.execute(select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+        assert row is not None
+
+
+    @pytest.mark.asyncio
+    async def test_purge_detaches_surviving_child_from_archived_parent(
+        self, client: AsyncClient, db_session
+    ):
+        """Purging an archived parent with a surviving child must succeed.
+
+        The self-referential FK (task.parent_task_id -> task.id) uses NO ACTION,
+        so deleting a parent while a live child still references it raises
+        IntegrityError and rolls back the whole purge.  The fix nulls out
+        parent_task_id on surviving tasks before the DELETE.
+        """
+        from testing.factories import make_task
+
+        project = await _make_project(db_session)
+
+        # Archived parent — eligible for purge
+        parent = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(parent)
+        await db_session.flush()
+
+        # Live child referencing the archived parent — must NOT be deleted
+        child = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=False
+        )
+        child.parent_task_id = parent.id
+        db_session.add(child)
+        await db_session.commit()
+        parent_id, child_id = parent.id, child.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["deleted_count"] >= 1
+
+        # The endpoint runs on its OWN session (separate from this test's
+        # ``db_session``) and commits the detach UPDATE + parent DELETE there.
+        # This test's ``db_session`` still holds the ``parent``/``child`` ORM
+        # instances it created in its identity map, and because the harness uses
+        # ``expire_on_commit=False`` their attributes are NOT auto-expired. A
+        # plain re-``select()`` would return those cached instances unchanged
+        # (identity-map hit), masking the committed change — even ``expire_all()``
+        # is insufficient here. Expunge the identity map so the re-queries below
+        # materialize fresh objects from the rows the endpoint actually committed.
+        db_session.expunge_all()
+
+        # Archived parent is gone
+        gone = (
+            (await db_session.execute(select(Task).where(Task.id == parent_id)))
+            .scalars()
+            .first()
+        )
+        assert gone is None
+
+        # Live child survives with its lineage detached
+        surviving = (
+            (await db_session.execute(select(Task).where(Task.id == child_id)))
+            .scalars()
+            .first()
+        )
+        assert surviving is not None
+        assert surviving.parent_task_id is None
+
+
 class TestResetProjectStateHelper:
     def test_reset_project_state_clears_only_target(self):
         """reset_project_state pops one project's keys, leaves others intact."""
@@ -4326,6 +4545,49 @@ class TestMessages:
         assert msg.resolution == "Fixed!"
 
     @pytest.mark.asyncio
+    async def test_resolve_question_posts_question_answer_note(
+        self, client: AsyncClient, db_session
+    ):
+        """Resolving a QUESTION via PATCH /messages/{id} creates a question_answer NOTE."""
+        from sqlmodel import select
+
+        project = await _make_project(db_session)
+        question = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="agent",
+            content="What should I do?",
+            status="open",
+        )
+        db_session.add(question)
+        await db_session.commit()
+        await db_session.refresh(question)
+
+        resp = await client.patch(
+            f"/api/admin/messages/{question.id}",
+            json={"resolution": "Do X instead."},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "resolved"
+
+        # Exactly one question_answer NOTE should exist, reply_to set to the question id
+        notes = (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                    ProjectMessage.from_type == "user",
+                )
+            )
+        ).scalars().all()
+        assert len(notes) == 1
+        note = notes[0]
+        assert note.context is not None
+        assert note.context.get("event_type") == "question_answer"
+        assert note.context.get("reply_to") == str(question.id)
+        assert note.context.get("answer") == "Do X instead."
+
+    @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):
         """Can delete an existing message."""
         project = await _make_project(db_session)
@@ -4520,6 +4782,66 @@ class TestMessages:
             f"high-signal NOTE with event_type={high_signal_event_type!r} was evicted "
             "by routine flood — guaranteed-query logic did not include it"
         )
+
+
+    @pytest.mark.asyncio
+    async def test_list_messages_server_side_search_scoped_to_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """Server-side search (q=) filters by content and is scoped to the user's projects.
+
+        Verifies that:
+        - Only messages whose content contains the search term are returned.
+        - Messages from a project the caller does not belong to are never returned,
+          even if their content matches the search term.
+        """
+        project = await _make_project(db_session)
+
+        # Two messages in the user's project — only one matches the search term.
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="user",
+                content="deploy the authentication service",
+                status="open",
+            )
+        )
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="user",
+                content="unrelated routine update",
+                status="open",
+            )
+        )
+
+        # A message in a different project (user is NOT a member) — must never appear.
+        other_project = Project(name="Other Project", user_id="other-user-999")
+        db_session.add(other_project)
+        await db_session.flush()
+        db_session.add(
+            ProjectMessage(
+                project_id=other_project.id,
+                message_type=MessageType.NOTE,
+                from_type="user",
+                content="deploy the authentication service in other project",
+                status="open",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=all&q=authentication"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        contents = [m["content"] for m in data["messages"]]
+        # Only the matching message from the user's project is returned.
+        assert len(contents) == 1
+        assert "authentication" in contents[0]
+        assert all(m["project_id"] == str(project.id) for m in data["messages"])
 
 
 class TestMessagesLastSeen:
@@ -10961,6 +11283,99 @@ class TestVersionLifecycleTasksMerged:
         current = resp.json()["current_version"]
         assert current["tasks_merged"] == []
 
+    @pytest.mark.asyncio
+    async def test_tasks_merged_has_more_when_over_limit(
+        self, client: AsyncClient, db_session
+    ):
+        """tasks_merged_has_more is True and tasks_merged is capped at 50 when the
+        version has more than 50 landed tasks."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="build")
+
+        over_limit = [
+            {"task_type": "fix", "title": f"task {i}", "pr_number": i, "pr_url": None}
+            for i in range(51)
+        ]
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=51),
+            ),
+            patch(
+                "app.release_version.list_merged_tasks_for_version",
+                new=AsyncMock(return_value=over_limit),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["tasks_merged_has_more"] is True
+        assert len(current["tasks_merged"]) == 50
+
+    @pytest.mark.asyncio
+    async def test_tasks_merged_has_more_false_when_at_or_under_limit(
+        self, client: AsyncClient, db_session
+    ):
+        """tasks_merged_has_more is False when the version has 50 or fewer tasks."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="build")
+
+        at_limit = [
+            {"task_type": "fix", "title": f"task {i}", "pr_number": i, "pr_url": None}
+            for i in range(50)
+        ]
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=50),
+            ),
+            patch(
+                "app.release_version.list_merged_tasks_for_version",
+                new=AsyncMock(return_value=at_limit),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["tasks_merged_has_more"] is False
+        assert len(current["tasks_merged"]) == 50
+
 
 class TestVersionLifecycleCurrentVersionHighlights:
     """GET /version-lifecycle exposes a what's-new ``highlights`` block (headline +
@@ -12023,6 +12438,85 @@ class TestGetTaskWakeRegistration:
             "result_state": "resumed",
             "result_detail": "Task re-queued after compute job completed",
         }
+
+
+class TestGetTaskVmCostDrivers:
+    """GET /api/admin/tasks/{task_id} surfaces VM cost-driver fields
+    (vm_machine_type, vm_spot, vm_cold_start_ms, vm_warm_start) so the
+    task detail drawer can explain why a task cost what it did."""
+
+    @pytest.mark.asyncio
+    async def test_vm_cost_driver_fields_present_in_task_detail(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            vm_machine_type="n2d-standard-4",
+            vm_spot=True,
+            vm_cold_start_ms=4200,
+            vm_warm_start=False,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["vm_machine_type"] == "n2d-standard-4"
+        assert data["vm_spot"] is True
+        assert data["vm_cold_start_ms"] == 4200
+        assert data["vm_warm_start"] is False
+
+    @pytest.mark.asyncio
+    async def test_vm_cost_driver_fields_warm_start(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create"}],
+            vm_machine_type="n2d-standard-2",
+            vm_spot=False,
+            vm_cold_start_ms=None,
+            vm_warm_start=True,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["vm_machine_type"] == "n2d-standard-2"
+        assert data["vm_spot"] is False
+        assert data["vm_cold_start_ms"] is None
+        assert data["vm_warm_start"] is True
+
+    @pytest.mark.asyncio
+    async def test_vm_cost_driver_fields_null_when_unset(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["vm_machine_type"] is None
+        assert data["vm_spot"] is False
+        assert data["vm_cold_start_ms"] is None
 
 
 class TestGetAllTasksHistory:
@@ -14355,6 +14849,52 @@ class TestRequeueClearsStaleFailureVerdict:
         assert task.attempt_count == 0
 
 
+class TestRequeueStuckTask:
+    @pytest.mark.asyncio
+    async def test_requeue_stuck_task_terminates_vm_and_resets_to_queued(
+        self, db_session, mocker
+    ):
+        """Re-queuing a stuck IN_PROGRESS task must delete the old VM and reset
+        the task to QUEUED with a fresh vm_instance_id and cleared heartbeat."""
+        from unittest.mock import AsyncMock
+
+        from fastapi import BackgroundTasks
+
+        from app.admin_task_mutations import modify_task_apply
+
+        mock_delete_vm = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+        )
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Stuck task",
+            payloads=[{"type": "create", "prompt": "do something"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id="stuck-vm-abc123",
+            last_heartbeat=datetime(2020, 1, 1),
+            attempt_count=1,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await modify_task_apply(
+            task,
+            {"status": TaskStatus.QUEUED.value},
+            BackgroundTasks(),
+            db_session,
+        )
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id != "stuck-vm-abc123"
+        assert task.last_heartbeat is None
+        assert task.attempt_count == 0
+        mock_delete_vm.assert_awaited_once_with("stuck-vm-abc123", reason="admin_requeue")
+
+
 class TestTriggerRollup:
     @pytest.mark.asyncio
     async def test_intermediate_rollup_auto_merge_keeps_custom_staged_root_evaluating(
@@ -15786,9 +16326,11 @@ class TestComputeExperimentTaskLaunch:
         assert tasks == []
 
     @pytest.mark.asyncio
-    async def test_spend_above_threshold_requires_approval_with_status_message(
+    async def test_spend_above_threshold_requires_approval(
         self, client: AsyncClient, db_session
     ):
+        # Operator-launched compute_experiment tasks above the spend threshold
+        # must be held for approval (requires_approval=True).
         await self._project_with_repo(db_session)
         from app.shared_state import runtime_config as _rc
 
@@ -15806,18 +16348,46 @@ class TestComputeExperimentTaskLaunch:
                 _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
 
         assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["requires_approval"] is True
         task = (
             await db_session.execute(
-                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
             )
         ).scalar_one()
         assert task.requires_approval is True
-        assert task.context["approval_hold_reason"] == "spend_budget"
-        assert task.latest_status_message == (
-            "Held for operator approval: compute_experiment proposes "
-            "$5.01 spend cap / 1200s deadline, exceeding "
-            "the $5.00 approval threshold."
-        )
+
+    @pytest.mark.asyncio
+    async def test_spend_below_threshold_runs_without_approval(
+        self, client: AsyncClient, db_session
+    ):
+        # Operator-launched compute_experiment tasks at or below the spend
+        # threshold run immediately without approval.
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 10.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json=self._valid_payload(spend_cap_usd=5.0, deadline_seconds=900),
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["requires_approval"] is False
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        assert task.requires_approval is False
 
     @pytest.mark.asyncio
     async def test_spend_at_threshold_is_runnable(

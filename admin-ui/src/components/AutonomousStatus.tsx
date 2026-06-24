@@ -214,7 +214,7 @@ function CircuitBreakerPill({ state }: { state: string }) {
     HALF_OPEN: 'bg-amber-500/15 text-amber-400 border border-amber-500/30',
   };
   return (
-    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded font-mono ${styles[state] ?? 'bg-neutral-700 text-neutral-400'}`}>
+    <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded font-mono ${styles[state] ?? 'bg-neutral-700 text-neutral-400'}`}>
       {state}
     </span>
   );
@@ -307,14 +307,14 @@ function SpawnGuardDiagnostics({ guards }: { guards: BlockingGuard[] }) {
   if (errorGuards.length === 0) return null;
   return (
     <div className="mt-2 rounded-md bg-red-500/5 border border-red-500/20 px-2.5 py-2">
-      <p className="text-[10px] font-semibold text-red-400 uppercase tracking-wider mb-1.5">
+      <p className="text-ui-sm font-semibold text-red-400 uppercase tracking-wider mb-1.5">
         Why autonomy isn't spawning
       </p>
       <ul className="space-y-1">
         {errorGuards.map((g) => (
           <li key={g.guard} className="flex items-start gap-1.5">
             <span className="mt-px"><GuardIcon guard={g.guard} /></span>
-            <span className={`text-[11px] leading-tight ${guardColor(g.guard)}`}>
+            <span className={`text-ui-md leading-tight ${guardColor(g.guard)}`}>
               {guardLabel(g)}
             </span>
           </li>
@@ -327,7 +327,7 @@ function SpawnGuardDiagnostics({ guards }: { guards: BlockingGuard[] }) {
 function CircuitBreakerDetail({ cb }: { cb: CircuitBreakerInfo }) {
   const secsLeft = cb.cooldown_ends_at ? secondsUntil(cb.cooldown_ends_at) : null;
   return (
-    <div className="flex items-center justify-between text-[11px]">
+    <div className="flex items-center justify-between text-ui-md">
       <span className="text-neutral-500 flex items-center gap-1">
         <Zap className="w-3 h-3 shrink-0" />
         Circuit breaker
@@ -338,7 +338,7 @@ function CircuitBreakerDetail({ cb }: { cb: CircuitBreakerInfo }) {
           <span className="text-neutral-500 font-mono">{cb.failure_count}f</span>
         )}
         {cb.state === 'OPEN' && secsLeft != null && secsLeft > 0 && (
-          <span className="text-red-400 font-mono text-[10px]">-{formatSeconds(secsLeft)}</span>
+          <span className="text-red-400 font-mono text-ui-sm">-{formatSeconds(secsLeft)}</span>
         )}
       </span>
     </div>
@@ -354,7 +354,7 @@ function LifecycleIndicator({ debug }: { debug: AutonomyDebug }) {
 
   return (
     <div className="mt-2">
-      <p className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider mb-1.5 flex items-center gap-1">
+      <p className="text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-1.5 flex items-center gap-1">
         <Zap className="w-3 h-3" />Tactical (research)
       </p>
       <div className="flex items-center w-full">
@@ -374,7 +374,7 @@ function LifecycleIndicator({ debug }: { debug: AutonomyDebug }) {
                   }`}
                 />
                 <span
-                  className={`text-[9px] mt-0.5 leading-tight text-center whitespace-nowrap ${
+                  className={`text-ui-xs mt-0.5 leading-tight text-center whitespace-nowrap ${
                     isActive ? 'text-emerald-400 font-semibold' : 'text-neutral-600'
                   }`}
                 >
@@ -403,13 +403,13 @@ function phaseLabelForStrategicTask(phase: string): string {
 
 function strategicOutcomeBadge(outcome: string | undefined) {
   if (outcome === 'success' || outcome === 'completed') {
-    return <span className="inline-flex items-center gap-1 text-emerald-400 text-[10px]"><CheckCircle2 className="w-3 h-3" />success</span>;
+    return <span className="inline-flex items-center gap-1 text-emerald-400 text-ui-sm"><CheckCircle2 className="w-3 h-3" />success</span>;
   }
   if (outcome === 'in_progress') {
-    return <span className="inline-flex items-center gap-1 text-cyan-400 text-[10px]"><Activity className="w-3 h-3" />in progress</span>;
+    return <span className="inline-flex items-center gap-1 text-cyan-400 text-ui-sm"><Activity className="w-3 h-3" />in progress</span>;
   }
   if (outcome) {
-    return <span className="inline-flex items-center gap-1 text-red-400 text-[10px]"><XCircle className="w-3 h-3" />{outcome}</span>;
+    return <span className="inline-flex items-center gap-1 text-red-400 text-ui-sm"><XCircle className="w-3 h-3" />{outcome}</span>;
   }
   return null;
 }
@@ -436,7 +436,7 @@ function StrategicLifecycleIndicator({ debug }: { debug: StrategicDebug }) {
   })();
   return (
     <div className="mt-2">
-      <p className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider mb-1.5 flex items-center gap-1">
+      <p className="text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-1.5 flex items-center gap-1">
         <Compass className="w-3 h-3" />Strategic (directions)
       </p>
       <div className="flex items-center w-full">
@@ -450,7 +450,7 @@ function StrategicLifecycleIndicator({ debug }: { debug: StrategicDebug }) {
                   isActive ? 'bg-cyan-400 border-cyan-400 ring-2 ring-cyan-400/30'
                   : isPast ? 'bg-neutral-600 border-neutral-600' : 'bg-transparent border-neutral-600'
                 }`} />
-                <span className={`text-[9px] mt-0.5 leading-tight text-center whitespace-nowrap ${
+                <span className={`text-ui-xs mt-0.5 leading-tight text-center whitespace-nowrap ${
                   isActive ? 'text-cyan-400 font-semibold' : 'text-neutral-600'
                 }`}>
                   {step}
@@ -485,14 +485,14 @@ function PayloadBloatIndicator({ skip }: { skip: PayloadBloatSkip }) {
   return (
     <div className="rounded-md bg-amber-500/10 border border-amber-500/40 px-2.5 py-2">
       <div className="flex items-center justify-between">
-        <span className="text-[10px] font-semibold text-amber-400 uppercase tracking-wider flex items-center gap-1">
+        <span className="text-ui-sm font-semibold text-amber-400 uppercase tracking-wider flex items-center gap-1">
           <AlertTriangle className="w-3 h-3 shrink-0" />Strategic paused — payload too large
         </span>
         {skip.skipped_at && (
-          <span className="font-mono text-[10px] text-amber-400/70">{formatTimeAgoShort(skip.skipped_at)}</span>
+          <span className="font-mono text-ui-sm text-amber-400/70">{formatTimeAgoShort(skip.skipped_at)}</span>
         )}
       </div>
-      <p className="text-[11px] leading-tight text-amber-300 mt-1">
+      <p className="text-ui-md leading-tight text-amber-300 mt-1">
         Assembled payload{sizeKb != null ? ` (${sizeKb} KB)` : ''} exceeds the {MAX_PAYLOAD_KB} KB cap, so strategic refresh is frozen.
         Compact{' '}
         {contributors.length > 0
@@ -518,11 +518,11 @@ function ProblemModelTrimIndicator({ trim }: { trim: ProblemModelTrim }) {
   if (trim.status === 'full') {
     const trimmedGaps = trim.gap_memory_trimmed_count ?? 0;
     return (
-      <div className="flex items-center justify-between text-[11px] text-neutral-500">
+      <div className="flex items-center justify-between text-ui-md text-neutral-500">
         <span className="flex items-center gap-1">
           <FileText className="w-3 h-3 shrink-0" />Problem model
         </span>
-        <span className="font-mono text-[10px] text-emerald-400">
+        <span className="font-mono text-ui-sm text-emerald-400">
           full{trimmedGaps > 0 ? ` · ${trimmedGaps} gap${trimmedGaps === 1 ? '' : 's'} trimmed` : ''}
         </span>
       </div>
@@ -547,14 +547,14 @@ function ProblemModelTrimIndicator({ trim }: { trim: ProblemModelTrim }) {
   return (
     <div className="rounded-md bg-amber-500/10 border border-amber-500/30 px-2.5 py-2">
       <div className="flex items-center justify-between">
-        <span className={`text-[10px] font-semibold uppercase tracking-wider flex items-center gap-1 ${meta.tone}`}>
+        <span className={`text-ui-sm font-semibold uppercase tracking-wider flex items-center gap-1 ${meta.tone}`}>
           <AlertTriangle className="w-3 h-3 shrink-0" />Problem model {meta.label}
         </span>
         {trim.assembled_at && (
-          <span className="font-mono text-[10px] text-amber-400/70">{formatTimeAgoShort(trim.assembled_at)}</span>
+          <span className="font-mono text-ui-sm text-amber-400/70">{formatTimeAgoShort(trim.assembled_at)}</span>
         )}
       </div>
-      <p className="text-[11px] leading-tight text-amber-300 mt-1">
+      <p className="text-ui-md leading-tight text-amber-300 mt-1">
         Read-time packing trimmed the problem_model, so the strategist saw a reduced view.
         {trim.status === 'dropped' && (trim.dropped_reason ? ` ${trim.dropped_reason}.` : ' It was omitted entirely.')}
         {trim.status === 'floor' && droppedGaps > 0 && ` Dropped ${droppedGaps} low-priority gap${droppedGaps === 1 ? '' : 's'}.`}
@@ -580,14 +580,14 @@ function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
 
       {/* Active task or next countdown */}
       {strategic.active_task ? (
-        <div className="flex items-center justify-between text-[11px]">
+        <div className="flex items-center justify-between text-ui-md">
           <span className="text-neutral-500 flex items-center gap-1">
             <Activity className="w-3 h-3 shrink-0" />{phaseLabelForStrategicTask(strategic.active_task.phase)}
           </span>
-          <span className="text-cyan-400 font-mono text-[10px]">{strategic.active_task.status}</span>
+          <span className="text-cyan-400 font-mono text-ui-sm">{strategic.active_task.status}</span>
         </div>
       ) : bloat ? null : strategic.next_strategic_in != null && (
-        <div className="flex items-center justify-between text-[11px] text-neutral-500">
+        <div className="flex items-center justify-between text-ui-md text-neutral-500">
           <span>Next strategic cycle</span>
           <span className="font-mono">
             {strategic.next_strategic_in === 0 ? 'ready now' : `${strategic.next_strategic_in} spawn${strategic.next_strategic_in === 1 ? '' : 's'}`}
@@ -597,16 +597,16 @@ function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
       )}
 
       {/* Cycle counts */}
-      <div className="flex items-center justify-between text-[11px] text-neutral-500">
+      <div className="flex items-center justify-between text-ui-md text-neutral-500">
         <span>Spawns · cycles</span>
         <span className="font-mono">{strategic.research_spawn_count} · {strategic.strategic_cycle_count}</span>
       </div>
 
       {/* Last cycle */}
       {strategic.last_cycle && (
-        <div className="flex items-center justify-between text-[11px] text-neutral-500">
+        <div className="flex items-center justify-between text-ui-md text-neutral-500">
           <span>Last cycle</span>
-          <span className="flex items-center gap-1.5 font-mono text-[10px]">
+          <span className="flex items-center gap-1.5 font-mono text-ui-sm">
             {strategicOutcomeBadge(strategic.last_cycle.outcome)}
             {strategic.last_cycle.phase2_completed_at && (
               <span className="text-neutral-600">{formatTimeAgoShort(strategic.last_cycle.phase2_completed_at)}</span>
@@ -618,7 +618,7 @@ function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
       {!strategic.has_purpose && (
         <div className="rounded-md bg-amber-500/5 border border-amber-500/20 px-2 py-1 flex items-start gap-1.5">
           <AlertTriangle className="w-3 h-3 shrink-0 text-amber-400 mt-0.5" />
-          <span className="text-[11px] leading-tight text-amber-300">
+          <span className="text-ui-md leading-tight text-amber-300">
             No purpose set (problem model or legacy vision) — strategic cycles will bootstrap once, then stall on failure.
           </span>
         </div>
@@ -626,12 +626,12 @@ function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
 
       {otherGuards.length > 0 && (
         <div className="rounded-md bg-red-500/5 border border-red-500/20 px-2.5 py-2">
-          <p className="text-[10px] font-semibold text-red-400 uppercase tracking-wider mb-1.5">Why strategic is blocked</p>
+          <p className="text-ui-sm font-semibold text-red-400 uppercase tracking-wider mb-1.5">Why strategic is blocked</p>
           <ul className="space-y-1">
             {otherGuards.map((g) => (
               <li key={g.guard} className="flex items-start gap-1.5">
                 <AlertTriangle className="w-3 h-3 shrink-0 text-red-400 mt-px" />
-                <span className="text-[11px] leading-tight text-red-300">{StrategicGuardLabel(g)}</span>
+                <span className="text-ui-md leading-tight text-red-300">{StrategicGuardLabel(g)}</span>
               </li>
             ))}
           </ul>
@@ -648,23 +648,23 @@ function ArchitectureSection({ strategic }: { strategic: StrategicDebug }) {
   const cyclesUntilArch = arch.next_arch_in_cycles;
   return (
     <div className="mt-3 pt-3 border-t border-neutral-800 space-y-1.5">
-      <p className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider flex items-center gap-1">
+      <p className="text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider flex items-center gap-1">
         <FileText className="w-3 h-3" />Architecture (design doc)
       </p>
-      <div className="flex items-center justify-between text-[11px] text-neutral-500">
+      <div className="flex items-center justify-between text-ui-md text-neutral-500">
         <span>Last update</span>
-        <span className="font-mono text-[10px]">
+        <span className="font-mono text-ui-sm">
           {formatTimeAgoShort(arch.last_updated)}
           {arch.revision > 0 && <span className="text-neutral-600 ml-1">rev {arch.revision}</span>}
         </span>
       </div>
-      <div className="flex items-center justify-between text-[11px] text-neutral-500">
+      <div className="flex items-center justify-between text-ui-md text-neutral-500">
         <span>Systems · capabilities</span>
-        <span className="font-mono text-[10px]">{arch.system_count} · {arch.capability_count}</span>
+        <span className="font-mono text-ui-sm">{arch.system_count} · {arch.capability_count}</span>
       </div>
-      <div className="flex items-center justify-between text-[11px] text-neutral-500">
+      <div className="flex items-center justify-between text-ui-md text-neutral-500">
         <span>Next review</span>
-        <span className="font-mono text-[10px]">
+        <span className="font-mono text-ui-sm">
           {cyclesUntilArch == null ? 'disabled'
             : cyclesUntilArch === 0 ? 'next strategic cycle'
             : `${cyclesUntilArch} cycle${cyclesUntilArch === 1 ? '' : 's'} away`}
@@ -869,7 +869,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
         className="flex flex-col items-center cursor-pointer group"
         title="Autonomous Pipeline Status"
       >
-        <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Autonomy</span>
+        <span className="text-ui-sm text-neutral-500 font-semibold uppercase tracking-wider mb-1">Autonomy</span>
         <span
           className={`text-xl font-bold font-mono leading-none flex items-center gap-1.5 ${stale ? STALE_CLASSES : ''}`}
           title={stale ? 'Last autonomy reading is stale — poll may have stalled' : undefined}
@@ -894,11 +894,11 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
         // eslint-disable-next-line viewport/no-fixed-width -- dropdown drawer; max-w-[calc(100vw-1rem)] caps mobile width
         <div className="absolute top-full mt-2 right-0 w-96 max-w-[calc(100vw-1rem)] bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-4 z-50 max-h-[70vh] overflow-y-auto custom-scrollbar">
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Autonomous Pipeline — Tactical · Strategic · Architecture</h3>
+            <h3 className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">Autonomous Pipeline — Tactical · Strategic · Architecture</h3>
             <span className="flex items-center gap-1.5">
               {lastUpdated && (
                 <span
-                  className={`text-[10px] font-mono ${stale ? 'text-amber-400 font-semibold' : 'text-neutral-600'}`}
+                  className={`text-ui-sm font-mono ${stale ? 'text-amber-400 font-semibold' : 'text-neutral-600'}`}
                   title={stale ? 'Last successful update is stale — poll may have stalled' : 'Last successful update'}
                 >
                   {stale && '⚠ '}
@@ -915,7 +915,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
           {pauseReason && (
             <div className="mb-3 rounded-md bg-amber-500/10 border border-amber-500/25 px-2.5 py-2 flex items-start gap-1.5">
               <AlertTriangle className="w-3 h-3 shrink-0 text-amber-400 mt-0.5" />
-              <span className="text-[11px] text-amber-300 leading-tight">{pauseReason}</span>
+              <span className="text-ui-md text-amber-300 leading-tight">{pauseReason}</span>
             </div>
           )}
 
@@ -936,7 +936,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                   <button
                     onClick={() => toggleAutonomy(p.project_id, !p.autonomous_enabled)}
                     disabled={toggling === p.project_id}
-                    className={`text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded transition-colors ${
+                    className={`text-ui-sm font-semibold uppercase tracking-wider px-2 py-0.5 rounded transition-colors ${
                       p.autonomous_enabled
                         ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
                         : 'bg-neutral-800 text-neutral-500 hover:bg-neutral-700'
@@ -957,7 +957,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                           <button
                             onClick={() => resetCircuitBreaker(p.project_id)}
                             disabled={resettingBreaker === p.project_id}
-                            className={`text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded transition-colors bg-red-500/10 text-red-400 hover:bg-red-500/20 ${resettingBreaker === p.project_id ? 'opacity-50' : ''}`}
+                            className={`text-ui-sm font-semibold uppercase tracking-wider px-2 py-0.5 rounded transition-colors bg-red-500/10 text-red-400 hover:bg-red-500/20 ${resettingBreaker === p.project_id ? 'opacity-50' : ''}`}
                           >
                             {resettingBreaker === p.project_id ? 'Resetting…' : 'Reset Circuit Breaker'}
                           </button>
@@ -965,7 +965,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                       )}
                     </>
                   ) : p.consecutive_failures > 0 ? (
-                    <div className="flex items-center gap-1.5 text-[11px]">
+                    <div className="flex items-center gap-1.5 text-ui-md">
                       <AlertTriangle className={`w-3 h-3 shrink-0 ${p.consecutive_failures >= 3 ? 'text-red-400' : 'text-amber-400'}`} />
                       <span className={p.consecutive_failures >= 3 ? 'text-red-400' : 'text-amber-400'}>
                         {p.consecutive_failures} consecutive failure{p.consecutive_failures !== 1 ? 's' : ''}
@@ -975,13 +975,13 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                   ) : null}
 
                   {/* Last research */}
-                  <div className="flex items-center justify-between text-[11px] text-neutral-500">
+                  <div className="flex items-center justify-between text-ui-md text-neutral-500">
                     <span>Last research</span>
                     <span className="font-mono">{p.last_research_at ? formatTimeAgo(p.last_research_at) : 'never'}</span>
                   </div>
 
                   {/* Rate limit usage */}
-                  <div className="flex items-center justify-between text-[11px] text-neutral-500">
+                  <div className="flex items-center justify-between text-ui-md text-neutral-500">
                     <span>Tasks this hour</span>
                     <span className="font-mono flex items-center gap-1">
                       <span className={p.tasks_spawned_last_hour >= p.rate_limit ? 'text-amber-400' : ''}>
@@ -990,7 +990,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                       /{p.rate_limit}
                       {p.rate_limit_source === 'project_override' && (
                         <span
-                          className="ml-1 px-1 rounded text-[9px] bg-neutral-700 text-neutral-300"
+                          className="ml-1 px-1 rounded text-ui-xs bg-neutral-700 text-neutral-300"
                           title={`Project override (fleet default: ${p.fleet_default_rate_limit ?? '?'})`}
                         >
                           override

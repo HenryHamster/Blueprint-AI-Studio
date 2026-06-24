@@ -1,6 +1,9 @@
 import { useState, useRef, useReducer, useCallback } from 'react';
 
+export type PrimaryTab = 'home' | 'board' | 'directions' | 'settings';
+
 export function useUIState() {
+  const [activeTab, setActiveTab] = useState<PrimaryTab>('home');
   // Panel visibility
   const [showResearchBrowser, setShowResearchBrowser] = useState(false);
   const [showKnowledgeBrowser, setShowKnowledgeBrowser] = useState(false);
@@ -33,6 +36,9 @@ export function useUIState() {
   }, []);
 
   const [showMessages, setShowMessages] = useState(false);
+  const [showComposeDrawer, setShowComposeDrawer] = useState(false);
+  const [showFleetDetail, setShowFleetDetail] = useState(false);
+  const [showAlertsPopover, setShowAlertsPopover] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showDirections, setShowDirections] = useState(false);
   const [showMetrics, setShowMetrics] = useState(false);
@@ -111,10 +117,14 @@ export function useUIState() {
   } | null>(null);
 
   return {
+    activeTab, setActiveTab,
     showResearchBrowser, setShowResearchBrowser,
     showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     showMessages, setShowMessages,
+    showComposeDrawer, setShowComposeDrawer,
+    showFleetDetail, setShowFleetDetail,
+    showAlertsPopover, setShowAlertsPopover,
     showSettings, setShowSettings,
     showDirections, setShowDirections,
     showMetrics, setShowMetrics,

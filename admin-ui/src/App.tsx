@@ -1,6 +1,6 @@
 import { useMemo, useRef, useEffect, useState, useCallback } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { Activity, AlertCircle, LayoutList, CheckSquare } from 'lucide-react';
+import { Activity, AlertCircle, LayoutList, CheckSquare, Microscope, BookOpen } from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
 import { ConfirmDialog } from './components/ConfirmDialog';
@@ -12,34 +12,33 @@ import TaskStreamPanel from './components/TaskStreamPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
 import { KnowledgeBrowser } from './components/KnowledgeBrowser';
 import { PipelineView } from './components/PipelineView';
-import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
-import { fetchTask, apiFetch, API_BASE_URL, fetchSrMissedRetrospectives } from './api';
+import { fetchTask, apiFetch, API_BASE_URL } from './api';
 import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen, fetchBackendLastSeen, resolveLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
-import { SrMissedRetrospective, type SrMissedTask, type SrInvestigationSignal } from './components/SrTrendBreakdown';
+import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
-import { AlertsBanner } from './components/AlertsBanner';
+import { AlertsPopover } from './components/AlertsPopover';
+import { ComposeDrawer } from './components/ComposeDrawer';
+import { FleetDetailDrawer } from './components/FleetDetailDrawer';
 import { NewTaskModal } from './components/NewTaskModal';
 import { NewProjectModal } from './components/NewProjectModal';
 import { HeaderBar } from './components/HeaderBar';
 import type { SectionId } from './components/SettingsDropdown';
-import { TaskLaunchFAB } from './components/TaskLaunchFAB';
-import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { DashboardHome } from './components/DashboardHome';
-import { SrMissedRetrospectivesPanel } from './components/SrMissedRetrospectivesPanel';
+import { ConsoleHome } from './components/ConsoleHome';
+import { ProjectSwitcherDropdown } from './components/ProjectSwitcherDropdown';
+import type { PrimaryTab } from './hooks/useUIState';
 import { BulkActionBar } from './components/BulkActionBar';
 import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
-import { TimelineView } from './components/TimelineView';
 import { downloadTaskCsv, orderTasksForKanbanExport } from './utils/taskCsv';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
-import { CatchUpPanel } from './components/CatchUpPanel';
 import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
@@ -49,12 +48,7 @@ import type { Task } from './components/TaskCard';
 // StatusBar removed — redundant connection info
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
-import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
-import { PipelineRegressionsPanel } from './components/PipelineRegressionsPanel';
-import { PlaybookPanel } from './components/PlaybookPanel';
-import { TaskTypeCatalogPanel } from './components/TaskTypeCatalogPanel';
-import { WarmVmPanel } from './components/WarmVmPanel';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 
@@ -79,6 +73,16 @@ export default function App() {
   const s = useAppState();
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [drawerWidth, setDrawerWidth] = useState(0);
+  // Dedup guard: track the last lastCycleCompletion object we toasted for so a
+  // WS reconnect that re-emits the same event doesn't fire a second toast.
+  const lastCycleCompletionToastRef = useRef<typeof s.lastCycleCompletion>(null);
+  const { lastCycleCompletion: cycleCompletion, addToast } = s;
+  useEffect(() => {
+    if (!cycleCompletion) return;
+    if (cycleCompletion === lastCycleCompletionToastRef.current) return;
+    lastCycleCompletionToastRef.current = cycleCompletion;
+    addToast('Strategic cycle complete', 'success');
+  }, [cycleCompletion, addToast]);
   const [openMessageCount, setOpenMessageCount] = useState(0);
   const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);
   const handleMessageCountChange = useCallback((count: number) => setOpenMessageCount(count), []);
@@ -286,6 +290,7 @@ export default function App() {
 
   const [dismissedZoneAlertIds, setDismissedZoneAlertIds] = useState<Set<string>>(new Set());
   const [researchBrowserDirectionId, setResearchBrowserDirectionId] = useState<string | null>(null);
+  const [knowledgeBrowserDirectionId, setKnowledgeBrowserDirectionId] = useState<string | null>(null);
   const [researchFeed, setResearchFeed] = useState<Task[]>([]);
 
   // Fetch project tasks when the Findings Journal opens so findings and implementation child
@@ -307,25 +312,6 @@ export default function App() {
     return () => { cancelled = true; };
   }, [s.showResearchBrowser, selectedProjectId]);
 
-  const [showSrMissed, setShowSrMissed] = useState(false);
-  const [srMissedTasks, setSrMissedTasks] = useState<SrMissedTask[]>([]);
-  const [srMissedLoading, setSrMissedLoading] = useState(false);
-  const [srMissedCategory, setSrMissedCategory] = useState('');
-  const [srMissedScope, setSrMissedScope] = useState('');
-  const [srMissedWindowDays, setSrMissedWindowDays] = useState<7 | 14 | 30>(14);
-  const [srMissedTruncated, setSrMissedTruncated] = useState(false);
-  const srMissedRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!showSrMissed || !selectedProjectId) return;
-    setSrMissedLoading(true);
-    fetchSrMissedRetrospectives(selectedProjectId, { days: srMissedWindowDays, page_size: 500 })
-      .then(r => {
-        setSrMissedTasks(r.items);
-        setSrMissedTruncated(r.items.length < r.total);
-      })
-      .catch(() => {})
-      .finally(() => setSrMissedLoading(false));
-  }, [showSrMissed, selectedProjectId, srMissedWindowDays]);
 
   // Open operator-spawned SR investigations, keyed by category — used to dedup spawning.
   const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
@@ -428,6 +414,30 @@ export default function App() {
     return alerts.filter(a => !dismissedZoneAlertIds.has(a.id));
   }, [s.zoneHealth, dismissedZoneAlertIds]);
 
+  const combinedAlerts = useMemo(() => [...zoneHealthAlerts, ...s.alerts], [zoneHealthAlerts, s.alerts]);
+  const alertMaxSeverity: 'ERROR' | 'WARNING' | 'INFO' | null = combinedAlerts.some(a => a.severity === 'ERROR') ? 'ERROR'
+    : combinedAlerts.some(a => a.severity === 'WARNING') ? 'WARNING'
+    : combinedAlerts.length > 0 ? 'INFO' : null;
+
+  const pendingFindingsCount = useMemo(() => {
+    const implemented = new Set<string>();
+    for (const t of s.tasks) {
+      const ctx = t.context as Record<string, unknown> | undefined;
+      if (ctx?.research_task_id && ctx?.finding_index !== undefined) {
+        implemented.add(`${ctx.research_task_id}-${ctx.finding_index}`);
+      }
+    }
+    let count = 0;
+    for (const t of s.tasks) {
+      if (t.task_type !== 'research' || t.status !== 'COMPLETED' || !t.research_findings) continue;
+      const arr = Array.isArray(t.research_findings) ? t.research_findings : [];
+      arr.forEach((_: unknown, i: number) => {
+        if (!implemented.has(`${t.id}-${i}`)) count++;
+      });
+    }
+    return count;
+  }, [s.tasks]);
+
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
 
@@ -492,10 +502,21 @@ export default function App() {
 
   const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
 
-  // Catch-Up, Pipeline Health, Pipeline Regressions, and VM Fleet are
-  // home-dashboard furniture; on every other view they pushed the actual
-  // content below the fold.
-  const onDashboardHome = s.viewMode === 'home' && !s.showArchive && !s.showUserManagement && !s.showMessages;
+  const [showAnalytics, setShowAnalytics] = useState(false);
+
+  // activeTab drives the primary nav; 'home' renders ConsoleHome, 'board' renders
+  // the kanban/pipeline views, 'directions' renders DirectionsPanel in page mode.
+  const activeTab: PrimaryTab = s.activeTab;
+  const handleTabChange = (tab: PrimaryTab) => {
+    if (tab === 'settings') {
+      s.handleToggleSettings();
+      return;
+    }
+    s.setActiveTab(tab);
+    if (tab === 'board' && s.viewMode === 'home') {
+      s.setViewMode('kanban');
+    }
+  };
 
   if (s.authLoading) {
     return (
@@ -583,21 +604,32 @@ export default function App() {
         onUpdateSoundOnComplete={s.setSoundOnComplete}
         notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
         onUpdateNotifyOnHighSignalMessage={s.setNotifyOnHighSignalMessage}
-        onSetViewMode={s.setViewMode}
+        onSetViewMode={(mode) => {
+          s.setViewMode(mode);
+          if (mode === 'home') s.setActiveTab('home');
+          else s.setActiveTab('board');
+        }}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
         showKnowledgeBrowser={s.showKnowledgeBrowser}
         onToggleKnowledgeBrowser={() => s.setShowKnowledgeBrowser(prev => !prev)}
         showArchive={s.showArchive}
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
-        showMessages={s.showMessages}
-        onToggleMessages={() => s.setShowMessages(prev => !prev)}
+        showMessages={s.showMessages || s.showComposeDrawer}
+        onToggleMessages={() => {
+          if (s.showMessages) { s.setShowMessages(false); }
+          else { s.setShowComposeDrawer(prev => !prev); }
+        }}
+        alertCount={combinedAlerts.length}
+        alertMaxSeverity={alertMaxSeverity}
+        showAlertsPopover={s.showAlertsPopover}
+        onToggleAlertsPopover={() => s.setShowAlertsPopover(prev => !prev)}
         onOpenActivityFeed={() => setShowActivityFeed(true)}
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={s.needsAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
-        onShowDirections={() => s.setShowDirections(true)}
+        onShowDirections={() => s.setActiveTab('directions')}
         onSignOut={() => signOut(auth)}
         userEmail={s.user.email || ''}
         wsRef={s.wsRef}
@@ -770,61 +802,41 @@ export default function App() {
         pipelineThrottle={s.pipelineThrottle}
       />
 
-      <ProjectDashboard
-        projects={s.projects}
-        tasks={s.tasks}
-        dataStale={s.projectsFetchError != null}
-        selectedProjectId={s.selectedProjectId}
-        onSelectProject={s.setSelectedProjectId}
-        userRole={s.userRole}
-        onNewProject={() => setShowNewProjectModal(true)}
-        onOpenSetupGuide={(projectId) => setSetupProjectId(projectId)}
-        onNavigateToTask={(taskId) => {
-          const target = s.tasks.find(t => t.id === taskId);
-          if (target) {
-            s.handleViewLogs(target);
-          } else {
-            fetchTask(taskId).then(s.handleViewLogs).catch(() => {
-              s.addToast('Could not load task — it may have been deleted', 'error');
-            });
-          }
-        }}
-        onLaunchCompute={() => {
-          s.setComputeExperiment(defaultComputeExperimentForm());
-          s.openPrefilledTaskModal({ taskType: 'compute_experiment', title: '', prompt: '' });
-        }}
-        onProjectDeleted={(projectId) => {
-          if (s.selectedProjectId === projectId) s.setSelectedProjectId(null);
-          void s.fetchProjects(true);
-        }}
-        onProjectReset={() => {
-          // The project row survives; its tasks were wiped. Refetch both so
-          // the dashboard reflects the cleared task history and new status.
-          void s.fetchProjects(true);
-          void s.fetchTasks();
-        }}
-        onProjectCancelled={() => {
-          // Cancel is terminal for the project and its active tasks. Refetch
-          // both views so the CANCELLED badge and task list update immediately.
-          void s.fetchProjects(true);
-          void s.fetchTasks();
-        }}
-        onProjectPaused={() => {
-          // Pause is a reversible flag on the project row; refetch so the
-          // dashboard reflects the new paused state (pill + menu label).
-          void s.fetchProjects(true);
-        }}
-        onProjectArchived={(projectId) => {
-          // Archived projects drop out of the active list; clear any selection
-          // pointing at the now-hidden project and refetch the active set.
-          if (s.selectedProjectId === projectId) s.setSelectedProjectId(null);
-          void s.fetchProjects(true);
-        }}
-        onProjectUnarchived={() => {
-          // The project reappears in the active list — refetch it back in.
-          void s.fetchProjects(true);
-        }}
-      />
+      {/* Primary nav: project switcher + tab strip */}
+      <div className="flex items-center gap-3 shrink-0 border-b border-neutral-800/60 pb-1 mb-1">
+        <ProjectSwitcherDropdown
+          projects={s.projects}
+          selectedProjectId={s.selectedProjectId}
+          onSelectProject={s.setSelectedProjectId}
+        />
+        <nav className="flex items-center gap-0.5 flex-1">
+          {(['home', 'board', 'directions', 'settings'] as const).map(tab => {
+            const isActive = tab === 'settings' ? s.showSettings : activeTab === tab;
+            const label = tab.charAt(0).toUpperCase() + tab.slice(1);
+            return (
+              <button
+                key={tab}
+                onClick={() => handleTabChange(tab)}
+                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                  isActive
+                    ? 'bg-neutral-800 text-neutral-100'
+                    : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
+                }`}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </nav>
+        {/* eslint-disable-next-line viewport/min-touch-target */}
+        <button
+          onClick={() => setShowNewProjectModal(true)}
+          className="text-xs text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
+          title="New project"
+        >
+          + Project
+        </button>
+      </div>
 
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
         const projectId = s.selectedProjectId;
@@ -842,61 +854,7 @@ export default function App() {
 
       <VersionMismatchBanner />
 
-      <AlertsBanner
-        alerts={[...zoneHealthAlerts, ...s.alerts]}
-        onDismiss={(id) => {
-          if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
-          else s.dismissAlert(id);
-        }}
-        onDismissAll={() => {
-          setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
-          s.dismissAllAlerts();
-        }}
-        onViewTask={handleViewTask}
-        projectId={s.selectedProjectId ?? undefined}
-        onSpawnSrInvestigation={s.selectedProjectId ? handleSpawnSrInvestigation : undefined}
-        activeInvestigationTaskIds={srInvestigationTaskIds}
-      />
-
-      {onDashboardHome && (
-        <CatchUpPanel
-          selectedProjectId={s.selectedProjectId}
-          projects={s.projects}
-          lastVisitTimestamp={s.lastVisitTimestamp}
-          refreshInterval={s.refreshInterval}
-          needsAttentionCount={s.needsAttentionCount}
-          onSelectTask={(task) => {
-            fetchTask(task.id).then(s.handleViewLogs).catch(() => {
-              s.addToast('Could not load task — it may have been deleted', 'error');
-            });
-          }}
-          onApprove={(taskId) => s.handleApprove(taskId)}
-          onRetry={(taskId) => s.handleRetry(taskId)}
-          onBulkApprove={(taskIds) => s.handleBulkAction('approve', taskIds)}
-          onBulkRetry={(taskIds) => s.handleBulkAction('retry', taskIds)}
-          wsRef={s.wsRef}
-          userEmail={s.user?.email ?? null}
-          onOpenActivityFeed={() => setShowActivityFeed(true)}
-        />
-      )}
-
-      {onDashboardHome && (
-        <DiagnosticsPanel
-          diagnostics={s.diagnostics}
-          onViewTask={handleViewTask}
-          handleRetry={s.handleRetry}
-          handleCancel={s.handleCancel}
-          setConfirmDialog={s.setConfirmDialog}
-        />
-      )}
-
-      {onDashboardHome && s.userRole === 'admin' && s.selectedProjectId && (
-        <PipelineRegressionsPanel projectId={s.selectedProjectId} />
-      )}
-
       {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
-
-      {onDashboardHome && <WarmVmPanel onViewTask={handleViewTask} projects={s.projects} />}
 
 
       {s.error && (
@@ -957,10 +915,90 @@ export default function App() {
           onUnarchiveTask={s.handleUnarchiveTask}
           archiveSortOrder={s.archiveSortOrder}
           setArchiveSortOrder={s.setArchiveSortOrder}
+          onPurgeArchive={s.handlePurgeArchive}
         />
+      ) : activeTab === 'directions' ? (
+        <ErrorBoundary level="panel">
+          <DirectionsPanel
+            pageMode
+            addToast={s.addToast}
+            selectedProjectId={s.selectedProjectId}
+            projects={s.projects}
+            fetchDirectionsRef={s.fetchDirectionsRef}
+            strategistActive={s.strategistActive}
+            cycleProgress={s.cycleProgress}
+            lastCycleCompletion={s.lastCycleCompletion}
+            onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
+            onViewKnowledge={(dirId) => { setKnowledgeBrowserDirectionId(dirId); s.setShowKnowledgeBrowser(true); }}
+            onNavigateToTask={(taskId) => {
+              const target = s.tasks.find(t => t.id === taskId);
+              if (target) s.handleViewLogs(target);
+              else fetchTask(taskId).then(s.handleViewLogs).catch(() => { s.addToast('Could not load task — it may have been deleted', 'error'); });
+            }}
+          />
+        </ErrorBoundary>
+      ) : activeTab === 'home' ? (
+        <ErrorBoundary level="panel">
+          <ConsoleHome
+            selectedProjectId={s.selectedProjectId}
+            scopedActiveCount={s.scopedActiveCount}
+            scopedQueuedCount={s.scopedQueuedCount}
+            globalActiveCount={s.globalActiveCount}
+            globalQueuedCount={s.globalQueuedCount}
+            tasks={s.tasks}
+            onViewTask={s.handleViewLogs}
+            onShowAnalytics={() => setShowAnalytics(true)}
+            onOpenFleet={() => s.setShowFleetDetail(true)}
+          />
+        </ErrorBoundary>
       ) : (
         <>
-          {s.viewMode !== 'home' && <div className="flex items-center gap-2 shrink-0 mb-1 flex-wrap">
+          {/* Board view mode sub-tabs + Research/Knowledge toolbar buttons */}
+          <div className="flex items-center gap-1 shrink-0 mb-1">
+            {(['kanban', 'pipeline'] as const).map(mode => (
+              <button
+                key={mode}
+                onClick={() => s.setViewMode(mode)}
+                className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                  s.viewMode === mode
+                    ? 'bg-neutral-800 text-neutral-100'
+                    : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
+                }`}
+              >
+                {mode.charAt(0).toUpperCase() + mode.slice(1)}
+              </button>
+            ))}
+            <div className="flex-1" />
+            {/* eslint-disable-next-line viewport/min-touch-target */}
+            <button
+              onClick={() => s.setShowResearchBrowser(prev => !prev)}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors relative ${
+                s.showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
+              }`}
+              title="Research Findings"
+            >
+              <Microscope className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Research</span>
+              {pendingFindingsCount > 0 && (
+                <span className="ml-0.5 bg-cyan-500 text-black text-ui-2xs font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
+                  {pendingFindingsCount}
+                </span>
+              )}
+            </button>
+            {/* eslint-disable-next-line viewport/min-touch-target */}
+            <button
+              onClick={() => s.setShowKnowledgeBrowser(prev => !prev)}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${
+                s.showKnowledgeBrowser ? 'text-violet-400 bg-violet-500/10' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
+              }`}
+              title="Knowledge Library"
+            >
+              <BookOpen className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Knowledge</span>
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0 mb-1 flex-wrap">
             <SearchFilterBar
               searchQuery={s.searchQuery}
               onSearchChange={s.setSearchQuery}
@@ -1025,18 +1063,16 @@ export default function App() {
             )}
             <div className="flex-1" />
             <span className="text-xs text-neutral-500">{filteredTasks.length} of {s.tasks.length}</span>
-          </div>}
+          </div>
 
           {/* Named saved filter views */}
-          {s.viewMode !== 'home' && (
-            <BoardSavedViewsBar
-              key={`${s.user?.email ?? 'anon'}:${s.selectedProjectId ?? 'none'}`}
-              userId={s.user?.email}
-              projectId={s.selectedProjectId}
-              current={boardFilterSnapshot}
-              onApply={applyBoardView}
-            />
-          )}
+          <BoardSavedViewsBar
+            key={`${s.user?.email ?? 'anon'}:${s.selectedProjectId ?? 'none'}`}
+            userId={s.user?.email}
+            projectId={s.selectedProjectId}
+            current={boardFilterSnapshot}
+            onApply={applyBoardView}
+          />
 
           {/* Quick-filter preset buttons */}
           <QuickFilterPresets
@@ -1061,33 +1097,7 @@ export default function App() {
             setSearchQuery={s.setSearchQuery}
           />
 
-          {s.viewMode === 'home' ? (
-            <>
-              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} globalActiveCount={s.globalActiveCount} globalQueuedCount={s.globalQueuedCount} scopedActiveCount={s.scopedActiveCount} scopedQueuedCount={s.scopedQueuedCount} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onScopeClick={(scope) => { setSrMissedScope(scope); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })} userRole={s.userRole} /></ErrorBoundary>
-              {s.userRole === 'admin' && s.selectedProjectId && (
-                <ErrorBoundary level="panel">
-                  <SrMissedRetrospectivesPanel selectedProjectId={s.selectedProjectId} onSelectTask={handleViewTask} activeCategory={srMissedCategory} activeScope={srMissedScope} activeInvestigationTaskIds={srInvestigationTaskIds} />
-                </ErrorBoundary>
-              )}
-              <PlaybookPanel selectedProjectId={s.selectedProjectId} />
-              <TaskTypeCatalogPanel />
-              {s.selectedProjectId && (
-                <div ref={srMissedRef} className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
-                  <button
-                    onClick={() => { setShowSrMissed(v => { if (v) { setSrMissedCategory(''); setSrMissedScope(''); } return !v; }); }}
-                    className="text-xs font-medium text-neutral-400 hover:text-neutral-200"
-                  >
-                    Self-Review Missed Retrospectives {showSrMissed ? '▲' : '▼'}
-                  </button>
-                  {showSrMissed && (
-                    srMissedLoading
-                      ? <p className="text-[10px] text-neutral-500 mt-2">Loading…</p>
-                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} selectedCategory={srMissedCategory} windowDays={srMissedWindowDays} onWindowDaysChange={setSrMissedWindowDays} truncated={srMissedTruncated} /></div>
-                  )}
-                </div>
-              )}
-            </>
-          ) : s.viewMode === 'kanban' ? (
+          {s.viewMode === 'kanban' ? (
             <ErrorBoundary level="panel">
             <KanbanBoard
               tasks={filteredTasks}
@@ -1154,19 +1164,9 @@ export default function App() {
               />
             </main>
             </ErrorBoundary>
-          ) : (
-            <ErrorBoundary level="panel">
-            <main className="flex-1 overflow-hidden flex flex-col">
-              <TimelineView
-                tasks={filteredTasks}
-                hasActiveFilters={hasActiveFilters}
-                onViewLogs={s.handleViewLogs}
-              />
-            </main>
-            </ErrorBoundary>
-          )}
+          ) : null}
 
-          {s.viewMode !== 'home' && <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />}
+          <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />
         </>
       )}
 
@@ -1194,6 +1194,9 @@ export default function App() {
           setComputeExperiment={s.setComputeExperiment}
           getDefaultModelForType={s.getDefaultModelForType}
           getDefaultEffortForType={s.getDefaultEffortForType}
+          preflightResult={s.preflightResult}
+          preflightLoading={s.preflightLoading}
+          preflightError={s.preflightError}
           repoOptions={s.repoOptions}
           repoLoading={s.repoLoading}
           repoError={s.repoError}
@@ -1252,8 +1255,9 @@ export default function App() {
       {s.showKnowledgeBrowser && (
         <KnowledgeBrowser
           selectedProjectId={s.selectedProjectId}
-          onClose={() => s.setShowKnowledgeBrowser(false)}
+          onClose={() => { s.setShowKnowledgeBrowser(false); setKnowledgeBrowserDirectionId(null); }}
           onLaunchWebResearchTask={s.openWebResearchTaskModal}
+          initialDirectionId={knowledgeBrowserDirectionId ?? undefined}
           onNavigateToTask={(taskId) => {
             s.setShowKnowledgeBrowser(false);
             const target = s.tasks.find(t => t.id === taskId);
@@ -1325,27 +1329,21 @@ export default function App() {
         />
       )}
 
-      {s.showDirections && (
-        <DirectionsPanel
-          onClose={() => s.setShowDirections(false)}
-          addToast={s.addToast}
-          selectedProjectId={s.selectedProjectId}
-          projects={s.projects}
-          fetchDirectionsRef={s.fetchDirectionsRef}
-          strategistActive={s.strategistActive}
-          cycleProgress={s.cycleProgress}
-          onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
-          onNavigateToTask={(taskId) => {
-            const target = s.tasks.find(t => t.id === taskId);
-            if (target) {
-              s.handleViewLogs(target);
-            } else {
-              fetchTask(taskId).then(s.handleViewLogs).catch(() => {
-                s.addToast('Could not load task — it may have been deleted', 'error');
-              });
-            }
-          }}
-        />
+      {showAnalytics && (
+        <div className="fixed inset-0 z-[60] bg-black/60 flex items-start justify-center overflow-y-auto p-4" onClick={(e) => { if (e.target === e.currentTarget) setShowAnalytics(false); }}>
+          <div className="relative w-full max-w-6xl bg-neutral-950 rounded-xl border border-neutral-800 shadow-2xl my-8">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-neutral-800">
+              <h2 className="text-sm font-semibold text-neutral-200">Detailed Analytics</h2>
+              {/* eslint-disable-next-line viewport/min-touch-target */}
+              <button onClick={() => setShowAnalytics(false)} className="text-neutral-500 hover:text-neutral-300 transition-colors text-xs px-2 py-1">Close</button>
+            </div>
+            <div className="p-4">
+              <ErrorBoundary level="panel">
+                <DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} globalActiveCount={s.globalActiveCount} globalQueuedCount={s.globalQueuedCount} scopedActiveCount={s.scopedActiveCount} scopedQueuedCount={s.scopedQueuedCount} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })} userRole={s.userRole} />
+              </ErrorBoundary>
+            </div>
+          </div>
+        </div>
       )}
 
       {s.selectionMode && s.selectedTaskIds.size > 0 && (
@@ -1378,10 +1376,46 @@ export default function App() {
 
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
 
-      <TaskLaunchFAB
-        onClick={s.openNewTaskModal}
-        visible={!s.showNewTaskModal && !s.logTask && !showNewProjectModal && !s.showMessages}
-      />
+      {s.showAlertsPopover && combinedAlerts.length > 0 && (
+        <AlertsPopover
+          alerts={combinedAlerts}
+          onDismiss={(id) => {
+            if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
+            else s.dismissAlert(id);
+          }}
+          onDismissAll={() => {
+            setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
+            s.dismissAllAlerts();
+          }}
+          onViewTask={handleViewTask}
+          projectId={s.selectedProjectId ?? undefined}
+          onSpawnSrInvestigation={s.selectedProjectId ? handleSpawnSrInvestigation : undefined}
+          activeInvestigationTaskIds={srInvestigationTaskIds}
+          onClose={() => s.setShowAlertsPopover(false)}
+        />
+      )}
+
+      {s.showComposeDrawer && (
+        <ComposeDrawer
+          projectId={s.selectedProjectId}
+          userEmail={s.user?.email ?? ''}
+          onOpenFullPanel={() => {
+            s.setShowComposeDrawer(false);
+            s.setShowMessages(true);
+          }}
+          onClose={() => s.setShowComposeDrawer(false)}
+          addToast={s.addToast}
+          strategistActive={s.strategistActive}
+        />
+      )}
+
+      {s.showFleetDetail && (
+        <FleetDetailDrawer
+          onClose={() => s.setShowFleetDetail(false)}
+          onViewTask={handleViewTask}
+          projects={s.projects}
+        />
+      )}
 
       {s.confirmDialog && (
         <ConfirmDialog

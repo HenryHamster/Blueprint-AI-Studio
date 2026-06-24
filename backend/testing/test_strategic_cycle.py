@@ -247,9 +247,7 @@ async def test_advance_running_update_baseline_updates_snapshot(db_session):
     db_session.add(cycle)
     await db_session.commit()
     fetched = await strategic_cycle.get(db_session, cycle.id)
-    assert (
-        strategic_cycle.baseline_running_update(fetched) == "## v2 (agent doc A)"
-    )
+    assert strategic_cycle.baseline_running_update(fetched) == "## v2 (agent doc A)"
 
 
 def test_advance_running_update_baseline_noop_for_legacy_cycle():
@@ -278,9 +276,7 @@ def test_advance_running_update_baseline_handles_empty_baseline():
         cycle_metadata={"baseline_running_update": ""},
     )
     strategic_cycle.advance_running_update_baseline(cycle, "## first agent doc")
-    assert (
-        strategic_cycle.baseline_running_update(cycle) == "## first agent doc"
-    )
+    assert strategic_cycle.baseline_running_update(cycle) == "## first agent doc"
 
 
 @pytest.mark.asyncio
@@ -604,6 +600,25 @@ async def test_mark_phase2_completed_stores_memo_counts(db_session):
     assert updated is not None
     assert updated.cycle_metadata["memos_available"] == 5
     assert updated.cycle_metadata["memos_cited"] == 2
+    assert updated.outcome == strategic_cycle.OUTCOME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_mark_phase2_completed_stores_knowledge_counts(db_session):
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    updated = await strategic_cycle.mark_phase2_completed(
+        db_session,
+        cycle.id,
+        knowledge_available=3,
+        knowledge_cited=1,
+    )
+    await db_session.commit()
+    assert updated is not None
+    assert updated.cycle_metadata["knowledge_available"] == 3
+    assert updated.cycle_metadata["knowledge_cited"] == 1
     assert updated.outcome == strategic_cycle.OUTCOME_COMPLETED
 
 

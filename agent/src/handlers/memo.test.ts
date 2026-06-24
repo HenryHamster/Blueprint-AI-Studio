@@ -37,10 +37,26 @@ vi.mock('child_process', () => ({
   execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
 }));
 
+vi.mock('../telemetry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../telemetry.js')>();
+  return {
+    ...actual,
+    recordFormatRepairTokens: vi.fn(),
+    recordFormatRepairMiss: vi.fn(),
+    getLlmTelemetry: vi.fn().mockReturnValue({
+      llm_call_count: 0,
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
+    }),
+  };
+});
+
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleMemo } from './memo.js';
 import { runClaudeCode, persistAndPostStatus, sendHeartbeatSync, setCurrentPromptFingerprint } from '../index.js';
 import { configureAgentPermissions } from '../prompt.js';
+import { recordFormatRepairTokens, recordFormatRepairMiss, getLlmTelemetry } from '../telemetry.js';
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 const TASK_ID = 'task-memo-123';
@@ -65,6 +81,11 @@ describe('handleMemo', () => {
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '', lastResultText: VALID_MEMO_JSON,
       codexTurnCompleted: true, stderrTail: '',
+    });
+    vi.mocked(getLlmTelemetry).mockReturnValue({
+      llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0,
+      total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
     });
   });
 
@@ -204,9 +225,55 @@ describe('handleMemo', () => {
     expect(call.logs).toContain('A concise summary.');
   });
 
+  it('records repair token delta when retry attempt consumes LLM tokens', async () => {
+    // First run: agent drifts, emits prose but no JSON
+    // Second run (the reopen): agent emits valid JSON and consumes tokens
+    const validJson = JSON.stringify({
+      summary: 'A concise summary.',
+      reasoning: 'Detailed reasoning.',
+      citations: ['task:abc'],
+      tags: ['tag-a'],
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'prose without any valid JSON object emitted',
+        lastResultText: '',
+        codexTurnCompleted: true, stderrTail: '',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: validJson,
+        lastResultText: validJson,
+        codexTurnCompleted: true, stderrTail: '',
+      });
+
+    // Mock token consumption: first call returns before-repair tokens, second returns after-repair
+    let callCount = 0;
+    vi.mocked(getLlmTelemetry).mockImplementation(() => {
+      callCount++;
+      return {
+        llm_call_count: 1,
+        // First call (before repair) returns 100/50
+        // Second call (after repair) returns 300/150 (consumed 200 input, 100 output)
+        total_input_tokens: callCount === 1 ? 100 : 300,
+        total_output_tokens: callCount === 1 ? 50 : 150,
+        total_cache_creation_input_tokens: 0,
+        total_cache_read_input_tokens: 0,
+        viewport_screenshot_forwarded_count: 0,
+      };
+    });
+
+    await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Verify recordFormatRepairTokens is called with positive delta and schemaLabel='memo'
+    expect(vi.mocked(recordFormatRepairTokens)).toHaveBeenCalledWith(200, 100, 'memo');
+  });
+
   it('does NOT reopen when first run failed (exitCode !== 0)', async () => {
     // If the agent itself crashed (rate limit, OOM, etc), retrying with the
     // same setup wastes a slot. Reopen only fires for exitCode=0 drift.
+    vi.mocked(runClaudeCode).mockClear();
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 1,
       allOutput: 'Claude init banner only',
@@ -220,6 +287,34 @@ describe('handleMemo', () => {
     expect(vi.mocked(runClaudeCode).mock.calls.length).toBe(1);
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
+  });
+
+  it('records repair miss when retry fails with clean exit (exitCode=0)', async () => {
+    // First run: agent drifts, emits prose but no JSON
+    // Second run (the reopen): agent also emits bad JSON, missing required keys
+    const incompleteJson = JSON.stringify({
+      summary: 'Only has summary',
+      reasoning: 'and reasoning',
+      // Missing citations and tags — will fail extraction
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'prose without any valid JSON object emitted',
+        lastResultText: '',
+        codexTurnCompleted: true, stderrTail: '',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: incompleteJson,
+        lastResultText: incompleteJson,
+        codexTurnCompleted: true, stderrTail: '',
+      });
+
+    await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // recordFormatRepairMiss should be called with the retry's miss reason
+    expect(vi.mocked(recordFormatRepairMiss)).toHaveBeenCalledWith('parsed_object_missing_key', 'memo');
   });
 
   it('logs the serialized memo object on success', async () => {

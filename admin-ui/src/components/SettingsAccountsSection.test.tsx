@@ -43,7 +43,6 @@ function Harness({
     <SettingsAccountsSection
       githubAccount={null}
       onConnectGitHub={vi.fn()}
-      isAdmin={true}
       maxPlanAccounts={overrides.maxPlanAccounts ?? []}
       onToggleAccount={overrides.onToggleAccount ?? vi.fn()}
       onRemoveAccount={onRemoveAccount}
@@ -51,13 +50,6 @@ function Harness({
       onRefreshAccountModels={vi.fn()}
       onUpdateAccount={onUpdateAccount}
       onUpdateAccountCaps={onUpdateAccountCaps}
-      showUserManagement={false}
-      onToggleUserManagement={vi.fn()}
-      showProjectMembers={false}
-      onToggleProjectMembers={vi.fn()}
-      selectedProjectId={null}
-      selectedProjectMyRole={null}
-      onToggleSettings={vi.fn()}
       providers={overrides.providers ?? {
         anthropic: { auth_modes: { oauth: { required_metadata_fields: [] }, api_key: { required_metadata_fields: [] } }, supported_execution_modes: [], execution_modes: [], mode_capabilities: {} },
         openai: { auth_modes: { api_key: { required_metadata_fields: [] }, oauth: { required_metadata_fields: [] } }, supported_execution_modes: [], execution_modes: [], mode_capabilities: {} },

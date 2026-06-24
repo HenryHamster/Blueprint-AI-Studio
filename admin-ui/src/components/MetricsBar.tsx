@@ -35,7 +35,7 @@ export function MetricsBar(props: MetricsBarProps) {
       title="Toggle metrics dashboard"
     >
       <div className="flex flex-col items-center" title={`${globalActiveCount} VMs active out of ${maxConcurrentVMs} configured maximum`}>
-        <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Active VMs</span>
+        <span className="text-ui-sm text-neutral-500 font-semibold uppercase tracking-wider mb-1">Active VMs</span>
         <span className="text-xl font-bold text-emerald-400 font-mono leading-none flex items-center gap-1.5">
           {globalActiveCount > 0 && <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>}
           {globalActiveCount}<span className="text-xs text-neutral-600 font-sans">/{maxConcurrentVMs}</span>
@@ -43,17 +43,17 @@ export function MetricsBar(props: MetricsBarProps) {
       </div>
       <div className="w-px h-8 bg-neutral-800"></div>
       <div className="flex flex-col items-center">
-        <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Evaluating</span>
+        <span className="text-ui-sm text-neutral-500 font-semibold uppercase tracking-wider mb-1">Evaluating</span>
         <span className="text-xl font-bold text-amber-400 font-mono leading-none">{globalEvaluatingCount}</span>
       </div>
       <div className="w-px h-8 bg-neutral-800"></div>
       <div className="flex flex-col items-center">
-        <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Queue</span>
+        <span className="text-ui-sm text-neutral-500 font-semibold uppercase tracking-wider mb-1">Queue</span>
         <span className="text-xl font-bold text-neutral-200 font-mono leading-none">{queuedTasksLength}</span>
       </div>
       <div className="w-px h-8 bg-neutral-800"></div>
       <button className="flex flex-col items-center group" onClick={(e) => { e.stopPropagation(); onRefresh(); }} title="Click to refresh">
-        <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Refreshed</span>
+        <span className="text-ui-sm text-neutral-500 font-semibold uppercase tracking-wider mb-1">Refreshed</span>
         <span className="text-xs font-medium text-neutral-400 font-mono group-hover:text-neutral-200 transition-colors flex items-center gap-1.5">
           <RefreshCw className="w-3 h-3" />
           {lastRefresh ? timeAgo(lastRefresh) : '...'}

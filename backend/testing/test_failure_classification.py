@@ -1295,6 +1295,32 @@ class TestClassifyFailureAgentTimeout:
         assert ADMIN_CANCEL in INFRA_CLASSES
 
 
+class TestAdminSupersedesPersistsAdminCancel:
+    def test_admin_superseded_task_persists_admin_cancel_not_agent_timeout(self):
+        """Admin supersession writes ADMIN_CANCEL, not AGENT_TIMEOUT.
+
+        This covers the 6 administrative cancel call sites (review supersession,
+        fix-supersedes-review, churn halt, dispatch dedup running/queued sibling,
+        and queue-cleanup backstop) that previously hardcoded AGENT_TIMEOUT,
+        causing phantom 90.8% cascade_cancellation dominance in compute_timeout_rate.
+        """
+        from app.digest_metrics import compute_timeout_rate
+
+        task = _task(
+            "Superseded by fix on PR #42: review was scoped to a pre-conflict snapshot"
+        )
+        task.started_at = object()  # marks it as execution-reached for the denominator
+
+        persist_failure_category(task, ADMIN_CANCEL)
+
+        assert task.context["failure_category"] == ADMIN_CANCEL
+        assert "timeout_subtype" not in task.context
+
+        result = compute_timeout_rate([task])
+        assert result["timeout_count"] == 0
+        assert result["by_subtype"]["cascade_cancellation"]["count"] == 0
+
+
 class TestClassifyFailureExternalApi:
     @pytest.mark.parametrize(
         "msg",

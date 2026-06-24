@@ -46,7 +46,7 @@ function formatAbsoluteTime(isoString: string | null | undefined): string | null
 function exitReasonBadge(reason: string | null | undefined): ReactElement | null {
   if (!reason) return null;
   const cls = EXIT_REASON_STYLE[reason] ?? 'text-neutral-400';
-  return <span className={`text-[10px] font-medium ${cls}`}>{reason.replace(/_/g, ' ')}</span>;
+  return <span className={`text-ui-sm font-medium ${cls}`}>{reason.replace(/_/g, ' ')}</span>;
 }
 
 function generateLoopOutcome(
@@ -107,7 +107,7 @@ function AttemptRow({ attempt, index }: { attempt: FixLoopAttempt; index: number
   return (
     <div className={`flex items-start gap-2 text-xs py-1.5 border-b border-neutral-800/50 last:border-0 ${isSynth ? 'opacity-70' : ''}`}>
       <div className="flex flex-col items-center shrink-0 w-6 gap-0.5 pt-0.5">
-        <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 ${
+        <div className={`w-5 h-5 rounded-full flex items-center justify-center text-ui-sm font-bold shrink-0 ${
           attempt.exit_reason === 'passed' ? 'bg-emerald-600/30 text-emerald-300' :
           isTerminal ? 'bg-red-600/30 text-red-300' :
           'bg-neutral-700 text-neutral-400'
@@ -115,7 +115,7 @@ function AttemptRow({ attempt, index }: { attempt: FixLoopAttempt; index: number
           {index + 1}
         </div>
         {isSynth && (
-          <span className="text-[8px] text-purple-500 leading-none">synth</span>
+          <span className="text-ui-2xs text-purple-500 leading-none">synth</span>
         )}
       </div>
 
@@ -123,14 +123,14 @@ function AttemptRow({ attempt, index }: { attempt: FixLoopAttempt; index: number
         <div className="flex items-center gap-2 flex-wrap">
           {exitReasonBadge(attempt.exit_reason)}
           {attempt.fingerprint_hash && (
-            <span className="font-mono text-[10px] text-neutral-600">{attempt.fingerprint_hash.slice(0, 12)}</span>
+            <span className="font-mono text-ui-sm text-neutral-600">{attempt.fingerprint_hash.slice(0, 12)}</span>
           )}
           {attempt.change_summary && (
-            <span className="text-[10px] text-neutral-500">{attempt.change_summary}</span>
+            <span className="text-ui-sm text-neutral-500">{attempt.change_summary}</span>
           )}
         </div>
         {attempt.error_tail && (
-          <pre className="mt-0.5 text-[10px] text-neutral-400 font-mono whitespace-pre-wrap break-words leading-snug line-clamp-3">
+          <pre className="mt-0.5 text-ui-sm text-neutral-400 font-mono whitespace-pre-wrap break-words leading-snug line-clamp-3">
             {attempt.error_tail.slice(0, 300)}
           </pre>
         )}
@@ -138,7 +138,7 @@ function AttemptRow({ attempt, index }: { attempt: FixLoopAttempt; index: number
 
       {duration && (
         <div className="shrink-0 text-right" title={tooltipText ?? undefined}>
-          <span className="font-mono text-[10px] text-neutral-500">{duration}</span>
+          <span className="font-mono text-ui-sm text-neutral-500">{duration}</span>
         </div>
       )}
     </div>
@@ -169,7 +169,7 @@ function LoopSection({ name, attempts, summary }: { name: string; attempts: FixL
         <span className="text-xs font-medium text-neutral-200">{label}</span>
         <span className="text-xs text-neutral-500">{summary.attempts} iter</span>
         {last_exit_reason && exitReasonBadge(last_exit_reason)}
-        <span className="ml-auto text-neutral-600 text-[10px]">{expanded ? '▲' : '▼'}</span>
+        <span className="ml-auto text-neutral-600 text-ui-sm">{expanded ? '▲' : '▼'}</span>
       </button>
       {expanded && attempts.length > 0 && (
         <div className="ml-4 mt-1 bg-neutral-900/50 rounded-lg border border-neutral-800 p-2">

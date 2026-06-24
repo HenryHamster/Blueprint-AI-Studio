@@ -680,7 +680,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const fetchMessages = useCallback(async () => {
     if (!selectedProjectId) { setLoading(false); return; }
     try {
-      const params = new URLSearchParams({ project_id: selectedProjectId, status: 'all', limit: '100' });
+      const params = new URLSearchParams({ project_id: selectedProjectId, status: 'all', limit: searchQuery.trim() ? '200' : '100' });
+      if (searchQuery.trim()) params.set('q', searchQuery.trim());
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -774,7 +775,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     } finally {
       setLoading(false);
     }
-  }, [selectedProjectId, onMessageCountChange, eventPrefs]);
+  }, [selectedProjectId, onMessageCountChange, eventPrefs, searchQuery]);
 
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
 

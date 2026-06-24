@@ -69,7 +69,7 @@ function ResolvedModelsReveal({ models }: { models: EfficiencyResolvedModel[] })
   if (models.length === 0) return null;
   const diverged = models.length > 1 || models.some((m) => !m.priced);
   return (
-    <details className="text-[10px] px-1 py-0.5">
+    <details className="text-ui-sm px-1 py-0.5">
       <summary
         className={`cursor-pointer select-none ${diverged ? 'text-amber-400/90' : 'text-neutral-500'} hover:text-neutral-300`}
       >
@@ -126,9 +126,9 @@ function EfficiencySubTable({
   if (rows.length === 0) return null;
   return (
     <div className="mb-3 last:mb-0">
-      <h3 className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider mb-1 px-1">{title}</h3>
+      <h3 className="text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-1 px-1">{title}</h3>
       {caption && (
-        <p className="text-[9px] text-neutral-600 mb-1 px-1 normal-case tracking-normal">{caption}</p>
+        <p className="text-ui-xs text-neutral-600 mb-1 px-1 normal-case tracking-normal">{caption}</p>
       )}
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
@@ -137,7 +137,7 @@ function EfficiencySubTable({
             const m = mergeFigures(row);
             const expansion = renderExpansion?.(row);
             return (
-              <div key={row._key} className="px-3 py-2 text-[10px]">
+              <div key={row._key} className="px-3 py-2 text-ui-sm">
                 <div className="mb-1 font-medium text-neutral-200 break-words">{row._label}</div>
                 <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-neutral-500">
                   <span>Runs: <span className="text-neutral-300 tabular-nums">{row.run_count}</span></span>
@@ -154,7 +154,7 @@ function EfficiencySubTable({
         {/* Desktop: table layout */}
         <table className="hidden sm:table w-full text-xs">
           <thead>
-            <tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50">
+            <tr className="text-ui-sm text-neutral-500 border-b border-neutral-800/50">
               <th className="text-left px-3 py-2 font-medium">{label}</th>
               <th className="text-right px-3 py-2 font-medium">Runs</th>
               <th className="text-right px-3 py-2 font-medium">Landed</th>
@@ -173,8 +173,8 @@ function EfficiencySubTable({
                     <td className="px-3 py-2 font-medium text-neutral-200">{row._label}</td>
                     <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{row.run_count}</td>
                     <td className={`text-right px-3 py-2 tabular-nums ${rateColor(m.rate)}`}>
-                      {m.count}/{row.run_count} <span className="text-[10px]">({fmtRate(m.rate)})</span>
-                      {m.rawDiffers && <span className="block text-[9px] text-neutral-600 leading-tight">raw {m.raw}</span>}
+                      {m.count}/{row.run_count} <span className="text-ui-sm">({fmtRate(m.rate)})</span>
+                      {m.rawDiffers && <span className="block text-ui-xs text-neutral-600 leading-tight">raw {m.raw}</span>}
                     </td>
                     <td className="text-right px-3 py-2 text-neutral-300 font-mono tabular-nums">${row.total_cost_usd.toFixed(2)}</td>
                     <td className={`text-right px-3 py-2 font-mono tabular-nums ${cpmColor(row.cost_per_merge)}`}>{fmtCpm(row.cost_per_merge)}</td>
@@ -230,12 +230,12 @@ export function EffortEfficiencyPanel({ data }: { data: EffortModelEfficiency | 
 
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+      <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
         Effort &amp; Model Efficiency
       </h2>
 
       {hasFallbacks && (
-        <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+        <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-ui-sm text-amber-300">
           <span className="font-semibold">{fallbacks.total} run{fallbacks.total === 1 ? '' : 's'} fell back / downgraded</span>
           {' — '}the requested model differed from the model that actually ran, so per-tier cost reflects the cheaper resolved model.
           {fallbacks.combos.length > 0 && (
@@ -251,7 +251,7 @@ export function EffortEfficiencyPanel({ data }: { data: EffortModelEfficiency | 
       )}
 
       {hasUnpricedGap && (
-        <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] text-amber-300">
+        <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-ui-sm text-amber-300">
           <span className="font-semibold">Pricing coverage {fmtRate(coverage)}</span>
           {' — '}{totals.unpriced_run_count} of {totals.priced_run_count + totals.unpriced_run_count} token-bearing runs have no pricing entry, so reported cost &amp; $/merge are understated.
           {(unpriced_combos?.length ?? 0) > 0 && (

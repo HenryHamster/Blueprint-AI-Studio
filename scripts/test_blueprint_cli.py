@@ -4,8 +4,11 @@ Verifies the argparse tree parses (every subcommand exposes --help), that the
 module imports cleanly, and that --json emits valid JSON for a read command —
 all with blueprint_api.api mocked so no network/credentials are needed.
 """
+import argparse
 import io
 import json
+import os
+import subprocess
 import urllib.error
 import urllib.request
 
@@ -13,6 +16,59 @@ import pytest
 
 import blueprint
 import blueprint_api
+
+# ── root wrapper existence and invocation tests ───────────────────────────────
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_blueprint_wrapper_exists_and_is_executable():
+    """./blueprint exists at the repo root and is executable."""
+    wrapper = os.path.join(REPO_ROOT, "blueprint")
+    assert os.path.isfile(wrapper), f"./blueprint not found at {wrapper}"
+    assert os.access(wrapper, os.X_OK), "./blueprint is not executable"
+
+
+def test_check_wrapper_exists_and_is_executable():
+    """./check exists at the repo root and is executable."""
+    wrapper = os.path.join(REPO_ROOT, "check")
+    assert os.path.isfile(wrapper), f"./check not found at {wrapper}"
+    assert os.access(wrapper, os.X_OK), "./check is not executable"
+
+
+def test_blueprint_wrapper_help_exits_zero():
+    """./blueprint --help exits 0 and emits CLI output."""
+    wrapper = os.path.join(REPO_ROOT, "blueprint")
+    result = subprocess.run(
+        [wrapper, "--help"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"./blueprint --help exited {result.returncode}: {result.stderr}"
+    assert len(result.stdout) > 0, "./blueprint --help produced no output"
+
+
+def test_check_test_delegates_to_standalone_harness():
+    """./check test script delegates to scripts/test-backend.sh --standalone --no-postgres."""
+    check_path = os.path.join(REPO_ROOT, "check")
+    with open(check_path) as f:
+        content = f.read()
+    assert "scripts/test-backend.sh" in content, "./check does not reference scripts/test-backend.sh"
+    assert "--standalone" in content, "./check does not pass --standalone to scripts/test-backend.sh"
+    assert "--no-postgres" in content, "./check does not pass --no-postgres to scripts/test-backend.sh"
+
+
+def test_blueprint_wrapper_shell_syntax():
+    """./blueprint passes bash -n (no syntax errors)."""
+    wrapper = os.path.join(REPO_ROOT, "blueprint")
+    result = subprocess.run(["bash", "-n", wrapper], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed on ./blueprint: {result.stderr}"
+
+
+def test_check_wrapper_shell_syntax():
+    """./check passes bash -n (no syntax errors)."""
+    wrapper = os.path.join(REPO_ROOT, "check")
+    result = subprocess.run(["bash", "-n", wrapper], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed on ./check: {result.stderr}"
 
 
 # ── --help for every (sub)command parses and exits 0 ─────────────────────────
@@ -74,6 +130,7 @@ HELP_INVOCATIONS = [
     ["messages"],
     ["messages", "list"],
     ["messages", "send"],
+    ["messages", "answer"],
     ["fleet"],
     ["fleet", "pool"],
     ["fleet", "warm"],
@@ -82,6 +139,14 @@ HELP_INVOCATIONS = [
     ["envelope"],
     ["envelope", "show"],
     ["envelope", "set"],
+    ["knowledge"],
+    ["knowledge", "list"],
+    ["knowledge", "show"],
+    ["compute"],
+    ["compute", "list"],
+    ["compute", "show"],
+    ["compute", "kill"],
+    ["compute", "analyze"],
 ]
 
 
@@ -97,6 +162,64 @@ def test_module_builds_full_parser():
     """The full parser tree constructs without error."""
     parser = blueprint.build_parser()
     assert parser.prog == "blueprint"
+
+
+def test_no_duplicate_top_level_defs():
+    """Each CLI module must not define the same top-level name twice.
+
+    Rollup merges can silently concatenate duplicate defs; Python binds the
+    last one, so the first (often correct) definition is silently shadowed.
+    """
+    import ast
+    import pathlib
+
+    scripts_dir = pathlib.Path(__file__).parent
+    for module_name in ("blueprint.py", "blueprint_api.py"):
+        source = (scripts_dir / module_name).read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=module_name)
+        seen: dict = {}
+        dups: list = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = node.name
+                if name in seen:
+                    dups.append(
+                        f"{name} (first at line {seen[name]}, again at line {node.lineno})"
+                    )
+                else:
+                    seen[name] = node.lineno
+        assert not dups, (
+            f"{module_name} has duplicate top-level definitions: {', '.join(dups)}"
+        )
+
+
+def test_envelope_registered_once():
+    """The 'envelope' subcommand is registered exactly once in the parser."""
+    parser = blueprint.build_parser()
+    # Get the subparsers action which contains all top-level subcommands
+    subparsers_action = None
+    for action in parser._subparsers._group_actions:
+        if isinstance(action, argparse._SubParsersAction):
+            subparsers_action = action
+            break
+
+    assert subparsers_action is not None, "No subparsers found in parser"
+
+    # Count how many times 'envelope' appears in the subcommand choices
+    choices = subparsers_action.choices
+    envelope_count = sum(1 for choice in choices.keys() if choice == 'envelope')
+
+    # Verify envelope is registered exactly once
+    assert envelope_count == 1, (
+        f"Expected 'envelope' to be registered exactly once, but found {envelope_count} "
+        f"registrations. Available subcommands: {sorted(choices.keys())}"
+    )
+
+    # Verify the envelope parser is configured correctly
+    assert 'envelope' in choices, "'envelope' not found in subcommand choices"
+    envelope_parser = choices['envelope']
+    assert envelope_parser is not None
+    assert envelope_parser.prog == 'blueprint envelope'
 
 
 # ── --json produces valid JSON for a read command ───────────────────────────
@@ -373,6 +496,10 @@ def mock_api(monkeypatch):
                 "active_vm_count": 3,
                 "is_throttled": False,
             }
+        if "/messages" in path and "/answer" in path and method == "POST":
+            msg_id = path.split("/messages/")[1].split("/answer")[0]
+            return {"id": f"answer-{msg_id[:8]}", "parent_message_id": msg_id,
+                    "status": "created", "type": "ANSWER"}
         if "/messages" in path and method == "POST":
             return {"id": "msg-abc", "status": "created", "arming": "not_armed"}
         if "/messages" in path:
@@ -547,6 +674,67 @@ def mock_api(monkeypatch):
                 "anomaly_tightened": False,
                 "window_minutes": 15,
                 "generated_at": "2026-06-18T00:00:00",
+            }
+        if "/knowledge/" in path and method == "GET":
+            doc_id = path.split("/knowledge/")[1].split("?")[0]
+            return {
+                "id": doc_id,
+                "title": "Research on test coverage",
+                "source_kind": "web_research",
+                "direction_id": "d-abc12345",
+                "created_at": "2026-06-15T00:00:00Z",
+                "body": "## Findings\n\nTest coverage is important for reliability.",
+            }
+        if "/knowledge" in path and method == "GET":
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(path).query)
+            docs = [
+                {"id": "kdoc-001", "title": "API Rate Limiting", "source_kind": "web_research",
+                 "direction_id": "d-abc12345", "created_at": "2026-06-15T00:00:00Z"},
+                {"id": "kdoc-002", "title": "Design Patterns", "source_kind": "design",
+                 "direction_id": "d-def67890", "created_at": "2026-06-14T00:00:00Z"},
+            ]
+            direction_f = qs.get("direction_id", [None])[0]
+            source_kind_f = qs.get("source_kind", [None])[0]
+            q_f = qs.get("q", [None])[0]
+            if direction_f:
+                docs = [d for d in docs if d.get("direction_id") == direction_f]
+            if source_kind_f:
+                docs = [d for d in docs if d.get("source_kind") == source_kind_f]
+            if q_f:
+                docs = [d for d in docs if q_f.lower() in (d.get("title") or "").lower()]
+            return {"documents": docs, "total": len(docs)}
+        if "/compute-jobs/" in path and "/kill" in path and method == "POST":
+            job_id = path.split("/compute-jobs/")[1].split("/")[0]
+            return {"compute_job": {"id": job_id, "status": "CANCELLED"}}
+        if "/compute-jobs/" in path and "/analyze" in path and method == "POST":
+            job_id = path.split("/compute-jobs/")[1].split("/")[0]
+            return {"outcome": "success", "knowledge_document_id": "kdoc-abc123", "job_id": job_id}
+        if "/compute-jobs" in path:
+            return {
+                "compute_jobs": [
+                    {"id": "cjob-aaa0-0000-0000-000000000001",
+                     "status": "RUNNING", "task_title": "GPU benchmark alpha",
+                     "task_type": "compute_experiment",
+                     "final_cost_usd": None,
+                     "experiment": "exp-alpha",
+                     "benchmark": "bench-1",
+                     "hypothesis": "GPU is faster",
+                     "criterion_verdict": None,
+                     "success_criterion": {"metric": "latency_ms", "operator": "lt", "threshold": 100}},
+                    {"id": "cjob-bbb0-0000-0000-000000000002",
+                     "status": "SUCCEEDED", "task_title": "GPU benchmark beta",
+                     "task_type": "compute_experiment",
+                     "final_cost_usd": 12.5,
+                     "experiment": "exp-beta",
+                     "benchmark": "bench-2",
+                     "hypothesis": "Quantization works",
+                     "criterion_verdict": {"met": True, "measured_value": 80.0},
+                     "success_criterion": {"metric": "latency_ms", "operator": "lt", "threshold": 100}},
+                ],
+                "has_more": False,
+                "limit": 20,
+                "offset": 0,
             }
         if "/directions/" in path and "/unhold" in path:
             return {"status": "unheld", "direction_id": "d-abc12345", "was_held": True}
@@ -2405,6 +2593,39 @@ def test_messages_group(mock_api, monkeypatch, capsys):
     assert exc.value.code == 1
 
 
+def test_messages_answer(mock_api, monkeypatch, capsys):
+    """messages answer sends a threaded reply linked to the target message id."""
+
+    # --- answer posts correct body with message_id in URL ---
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    mock_api.clear()
+    rc = blueprint.main(["messages", "answer", "msg-002", "yes, we are stuck"])
+    assert rc == 0
+    post_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/answer" in p]
+    assert len(post_calls) == 1
+    _, path, body = post_calls[0]
+    assert "/messages/msg-002/answer" in path
+    assert body["content"] == "yes, we are stuck"
+    out = capsys.readouterr().out
+    assert "answer-msg" in out
+
+    # --- answer with --json emits valid JSON with parent_message_id ---
+    mock_api.clear()
+    rc = blueprint.main(["--json", "messages", "answer", "msg-002", "response text"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["parent_message_id"] == "msg-002"
+    assert parsed["type"] == "ANSWER"
+
+    # --- read-only config refuses answer ---
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["messages", "answer", "msg-002", "blocked answer"])
+    assert exc.value.code == 1
+
+
 # ── envelope group ────────────────────────────────────────────────────────────
 
 def test_envelope_show(mock_api, monkeypatch, capsys):
@@ -2614,3 +2835,162 @@ def test_envelope_set_patches_envelope(mock_api, monkeypatch, capsys):
         m == "PATCH" and "resource-envelope" in p
         for m, p, _ in mock_api
     )
+
+
+# ── knowledge ─────────────────────────────────────────────────────────────────
+
+def test_knowledge_list_applies_filters(mock_api, capsys):
+    """knowledge list applies direction and source-kind filters to the API request path."""
+    rc = blueprint.main([
+        "knowledge", "list",
+        "--direction", "d-abc12345",
+        "--source-kind", "web_research",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "KNOWLEDGE LIBRARY" in out
+    # Both filter params must appear in the request URL
+    assert any("direction_id=d-abc12345" in path for _, path, _ in mock_api)
+    assert any("source_kind=web_research" in path for _, path, _ in mock_api)
+    # The matching document is rendered; the design doc (different direction) is not
+    assert "API Rate Limiting" in out
+    assert "Design Patterns" not in out
+
+
+def test_knowledge_show_renders_document_body(mock_api, capsys):
+    """knowledge show <id> renders the document title, metadata, and body text."""
+    rc = blueprint.main(["knowledge", "show", "kdoc-001"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "KNOWLEDGE" in out
+    assert "Research on test coverage" in out
+    # body is rendered verbatim
+    assert "## Findings" in out
+    assert "Test coverage is important for reliability" in out
+
+
+# ── compute command group ─────────────────────────────────────────────────────
+
+def test_compute_list_json(mock_api, capsys):
+    """compute list --json returns compute jobs with status, title, and cost fields."""
+    rc = blueprint.main(["--json", "compute", "list"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    jobs = parsed["compute_jobs"]
+    assert len(jobs) == 2
+    # running job has no cost yet
+    running = next(j for j in jobs if j["status"] == "RUNNING")
+    assert running["task_title"] == "GPU benchmark alpha"
+    assert running["experiment"] == "exp-alpha"
+    assert running["final_cost_usd"] is None
+    # succeeded job has cost and a criterion verdict
+    done = next(j for j in jobs if j["status"] == "SUCCEEDED")
+    assert done["final_cost_usd"] == 12.5
+    assert done["criterion_verdict"]["met"] is True
+    assert any("/compute-jobs" in path for _, path, _ in mock_api)
+
+
+def test_compute_list_human_render(mock_api, capsys):
+    """compute list human output shows status and job titles."""
+    rc = blueprint.main(["compute", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "COMPUTE JOBS" in out
+    assert "RUNNING" in out
+    assert "GPU benchmark alpha" in out
+    assert "SUCCEEDED" in out
+    assert "GPU benchmark beta" in out
+    assert "$12.50" in out
+    assert "met=True" in out
+
+
+def test_compute_list_defaults_to_list(mock_api, capsys):
+    """compute without a subcommand defaults to list."""
+    rc = blueprint.main(["compute"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "COMPUTE JOBS" in out
+
+
+def test_compute_kill_read_only_refused(mock_api, monkeypatch):
+    """compute kill refuses under a read-only (agent-JWT) config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["compute", "kill", "cjob-aaa0-0000-0000-000000000001", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_compute_kill_with_yes_posts_kill(mock_api, monkeypatch, capsys):
+    """compute kill --yes POSTs to the kill endpoint and reports the final status."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    job_id = "cjob-aaa0-0000-0000-000000000001"
+    rc = blueprint.main(["compute", "kill", job_id, "--yes"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "CANCELLED" in out
+    kill_calls = [(m, p) for m, p, _ in mock_api if m == "POST" and "/kill" in p]
+    assert kill_calls, "Expected a POST to the /kill endpoint"
+    assert job_id in kill_calls[0][1]
+
+
+def test_compute_analyze_with_yes_posts_analyze(mock_api, monkeypatch, capsys):
+    """compute analyze --yes POSTs to the analyze endpoint and reports outcome."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    job_id = "cjob-bbb0-0000-0000-000000000002"
+    rc = blueprint.main(["compute", "analyze", job_id, "--yes"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "success" in out
+    analyze_calls = [(m, p) for m, p, _ in mock_api if m == "POST" and "/analyze" in p]
+    assert analyze_calls, "Expected a POST to the /analyze endpoint"
+    assert job_id in analyze_calls[0][1]
+
+
+def test_compute_show_renders_result_and_tolerates_missing_fields(mock_api, capsys):
+    """compute show <id-prefix> renders metrics, verdict, and knowledge doc; missing fields are omitted."""
+    # Full-match job id for the SUCCEEDED job in mock_api fixture
+    job_id = "cjob-bbb0-0000-0000-000000000002"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Core fields must appear
+    assert job_id in out
+    assert "SUCCEEDED" in out
+    assert "GPU benchmark beta" in out
+    # Cost rendered
+    assert "12.5" in out
+    # Criterion verdict rendered
+    assert "met=True" in out
+    # Hypothesis rendered
+    assert "Quantization works" in out
+    # Test prefix-match: short prefix also resolves
+    rc2 = blueprint.main(["compute", "show", "cjob-bbb0"])
+    assert rc2 == 0
+    out2 = capsys.readouterr().out
+    assert "SUCCEEDED" in out2
+    # Fields absent from the RUNNING job (no cost, no verdict) are tolerated
+    rc3 = blueprint.main(["compute", "show", "cjob-aaa0"])
+    assert rc3 == 0
+    out3 = capsys.readouterr().out
+    assert "RUNNING" in out3
+    assert "GPU benchmark alpha" in out3
+
+
+def test_compute_show_registers_in_help_invocations():
+    """'compute show' is in HELP_INVOCATIONS so --help parsing is verified."""
+    assert ["compute", "show"] in HELP_INVOCATIONS
+
+
+def test_compute_kill_aborts_without_yes(mock_api, monkeypatch, capsys):
+    """compute kill without --yes on non-interactive stdin aborts cleanly."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = blueprint.main(["compute", "kill", "cjob-aaa0-0000-0000-000000000001"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Aborted" in out
+    assert not any(m == "POST" and "/kill" in p for m, p, _ in mock_api)

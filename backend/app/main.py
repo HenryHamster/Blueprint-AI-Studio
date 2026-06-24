@@ -1477,15 +1477,11 @@ async def health_check():
         cycle_age = (_utcnow() - _orch._orchestrator_last_cycle).total_seconds()
     slow_cycle = cycle_age is not None and cycle_age >= 120
 
-    # Detect hung orchestrator (cycle started but not completed in 5+ minutes)
-    orchestrator_hung = False
-    if (
-        _orch._orchestrator_cycle_started
-        and _orch._orchestrator_last_cycle
-        and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle
-    ):
-        hung_seconds = (_utcnow() - _orch._orchestrator_cycle_started).total_seconds()
-        orchestrator_hung = hung_seconds > 300
+    # Use the same stalled verdict as the debug endpoint and watchdog, so all
+    # surfaces agree: liveness.stalled fires after ORCHESTRATOR_HANG_SECONDS
+    # (180s) without a progress heartbeat, which is stricter than the old
+    # hardcoded 300s wall-clock check on cycle_started.
+    orchestrator_hung = liveness.stalled
 
     # Only DB is critical for 503 — provider or external API outages shouldn't remove us from LB.
     critical_healthy = external_health.get("db", True)

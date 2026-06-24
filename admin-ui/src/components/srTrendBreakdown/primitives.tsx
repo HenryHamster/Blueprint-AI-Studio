@@ -19,7 +19,7 @@ export function ExampleList({ examples, indent }: { examples: SrMissExample[]; i
   return (
     <div className={`flex flex-col gap-0.5 mt-0.5 ${indent ? 'pl-4' : 'pl-3'} border-l border-neutral-800/60`}>
       {examples.map((ex, i) => (
-        <div key={i} className="flex items-start gap-1 text-[10px] leading-tight">
+        <div key={i} className="flex items-start gap-1 text-ui-sm leading-tight">
           <span className={`font-mono shrink-0 ${severityColor(ex.severity)}`} title={ex.severity}>
             {ex.severity[0]}
           </span>
@@ -101,7 +101,7 @@ export function SrCatchRateFreshnessPill({ health }: { health?: SrCatchRateHealt
   return (
     <span
       data-testid={`sr-catch-rate-health-${health.status}`}
-      className={`inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded border text-[9px] font-mono ${style.badge}`}
+      className={`inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded border text-ui-xs font-mono ${style.badge}`}
       title={healthTooltip(health)}
     >
       {health.status === 'healthy' && <Check className="w-2.5 h-2.5 shrink-0" aria-hidden="true" />}

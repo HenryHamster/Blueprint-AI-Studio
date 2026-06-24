@@ -139,22 +139,22 @@ function ChallengePanel({ challenge, onNavigateToTask }: { challenge: FindingCha
     <div className="mt-1.5 border border-neutral-800 rounded p-2 space-y-1 bg-neutral-900/40">
       <div className="flex items-center gap-1.5 flex-wrap">
         <GitBranch className="w-3 h-3 text-neutral-500 shrink-0" />
-        <span className="text-[10px] uppercase tracking-wide text-neutral-500">Second opinion</span>
-        <span className={`text-[10px] border px-1.5 py-0.5 rounded font-medium ${style.cls}`}>{style.label}</span>
+        <span className="text-ui-sm uppercase tracking-wide text-neutral-500">Second opinion</span>
+        <span className={`text-ui-sm border px-1.5 py-0.5 rounded font-medium ${style.cls}`}>{style.label}</span>
         {challenge.challenged_boundary && (
-          <span className="text-[10px] text-neutral-500">on <span className="font-mono text-neutral-400">{challenge.challenged_boundary}</span></span>
+          <span className="text-ui-sm text-neutral-500">on <span className="font-mono text-neutral-400">{challenge.challenged_boundary}</span></span>
         )}
       </div>
       {challenge.second_opinion_verdict && (
-        <div className="text-[10px] text-neutral-400">
+        <div className="text-ui-sm text-neutral-400">
           <span className="text-neutral-600">Second verdict:</span> {challenge.second_opinion_verdict}
         </div>
       )}
       {challenge.reason && (
-        <div className="text-[10px] text-neutral-400 leading-relaxed">{challenge.reason}</div>
+        <div className="text-ui-sm text-neutral-400 leading-relaxed">{challenge.reason}</div>
       )}
       {challenge.sidecar_task_id && (
-        <div className="text-[10px] text-neutral-500 flex items-center gap-1">
+        <div className="text-ui-sm text-neutral-500 flex items-center gap-1">
           <span>Challenger task:</span>
           {onNavigateToTask ? (
             <button
@@ -185,16 +185,16 @@ function EvidencePanel({ finding, repoUrl }: { finding: ResearchFinding; repoUrl
     <div className="space-y-1.5 pt-1">
       {claims.length > 0 && (
         <div>
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500 mb-0.5">Claims</div>
-          <ul className="list-disc list-inside text-[11px] text-neutral-300 space-y-0.5">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500 mb-0.5">Claims</div>
+          <ul className="list-disc list-inside text-ui-md text-neutral-300 space-y-0.5">
             {visibleClaims.map((c, i) => <li key={i}>{c}</li>)}
           </ul>
           {hiddenCount > 0 && (
-            // reason: expand-claims link in compact finding card; text-[10px] single-line height
+            // reason: expand-claims link in compact finding card; text-ui-sm single-line height
             <button
               data-viewport-allow-small-target
               onClick={e => { e.stopPropagation(); setShowAllClaims(v => !v); }}
-              className="mt-0.5 text-[10px] text-cyan-400 hover:text-cyan-300 transition-colors"
+              className="mt-0.5 text-ui-sm text-cyan-400 hover:text-cyan-300 transition-colors"
             >
               {showAllClaims ? 'Show fewer' : `Show ${hiddenCount} more`}
             </button>
@@ -203,8 +203,8 @@ function EvidencePanel({ finding, repoUrl }: { finding: ResearchFinding; repoUrl
       )}
       {sources.length > 0 && (
         <div>
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500 mb-0.5">Sources</div>
-          <ul className="space-y-0.5 text-[11px]">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500 mb-0.5">Sources</div>
+          <ul className="space-y-0.5 text-ui-md">
             {sources.map((s, i) => {
               const link = classifySourceRef(s.ref, repoUrl);
               const refNode = link.kind === 'url' ? (
@@ -228,9 +228,9 @@ function EvidencePanel({ finding, repoUrl }: { finding: ResearchFinding; repoUrl
               );
               return (
                 <li key={i} className="leading-snug">
-                  {s.type && <span className="text-[10px] text-neutral-500 mr-1">[{s.type}]</span>}
+                  {s.type && <span className="text-ui-sm text-neutral-500 mr-1">[{s.type}]</span>}
                   {refNode}
-                  {s.excerpt && <div className="ml-3 italic text-[10px] text-neutral-500">{s.excerpt}</div>}
+                  {s.excerpt && <div className="ml-3 italic text-ui-sm text-neutral-500">{s.excerpt}</div>}
                 </li>
               );
             })}
@@ -245,7 +245,7 @@ function OutcomeSummaryPills({ summary }: { summary: TaskEvaluationSummary }) {
   const highlights = summary.highlights ?? [];
   const { label: verdictLabel, tone: verdictToneId } = formatVerdict(summary.verdict);
   return (
-    <div className="flex flex-wrap gap-1.5 text-[10px]">
+    <div className="flex flex-wrap gap-1.5 text-ui-sm">
       <span className="rounded bg-neutral-800/80 px-1.5 py-0.5 text-neutral-300 uppercase tracking-wide">
         {summary.status}
       </span>
@@ -286,6 +286,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
   const [directionFilter, setDirectionFilter] = useState<string | null>(initialDirectionId ?? null);
   const [recentFindings, setRecentFindings] = useState<RecentFindingsResponse | null>(null);
   const [qualityCardCollapsed, setQualityCardCollapsed] = useState(false);
+  const [gradeFilter, setGradeFilter] = useState<'HIGH' | 'MEDIUM' | 'LOW' | null>(null);
 
   // Fetch recent findings with actionability grades for the quality card
   useEffect(() => {
@@ -502,7 +503,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
               <Compass className="w-4 h-4 text-cyan-400" />
               Findings Journal
             </h3>
-            <p className="text-[10px] text-neutral-500 mt-0.5">
+            <p className="text-ui-sm text-neutral-500 mt-0.5">
               {totalFindings} finding{totalFindings !== 1 ? 's' : ''} across {filteredGroups.length} direction{filteredGroups.length !== 1 ? 's' : ''}
               {outcomeFilter !== 'all' && (
                 <span className="ml-1 text-neutral-600">— filtered by {OUTCOME_FILTER_OPTIONS.find(o => o.value === outcomeFilter)?.label.toLowerCase()}</span>
@@ -519,8 +520,8 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
         <div className="px-4 py-2 border-b border-neutral-800/50 shrink-0 space-y-2">
           {directionFilterText && (
             <div className="flex items-center gap-1.5">
-              <span className="text-[10px] text-neutral-500">Filtered:</span>
-              <span className="flex items-center gap-1 text-[10px] bg-cyan-950/40 border border-cyan-900/50 text-cyan-400 px-2 py-0.5 rounded max-w-[400px] truncate">
+              <span className="text-ui-sm text-neutral-500">Filtered:</span>
+              <span className="flex items-center gap-1 text-ui-sm bg-cyan-950/40 border border-cyan-900/50 text-cyan-400 px-2 py-0.5 rounded max-w-[400px] truncate">
                 <span className="truncate">{directionFilterText.length > 60 ? directionFilterText.slice(0, 60) + '…' : directionFilterText}</span>
                 {/* reason: icon-only clear filter button inline in filter chip; w-2.5 h-2.5 icon */}
                 <button data-viewport-allow-small-target onClick={() => setDirectionFilter(null)} className="ml-0.5 text-cyan-600 hover:text-cyan-300 transition-colors shrink-0">
@@ -541,12 +542,12 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
           </div>
           <div className="flex items-center gap-1 flex-wrap">
             {OUTCOME_FILTER_OPTIONS.map(opt => (
-              // reason: outcome filter chip in compact search toolbar; text-[10px] py-0.5 matches search bar density
+              // reason: outcome filter chip in compact search toolbar; text-ui-sm py-0.5 matches search bar density
               <button
                 data-viewport-allow-small-target
                 key={opt.value}
                 onClick={() => setOutcomeFilter(opt.value)}
-                className={`px-2 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                className={`px-2 py-0.5 rounded text-ui-sm font-medium transition-colors ${
                   outcomeFilter === opt.value
                     ? `bg-neutral-700 ${opt.color}`
                     : 'bg-neutral-900 text-neutral-600 hover:text-neutral-400'
@@ -571,7 +572,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
               >
                 <BarChart2 className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
                 <span className="flex-1 text-xs font-medium text-neutral-200">Research quality</span>
-                <span className="text-[10px] text-neutral-500 shrink-0">{recentFindings.total} findings · last 7d</span>
+                <span className="text-ui-sm text-neutral-500 shrink-0">{recentFindings.total} findings · last 7d</span>
                 {qualityCardCollapsed
                   ? <ChevronRight className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
                   : <ChevronDown className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
@@ -592,29 +593,71 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                         <div style={{ width: `${recentFindings.grade_distribution_pct.LOW}%` }} className="bg-neutral-600" />
                       )}
                     </div>
-                    <div className="flex gap-4 text-[10px]">
-                      <span className="text-emerald-400">{recentFindings.grade_distribution.HIGH} HIGH ({recentFindings.grade_distribution_pct.HIGH}%)</span>
-                      <span className="text-amber-400">{recentFindings.grade_distribution.MEDIUM} MED ({recentFindings.grade_distribution_pct.MEDIUM}%)</span>
-                      <span className="text-neutral-500">{recentFindings.grade_distribution.LOW} LOW ({recentFindings.grade_distribution_pct.LOW}%)</span>
+                    <div className="flex gap-4 text-ui-sm">
+                      {/* reason: grade filter toggle chips; data-viewport-allow-small-target for sub-44px compact rows */}
+                      <button
+                        data-viewport-allow-small-target
+                        onClick={() => setGradeFilter(g => g === 'HIGH' ? null : 'HIGH')}
+                        className={`transition-colors ${gradeFilter === 'HIGH' ? 'text-emerald-300 underline' : 'text-emerald-400 hover:text-emerald-300'}`}
+                        aria-pressed={gradeFilter === 'HIGH'}
+                      >{recentFindings.grade_distribution.HIGH} HIGH ({recentFindings.grade_distribution_pct.HIGH}%)</button>
+                      <button
+                        data-viewport-allow-small-target
+                        onClick={() => setGradeFilter(g => g === 'MEDIUM' ? null : 'MEDIUM')}
+                        className={`transition-colors ${gradeFilter === 'MEDIUM' ? 'text-amber-300 underline' : 'text-amber-400 hover:text-amber-300'}`}
+                        aria-pressed={gradeFilter === 'MEDIUM'}
+                      >{recentFindings.grade_distribution.MEDIUM} MED ({recentFindings.grade_distribution_pct.MEDIUM}%)</button>
+                      <button
+                        data-viewport-allow-small-target
+                        onClick={() => setGradeFilter(g => g === 'LOW' ? null : 'LOW')}
+                        className={`transition-colors ${gradeFilter === 'LOW' ? 'text-neutral-300 underline' : 'text-neutral-500 hover:text-neutral-400'}`}
+                        aria-pressed={gradeFilter === 'LOW'}
+                      >{recentFindings.grade_distribution.LOW} LOW ({recentFindings.grade_distribution_pct.LOW}%)</button>
                     </div>
                   </div>
                   {/* Recent findings list */}
                   <div className="space-y-1">
-                    {recentFindings.findings.slice(0, 10).map((f, i) => (
-                      <div key={i} className="flex items-center gap-2 text-[11px]">
-                        <span className={`shrink-0 px-1.5 py-0.5 rounded text-[9px] font-medium ${
-                          f.actionability_grade === 'HIGH' ? 'bg-emerald-500/20 text-emerald-400' :
-                          f.actionability_grade === 'LOW' ? 'bg-neutral-700 text-neutral-500' :
-                          'bg-amber-500/20 text-amber-400'
-                        }`}>
-                          {f.actionability_grade}
-                        </span>
-                        <span className="text-neutral-300 truncate">{f.title}</span>
-                        {f.researched_at && (
-                          <span className="text-neutral-600 shrink-0 ml-auto">{relativeDate(f.researched_at)}</span>
-                        )}
-                      </div>
-                    ))}
+                    {(gradeFilter ? recentFindings.findings.filter(f => f.actionability_grade === gradeFilter) : recentFindings.findings).slice(0, 10).map((f, i) => {
+                      const handleFindingClick = () => {
+                        // Find the matching EnrichedFinding in the grouped list and expand it
+                        for (const group of groups) {
+                          const match = group.findings.find(ef => ef.taskId === f.task_id && ef.finding.title === f.title);
+                          if (match) {
+                            const fKey = `${match.taskId}-${match.findingIndex}`;
+                            setExpandedFinding(fKey);
+                            const groupKey = match.finding.direction_id || '_undirected';
+                            setExpandedGroups(prev => {
+                              const next = new Set(prev ?? effectiveExpanded);
+                              next.add(groupKey);
+                              return next;
+                            });
+                            if (directionFilter && directionFilter !== (match.finding.direction_id ?? null)) {
+                              setDirectionFilter(null);
+                            }
+                            break;
+                          }
+                        }
+                      };
+                      return (
+                        <button
+                          key={i}
+                          onClick={handleFindingClick}
+                          className="w-full flex items-center gap-2 text-ui-md text-left hover:bg-neutral-800/30 px-1.5 py-1 rounded transition-colors min-h-[44px]"
+                        >
+                          <span className={`shrink-0 px-1.5 py-0.5 rounded text-ui-xs font-medium ${
+                            f.actionability_grade === 'HIGH' ? 'bg-emerald-500/20 text-emerald-400' :
+                            f.actionability_grade === 'LOW' ? 'bg-neutral-700 text-neutral-500' :
+                            'bg-amber-500/20 text-amber-400'
+                          }`}>
+                            {f.actionability_grade}
+                          </span>
+                          <span className="text-neutral-300 truncate">{f.title}</span>
+                          {f.researched_at && (
+                            <span className="text-neutral-600 shrink-0 ml-auto">{relativeDate(f.researched_at)}</span>
+                          )}
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
               )}
@@ -650,7 +693,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                       {group.directionText.length > 120 ? group.directionText.slice(0, 120) + '...' : group.directionText}
                     </span>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0 text-[10px]">
+                  <div className="flex items-center gap-2 shrink-0 text-ui-sm">
                     {group.directionStatus && (
                       <span className={`px-1.5 py-0.5 rounded ${
                         group.directionStatus === 'active' ? 'bg-emerald-500/15 text-emerald-400' :
@@ -717,7 +760,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                             <span className="text-xs text-neutral-200 flex-1 truncate">{ef.finding.title}</span>
                             {ef.finding._provenance_warnings && ef.finding._provenance_warnings.broken_source_ref_count > 0 && (
                               <span
-                                className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 text-[10px] font-mono tabular-nums"
+                                className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 text-ui-sm font-mono tabular-nums"
                                 title={`Broken source refs:\n${ef.finding._provenance_warnings.broken_refs.slice(0, 5).join('\n')}`}
                               >
                                 ⚠ {ef.finding._provenance_warnings.broken_source_ref_count} broken refs
@@ -725,7 +768,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                             )}
                             {ef.outcome?.spawnGateState?.kind === 'fail-open-pass' && (
                               <span
-                                className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 text-[10px]"
+                                className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 text-ui-sm"
                                 title={ef.outcome.spawnGateState.reason ?? 'Passed by fail-open — no challenger verdict was returned'}
                               >
                                 fail-open
@@ -733,7 +776,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                             )}
                             {ef.outcome?.spawnGateState?.kind === 'challenged-pass' && (
                               <span
-                                className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-400 text-[10px]"
+                                className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-400 text-ui-sm"
                                 title={ef.outcome.spawnGateState.reason ?? 'Challenger confirmed this finding as actionable'}
                               >
                                 gate ✓
@@ -749,22 +792,22 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                               if (!deferred) return null;
                               return (
                                 <span
-                                  className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-red-900/40 text-red-400 text-[10px]"
+                                  className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded bg-red-900/40 text-red-400 text-ui-sm"
                                   title={deferred.adversarial_gate_reason ?? 'Refuted by adversarial gate'}
                                 >
                                   refuted
                                 </span>
                               );
                             })()}
-                            <span className="text-[10px] text-neutral-600 shrink-0">{relativeDate(ef.taskCreatedAt)}</span>
+                            <span className="text-ui-sm text-neutral-600 shrink-0">{relativeDate(ef.taskCreatedAt)}</span>
                           </div>
                           {isDetailOpen && (
                             <div className="mt-2 ml-5 space-y-1.5" onClick={e => e.stopPropagation()}>
-                              <p className="text-[11px] text-neutral-400 leading-relaxed">{ef.finding.description}</p>
-                              <div className="flex items-center gap-3 flex-wrap text-[10px] text-neutral-600">
+                              <p className="text-ui-md text-neutral-400 leading-relaxed">{ef.finding.description}</p>
+                              <div className="flex items-center gap-3 flex-wrap text-ui-sm text-neutral-600">
                                 {outcomeInfo && outcomeTaskId && onNavigateToTask
                                   ? (
-                                    // reason: inline outcome label link in compact finding detail; text-[10px]
+                                    // reason: inline outcome label link in compact finding detail; text-ui-sm
                                     <button
                                       data-viewport-allow-small-target
                                       onClick={e => { e.stopPropagation(); onNavigateToTask(outcomeTaskId); }}
@@ -787,7 +830,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                   <span className="font-mono">{ef.finding.related_files.length} file{ef.finding.related_files.length !== 1 ? 's' : ''}</span>
                                 )}
                                 {ef.finding.scope && ef.finding.risk && (
-                                  <span className={`inline-block text-[9px] uppercase px-1 rounded ${
+                                  <span className={`inline-block text-ui-xs uppercase px-1 rounded ${
                                     ef.finding.risk === 'high' ? 'bg-red-900/40 text-red-400' :
                                     ef.finding.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' :
                                     'bg-emerald-900/40 text-emerald-400'
@@ -809,11 +852,11 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                               )}
                               {/* Downstream task chain */}
                               {ef.outcome && (
-                                <div className="flex items-center gap-2 text-[10px] text-neutral-500 mt-1">
+                                <div className="flex items-center gap-2 text-ui-sm text-neutral-500 mt-1">
                                   <span className="text-neutral-600">→</span>
                                   <TaskTypeBadge taskType={ef.outcome.taskType as import('../types/task').TaskType | undefined} />
                                   {ef.outcome.status === 'FAILED' && ef.outcome.failureClass && FAILURE_CLASS_CONFIG[ef.outcome.failureClass] && (
-                                    <span className={`inline-block px-1.5 py-0.5 rounded text-[9px] font-medium ${FAILURE_CLASS_CONFIG[ef.outcome.failureClass].color}`}>
+                                    <span className={`inline-block px-1.5 py-0.5 rounded text-ui-xs font-medium ${FAILURE_CLASS_CONFIG[ef.outcome.failureClass].color}`}>
                                       {FAILURE_CLASS_CONFIG[ef.outcome.failureClass].label}
                                     </span>
                                   )}

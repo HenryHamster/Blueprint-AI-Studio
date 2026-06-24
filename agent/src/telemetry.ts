@@ -39,6 +39,8 @@ export function getCurrentPromptFingerprint(): string | null {
 let _llmCallCount = 0; // @per-role
 let _totalInputTokens = 0; // @per-role
 let _totalOutputTokens = 0; // @per-role
+let _totalCacheCreationInputTokens = 0; // @per-role
+let _totalCacheReadInputTokens = 0; // @per-role
 let _viewportScreenshotForwardedCount = 0; // @per-role
 
 /** Increment the per-task LLM call counter (one per CLI invocation). */
@@ -46,13 +48,31 @@ export function recordLlmCallStart(): void {
   _llmCallCount += 1;
 }
 
-/** Add the input/output token totals reported by a single CLI result event. */
-export function recordLlmTokens(inputTokens: number, outputTokens: number): void {
+/** Add the input/output token totals reported by a single CLI result event.
+ *
+ *  `inputTokens` is the INCLUSIVE sum of all three Anthropic input-token
+ *  classes (uncached + cache-creation + cache-read) so total_input_tokens stays
+ *  backward-compatible. The optional `cacheCreationTokens` / `cacheReadTokens`
+ *  break out the two cache classes into their own counters so the backend can
+ *  price each input class at its true rate. Callers without cache data (e.g.
+ *  text-output-mode estimation) omit them and leave the cache counters at 0. */
+export function recordLlmTokens(
+  inputTokens: number,
+  outputTokens: number,
+  cacheCreationTokens = 0,
+  cacheReadTokens = 0,
+): void {
   if (Number.isFinite(inputTokens) && inputTokens > 0) {
     _totalInputTokens += Math.floor(inputTokens);
   }
   if (Number.isFinite(outputTokens) && outputTokens > 0) {
     _totalOutputTokens += Math.floor(outputTokens);
+  }
+  if (Number.isFinite(cacheCreationTokens) && cacheCreationTokens > 0) {
+    _totalCacheCreationInputTokens += Math.floor(cacheCreationTokens);
+  }
+  if (Number.isFinite(cacheReadTokens) && cacheReadTokens > 0) {
+    _totalCacheReadInputTokens += Math.floor(cacheReadTokens);
   }
 }
 
@@ -68,12 +88,16 @@ export function getLlmTelemetry(): {
   llm_call_count: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  total_cache_creation_input_tokens: number;
+  total_cache_read_input_tokens: number;
   viewport_screenshot_forwarded_count: number;
 } {
   return {
     llm_call_count: _llmCallCount,
     total_input_tokens: _totalInputTokens,
     total_output_tokens: _totalOutputTokens,
+    total_cache_creation_input_tokens: _totalCacheCreationInputTokens,
+    total_cache_read_input_tokens: _totalCacheReadInputTokens,
     viewport_screenshot_forwarded_count: _viewportScreenshotForwardedCount,
   };
 }
@@ -83,6 +107,8 @@ export function resetLlmTelemetry(): void {
   _llmCallCount = 0;
   _totalInputTokens = 0;
   _totalOutputTokens = 0;
+  _totalCacheCreationInputTokens = 0;
+  _totalCacheReadInputTokens = 0;
   _viewportScreenshotForwardedCount = 0;
 }
 
@@ -124,6 +150,8 @@ export type SchemaLabel =
   | 'specialized_result'
   | 'thinker'
   | 'review_verdict'
+  | 'panel_review_lens'
+  | 'strategic'
   | 'unknown';
 
 let _formatMissByReason: Record<string, number> = {}; // @per-role

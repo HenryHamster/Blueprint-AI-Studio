@@ -16,7 +16,7 @@ interface MessagesSummaryCardProps {
 
 export function MessagesSummaryCard({ newMessageCounts, onScrollToBlockers, onScrollToQuestions, onScrollToRoutine }: MessagesSummaryCardProps) {
   return (
-    <div className="mx-2 my-3 p-3 rounded-lg bg-gradient-to-r from-blue-950/40 to-blue-900/30 border border-blue-800/40 text-[11px] text-blue-200/90">
+    <div className="mx-2 my-3 p-3 rounded-lg bg-gradient-to-r from-blue-950/40 to-blue-900/30 border border-blue-800/40 text-ui-md text-blue-200/90">
       <div className="font-semibold mb-2 text-blue-300">Since you last looked</div>
       <div className="space-y-1.5">
         {newMessageCounts.blockers > 0 && (

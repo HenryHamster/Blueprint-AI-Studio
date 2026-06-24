@@ -5495,7 +5495,6 @@ def _qualifier_ci_resolves_green(mocker):
     )
 
 
-
 # ===========================================================================
 # run_qualification — phase 1: guards + snapshot + spawn
 # ===========================================================================
@@ -6160,7 +6159,10 @@ async def test_run_qualification_with_goal_spawns_merge_grade_task(db_session, m
 
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
-    assert version.last_qualification.get("merge_grade_task_id") == result["merge_grade_task_id"]
+    assert (
+        version.last_qualification.get("merge_grade_task_id")
+        == result["merge_grade_task_id"]
+    )
     # No inline blind_merge_grade key on the pending record — grading is now
     # done exclusively by the spawned merge_grade task.
     assert "blind_merge_grade" not in version.last_qualification
@@ -6176,6 +6178,66 @@ async def test_run_qualification_with_goal_spawns_merge_grade_task(db_session, m
     types = sorted((t.first_payload or {}).get("type") for t in tasks)
     assert "release_audit" in types
     assert "release_merge_grade" in types
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_reuses_grade_when_skipped_pr_count_nonzero(
+    db_session, mocker
+):
+    """Regression: a persisted grade with pr_count>0 and skipped_pr_count>0 must
+    allow run_qualification to proceed normally — spawning both audit and
+    merge_grade tasks. Grading is now done exclusively by the spawned
+    merge_grade task; there is no inline re-grade.
+
+    Previously blind_merge_grade_satisfied returned False whenever skipped_pr_count>0,
+    causing incorrect behavior in the qualification pipeline.
+    """
+    from app.blind_merge_grade import BLIND_MERGE_GRADE_KEY
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.goal = "deliver cost-reduction VM substrate change"
+    candidate = "abcd" * 10
+
+    # Pre-seed a grade with pr_count=3 and skipped_pr_count=1 (partial fetch)
+    # — the grade is real and must NOT trigger a re-compute.
+    existing_grade = {
+        "candidate_sha": candidate,
+        "coverage_verdict": "partial",
+        "biggest_gap": "VM substrate not fully migrated",
+        "model": "test-model",
+        "pr_count": 3,
+        "skipped_pr_count": 1,
+        "graded_at": "2026-01-01T00:00:00+00:00",
+    }
+    version.last_qualification = {BLIND_MERGE_GRADE_KEY: existing_grade}
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Qualification proceeds (spawned).
+    assert result["status"] == "spawned", f"unexpected status: {result}"
+
+    # A merge_grade task was spawned for the non-empty goal.
+    assert result.get("merge_grade_task_id"), (
+        "merge_grade_task_id must be set when version.goal is non-empty"
+    )
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert (
+        version.last_qualification.get("merge_grade_task_id")
+        == result["merge_grade_task_id"]
+    )
+    # Grading is now done exclusively by the spawned merge_grade task — no
+    # inline blind_merge_grade key on the pending record.
+    assert "blind_merge_grade" not in version.last_qualification
 
 
 @pytest.mark.asyncio
@@ -8822,6 +8884,132 @@ async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocke
     assert version.status == "open"
     assert version.phase == "stabilize"
     assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_apply_gate_defer_with_duplicate_revision_blocks_instead_of_infra_retry():
+    """Structural defect detection: when the candidate's migration chain has a
+    duplicate revision id, the apply gate returns 'block' (a hard deterministic
+    finding) even when production state is unavailable (the scenario that would
+    normally produce a 'defer' / infra-retry).
+
+    This exercises the structural pre-check added to run_migration_apply_gate:
+    sources are resolved and checked for dup revisions BEFORE the prod-state DB
+    read, so a structurally-defective candidate is surfaced as a real blocking
+    finding instead of being auto-retried as migration_apply_check_unavailable."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.migration_apply_gate import run_migration_apply_gate
+
+    # Two migration files share the same revision id — a deterministic defect.
+    dup_sources = {
+        "0001_init.py": (
+            "revision = 'dup01'\ndown_revision = None\ndef upgrade(): pass\n"
+        ),
+        "0001_also_init.py": (
+            "revision = 'dup01'\ndown_revision = None\ndef upgrade(): pass\n"
+        ),
+        "0002_next.py": (
+            "revision = 'next01'\ndown_revision = 'dup01'\ndef upgrade(): pass\n"
+        ),
+    }
+
+    # A postgres-URL engine pointing at a non-existent host: passes the postgres
+    # URL check but would fail (defer) at the prod-state read step. The structural
+    # check runs before that step, so the result must be 'block', not 'defer'.
+    engine = create_async_engine("postgresql+asyncpg://u:p@127.0.0.1:1/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources=dup_sources,
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "block", (
+        f"expected block on dup revision, got {verdict!r}: {detail}"
+    )
+    assert "dup01" in (detail or ""), f"detail should name the dup revision: {detail!r}"
+
+
+@pytest.mark.asyncio
+async def test_apply_gate_defer_with_broken_chain_blocks_instead_of_infra_retry():
+    """Structural defect detection: when the candidate's migration chain has a
+    broken down_revision pointer (a revision referencing a parent not in the
+    chain) or a cyclic chain (zero structural heads), the apply gate returns
+    'block' (a hard deterministic finding) even when production state is
+    unavailable (the scenario that would normally produce a 'defer'/infra-retry).
+
+    This exercises the structural pre-checks added to run_migration_apply_gate:
+    sources are checked for chain integrity BEFORE the prod-state DB read, so
+    structurally-defective candidates surface as real blocking findings instead
+    of being auto-retried as migration_apply_check_unavailable."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.migration_apply_gate import run_migration_apply_gate
+
+    # Case 1: Broken down_revision — the root migration references a parent
+    # that is not in the chain. The chain appears to have a single head ('0002'),
+    # so the existing multi-head check does NOT catch this; the broken-pointer
+    # check must fire.
+    broken_sources = {
+        "0001_init.py": (
+            "revision = '0001'\ndown_revision = 'missing_parent'\ndef upgrade(): pass\n"
+        ),
+        "0002_next.py": (
+            "revision = '0002'\ndown_revision = '0001'\ndef upgrade(): pass\n"
+        ),
+    }
+
+    # A postgres-URL engine pointing at a non-existent host: passes the postgres
+    # URL check but would fail (defer) at the prod-state read step. The structural
+    # check runs before that step, so the result must be 'block', not 'defer'.
+    engine = create_async_engine("postgresql+asyncpg://u:p@127.0.0.1:1/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources=broken_sources,
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "block", (
+        f"expected block on broken down_revision, got {verdict!r}: {detail}"
+    )
+    assert "0001" in (detail or "") or "missing_parent" in (detail or ""), (
+        f"detail should name the broken revision or missing parent: {detail!r}"
+    )
+    assert "broken" in (detail or "").lower() or "pointer" in (detail or "").lower(), (
+        f"detail should describe the defect class: {detail!r}"
+    )
+
+    # Case 2: Cyclic chain — every revision points to another in the chain, so
+    # there are zero structural heads. The existing multi-head check (>1) does
+    # NOT catch the zero-head case; the cycle check must fire.
+    cyclic_sources = {
+        "0001_a.py": (
+            "revision = '0001'\ndown_revision = '0002'\ndef upgrade(): pass\n"
+        ),
+        "0002_b.py": (
+            "revision = '0002'\ndown_revision = '0001'\ndef upgrade(): pass\n"
+        ),
+    }
+
+    engine2 = create_async_engine("postgresql+asyncpg://u:p@127.0.0.1:1/nope")
+    try:
+        verdict2, detail2 = await run_migration_apply_gate(
+            prod_engine=engine2,
+            candidate_sources=cyclic_sources,
+        )
+    finally:
+        await engine2.dispose()
+
+    assert verdict2 == "block", (
+        f"expected block on cyclic chain, got {verdict2!r}: {detail2}"
+    )
+    assert "cycle" in (detail2 or "").lower() or "zero" in (detail2 or "").lower(), (
+        f"detail should mention cycle or zero heads: {detail2!r}"
+    )
 
 
 # ===========================================================================
@@ -26009,7 +26197,6 @@ class TestBlindMergeGradeBlock:
         )
         assert result["confidence"] == 0.0
         assert result["blocker"] == "merge_grade_goal_coverage"
-
 
 
 @pytest.mark.asyncio

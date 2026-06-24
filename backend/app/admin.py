@@ -20,7 +20,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import func, update, case
+from sqlalchemy import func, update, case, delete
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
@@ -33,7 +33,7 @@ from app.shared_state import (
     get_project_task_branch_namespace,
     limiter,
     resolve_task_branch as _resolve_task_branch,
-    runtime_config,
+    runtime_config as _runtime_config,
 )
 from app.models import (
     Task,
@@ -63,7 +63,12 @@ from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
     resolve_compute_spend_approval,
 )
-from app.vm_cost_rates import validate_compute_request
+from app.vm_cost_rates import (
+    get_compute_rate_per_second,
+    resolve_compute_machine_type,
+    validate_compute_request,
+)
+from app.resource_envelope import resolve_project_hardware_policy
 from app.schemas import TaskEvaluationSummary, TaskEvaluationSummaryItem
 from app.task_outcomes import build_task_evaluation_summary
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
@@ -81,7 +86,7 @@ from app.admin_task_mutations import (
     modify_task_apply,
 )
 from app.task_blocked import strip_fresh_attempt_context
-from app.efficiency_snapshot import _task_llm_cost as _calc_task_llm_cost
+from app.llm_cost_attribution import _task_llm_cost as _calc_task_llm_cost
 from app.time_utils import clear_retry_after
 from app.routers.admin_operator_triggers import (  # noqa: F401
     _record_failure_result,
@@ -621,6 +626,69 @@ async def bulk_archive_tasks(
     )
     await session.commit()
     return {"archived_count": len(lockable_ids), "has_more": len(lockable_ids) == 5000}
+
+
+class PurgeArchiveRequest(BaseModel):
+    older_than_days: int | None = (
+        None  # if set, only purge tasks older than this many days
+    )
+
+
+@router.post("/tasks/purge-archive")
+async def purge_archive_tasks(
+    request: PurgeArchiveRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Permanently delete archived tasks for the caller's projects.
+
+    Only tasks with ``archived=True`` are eligible — live/active tasks are
+    never touched. An optional ``older_than_days`` filter restricts deletion to
+    tasks created more than that many days ago, providing a safety window for
+    recently archived items. Up to 5000 tasks are deleted per call; callers
+    should repeat until ``deleted_count`` is zero if they need to drain a large
+    archive.
+    """
+    user_project_ids = _user_project_ids(current_user["user_id"])
+
+    where_clauses = [
+        Task.archived.is_(True),
+        Task.project_id.in_(user_project_ids),
+    ]
+    if request.older_than_days is not None:
+        if request.older_than_days < 1:
+            raise HTTPException(
+                status_code=400, detail="older_than_days must be at least 1"
+            )
+        cutoff = _utcnow() - timedelta(days=request.older_than_days)
+        where_clauses.append(Task.created_at < cutoff)
+
+    # Fetch up to 5000 IDs to delete in one batch. SKIP LOCKED avoids racing
+    # the orchestrator on tasks that happen to be transitioning (rare but safe).
+    select_stmt = (
+        select(Task.id)
+        .where(*where_clauses)
+        .limit(5000)
+        .with_for_update(skip_locked=True)
+    )
+    ids_to_delete = (await session.execute(select_stmt)).scalars().all()
+    if not ids_to_delete:
+        return {"deleted_count": 0, "has_more": False}
+
+    # Detach any surviving tasks whose parent_task_id points into the delete
+    # batch. The FK (task.parent_task_id -> task.id) was created with NO ACTION
+    # so the DB-level check fires at statement end — a live child referencing a
+    # to-be-deleted parent causes IntegrityError and rolls back the whole purge.
+    # Nulling it out preserves the live child while allowing the parent to be
+    # removed. We must NOT cascade-delete non-archived children.
+    await session.execute(
+        update(Task)
+        .where(Task.parent_task_id.in_(ids_to_delete))
+        .values(parent_task_id=None)
+    )
+    await session.execute(delete(Task).where(Task.id.in_(ids_to_delete)))
+    await session.commit()
+    return {"deleted_count": len(ids_to_delete), "has_more": len(ids_to_delete) == 5000}
 
 
 class BulkActionRequest(BaseModel):
@@ -1235,6 +1303,10 @@ async def get_task(
         "child_task_ids": child_task_ids,
         "child_task_ids_truncated": child_task_ids_truncated,
         "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(task),
+        "vm_machine_type": task.vm_machine_type,
+        "vm_spot": task.vm_spot,
+        "vm_cold_start_ms": task.vm_cold_start_ms,
+        "vm_warm_start": task.vm_warm_start,
         "api_call_summary": task.api_call_summary,
         **_task_llm_cost_fields(task),
         "post_commit_pending": task.post_commit_pending,
@@ -1478,9 +1550,20 @@ class ComputeExperimentTaskPayload(BaseModel):
     success_criterion: ComputeSuccessCriterion | None = None
     require_live_release: bool = False
     require_durable_artifact: bool = False
+    provisioning_model: str | None = None
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
+
+    @field_validator("provisioning_model")
+    @classmethod
+    def validate_provisioning_model(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        normalized = v.upper()
+        if normalized not in {"STANDARD", "SPOT"}:
+            raise ValueError("provisioning_model must be STANDARD or SPOT")
+        return normalized
 
     @field_validator("base_branch")
     @classmethod
@@ -1872,6 +1955,117 @@ async def create_task_manually(
     }
 
 
+class ComputeExperimentPreflightPayload(BaseModel):
+    github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
+    accelerator: str | None = None
+    machine_type: str | None = None
+    spend_cap_usd: float
+    deadline_seconds: int
+    provisioning_model: str | None = None
+
+    @field_validator("provisioning_model")
+    @classmethod
+    def validate_provisioning_model(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        normalized = v.upper()
+        if normalized not in {"STANDARD", "SPOT"}:
+            raise ValueError("provisioning_model must be STANDARD or SPOT")
+        return normalized
+
+
+@router.post("/tasks/compute-experiment/preflight")
+@limiter.limit("60/minute")
+async def compute_experiment_preflight(
+    request: Request,
+    payload: ComputeExperimentPreflightPayload,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return projected cost and hardware-policy verdict for a compute experiment selection."""
+    github_owner, github_repo = payload.github_repo.split("/", 1)
+
+    stmt = select(Project).where(
+        Project.github_owner == github_owner,
+        Project.github_repo == github_repo,
+        Project.id.in_(_user_project_ids(current_user["user_id"])),
+    )
+    project = (await session.execute(stmt)).scalars().first()
+
+    allowed_machines: list[str] | None
+    allowed_accels: list[str] | None
+    if project is not None:
+        allowed_machines, allowed_accels = resolve_project_hardware_policy(project)
+    else:
+        allowed_machines, allowed_accels = None, None
+
+    spec, shape_rejection = validate_compute_request(
+        payload.accelerator,
+        payload.machine_type,
+    )
+
+    resolved_machine_type = resolve_compute_machine_type(
+        accelerator=payload.accelerator,
+        machine_type=payload.machine_type,
+    )
+
+    rate_per_second: float | None = None
+    rate_per_hour: float | None = None
+    projected_cost_usd: float | None = None
+    max_runtime_seconds: int | None = None
+    if shape_rejection is None:
+        spot = payload.provisioning_model == "SPOT"
+        rate_per_second = get_compute_rate_per_second(
+            machine_type=resolved_machine_type,
+            accelerator=payload.accelerator,
+            spot=spot,
+        )
+        rate_per_hour = rate_per_second * 3600
+        projected_cost_usd = rate_per_second * payload.deadline_seconds
+        if rate_per_second > 0:
+            max_runtime_seconds = int(payload.spend_cap_usd / rate_per_second)
+
+    # Policy verdict: use the canonical accelerator name (spec.name) to mirror
+    # the comparison done in _check_project_hardware_policy.
+    canonical_accelerator = spec.name if spec is not None else None
+    in_policy = True
+    reason: str | None = None
+    if shape_rejection is None:
+        if canonical_accelerator is not None:
+            if (
+                allowed_accels is not None
+                and canonical_accelerator not in allowed_accels
+            ):
+                in_policy = False
+                reason = (
+                    f"accelerator {canonical_accelerator!r} is not in the project's "
+                    f"allowed_accelerator_types {allowed_accels!r}"
+                )
+        else:
+            if (
+                allowed_machines is not None
+                and resolved_machine_type not in allowed_machines
+            ):
+                in_policy = False
+                reason = (
+                    f"machine type {resolved_machine_type!r} is not in the project's "
+                    f"allowed_machine_types {allowed_machines!r}"
+                )
+
+    return {
+        "resolved_machine_type": resolved_machine_type,
+        "rate_per_second": rate_per_second,
+        "rate_per_hour": rate_per_hour,
+        "projected_cost_usd": projected_cost_usd,
+        "max_runtime_seconds": max_runtime_seconds,
+        "allowed_accelerator_types": allowed_accels,
+        "allowed_machine_types": allowed_machines,
+        "in_policy": in_policy,
+        "reason": reason,
+        "shape_rejection": shape_rejection,
+    }
+
+
 @router.post("/tasks/compute-experiment")
 @limiter.limit("60/minute")
 async def create_compute_experiment_task(
@@ -1938,6 +2132,7 @@ async def create_compute_experiment_task(
         "benchmark",
         "hypothesis",
         "metric",
+        "provisioning_model",
     ):
         val = getattr(payload, opt_key)
         if val is not None:
@@ -1952,18 +2147,55 @@ async def create_compute_experiment_task(
     # fast with a clear 422 instead of creating a task that can never launch.
     # Accelerator-only requests for supported accelerators stay valid and are
     # canonicalized downstream when the agent launches the actual compute job.
-    _, gpu_reason = validate_compute_request(
+    accel_spec, gpu_reason = validate_compute_request(
         launch_contract.get("accelerator"),
         launch_contract.get("machine_type"),
     )
     if gpu_reason is not None:
         raise HTTPException(status_code=422, detail=gpu_reason)
 
-    requires_approval, threshold = resolve_compute_spend_approval(
-        runtime_config=runtime_config,
-        direction=None,
-        spend_cap_usd=float(launch_contract["spend_cap_usd"]),
+    # Enforce the project's hardware policy before persisting the Task so a
+    # project-disallowed accelerator or machine type fails at dispatch time
+    # rather than silently passing the form and dying later in create_compute_job.
+    _lc_accelerator = launch_contract.get("accelerator")
+    _canonical_accelerator = accel_spec.name if accel_spec is not None else None
+    _resolved_mt = resolve_compute_machine_type(
+        accelerator=_lc_accelerator,
+        machine_type=launch_contract.get("machine_type"),
     )
+    _allowed_machines, _allowed_accels = resolve_project_hardware_policy(project)
+    if _canonical_accelerator is not None:
+        if (
+            _allowed_accels is not None
+            and _canonical_accelerator not in _allowed_accels
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "project_hardware_policy_violated",
+                    "message": (
+                        f"accelerator {_canonical_accelerator!r} is not in the project's "
+                        f"allowed_accelerator_types {_allowed_accels!r}"
+                    ),
+                    "requested": _canonical_accelerator,
+                    "allowed": _allowed_accels,
+                },
+            )
+    else:
+        if _allowed_machines is not None and _resolved_mt not in _allowed_machines:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "project_hardware_policy_violated",
+                    "message": (
+                        f"machine type {_resolved_mt!r} is not in the project's "
+                        f"allowed_machine_types {_allowed_machines!r}"
+                    ),
+                    "requested": _resolved_mt,
+                    "allowed": _allowed_machines,
+                },
+            )
+
     task_payload_raw = {
         "type": "compute_experiment",
         "prompt": payload.prompt,
@@ -1988,6 +2220,7 @@ async def create_compute_experiment_task(
                 "benchmark",
                 "hypothesis",
                 "metric",
+                "provisioning_model",
             )
             if launch_contract.get(k) is not None
         },
@@ -2064,6 +2297,12 @@ async def create_compute_experiment_task(
                 "is_duplicate": True,
             }
 
+    requires_approval, _ = resolve_compute_spend_approval(
+        runtime_config=_runtime_config,
+        direction=None,
+        spend_cap_usd=float(launch_contract["spend_cap_usd"]),
+    )
+
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
     new_task = Task(
         project_id=project.id,
@@ -2076,15 +2315,7 @@ async def create_compute_experiment_task(
         launched_by_user_id=current_user["user_id"],
         requires_approval=requires_approval,
         idempotency_key=scoped_idempotency_key,
-        context={"approval_hold_reason": "spend_budget"} if requires_approval else {},
     )
-    if requires_approval:
-        new_task.latest_status_message = (
-            "Held for operator approval: compute_experiment proposes "
-            f"${float(launch_contract['spend_cap_usd']):.2f} spend cap / "
-            f"{int(launch_contract['deadline_seconds'])}s deadline, exceeding "
-            f"the ${threshold:.2f} approval threshold."
-        )
     session.add(new_task)
     try:
         await session.commit()

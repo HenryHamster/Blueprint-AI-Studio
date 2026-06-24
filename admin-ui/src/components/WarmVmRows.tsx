@@ -11,16 +11,16 @@ export function PoolCostGuardBanner({ guard }: { guard: NonNullable<PoolMetrics[
   const hitRate = guard.hit_rate;
   return (
     <div
-      className="mb-3 px-2 py-1.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 text-[11px] flex items-start gap-2"
+      className="mb-3 px-2 py-1.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 text-ui-md flex items-start gap-2"
       data-testid="pool-cost-guard-banner"
     >
       <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
       <div className="min-w-0">
-        <div className="font-bold uppercase tracking-wide text-[10px] mb-0.5">
+        <div className="font-bold uppercase tracking-wide text-ui-sm mb-0.5">
           Warm-pool cost guard engaged — draining idle members, provisioning paused
         </div>
         {guard.reason && <div className="text-amber-200/90 mb-0.5">{guard.reason}</div>}
-        <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[10px] text-amber-200/80">
+        <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-ui-sm text-amber-200/80">
           <span data-testid="pool-cost-guard-hit-rate">
             hit rate {hitRate === null || hitRate === undefined ? '—' : `${Math.round(hitRate * 100)}%`}
             {' '}/ floor {Math.round(guard.min_hit_rate * 100)}%
@@ -41,7 +41,7 @@ export function PoolMetricsRow({ pool }: { pool: PoolMetrics }) {
   const funnel = pool.funnel;
   const hitRate = funnel?.pool_hit_rate;
   return (
-    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60" data-testid="pool-metrics-row">
+    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-ui-sm text-neutral-400 pt-2 border-t border-neutral-800/60" data-testid="pool-metrics-row">
       <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">
         Warm Pool {pool.enabled ? '(enabled)' : '(disabled)'}
       </span>
@@ -86,11 +86,11 @@ export function BreakerCallout({ name, suppressedUntil, failures, threshold, tes
   return (
     <div
       data-testid={testid}
-      className="px-2 py-1.5 rounded border border-red-500/40 bg-red-500/10 text-red-400 text-[11px] flex flex-wrap items-center gap-x-2 gap-y-1"
+      className="px-2 py-1.5 rounded border border-red-500/40 bg-red-500/10 text-red-400 text-ui-md flex flex-wrap items-center gap-x-2 gap-y-1"
     >
       <AlertTriangle className="w-3 h-3 shrink-0" />
       <span className="font-bold uppercase tracking-wide">{name} breaker</span>
-      <span className="bg-red-500/20 border border-red-500/40 text-red-300 text-[10px] font-bold px-1.5 py-0.5 rounded leading-none">
+      <span className="bg-red-500/20 border border-red-500/40 text-red-300 text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none">
         OPEN
       </span>
       {suppressedUntil && (
@@ -163,7 +163,7 @@ export function AccountRetargetCallout({ pool, poolOn, accountRetargetEnabled, f
   return (
     <div
       data-testid="account-retarget-callout"
-      className="mb-3 px-2 py-1.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 text-[11px] flex flex-wrap items-center gap-x-2 gap-y-1"
+      className="mb-3 px-2 py-1.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 text-ui-md flex flex-wrap items-center gap-x-2 gap-y-1"
     >
       <AlertTriangle className="w-3 h-3 shrink-0 text-amber-400" />
       <span>
@@ -177,7 +177,7 @@ export function AccountRetargetCallout({ pool, poolOn, accountRetargetEnabled, f
         data-testid="account-retarget-enable-btn"
         className={
           'bg-violet-500/20 border border-violet-500/40 text-violet-300 hover:bg-violet-500/30 ' +
-          'text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors shrink-0' +
+          'text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors shrink-0' +
           (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer')
         }
       >
@@ -202,7 +202,7 @@ export function WarmPoolScopeRow({ projects, allowlist, busy, onEnable, onDisabl
   const candidates = projects.filter((p) => !scopedIds.has(p.id));
   return (
     <div
-      className="mb-3 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60"
+      className="mb-3 text-ui-sm text-neutral-400 pt-2 border-t border-neutral-800/60"
       data-testid="warm-pool-scope-row"
     >
       <span className="text-neutral-500 font-bold uppercase tracking-widest block mb-1">
@@ -214,7 +214,7 @@ export function WarmPoolScopeRow({ projects, allowlist, busy, onEnable, onDisabl
           onChange={(e) => setSelected(e.target.value)}
           disabled={busy || candidates.length === 0}
           data-testid="warm-pool-scope-select"
-          className="bg-neutral-800 border border-neutral-700 rounded px-1.5 py-0.5 text-[10px] text-neutral-200 max-w-[180px] disabled:opacity-50"
+          className="bg-neutral-800 border border-neutral-700 rounded px-1.5 py-0.5 text-ui-sm text-neutral-200 max-w-[180px] disabled:opacity-50"
         >
           <option value="">{candidates.length === 0 ? 'all projects scoped' : 'Select project…'}</option>
           {candidates.map((p) => (
@@ -227,7 +227,7 @@ export function WarmPoolScopeRow({ projects, allowlist, busy, onEnable, onDisabl
           data-testid="warm-pool-enable-btn"
           className={
             'bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/30' +
-            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
             (busy || !selected ? ' opacity-50 cursor-not-allowed' : ' cursor-pointer')
           }
         >
@@ -253,7 +253,7 @@ export function WarmPoolScopeRow({ projects, allowlist, busy, onEnable, onDisabl
                 data-testid={`warm-pool-disable-${id}`}
                 className={
                   'bg-neutral-700/40 border border-neutral-600/40 text-neutral-300 hover:bg-neutral-700/60' +
-                  ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+                  ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
                   (busy ? ' opacity-50 cursor-not-allowed' : ' cursor-pointer')
                 }
               >
@@ -289,7 +289,7 @@ export function PoolAccountMixRow({ pool }: { pool: PoolMetrics }) {
   if (entries.length === 0) return null;
   return (
     <div
-      className="mb-3 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60"
+      className="mb-3 text-ui-sm text-neutral-400 pt-2 border-t border-neutral-800/60"
       data-testid="pool-account-mix-row"
     >
       <span className="text-neutral-500 font-bold uppercase tracking-widest block mb-1">
@@ -340,7 +340,7 @@ export function SpawnPinFunnelRow({ funnel }: { funnel: SpawnPinFunnelSnapshot }
   const skippedStale = funnel.skipped_by_reason?.stale_source ?? 0;
   const skippedSuppressed = funnel.skipped_by_reason?.caller_suppressed ?? 0;
   return (
-    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60">
+    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-ui-sm text-neutral-400 pt-2 border-t border-neutral-800/60">
       <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">
         Spawn Pin Funnel ({funnel.window_hours}h)
       </span>
@@ -373,7 +373,7 @@ export function BacklogReuseFunnelRow({ funnel }: { funnel: BacklogReuseFunnelSn
   const scanFile = funnel.scan_polls_with_file_conflict_skip ?? 0;
   const scanSat = funnel.scan_polls_saturated ?? 0;
   return (
-    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60">
+    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-ui-sm text-neutral-400 pt-2 border-t border-neutral-800/60">
       <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">
         Backlog Reuse Funnel ({funnel.window_hours}h)
       </span>
@@ -422,7 +422,7 @@ export function ChainFunnelRow({ funnel }: { funnel: ChainContinuityFunnelSnapsh
   const skippedDisabled = funnel.skipped_by_reason?.disabled ?? 0;
   const skippedBreaker = funnel.skipped_by_reason?.breaker_tripped ?? 0;
   return (
-    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60">
+    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-ui-sm text-neutral-400 pt-2 border-t border-neutral-800/60">
       <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">
         Chain Continuity Funnel ({funnel.window_hours}h)
       </span>
@@ -449,13 +449,13 @@ export function VmCard({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId
   const cur = vm.current_task;
 
   return (
-    <div className="py-2 text-[11px]">
+    <div className="py-2 text-ui-md">
       <div className="flex items-center justify-between gap-2 mb-1">
         <span className="flex items-center gap-1.5 font-mono text-neutral-300" title={vm.vm_instance_id}>
           <span className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${aliveDot}`} />
           {shortVm(vm.vm_instance_id)}
         </span>
-        <span className="font-mono text-neutral-400 text-[10px]">
+        <span className="font-mono text-neutral-400 text-ui-sm">
           {hbAge === null ? <span className="text-neutral-600">no hb</span> : (
             <span className={vm.is_alive ? 'text-neutral-400' : 'text-amber-400'}>
               <Clock className="w-2.5 h-2.5 inline mr-0.5" />{fmtAge(hbAge)}
@@ -472,7 +472,7 @@ export function VmCard({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId
             {cur.warm_start && <Flame aria-label="Warm start" className="w-2.5 h-2.5 text-orange-400 shrink-0"><title>Warm start</title></Flame>}
             <span className="text-neutral-200 truncate" title={cur.title}>{cur.title || '(untitled)'}</span>
           </div>
-          <div className="text-[10px] text-neutral-500 font-mono mt-0.5">
+          <div className="text-ui-sm text-neutral-500 font-mono mt-0.5">
             {cur.task_type}
             {cur.pr_number !== null && <> · PR #{cur.pr_number}</>}
             {cur.warm_start && cur.warm_claim_origin === 'backlog_reuse' && (
@@ -492,7 +492,7 @@ export function VmCard({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId
       ) : (
         <div className="text-neutral-600 italic mb-1">idle</div>
       )}
-      <div className="grid grid-cols-2 gap-x-3 text-[10px] text-neutral-500">
+      <div className="grid grid-cols-2 gap-x-3 text-ui-sm text-neutral-500">
         <span>Setup: <span className="font-mono text-neutral-400">{cur ? fmtSetupSecs(cur.setup_secs) : '—'}</span></span>
         <span>Pinned: <span className="font-mono text-neutral-400">{vm.warm_pinned_queued.length || '—'}</span></span>
         {vm.recent_completions.length > 0 && (
@@ -547,7 +547,7 @@ export function VmRow({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId:
               {cur.warm_start && <Flame aria-label="Warm start" className="w-2.5 h-2.5 text-orange-400 shrink-0"><title>Warm start</title></Flame>}
               <span className="text-neutral-200 truncate max-w-[280px]" title={cur.title}>{cur.title || '(untitled)'}</span>
             </div>
-            <div className="text-[10px] text-neutral-500 font-mono mt-0.5">
+            <div className="text-ui-sm text-neutral-500 font-mono mt-0.5">
               {cur.task_type}
               {cur.pr_number !== null && <> · PR #{cur.pr_number}</>}
               {cur.warm_start && cur.warm_claim_origin === 'backlog_reuse' && (
@@ -585,7 +585,7 @@ export function VmRow({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId:
                 <button
                   key={p.id}
                   onClick={() => onViewTask?.(p.id)}
-                  className="block text-left hover:text-blue-400 transition-colors text-[10px] font-mono"
+                  className="block text-left hover:text-blue-400 transition-colors text-ui-sm font-mono"
                 >
                   <span className="text-neutral-300">{p.task_type}</span>
                   {p.warm_target_pr !== null && <span className="text-neutral-500"> #{p.warm_target_pr}</span>}
@@ -600,7 +600,7 @@ export function VmRow({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId:
         {vm.recent_completions.length === 0 ? (
           <span className="text-neutral-600">—</span>
         ) : (
-          <div className="flex flex-wrap gap-1 text-[10px] font-mono">
+          <div className="flex flex-wrap gap-1 text-ui-sm font-mono">
             {vm.recent_completions.slice(0, 5).map((rc) => (
               <button
                 key={rc.id}

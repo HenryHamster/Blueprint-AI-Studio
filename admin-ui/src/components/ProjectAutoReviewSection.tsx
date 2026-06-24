@@ -56,7 +56,7 @@ export function ProjectAutoReviewSection({ config, canSave, onSave }: ProjectAut
     <div className="space-y-6">
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Auto-Review</h3>
-        <p className="text-[11px] text-neutral-600 mb-3">
+        <p className="text-ui-md text-neutral-600 mb-3">
           Automatically enqueue review tasks for incoming changes on this project.
         </p>
         <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center justify-between">
@@ -85,7 +85,7 @@ export function ProjectAutoReviewSection({ config, canSave, onSave }: ProjectAut
               onChange={e => setMaxPerHourInput(e.target.value)}
               className={`w-full bg-neutral-950 border ${maxPerHourValid ? 'border-neutral-700' : 'border-red-600'} text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600`}
             />
-            {!maxPerHourValid && <p className="text-[11px] text-red-400 mt-1">Enter an integer between 1 and 20.</p>}
+            {!maxPerHourValid && <p className="text-ui-md text-red-400 mt-1">Enter an integer between 1 and 20.</p>}
           </div>
           <div>
             <label className="block text-xs text-neutral-400 mb-1">Max concurrent <span className="text-neutral-600">(1–10)</span></label>
@@ -97,7 +97,7 @@ export function ProjectAutoReviewSection({ config, canSave, onSave }: ProjectAut
               onChange={e => setMaxConcurrentInput(e.target.value)}
               className={`w-full bg-neutral-950 border ${maxConcurrentValid ? 'border-neutral-700' : 'border-red-600'} text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600`}
             />
-            {!maxConcurrentValid && <p className="text-[11px] text-red-400 mt-1">Enter an integer between 1 and 10.</p>}
+            {!maxConcurrentValid && <p className="text-ui-md text-red-400 mt-1">Enter an integer between 1 and 10.</p>}
           </div>
         </div>
       </div>

@@ -54,7 +54,7 @@ resource "google_sql_database_instance" "default" {
       start_time                     = "03:00" # UTC
       transaction_log_retention_days = 7
       backup_retention_settings {
-        retained_backups = 7
+        retained_backups = 3 # down from 7; saves ~57% of backup storage ($0.11/GB-month × backup size × 4 fewer copies)
         retention_unit   = "COUNT"
       }
     }

@@ -12,7 +12,7 @@ export function WaitingBadge({ hours }: { hours: number | undefined }) {
       ? 'bg-amber-500/15 text-amber-400 border-amber-500/20'
       : 'bg-neutral-700/30 text-neutral-500 border-neutral-700/30';
   return (
-    <span className={`shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded border ${color}`}>
+    <span className={`shrink-0 text-ui-xs font-mono px-1.5 py-0.5 rounded border ${color}`}>
       {label}
     </span>
   );
@@ -33,7 +33,7 @@ export function CompletionRow({ c, onSelectTask }: { c: RecentCompletion; onSele
       <div className="shrink-0 flex items-center gap-2">
         {c.direction_text && (
           <span
-            className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[12rem]"
+            className="shrink-0 text-ui-xs px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[12rem]"
             title={c.direction_text}
           >
             {c.direction_text.length > 40 ? c.direction_text.slice(0, 40) + '…' : c.direction_text}
@@ -41,20 +41,20 @@ export function CompletionRow({ c, onSelectTask }: { c: RecentCompletion; onSele
         )}
         {c.scope && (
           <span
-            className="shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
+            className="shrink-0 text-ui-xs uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
             title={`scope: ${c.scope}`}
           >
             {c.scope}
           </span>
         )}
         {typeof c.duration_seconds === 'number' && c.duration_seconds > 0 && (
-          <span className="text-[9px] text-neutral-500 font-mono" title="duration">
+          <span className="text-ui-xs text-neutral-500 font-mono" title="duration">
             {formatDuration(c.duration_seconds)}
           </span>
         )}
         {typeof c.review_iterations === 'number' && c.review_iterations > 1 && (
           <span
-            className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20"
+            className="shrink-0 text-ui-xs px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20"
             title="review iterations"
           >
             {c.review_iterations} cycles
@@ -66,13 +66,13 @@ export function CompletionRow({ c, onSelectTask }: { c: RecentCompletion; onSele
             target="_blank"
             rel="noopener noreferrer"
             onClick={e => e.stopPropagation()}
-            className="text-[9px] text-emerald-400 hover:text-emerald-300 font-medium"
+            className="text-ui-xs text-emerald-400 hover:text-emerald-300 font-medium"
           >
             {prNum ? `PR #${prNum}` : 'PR'}
           </a>
         )}
         {c.completed_at && (
-          <span className="text-[10px] text-neutral-600 font-mono">{timeAgo(c.completed_at)}</span>
+          <span className="text-ui-sm text-neutral-600 font-mono">{timeAgo(c.completed_at)}</span>
         )}
       </div>
     </div>

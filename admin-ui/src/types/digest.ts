@@ -25,8 +25,31 @@
 
 import type { EdgesTrend } from '../components/SrTrendBreakdown';
 import type { SrTrendWithFixIterations } from '../components/ReviewQualitySection';
-import type { ActiveTask } from '../components/CatchUpInProgressSection';
-import type { NeedsAttentionItem } from '../components/CatchUpNeedsAttentionSection';
+export interface ActiveTask {
+  task_id: string;
+  title?: string | null;
+  status: string;
+  task_type?: string;
+  started_at?: string | null;
+  running_cost_usd?: number | null;
+  direction_text?: string | null;
+  scope?: string | null;
+  review_iteration?: number | null;
+  review_cap?: number | null;
+}
+
+export interface NeedsAttentionItem {
+  task_id: string;
+  title?: string | null;
+  reason: string;
+  error_snippet?: string | null;
+  pr_url?: string | null;
+  failure_class?: string | null;
+  scope?: string | null;
+  direction_text?: string | null;
+  merge_retries_saved?: number;
+  waiting_hours?: number;
+}
 
 export interface FailureGroupTask {
   task_id: string;

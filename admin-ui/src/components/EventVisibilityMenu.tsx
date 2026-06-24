@@ -66,11 +66,11 @@ export function EventVisibilityMenu({ open, onOpenChange, messages, eventPrefs, 
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-neutral-300">Event visibility</span>
               {Object.keys(eventPrefs).length > 0 && (
-                <button onClick={onResetAll} className="text-[10px] text-neutral-500 hover:text-red-400 transition-colors">Reset all</button>
+                <button onClick={onResetAll} className="text-ui-sm text-neutral-500 hover:text-red-400 transition-colors">Reset all</button>
               )}
             </div>
             {sortedEventTypes.length === 0 ? (
-              <p className="text-[11px] text-neutral-600 py-1">No events loaded</p>
+              <p className="text-ui-md text-neutral-600 py-1">No events loaded</p>
             ) : sortedEventTypes.map(et => {
               const pref = eventPrefs[et] ?? 'routine';
               const count = eventType24hVolume.get(et) ?? 0;
@@ -78,9 +78,9 @@ export function EventVisibilityMenu({ open, onOpenChange, messages, eventPrefs, 
               return (
                 <div key={et} className="flex items-center gap-1.5">
                   <div className="flex items-center gap-1 flex-1 min-w-0">
-                    <span className="text-[11px] text-neutral-400 truncate">{et.replace(/_/g, ' ')}</span>
+                    <span className="text-ui-md text-neutral-400 truncate">{et.replace(/_/g, ' ')}</span>
                     {count > 0 && (
-                      <span className={`text-[10px] shrink-0 px-1.5 py-0.5 rounded-full font-medium ${
+                      <span className={`text-ui-sm shrink-0 px-1.5 py-0.5 rounded-full font-medium ${
                         isHighVolume
                           ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30'
                           : 'bg-neutral-800 text-neutral-500'
@@ -92,7 +92,7 @@ export function EventVisibilityMenu({ open, onOpenChange, messages, eventPrefs, 
                   {(['surfaced', 'routine', 'mute'] as EventPref[]).map(p => (
                     <button key={p} onClick={() => onUpdatePref(et, p)}
                       title={p}
-                      className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${pref === p ? (p === 'mute' ? 'border-red-500/50 text-red-400 bg-red-500/10' : p === 'surfaced' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' : 'border-neutral-600 text-neutral-300 bg-neutral-800') : 'border-transparent text-neutral-600 hover:text-neutral-400'}`}>
+                      className={`text-ui-sm px-1.5 py-0.5 rounded border transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${pref === p ? (p === 'mute' ? 'border-red-500/50 text-red-400 bg-red-500/10' : p === 'surfaced' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' : 'border-neutral-600 text-neutral-300 bg-neutral-800') : 'border-transparent text-neutral-600 hover:text-neutral-400'}`}>
                       {p === 'surfaced' ? '↑' : p === 'mute' ? '✕' : '·'}
                     </button>
                   ))}

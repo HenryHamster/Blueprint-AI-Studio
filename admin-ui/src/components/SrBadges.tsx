@@ -1,5 +1,14 @@
 import { AlertTriangle } from 'lucide-react';
 import type { Task } from '../types/task';
+import { Badge } from './ui/Badge';
+import type { StatusTone } from './ui/Badge';
+
+const SR_VARIANT_TONE: Record<string, StatusTone> = {
+  pass: 'success',
+  fail: 'blocking',
+  skip: 'neutral',
+  miss: 'warning',
+};
 
 interface SelfReviewCheckResult {
   passed: boolean;
@@ -119,33 +128,21 @@ export function SrBadge({ task, onClick }: { task: Task; onClick?: () => void })
   const state = getSrBadgeState(task);
   if (!state) return null;
 
-  const colorClass =
-    state.variant === 'pass' ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400' :
-    state.variant === 'pass-fixed' ? 'bg-teal-500/10 border-teal-500/20 text-teal-400' :
-    state.variant === 'fail' ? 'bg-red-500/10 border-red-500/20 text-red-400' :
-    state.variant === 'skip' ? 'bg-slate-500/10 border-slate-500/20 text-slate-400' :
-    'bg-amber-500/10 border-amber-500/20 text-amber-400';
-
-  if (onClick) {
-    return (
-      <button
-        type="button"
-        title={state.tooltip}
-        onClick={(e) => { e.stopPropagation(); onClick(); }}
-        className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${colorClass} hover:opacity-80 transition-opacity`}
-      >
-        {state.label}
-      </button>
-    );
-  }
+  const isPassFixed = state.variant === 'pass-fixed';
+  const tone = isPassFixed ? undefined : (SR_VARIANT_TONE[state.variant] ?? 'neutral');
+  // pass-fixed uses teal (distinct from pass/emerald) to signal "passed only after self-correction"
+  const tealClass = isPassFixed ? 'border bg-teal-500/10 border-teal-500/20 text-teal-400' : '';
+  const buttonExtra = onClick ? 'min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto hover:opacity-80 transition-opacity' : '';
 
   return (
-    <span
+    <Badge
+      tone={tone}
       title={state.tooltip}
-      className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass}`}
+      className={[tealClass, buttonExtra].filter(Boolean).join(' ')}
+      onClick={onClick ? (e) => { e.stopPropagation(); onClick(); } : undefined}
     >
       {state.label}
-    </span>
+    </Badge>
   );
 }
 
@@ -157,13 +154,10 @@ export function SrDisallowedBadge({ task }: { task: Task }) {
 
   const tooltip = `Agent emitted ${count} disallowed blind-spot pattern${count !== 1 ? 's' : ''} (filtered before aggregation)\nDisallowed categories: ${DISALLOWED_BLIND_SPOT_LABELS.join(', ')}`;
   return (
-    <span
-      title={tooltip}
-      className="inline-flex items-center gap-0.5 text-[10px] font-medium border px-1.5 py-0.5 rounded bg-amber-500/10 border-amber-500/20 text-amber-400"
-    >
+    <Badge tone="warning" title={tooltip} className="gap-0.5">
       <AlertTriangle className="w-3 h-3 shrink-0" />
       {count} disallowed
-    </span>
+    </Badge>
   );
 }
 
@@ -219,32 +213,22 @@ export function SrDivergenceBadge({ task, onClick }: { task: Task; onClick?: () 
   if (!state) return null;
 
   const isMissed = state.variant === 'missed';
-  const colorClass = isMissed ? 'bg-red-500/10 border-red-500/20 text-red-400' : 'bg-amber-500/10 border-amber-500/20 text-amber-400';
+  const tone = isMissed ? 'blocking' : 'warning';
   const label = isMissed ? `SR missed ${state.category}` : `SR over-flagged ${state.category}`;
   const allLabels = state.allDivergences.map(d => `${d.variant === 'missed' ? 'missed' : 'over-flagged'} ${d.category}`).join(', ');
   const tooltip = state.allDivergences.length > 1
     ? `${label}; all divergences: ${allLabels}`
     : label;
-
-  if (onClick) {
-    return (
-      <button
-        type="button"
-        title={tooltip}
-        onClick={(e) => { e.stopPropagation(); onClick(); }}
-        className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${colorClass} hover:opacity-80 transition-opacity`}
-      >
-        {label}
-      </button>
-    );
-  }
+  const buttonExtra = onClick ? 'min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto hover:opacity-80 transition-opacity' : '';
 
   return (
-    <span
+    <Badge
+      tone={tone}
       title={tooltip}
-      className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass}`}
+      className={buttonExtra}
+      onClick={onClick ? (e) => { e.stopPropagation(); onClick(); } : undefined}
     >
       {label}
-    </span>
+    </Badge>
   );
 }

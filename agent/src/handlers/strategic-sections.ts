@@ -652,6 +652,16 @@ export function buildConversationThreadSection(conversationThread: Array<Record<
     }).join('\n') + '\n';
 }
 
+export function buildQuestionSection(openMessages: Array<Record<string, unknown>>): string {
+  const questionMessages = openMessages.filter(m => strVal(m.type) === 'QUESTION');
+  if (questionMessages.length === 0) return '';
+  const questionLines = questionMessages.map(m => {
+    const age = calcMessageAge(m);
+    return `- (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 5000)}`;
+  }).join('\n');
+  return `\n## Operator Questions Awaiting Answers\nThese QUESTION messages are direct operator questions. Answer each unanswered one by resolving it with a substantive answer via \`./messages resolve <id> '<answer>'\`:\n${questionLines}\n`;
+}
+
 export function buildFeedbackSection(openMessages: Array<Record<string, unknown>>): string {
   const feedbackMessages = openMessages.filter(m => strVal(m.type) === 'FEEDBACK');
   if (feedbackMessages.length === 0) return '';

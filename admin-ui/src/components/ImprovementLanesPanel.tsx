@@ -76,14 +76,14 @@ function CheckpointRow({ cp }: { cp: ImprovementLaneCheckpoint }) {
   };
   return (
     <tr className="border-t border-neutral-800/60">
-      <td className="py-1 pr-3 font-mono text-[10px] text-neutral-500">{cp.seq}</td>
-      <td className="py-1 pr-3 font-mono text-[10px] text-neutral-300">{cp.phase}</td>
-      <td className="py-1 pr-3 font-mono text-[10px] text-neutral-400">{short(cp.sha)}</td>
+      <td className="py-1 pr-3 font-mono text-ui-sm text-neutral-500">{cp.seq}</td>
+      <td className="py-1 pr-3 font-mono text-ui-sm text-neutral-300">{cp.phase}</td>
+      <td className="py-1 pr-3 font-mono text-ui-sm text-neutral-400">{short(cp.sha)}</td>
       <td className="py-1 pr-3 text-center">{boolBadge(cp.validated?.lint)}</td>
       <td className="py-1 pr-3 text-center">{boolBadge(cp.validated?.tests)}</td>
       <td className="py-1 pr-3 text-center">{cp.warm_resume == null ? <span className="text-neutral-600">—</span> : cp.warm_resume ? <span className="text-emerald-400">warm</span> : <span className="text-neutral-400">cold</span>}</td>
-      <td className="py-1 pr-3 text-[10px] text-neutral-400">{cp.tokens_in != null ? cp.tokens_in.toLocaleString() : '—'}</td>
-      <td className="py-1 text-[10px] text-neutral-400">{cp.vm_cost_usd != null ? `$${cp.vm_cost_usd.toFixed(4)}` : '—'}</td>
+      <td className="py-1 pr-3 text-ui-sm text-neutral-400">{cp.tokens_in != null ? cp.tokens_in.toLocaleString() : '—'}</td>
+      <td className="py-1 text-ui-sm text-neutral-400">{cp.vm_cost_usd != null ? `$${cp.vm_cost_usd.toFixed(4)}` : '—'}</td>
     </tr>
   );
 }
@@ -91,8 +91,8 @@ function CheckpointRow({ cp }: { cp: ImprovementLaneCheckpoint }) {
 function ManifestSection({ manifest }: { manifest: ImprovementLaneManifest }) {
   const listItems = (items: unknown[] | null | undefined) =>
     items && items.length > 0
-      ? <ul className="mt-0.5 space-y-0.5">{items.map((it, i) => <li key={i} className="font-mono text-[10px] text-neutral-300">{String(it)}</li>)}</ul>
-      : <span className="text-[10px] text-neutral-600">none</span>;
+      ? <ul className="mt-0.5 space-y-0.5">{items.map((it, i) => <li key={i} className="font-mono text-ui-sm text-neutral-300">{String(it)}</li>)}</ul>
+      : <span className="text-ui-sm text-neutral-600">none</span>;
 
   const hasContent =
     manifest.progress != null ||
@@ -104,23 +104,23 @@ function ManifestSection({ manifest }: { manifest: ImprovementLaneManifest }) {
     manifest.recovery != null;
 
   if (!hasContent) {
-    return <div className="text-[10px] text-neutral-600">No manifest data</div>;
+    return <div className="text-ui-sm text-neutral-600">No manifest data</div>;
   }
 
   return (
     <div className="space-y-2">
       {manifest.progress != null && (
         <div>
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Progress</div>
-          <div className="mt-0.5 text-[10px] text-neutral-300">{String(manifest.progress)}</div>
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Progress</div>
+          <div className="mt-0.5 text-ui-sm text-neutral-300">{String(manifest.progress)}</div>
         </div>
       )}
       {manifest.phase_log && manifest.phase_log.length > 0 && (
         <div>
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Phase log</div>
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Phase log</div>
           <div className="mt-0.5 space-y-0.5">
             {manifest.phase_log.map((entry, i) => (
-              <div key={i} className="font-mono text-[10px] text-neutral-300">
+              <div key={i} className="font-mono text-ui-sm text-neutral-300">
                 {typeof entry === 'object' ? JSON.stringify(entry) : String(entry)}
               </div>
             ))}
@@ -129,32 +129,32 @@ function ManifestSection({ manifest }: { manifest: ImprovementLaneManifest }) {
       )}
       {(manifest.remaining as unknown[] | null | undefined) && (manifest.remaining as unknown[]).length > 0 && (
         <div>
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Remaining</div>
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Remaining</div>
           {listItems(manifest.remaining as unknown[])}
         </div>
       )}
       {manifest.critical_files && manifest.critical_files.length > 0 && (
         <div>
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Critical files</div>
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Critical files</div>
           {listItems(manifest.critical_files)}
         </div>
       )}
       {manifest.failing_tests && manifest.failing_tests.length > 0 && (
         <div>
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Failing tests</div>
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Failing tests</div>
           {listItems(manifest.failing_tests)}
         </div>
       )}
       {manifest.risks && manifest.risks.length > 0 && (
         <div>
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Risks</div>
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Risks</div>
           {listItems(manifest.risks)}
         </div>
       )}
       {manifest.recovery != null && (
         <div>
-          <div className="text-[10px] uppercase tracking-wide text-neutral-500">Recovery</div>
-          <div className="mt-0.5 font-mono text-[10px] text-neutral-300">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Recovery</div>
+          <div className="mt-0.5 font-mono text-ui-sm text-neutral-300">
             {typeof manifest.recovery === 'object' ? JSON.stringify(manifest.recovery) : String(manifest.recovery)}
           </div>
         </div>
@@ -165,7 +165,7 @@ function ManifestSection({ manifest }: { manifest: ImprovementLaneManifest }) {
 
 function CurrentTaskSection({ task }: { task: ImprovementLaneCurrentTask | null }) {
   if (task == null) {
-    return <div className="text-[10px] text-neutral-600">No task currently running</div>;
+    return <div className="text-ui-sm text-neutral-600">No task currently running</div>;
   }
   const statusColors: Record<string, string> = {
     IN_PROGRESS: 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300',
@@ -176,16 +176,16 @@ function CurrentTaskSection({ task }: { task: ImprovementLaneCurrentTask | null 
   const statusClass = statusColors[task.status?.toUpperCase()] ?? 'border-neutral-700 bg-neutral-800 text-neutral-300';
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <span className={`rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${statusClass}`}>
+      <span className={`rounded border px-1.5 py-0.5 text-ui-sm font-bold uppercase leading-none ${statusClass}`}>
         {task.status}
       </span>
       {task.task_type && (
-        <span className="rounded border border-neutral-700 bg-neutral-800 px-1.5 py-0.5 text-[10px] leading-none text-neutral-400">
+        <span className="rounded border border-neutral-700 bg-neutral-800 px-1.5 py-0.5 text-ui-sm leading-none text-neutral-400">
           {task.task_type}
         </span>
       )}
-      <span className="text-[10px] text-neutral-300">{task.title ?? '—'}</span>
-      <span className="font-mono text-[10px] text-neutral-600">{task.task_id}</span>
+      <span className="text-ui-sm text-neutral-300">{task.title ?? '—'}</span>
+      <span className="font-mono text-ui-sm text-neutral-600">{task.task_id}</span>
     </div>
   );
 }
@@ -228,7 +228,7 @@ function LaneDetailPanel({ projectId, laneId }: LaneDetailPanelProps) {
     return (
       <div className="flex items-center gap-2 px-3 py-3 text-neutral-500">
         <RefreshCw className="h-3 w-3 animate-spin" />
-        <span className="text-[11px]">Loading detail…</span>
+        <span className="text-ui-md">Loading detail…</span>
       </div>
     );
   }
@@ -237,7 +237,7 @@ function LaneDetailPanel({ projectId, laneId }: LaneDetailPanelProps) {
     return (
       <div className="flex items-start gap-2 px-3 py-2 text-red-300">
         <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
-        <span className="text-[11px]">{error}</span>
+        <span className="text-ui-md">{error}</span>
       </div>
     );
   }
@@ -250,22 +250,22 @@ function LaneDetailPanel({ projectId, laneId }: LaneDetailPanelProps) {
     <div className="border-t border-neutral-800/80 bg-neutral-950/40 px-3 py-3 space-y-4">
       {/* Current task */}
       <div>
-        <div className="mb-1.5 text-[10px] uppercase tracking-wide text-neutral-500 font-semibold">Current task</div>
+        <div className="mb-1.5 text-ui-sm uppercase tracking-wide text-neutral-500 font-semibold">Current task</div>
         <CurrentTaskSection task={detail.current_task} />
       </div>
 
       {/* Checkpoint history */}
       <div>
-        <div className="mb-1.5 text-[10px] uppercase tracking-wide text-neutral-500 font-semibold">
+        <div className="mb-1.5 text-ui-sm uppercase tracking-wide text-neutral-500 font-semibold">
           Checkpoint history ({checkpoints.length})
         </div>
         {checkpoints.length === 0 ? (
-          <div className="text-[10px] text-neutral-600">No checkpoints yet</div>
+          <div className="text-ui-sm text-neutral-600">No checkpoints yet</div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-[11px]">
+            <table className="w-full text-left text-ui-md">
               <thead>
-                <tr className="text-[10px] uppercase tracking-wide text-neutral-600">
+                <tr className="text-ui-sm uppercase tracking-wide text-neutral-600">
                   <th className="pb-1 pr-3 font-medium">#</th>
                   <th className="pb-1 pr-3 font-medium">Phase</th>
                   <th className="pb-1 pr-3 font-medium">SHA</th>
@@ -286,7 +286,7 @@ function LaneDetailPanel({ projectId, laneId }: LaneDetailPanelProps) {
 
       {/* Manifest */}
       <div>
-        <div className="mb-1.5 text-[10px] uppercase tracking-wide text-neutral-500 font-semibold">Manifest</div>
+        <div className="mb-1.5 text-ui-sm uppercase tracking-wide text-neutral-500 font-semibold">Manifest</div>
         <ManifestSection manifest={detail.manifest} />
       </div>
     </div>
@@ -417,25 +417,25 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
         onClick={toggleCollapsed}
         data-testid="improvement-lanes-toggle"
         aria-expanded={!collapsed}
-        className="flex flex-wrap min-h-[44px] w-full items-center gap-2 px-1 py-1 text-[11px] font-bold uppercase tracking-widest text-neutral-400 transition-colors hover:text-neutral-300"
+        className="flex flex-wrap min-h-[44px] w-full items-center gap-2 px-1 py-1 text-ui-md font-bold uppercase tracking-widest text-neutral-400 transition-colors hover:text-neutral-300"
       >
         {collapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
         <GitBranch className="h-3 w-3" />
         Improvement lanes
         {hasLanes && (
-          <span className="ml-1 rounded-full border border-neutral-700 bg-neutral-800 px-1.5 py-0.5 text-[10px] font-bold leading-none text-neutral-300">
+          <span className="ml-1 rounded-full border border-neutral-700 bg-neutral-800 px-1.5 py-0.5 text-ui-sm font-bold leading-none text-neutral-300">
             {lanes.length} lanes
           </span>
         )}
         {activeCount > 0 && (
-          <span className="rounded-full border border-emerald-500/30 bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-bold leading-none text-emerald-300">
+          <span className="rounded-full border border-emerald-500/30 bg-emerald-500/15 px-1.5 py-0.5 text-ui-sm font-bold leading-none text-emerald-300">
             {activeCount} active
           </span>
         )}
         {shadowCount > 0 && (
           <span
             data-testid="improvement-lanes-shadow-summary"
-            className="rounded-full border border-orange-500/30 bg-orange-500/15 px-1.5 py-0.5 text-[10px] font-bold leading-none text-orange-300"
+            className="rounded-full border border-orange-500/30 bg-orange-500/15 px-1.5 py-0.5 text-ui-sm font-bold leading-none text-orange-300"
           >
             {shadowCount} shadow
           </span>
@@ -443,13 +443,13 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
         {shadowHealth && shadowHealth.shadow_lane_count > 0 && shadowHealth.miss_rate != null && (
           <span
             data-testid="improvement-lanes-shadow-miss-rate"
-            className={`rounded-full border px-1.5 py-0.5 text-[10px] font-bold leading-none ${shadowHealth.miss_rate > 0 ? 'border-amber-500/30 bg-amber-500/15 text-amber-300' : 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300'}`}
+            className={`rounded-full border px-1.5 py-0.5 text-ui-sm font-bold leading-none ${shadowHealth.miss_rate > 0 ? 'border-amber-500/30 bg-amber-500/15 text-amber-300' : 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300'}`}
           >
             miss {(shadowHealth.miss_rate * 100).toFixed(0)}%
           </span>
         )}
         {collapsed && fetchError && (
-          <span className="ml-1 rounded-full border border-red-500/30 bg-red-500/15 px-1.5 py-0.5 text-[10px] font-bold leading-none text-red-300">
+          <span className="ml-1 rounded-full border border-red-500/30 bg-red-500/15 px-1.5 py-0.5 text-ui-sm font-bold leading-none text-red-300">
             Error
           </span>
         )}
@@ -470,7 +470,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
           {preflightError && (
             <div className="mb-3 flex items-start gap-2 rounded border border-amber-500/20 bg-amber-500/10 px-3 py-2">
               <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-amber-400" />
-              <span className="min-w-0 break-words text-amber-300 text-[11px]">Preflight data unavailable</span>
+              <span className="min-w-0 break-words text-amber-300 text-ui-md">Preflight data unavailable</span>
             </div>
           )}
           {preflight && (
@@ -486,12 +486,12 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                   {preflight.ready ? 'Pilot ready to enable' : 'Prerequisites unmet'}
                 </span>
                 {preflight.pilot_mode && preflight.pilot_mode !== 'off' && (
-                  <span className={`rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${preflight.pilot_mode === 'on' ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : 'border-amber-500/40 bg-amber-500/15 text-amber-300'}`}>
+                  <span className={`rounded border px-1.5 py-0.5 text-ui-sm font-bold uppercase leading-none ${preflight.pilot_mode === 'on' ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : 'border-amber-500/40 bg-amber-500/15 text-amber-300'}`}>
                     {preflight.pilot_mode === 'on' ? 'pilot on' : 'shadow'}
                   </span>
                 )}
                 {preflight.durable_verdict && (
-                  <span className={`ml-auto rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${preflight.durable_verdict === 'KILL' ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'}`}>
+                  <span className={`ml-auto rounded border px-1.5 py-0.5 text-ui-sm font-bold uppercase leading-none ${preflight.durable_verdict === 'KILL' ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'}`}>
                     {preflight.durable_verdict}
                   </span>
                 )}
@@ -523,16 +523,16 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
             >
               <div className="mb-1.5 flex items-center gap-1.5">
                 <span className="font-semibold text-neutral-200">Trial metrics</span>
-                <span className={`ml-auto rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${trialMetrics.verdict === 'KILL' ? 'border-red-500/40 bg-red-500/15 text-red-300' : trialMetrics.verdict === 'ADOPT' ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : 'border-neutral-700 bg-neutral-800 text-neutral-300'}`}>
+                <span className={`ml-auto rounded border px-1.5 py-0.5 text-ui-sm font-bold uppercase leading-none ${trialMetrics.verdict === 'KILL' ? 'border-red-500/40 bg-red-500/15 text-red-300' : trialMetrics.verdict === 'ADOPT' ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : 'border-neutral-700 bg-neutral-800 text-neutral-300'}`}>
                   {trialMetrics.verdict}
                 </span>
                 {trialMetrics.immediate_alert && (
-                  <span className="rounded border border-red-500/40 bg-red-500/15 px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none text-red-300">
+                  <span className="rounded border border-red-500/40 bg-red-500/15 px-1.5 py-0.5 text-ui-sm font-bold uppercase leading-none text-red-300">
                     Alert
                   </span>
                 )}
               </div>
-              <div className="mb-1.5 text-[10px] text-neutral-500">
+              <div className="mb-1.5 text-ui-sm text-neutral-500">
                 Reason: <span className="font-mono text-neutral-300">{trialMetrics.verdict_reason}</span>
               </div>
               <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-neutral-400 sm:grid-cols-4">
@@ -597,10 +597,10 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                 };
                 return (
                   <div className="mt-2 border-t border-neutral-700/60 pt-2">
-                    <div className="mb-1 text-[10px] text-neutral-500">
+                    <div className="mb-1 text-ui-sm text-neutral-500">
                       Relay comparison vs v{cmp.source_version.version_number}
                     </div>
-                    <div className="grid grid-cols-4 gap-x-4 gap-y-0.5 text-[10px] text-neutral-400">
+                    <div className="grid grid-cols-4 gap-x-4 gap-y-0.5 text-ui-sm text-neutral-400">
                       <div className="text-neutral-600" />
                       <div className="text-neutral-500">Wall clock</div>
                       <div className="text-neutral-500">Active</div>
@@ -684,7 +684,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
               data-testid="drain-lane-pilot-button"
               disabled={draining || !projectId}
               onClick={() => setShowDrainConfirm(true)}
-              className="min-h-[44px] rounded border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-semibold text-red-400 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+              className="min-h-[44px] rounded border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-ui-md font-semibold text-red-400 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {draining ? 'Draining…' : 'Drain / Kill Pilot'}
             </button>
@@ -693,17 +693,17 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
               data-testid="reclaim-orphaned-button"
               disabled={reclaiming || !projectId}
               onClick={handleReclaimOrphaned}
-              className="min-h-[44px] rounded border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-[11px] font-semibold text-amber-400 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+              className="min-h-[44px] rounded border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-ui-md font-semibold text-amber-400 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {reclaiming ? 'Reclaiming…' : 'Reclaim Orphaned'}
             </button>
             {drainResult && (
-              <span className="text-[11px] text-emerald-400" data-testid="drain-result-summary">
+              <span className="text-ui-md text-emerald-400" data-testid="drain-result-summary">
                 Pilot drained: {drainResult.reservations_cleared} reservation{drainResult.reservations_cleared !== 1 ? 's' : ''} released, {drainResult.lanes_killed} lane{drainResult.lanes_killed !== 1 ? 's' : ''} killed
               </span>
             )}
             {reclaimResult != null && (
-              <span className="text-[11px] text-emerald-400" data-testid="reclaim-result-summary">
+              <span className="text-ui-md text-emerald-400" data-testid="reclaim-result-summary">
                 Reclaimed {reclaimResult} orphaned lane{reclaimResult !== 1 ? 's' : ''}
               </span>
             )}
@@ -769,13 +769,13 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                       >
                         {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
                       </button>
-                      <span className={`rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${statusClasses(lane.status)}`}>
+                      <span className={`rounded border px-1.5 py-0.5 text-ui-sm font-bold uppercase leading-none ${statusClasses(lane.status)}`}>
                         {lane.status}
                       </span>
                       {lane.shadow && (
                         <span
                           data-testid="improvement-lane-shadow-badge"
-                          className={`rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase leading-none ${shadowClasses(true)}`}
+                          className={`rounded border px-1.5 py-0.5 text-ui-sm font-bold uppercase leading-none ${shadowClasses(true)}`}
                         >
                           Shadow mode
                         </span>
@@ -786,21 +786,21 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                             {lane.title}
                           </span>
                         )}
-                        <span className={`block truncate ${lane.title ? 'font-mono text-[10px] text-neutral-500' : 'font-medium text-neutral-200'}`}>
+                        <span className={`block truncate ${lane.title ? 'font-mono text-ui-sm text-neutral-500' : 'font-medium text-neutral-200'}`}>
                           {lane.branch ?? '—'}
                         </span>
-                        <span className="block truncate font-mono text-[10px] text-neutral-500">
+                        <span className="block truncate font-mono text-ui-sm text-neutral-500">
                           {lane.direction_id ?? '—'}
                         </span>
                       </span>
-                      <span className="shrink-0 text-[10px] text-neutral-500">
+                      <span className="shrink-0 text-ui-sm text-neutral-500">
                         {formatCheckpointAge(lane.last_checkpoint_sha, lane.last_checkpoint_age_seconds)}
                       </span>
                     </div>
 
                     <div className="grid grid-cols-1 gap-2 border-t border-neutral-800/80 px-3 py-2 sm:grid-cols-2 xl:grid-cols-4">
                       <div>
-                        <div className="text-[10px] uppercase tracking-wide text-neutral-500">Checkpoint</div>
+                        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Checkpoint</div>
                         <div className="mt-0.5 break-words text-neutral-300">
                           <span className="font-medium">{lane.last_checkpoint_phase ?? '—'}</span>
                           <span className="text-neutral-600"> · </span>
@@ -814,7 +814,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                       </div>
 
                       <div>
-                        <div className="text-[10px] uppercase tracking-wide text-neutral-500">Workspace</div>
+                        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Workspace</div>
                         <div className="mt-0.5 break-words text-neutral-300">
                           {lane.workspace_state ?? '—'}
                         </div>
@@ -824,7 +824,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                       </div>
 
                       <div>
-                        <div className="text-[10px] uppercase tracking-wide text-neutral-500">Reservation</div>
+                        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Reservation</div>
                         <div className="mt-0.5 break-words text-neutral-300">
                           {lane.reserved_vm_instance_id ?? '—'}
                         </div>
@@ -837,7 +837,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                             Expires {reservationExpiresAt}
                           </div>
                         )}
-                        <div className="mt-1 space-y-0.5 text-[10px]" data-testid="reservation-cause-breakdown">
+                        <div className="mt-1 space-y-0.5 text-ui-sm" data-testid="reservation-cause-breakdown">
                           <div>
                             <span className="text-neutral-500">Claimed </span>
                             <span className={lane.reservation_claimed_by_fix_count != null && lane.reservation_claimed_by_fix_count > 0 ? 'font-medium text-emerald-400' : 'text-neutral-400'}>
@@ -860,7 +860,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                       </div>
 
                       <div>
-                        <div className="text-[10px] uppercase tracking-wide text-neutral-500">Pilot / requeues</div>
+                        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Pilot / requeues</div>
                         <div className="mt-0.5 break-words text-neutral-300">
                           {lane.pilot_arm ?? '—'}
                         </div>
@@ -868,7 +868,7 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
                           Phase requeues {lane.phase_requeues}
                         </div>
                         {lane.recovery && (
-                          <div className="mt-1 space-y-0.5 text-[10px]" data-testid="lane-recovery">
+                          <div className="mt-1 space-y-0.5 text-ui-sm" data-testid="lane-recovery">
                             <div className={lane.recovery.exhausted ? 'font-medium text-red-400' : 'text-amber-400'}>
                               Recovery #{lane.recovery.attempt}{lane.recovery.exhausted ? ' (exhausted)' : ''}
                             </div>
@@ -880,22 +880,22 @@ export function ImprovementLanesPanel({ projectId }: ImprovementLanesPanelProps)
 
                     <div className="grid grid-cols-2 gap-2 border-t border-neutral-800/80 px-3 py-2 text-neutral-300 sm:grid-cols-4">
                       <div>
-                        <div className="text-[10px] uppercase tracking-wide text-neutral-500">LLM input</div>
+                        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">LLM input</div>
                         <div className="mt-0.5">{lane.llm_input_tokens_total ?? '—'}</div>
                       </div>
                       <div>
-                        <div className="text-[10px] uppercase tracking-wide text-neutral-500">LLM output</div>
+                        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">LLM output</div>
                         <div className="mt-0.5">{lane.llm_output_tokens_total ?? '—'}</div>
                       </div>
                       <div>
-                        <div className="text-[10px] uppercase tracking-wide text-neutral-500">VM cost</div>
+                        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">VM cost</div>
                         <div className="mt-0.5 inline-flex items-center gap-1">
                           <CircleDollarSign className="h-3 w-3 shrink-0 text-neutral-500" />
                           {formatUsd(lane.vm_cost_usd_total)}
                         </div>
                       </div>
                       <div>
-                        <div className="text-[10px] uppercase tracking-wide text-neutral-500">Reserved idle / loss</div>
+                        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Reserved idle / loss</div>
                         <div className="mt-0.5 inline-flex items-center gap-1">
                           <TimerReset className="h-3 w-3 shrink-0 text-neutral-500" />
                           {formatUsd(lane.reserved_idle_cost_usd_total)} / {lane.checkpoint_loss_count}

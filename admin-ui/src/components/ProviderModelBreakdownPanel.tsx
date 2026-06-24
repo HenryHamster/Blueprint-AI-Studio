@@ -85,14 +85,14 @@ function QuarantineBadge({
 
   return (
     <div className="flex items-center gap-1.5 flex-wrap">
-      <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded border bg-orange-500/20 text-orange-400 border-orange-500/30 uppercase">
+      <span className="text-ui-xs font-semibold px-1.5 py-0.5 rounded border bg-orange-500/20 text-orange-400 border-orange-500/30 uppercase">
         quarantine:{qs.kind}
       </span>
       {qs.started_at && (
-        <span className="text-[9px] text-neutral-500">{fmtDate(qs.started_at)}</span>
+        <span className="text-ui-xs text-neutral-500">{fmtDate(qs.started_at)}</span>
       )}
       {qs.account_rate != null && qs.project_median != null && (
-        <span className="text-[9px] text-neutral-500 font-mono">
+        <span className="text-ui-xs text-neutral-500 font-mono">
           {fmtPct(qs.account_rate)} vs {fmtPct(qs.project_median)} median
         </span>
       )}
@@ -103,14 +103,14 @@ function QuarantineBadge({
             <button
               onClick={doClear}
               disabled={clearing}
-              className="text-[9px] px-1.5 py-0.5 rounded bg-orange-500/30 text-orange-300 hover:bg-orange-500/50 transition-colors disabled:opacity-50"
+              className="text-ui-xs px-1.5 py-0.5 rounded bg-orange-500/30 text-orange-300 hover:bg-orange-500/50 transition-colors disabled:opacity-50"
             >
               {clearing ? 'Clearing…' : 'Confirm clear'}
             </button>
             {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               onClick={() => setConfirming(false)}
-              className="text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/50 text-neutral-400 hover:bg-neutral-700 transition-colors"
+              className="text-ui-xs px-1.5 py-0.5 rounded bg-neutral-700/50 text-neutral-400 hover:bg-neutral-700 transition-colors"
             >
               Cancel
             </button>
@@ -119,7 +119,7 @@ function QuarantineBadge({
           // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             onClick={() => setConfirming(true)}
-            className="text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/50 text-neutral-400 hover:text-orange-300 hover:bg-orange-500/20 transition-colors"
+            className="text-ui-xs px-1.5 py-0.5 rounded bg-neutral-700/50 text-neutral-400 hover:text-orange-300 hover:bg-orange-500/20 transition-colors"
           >
             Clear quarantine
           </button>
@@ -183,10 +183,10 @@ export function ProviderModelBreakdownPanel({
   if (!hasSucceeded && pollError) {
     return (
       <section>
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+        <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
           Provider / Model Breakdown
         </h2>
-        <div className="bg-neutral-900/50 border border-red-500/30 rounded-lg px-3 py-2 text-[11px] text-red-300">
+        <div className="bg-neutral-900/50 border border-red-500/30 rounded-lg px-3 py-2 text-ui-md text-red-300">
           Could not load the provider/model breakdown — the endpoint is unreachable. Retrying…
         </div>
       </section>
@@ -210,12 +210,12 @@ export function ProviderModelBreakdownPanel({
     <section>
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
-          <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">
+          <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest">
             Provider / Model Breakdown
           </h2>
           {showStale && (
             <span
-              className="text-[9px] font-semibold px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/15 text-amber-300"
+              className="text-ui-xs font-semibold px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/15 text-amber-300"
               title={
                 pollError
                   ? `Polling is failing — these rows are the last-good reading${asOfLabel ? ` from ${asOfLabel}` : ''}`
@@ -229,7 +229,7 @@ export function ProviderModelBreakdownPanel({
         {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
         <button
           onClick={() => setHideSingleAccount(v => !v)}
-          className={`text-[9px] px-1.5 py-0.5 rounded border transition-colors ${
+          className={`text-ui-xs px-1.5 py-0.5 rounded border transition-colors ${
             hideSingleAccount
               ? 'bg-neutral-700/50 text-neutral-300 border-neutral-600/50'
               : 'text-neutral-500 border-neutral-800/50 hover:text-neutral-300'
@@ -247,7 +247,7 @@ export function ProviderModelBreakdownPanel({
             return (
               <div key={key}>
                 <div
-                  className="px-3 py-2 text-[10px] cursor-pointer"
+                  className="px-3 py-2 text-ui-sm cursor-pointer"
                   onClick={() => setExpandedKey(expanded ? null : key)}
                 >
                   <div className="flex items-start justify-between gap-2 mb-1">
@@ -267,17 +267,17 @@ export function ProviderModelBreakdownPanel({
                       {row.accounts.map(acct => (
                         <div key={acct.account_id} className="rounded border border-neutral-800/50 bg-neutral-900/60 px-2.5 py-1.5">
                           <div className="flex items-center gap-2 flex-wrap">
-                            <span className="text-[10px] font-medium text-neutral-300">
+                            <span className="text-ui-sm font-medium text-neutral-300">
                               {labelFor(acct.account_id)}
                             </span>
-                            <span className="text-[9px] text-neutral-500 font-mono tabular-nums">
+                            <span className="text-ui-xs text-neutral-500 font-mono tabular-nums">
                               {acct.total_tasks} tasks
                             </span>
-                            <span className={`text-[10px] font-mono font-bold tabular-nums ${srColor(acct.success_rate)}`}>
+                            <span className={`text-ui-sm font-mono font-bold tabular-nums ${srColor(acct.success_rate)}`}>
                               {fmtPct(acct.success_rate)}
                             </span>
                             {acct.below_median && (
-                              <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-400 border-amber-500/30 uppercase">
+                              <span className="text-ui-xs font-semibold px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-400 border-amber-500/30 uppercase">
                                 below median
                               </span>
                             )}
@@ -305,7 +305,7 @@ export function ProviderModelBreakdownPanel({
         {/* Desktop: table layout */}
         <table className="hidden sm:table w-full text-xs">
           <thead>
-            <tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50">
+            <tr className="text-ui-sm text-neutral-500 border-b border-neutral-800/50">
               <th className="text-left px-3 py-2 font-medium">Provider / Model</th>
               <th className="text-right px-3 py-2 font-medium">Tasks</th>
               <th className="text-right px-3 py-2 font-medium">Rate</th>
@@ -325,7 +325,7 @@ export function ProviderModelBreakdownPanel({
                 >
                   <td className="px-3 py-2">
                     <span className="font-medium text-neutral-200">{row.model}</span>
-                    <span className="text-neutral-500 ml-1.5 text-[10px]">{row.provider}</span>
+                    <span className="text-neutral-500 ml-1.5 text-ui-sm">{row.provider}</span>
                   </td>
                   <td className="text-right px-3 py-2 text-neutral-300 tabular-nums">{row.total_tasks}</td>
                   <td className={`text-right px-3 py-2 tabular-nums ${srColor(row.success_rate)}`}>
@@ -343,17 +343,17 @@ export function ProviderModelBreakdownPanel({
                         {row.accounts.map(acct => (
                           <div key={acct.account_id} className="rounded border border-neutral-800/50 bg-neutral-900/60 px-2.5 py-1.5">
                             <div className="flex items-center gap-2 flex-wrap">
-                              <span className="text-[10px] font-medium text-neutral-300">
+                              <span className="text-ui-sm font-medium text-neutral-300">
                                 {labelFor(acct.account_id)}
                               </span>
-                              <span className="text-[9px] text-neutral-500 font-mono tabular-nums">
+                              <span className="text-ui-xs text-neutral-500 font-mono tabular-nums">
                                 {acct.total_tasks} tasks
                               </span>
-                              <span className={`text-[10px] font-mono font-bold tabular-nums ${srColor(acct.success_rate)}`}>
+                              <span className={`text-ui-sm font-mono font-bold tabular-nums ${srColor(acct.success_rate)}`}>
                                 {fmtPct(acct.success_rate)}
                               </span>
                               {acct.below_median && (
-                                <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-400 border-amber-500/30 uppercase">
+                                <span className="text-ui-xs font-semibold px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-400 border-amber-500/30 uppercase">
                                   below median
                                 </span>
                               )}

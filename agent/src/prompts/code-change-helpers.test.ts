@@ -36,6 +36,13 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
       const [path, content] = args as [string, string];
       capturedScripts[path] = content;
+      // Self-repo runs write the generated check body to the gitignored
+      // `.check-task` (the tracked `check` is a static delegating entrypoint —
+      // see writeCheckHelper / check-helper.test.ts). These content assertions
+      // are repo-agnostic, so mirror it under the `check` key the tests read.
+      if (path.endsWith('/.check-task')) {
+        capturedScripts[path.replace(/\.check-task$/, 'check')] = content;
+      }
     });
   });
 
@@ -511,6 +518,13 @@ describe('writeCheckHelper — config-driven build_config path', () => {
     vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
       const [path, content] = args as [string, string];
       capturedScripts[path] = content;
+      // Self-repo runs write the generated check body to the gitignored
+      // `.check-task` (the tracked `check` is a static delegating entrypoint —
+      // see writeCheckHelper / check-helper.test.ts). These content assertions
+      // are repo-agnostic, so mirror it under the `check` key the tests read.
+      if (path.endsWith('/.check-task')) {
+        capturedScripts[path.replace(/\.check-task$/, 'check')] = content;
+      }
     });
   });
 
@@ -596,7 +610,7 @@ describe('writeCheckHelper — config-driven build_config path', () => {
     const checkScript = capturedScripts['/tmp/workspace/check'];
     // test_cmd is wrapped in a WITH_TESTS guard.
     expect(checkScript).toContain('if [ "$WITH_TESTS" = "1" ]; then');
-    expect(checkScript).toContain(`run "service/api test" bash -c 'cd "service/api" && pytest -q'`);
+    expect(checkScript).toContain(`( cd "service/api" && pytest -q )`);
     // The directory with no test_cmd produces no test run line.
     expect(checkScript).not.toContain('web test');
   });
@@ -786,6 +800,13 @@ describe('writeCheckHelper — config-driven scoped lint', () => {
     vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
       const [path, content] = args as [string, string];
       capturedScripts[path] = content;
+      // Self-repo runs write the generated check body to the gitignored
+      // `.check-task` (the tracked `check` is a static delegating entrypoint —
+      // see writeCheckHelper / check-helper.test.ts). These content assertions
+      // are repo-agnostic, so mirror it under the `check` key the tests read.
+      if (path.endsWith('/.check-task')) {
+        capturedScripts[path.replace(/\.check-task$/, 'check')] = content;
+      }
     });
   });
 
@@ -844,6 +865,13 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
     vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
       const [path, content] = args as [string, string];
       capturedScripts[path] = content;
+      // Self-repo runs write the generated check body to the gitignored
+      // `.check-task` (the tracked `check` is a static delegating entrypoint —
+      // see writeCheckHelper / check-helper.test.ts). These content assertions
+      // are repo-agnostic, so mirror it under the `check` key the tests read.
+      if (path.endsWith('/.check-task')) {
+        capturedScripts[path.replace(/\.check-task$/, 'check')] = content;
+      }
     });
   });
 
@@ -1074,6 +1102,13 @@ describe('writeCodeChangeHelpers — viewport upload block', () => {
     vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
       const [path, content] = args as [string, string];
       capturedScripts[path] = content;
+      // Self-repo runs write the generated check body to the gitignored
+      // `.check-task` (the tracked `check` is a static delegating entrypoint —
+      // see writeCheckHelper / check-helper.test.ts). These content assertions
+      // are repo-agnostic, so mirror it under the `check` key the tests read.
+      if (path.endsWith('/.check-task')) {
+        capturedScripts[path.replace(/\.check-task$/, 'check')] = content;
+      }
     });
   });
 

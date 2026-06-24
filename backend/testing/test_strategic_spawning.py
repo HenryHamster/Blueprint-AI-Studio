@@ -13378,3 +13378,95 @@ def test_summarize_efficiency_snapshot_empty_returns_empty():
 
     assert _summarize_efficiency_snapshot({}) == {}
     assert _summarize_efficiency_snapshot(None) == {}  # type: ignore[arg-type]
+
+
+def test_summarize_efficiency_snapshot_includes_dominant_failure_class():
+    """strategist efficiency-snapshot summary forwards the dominant non-MERGED
+    failure-class LLM cost (highest-cost failure mode excluding merged tasks)."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "axes": {
+            "cost_per_merged_pr": {
+                "current": 1.5,
+                "baseline": 2.0,
+                "drift_pct": -25.0,
+                "history": [],
+            }
+        },
+        "baseline_captured_at": "2026-04-05T00:00:00",
+        "last_snapshot_at": "2026-05-01T00:00:00",
+        "llm_cost_attribution": {
+            "total_llm_usd": 100.0,
+            "rework_share": 0.15,
+            "by_model": [
+                {"provider": "anthropic", "model": "claude-opus", "cost_usd": 50.0}
+            ],
+            "by_task_type": [{"task_type": "task_edit", "cost_usd": 75.0}],
+            # by_failure_class sorted by cost descending: context_limit (80) > MERGED (15) > import_error (5)
+            "by_failure_class": [
+                {"failure_class": "context_limit", "task_count": 2, "total_cost_usd": 80.0},
+                {"failure_class": "MERGED", "task_count": 3, "total_cost_usd": 15.0},
+                {"failure_class": "import_error", "task_count": 1, "total_cost_usd": 5.0},
+            ],
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    assert "llm_cost_attribution" in result
+    attr = result["llm_cost_attribution"]
+    assert attr["dominant_failure_class"] == {
+        "failure_class": "context_limit",
+        "task_count": 2,
+        "total_cost_usd": 80.0,
+    }
+
+
+# ── direction-linked knowledge in strategist payload ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_strategist_context_surfaces_direction_linked_knowledge(db_session):
+    """strategic_review outcome_evaluation surfaces direction_knowledge for
+    directions that have linked knowledge documents."""
+    direction_id = "d-linked-knowledge"
+    project = _make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "text": "Direction with linked knowledge",
+                "priority": "high",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+    await _seed_knowledge_doc(
+        db_session,
+        project,
+        title="Auth research findings",
+        direction_id=direction_id,
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+
+    outcome_eval = payload["outcome_evaluation"]
+    direction_outcomes = outcome_eval["directions"]
+    matched = next((d for d in direction_outcomes if d["id"] == direction_id), None)
+    assert matched is not None, f"direction {direction_id!r} not in outcome_evaluation"
+    assert "direction_knowledge" in matched, (
+        "direction_knowledge missing from direction outcome — linked knowledge not surfaced"
+    )
+    assert matched["direction_knowledge"][0]["title"] == "Auth research findings"

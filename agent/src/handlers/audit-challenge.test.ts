@@ -576,6 +576,24 @@ describe('handleReleaseAuditChallenge — pinned candidate + diff-range pre-flig
     expect(call.failure_category).toBe('release_audit_challenge_unparseable');
   });
 
+  it('reopen prompt includes prior-run analysis so the repair session is not blind', async () => {
+    const PRIOR_ANALYSIS = 'I analyzed the diff and found the following issues in detail: <analysis>';
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'raw output', lastResultText: PRIOR_ANALYSIS })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify({ challenged_candidate_sha: CANDIDATE_SHA, verdicts: [] }) });
+
+    await handleReleaseAuditChallenge(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const reopenPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    // Prior analysis must appear BEFORE the schema instruction
+    expect(reopenPrompt).toContain(PRIOR_ANALYSIS);
+    const priorIdx = reopenPrompt.indexOf(PRIOR_ANALYSIS);
+    const schemaIdx = reopenPrompt.indexOf('Output ONLY the JSON object now');
+    expect(priorIdx).toBeLessThan(schemaIdx);
+  });
+
   it('includes the primary findings list in the repair prompt when reopening', async () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(runClaudeCode)
@@ -592,6 +610,23 @@ describe('handleReleaseAuditChallenge — pinned candidate + diff-range pre-flig
     const repairPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
     expect(repairPrompt).toContain('1. [high] Unsafe deserialization in upload handler. (file: app/upload.py)');
     expect(repairPrompt).toContain('copy the listed primary finding summary exactly into "summary"');
+  });
+
+  it('audit-challenge repair reopen includes prior output when no primary findings provided', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const priorText = 'some attempted JSON that failed to parse properly';
+    const priorAllOutput = 'extra context from the first run attempt';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: priorAllOutput, lastResultText: priorText })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify({ challenged_candidate_sha: CANDIDATE_SHA, verdicts: [] }) });
+
+    await handleReleaseAuditChallenge(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const repairPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(repairPrompt).toContain(priorText);
+    expect(repairPrompt).toContain(priorAllOutput);
+    expect(repairPrompt).toContain('Your prior release audit challenge response did not end with a parseable JSON verdict object');
   });
 
   it('self-repair records audit_challenge schema telemetry and pins output basename', async () => {

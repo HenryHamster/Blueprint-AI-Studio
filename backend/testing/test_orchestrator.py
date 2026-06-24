@@ -4923,6 +4923,143 @@ class TestWarmVMSkipProvision:
             assert child_task.status == TaskStatus.CANCELLED
 
     @pytest.mark.asyncio
+    async def test_deadlock_breaker_cascade_cancel_emits_alert(
+        self, orch_warm_db, mocker
+    ):
+        """_apply_deadlock_classification emits a deduplicated operator alert
+        (same contract as the main dispatch loop) when the deadlock-breaker
+        cascade-cancels a dependent with a genuinely failed prerequisite."""
+        from sqlmodel import select as _select
+        from app.models import Alert, AlertSeverity
+        from app.orchestrator import _apply_deadlock_classification
+        from app.broadcast import broadcast_to_project
+
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Deadlock Alert", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            prereq = make_task(
+                project_id=project.id,
+                title="failed-prereq",
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create", "prompt": "prereq"}],
+            )
+            session.add(prereq)
+            await session.commit()
+            await session.refresh(prereq)
+
+            dependent = make_task(
+                project_id=project.id,
+                title="stuck-dependent",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create", "prompt": "dependent"}],
+                depends_on=[str(prereq.id)],
+            )
+            session.add(dependent)
+            await session.commit()
+            await session.refresh(dependent)
+            project_id = project.id
+            prereq_id = prereq.id
+
+        # Simulate what _classify_stuck_tasks returns: 3-tuple with the failed prereq.
+        classified = [(dependent.id, "cascade_cancel", prereq)]
+        await _apply_deadlock_classification(classified, broadcast_to_project, [])
+
+        async with orch_warm_db() as verify:
+            alerts = (
+                (
+                    await verify.execute(
+                        _select(Alert).where(Alert.project_id == project_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(alerts) == 1, (
+                f"Expected exactly one cascade-cancel alert from deadlock-breaker path, "
+                f"got {len(alerts)}"
+            )
+            alert = alerts[0]
+            assert alert.severity == AlertSeverity.WARNING
+            assert "failed-prereq" in alert.title
+            assert alert.task_id == prereq_id
+
+    @pytest.mark.asyncio
+    async def test_deadlock_breaker_deduplicates_alert_on_repeat(
+        self, orch_warm_db, mocker
+    ):
+        """A second _apply_deadlock_classification call for the same prereq must not
+        create a duplicate alert (title-based dedup)."""
+        from sqlmodel import select as _select
+        from app.models import Alert
+        from app.orchestrator import _apply_deadlock_classification
+        from app.broadcast import broadcast_to_project
+
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Deadlock Dedup", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            prereq = make_task(
+                project_id=project.id,
+                title="failed-prereq-dedup",
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create", "prompt": "prereq"}],
+            )
+            session.add(prereq)
+            await session.commit()
+            await session.refresh(prereq)
+
+            dep1 = make_task(
+                project_id=project.id,
+                title="stuck-dep-1",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create", "prompt": "dep1"}],
+                depends_on=[str(prereq.id)],
+            )
+            dep2 = make_task(
+                project_id=project.id,
+                title="stuck-dep-2",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create", "prompt": "dep2"}],
+                depends_on=[str(prereq.id)],
+            )
+            session.add_all([dep1, dep2])
+            await session.commit()
+            await session.refresh(dep1)
+            await session.refresh(dep2)
+            project_id = project.id
+
+        await _apply_deadlock_classification(
+            [(dep1.id, "cascade_cancel", prereq)], broadcast_to_project, []
+        )
+        await _apply_deadlock_classification(
+            [(dep2.id, "cascade_cancel", prereq)], broadcast_to_project, []
+        )
+
+        async with orch_warm_db() as verify:
+            alerts = (
+                (
+                    await verify.execute(
+                        _select(Alert).where(Alert.project_id == project_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(alerts) == 1, (
+                "Two deadlock-breaker passes for the same prereq must not "
+                f"duplicate the alert, got {len(alerts)}"
+            )
+
+    @pytest.mark.asyncio
     async def test_ci_poll_merge_on_promotion_target_withholds_pr_merged(
         self, db_session
     ):
@@ -6189,7 +6326,11 @@ class TestClassifyStuckTasksSharedPolicy:
         )
         # The real prerequisite genuinely failed → cascade-cancel, NOT dead_deps
         # (which would clear depends_on and dispatch the impossible work).
-        assert out == [(stuck.id, "cascade_cancel")]
+        # Result is a 3-tuple: (task_id, reason, failed_prereq_or_None).
+        assert len(out) == 1
+        assert out[0][0] == stuck.id
+        assert out[0][1] == "cascade_cancel"
+        assert out[0][2] is not None and out[0][2].id == dep.id
 
     @pytest.mark.asyncio
     async def test_scope_empty_dep_is_satisfied(self, db_session):
@@ -6460,6 +6601,70 @@ class TestClassifyStuckTasksSharedPolicy:
         # Still-recovering BLOCKED foundation is a normal in-flight wait — the
         # dependent keeps waiting unchanged, not stranded.
         assert out == []
+
+    @pytest.mark.asyncio
+    async def test_co_deferred_plus_failed_prereq_identifies_correct_prereq(
+        self, db_session
+    ):
+        """When a task has two deps — one co-deferred (CANCELLED+CO_DEFERRED_SHELVED)
+        and one genuinely FAILED — _classify_stuck_tasks must name the genuinely
+        failed dep as the prereq in the 3-tuple, not the co-deferred one."""
+        from app.failure_classification import CO_DEFERRED_SHELVED
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="CoDeferredFail", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        co_deferred_dep = make_task(
+            project_id=project.id,
+            title="co-deferred-dep",
+            payloads=[{"type": "create", "prompt": "co-deferred"}],
+            status=TaskStatus.CANCELLED,
+            context={CO_DEFERRED_SHELVED: True},
+        )
+        failed_dep = make_task(
+            project_id=project.id,
+            title="genuinely-failed-dep",
+            payloads=[{"type": "create", "prompt": "failed"}],
+            status=TaskStatus.FAILED,
+        )
+        db_session.add_all([co_deferred_dep, failed_dep])
+        await db_session.commit()
+        await db_session.refresh(co_deferred_dep)
+        await db_session.refresh(failed_dep)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(co_deferred_dep.id), str(failed_dep.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        dep_uuids = {co_deferred_dep.id, failed_dep.id}
+        dep_tasks_by_id = {
+            co_deferred_dep.id: co_deferred_dep,
+            failed_dep.id: failed_dep,
+        }
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: dep_uuids},
+            dep_tasks_by_id,
+            {stuck.id},
+            db_session,
+            self._noop_verify,
+        )
+        assert len(out) == 1
+        assert out[0][1] == "cascade_cancel"
+        # The 3rd element must be the genuinely FAILED dep, not the co-deferred one.
+        assert out[0][2] is not None, "Failed prereq must be identified"
+        assert out[0][2].id == failed_dep.id, (
+            f"Expected failed_dep ({failed_dep.id}) as prereq, got {out[0][2].id}"
+        )
 
 
 # ── BLOCKED tasks are undispatchable on the normal queue path ────────────────

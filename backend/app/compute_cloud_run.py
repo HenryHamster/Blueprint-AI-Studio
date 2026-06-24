@@ -201,16 +201,45 @@ async def launch_agent_cloud_run_job(
                 provider_settings=provider_settings,
                 materials=materials,
             )
+            # Build the combined credential key set: static denylist ∪ every key
+            # the provider declared in secret_env. This is the key-based guard.
+            credential_keys = _SECRET_ENV_KEYS | set(materials.secret_env.keys())
+            # Build the known secret VALUE set for the fail-closed value guard.
+            # Suppresses any override whose value matches a known secret, even when
+            # the key is not yet in the denylist (e.g. a new provider credential).
+            secret_values: set[str] = set()
+            for _sv in materials.secret_env.values():
+                if isinstance(_sv, str) and _sv.strip():
+                    secret_values.add(_sv)
+            if isinstance(oauth_token, str) and oauth_token.strip():
+                secret_values.add(oauth_token)
             for k, v in llm_env.items():
-                # Never pass credential values as plaintext overrides.
-                if k in _SECRET_ENV_KEYS:
+                # Key guard: never pass any provider-declared or known credential
+                # env var as a plaintext override.
+                if k in credential_keys:
+                    logger.debug(
+                        "[CLOUD-RUN] Suppressing credential key %s for task %s",
+                        k,
+                        task_id,
+                    )
                     continue
-                # Skip file-path credential values — Cloud Run env overrides
-                # cannot carry file contents and the file won't exist in the container.
+                # File-path guard: values that are file paths cannot be carried as
+                # Cloud Run env overrides (the file won't exist in the container).
                 if isinstance(v, str) and v.startswith("/"):
                     logger.warning(
                         "[CLOUD-RUN] Skipping file-path credential env var %s for task %s "
                         "(value starts with '/'; file-based credentials cannot be env overrides)",
+                        k,
+                        task_id,
+                    )
+                    continue
+                # Value guard (fail-closed): refuse to emit any override whose value
+                # matches a known secret value, even for unknown credential keys not
+                # yet in the static denylist.
+                if isinstance(v, str) and v in secret_values:
+                    logger.warning(
+                        "[CLOUD-RUN] Suppressing plaintext secret value in env var %s "
+                        "for task %s (fail-closed value guard)",
                         k,
                         task_id,
                     )

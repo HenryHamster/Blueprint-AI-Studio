@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobs, killComputeJob, type ComputeJob } from '../api';
+import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid } from 'lucide-react';
+import { analyzeComputeJob, fetchComputeJobs, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -11,11 +11,251 @@ import {
   computeJobTerminalLabel,
   computeJobRpcDiagnostic,
   computeJobSpent,
+  computeJobRuntimeSec,
+  computeJobBurnRate,
+  computeJobProjectedSpend,
+  computeJobMargin,
   fmtUsd,
   fmtCountdown,
+  fmtDuration,
 } from './ComputeJobsPanel.utils';
 
 const POLL_INTERVAL_MS = 10_000;
+
+type MetricDirection = 'higher_better' | 'lower_better' | 'unknown';
+
+function metricDirection(key: string, group: ComputeJob[]): MetricDirection {
+  if (key === '__cost__' || key === '__runtime__') return 'lower_better';
+  for (const job of group) {
+    const v = job.criterion_verdict;
+    if (v && v.metric === key) {
+      return v.operator === '>=' || v.operator === '>' ? 'higher_better' : 'lower_better';
+    }
+  }
+  return 'unknown';
+}
+
+function bestIndex(values: (number | null)[], dir: MetricDirection): number | null {
+  if (dir === 'unknown') return null;
+  let bi: number | null = null;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    if (v === null) continue;
+    if (bi === null) { bi = i; continue; }
+    const bv = values[bi]!;
+    if (dir === 'higher_better' ? v > bv : v < bv) bi = i;
+  }
+  return bi;
+}
+
+function jobMetricValue(job: ComputeJob, key: string, criterionMetric: string | null): number | null {
+  if (key === '__cost__') return computeJobSpent(job);
+  if (key === '__runtime__') return computeJobRuntimeSec(job);
+  if (key === criterionMetric && job.criterion_verdict?.value != null) return job.criterion_verdict.value;
+  const rm = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
+  const v = rm?.[key];
+  return typeof v === 'number' ? v : null;
+}
+
+function formatMetricLabel(key: string): string {
+  if (key === '__cost__') return 'Cost';
+  if (key === '__runtime__') return 'Runtime';
+  return key;
+}
+
+function formatMetricValue(key: string, v: number | null): string {
+  if (v === null) return '—';
+  if (key === '__cost__') return fmtUsd(v);
+  if (key === '__runtime__') return fmtDuration(v);
+  return String(v);
+}
+
+function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
+  let criterionMetric: string | null = null;
+  const extraKeys = new Set<string>();
+  for (const job of group) {
+    if (!criterionMetric && job.criterion_verdict?.metric) criterionMetric = job.criterion_verdict.metric;
+    const rm = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
+    if (rm) for (const k of Object.keys(rm)) if (k !== criterionMetric) extraKeys.add(k);
+  }
+
+  const allKeys: string[] = [
+    ...(criterionMetric ? [criterionMetric] : []),
+    ...extraKeys,
+    '__cost__',
+    '__runtime__',
+  ];
+
+  const rows = allKeys
+    .map((key) => {
+      const dir = metricDirection(key, group);
+      const values = group.map((job) => jobMetricValue(job, key, criterionMetric));
+      return { key, dir, values, bi: bestIndex(values, dir) };
+    })
+    .filter((r) => r.values.some((v) => v !== null));
+
+  const metCount = group.filter((j) => j.criterion_verdict?.met).length;
+
+  return (
+    <div data-testid="run-comparison-matrix">
+      <div className="mb-1 text-ui-sm font-mono text-neutral-400">{metCount}/{group.length} met criterion</div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-ui-sm font-mono">
+          <thead>
+            <tr>
+              <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Metric</th>
+              {group.map((job) => (
+                <th key={job.id} className="text-right pr-2 pb-1 text-neutral-300 font-semibold max-w-28 truncate">
+                  {(job.task_title ?? job.id).slice(0, 24)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(({ key, values, bi }) => (
+              <tr key={key} className="border-t border-neutral-800/50">
+                <td className="py-0.5 pr-3 text-neutral-500">{formatMetricLabel(key)}</td>
+                {values.map((v, i) => (
+                  <td
+                    key={i}
+                    className={`py-0.5 pr-2 text-right ${i === bi ? 'text-emerald-300 font-semibold' : 'text-neutral-400'}`}
+                    data-testid={i === bi ? 'matrix-best-cell' : undefined}
+                  >
+                    {formatMetricValue(key, v)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-1.5" data-testid="matrix-verdict-summary">
+        {group.map((job) => {
+          const v = job.criterion_verdict;
+          return (
+            <span
+              key={job.id}
+              className={`rounded border px-1.5 py-0.5 text-ui-xs font-semibold ${v?.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : v ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-600/40 bg-neutral-800/60 text-neutral-400'}`}
+              data-testid="matrix-verdict-chip"
+            >
+              {(job.task_title ?? job.id).slice(0, 20)}: {v?.met ? 'met' : v ? 'missed' : 'no verdict'}
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function groupJobsByExperiment(jobs: ComputeJob[]): Map<string, ComputeJob[]> {
+  const groups = new Map<string, ComputeJob[]>();
+  for (const job of jobs) {
+    if (isComputeJobActive(job)) continue;
+    const key = job.experiment ?? job.benchmark;
+    if (!key) continue;
+    const group = groups.get(key) ?? [];
+    group.push(job);
+    groups.set(key, group);
+  }
+  return groups;
+}
+
+function bestRunId(group: ComputeJob[]): string | null {
+  const measurable = group.filter((j) => j.criterion_verdict?.value != null);
+  if (measurable.length === 0) return null;
+  const op = measurable[0].criterion_verdict?.operator ?? '>=';
+  const higherBetter = op === '>=' || op === '>';
+  return measurable.reduce((best, job) => {
+    const bv = best.criterion_verdict!.value!;
+    const jv = job.criterion_verdict!.value!;
+    return higherBetter ? (jv > bv ? job : best) : (jv < bv ? job : best);
+  }, measurable[0]).id;
+}
+
+function ExperimentSweepSummary({ jobs }: { jobs: ComputeJob[] }) {
+  const groups = groupJobsByExperiment(jobs);
+  const multiRun = [...groups.entries()].filter(([, g]) => g.length >= 2);
+  const [compareSet, setCompareSet] = useState<Set<string>>(new Set());
+  if (multiRun.length === 0) return null;
+
+  function toggleCompare(expName: string) {
+    setCompareSet((prev) => {
+      const next = new Set(prev);
+      if (next.has(expName)) next.delete(expName); else next.add(expName);
+      return next;
+    });
+  }
+
+  return (
+    <div className="mb-3 flex flex-col gap-2">
+      {multiRun.map(([expName, group]) => {
+        const metCount = group.filter((j) => j.criterion_verdict?.met).length;
+        const best = bestRunId(group);
+        const comparing = compareSet.has(expName);
+        return (
+          <div
+            key={expName}
+            className="rounded-lg border border-violet-500/20 bg-violet-500/5 px-3 py-2"
+            data-testid="experiment-sweep-summary"
+          >
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <span className="text-ui-sm font-semibold text-violet-300 break-words">{expName}</span>
+              <div className="flex items-center gap-2 shrink-0">
+                {!comparing && (
+                  <span className="text-ui-sm text-neutral-400 font-mono" data-testid="sweep-criterion-count">
+                    {metCount}/{group.length} met criterion
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => toggleCompare(expName)}
+                  className="min-h-[44px] flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-violet-400 hover:text-violet-200 hover:bg-violet-500/15 transition-colors"
+                  data-testid="sweep-compare-toggle"
+                >
+                  <LayoutGrid className="w-3 h-3" />
+                  {comparing ? 'List' : 'Compare'}
+                </button>
+              </div>
+            </div>
+            {comparing ? (
+              <RunComparisonMatrix group={group} />
+            ) : (
+              <div className="flex flex-col gap-0.5">
+                {group.map((job) => {
+                  const isBest = job.id === best;
+                  const verdict = job.criterion_verdict;
+                  return (
+                    <div
+                      key={job.id}
+                      className={`flex items-center gap-2 text-ui-sm font-mono ${isBest ? 'text-emerald-300' : 'text-neutral-400'}`}
+                      data-testid={isBest ? 'sweep-best-run' : 'sweep-run-row'}
+                    >
+                      <span className="min-w-0 flex-1 truncate">{job.task_title ?? job.id}</span>
+                      {verdict?.value != null && (
+                        <span className={isBest ? 'font-semibold' : ''}>{verdict.value}</span>
+                      )}
+                      {verdict ? (
+                        verdict.met ? (
+                          <span className="shrink-0 rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-ui-xs text-emerald-300">
+                            met
+                          </span>
+                        ) : (
+                          <span className="shrink-0 rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-ui-xs text-red-300">
+                            unmet
+                          </span>
+                        )
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 function statusBadgeClass(job: ComputeJob): string {
   if (isComputeJobActive(job)) return 'bg-sky-500/20 text-sky-200 border-sky-500/30';
@@ -33,16 +273,28 @@ interface ComputeJobsPanelProps {
   projectId: string | null;
   onNavigateToTask?: (taskId: string) => void;
   onLaunchCompute?: () => void;
+  onDuplicateTask?: (taskId: string) => Promise<void>;
 }
 
-export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute }: ComputeJobsPanelProps) {
+export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onDuplicateTask }: ComputeJobsPanelProps) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [killingId, setKillingId] = useState<string | null>(null);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
+  const [analysisDocs, setAnalysisDocs] = useState<Record<string, KnowledgeDocument>>({});
+  const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
+  const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
   const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const toggleDocExpanded = useCallback((key: string) => {
+    setExpandedDocIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }, []);
 
   const load = useCallback(
     async (signal?: AbortSignal) => {
@@ -66,6 +318,18 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
     enabled: !!projectId,
     deps: [projectId],
   });
+
+  // Auto-fetch durable knowledge docs for terminal jobs that have a knowledge_document_id.
+  useEffect(() => {
+    if (!projectId) return;
+    for (const job of jobs) {
+      const docId = job.knowledge_document_id;
+      if (!docId || isComputeJobActive(job) || knowledgeDocs[job.id]) continue;
+      fetchKnowledgeDocument(projectId, docId).then((doc) => {
+        setKnowledgeDocs((prev) => ({ ...prev, [job.id]: doc }));
+      }).catch(() => {/* non-fatal */});
+    }
+  }, [jobs, projectId, knowledgeDocs]);
 
   // Local 1s clock drives the live deadline countdowns between polls.
   const hasActive = jobs.some(isComputeJobActive);
@@ -115,8 +379,16 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
         } else {
           setAnalysisFeedback((prev) => ({
             ...prev,
-            [job.id]: { kind: 'upgraded', message: 'Analysis upgraded' },
+            [job.id]: { kind: 'upgraded', message: 'Analysis complete' },
           }));
+          if (result.knowledge_document_id && projectId) {
+            try {
+              const doc = await fetchKnowledgeDocument(projectId, result.knowledge_document_id);
+              setAnalysisDocs((prev) => ({ ...prev, [job.id]: doc }));
+            } catch {
+              // Non-fatal: feedback already shown, doc fetch is best-effort
+            }
+          }
         }
       } catch (e) {
         setAnalysisFeedback((prev) => ({
@@ -131,7 +403,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
         await load();
       }
     },
-    [load],
+    [load, projectId],
   );
 
   if (!projectId) return null;
@@ -139,13 +411,13 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
 
   return (
     <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4" data-viewport-allow-truncation>
-      <div className="flex items-center gap-2 mb-3 text-[11px] font-bold text-neutral-400 uppercase tracking-widest">
+      <div className="flex items-center gap-2 mb-3 text-ui-md font-bold text-neutral-400 uppercase tracking-widest">
         <Cpu className="w-3.5 h-3.5 shrink-0" />
         Compute jobs
       </div>
 
       {error && (
-        <p className="text-[10px] text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 mb-2 break-words flex items-start gap-1.5">
+        <p className="text-ui-sm text-red-300 bg-red-500/10 border border-red-500/20 rounded px-1.5 py-1 mb-2 break-words flex items-start gap-1.5">
           <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
           {error}
         </p>
@@ -156,7 +428,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <div className="text-xs font-semibold text-neutral-200">No compute jobs</div>
-              <div className="mt-0.5 text-[10px] text-neutral-500">
+              <div className="mt-0.5 text-ui-sm text-neutral-500">
                 Launch a structured experiment for this project.
               </div>
             </div>
@@ -164,7 +436,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
               <button
                 type="button"
                 onClick={onLaunchCompute}
-                className="shrink-0 min-h-[36px] rounded bg-sky-500/20 px-3 text-[11px] font-semibold text-sky-200 transition-colors hover:bg-sky-500/30"
+                className="shrink-0 min-h-[36px] rounded bg-sky-500/20 px-3 text-ui-md font-semibold text-sky-200 transition-colors hover:bg-sky-500/30"
               >
                 Launch compute experiment
               </button>
@@ -172,6 +444,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
           </div>
         </div>
       )}
+
+      <ExperimentSweepSummary jobs={jobs} />
 
       <div className="flex flex-col gap-2">
         {jobs.map((job) => {
@@ -198,10 +472,11 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                       {job.task_title ?? job.task_id ?? job.id}
                     </div>
                   )}
-                  <div className="text-[10px] text-neutral-500 font-mono mt-0.5 break-words">
+                  <div className="text-ui-sm text-neutral-500 font-mono mt-0.5 break-words">
                     {job.backend}
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
                     {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
+                    {job.launch_contract?.provisioning_model ? ` · ${job.launch_contract.provisioning_model}` : ''}
                   </div>
                   {(() => {
                     const evidence = asLiveReleaseEvidence(job.polling_metadata?.live_release_evidence);
@@ -214,14 +489,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                   })()}
                 </div>
                 <span
-                  className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${statusBadgeClass(job)}`}
+                  className={`shrink-0 rounded border px-1.5 py-0.5 text-ui-sm font-semibold ${statusBadgeClass(job)}`}
                 >
                   {active ? job.status : computeJobTerminalLabel(job)}
                 </span>
               </div>
 
               <div className="mb-1.5">
-                <div className="flex items-center justify-between text-[10px] text-neutral-400 font-mono mb-1">
+                <div className="flex items-center justify-between text-ui-sm text-neutral-400 font-mono mb-1">
                   <span>Budget</span>
                   <span>
                     {fmtUsd(spent)} / {fmtUsd(job.spend_cap_usd)}
@@ -235,32 +510,121 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                 </div>
               </div>
 
+              {(() => {
+                if (!active) return null;
+                const burnRate = computeJobBurnRate(job, nowMs);
+                if (burnRate == null) return null;
+                const projected = computeJobProjectedSpend(job, burnRate, nowMs);
+                const cap = job.spend_cap_usd ?? 0;
+                const willExceedCap = projected != null && cap > 0 && projected > cap;
+                return (
+                  <>
+                    <div className="mb-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-400 font-mono" data-testid="compute-burn-rate">
+                      <span>
+                        <span className="text-neutral-500">rate</span>{' '}
+                        {fmtUsd(burnRate)}/hr
+                      </span>
+                      {projected != null && (
+                        <span>
+                          <span className="text-neutral-500">projected</span>{' '}
+                          {fmtUsd(projected)}
+                        </span>
+                      )}
+                    </div>
+                    {willExceedCap && (
+                      <div
+                        className="mb-1.5 rounded border border-red-500/40 bg-red-500/10 px-2 py-1.5 text-ui-sm text-red-200"
+                        data-testid="compute-budget-kill-warning"
+                      >
+                        <div className="flex items-start gap-1.5">
+                          <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+                          <span>
+                            At current burn rate ({fmtUsd(burnRate)}/hr), this job will hit the spend cap ({fmtUsd(cap)}) before its deadline and be killed.
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
+              {(() => {
+                if (active) return null;
+                const runtimeSec = computeJobRuntimeSec(job);
+                const deadlineSec = job.launch_contract?.requested_deadline_seconds;
+                const costRate =
+                  runtimeSec != null && runtimeSec > 0 && job.final_cost_usd != null
+                    ? job.final_cost_usd / (runtimeSec / 3600)
+                    : null;
+                if (runtimeSec === null && costRate === null) return null;
+                return (
+                  <div
+                    className="mb-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-400 font-mono"
+                    data-testid="compute-result-story"
+                  >
+                    {runtimeSec !== null && (
+                      <span>
+                        <span className="text-neutral-500">ran</span>{' '}
+                        {fmtDuration(runtimeSec)}
+                        {typeof deadlineSec === 'number' && (
+                          <span className="text-neutral-500"> / {fmtDuration(deadlineSec)} budget</span>
+                        )}
+                      </span>
+                    )}
+                    {costRate !== null && (
+                      <span>
+                        <span className="text-neutral-500">rate</span>{' '}
+                        {fmtUsd(costRate)}/hr
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
               <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-1.5 text-[10px] text-neutral-400 font-mono min-w-0">
+                <div className="flex items-center gap-1.5 text-ui-sm text-neutral-400 font-mono min-w-0">
                   <Clock className="w-3 h-3 shrink-0" />
                   {active ? (
                     <span className="break-words">{fmtCountdown(job.wall_clock_deadline, nowMs)} left</span>
                   ) : (
                     <span className="break-words">{job.terminal_reason ?? '—'}</span>
                   )}
+                  {!active && typeof (job.polling_metadata?.exit_code) === 'number' && (
+                    <span
+                      className="shrink-0 rounded border border-neutral-700 bg-neutral-800/60 px-1 py-0.5 text-ui-xs text-neutral-400"
+                      data-testid="compute-exit-code"
+                    >
+                      exit {job.polling_metadata.exit_code as number}
+                    </span>
+                  )}
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   {!active && (
-                    <button
-                      onClick={() => void handleAnalyze(job)}
-                      disabled={analyzingId === job.id}
-                      className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-violet-500/20 text-violet-200 hover:bg-violet-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
-                      title="Run analysis for this terminal compute job"
-                    >
-                      <Cpu className="w-3 h-3" />
-                      {analyzingId === job.id ? 'Analyzing…' : 'Run analysis'}
-                    </button>
+                    <>
+                      <button
+                        onClick={() => void handleAnalyze(job)}
+                        disabled={analyzingId === job.id}
+                        className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-violet-500/20 text-violet-200 hover:bg-violet-500/30 text-ui-md font-semibold px-3 transition-colors disabled:opacity-50"
+                        title="Run analysis for this terminal compute job"
+                      >
+                        <Cpu className="w-3 h-3" />
+                        {analyzingId === job.id ? 'Analyzing…' : 'Run analysis'}
+                      </button>
+                      {onDuplicateTask && (
+                        <button
+                          onClick={() => job.task_id && void onDuplicateTask(job.task_id)}
+                          className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-sky-500/20 text-sky-200 hover:bg-sky-500/30 text-ui-md font-semibold px-3 transition-colors"
+                          title="Re-run this experiment with the same configuration"
+                        >
+                          <Cpu className="w-3 h-3" />
+                          Re-run
+                        </button>
+                      )}
+                    </>
                   )}
                   {active && (
                     <button
                       onClick={() => void handleKill(job)}
                       disabled={killingId === job.id}
-                      className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-red-500/20 text-red-200 hover:bg-red-500/30 text-[11px] font-semibold px-3 transition-colors disabled:opacity-50"
+                      className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-red-500/20 text-red-200 hover:bg-red-500/30 text-ui-md font-semibold px-3 transition-colors disabled:opacity-50"
                       title="Kill this compute job"
                     >
                       <Square className="w-3 h-3" />
@@ -286,7 +650,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                 if (!cause && !hasContract) return null;
                 return (
                   <div
-                    className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-200"
+                    className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-ui-sm text-amber-200"
                     data-testid="compute-provisioning-cause"
                   >
                     <div className="flex items-start gap-1.5">
@@ -315,9 +679,43 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                   </div>
                 );
               })()}
+              {(() => {
+                const doc = knowledgeDocs[job.id];
+                if (!doc) return null;
+                const docKey = `knowledge-${job.id}`;
+                const expanded = expandedDocIds.has(docKey);
+                return (
+                  <div
+                    className="mt-1.5 rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1.5 text-ui-sm"
+                    data-testid="compute-knowledge-doc-link"
+                  >
+                    <div className="flex items-start gap-1.5">
+                      <FileText className="w-3 h-3 shrink-0 mt-0.5 text-sky-300" />
+                      <div className="min-w-0 flex-1">
+                        <button
+                          type="button"
+                          onClick={() => toggleDocExpanded(docKey)}
+                          className="font-semibold text-sky-200 break-words text-left w-full hover:text-sky-100"
+                          data-testid="compute-knowledge-doc-toggle"
+                        >
+                          {doc.title}
+                        </button>
+                        {!expanded && doc.summary && (
+                          <div className="mt-0.5 text-sky-300/80 break-words whitespace-pre-wrap line-clamp-3">{doc.summary}</div>
+                        )}
+                        {expanded && (
+                          <div className="mt-0.5 text-sky-300/80 break-words whitespace-pre-wrap" data-testid="compute-knowledge-doc-body">
+                            {doc.body ?? doc.summary}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
               {analysisFeedback[job.id] && (
                 <div
-                  className={`mt-1.5 rounded border px-2 py-1 text-[10px] ${
+                  className={`mt-1.5 rounded border px-2 py-1 text-ui-sm ${
                     analysisFeedback[job.id].kind === 'error'
                       ? 'border-red-500/30 bg-red-500/10 text-red-200'
                       : analysisFeedback[job.id].kind === 'analysis_unavailable'
@@ -330,8 +728,47 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                   {analysisFeedback[job.id].message}
                 </div>
               )}
+              {(() => {
+                const doc = analysisDocs[job.id];
+                if (!doc) return null;
+                const docKey = `analysis-${job.id}`;
+                const expanded = expandedDocIds.has(docKey);
+                return (
+                  <div
+                    className="mt-1.5 rounded border border-violet-500/30 bg-violet-500/10 px-2 py-1.5 text-ui-sm"
+                    data-testid="compute-analysis-doc"
+                  >
+                    <div className="flex items-start gap-1.5">
+                      <FileText className="w-3 h-3 shrink-0 mt-0.5 text-violet-300" />
+                      <div className="min-w-0 flex-1">
+                        <button
+                          type="button"
+                          onClick={() => toggleDocExpanded(docKey)}
+                          className="font-semibold text-violet-200 break-words text-left w-full hover:text-violet-100"
+                          data-testid="compute-analysis-doc-toggle"
+                        >
+                          {doc.title}
+                        </button>
+                        {!expanded && doc.summary && (
+                          <div className="mt-0.5 text-violet-300/80 break-words whitespace-pre-wrap line-clamp-3">{doc.summary}</div>
+                        )}
+                        {!expanded && !doc.summary && doc.body && (
+                          <div className="mt-0.5 text-violet-300/80 break-words line-clamp-4 whitespace-pre-wrap">
+                            {doc.body.slice(0, 400)}{doc.body.length > 400 ? '…' : ''}
+                          </div>
+                        )}
+                        {expanded && (
+                          <div className="mt-0.5 text-violet-300/80 break-words whitespace-pre-wrap" data-testid="compute-analysis-doc-body">
+                            {doc.body ?? doc.summary}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
               {job.artifact_id && (
-                <div className="mt-1.5 flex items-start gap-1.5 text-[10px]">
+                <div className="mt-1.5 flex items-start gap-1.5 text-ui-sm">
                   <Package className="w-3 h-3 shrink-0 mt-px text-emerald-300" />
                   <div className="min-w-0">
                     {job.result_reference ? (
@@ -352,7 +789,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                 </div>
               )}
               {job.result_reference && (
-                <div className="mt-1.5 flex items-start gap-1.5 text-[10px] text-neutral-400 font-mono break-words">
+                <div className="mt-1.5 flex items-start gap-1.5 text-ui-sm text-neutral-400 font-mono break-words">
                   <span className="shrink-0 text-neutral-500">Result reference</span>
                   <ResolvedReferenceLink
                     projectId={projectId}
@@ -370,7 +807,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                 const entries = Object.entries(metrics);
                 if (entries.length === 0) return null;
                 return (
-                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-neutral-400 font-mono">
+                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-400 font-mono">
                     {entries.map(([k, v]) => (
                       <span key={k}>
                         <span className="text-neutral-500">{k}:</span> {String(v)}
@@ -381,10 +818,35 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
               })()}
               {(() => {
                 if (active) return null;
+                const { experiment, benchmark, hypothesis } = job;
+                if (!experiment && !benchmark && !hypothesis) return null;
+                return (
+                  <div
+                    className="mt-1.5 flex flex-col gap-0.5 text-ui-sm font-mono"
+                    data-testid="compute-experiment-identity"
+                  >
+                    {(experiment || benchmark) && (
+                      <div className="flex items-start gap-1.5">
+                        <span className="text-neutral-500 shrink-0">{experiment ? 'Experiment' : 'Benchmark'}</span>
+                        <span className="text-neutral-300 break-words">{experiment ?? benchmark}</span>
+                      </div>
+                    )}
+                    {hypothesis && (
+                      <div className="flex items-start gap-1.5">
+                        <span className="text-neutral-500 shrink-0">Hypothesis</span>
+                        <span className="text-neutral-300 break-words">{hypothesis}</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+              {(() => {
+                if (active) return null;
                 const sc = job.success_criterion;
                 const verdict = job.criterion_verdict;
                 if (!sc) return null;
                 const expr = `${sc.metric} ${sc.operator} ${sc.threshold}`;
+                const margin = computeJobMargin(job);
                 let chip: React.ReactNode;
                 if (!verdict) {
                   chip = (
@@ -413,17 +875,81 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                 }
                 return (
                   <div
-                    className="mt-1.5 flex items-center gap-1.5 text-[10px] font-mono"
+                    className="mt-1.5 flex flex-col gap-1 text-ui-sm font-mono"
                     data-testid="criterion-verdict-row"
                   >
-                    <span className="text-neutral-500 shrink-0">Criterion</span>
-                    <span className="text-neutral-300 break-words">{expr}</span>
-                    {verdict && verdict.value !== null && verdict.value !== undefined && (
-                      <span className="text-neutral-500">
-                        (measured: {verdict.value})
-                      </span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-neutral-500 shrink-0">Criterion</span>
+                      <span className="text-neutral-300 break-words">{expr}</span>
+                      {verdict && verdict.value !== null && verdict.value !== undefined && (
+                        <span className="text-neutral-500">
+                          (measured: {verdict.value})
+                        </span>
+                      )}
+                      {chip}
+                    </div>
+                    {margin !== null && (
+                      <div className="flex items-center gap-1.5 text-neutral-500">
+                        <span className="shrink-0">Margin</span>
+                        <span
+                          className={`font-semibold ${
+                            margin >= 0 ? 'text-emerald-300' : 'text-red-300'
+                          }`}
+                          data-testid="criterion-margin"
+                        >
+                          {margin >= 0 ? '+' : ''}{margin.toFixed(2)}
+                        </span>
+                      </div>
                     )}
-                    {chip}
+                  </div>
+                );
+              })()}
+              {(() => {
+                if (!active) return null;
+                const lo = job.polling_metadata?.live_output as ComputeJobLiveOutput | undefined | null;
+                if (!lo || typeof lo.text !== 'string' || !lo.text.trim()) return null;
+                const lines = lo.text.split('\n');
+                const displayLines = lines.length > 30 ? lines.slice(-30) : lines;
+                const clipped = lines.length > 30;
+                return (
+                  <div className="mt-1.5" data-testid="compute-live-output">
+                    <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
+                      <span>Live output</span>
+                      <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-500">
+                        updating…
+                      </span>
+                      {(lo.truncated || clipped) && (
+                        <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-400">
+                          truncated
+                        </span>
+                      )}
+                    </div>
+                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
+                      {displayLines.join('\n')}
+                    </pre>
+                  </div>
+                );
+              })()}
+              {(() => {
+                if (active) return null;
+                const cl = job.polling_metadata?.command_log as ComputeJobCommandLog | undefined | null;
+                if (!cl || typeof cl.text !== 'string' || !cl.text.trim()) return null;
+                const lines = cl.text.split('\n');
+                const displayLines = lines.length > 30 ? lines.slice(-30) : lines;
+                const clipped = lines.length > 30;
+                return (
+                  <div className="mt-1.5" data-testid="compute-command-log">
+                    <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
+                      <span>Command log</span>
+                      {(cl.truncated || clipped) && (
+                        <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-400">
+                          truncated
+                        </span>
+                      )}
+                    </div>
+                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
+                      {displayLines.join('\n')}
+                    </pre>
                   </div>
                 );
               })()}
@@ -444,7 +970,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute 
                 }
                 return (
                   <div
-                    className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-200"
+                    className="mt-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-ui-sm text-amber-200"
                     data-testid="compute-rpc-diagnostic"
                   >
                     <div className="flex items-start gap-1.5">

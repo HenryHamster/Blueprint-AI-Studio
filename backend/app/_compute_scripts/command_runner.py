@@ -3,13 +3,17 @@
 argv[1]: command string to run via bash -lc
 argv[2]: path to write the bounded command log JSON
 argv[3]: max log bytes (integer; defaults to 32768)
+argv[4]: path to write the live output tail (base64 JSON; optional)
 """
 
+import base64
+import contextlib
 import json
 import pathlib
 import re
 import subprocess
 import sys
+import threading
 
 # ---------------------------------------------------------------------------
 # Credential redaction — stdlib-only, mirrors failure_classification._CRED_REDACT_SUBS
@@ -70,6 +74,8 @@ _CRED_FIELD_RE = re.compile(
     re.IGNORECASE,
 )
 
+_LIVE_TAIL_MAX_BYTES = 10240
+
 
 def _redact_credentials(text: str) -> str:
     for pattern, replacement in _CRED_REDACT_SUBS:
@@ -83,6 +89,7 @@ def _redact_credentials(text: str) -> str:
 command = sys.argv[1]
 log_path = pathlib.Path(sys.argv[2])
 max_log_bytes = int(sys.argv[3]) if len(sys.argv) > 3 else 32768
+live_tail_path = pathlib.Path(sys.argv[4]) if len(sys.argv) > 4 else None
 log_path.parent.mkdir(parents=True, exist_ok=True)
 proc = subprocess.Popen(
     ["bash", "-lc", command],
@@ -91,6 +98,35 @@ proc = subprocess.Popen(
 )
 captured = bytearray()
 truncated = False
+
+_stop_tail = threading.Event()
+
+
+def _flush_live_tail() -> None:
+    if live_tail_path is None:
+        return
+    snapshot = bytes(captured)
+    tail = snapshot[-_LIVE_TAIL_MAX_BYTES:]
+    is_truncated = len(snapshot) > _LIVE_TAIL_MAX_BYTES or truncated
+    payload = json.dumps(
+        {
+            "text": _redact_credentials(tail.decode("utf-8", "replace")),
+            "truncated": is_truncated,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    with contextlib.suppress(OSError):
+        live_tail_path.write_bytes(base64.b64encode(payload))
+
+
+def _tail_worker() -> None:
+    while not _stop_tail.wait(timeout=30):
+        _flush_live_tail()
+
+
+_tail_thread = threading.Thread(target=_tail_worker, daemon=True)
+_tail_thread.start()
+
 assert proc.stdout is not None
 while True:
     chunk = proc.stdout.read(8192)
@@ -106,6 +142,7 @@ while True:
     else:
         truncated = True
 exit_code = proc.wait()
+_stop_tail.set()
 if proc.stdout is not None:
     proc.stdout.close()
 if captured or truncated:

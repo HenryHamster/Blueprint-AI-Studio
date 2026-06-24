@@ -17,9 +17,6 @@
     "MetricsDashboard",
     "OrchestratorHealthBar",
     "SearchFilterBar",
-    "PlaybookPanel",
-    "CatchUpPanel",
-    "DiagnosticsPanel",
     "SettingsAccountsSection"
   ]
 }

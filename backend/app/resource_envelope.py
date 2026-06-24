@@ -70,6 +70,21 @@ def resolve_project_spend_window_days(project: Project) -> int:
     return 30
 
 
+def resolve_project_hardware_policy(
+    project: Project,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Return (allowed_machine_types, allowed_accelerator_types) from the envelope.
+
+    Returns (None, None) when absent or not lists — callers treat None as unlimited.
+    """
+    env = _get_envelope(project)
+    machine_types = env.get("allowed_machine_types")
+    accelerator_types = env.get("allowed_accelerator_types")
+    allowed_machines = machine_types if isinstance(machine_types, list) else None
+    allowed_accels = accelerator_types if isinstance(accelerator_types, list) else None
+    return allowed_machines, allowed_accels
+
+
 def resolve_project_spend_warning_fraction(project: Project) -> float:
     """Return the warning fraction of the spend ceiling, defaulting to 0.8.
 

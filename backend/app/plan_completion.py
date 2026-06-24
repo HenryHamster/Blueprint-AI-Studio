@@ -22,6 +22,7 @@ from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
     _author_compute_launch_contract,
     _validate_compute_launch_contract,
+    resolve_compute_spend_approval,
 )
 from app.depends_on_provenance import remember_structural_depends_on
 from app.finding_deduplication import normalize_prerequisite
@@ -933,12 +934,32 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 },
                 f"task_completion:plan_subtask:{subtask_type}",
             )
+        if subtask_type == "compute_experiment":
+            _ce_direction = (
+                next(
+                    (
+                        d
+                        for d in (getattr(project, "directions", None) or [])
+                        if d.get("id") == str(parent_direction_id)
+                    ),
+                    None,
+                )
+                if parent_direction_id
+                else None
+            )
+            child_requires_approval, _ = resolve_compute_spend_approval(
+                runtime_config=_runtime_config,
+                direction=_ce_direction,
+                spend_cap_usd=float(compute_contract["spend_cap_usd"]),
+            )
+        else:
+            child_requires_approval = False
         child = Task(
             project_id=task.project_id,
             title=subtask_def.get("title", "Untitled subtask"),
             description=subtask_def.get("prompt", ""),
             parent_task_id=task.id,
-            requires_approval=False,
+            requires_approval=child_requires_approval,
             payloads=[child_payload],
             context={
                 "plan_branch": plan_branch,

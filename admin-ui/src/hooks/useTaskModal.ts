@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type React from 'react';
-import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog, createComputeExperiment } from '../api';
-import type { ComputeSuccessOperator, ComputeExperimentLaunchRequest, ComputeSuccessCriterion } from '../api';
+import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog, createComputeExperiment, computeExperimentPreflight } from '../api';
+import type { ComputeSuccessOperator, ComputeExperimentLaunchRequest, ComputeSuccessCriterion, ComputeExperimentPreflightResponse } from '../api';
 import type { LaunchableTaskTypeOption, UserLaunchableTaskType } from '../taskCapabilities';
 import { USER_LAUNCHABLE_TASK_TYPE_IDS, USER_LAUNCHABLE_TASK_TYPE_OPTIONS, resolveTaskCapabilities } from '../taskCapabilities';
 import type { TaskCapabilityContract } from '../types/settings';
@@ -22,6 +22,8 @@ export const COMPUTE_EXPERIMENT_TASK_TYPE = 'compute_experiment';
 // all-or-nothing: leave them blank to launch without a machine-checkable goal.
 export interface ComputeExperimentForm {
   command: string;
+  cwd: string;
+  envVars: string;
   accelerator: string;
   machineType: string;
   spendCapUsd: string;
@@ -35,6 +37,7 @@ export interface ComputeExperimentForm {
   successThreshold: string;
   requireLiveRelease: boolean;
   requireDurableArtifact: boolean;
+  provisioningModel: 'STANDARD' | 'SPOT';
 }
 
 export const COMPUTE_ACCELERATOR_OPTIONS = [
@@ -51,6 +54,8 @@ export function canonicalMachineTypeForAccelerator(accelerator: string): string 
 export function defaultComputeExperimentForm(): ComputeExperimentForm {
   return {
     command: '',
+    cwd: '',
+    envVars: '',
     accelerator: '',
     machineType: '',
     spendCapUsd: '',
@@ -64,6 +69,7 @@ export function defaultComputeExperimentForm(): ComputeExperimentForm {
     successThreshold: '',
     requireLiveRelease: false,
     requireDurableArtifact: false,
+    provisioningModel: 'STANDARD',
   };
 }
 
@@ -107,6 +113,11 @@ export function useTaskModal(
   // newTaskType === 'compute_experiment'; otherwise inert.
   const [computeExperiment, setComputeExperiment] =
     useState<ComputeExperimentForm>(defaultComputeExperimentForm);
+
+  // Preflight projection state — debounced on hardware/budget inputs.
+  const [preflightResult, setPreflightResult] = useState<ComputeExperimentPreflightResponse | null>(null);
+  const [preflightLoading, setPreflightLoading] = useState(false);
+  const [preflightError, setPreflightError] = useState<string | null>(null);
 
   // GitHub repo/branch dropdown state
   const [repoOptions, setRepoOptions] = useState<RepoOption[]>([]);
@@ -155,6 +166,61 @@ export function useTaskModal(
       setNewTaskBranch(defaultTaskBranch);
     }
   }, [defaultTaskBranch, newTaskBranch, showNewTaskModal]);
+
+  // Debounced preflight projection: fires 500ms after hardware/budget inputs settle.
+  // Stale in-flight requests are aborted via AbortController. On error the panel
+  // degrades silently (preflightError is set) rather than blocking submission.
+  useEffect(() => {
+    if (newTaskType !== COMPUTE_EXPERIMENT_TASK_TYPE) {
+      setPreflightResult(null);
+      setPreflightLoading(false);
+      setPreflightError(null);
+      return;
+    }
+    const repo = newTaskRepo;
+    if (!repo || !repo.includes('/')) {
+      setPreflightResult(null);
+      return;
+    }
+    const spendCap = Number(computeExperiment.spendCapUsd);
+    const deadline = Number(computeExperiment.deadlineSeconds);
+    if (!Number.isFinite(spendCap) || spendCap <= 0) {
+      setPreflightResult(null);
+      return;
+    }
+    if (!Number.isInteger(deadline) || deadline <= 0) {
+      setPreflightResult(null);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      setPreflightLoading(true);
+      setPreflightError(null);
+      computeExperimentPreflight(
+        {
+          github_repo: repo,
+          ...(computeExperiment.accelerator.trim() ? { accelerator: computeExperiment.accelerator.trim() } : {}),
+          ...(computeExperiment.machineType.trim() ? { machine_type: computeExperiment.machineType.trim() } : {}),
+          spend_cap_usd: spendCap,
+          deadline_seconds: deadline,
+          ...(computeExperiment.provisioningModel !== 'STANDARD' ? { provisioning_model: computeExperiment.provisioningModel } : {}),
+        },
+        controller.signal,
+      ).then(result => {
+        setPreflightResult(result);
+        setPreflightLoading(false);
+      }).catch(e => {
+        if (e instanceof Error && e.name === 'AbortError') return;
+        setPreflightError(e instanceof Error ? e.message : 'Preflight check failed');
+        setPreflightLoading(false);
+      });
+    }, 500);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [newTaskType, newTaskRepo, computeExperiment.accelerator, computeExperiment.machineType, computeExperiment.spendCapUsd, computeExperiment.deadlineSeconds, computeExperiment.provisioningModel]);
 
   const getDefaultBranchForRepo = (repo: string) => {
     const repoMeta = repoOptions.find(r => r.full_name === repo);
@@ -301,6 +367,21 @@ export function useTaskModal(
   // immediate inline error instead of a round-trip rejection. Returns nothing;
   // surfaces all outcomes through addToast.
   const handleCreateComputeExperiment = async () => {
+    // Block submission when a resolved preflight verdict marks the selected
+    // hardware as outside the project's allowed set. A fetch error (preflightError
+    // set, preflightResult null) degrades gracefully — the server still enforces
+    // the policy, so we don't hard-block on a transient preflight failure.
+    if (preflightResult && !preflightResult.in_policy) {
+      const allowed =
+        preflightResult.allowed_accelerator_types?.join(', ') ||
+        preflightResult.allowed_machine_types?.join(', ') ||
+        'none configured';
+      addToast(
+        `Hardware is outside this project's policy. Allowed: ${allowed}`,
+        'error',
+      );
+      return;
+    }
     const command = computeExperiment.command.trim();
     if (!command) {
       addToast('Command is required for compute experiments', 'error');
@@ -344,6 +425,17 @@ export function useTaskModal(
     const benchmark = computeExperiment.benchmark.trim();
     const hypothesis = computeExperiment.hypothesis.trim();
     const metric = computeExperiment.metric.trim();
+    const cwd = computeExperiment.cwd.trim();
+    // Parse KEY=VALUE lines into an env record; skip blank lines and comments.
+    const envRecord: Record<string, string> = {};
+    for (const line of computeExperiment.envVars.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx < 1) continue;
+      envRecord[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1);
+    }
+    const hasEnv = Object.keys(envRecord).length > 0;
     const title = newTaskTitle.trim() || `Compute experiment: ${command.slice(0, 60)}`;
     const prompt = newTaskPrompt.trim() || hypothesis || `Run compute experiment: ${command}`;
     const body: ComputeExperimentLaunchRequest = {
@@ -356,6 +448,8 @@ export function useTaskModal(
       deadline_seconds: deadline,
       ...(accelerator ? { accelerator } : {}),
       ...(machineType ? { machine_type: machineType } : {}),
+      ...(cwd ? { cwd } : {}),
+      ...(hasEnv ? { env: envRecord } : {}),
       ...(experiment ? { experiment } : {}),
       ...(benchmark ? { benchmark } : {}),
       ...(hypothesis ? { hypothesis } : {}),
@@ -364,6 +458,9 @@ export function useTaskModal(
       ...(computeExperiment.requireLiveRelease ? { require_live_release: true } : {}),
       ...(computeExperiment.requireDurableArtifact
         ? { require_durable_artifact: true }
+        : {}),
+      ...(computeExperiment.provisioningModel !== 'STANDARD'
+        ? { provisioning_model: computeExperiment.provisioningModel }
         : {}),
       ...(newTaskModel ? { model: newTaskModel } : {}),
       ...(newTaskEffort ? { effort: newTaskEffort } : {}),
@@ -513,10 +610,14 @@ export function useTaskModal(
     const branch = (payload.base_branch as string) || '';
     const model = (payload.model as string) || '';
     const effort = (payload.effort as string) || '';
-    const taskType: UserLaunchableTaskType =
-      task.task_type && launchableTaskTypeIds.includes(task.task_type)
-        ? (task.task_type as UserLaunchableTaskType)
-        : 'create';
+    // compute_experiment is operator_contract_launchable but not in USER_LAUNCHABLE_TASK_TYPE_IDS,
+    // so check for it explicitly. Otherwise use launchableTaskTypeIds.
+    const taskType: UserLaunchableTaskType | 'compute_experiment' =
+      (task.task_type as string) === COMPUTE_EXPERIMENT_TASK_TYPE
+        ? COMPUTE_EXPERIMENT_TASK_TYPE
+        : task.task_type && launchableTaskTypeIds.includes(task.task_type)
+          ? (task.task_type as UserLaunchableTaskType)
+          : 'create';
 
     setModalOpener('duplicate');
     setShowNewTaskModal(true);
@@ -533,6 +634,45 @@ export function useTaskModal(
     setUseManualBranch(false);
     setBranchOptions([]);
     setBranchError(null);
+
+    // For compute_experiment tasks, prefill the compute experiment form from the payload.
+    if ((task.task_type as string) === COMPUTE_EXPERIMENT_TASK_TYPE) {
+      setComputeExperiment({
+        command: (payload.command as string) || '',
+        cwd: (payload.cwd as string) || '',
+        envVars: (() => {
+          const env = payload.env as Record<string, string> | undefined;
+          if (!env) return '';
+          return Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\n');
+        })(),
+        accelerator: (payload.accelerator as string) || '',
+        machineType: (payload.machine_type as string) || '',
+        spendCapUsd: String(payload.spend_cap_usd ?? ''),
+        deadlineSeconds: String(payload.deadline_seconds ?? ''),
+        experiment: (payload.experiment as string) || '',
+        benchmark: (payload.benchmark as string) || '',
+        hypothesis: (payload.hypothesis as string) || '',
+        metric: (payload.metric as string) || '',
+        successMetric: (() => {
+          const sc = payload.success_criterion as { metric: string; operator: string; threshold: number } | undefined;
+          return sc?.metric || '';
+        })(),
+        successOperator: (() => {
+          const sc = payload.success_criterion as { metric: string; operator: ComputeSuccessOperator; threshold: number } | undefined;
+          return (sc?.operator as ComputeSuccessOperator) || '>=';
+        })(),
+        successThreshold: (() => {
+          const sc = payload.success_criterion as { metric: string; operator: string; threshold: number } | undefined;
+          return sc ? String(sc.threshold) : '';
+        })(),
+        requireLiveRelease: (payload.require_live_release as boolean) || false,
+        requireDurableArtifact: (payload.require_durable_artifact as boolean) || false,
+        provisioningModel: ((payload.provisioning_model as 'STANDARD' | 'SPOT') || 'STANDARD'),
+      });
+    } else {
+      setComputeExperiment(defaultComputeExperimentForm());
+    }
+
     fetchRepoOptions();
     fetchLaunchableTaskTypeOptions();
     if (repo) fetchBranchOptions(repo);
@@ -545,6 +685,7 @@ export function useTaskModal(
     setNewTaskRepo, setNewTaskBranch, setNewTaskTitle, setNewTaskPrompt,
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     computeExperiment, setComputeExperiment,
+    preflightResult, preflightLoading, preflightError,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
     launchableTaskTypeOptions,

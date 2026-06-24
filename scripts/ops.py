@@ -246,360 +246,60 @@ def cmd_directions(args):
 
 
 def cmd_vision(args):
-    """Show the product vision and design document.
-
-    Usage:
-        ops.py vision                       — show the strategic vision
-        ops.py vision --design-doc          — show the design document (architecture wiki)
-        ops.py vision --design-doc KEY      — show a single design doc page
-    """
-    import io, os
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    pid = get_project_id()
-    data = api("GET", f"/api/admin/projects/{pid}/directions")
-
-    if args and args[0] == '--design-doc':
-        doc = data.get('design_doc', {})
-        if not doc:
-            print("No design document yet.")
-            return
-        if len(args) > 1:
-            key = args[1]
-            page = doc.get(key)
-            if page is None:
-                print(f"Page not found: {key}")
-                print(f"Available pages: {', '.join(sorted(doc.keys()))}")
-                return
-            print(f"=== DESIGN DOC: {key} ===")
-            print(json.dumps(page, indent=2))
-        else:
-            print(f"=== DESIGN DOCUMENT ({len(doc)} pages) ===")
-            for key in sorted(doc.keys()):
-                page = doc[key]
-                if isinstance(page, dict):
-                    summary = page.get('summary', page.get('description', str(page)[:120]))
-                    status = page.get('status', '')
-                    status_str = f" [{status}]" if status else ''
-                    print(f"  {key}{status_str} — {str(summary)[:100]}")
-                else:
-                    print(f"  {key} — {str(page)[:100]}")
-        return
-
-    vision = data.get('vision', {})
-    if not vision:
-        print("No vision set yet.")
-        return
-
-    print("=== PRODUCT VISION ===")
-    print(f"  Purpose:  {vision.get('purpose', '(not set)')}")
-    focus = vision.get('focus')
-    if focus:
-        if isinstance(focus, list):
-            print(f"  Focus ({len(focus)} active):")
-            for f in focus:
-                print(f"    - {f}")
-        else:
-            print(f"  Focus:    {focus}")
-    print(f"  Revision: {vision.get('revision', '?')}")
-    print(f"  Updated:  {(vision.get('last_updated') or '?')[:19]}")
-    criteria = vision.get('success_criteria', [])
-    if criteria:
-        print(f"\n  Success criteria ({len(criteria)}):")
-        for c in criteria:
-            print(f"    - {c}")
-    systems = vision.get('systems', [])
-    if systems:
-        print(f"\n  Systems ({len(systems)}):")
-        for s in systems:
-            sid = s.get('id', '?')
-            name = s.get('name', '?')
-            status = s.get('status', '?')
-            print(f"    {sid} [{status}] {name}")
-    context = vision.get('context', '')
-    if context:
-        print(f"\n  Context:\n    {context[:500]}")
-    cycles = vision.get('_strategic_cycle_count', 0)
-    spawns = vision.get('_research_spawn_count', 0)
-    if cycles or spawns:
-        print(f"\n  Stats: {spawns} research spawns, {cycles} strategic cycles")
+    """DEPRECATED — use: python scripts/blueprint.py vision"""
+    print(
+        "DEPRECATED: use python scripts/blueprint.py vision\n"
+        "  Show vision:      python scripts/blueprint.py vision\n"
+        "  Show design doc:  python scripts/blueprint.py vision --design-doc\n"
+        "  Show page KEY:    python scripts/blueprint.py vision --design-doc KEY"
+    )
+    sys.exit(1)
 
 
 def cmd_strategic_cycle(args):
-    """Manually trigger a strategic cycle.
-
-    Usage:
-        ops.py strategic-cycle                  -- full cycle (design_doc -> chains to strategic_review)
-        ops.py strategic-cycle --phase strategic_review  -- Phase 2 only (no design doc update)
-    """
-    phase = "design_doc"
-    i = 0
-    while i < len(args):
-        if args[i] == '--phase' and i + 1 < len(args):
-            phase = args[i + 1]; i += 2
-        else:
-            i += 1
-    pid = get_project_id()
-    result = api("POST", f"/api/admin/projects/{pid}/strategic-cycle?phase={phase}")
-    task_id = result.get("task_id") or result.get("id") or "?"
-    print(f"Spawned {phase} task: {task_id}")
-    print(f"  Title: {result.get('title', '?')}")
-    if phase == "design_doc":
-        print("  Phase 1 will chain into strategic_review (Phase 2) on completion.")
+    """DEPRECATED — use: python scripts/blueprint.py strategic-cycle"""
+    print(
+        "DEPRECATED: use python scripts/blueprint.py strategic-cycle\n"
+        "  Full cycle:     python scripts/blueprint.py strategic-cycle --yes\n"
+        "  Phase 2 only:   python scripts/blueprint.py strategic-cycle --phase strategic_review --yes"
+    )
+    sys.exit(1)
 
 
 def cmd_trim_playbook_archive(args):
-    """Trim design_doc.playbook_archive to the last N entries (default 50).
-
-    One-shot cleanup for projects that accumulated archive entries before the
-    mechanical cap shipped. The live code caps archive length on every
-    _archive_least_useful_entry call, but that only kicks in on the next
-    archival event — this forces an immediate trim.
-
-    Usage:
-        ops.py trim-playbook-archive              — trim to 50 entries
-        ops.py trim-playbook-archive --keep 20    — trim to 20 entries
-        ops.py trim-playbook-archive --dry-run    — report size without writing
-    """
-    keep = 50
-    dry_run = False
-    i = 0
-    while i < len(args):
-        if args[i] == '--keep' and i + 1 < len(args):
-            keep = int(args[i + 1]); i += 2
-        elif args[i] == '--dry-run':
-            dry_run = True; i += 1
-        else:
-            i += 1
-
-    pid = get_project_id()
-    data = api("GET", f"/api/admin/projects/{pid}/directions")
-    doc = data.get('design_doc') or {}
-    archive = doc.get('playbook_archive') or []
-
-    print(f"Current playbook_archive: {len(archive)} entries")
-    before_bytes = len(json.dumps(archive).encode())
-    print(f"Archive size: {before_bytes:,} bytes ({before_bytes // 1024} KB)")
-
-    if len(archive) <= keep:
-        print(f"Already within cap of {keep} — nothing to trim.")
-        return
-
-    trimmed = archive[-keep:]
-    after_bytes = len(json.dumps(trimmed).encode())
-    dropped = len(archive) - len(trimmed)
-    print(f"Would drop {dropped} oldest entries -> {len(trimmed)} remain ({after_bytes:,} bytes)")
-
-    if dry_run:
-        print("(dry-run -- no changes written)")
-        return
-
-    new_doc = dict(doc)
-    new_doc['playbook_archive'] = trimmed
-    api("PATCH", f"/api/admin/projects/{pid}", {"design_doc": new_doc})
-    print(f"Trimmed archive to {len(trimmed)} entries ({before_bytes - after_bytes:,} bytes freed)")
-
-
-def _resolve_fingerprint(query: str, project_id: str | None = None) -> dict | None:
-    """Find a residual case by fingerprint substring (case-insensitive).
-
-    Fingerprints are long opaque strings; the CLI accepts a unique prefix or
-    substring and matches against open cases. Returns None on no/ambiguous
-    match (with a printed hint).
-    """
-    path = "/api/admin/residual-cases?limit=200"
-    if project_id:
-        path += f"&project_id={project_id}"
-    cases = api("GET", path).get("cases", [])
-    needle = query.lower()
-    matches = [c for c in cases if needle in (c.get("fingerprint") or "").lower()]
-    if not matches:
-        print(f"No open residual case matches: {query!r}")
-        return None
-    if len(matches) > 1:
-        print(f"Ambiguous — {len(matches)} cases match {query!r}:")
-        for c in matches[:5]:
-            print(f"  - {c['fingerprint'][:120]}")
-        print("Use a longer substring to disambiguate.")
-        return None
-    return matches[0]
+    """DEPRECATED — use: python scripts/blueprint.py trim-playbook-archive"""
+    print(
+        "DEPRECATED: use python scripts/blueprint.py trim-playbook-archive\n"
+        "  Trim to 50:   python scripts/blueprint.py trim-playbook-archive\n"
+        "  Trim to N:    python scripts/blueprint.py trim-playbook-archive --keep N\n"
+        "  Dry run:      python scripts/blueprint.py trim-playbook-archive --dry-run"
+    )
+    sys.exit(1)
 
 
 def cmd_fingerprints(args):
-    """List or manage residual remediation cases.
-
-    Usage:
-        python scripts/ops.py fingerprints
-        python scripts/ops.py fingerprints --status IGNORED [--status RESOLVED]
-        python scripts/ops.py fingerprints --all                    — every status
-        python scripts/ops.py fingerprints --ignore <fp-substring>
-        python scripts/ops.py fingerprints --unignore <fp-substring>
-        python scripts/ops.py fingerprints --clear                  — wipe in-memory store
-    """
-    # Mutations first.
-    if args and args[0] == '--ignore' and len(args) > 1:
-        from blueprint_api import get_project_id
-        pid = get_project_id()
-        case = _resolve_fingerprint(args[1], pid)
-        if not case:
-            return
-        from urllib.parse import quote
-        result = api("POST", f"/api/admin/residual-cases/{quote(case['fingerprint'], safe='')}/ignore?project_id={pid}")
-        print(f"Ignored: {result.get('fingerprint', '')[:100]} → status={result.get('status')}")
-        return
-    if args and args[0] == '--unignore' and len(args) > 1:
-        from blueprint_api import get_project_id
-        pid = get_project_id()
-        # IGNORED cases aren't in the default open-status list, look across all
-        ignored_path = f"/api/admin/residual-cases?status=IGNORED&limit=200&project_id={pid}"
-        cases = api("GET", ignored_path).get("cases", [])
-        needle = args[1].lower()
-        matches = [c for c in cases if needle in (c.get("fingerprint") or "").lower()]
-        if not matches:
-            print(f"No IGNORED case matches: {args[1]!r}")
-            return
-        if len(matches) > 1:
-            print(f"Ambiguous — {len(matches)} IGNORED cases match. Use a longer substring.")
-            return
-        from urllib.parse import quote
-        result = api("POST", f"/api/admin/residual-cases/{quote(matches[0]['fingerprint'], safe='')}/unignore?project_id={pid}")
-        print(f"Unignored: {result.get('fingerprint', '')[:100]} → status={result.get('status')}")
-        return
-    if args and args[0] == '--clear':
-        result = api("POST", "/api/admin/residual-fingerprints/clear")
-        print(f"Cleared in-memory store: {result}")
-        return
-
-    # List mode.
-    statuses: list[str] = []
-    show_all = False
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == '--status' and i + 1 < len(args):
-            statuses.append(args[i + 1])
-            i += 2
-            continue
-        if a == '--all':
-            show_all = True
-            i += 1
-            continue
-        i += 1
-    path = "/api/admin/residual-cases?limit=100"
-    if show_all:
-        for s in ('ACTIVE', 'REMEDIATING', 'SUSPENDED', 'IGNORED', 'RESOLVED', 'CLOSED_ORGANICALLY', 'MERGED', 'FAILED'):
-            path += f"&status={s}"
-    else:
-        for s in statuses:
-            path += f"&status={s}"
-    result = api("GET", path)
-    cases = result.get("cases", [])
-    filt = result.get("status_filter", [])
-    print(f"=== RESIDUAL CASES ({len(cases)}) status={','.join(filt)} ===")
-    if not cases:
-        print("(none)")
-        return
-    for c in cases:
-        fp = (c.get("fingerprint") or "").replace("\n", " ")
-        print(f"  [{c['status']:18}] hits={c['hit_count']:<3} consec={c.get('consecutive_failure_count', 0)}  last_seen={(c.get('last_seen_at') or '')[:19]}  pr={c.get('last_spawned_pr_number') or '-'}")
-        print(f"    fp: {fp[:200]}")
+    """DEPRECATED — use: python scripts/blueprint.py fingerprints"""
+    print(
+        "DEPRECATED: use python scripts/blueprint.py fingerprints\n"
+        "  List:     python scripts/blueprint.py fingerprints\n"
+        "  All:      python scripts/blueprint.py fingerprints --all\n"
+        "  Ignore:   python scripts/blueprint.py fingerprints --ignore <fp-substring>\n"
+        "  Unignore: python scripts/blueprint.py fingerprints --unignore <fp-substring>\n"
+        "  Clear:    python scripts/blueprint.py fingerprints --clear"
+    )
+    sys.exit(1)
 
 
 def cmd_regression_cases(args):
-    """List or close regression remediation cases.
-
-    Usage:
-        python scripts/ops.py regression-cases
-        python scripts/ops.py regression-cases --status ACTIVE
-        python scripts/ops.py regression-cases --all
-        python scripts/ops.py regression-cases --close <regression_class> [--reason "why"]
-        python scripts/ops.py regression-cases --close-prefix <prefix> [--reason "why"]
-    """
-    from urllib.parse import quote
-    from blueprint_api import get_project_id
-    pid = get_project_id()
-
-    # Mutations.
-    def _build_close_path(cls: str, reason: str | None) -> str:
-        # regression_class is a query param so slashes / quotes don't
-        # fragment FastAPI's path routing.
-        p = f"/api/admin/regression-cases/close?project_id={pid}&regression_class={quote(cls, safe='')}"
-        if reason:
-            p += f"&reason={quote(reason, safe='')}"
-        return p
-
-    if args and args[0] == '--close' and len(args) > 1:
-        cls = args[1]
-        reason = None
-        for i, a in enumerate(args[2:]):
-            if a == '--reason' and i + 3 < len(args):
-                reason = args[i + 3]
-                break
-        try:
-            result = api("POST", _build_close_path(cls, reason))
-            print(f"Closed: {result.get('regression_class', '')[:120]} → {result.get('prior_status')} → {result.get('status')}")
-        except Exception as e:
-            print(f"Error closing {cls!r}: {e}")
-        return
-    if args and args[0] == '--close-prefix' and len(args) > 1:
-        prefix = args[1]
-        reason = None
-        for i, a in enumerate(args[2:]):
-            if a == '--reason' and i + 3 < len(args):
-                reason = args[i + 3]
-                break
-        # Fetch open cases and filter by prefix
-        path = f"/api/admin/regression-cases?project_id={pid}&limit=200"
-        for s in ('ACTIVE', 'REMEDIATING', 'NEEDS_MANUAL_INTERVENTION'):
-            path += f"&status={s}"
-        result = api("GET", path)
-        cases = result.get("cases", [])
-        matches = [c for c in cases if c.get("regression_class", "").startswith(prefix)]
-        if not matches:
-            print(f"No open cases match prefix {prefix!r}")
-            return
-        print(f"Closing {len(matches)} case(s) matching prefix {prefix!r}:")
-        for c in matches:
-            cls = c["regression_class"]
-            try:
-                r = api("POST", _build_close_path(cls, reason))
-                print(f"  {r.get('prior_status'):28} → {r.get('status'):8}  {cls[:80]}")
-            except Exception as e:
-                print(f"  ERROR  {cls[:80]}: {e}")
-        return
-
-    # List mode.
-    statuses = []
-    show_all = False
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == '--status' and i + 1 < len(args):
-            statuses.append(args[i + 1])
-            i += 2
-            continue
-        if a == '--all':
-            show_all = True
-            i += 1
-            continue
-        i += 1
-    path = f"/api/admin/regression-cases?project_id={pid}&limit=200"
-    if show_all:
-        for s in ('ACTIVE', 'REMEDIATING', 'NEEDS_MANUAL_INTERVENTION', 'CLOSED', 'MERGED'):
-            path += f"&status={s}"
-    else:
-        for s in statuses:
-            path += f"&status={s}"
-    result = api("GET", path)
-    cases = result.get("cases", [])
-    filt = result.get("status_filter", [])
-    print(f"=== REGRESSION CASES ({len(cases)}) status={','.join(filt)} ===")
-    if not cases:
-        print("(none)")
-        return
-    for c in cases:
-        cls = (c.get("regression_class") or "").replace("\n", " ")
-        print(f"  [{c['status']:28}] attempts={c.get('attempts',0)}  hits={c.get('hit_count',0)}  last_seen={(c.get('last_seen_at') or '')[:19]}  pr={c.get('last_remediation_pr_number') or '-'}")
-        print(f"    class: {cls[:200]}")
+    """DEPRECATED — use: python scripts/blueprint.py regression-cases"""
+    print(
+        "DEPRECATED: use python scripts/blueprint.py regression-cases\n"
+        "  List:         python scripts/blueprint.py regression-cases\n"
+        "  All:          python scripts/blueprint.py regression-cases --all\n"
+        "  Close:        python scripts/blueprint.py regression-cases --close CLASS [--reason 'why']\n"
+        "  Close prefix: python scripts/blueprint.py regression-cases --close-prefix PREFIX"
+    )
+    sys.exit(1)
 
 
 def cmd_qualify(args):

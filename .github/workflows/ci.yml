@@ -103,7 +103,19 @@ jobs:
 
       - name: Install dependencies
         working-directory: ./admin-ui
-        run: npm ci || { echo "::warning::npm ci failed (esbuild ETXTBSY postinstall race) - retrying once"; sleep 5; npm ci; }
+        run: |
+          # --prefer-offline serves already-cached tarballs from the warm
+          # setup-node npm cache instead of re-hitting the registry, so a
+          # registry blip can't flake a warm run ("npm ERR! registry
+          # unreachable"). Backoff retry absorbs the esbuild ETXTBSY postinstall
+          # race and transient registry degradation on a cold cache.
+          for i in 1 2 3; do
+            npm ci --prefer-offline --no-audit --fund=false && exit 0
+            echo "::warning::npm ci failed (attempt $i/3) — retrying"
+            sleep $((i * 5))
+          done
+          echo "::error::npm ci failed after 3 attempts"
+          exit 1
 
       - name: Build (tsc + vite)
         working-directory: ./admin-ui
@@ -142,7 +154,19 @@ jobs:
 
       - name: Install dependencies
         working-directory: ./admin-ui
-        run: npm ci || { echo "::warning::npm ci failed (esbuild ETXTBSY postinstall race) - retrying once"; sleep 5; npm ci; }
+        run: |
+          # --prefer-offline serves already-cached tarballs from the warm
+          # setup-node npm cache instead of re-hitting the registry, so a
+          # registry blip can't flake a warm run ("npm ERR! registry
+          # unreachable"). Backoff retry absorbs the esbuild ETXTBSY postinstall
+          # race and transient registry degradation on a cold cache.
+          for i in 1 2 3; do
+            npm ci --prefer-offline --no-audit --fund=false && exit 0
+            echo "::warning::npm ci failed (attempt $i/3) — retrying"
+            sleep $((i * 5))
+          done
+          echo "::error::npm ci failed after 3 attempts"
+          exit 1
 
       - name: Unit tests (happy-dom, shard ${{ matrix.shard }}/2)
         working-directory: ./admin-ui
@@ -165,15 +189,42 @@ jobs:
 
       - name: Install dependencies
         working-directory: ./admin-ui
-        run: npm ci || { echo "::warning::npm ci failed (esbuild ETXTBSY postinstall race) - retrying once"; sleep 5; npm ci; }
+        run: |
+          # --prefer-offline serves already-cached tarballs from the warm
+          # setup-node npm cache instead of re-hitting the registry, so a
+          # registry blip can't flake a warm run ("npm ERR! registry
+          # unreachable"). Backoff retry absorbs the esbuild ETXTBSY postinstall
+          # race and transient registry degradation on a cold cache.
+          for i in 1 2 3; do
+            npm ci --prefer-offline --no-audit --fund=false && exit 0
+            echo "::warning::npm ci failed (attempt $i/3) — retrying"
+            sleep $((i * 5))
+          done
+          echo "::error::npm ci failed after 3 attempts"
+          exit 1
+
+      - name: Resolve Playwright version
+        id: pw
+        working-directory: ./admin-ui
+        # Browser binaries are tied to the playwright package version, not the
+        # whole lockfile — keying the cache on the version keeps it a HIT across
+        # unrelated dependency bumps, so the ~100 MB Chromium download (the
+        # "playwright install failed" flake) only runs on a real version change.
+        run: |
+          V=$(node -p "require('playwright/package.json').version" 2>/dev/null || echo "unknown")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "playwright version: $V"
 
       - name: Cache Playwright Chromium browser
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          # Keyed on the lockfile hash so it auto-invalidates whenever the
-          # resolved Playwright version changes — no manual key bump needed.
-          key: playwright-chromium-${{ hashFiles('admin-ui/package-lock.json') }}
+          key: playwright-chromium-${{ steps.pw.outputs.version }}
+          # restore-keys lets a prior browser cache restore even when the exact
+          # version key misses (e.g. first run after a playwright bump), so we
+          # never throw away a usable Chromium and force a full CDN re-download.
+          restore-keys: |
+            playwright-chromium-
 
       - name: Install Playwright Chromium browser
         # Downloads the ~100 MB binary only on a cache miss; served from
@@ -624,7 +675,19 @@ jobs:
 
       - name: Install dependencies
         working-directory: ./agent
-        run: npm ci || { echo "::warning::npm ci failed (esbuild ETXTBSY postinstall race) - retrying once"; sleep 5; npm ci; }
+        run: |
+          # --prefer-offline serves already-cached tarballs from the warm
+          # setup-node npm cache instead of re-hitting the registry, so a
+          # registry blip can't flake a warm run ("npm ERR! registry
+          # unreachable"). Backoff retry absorbs the esbuild ETXTBSY postinstall
+          # race and transient registry degradation on a cold cache.
+          for i in 1 2 3; do
+            npm ci --prefer-offline --no-audit --fund=false && exit 0
+            echo "::warning::npm ci failed (attempt $i/3) — retrying"
+            sleep $((i * 5))
+          done
+          echo "::error::npm ci failed after 3 attempts"
+          exit 1
 
       - name: Type check
         id: typecheck

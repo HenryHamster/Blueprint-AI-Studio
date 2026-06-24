@@ -446,7 +446,7 @@ export function SettingsOrchestratorSection({
               onChange={e => onUpdateStrategicResearchFrequency(parseInt(e.target.value) || 0)}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
-            <p className="text-[10px] text-neutral-600 mt-1">Every Nth cycle reviews vision</p>
+            <p className="text-ui-sm text-neutral-600 mt-1">Every Nth cycle reviews vision</p>
           </div>
         </div>
         <button

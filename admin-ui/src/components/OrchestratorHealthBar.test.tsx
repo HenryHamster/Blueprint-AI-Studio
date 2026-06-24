@@ -276,6 +276,40 @@ describe('OrchestratorHealthBar cycle liveness verdict', () => {
     expect(cycle.innerHTML).toContain('bg-red-500');
     expect(cycle.textContent).toContain('⚠');
   });
+
+  it('stays green on cold-start (alive=false, stalled=false) — not a genuine hang', async () => {
+    // Before the first cycle completes, evaluate_orchestrator_liveness returns
+    // alive=false, stalled=false. The dot must stay green so cold-start does
+    // not trigger a false-positive red indicator.
+    const health = healthWith({
+      last_cycle_seconds_ago: null,
+      orchestrator_alive: false,
+      orchestrator_hung: false,
+      orchestrator_progress_age_seconds: null,
+      orchestrator_liveness_reason: 'no cycle seen',
+    });
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} health={health} />); });
+
+    const cycle = screen.getByTitle(/Orchestrator starting — no cycle recorded yet/);
+    expect(cycle.innerHTML).toContain('bg-emerald-500');
+    expect(cycle.innerHTML).not.toContain('bg-red-500');
+    expect(cycle.textContent).not.toContain('⚠');
+  });
+
+  it('shows "starting" tooltip hint on cold-start (alive=false, not stalled)', async () => {
+    const health = healthWith({
+      last_cycle_seconds_ago: null,
+      orchestrator_alive: false,
+      orchestrator_hung: false,
+      orchestrator_progress_age_seconds: null,
+      orchestrator_liveness_reason: 'no cycle seen',
+    });
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} health={health} />); });
+
+    expect(screen.getByTitle(/Orchestrator starting — no cycle recorded yet/)).toBeTruthy();
+  });
 });
 
 describe('OrchestratorHealthBar deploy state', () => {

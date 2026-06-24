@@ -65,26 +65,84 @@ describe('setCurrentPromptFingerprint / getCurrentPromptFingerprint', () => {
 
 describe('LLM telemetry', () => {
   it('starts at zero', () => {
-    expect(getLlmTelemetry()).toEqual({ llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0, viewport_screenshot_forwarded_count: 0 });
+    expect(getLlmTelemetry()).toEqual({
+      llm_call_count: 0,
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      total_cache_creation_input_tokens: 0,
+      total_cache_read_input_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
+    });
   });
   it('accumulates call counts and token totals', () => {
     recordLlmCallStart();
     recordLlmTokens(100, 50);
     recordLlmCallStart();
     recordLlmTokens(200, 75);
-    expect(getLlmTelemetry()).toEqual({ llm_call_count: 2, total_input_tokens: 300, total_output_tokens: 125, viewport_screenshot_forwarded_count: 0 });
+    expect(getLlmTelemetry()).toEqual({
+      llm_call_count: 2,
+      total_input_tokens: 300,
+      total_output_tokens: 125,
+      total_cache_creation_input_tokens: 0,
+      total_cache_read_input_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
+    });
   });
   it('ignores invalid token values (NaN, negative, Infinity)', () => {
     recordLlmTokens(Number.NaN, 50);   // NaN input ignored, 50 output added
     recordLlmTokens(-5, -10);           // negatives ignored
     recordLlmTokens(100, Number.POSITIVE_INFINITY); // 100 input added, Infinity output ignored
-    expect(getLlmTelemetry()).toEqual({ llm_call_count: 0, total_input_tokens: 100, total_output_tokens: 50, viewport_screenshot_forwarded_count: 0 });
+    expect(getLlmTelemetry()).toEqual({
+      llm_call_count: 0,
+      total_input_tokens: 100,
+      total_output_tokens: 50,
+      total_cache_creation_input_tokens: 0,
+      total_cache_read_input_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
+    });
   });
   it('resets all counters', () => {
     recordLlmCallStart();
     recordLlmTokens(500, 250);
     resetLlmTelemetry();
-    expect(getLlmTelemetry()).toEqual({ llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0, viewport_screenshot_forwarded_count: 0 });
+    expect(getLlmTelemetry()).toEqual({
+      llm_call_count: 0,
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      total_cache_creation_input_tokens: 0,
+      total_cache_read_input_tokens: 0,
+      viewport_screenshot_forwarded_count: 0,
+    });
+  });
+  it('breaks out cache-creation and cache-read while total_input_tokens stays the inclusive sum', () => {
+    // inputTokens arg is the inclusive sum (uncached 100 + creation 40 + read 60 = 200).
+    recordLlmTokens(200, 75, 40, 60);
+    recordLlmTokens(150, 25, 10, 90); // inclusive sum 150 (uncached 50 + creation 10 + read 90)
+    const tel = getLlmTelemetry();
+    expect(tel.total_input_tokens).toBe(350);            // inclusive sum of all three classes
+    expect(tel.total_cache_creation_input_tokens).toBe(50);  // 40 + 10
+    expect(tel.total_cache_read_input_tokens).toBe(150);     // 60 + 90
+    expect(tel.total_output_tokens).toBe(100);
+  });
+  it('leaves cache counters at zero for 2-arg (text-mode) calls', () => {
+    recordLlmTokens(100, 50);
+    const tel = getLlmTelemetry();
+    expect(tel.total_cache_creation_input_tokens).toBe(0);
+    expect(tel.total_cache_read_input_tokens).toBe(0);
+  });
+  it('ignores invalid cache token values (NaN, negative, Infinity)', () => {
+    recordLlmTokens(100, 50, Number.NaN, -5);
+    recordLlmTokens(100, 50, Number.POSITIVE_INFINITY, 30);
+    const tel = getLlmTelemetry();
+    expect(tel.total_cache_creation_input_tokens).toBe(0); // NaN and Infinity ignored
+    expect(tel.total_cache_read_input_tokens).toBe(30);    // negative ignored, 30 added
+  });
+  it('resets the cache counters', () => {
+    recordLlmTokens(200, 75, 40, 60);
+    resetLlmTelemetry();
+    const tel = getLlmTelemetry();
+    expect(tel.total_cache_creation_input_tokens).toBe(0);
+    expect(tel.total_cache_read_input_tokens).toBe(0);
   });
 });
 

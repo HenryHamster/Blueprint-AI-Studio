@@ -79,7 +79,7 @@ export function EvergreenBacklogPanel({ projectId }: EvergreenBacklogPanelProps)
             <div className="flex flex-wrap gap-3">
               {Object.entries(summary).map(([status, count]) => (
                 <div key={status} className="flex items-center gap-1.5">
-                  <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium border ${statusBadgeClasses(status)}`}>
+                  <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-ui-sm font-medium border ${statusBadgeClasses(status)}`}>
                     {status}
                   </span>
                   <span className="text-xs font-mono text-neutral-400">{count}</span>
@@ -96,7 +96,7 @@ export function EvergreenBacklogPanel({ projectId }: EvergreenBacklogPanelProps)
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead>
-                  <tr className="text-left text-[10px] text-neutral-500 border-b border-neutral-800">
+                  <tr className="text-left text-ui-sm text-neutral-500 border-b border-neutral-800">
                     <th className="pb-1 pr-3 font-medium">Title</th>
                     <th className="pb-1 pr-3 font-medium">Status</th>
                     <th className="pb-1 pr-3 font-medium">Provenance</th>
@@ -110,10 +110,10 @@ export function EvergreenBacklogPanel({ projectId }: EvergreenBacklogPanelProps)
                     <tr key={item.id} className="border-b border-neutral-800/50 last:border-0 hover:bg-neutral-800/20">
                       <td className="py-1.5 pr-3 max-w-[200px]">
                         <span className="text-neutral-200 truncate block" title={item.title}>{item.title}</span>
-                        <span className="text-[10px] text-neutral-600 font-mono">{item.finding_key}</span>
+                        <span className="text-ui-sm text-neutral-600 font-mono">{item.finding_key}</span>
                       </td>
                       <td className="py-1.5 pr-3">
-                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium border ${statusBadgeClasses(item.status)}`}>
+                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-ui-sm font-medium border ${statusBadgeClasses(item.status)}`}>
                           {item.status}
                         </span>
                       </td>
@@ -121,7 +121,7 @@ export function EvergreenBacklogPanel({ projectId }: EvergreenBacklogPanelProps)
                       <td className="py-1.5 pr-3 font-mono text-neutral-400">{item.attempts}</td>
                       <td className="py-1.5 pr-3">
                         {item.spawned_task_id ? (
-                          <span className="font-mono text-[10px] text-neutral-400" title={item.spawned_task_id}>
+                          <span className="font-mono text-ui-sm text-neutral-400" title={item.spawned_task_id}>
                             {item.spawned_task_id.slice(0, 8)}…
                           </span>
                         ) : (

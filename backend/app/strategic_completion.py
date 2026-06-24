@@ -3333,6 +3333,32 @@ async def _handle_strategic_completion(
                 _memos_cited = strategic_cycle.count_cited_memos(
                     _memo_citations, _cycle_reasoning
                 )
+            # Knowledge document consumption tracking — mirrors the memo pattern.
+            # knowledge_available = count of docs in the index fed to the agent;
+            # knowledge_cited = count from the cite_knowledge API op stored on
+            # task.context["_strategic_cited_knowledge_ids"].
+            _knowledge_available = 0
+            _knowledge_cited = 0
+            try:
+                from app.knowledge_query import build_knowledge_index  # noqa: PLC0415
+
+                _knowledge_index = await build_knowledge_index(session, project.id)
+                _knowledge_available = len(_knowledge_index)
+                _ctx_cited_knowledge_ids = (task.context or {}).get(
+                    "_strategic_cited_knowledge_ids"
+                )
+                if _ctx_cited_knowledge_ids is not None:
+                    _available_knowledge_ids = {
+                        str(e.get("id")) for e in _knowledge_index if e.get("id")
+                    }
+                    _knowledge_cited = len(
+                        set(_ctx_cited_knowledge_ids) & _available_knowledge_ids
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    f"[STRATEGIC] Task {task.id}: failed to compute knowledge counts (non-fatal)",
+                    exc_info=True,
+                )
             completed_cycle = await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,
@@ -3344,6 +3370,8 @@ async def _handle_strategic_completion(
                 vision_updated=_vision_updated,
                 memos_available=_memos_available,
                 memos_cited=_memos_cited,
+                knowledge_available=_knowledge_available,
+                knowledge_cited=_knowledge_cited,
                 extra_metadata=_extra,
             )
         else:
@@ -3420,6 +3448,26 @@ async def _handle_strategic_completion(
                 task.project_id,
                 session,
                 f"{open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review — agent may be ignoring user requests",
+            )
+        # Audit: check for unanswered QUESTION messages
+        remaining_questions_result = await session.execute(
+            select(func.count())
+            .select_from(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.status == "open",
+                ProjectMessage.message_type == MessageType.QUESTION,
+            )
+        )
+        open_question_count = remaining_questions_result.scalar() or 0
+        if open_question_count > 0:
+            logger.warning(
+                f"[STRATEGIC] Task {task.id}: {open_question_count} QUESTION(s) left unanswered after strategic review"
+            )
+            await _create_strategic_alert(
+                task.project_id,
+                session,
+                f"{open_question_count} QUESTION(s) left unanswered after strategic review — agent may be ignoring operator questions",
             )
         # Apply version_phase_decision if the agent supplied one via the API.
         # The ``set_problem_model`` endpoint lifts the field out of the
@@ -4833,6 +4881,23 @@ async def _handle_strategic_completion(
                             logger.warning(
                                 f"[NOTIFY] Failed to post feedback acknowledgment: {_e}"
                             )
+                    elif msg.message_type == MessageType.QUESTION:
+                        try:
+                            from app.notification_dispatch import (
+                                post_question_answer,
+                            )
+
+                            await post_question_answer(
+                                session,
+                                project.id,
+                                msg.id,
+                                msg.resolution or "Addressed by strategic review",
+                                task.id,
+                            )
+                        except Exception as _e:  # noqa: BLE001
+                            logger.warning(
+                                f"[NOTIFY] Failed to post question answer: {_e}"
+                            )
         except (ValueError, TypeError):  # noqa: PERF203
             pass
 
@@ -4855,6 +4920,26 @@ async def _handle_strategic_completion(
             task.project_id,
             session,
             f"{open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review — agent may be ignoring user requests",
+        )
+    # Audit: check for unanswered QUESTION messages
+    remaining_questions_result = await session.execute(
+        select(func.count())
+        .select_from(ProjectMessage)
+        .where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status == "open",
+            ProjectMessage.message_type == MessageType.QUESTION,
+        )
+    )
+    open_question_count = remaining_questions_result.scalar() or 0
+    if open_question_count > 0:
+        logger.warning(
+            f"[STRATEGIC] Task {task.id}: {open_question_count} QUESTION(s) left unanswered after strategic review"
+        )
+        await _create_strategic_alert(
+            task.project_id,
+            session,
+            f"{open_question_count} QUESTION(s) left unanswered after strategic review — agent may be ignoring operator questions",
         )
 
     vision_rev = (project.vision or {}).get("revision", "?")

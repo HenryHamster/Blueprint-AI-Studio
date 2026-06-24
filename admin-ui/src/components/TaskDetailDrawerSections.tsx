@@ -10,7 +10,7 @@ import { isComputeJobActive, computeJobTerminalLabel } from './ComputeJobsPanel.
 import type { AdversarialGateDiagnostic, PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
 import { deriveSpawnGateState } from '../types/task';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
-import { CopyableId, SectionHeader, DetailRow, Sparkline } from './TaskDetailDrawerPrimitives';
+import { CopyableId, SectionHeader, DetailRow, Sparkline, DependencyItem } from './TaskDetailDrawerPrimitives';
 import { humanizeUnverifiedReason, labelNoTestsReason } from '../utils/unverifiedReasonLabels';
 import { parseMergeTestVerdict, deriveMergeTestOutcome, type MergeTestVerdict, type MergeTestResult } from '../utils/mergeTestVerdict';
 import { getLogEntryColor } from './TaskDetailDrawerDiagnostics';
@@ -421,13 +421,13 @@ export function KnowledgeDocumentSection({ task }: { task: Task }) {
         {doc.summary && <p className="text-xs text-neutral-400 leading-relaxed break-words">{doc.summary}</p>}
         <div className="flex items-center gap-2 flex-wrap">
           {verdict && (
-            <span className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border ${verdict.passed ? 'border-emerald-800/40 bg-emerald-950/30 text-emerald-300' : 'border-red-800/40 bg-red-950/30 text-red-300'}`}>
+            <span className={`inline-flex items-center gap-1 text-ui-md px-2 py-0.5 rounded border ${verdict.passed ? 'border-emerald-800/40 bg-emerald-950/30 text-emerald-300' : 'border-red-800/40 bg-red-950/30 text-red-300'}`}>
               {verdict.passed ? <CheckCircle className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
               Forward quality: {verdict.passed ? 'passed' : 'failed'}
             </span>
           )}
           {doc.analysis_mode && (
-            <span className="text-[11px] px-2 py-0.5 rounded border border-neutral-700/40 bg-neutral-800/40 text-neutral-300">
+            <span className="text-ui-md px-2 py-0.5 rounded border border-neutral-700/40 bg-neutral-800/40 text-neutral-300">
               {doc.analysis_mode}
             </span>
           )}
@@ -455,14 +455,14 @@ export function KnowledgeDocumentSection({ task }: { task: Task }) {
             return (
               <span className="inline-flex items-center gap-1 flex-wrap">
                 <span
-                  className={`${cls} border text-[9px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
+                  className={`${cls} border text-ui-xs uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
                   title={analysisCauseLabel ? `${tooltip} · ${analysisCauseLabel}` : tooltip}
                 >
                   {isAcceptance ? <CheckCircle className="w-2.5 h-2.5 shrink-0" /> : <HelpCircle className="w-2.5 h-2.5 shrink-0" />}
                   {isAcceptance ? 'Acceptance' : 'Measured only'}
                 </span>
                 {analysisCauseLabel && (
-                  <span className="text-[10px] text-amber-200/80 leading-tight break-words max-w-[18rem]">
+                  <span className="text-ui-sm text-amber-200/80 leading-tight break-words max-w-[18rem]">
                     {analysisCauseLabel}
                   </span>
                 )}
@@ -470,10 +470,10 @@ export function KnowledgeDocumentSection({ task }: { task: Task }) {
             );
           })()}
           {doc.source_kind && (
-            <span className="text-[11px] text-neutral-500">{doc.source_kind.replace(/_/g, ' ')}</span>
+            <span className="text-ui-md text-neutral-500">{doc.source_kind.replace(/_/g, ' ')}</span>
           )}
           {typeof doc.citation_count === 'number' && (
-            <span className="text-[11px] text-neutral-500">{doc.citation_count} citation{doc.citation_count !== 1 ? 's' : ''}</span>
+            <span className="text-ui-md text-neutral-500">{doc.citation_count} citation{doc.citation_count !== 1 ? 's' : ''}</span>
           )}
           {releaseEvidence && <ReleaseEvidenceChip evidence={releaseEvidence} />}
         </div>
@@ -537,7 +537,7 @@ export function EvaluationSummarySection({ summary }: { summary: TaskEvaluationS
             <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Highlights</span>
             <div className="min-w-0 flex-1 flex flex-wrap gap-1.5">
               {highlights.map((item, i) => (
-                <span key={i} className="inline-flex max-w-full flex-wrap gap-x-1 rounded bg-neutral-900/70 px-2 py-1 text-[11px] text-neutral-200 border border-neutral-800">
+                <span key={i} className="inline-flex max-w-full flex-wrap gap-x-1 rounded bg-neutral-900/70 px-2 py-1 text-ui-md text-neutral-200 border border-neutral-800">
                   <span className="text-neutral-500">{item.label}</span>
                   <span className="break-words">{item.value}</span>
                 </span>
@@ -613,7 +613,7 @@ export function PanelReviewVerdictSection({ verdict }: { verdict: PanelReviewVer
             <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Investigated</span>
             <div className="flex min-w-0 flex-wrap gap-1.5">
               {verdict.investigated_files.map((file, index) => (
-                <span key={`${file}-${index}`} className="rounded border border-fuchsia-800/40 bg-neutral-900/70 px-2 py-1 font-mono text-[11px] text-neutral-200 break-all">
+                <span key={`${file}-${index}`} className="rounded border border-fuchsia-800/40 bg-neutral-900/70 px-2 py-1 font-mono text-ui-md text-neutral-200 break-all">
                   {file}
                 </span>
               ))}
@@ -628,7 +628,7 @@ export function PanelReviewVerdictSection({ verdict }: { verdict: PanelReviewVer
                 <span className="text-sm font-semibold text-neutral-100">
                   {PANEL_REVIEW_LENS_LABELS[lensId as keyof PanelReviewVerdict['lenses']]}
                 </span>
-                <span className={`text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded border ${PANEL_REVIEW_BADGES[lens.verdict]}`}>
+                <span className={`text-ui-md font-semibold uppercase tracking-wider px-2 py-0.5 rounded border ${PANEL_REVIEW_BADGES[lens.verdict]}`}>
                   {lens.verdict === 'APPROVE' ? 'Approve' : 'Request Changes'}
                 </span>
               </div>
@@ -639,12 +639,12 @@ export function PanelReviewVerdictSection({ verdict }: { verdict: PanelReviewVer
                     <div key={`${lensId}-${index}`} className="rounded border border-neutral-800 bg-neutral-900/70 p-2">
                       <div className="flex flex-wrap items-center gap-2">
                         {issue.severity && (
-                          <span className="rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-neutral-300">
+                          <span className="rounded border border-neutral-700 px-1.5 py-0.5 text-ui-sm font-semibold uppercase tracking-wider text-neutral-300">
                             {issue.severity}
                           </span>
                         )}
                         {formatIssueLocation(issue) && (
-                          <span className="inline-flex items-center gap-1 font-mono text-[11px] text-blue-300 break-all">
+                          <span className="inline-flex items-center gap-1 font-mono text-ui-md text-blue-300 break-all">
                             <Hash className="h-3 w-3 shrink-0" />
                             {formatIssueLocation(issue)}
                           </span>
@@ -1489,7 +1489,7 @@ export function CodeOutputSection({ task }: { task: Task }) {
                   key={`${artifact.artifact_type}-${artifact.iteration ?? 1}-${artifact.storage_uri ?? index}`}
                   className="rounded-lg border border-neutral-800/80 bg-neutral-900/40 px-3 py-2"
                 >
-                  <div className="flex flex-wrap items-center gap-2 text-[11px] mb-1">
+                  <div className="flex flex-wrap items-center gap-2 text-ui-md mb-1">
                     <span className="rounded border border-neutral-700 bg-neutral-900/70 px-1.5 py-0.5 font-semibold text-neutral-200">
                       {formatArtifactTypeLabel(artifact.artifact_type)}
                     </span>
@@ -1644,26 +1644,15 @@ export function BaseRecutHoldSection({ task }: { task: Task }) {
   );
 }
 
-export function ChildTasksSection({ task, onNavigateToTask }: { task: Task; onNavigateToTask?: (taskId: string) => void }) {
+export function ChildTasksSection({ task, tasks, onNavigateToTask }: { task: Task; tasks?: Task[]; onNavigateToTask?: (taskId: string) => void }) {
   if (!task.child_task_ids || task.child_task_ids.length === 0) return null;
+  const taskById = new Map((tasks ?? []).map(t => [t.id, t]));
   return (
     <>
       <SectionHeader>Child Tasks</SectionHeader>
       <div className="space-y-1">
         {task.child_task_ids.map((childId) => (
-          <div key={childId} className="font-mono text-sm text-neutral-300 flex items-center gap-1.5 flex-wrap min-w-0">
-            <ChevronRight className="w-3 h-3 text-neutral-600 shrink-0" />
-            {onNavigateToTask ? (
-              <button
-                onClick={() => onNavigateToTask(childId)}
-                className="text-blue-400 hover:text-blue-300 transition-colors text-left break-all min-w-0"
-              >
-                {childId}
-              </button>
-            ) : (
-              <CopyableId value={childId} />
-            )}
-          </div>
+          <DependencyItem key={childId} dep={childId} depTask={taskById.get(childId)} onNavigateToTask={onNavigateToTask} />
         ))}
       </div>
     </>
@@ -1714,7 +1703,7 @@ function ViewportMagnitudeBadge({ magnitude }: { magnitude: number }) {
         ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
         : 'bg-neutral-500/15 text-neutral-400 border-neutral-500/30';
   return (
-    <span className={`inline-flex items-center rounded px-1 py-0 text-[9px] font-semibold border ${color}`}>
+    <span className={`inline-flex items-center rounded px-1 py-0 text-ui-xs font-semibold border ${color}`}>
       {pct}% changed
     </span>
   );
