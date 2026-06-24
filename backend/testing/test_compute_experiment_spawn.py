@@ -1495,3 +1495,78 @@ async def test_launch_allows_operator_approved_above_threshold_compute_job(db_se
         deadline_seconds=300,
     )
     assert job is not None
+
+
+@pytest.mark.asyncio
+async def test_launch_allows_zero_config_project_below_global_threshold(db_session):
+    """Chokepoint reads global runtime_config: a project with runtime_config_json=None
+    uses the global threshold (default 10.0), so a spend below that launches without
+    a precondition failure."""
+    from app import runtime_config_state as rcs
+    from app.compute_jobs import ComputeLaunchPreconditionFailed
+
+    prev = rcs.runtime_config.get("compute_experiment_spend_threshold_usd")
+    rcs.runtime_config["compute_experiment_spend_threshold_usd"] = 10.0
+    try:
+        project = Project(
+            name="ZeroConfigGate",
+            user_id="test-user",
+            runtime_config_json=None,
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task_below = Task(
+            project_id=project.id,
+            title="compute_experiment: zero-config below threshold",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "compute_experiment", "command": "python bench.py"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            spend_approval_cleared_at=None,
+        )
+        db_session.add(task_below)
+        await db_session.commit()
+        await db_session.refresh(task_below)
+
+        # Below global threshold (9.0 < 10.0) — must succeed
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task_below,
+            command="python bench.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=9.0,
+            deadline_seconds=300,
+        )
+        assert job is not None
+
+        # Above global threshold (11.0 > 10.0) — must be refused
+        task_above = Task(
+            project_id=project.id,
+            title="compute_experiment: zero-config above threshold",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "compute_experiment", "command": "python bench.py"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            spend_approval_cleared_at=None,
+        )
+        db_session.add(task_above)
+        await db_session.commit()
+        await db_session.refresh(task_above)
+
+        with pytest.raises(ComputeLaunchPreconditionFailed) as exc_info:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task_above,
+                command="python bench.py",
+                machine_type="e2-standard-2",
+                spend_cap_usd=11.0,
+                deadline_seconds=300,
+            )
+        detail = exc_info.value.args[0]
+        assert detail["error"] == "spend_cap_requires_approval"
+        assert detail["threshold_usd"] == pytest.approx(10.0)
+    finally:
+        if prev is not None:
+            rcs.runtime_config["compute_experiment_spend_threshold_usd"] = prev
+        else:
+            rcs.runtime_config.pop("compute_experiment_spend_threshold_usd", None)

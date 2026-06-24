@@ -60,6 +60,7 @@ from app.models import (
     TaskStatus,
 )
 from app.compute_experiment_contract import resolve_compute_spend_approval
+from app.runtime_config_state import runtime_config as _global_runtime_config
 from app.schemas import redact_command_log_text
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
@@ -211,10 +212,13 @@ async def _assert_compute_spend_not_gated(
     if task_type != "compute_experiment":
         return
     project = await session.get(Project, task.project_id)
-    runtime_config: dict = {}
+    # Start from the global runtime_config (same source as the four spawn sites),
+    # then layer any per-project overrides on top so project-level config wins.
+    runtime_config: dict = dict(_global_runtime_config)
     direction: dict | None = None
     if project is not None:
-        runtime_config = dict(getattr(project, "runtime_config_json", None) or {})
+        project_overrides = dict(getattr(project, "runtime_config_json", None) or {})
+        runtime_config.update(project_overrides)
         direction_id = str((task.context or {}).get("direction_id") or "")
         if direction_id:
             direction = next(
