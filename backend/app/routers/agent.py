@@ -5037,7 +5037,7 @@ async def spawn_subtask(
             action="SPAWNED",
             details={
                 "spawned_by": f"AGENT_{parent_task.id}",
-                "requires_approval": req.requires_approval,
+                "requires_approval": task.requires_approval,
                 "context": req.context,
             },
         )

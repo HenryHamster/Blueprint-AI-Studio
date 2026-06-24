@@ -1330,6 +1330,15 @@ async def test_agent_spawn_compute_experiment_above_threshold_requires_approval(
         child = await db_session.get(Task, child_id)
         assert child is not None
         assert child.requires_approval is True
+        # Verify TaskHistory SPAWNED entry records the enforced value, not the caller request
+        history_rows = await db_session.execute(
+            select(TaskHistory).where(
+                (TaskHistory.task_id == child_id) & (TaskHistory.action == "SPAWNED")
+            )
+        )
+        history = history_rows.scalar_one_or_none()
+        assert history is not None
+        assert history.details["requires_approval"] is True
     finally:
         if prev_threshold is not None:
             _shared_state.runtime_config[
