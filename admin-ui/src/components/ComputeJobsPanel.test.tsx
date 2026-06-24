@@ -1266,6 +1266,174 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('compute-log-show-all')).toBeNull();
   });
 
+  test('terminal job with arms in result_metrics does not render [object Object] in per-job metrics row', async () => {
+    const armsJob = makeJob({
+      id: 'job-arms',
+      task_title: 'arms experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.0,
+      polling_metadata: {
+        result_metrics: {
+          accuracy: 0.92,
+          arms: {
+            'arm-a': { lr: 0.01, val_acc: 0.90 },
+            'arm-b': { lr: 0.001, val_acc: 0.92 },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue([armsJob]);
+    const { findByText, container, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('arms experiment');
+    // '[object Object]' must not appear anywhere
+    expect(container.textContent).not.toContain('[object Object]');
+    // Scalar metric still visible
+    expect(container.textContent).toContain('accuracy:');
+    // Arms breakdown section is shown
+    const armsBlock = await findByTestId('arms-breakdown');
+    expect(armsBlock.textContent).toContain('arm-a');
+    expect(armsBlock.textContent).toContain('arm-b');
+    expect(armsBlock.textContent).toContain('val_acc:');
+  });
+
+  test('run comparison matrix skips arms key from scalar metric rows', async () => {
+    const job1 = makeJob({
+      id: 'arms-cmp-1',
+      task_title: 'run X',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'arms-sweep',
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.88, met: false, measurable: true },
+      polling_metadata: {
+        result_metrics: {
+          accuracy: 0.88,
+          arms: { 'arm-x': { score: 0.88 } },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'arms-cmp-2',
+      task_title: 'run Y',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      experiment: 'arms-sweep',
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.93, met: true, measurable: true },
+      polling_metadata: {
+        result_metrics: {
+          accuracy: 0.93,
+          arms: { 'arm-y': { score: 0.93 } },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue([job1, job2]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    const matrix = await findByTestId('run-comparison-matrix');
+    // 'arms' must not appear as a row label in the scalar table
+    const tbody = matrix.querySelector('tbody');
+    const rowLabels = Array.from(tbody?.querySelectorAll('td:first-child') ?? []).map((td) => td.textContent);
+    expect(rowLabels).not.toContain('arms');
+    // numeric accuracy row still present
+    expect(rowLabels).toContain('accuracy');
+  });
+
+  test('run comparison matrix renders arms-comparison section when any job carries arms', async () => {
+    const job1 = makeJob({
+      id: 'arms-matrix-1',
+      task_title: 'matrix run 1',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'matrix-arms-test',
+      criterion_verdict: { metric: 'score', operator: '>=', threshold: 0.8, value: 0.82, met: true, measurable: true },
+      polling_metadata: {
+        result_metrics: {
+          score: 0.82,
+          arms: {
+            'control': { precision: 0.80, recall: 0.85 },
+            'treatment': { precision: 0.84, recall: 0.87 },
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'arms-matrix-2',
+      task_title: 'matrix run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.2,
+      experiment: 'matrix-arms-test',
+      criterion_verdict: { metric: 'score', operator: '>=', threshold: 0.8, value: 0.79, met: false, measurable: true },
+      polling_metadata: { result_metrics: { score: 0.79 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue([job1, job2]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    const armsSection = await findByTestId('arms-comparison');
+    expect(armsSection.textContent).toContain('Per-arm results');
+    expect(armsSection.textContent).toContain('control');
+    expect(armsSection.textContent).toContain('treatment');
+    expect(armsSection.textContent).toContain('precision:');
+    expect(armsSection.textContent).toContain('recall:');
+  });
+
+  test('arms comparison section shows per-arm metric key-value pairs for array-shape arms', async () => {
+    const job1 = makeJob({
+      id: 'arms-array-1',
+      task_title: 'array arms run 1',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'array-arms-sweep',
+      criterion_verdict: { metric: 'f1', operator: '>=', threshold: 0.75, value: 0.77, met: true, measurable: true },
+      polling_metadata: {
+        result_metrics: {
+          f1: 0.77,
+          arms: [
+            { name: 'baseline', f1: 0.72, auc: 0.81 },
+            { name: 'experimental', f1: 0.77, auc: 0.85 },
+          ],
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'arms-array-2',
+      task_title: 'array arms run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 0.8,
+      experiment: 'array-arms-sweep',
+      criterion_verdict: { metric: 'f1', operator: '>=', threshold: 0.75, value: 0.74, met: false, measurable: true },
+      polling_metadata: { result_metrics: { f1: 0.74 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue([job1, job2]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    const armsSection = await findByTestId('arms-comparison');
+    expect(armsSection.textContent).toContain('baseline');
+    expect(armsSection.textContent).toContain('experimental');
+    expect(armsSection.textContent).toContain('auc:');
+    expect(armsSection.textContent).toContain('0.85');
+  });
+
   test('job with external_compute_id shows it in the machine info subtitle', async () => {
     fetchComputeJobs.mockResolvedValue([
       makeJob({ external_compute_id: 'compute-job-abc-123' }),

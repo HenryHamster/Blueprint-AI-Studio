@@ -77,13 +77,39 @@ function formatMetricValue(key: string, v: number | null): string {
   return String(v);
 }
 
+type ArmRecord = { name: string; metrics: Record<string, unknown> };
+
+function normalizeArms(arms: unknown): ArmRecord[] | null {
+  if (!arms || typeof arms !== 'object') return null;
+  if (Array.isArray(arms)) {
+    const records = arms
+      .filter((a): a is Record<string, unknown> => a !== null && typeof a === 'object' && !Array.isArray(a))
+      .map((a) => {
+        const name = String(a.name ?? a.arm ?? 'arm');
+        const metrics: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(a)) {
+          if (k !== 'name' && k !== 'arm') metrics[k] = v;
+        }
+        return { name, metrics };
+      });
+    return records.length > 0 ? records : null;
+  }
+  const records: ArmRecord[] = [];
+  for (const [name, val] of Object.entries(arms as Record<string, unknown>)) {
+    if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
+      records.push({ name, metrics: val as Record<string, unknown> });
+    }
+  }
+  return records.length > 0 ? records : null;
+}
+
 function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
   let criterionMetric: string | null = null;
   const extraKeys = new Set<string>();
   for (const job of group) {
     if (!criterionMetric && job.criterion_verdict?.metric) criterionMetric = job.criterion_verdict.metric;
     const rm = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
-    if (rm) for (const k of Object.keys(rm)) if (k !== criterionMetric) extraKeys.add(k);
+    if (rm) for (const k of Object.keys(rm)) if (k !== criterionMetric && typeof rm[k] === 'number') extraKeys.add(k);
   }
 
   const allKeys: string[] = [
@@ -150,6 +176,41 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
           );
         })}
       </div>
+      {(() => {
+        const jobsWithArms = group.filter((job) => {
+          const rm = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
+          return rm && normalizeArms(rm.arms) !== null;
+        });
+        if (jobsWithArms.length === 0) return null;
+        return (
+          <div className="mt-2" data-testid="arms-comparison">
+            <div className="text-ui-sm text-neutral-500 font-mono mb-1">Per-arm results</div>
+            {jobsWithArms.map((job) => {
+              const rm = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
+              const arms = normalizeArms(rm?.arms);
+              if (!arms) return null;
+              return (
+                <div key={job.id} className="mb-1.5">
+                  <div className="text-ui-sm font-semibold text-neutral-300 font-mono mb-0.5">
+                    {(job.task_title ?? job.id).slice(0, 24)}
+                  </div>
+                  {arms.map((arm) => (
+                    <div key={arm.name} className="flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm font-mono mb-0.5 pl-2">
+                      <span className="text-neutral-400 font-semibold">{arm.name}:</span>
+                      {Object.entries(arm.metrics).map(([mk, mv]) => (
+                        <span key={mk}>
+                          <span className="text-neutral-500">{mk}:</span>{' '}
+                          <span className="text-neutral-300">{String(mv)}</span>
+                        </span>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -834,16 +895,40 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               {(() => {
                 const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
                 if (!metrics) return null;
-                const entries = Object.entries(metrics);
-                if (entries.length === 0) return null;
+                const scalarEntries = Object.entries(metrics).filter(([, v]) => v === null || typeof v !== 'object');
+                const arms = normalizeArms(metrics.arms);
+                if (scalarEntries.length === 0 && !arms) return null;
                 return (
-                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-400 font-mono">
-                    {entries.map(([k, v]) => (
-                      <span key={k}>
-                        <span className="text-neutral-500">{k}:</span> {String(v)}
-                      </span>
-                    ))}
-                  </div>
+                  <>
+                    {scalarEntries.length > 0 && (
+                      <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-400 font-mono">
+                        {scalarEntries.map(([k, v]) => (
+                          <span key={k}>
+                            <span className="text-neutral-500">{k}:</span> {String(v)}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {arms && (
+                      <div className="mt-1.5" data-testid="arms-breakdown">
+                        <div className="text-ui-sm text-neutral-500 font-mono mb-0.5">Arms</div>
+                        <div className="flex flex-col gap-1">
+                          {arms.map((arm) => (
+                            <div key={arm.name} className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1">
+                              <div className="text-ui-sm font-semibold text-neutral-300 font-mono mb-0.5">{arm.name}</div>
+                              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-400 font-mono">
+                                {Object.entries(arm.metrics).map(([mk, mv]) => (
+                                  <span key={mk}>
+                                    <span className="text-neutral-500">{mk}:</span> {String(mv)}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </>
                 );
               })()}
               {(() => {

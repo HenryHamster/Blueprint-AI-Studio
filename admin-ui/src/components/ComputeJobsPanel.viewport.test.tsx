@@ -149,6 +149,52 @@ const commandLogJobs: ComputeJob[] = [
   },
 ];
 
+const armsJobs: ComputeJob[] = [
+  {
+    id: 'job-arms-vp',
+    project_id: 'proj-1',
+    task_id: 'task-arms-vp',
+    backend: 'gcp_compute_engine',
+    external_compute_id: null,
+    machine_type: 'n1-standard-4',
+    status: 'SUCCEEDED',
+    terminal_reason: 'experiment completed',
+    outcome: 'SUCCESS',
+    spend_cap_usd: 5.0,
+    wall_clock_deadline: null,
+    created_at: new Date(Date.now() - 900_000).toISOString(),
+    updated_at: new Date(Date.now() - 300_000).toISOString(),
+    started_at: new Date(Date.now() - 890_000).toISOString(),
+    completed_at: new Date(Date.now() - 300_000).toISOString(),
+    last_polled_at: new Date(Date.now() - 300_000).toISOString(),
+    accrued_cost_usd: 2.5,
+    final_cost_usd: 2.5,
+    result_reference: null,
+    task_title: 'A/B arm experiment: learning rate sweep',
+    task_type: 'compute_experiment',
+    experiment: 'lr-ab-sweep',
+    success_criterion: { metric: 'val_acc', operator: '>=', threshold: 0.85 },
+    criterion_verdict: {
+      metric: 'val_acc',
+      operator: '>=',
+      threshold: 0.85,
+      value: 0.88,
+      met: true,
+      measurable: true,
+    },
+    polling_metadata: {
+      result_metrics: {
+        val_acc: 0.88,
+        arms: {
+          'arm-lr-0.01': { val_acc: 0.86, val_loss: 0.32, epochs: 50 },
+          'arm-lr-0.001': { val_acc: 0.88, val_loss: 0.28, epochs: 50 },
+          'arm-lr-0.0001': { val_acc: 0.82, val_loss: 0.41, epochs: 50 },
+        },
+      },
+    },
+  },
+];
+
 let jobsToReturn: ComputeJob[] = stressJobs;
 
 vi.mock('../api', async (importOriginal) => {
@@ -225,6 +271,28 @@ describe('ComputeJobsPanel — viewport regression', () => {
           r.render(<ComputeJobsPanel projectId="proj-1" />);
         });
         await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+      },
+      { waitMs: 60 },
+    );
+  });
+
+  test('renders terminal job with per-arm breakdown without overflow at 1024px', async () => {
+    jobsToReturn = armsJobs;
+    await expectFullViewportAt(
+      1024,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        const text = host.textContent ?? '';
+        if (!text.includes('arm-lr-0.01')) throw new Error('arms breakdown not rendered');
+        if (text.includes('[object Object]')) throw new Error('[object Object] still rendered');
       },
       { waitMs: 60 },
     );
