@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { AlertTriangle, BarChart2, Clock, ExternalLink, Layers } from 'lucide-react';
 import { useDashboardDigest } from '../hooks/useDashboardDigest';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
-import { fetchFleetUtilization } from '../api';
+import { fetchFleetUtilization, fetchTask } from '../api';
 import { MetricCard, SuccessRateCard, CostCard, Skeleton } from './DashboardMetricCards';
 import { FleetCapacityCard, type FleetUtilizationResponse } from './FleetCapacityCard';
 import { SystemStatusCard } from './SystemStatusCard';
@@ -99,9 +99,21 @@ export function ConsoleHome({
   const totalCost = digest?.spot_cost_usd;
   const trendHistory = digest?.trend_history ?? [];
 
+  const [fetchError, setFetchError] = useState<string | null>(null);
+
   const handleViewTaskById = (taskId: string) => {
     const task = tasks.find(t => t.id === taskId);
-    if (task) onViewTask(task);
+    if (task) {
+      setFetchError(null);
+      onViewTask(task);
+      return;
+    }
+    fetchTask(taskId).then(t => {
+      setFetchError(null);
+      onViewTask(t);
+    }).catch(() => {
+      setFetchError(`Could not load task ${taskId}.`);
+    });
   };
 
   return (
@@ -126,6 +138,11 @@ export function ConsoleHome({
 
       {/* System status */}
       <SystemStatusCard digest={digest} loading={loading} />
+
+      {/* Task fetch error */}
+      {fetchError && (
+        <p className="text-xs text-red-400 px-1">{fetchError}</p>
+      )}
 
       {/* Needs attention */}
       <NeedsAttentionSection

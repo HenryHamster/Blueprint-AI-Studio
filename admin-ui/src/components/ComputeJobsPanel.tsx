@@ -22,6 +22,13 @@ import {
 
 const POLL_INTERVAL_MS = 10_000;
 
+const WINDOW_OPTIONS: { label: string; minutes: number }[] = [
+  { label: '6h', minutes: 360 },
+  { label: '24h', minutes: 1440 },
+  { label: '3d', minutes: 4320 },
+  { label: '7d', minutes: 10080 },
+];
+
 type MetricDirection = 'higher_better' | 'lower_better' | 'unknown';
 
 function metricDirection(key: string, group: ComputeJob[]): MetricDirection {
@@ -280,6 +287,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [finishedWindowMinutes, setFinishedWindowMinutes] = useState(360);
   const [killingId, setKillingId] = useState<string | null>(null);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
@@ -300,7 +308,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     async (signal?: AbortSignal) => {
       if (!projectId) return;
       try {
-        const next = await fetchComputeJobs(projectId, signal);
+        const next = await fetchComputeJobs(projectId, signal, finishedWindowMinutes);
         setJobs(next);
         setError(null);
       } catch (e) {
@@ -310,13 +318,13 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         setLoaded(true);
       }
     },
-    [projectId],
+    [projectId, finishedWindowMinutes],
   );
 
   usePoller((signal) => load(signal), {
     intervalMs: POLL_INTERVAL_MS,
     enabled: !!projectId,
-    deps: [projectId],
+    deps: [projectId, finishedWindowMinutes],
   });
 
   // Auto-fetch durable knowledge docs for terminal jobs that have a knowledge_document_id.
@@ -411,9 +419,24 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
   return (
     <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4" data-viewport-allow-truncation>
-      <div className="flex items-center gap-2 mb-3 text-ui-md font-bold text-neutral-400 uppercase tracking-widest">
-        <Cpu className="w-3.5 h-3.5 shrink-0" />
-        Compute jobs
+      <div className="flex items-center justify-between gap-2 mb-3">
+        <div className="flex items-center gap-2 text-ui-md font-bold text-neutral-400 uppercase tracking-widest">
+          <Cpu className="w-3.5 h-3.5 shrink-0" />
+          Compute jobs
+        </div>
+        <div className="flex items-center gap-0.5" data-testid="compute-window-selector">
+          {WINDOW_OPTIONS.map(({ label, minutes }) => (
+            <button
+              key={minutes}
+              type="button"
+              onClick={() => setFinishedWindowMinutes(minutes)}
+              className={`min-h-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${finishedWindowMinutes === minutes ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+              data-testid={`compute-window-${label}`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {error && (
@@ -477,6 +500,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
                     {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
                     {job.launch_contract?.provisioning_model ? ` · ${job.launch_contract.provisioning_model}` : ''}
+                    {job.external_compute_id ? ` · ${job.external_compute_id}` : ''}
                   </div>
                   {(() => {
                     const evidence = asLiveReleaseEvidence(job.polling_metadata?.live_release_evidence);
@@ -935,19 +959,31 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const cl = job.polling_metadata?.command_log as ComputeJobCommandLog | undefined | null;
                 if (!cl || typeof cl.text !== 'string' || !cl.text.trim()) return null;
                 const lines = cl.text.split('\n');
-                const displayLines = lines.length > 30 ? lines.slice(-30) : lines;
                 const clipped = lines.length > 30;
+                const logKey = `cmdlog-${job.id}`;
+                const logExpanded = expandedDocIds.has(logKey);
+                const displayLines = clipped && !logExpanded ? lines.slice(-30) : lines;
                 return (
                   <div className="mt-1.5" data-testid="compute-command-log">
                     <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
                       <span>Command log</span>
-                      {(cl.truncated || clipped) && (
+                      {cl.truncated && (
                         <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-400">
-                          truncated
+                          server-truncated
                         </span>
                       )}
+                      {clipped && !logExpanded && (
+                        <button
+                          type="button"
+                          onClick={() => toggleDocExpanded(logKey)}
+                          className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
+                          data-testid="compute-log-show-all"
+                        >
+                          Show all ({lines.length} lines)
+                        </button>
+                      )}
                     </div>
-                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
+                    <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
                       {displayLines.join('\n')}
                     </pre>
                   </div>

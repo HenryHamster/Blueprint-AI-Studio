@@ -1194,4 +1194,78 @@ describe('ComputeJobsPanel render + kill', () => {
     await findByTestId('criterion-verdict-row');
     expect(queryByTestId('criterion-margin')).toBeNull();
   });
+
+  test('window selector renders with 6h active by default', async () => {
+    fetchComputeJobs.mockResolvedValue([]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const selector = await findByTestId('compute-window-selector');
+    expect(selector.textContent).toContain('6h');
+    expect(selector.textContent).toContain('24h');
+    expect(selector.textContent).toContain('3d');
+    expect(selector.textContent).toContain('7d');
+    // Initially fetched with default (no window arg or default 360)
+    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), 360);
+  });
+
+  test('clicking 7d window selector triggers refetch with 10080 minutes', async () => {
+    fetchComputeJobs.mockResolvedValue([]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('compute-window-selector');
+    const btn7d = await findByTestId('compute-window-7d');
+    await act(async () => { btn7d.click(); });
+    await waitFor(() =>
+      expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), 10080),
+    );
+  });
+
+  test('command log with more than 30 lines shows Show all button; clicking expands', async () => {
+    const longLog = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n');
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        polling_metadata: { command_log: { text: longLog, truncated: false, byte_count: longLog.length } },
+      }),
+    ]);
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const showAllBtn = await findByTestId('compute-log-show-all');
+    expect(showAllBtn.textContent).toContain('50 lines');
+    // Only last 30 lines visible — line 0 is not in the tail
+    const logBlock = await findByTestId('compute-command-log');
+    expect(logBlock.textContent).not.toContain('line 0');
+    // Expand
+    await act(async () => { showAllBtn.click(); });
+    // All 50 lines now visible
+    await waitFor(() => expect(findByTestId('compute-command-log')).resolves.toBeTruthy());
+    const logBlockExpanded = await findByTestId('compute-command-log');
+    expect(logBlockExpanded.textContent).toContain('line 0');
+    // Show all button gone after expanding
+    expect(queryByTestId('compute-log-show-all')).toBeNull();
+  });
+
+  test('command log with 30 or fewer lines shows no Show all button', async () => {
+    const shortLog = Array.from({ length: 10 }, (_, i) => `step ${i}`).join('\n');
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        polling_metadata: { command_log: { text: shortLog, truncated: false, byte_count: shortLog.length } },
+      }),
+    ]);
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('compute-command-log');
+    expect(queryByTestId('compute-log-show-all')).toBeNull();
+  });
+
+  test('job with external_compute_id shows it in the machine info subtitle', async () => {
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({ external_compute_id: 'compute-job-abc-123' }),
+    ]);
+    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const subtitle = await findByText((t) => t.includes('compute-job-abc-123'));
+    expect(subtitle.textContent).toContain('gcp_compute_engine');
+    expect(subtitle.textContent).toContain('compute-job-abc-123');
+  });
 });
