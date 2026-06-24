@@ -20,10 +20,12 @@ from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
+from httpx import AsyncClient
 from sqlalchemy import select
 
 from app import compute_jobs
 from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
+from app.auth import create_agent_token
 from app.models import (
     ComputeJobOutcome,
     ComputeJobStatus,
@@ -1269,3 +1271,133 @@ async def test_plan_compute_experiment_below_threshold_no_approval(db_session, m
     child = children[0]
     assert child.first_payload["type"] == "compute_experiment"
     assert child.requires_approval is False
+
+
+# ---------------------------------------------------------------------------
+# Agent /spawn endpoint spend-gate regression tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_spawn_compute_experiment_above_threshold_requires_approval(
+    client: AsyncClient, db_session
+):
+    """The /api/agent/spawn endpoint must enforce the spend gate for
+    compute_experiment payloads — a caller-supplied requires_approval=False
+    must be overridden to True when spend_cap_usd exceeds the threshold."""
+    import app.shared_state as _shared_state
+
+    project = Project(name="AgentSpawnSpendGate", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "research something"}],
+        vm_instance_id="agent-vm-spawn-gate-above",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    prev_threshold = _shared_state.runtime_config.get(
+        "compute_experiment_spend_threshold_usd"
+    )
+    _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = 5.0
+    try:
+        token = create_agent_token(str(parent_task.id), "agent-vm-spawn-gate-above")
+        resp = await client.post(
+            "/api/agent/spawn",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(parent_task.id),
+                "payloads": [
+                    {
+                        "type": "compute_experiment",
+                        "title": "Above-threshold experiment",
+                        "command": "python bench.py",
+                        "spend_cap_usd": 10.0,
+                        "deadline_seconds": 600,
+                    }
+                ],
+                "requires_approval": False,
+            },
+        )
+        assert resp.status_code == 200
+        child_id = uuid.UUID(resp.json()["task_ids"][0])
+        child = await db_session.get(Task, child_id)
+        assert child is not None
+        assert child.requires_approval is True
+    finally:
+        if prev_threshold is not None:
+            _shared_state.runtime_config[
+                "compute_experiment_spend_threshold_usd"
+            ] = prev_threshold
+        else:
+            _shared_state.runtime_config.pop(
+                "compute_experiment_spend_threshold_usd", None
+            )
+
+
+@pytest.mark.asyncio
+async def test_agent_spawn_compute_experiment_below_threshold_no_approval(
+    client: AsyncClient, db_session
+):
+    """The /api/agent/spawn endpoint must NOT require approval for
+    compute_experiment payloads whose spend_cap_usd is at or below threshold."""
+    import app.shared_state as _shared_state
+
+    project = Project(name="AgentSpawnSpendGateBelow", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "research something"}],
+        vm_instance_id="agent-vm-spawn-gate-below",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    prev_threshold = _shared_state.runtime_config.get(
+        "compute_experiment_spend_threshold_usd"
+    )
+    _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = 5.0
+    try:
+        token = create_agent_token(str(parent_task.id), "agent-vm-spawn-gate-below")
+        resp = await client.post(
+            "/api/agent/spawn",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(parent_task.id),
+                "payloads": [
+                    {
+                        "type": "compute_experiment",
+                        "title": "Below-threshold experiment",
+                        "command": "python bench.py",
+                        "spend_cap_usd": 3.0,
+                        "deadline_seconds": 600,
+                    }
+                ],
+                "requires_approval": False,
+            },
+        )
+        assert resp.status_code == 200
+        child_id = uuid.UUID(resp.json()["task_ids"][0])
+        child = await db_session.get(Task, child_id)
+        assert child is not None
+        assert child.requires_approval is False
+    finally:
+        if prev_threshold is not None:
+            _shared_state.runtime_config[
+                "compute_experiment_spend_threshold_usd"
+            ] = prev_threshold
+        else:
+            _shared_state.runtime_config.pop(
+                "compute_experiment_spend_threshold_usd", None
+            )
