@@ -19857,6 +19857,58 @@ class TestPostCommitPendingField:
         assert resp.json()["post_commit_pending"] is False
 
 
+class TestApprovalNeededFilter:
+    """GET /api/admin/tasks supports the approval_needed triage filter."""
+
+    @pytest.mark.asyncio
+    async def test_admin_tasks_approval_needed_filter(
+        self, client: AsyncClient, db_session
+    ):
+        """approval_needed narrows the list in both directions; omitting it
+        returns both tasks (backward-compatible default)."""
+        project = await _make_project(db_session)
+        needs_approval = Task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+            requires_approval=True,
+        )
+        no_approval = Task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+            requires_approval=False,
+        )
+        db_session.add_all([needs_approval, no_approval])
+        await db_session.commit()
+        await db_session.refresh(needs_approval)
+        await db_session.refresh(no_approval)
+
+        needs_id = str(needs_approval.id)
+        no_id = str(no_approval.id)
+
+        # Default (param omitted) — both tasks are returned unchanged.
+        resp = await client.get("/api/admin/tasks")
+        assert resp.status_code == 200, resp.text
+        all_ids = {t["id"] for t in resp.json()["tasks"]}
+        assert needs_id in all_ids
+        assert no_id in all_ids
+
+        # approval_needed=true — only the requires_approval task.
+        resp = await client.get("/api/admin/tasks?approval_needed=true")
+        assert resp.status_code == 200, resp.text
+        true_ids = {t["id"] for t in resp.json()["tasks"]}
+        assert needs_id in true_ids
+        assert no_id not in true_ids
+
+        # approval_needed=false — only the non-approval task.
+        resp = await client.get("/api/admin/tasks?approval_needed=false")
+        assert resp.status_code == 200, resp.text
+        false_ids = {t["id"] for t in resp.json()["tasks"]}
+        assert no_id in false_ids
+        assert needs_id not in false_ids
+
+
 class TestPoolAccountMutationsRequireAdmin:
     """Mutation endpoints on /max-plan-accounts must reject non-admin callers."""
 

@@ -220,6 +220,7 @@ async def get_all_tasks(
     task_type: str | None = Query(None),
     project_id: uuid.UUID | None = Query(None),
     spawned_by: str | None = Query(None, max_length=100),
+    approval_needed: bool | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -260,6 +261,11 @@ async def get_all_tasks(
         filters.append(Task.payloads[0]["type"].as_string() == task_type)
     if spawned_by:
         filters.append(Task.context["spawned_by"].as_string() == spawned_by)
+    if approval_needed is not None:
+        # requires_approval is a stored boolean column (not application-computed),
+        # so this narrows server-side. Mirrors the web console's approval-needed
+        # triage filter. Omitted (None) -> no change to existing behavior.
+        filters.append(Task.requires_approval == approval_needed)
 
     count_query = select(func.count()).select_from(Task)
     for f in filters:

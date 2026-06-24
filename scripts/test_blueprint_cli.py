@@ -570,6 +570,23 @@ def mock_api(monkeypatch):
                 {"id": "q-task-111", "task_type": "create", "title": "queued task",
                  "status": "QUEUED", "context": {}},
             ], "total": 1}
+        if "/tasks" in path and "limit=500" in path:
+            # Failure-class filtering raises the internal fetch limit to 500 and
+            # narrows client-side; return a mixed set carrying failure_class.
+            return {
+                "tasks": [
+                    {"id": "fc-code-0000-0000-000000000000",
+                     "task_type": "create", "title": "code error task",
+                     "status": "FAILED", "failure_class": "CODE_ERROR"},
+                    {"id": "fc-timeout-00-0000-000000000000",
+                     "task_type": "fix", "title": "timeout task",
+                     "status": "FAILED", "failure_class": "AGENT_TIMEOUT"},
+                    {"id": "fc-none-0000-0000-000000000000",
+                     "task_type": "create", "title": "running task",
+                     "status": "IN_PROGRESS", "failure_class": None},
+                ],
+                "total": 3,
+            }
         if "/tasks" in path:
             return {"tasks": [{"id": "task-123", "task_type": "create",
                                "status": "IN_PROGRESS", "title": "demo"}],
@@ -955,6 +972,91 @@ def test_tasks_list_json(mock_api, capsys):
     assert parsed["tasks"][0]["id"] == "task-123"
     # the status filter must have been threaded into the request path
     assert any("status=IN_PROGRESS" in path for _, path, _ in mock_api)
+
+
+def test_tasks_list_blocked_flag(mock_api, capsys):
+    """`tasks list --blocked` threads status=BLOCKED into the request."""
+    rc = blueprint.main(["--json", "tasks", "list", "--blocked"])
+    assert rc == 0
+    assert any("status=BLOCKED" in path for _, path, _ in mock_api)
+
+
+def test_tasks_list_blocked_appends_to_status(mock_api, capsys):
+    """--blocked appends BLOCKED rather than replacing an explicit --status."""
+    rc = blueprint.main(["--json", "tasks", "list", "--status", "QUEUED", "--blocked"])
+    assert rc == 0
+    paths = [path for _, path, _ in mock_api]
+    assert any("status=QUEUED" in p and "status=BLOCKED" in p for p in paths)
+
+
+def test_tasks_list_approval_needed_flag(mock_api, capsys):
+    """`tasks list --approval-needed` threads approval_needed=true."""
+    rc = blueprint.main(["--json", "tasks", "list", "--approval-needed"])
+    assert rc == 0
+    assert any("approval_needed=true" in path for _, path, _ in mock_api)
+
+
+def test_tasks_list_offset(mock_api, capsys):
+    """`tasks list --offset 50` threads offset=50 into the request."""
+    rc = blueprint.main(["--json", "tasks", "list", "--offset", "50"])
+    assert rc == 0
+    assert any("offset=50" in path for _, path, _ in mock_api)
+
+
+def test_tasks_list_offset_zero_omitted(mock_api, capsys):
+    """offset=0 (the default) is not appended to the request path."""
+    rc = blueprint.main(["--json", "tasks", "list"])
+    assert rc == 0
+    assert not any("offset=" in path for _, path, _ in mock_api)
+
+
+def test_tasks_list_filters(mock_api, capsys):
+    """`--failure-class CODE_ERROR` keeps only matching tasks and raises the fetch limit."""
+    rc = blueprint.main(["--json", "tasks", "list", "--failure-class", "CODE_ERROR"])
+    assert rc == 0
+    # internal fetch limit raised to 500 so the client-side filter has rows
+    assert any("limit=500" in path for _, path, _ in mock_api)
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["filtered_client_side"] is True
+    ids = [t["id"] for t in parsed["tasks"]]
+    assert ids == ["fc-code-0000-0000-000000000000"]
+    assert all(t["failure_class"] == "CODE_ERROR" for t in parsed["tasks"])
+
+
+def test_tasks_list_failure_class_repeatable(mock_api, capsys):
+    """Two --failure-class values union-filter the returned list."""
+    rc = blueprint.main(["--json", "tasks", "list",
+                         "--failure-class", "CODE_ERROR",
+                         "--failure-class", "AGENT_TIMEOUT"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    ids = sorted(t["id"] for t in parsed["tasks"])
+    assert ids == ["fc-code-0000-0000-000000000000",
+                   "fc-timeout-00-0000-000000000000"]
+
+
+def test_tasks_list_failure_class_warns_on_impossible_status(mock_api, capsys):
+    """--failure-class with a non-FAILED/CANCELLED status warns on stderr."""
+    rc = blueprint.main(["--json", "tasks", "list", "--status", "IN_PROGRESS",
+                         "--failure-class", "CODE_ERROR"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "IN_PROGRESS" in err
+
+
+def test_tasks_list_failure_class_no_warn_for_failed_status(mock_api, capsys):
+    """No warning when --failure-class is paired with FAILED."""
+    rc = blueprint.main(["--json", "tasks", "list", "--status", "FAILED",
+                         "--failure-class", "CODE_ERROR"])
+    assert rc == 0
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_tasks_list_invalid_failure_class_rejected(mock_api, capsys):
+    """An unknown --failure-class value errors at parse time (SystemExit 2)."""
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "list", "--failure-class", "NOT_A_CLASS"])
+    assert exc.value.code == 2
 
 
 def test_tasks_show_json(mock_api, capsys):

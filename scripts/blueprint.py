@@ -310,11 +310,44 @@ def cmd_tasks(args: argparse.Namespace) -> None:
         _tasks_list(args)
 
 
+# Valid failure_class values the backend's classify_failure can emit. Used as
+# argparse choices for `tasks list --failure-class` and to drive the client-side
+# filter. Only FAILED/CANCELLED tasks ever carry a failure_class.
+FAILURE_CLASSES = frozenset({
+    "CODE_ERROR", "PROVISION_FAILURE", "AGENT_TIMEOUT", "EXTERNAL_API",
+    "RATE_LIMIT", "SCOPE_OVERFLOW", "MIGRATION_ERROR", "VIEWPORT_REGRESSION",
+    "agent_stalled", "BLOCKED_PRECONDITION", "SCOPE_EMPTY",
+    "park_wake_timeout", "park_wake_stranded",
+})
+
+# Statuses whose tasks can carry a failure_class (backend only classifies
+# FAILED/CANCELLED). A --failure-class combined with any other status filter
+# can never match, so we warn.
+_FAILURE_CLASS_STATUSES = frozenset({"FAILED", "CANCELLED"})
+
+
 def _tasks_list(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
-    path = f"/api/admin/tasks?project_id={pid}&limit={getattr(args, 'limit', 50)}"
+    failure_classes = set(getattr(args, "failure_class", None) or [])
+    # When client-side failure-class filtering is active, fetch a wider page so
+    # the post-fetch narrowing has enough rows to work with (mirrors the web
+    # console, which also filters failure_class client-side).
+    display_limit = getattr(args, "limit", 50)
+    fetch_limit = max(display_limit, 500) if failure_classes else display_limit
+    path = f"/api/admin/tasks?project_id={pid}&limit={fetch_limit}"
+    # --status and --blocked both contribute repeatable status= params; the
+    # backend accepts a List[TaskStatus], so BLOCKED appends rather than replaces.
+    requested_statuses = []
     if getattr(args, "status", None):
         path += f"&status={args.status}"
+        requested_statuses.append(str(args.status).upper())
+    if getattr(args, "blocked", False):
+        path += "&status=BLOCKED"
+        requested_statuses.append("BLOCKED")
+    if getattr(args, "approval_needed", False):
+        path += "&approval_needed=true"
+    if getattr(args, "offset", 0):
+        path += f"&offset={args.offset}"
     if getattr(args, "task_type", None):
         path += f"&task_type={args.task_type}"
     if getattr(args, "direction", None):
@@ -323,6 +356,19 @@ def _tasks_list(args: argparse.Namespace) -> None:
         from urllib.parse import quote
 
         path += f"&search={quote(args.search)}"
+
+    # A failure-class filter only matches FAILED/CANCELLED tasks; warn (do not
+    # hard-error) when paired with a status that can never carry a failure_class.
+    if failure_classes:
+        impossible = [s for s in requested_statuses
+                      if s not in _FAILURE_CLASS_STATUSES]
+        if impossible:
+            print(
+                "WARNING: --failure-class only matches FAILED/CANCELLED tasks; "
+                f"status filter(s) {', '.join(impossible)} can never carry a "
+                "failure_class, so results may be empty.",
+                file=sys.stderr,
+            )
 
     # IMPORTANT API GAP: the Task model has NO release-version linkage (its
     # `version` column is an optimistic-lock counter, not a release version),
@@ -339,7 +385,15 @@ def _tasks_list(args: argparse.Namespace) -> None:
     resp = api("GET", path)
     tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
     total = resp.get("total") if isinstance(resp, dict) else None
-    _emit(args, {"tasks": tasks, "total": total}, _render_task_list)
+    payload = {"tasks": tasks, "total": total}
+    if failure_classes:
+        # Client-side narrowing to the requested failure classes, then re-trim
+        # to the display limit the operator asked for.
+        filtered = [t for t in (tasks or [])
+                    if t.get("failure_class") in failure_classes]
+        payload["tasks"] = filtered[:display_limit]
+        payload["filtered_client_side"] = True
+    _emit(args, payload, _render_task_list)
 
 
 def _render_task_list(data: dict) -> None:
@@ -3661,6 +3715,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_tasks_list.add_argument("--direction", help="Filter by direction id.")
     p_tasks_list.add_argument("--search", help="Substring search over title/desc/message.")
     p_tasks_list.add_argument("--limit", type=int, default=50, help="Max tasks (default 50).")
+    p_tasks_list.add_argument("--offset", type=int, default=0,
+                              help="Skip the first N tasks (server-side pagination; "
+                                   "combine with --limit to page through results).")
+    p_tasks_list.add_argument("--blocked", action="store_true",
+                              help="Show only tasks in BLOCKED status (dependency "
+                                   "unresolved). Appends BLOCKED to any --status values.")
+    p_tasks_list.add_argument("--approval-needed", dest="approval_needed",
+                              action="store_true",
+                              help="Show only tasks that require human approval.")
+    p_tasks_list.add_argument("--failure-class", dest="failure_class", action="append",
+                              default=[], choices=sorted(FAILURE_CLASSES), metavar="CLASS",
+                              help="Keep only tasks whose failure_class matches (repeatable). "
+                                   "Filters CLIENT-SIDE after fetching (matches the web "
+                                   "console); raises the internal fetch limit to 500 so "
+                                   "filtering has enough rows. Only FAILED/CANCELLED tasks "
+                                   "carry a failure_class.")
     p_tasks_list.add_argument("--version", help="UNSUPPORTED by the API — prints a notice "
                                                 "(Task has no release-version linkage).")
     p_tasks_show = tasks_sub.add_parser("show", parents=[common], help="Show one task by id.")
