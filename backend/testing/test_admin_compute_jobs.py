@@ -385,6 +385,56 @@ async def test_kill_compute_job_redacts_launch_secrets(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
+async def test_list_compute_jobs_redacts_credentials_in_per_arm_text_fields(
+    client: AsyncClient, db_session
+):
+    """serialize_compute_job_response_safe must redact credential-bearing patterns
+    from per-arm log/note/label text inside result_metrics.arms so VM stdout that
+    echoed a secret does not reach the operator-facing API."""
+    project = await _make_project(db_session, name="Arm Redact")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "result_metrics": {
+                "accuracy": 0.9,
+                "arms": {
+                    "control": {
+                        "accuracy": 0.85,
+                        "log": "run ok\nexport ANTHROPIC_API_KEY=sk-ant-api03-REDACTME\ndone",
+                        "note": "baseline run",
+                        "label": "control-arm",
+                    },
+                    "treatment": {
+                        "accuracy": 0.92,
+                        "log": "completed with ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH token",
+                        "note": "treatment note",
+                        "label": "treatment-arm",
+                    },
+                },
+            }
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    pm = resp.json()["compute_jobs"][0]["polling_metadata"]
+    arms = pm["result_metrics"]["arms"]
+
+    # Credential-bearing patterns must be scrubbed from log text.
+    assert "sk-ant-api03-REDACTME" not in arms["control"]["log"]
+    assert "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH" not in arms["treatment"]["log"]
+
+    # Non-sensitive fields survive intact.
+    assert arms["control"]["note"] == "baseline run"
+    assert arms["control"]["label"] == "control-arm"
+    assert arms["treatment"]["note"] == "treatment note"
+    assert arms["treatment"]["label"] == "treatment-arm"
+    assert pm["result_metrics"]["accuracy"] == 0.9
+
+
+@pytest.mark.asyncio
 async def test_list_compute_jobs_strips_non_dict_env_payload(
     client: AsyncClient, db_session
 ):
@@ -1142,6 +1192,47 @@ async def test_analyze_endpoint_persists_unavailable_cause(
     assert verdict.get("analysis_attempted_at") is not None
     # analysis_mode must not have changed.
     assert verdict.get("analysis_mode") == original_mode
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_redacts_credentials_in_result_metrics(
+    client: AsyncClient, db_session
+):
+    """result_metrics string values must have credentials redacted recursively."""
+    project = await _make_project(db_session, name="Redact Result Metrics")
+    await _add_member(db_session, project.id, "viewer")
+    # Seed a job whose result_metrics contains credential-bearing strings at
+    # various nesting depths, plus a safe numeric value that must survive.
+    await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "result_metrics": {
+                "accuracy": 0.95,
+                "log": "export ANTHROPIC_API_KEY=sk-ant-abc123 run complete",
+                "arms": {
+                    "arm_a": {
+                        "note": "Authorization: Bearer ghp_token123 step done",
+                        "score": 0.88,
+                    }
+                },
+            }
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    rm = resp.json()["compute_jobs"][0]["polling_metadata"]["result_metrics"]
+
+    # Numeric values survive unchanged.
+    assert rm["accuracy"] == 0.95
+    # Top-level credential string must be redacted.
+    assert "sk-ant-abc123" not in rm["log"]
+    assert "ANTHROPIC_API_KEY" not in rm["log"] or "***" in rm["log"]
+    # Nested string inside arms must also be redacted.
+    assert "ghp_token123" not in rm["arms"]["arm_a"]["note"]
+    # Numeric field inside arms survives.
+    assert rm["arms"]["arm_a"]["score"] == 0.88
 
 
 @pytest.mark.asyncio

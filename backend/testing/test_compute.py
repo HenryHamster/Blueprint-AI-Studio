@@ -9932,6 +9932,24 @@ def test_serialize_compute_job_response_safe_redacts_command_log():
     assert "result: 42" in text
 
 
+def test_serialize_compute_job_response_agent_returns_raw_command_log():
+    """serialize_compute_job_response (non-safe, agent-facing) passes command_log text through.
+
+    Agents own their job and need the full metadata — the non-safe variant intentionally
+    omits redaction. This test documents the safe/agent asymmetry so a future refactor
+    cannot collapse both serializers into a single redacting path without notice.
+    """
+    raw = "Bearer token=TOP_SECRET\nresult: 42\n"
+    job = _make_job_with_command_log(raw)
+    data = schemas.serialize_compute_job_response(job)
+    text = data["polling_metadata"]["command_log"]["text"]
+    # Non-safe: raw text is returned intact for agent callers (agents own the job).
+    assert "TOP_SECRET" in text, (
+        "agent-facing serialize_compute_job_response must not redact command_log.text"
+    )
+    assert "result: 42" in text
+
+
 def test_command_runner_redacts_credentials(tmp_path):
     """command_runner.py redacts credentials at capture time before writing command.log.json.
 
