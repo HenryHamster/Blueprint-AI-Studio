@@ -2995,3 +2995,50 @@ def test_compute_kill_aborts_without_yes(mock_api, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Aborted" in out
     assert not any(m == "POST" and "/kill" in p for m, p, _ in mock_api)
+
+
+def test_compute_show_live_cost_telemetry(monkeypatch, capsys):
+    """compute show renders burn rate, projected spend, and cap-hit warning for active jobs with cost data."""
+    active_job = {
+        "id": "cjob-live-0000-0000-000000000099",
+        "status": "RUNNING",
+        "task_title": "live GPU experiment",
+        "task_type": "compute_experiment",
+        # started far in the past so elapsed >> 60s in any test run
+        "started_at": "2020-01-01T00:00:00Z",
+        "accrued_cost_usd": 5.0,
+        # cap below accrued so projected spend will always exceed it
+        "spend_cap_usd": 3.0,
+        "wall_clock_deadline": "2099-01-01T00:00:00Z",
+        "final_cost_usd": None,
+        "experiment": "exp-live",
+        "hypothesis": None,
+        "criterion_verdict": None,
+    }
+
+    def fake_api(method, path, body=None, timeout=30):
+        return {"compute_jobs": [active_job], "has_more": False}
+
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+
+    rc = blueprint.main(["compute", "show", "cjob-live"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "RUNNING" in out
+    # accrued cost shown for active job
+    assert "accrued" in out
+    assert "5.0000" in out
+    # burn rate shown ($/hr)
+    assert "burn rate" in out
+    assert "/hr" in out
+    # projected spend shown
+    assert "projected" in out
+    # cap-hit warning shown because projected > spend_cap
+    assert "cap" in out
+    # spend cap displayed
+    assert "spend cap" in out
+    assert "$3.00" in out
+    # deadline displayed
+    assert "deadline" in out
+    assert "2099" in out

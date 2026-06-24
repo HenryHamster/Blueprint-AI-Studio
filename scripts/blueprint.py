@@ -3309,6 +3309,45 @@ def _render_knowledge_doc(doc: dict) -> None:
 
 # ── compute ───────────────────────────────────────────────────────────────────
 
+_ACTIVE_COMPUTE_STATUSES = frozenset({"QUEUED", "STARTING", "RUNNING", "POLLING"})
+
+
+def _compute_job_burn_rate(j: dict, now: "datetime") -> "float | None":
+    """Return $/hr burn rate for an active job; None if data is insufficient (<60s elapsed or no accrued cost)."""
+    if j.get("status") not in _ACTIVE_COMPUTE_STATUSES:
+        return None
+    started_at_str = j.get("started_at")
+    if not started_at_str:
+        return None
+    accrued = j.get("accrued_cost_usd")
+    if accrued is None or accrued <= 0:
+        return None
+    try:
+        started_at = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+        elapsed_sec = (now - started_at).total_seconds()
+    except (ValueError, TypeError):
+        return None
+    if elapsed_sec < 60:
+        return None
+    return (accrued / elapsed_sec) * 3600
+
+
+def _compute_job_projected_spend(j: dict, burn_rate: "float | None", now: "datetime") -> "float | None":
+    """Return projected total spend at the wall-clock deadline given current burn rate; None if unavailable."""
+    if burn_rate is None:
+        return None
+    deadline_str = j.get("wall_clock_deadline")
+    if not deadline_str:
+        return None
+    try:
+        deadline = datetime.fromisoformat(deadline_str.replace("Z", "+00:00"))
+        remaining_sec = max(0.0, (deadline - now).total_seconds())
+    except (ValueError, TypeError):
+        return None
+    accrued = j.get("accrued_cost_usd") or 0.0
+    return accrued + burn_rate * (remaining_sec / 3600)
+
+
 def cmd_compute(args: argparse.Namespace) -> None:
     """Dispatch compute subcommands: list / show / kill / analyze."""
     sub = getattr(args, "compute_cmd", None) or "list"
@@ -3339,6 +3378,7 @@ def _render_compute_list(data: dict) -> None:
     if not jobs:
         print("  (none)")
         return
+    now = datetime.now(timezone.utc)
     for j in jobs:
         jid = (j.get("id") or "?")[:8]
         status = j.get("status", "?")
@@ -3350,7 +3390,9 @@ def _render_compute_list(data: dict) -> None:
         verdict_str = f"  met={verdict}" if verdict is not None else ""
         exp = (j.get("experiment") or "")[:20]
         exp_str = f"  exp={exp}" if exp else ""
-        print(f"  {jid}  {status:12} [{task_type}]  {title}{cost_str}{verdict_str}{exp_str}")
+        burn = _compute_job_burn_rate(j, now)
+        burn_str = f"  burn=${burn:.2f}/hr" if burn is not None else ""
+        print(f"  {jid}  {status:12} [{task_type}]  {title}{cost_str}{verdict_str}{exp_str}{burn_str}")
     if data.get("has_more"):
         print("  (more jobs available; increase --limit or --include-finished)")
 
@@ -3390,9 +3432,30 @@ def _render_compute_show(data: dict) -> None:
     hypothesis = j.get("hypothesis")
     if hypothesis:
         print(f"  hypothesis: {hypothesis}")
-    cost = j.get("final_cost_usd")
-    if cost is not None:
-        print(f"  cost      : ${cost:.4f}")
+    status = j.get("status", "")
+    if status in _ACTIVE_COMPUTE_STATUSES:
+        now = datetime.now(timezone.utc)
+        accrued = j.get("accrued_cost_usd")
+        if accrued is not None:
+            print(f"  accrued   : ${accrued:.4f}")
+        burn = _compute_job_burn_rate(j, now)
+        if burn is not None:
+            print(f"  burn rate : ${burn:.2f}/hr")
+            proj = _compute_job_projected_spend(j, burn, now)
+            if proj is not None:
+                cap = j.get("spend_cap_usd")
+                cap_warn = "  ⚠ projected to exceed cap" if (cap is not None and proj > cap) else ""
+                print(f"  projected : ${proj:.2f}{cap_warn}")
+        cap = j.get("spend_cap_usd")
+        if cap is not None:
+            print(f"  spend cap : ${cap:.2f}")
+        deadline = j.get("wall_clock_deadline")
+        if deadline:
+            print(f"  deadline  : {deadline}")
+    else:
+        cost = j.get("final_cost_usd")
+        if cost is not None:
+            print(f"  cost      : ${cost:.4f}")
     exit_code = (j.get("polling_metadata") or {}).get("exit_code")
     if exit_code is not None:
         print(f"  exit_code : {exit_code}")
