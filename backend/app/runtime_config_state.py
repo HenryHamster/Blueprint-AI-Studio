@@ -132,15 +132,15 @@ runtime_config: Dict = {
     # growth in task.context. When it trips, it enrolls a DEDUPLICATED finding
     # into the EXISTING evergreen ledger (same triage as a correctness finding)
     # — no new queue, no schema change. Mirrors evergreen_fill_mode exactly.
-    #   off     — never act (default; whole feature inert until an operator flips).
-    #   observe — measure + record the would-be finding, enroll nothing.
+    #   off     — never act.
+    #   observe — measure + record the would-be finding, enroll nothing (default).
     #   enforce — enroll the deduped finding.
     "structural_health_audit_mode": os.getenv(
-        "STRUCTURAL_HEALTH_AUDIT_MODE", "off"
+        "STRUCTURAL_HEALTH_AUDIT_MODE", "observe"
     ).lower()
-    if os.getenv("STRUCTURAL_HEALTH_AUDIT_MODE", "off").lower()
+    if os.getenv("STRUCTURAL_HEALTH_AUDIT_MODE", "observe").lower()
     in ("off", "observe", "enforce")
-    else "off",
+    else "observe",
     # Cadence (minutes) between structural-health audit sweeps in the reaper loop.
     "structural_health_audit_interval_minutes": int(
         os.getenv("STRUCTURAL_HEALTH_AUDIT_INTERVAL_MINUTES", "60")

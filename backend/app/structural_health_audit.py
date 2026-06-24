@@ -87,8 +87,8 @@ STRUCTURAL_AUDIT_PROVENANCE = "structural_audit"
 
 # --- Defaults (operator-overridable via runtime_config / PATCH settings) -----
 
-#: Default mode — OFF so the whole feature is inert until an operator flips it.
-DEFAULT_AUDIT_MODE = "off"
+#: Default mode — OBSERVE to measure and record findings without enrolling.
+DEFAULT_AUDIT_MODE = "observe"
 #: Default cadence between audit sweeps.
 DEFAULT_INTERVAL_MINUTES = 60
 #: Default fat-row byte threshold (1 MiB). A ``task.context`` above this is a

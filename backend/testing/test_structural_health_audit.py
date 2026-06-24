@@ -242,6 +242,36 @@ async def test_sweep_cadence_gate_skips_within_interval(db_session):
 
 
 # --------------------------------------------------------------------------- #
+# Default mode configuration.
+# --------------------------------------------------------------------------- #
+
+
+async def test_default_mode_is_observe(db_session):
+    """When STRUCTURAL_HEALTH_AUDIT_MODE env var is unset, the default mode is
+    'observe' and the observe-mode code path runs without errors and enrolls nothing."""
+    project = await _make_project(db_session)
+    await _make_task(db_session, project, blob_bytes=5000)
+
+    # setup_function pops the mode from runtime_config, so we don't explicitly set it.
+    # This test verifies that run_structural_health_audit defaults to 'observe' mode.
+    # We set the threshold to detect the fat row we created above.
+    runtime_config["structural_health_audit_fat_row_bytes"] = 1000
+    result = await run_structural_health_audit(db_session)
+
+    # With default observe mode, the audit runs and records the decision...
+    assert result is not None
+    assert result["fat_row"]["offenders"] >= 1
+    # ...but enrolls nothing.
+    assert result["fat_row"]["enrolled"] == 0
+    assert await _enrolled_fat_row_items(db_session, project.id) == []
+    # Observability recorded the measurement + decision.
+    snap = sha.get_structural_health_observability()
+    assert snap["cycles"] >= 1
+    assert snap["last_decision"]["offenders"] >= 1
+    assert snap["last_decision"]["enrolled"] == 0
+
+
+# --------------------------------------------------------------------------- #
 # Admin endpoint: structural-health-observability.
 # --------------------------------------------------------------------------- #
 
