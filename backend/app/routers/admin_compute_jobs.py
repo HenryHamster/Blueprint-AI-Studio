@@ -180,6 +180,37 @@ async def _build_compute_job_payload(
     return payload
 
 
+def _build_compute_jobs_summary(payload: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute aggregate roll-up over a page of built compute-job dicts."""
+    total_spend = 0.0
+    criterion_met = 0
+    measured = 0
+    outcome_breakdown: Dict[str, int] = {}
+    for job in payload:
+        final = job.get("final_cost_usd")
+        accrued = job.get("accrued_cost_usd")
+        if final is not None:
+            total_spend += float(final)
+        elif accrued is not None:
+            total_spend += float(accrued)
+        verdict = job.get("criterion_verdict")
+        if isinstance(verdict, dict):
+            if verdict.get("met") is True:
+                criterion_met += 1
+            if verdict.get("measurable") is True:
+                measured += 1
+        status = job.get("status")
+        if status is not None:
+            outcome_breakdown[status] = outcome_breakdown.get(status, 0) + 1
+    return {
+        "job_count": len(payload),
+        "total_spend_usd": total_spend,
+        "criterion_met_count": criterion_met,
+        "measured_count": measured,
+        "outcome_breakdown": outcome_breakdown,
+    }
+
+
 @router.get("/projects/{project_id}/compute-jobs")
 async def get_project_compute_jobs(
     project_id: uuid.UUID,
@@ -200,11 +231,13 @@ async def get_project_compute_jobs(
         limit=limit,
         offset=offset,
     )
+    built_payload = await _build_compute_job_payload(session, jobs)
     return {
-        "compute_jobs": await _build_compute_job_payload(session, jobs),
+        "compute_jobs": built_payload,
         "has_more": has_more,
         "limit": limit,
         "offset": offset,
+        "summary": _build_compute_jobs_summary(built_payload),
     }
 
 

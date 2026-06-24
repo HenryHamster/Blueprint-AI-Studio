@@ -795,6 +795,127 @@ async def test_analyze_compute_job_member_ok(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_list_compute_jobs_includes_summary(client: AsyncClient, db_session):
+    """The list response includes a summary block aggregating job_count,
+    total_spend_usd, criterion_met_count, measured_count, and outcome_breakdown
+    computed over the returned page without altering existing per-job fields."""
+    project = await _make_project(db_session, name="Summary Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Job 1: terminal (succeeded), criterion met, measurable, final_cost_usd set.
+    criterion_met = {
+        "metric": "accuracy",
+        "operator": ">=",
+        "threshold": 0.9,
+        "value": 0.95,
+        "met": True,
+        "measurable": True,
+    }
+    task1 = Task(
+        project_id=project.id,
+        title="met task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}}],
+        plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": criterion_met}},
+    )
+    db_session.add(task1)
+    await db_session.commit()
+    await db_session.refresh(task1)
+    job1 = ComputeJob(
+        task_id=task1.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=1.0,
+        final_cost_usd=1.5,
+        completed_at=datetime.utcnow(),
+    )
+    db_session.add(job1)
+    await db_session.commit()
+
+    # Job 2: terminal (failed), criterion unmet (measurable but not met).
+    criterion_unmet = {
+        "metric": "accuracy",
+        "operator": ">=",
+        "threshold": 0.9,
+        "value": 0.75,
+        "met": False,
+        "measurable": True,
+    }
+    task2 = Task(
+        project_id=project.id,
+        title="unmet task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}}],
+        plan_output={"compute_result": {"outcome": "FAILURE", "criterion": criterion_unmet}},
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+    job2 = ComputeJob(
+        task_id=task2.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.FAILED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=0.8,
+        final_cost_usd=0.8,
+        completed_at=datetime.utcnow(),
+    )
+    db_session.add(job2)
+    await db_session.commit()
+
+    # Job 3: running (no criterion, only accrued cost).
+    task3 = Task(
+        project_id=project.id,
+        title="running task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task3)
+    await db_session.commit()
+    await db_session.refresh(task3)
+    job3 = ComputeJob(
+        task_id=task3.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=0.3,
+    )
+    db_session.add(job3)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Existing keys must be preserved.
+    assert "compute_jobs" in body
+    assert "has_more" in body
+    assert "limit" in body
+    assert "offset" in body
+    assert len(body["compute_jobs"]) == 3
+
+    summary = body["summary"]
+    assert summary["job_count"] == 3
+    # total_spend: job1 final=1.5, job2 final=0.8, job3 accrued=0.3 (no final)
+    assert summary["total_spend_usd"] == pytest.approx(2.6)
+    # criterion_met: only job1
+    assert summary["criterion_met_count"] == 1
+    # measured: job1 (measurable=True) + job2 (measurable=True)
+    assert summary["measured_count"] == 2
+    breakdown = summary["outcome_breakdown"]
+    assert breakdown[ComputeJobStatus.SUCCEEDED.value] == 1
+    assert breakdown[ComputeJobStatus.FAILED.value] == 1
+    assert breakdown[ComputeJobStatus.RUNNING.value] == 1
+
+
+@pytest.mark.asyncio
 async def test_analyze_endpoint_persists_unavailable_cause(
     client: AsyncClient, db_session
 ):
