@@ -144,6 +144,7 @@ HELP_INVOCATIONS = [
     ["knowledge", "show"],
     ["compute"],
     ["compute", "list"],
+    ["compute", "show"],
     ["compute", "kill"],
     ["compute", "analyze"],
 ]
@@ -2946,6 +2947,41 @@ def test_compute_analyze_with_yes_posts_analyze(mock_api, monkeypatch, capsys):
     analyze_calls = [(m, p) for m, p, _ in mock_api if m == "POST" and "/analyze" in p]
     assert analyze_calls, "Expected a POST to the /analyze endpoint"
     assert job_id in analyze_calls[0][1]
+
+
+def test_compute_show_renders_result_and_tolerates_missing_fields(mock_api, capsys):
+    """compute show <id-prefix> renders metrics, verdict, and knowledge doc; missing fields are omitted."""
+    # Full-match job id for the SUCCEEDED job in mock_api fixture
+    job_id = "cjob-bbb0-0000-0000-000000000002"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Core fields must appear
+    assert job_id in out
+    assert "SUCCEEDED" in out
+    assert "GPU benchmark beta" in out
+    # Cost rendered
+    assert "12.5" in out
+    # Criterion verdict rendered
+    assert "met=True" in out
+    # Hypothesis rendered
+    assert "Quantization works" in out
+    # Test prefix-match: short prefix also resolves
+    rc2 = blueprint.main(["compute", "show", "cjob-bbb0"])
+    assert rc2 == 0
+    out2 = capsys.readouterr().out
+    assert "SUCCEEDED" in out2
+    # Fields absent from the RUNNING job (no cost, no verdict) are tolerated
+    rc3 = blueprint.main(["compute", "show", "cjob-aaa0"])
+    assert rc3 == 0
+    out3 = capsys.readouterr().out
+    assert "RUNNING" in out3
+    assert "GPU benchmark alpha" in out3
+
+
+def test_compute_show_registers_in_help_invocations():
+    """'compute show' is in HELP_INVOCATIONS so --help parsing is verified."""
+    assert ["compute", "show"] in HELP_INVOCATIONS
 
 
 def test_compute_kill_aborts_without_yes(mock_api, monkeypatch, capsys):

@@ -4784,6 +4784,66 @@ class TestMessages:
         )
 
 
+    @pytest.mark.asyncio
+    async def test_list_messages_server_side_search_scoped_to_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """Server-side search (q=) filters by content and is scoped to the user's projects.
+
+        Verifies that:
+        - Only messages whose content contains the search term are returned.
+        - Messages from a project the caller does not belong to are never returned,
+          even if their content matches the search term.
+        """
+        project = await _make_project(db_session)
+
+        # Two messages in the user's project — only one matches the search term.
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="user",
+                content="deploy the authentication service",
+                status="open",
+            )
+        )
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="user",
+                content="unrelated routine update",
+                status="open",
+            )
+        )
+
+        # A message in a different project (user is NOT a member) — must never appear.
+        other_project = Project(name="Other Project", user_id="other-user-999")
+        db_session.add(other_project)
+        await db_session.flush()
+        db_session.add(
+            ProjectMessage(
+                project_id=other_project.id,
+                message_type=MessageType.NOTE,
+                from_type="user",
+                content="deploy the authentication service in other project",
+                status="open",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=all&q=authentication"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        contents = [m["content"] for m in data["messages"]]
+        # Only the matching message from the user's project is returned.
+        assert len(contents) == 1
+        assert "authentication" in contents[0]
+        assert all(m["project_id"] == str(project.id) for m in data["messages"])
+
+
 class TestMessagesLastSeen:
     @pytest.mark.asyncio
     async def test_get_last_seen_empty(self, client: AsyncClient, db_session):

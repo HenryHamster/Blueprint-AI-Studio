@@ -3310,12 +3310,14 @@ def _render_knowledge_doc(doc: dict) -> None:
 # ── compute ───────────────────────────────────────────────────────────────────
 
 def cmd_compute(args: argparse.Namespace) -> None:
-    """Dispatch compute subcommands: list / kill / analyze."""
+    """Dispatch compute subcommands: list / show / kill / analyze."""
     sub = getattr(args, "compute_cmd", None) or "list"
     if sub == "kill":
         _compute_kill(args)
     elif sub == "analyze":
         _compute_analyze(args)
+    elif sub == "show":
+        _compute_show(args)
     else:
         _compute_list(args)
 
@@ -3362,6 +3364,52 @@ def _compute_kill(args: argparse.Namespace) -> None:
     result = api("POST", f"/api/admin/compute-jobs/{job_id}/kill")
     killed_status = (result.get("compute_job") or {}).get("status", "killed")
     _emit(args, result, lambda r: print(f"  {job_id[:8]}: {killed_status}"))
+
+
+def _compute_show(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    job_id = args.job_id
+    resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs?include_finished_minutes=10080&limit=200")
+    jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
+    job = next((j for j in jobs if j.get("id", "").startswith(job_id) or j.get("id") == job_id), None)
+    if job is None:
+        print(f"No compute job found matching '{job_id}'.")
+        return
+    _emit(args, {"compute_job": job}, _render_compute_show)
+
+
+def _render_compute_show(data: dict) -> None:
+    j = data.get("compute_job") or {}
+    print(f"=== COMPUTE JOB: {j.get('id', '?')} ===")
+    print(f"  status    : {j.get('status', '?')}")
+    print(f"  title     : {j.get('task_title') or j.get('title') or '—'}")
+    print(f"  type      : {j.get('task_type', '?')}")
+    experiment = j.get("experiment")
+    if experiment:
+        print(f"  experiment: {experiment}")
+    hypothesis = j.get("hypothesis")
+    if hypothesis:
+        print(f"  hypothesis: {hypothesis}")
+    cost = j.get("final_cost_usd")
+    if cost is not None:
+        print(f"  cost      : ${cost:.4f}")
+    exit_code = (j.get("polling_metadata") or {}).get("exit_code")
+    if exit_code is not None:
+        print(f"  exit_code : {exit_code}")
+    metrics = j.get("result_metrics")
+    if metrics:
+        print(f"  metrics   : {metrics}")
+    verdict = j.get("criterion_verdict")
+    if isinstance(verdict, dict):
+        met = verdict.get("met")
+        reason = verdict.get("reason") or ""
+        print(f"  criterion : met={met}  {reason}")
+    ref = j.get("result_reference")
+    if ref:
+        print(f"  result_ref: {ref}")
+    doc = j.get("knowledge_document_id")
+    if doc:
+        print(f"  knowledge : {doc}")
 
 
 def _compute_analyze(args: argparse.Namespace) -> None:
@@ -3919,6 +3967,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include jobs that finished within this many minutes (default 360).")
     p_compute_list.add_argument("--limit", type=int, default=20,
                                 help="Max jobs to return (default 20).")
+    p_compute_show = compute_sub.add_parser(
+        "show", parents=[common],
+        help="Show full details for one compute job (metrics, verdict, knowledge doc).")
+    p_compute_show.add_argument("job_id", help="Compute job id prefix or full UUID.")
     p_compute_kill = compute_sub.add_parser(
         "kill", parents=[common],
         help="Kill a running compute job (confirms before mutating).")
