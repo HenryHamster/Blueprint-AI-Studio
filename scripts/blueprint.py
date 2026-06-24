@@ -3467,7 +3467,7 @@ def _compute_list(args: argparse.Namespace) -> None:
     summary = resp.get("summary") if isinstance(resp, dict) else None
     if status_filter:
         jobs = [j for j in jobs if j.get("status", "").upper() == status_filter.upper()]
-    _emit(args, {"compute_jobs": jobs, "has_more": has_more, "summary": summary}, _render_compute_list)
+    _emit(args, {"compute_jobs": jobs, "has_more": has_more, "summary": summary, "status_filter": status_filter}, _render_compute_list)
 
 
 def _render_compute_list(data: dict) -> None:
@@ -3499,16 +3499,25 @@ def _render_compute_list(data: dict) -> None:
         burn = _compute_job_burn_rate(j, now)
         burn_str = f"  burn=${burn:.2f}/hr" if burn is not None else ""
         print(f"  {jid}  {status:12} [{task_type}]  {title}{cost_str}{verdict_str}{exp_str}{burn_str}")
-    if data.get("has_more"):
+    status_filter = data.get("status_filter")
+    if data.get("has_more") and not status_filter:
         print("  (more jobs available; increase --limit, --include-finished, or use --all-terminal)")
-    summary = data.get("summary") or {}
-    if summary:
-        total = summary.get("total_jobs", len(jobs))
-        active = summary.get("active_jobs", 0)
-        spend = summary.get("total_spend_usd", 0.0)
-        measured = summary.get("criterion_measured", 0)
-        met = summary.get("criterion_met", 0)
+    if status_filter:
+        total = len(jobs)
+        active = sum(1 for j in jobs if j.get("status", "").upper() in _ACTIVE_COMPUTE_STATUSES)
+        spend = sum(j.get("final_cost_usd") or 0.0 for j in jobs)
+        measured = sum(1 for j in jobs if isinstance(j.get("criterion_verdict"), dict) and j["criterion_verdict"].get("measurable"))
+        met = sum(1 for j in jobs if isinstance(j.get("criterion_verdict"), dict) and j["criterion_verdict"].get("met"))
         print(f"  --- {total} jobs | {active} active | ${spend:.2f} total spend | {met}/{measured} criteria met ---")
+    else:
+        summary = data.get("summary") or {}
+        if summary:
+            total = summary.get("total_jobs", len(jobs))
+            active = summary.get("active_jobs", 0)
+            spend = summary.get("total_spend_usd", 0.0)
+            measured = summary.get("criterion_measured", 0)
+            met = summary.get("criterion_met", 0)
+            print(f"  --- {total} jobs | {active} active | ${spend:.2f} total spend | {met}/{measured} criteria met ---")
 
 
 def _compute_kill(args: argparse.Namespace) -> None:
@@ -3602,26 +3611,49 @@ def _render_compute_show(data: dict) -> None:
             print(f"  metrics   : {scalar_items}")
         if arms:
             print("  per-arm results:")
-            for arm_name, arm_metrics in (arms.items() if isinstance(arms, dict) else []):
-                if isinstance(arm_metrics, dict):
-                    label = arm_metrics.get("label")
-                    note = arm_metrics.get("note")
-                    log = arm_metrics.get("log")
-                    scalar_metrics = {k: v for k, v in arm_metrics.items() if k not in ("label", "note", "log")}
-                    print(f"    [{arm_name}]", end="")
-                    if scalar_metrics:
-                        print(f" {scalar_metrics}", end="")
-                    print()
-                    if label:
-                        print(f"      label: {label}")
-                    if note:
-                        print(f"      note: {note}")
-                    if log:
-                        print("      log:")
-                        for log_line in log.split("\n"):
-                            print(f"        {log_line}")
-                else:
-                    print(f"    [{arm_name}] {arm_metrics}")
+            if isinstance(arms, dict):
+                for arm_name, arm_metrics in arms.items():
+                    if isinstance(arm_metrics, dict):
+                        label = arm_metrics.get("label")
+                        note = arm_metrics.get("note")
+                        log = arm_metrics.get("log")
+                        scalar_metrics = {k: v for k, v in arm_metrics.items() if k not in ("label", "note", "log")}
+                        print(f"    [{arm_name}]", end="")
+                        if scalar_metrics:
+                            print(f" {scalar_metrics}", end="")
+                        print()
+                        if label:
+                            print(f"      label: {label}")
+                        if note:
+                            print(f"      note: {note}")
+                        if log:
+                            print("      log:")
+                            for log_line in log.split("\n"):
+                                print(f"        {log_line}")
+                    else:
+                        print(f"    [{arm_name}] {arm_metrics}")
+            elif isinstance(arms, list):
+                for i, arm_entry in enumerate(arms):
+                    if isinstance(arm_entry, dict):
+                        heading = arm_entry.get("label") or arm_entry.get("name") or arm_entry.get("arm") or f"[{i}]"
+                        label = arm_entry.get("label")
+                        note = arm_entry.get("note")
+                        log = arm_entry.get("log")
+                        scalar_metrics = {k: v for k, v in arm_entry.items() if k not in ("label", "name", "arm", "note", "log")}
+                        print(f"    [{heading}]", end="")
+                        if scalar_metrics:
+                            print(f" {scalar_metrics}", end="")
+                        print()
+                        if label:
+                            print(f"      label: {label}")
+                        if note:
+                            print(f"      note: {note}")
+                        if log:
+                            print("      log:")
+                            for log_line in log.split("\n"):
+                                print(f"        {log_line}")
+                    else:
+                        print(f"    [{i}] {arm_entry}")
     verdict = j.get("criterion_verdict")
     if isinstance(verdict, dict):
         met = verdict.get("met")

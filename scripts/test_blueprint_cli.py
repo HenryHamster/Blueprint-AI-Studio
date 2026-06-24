@@ -775,6 +775,17 @@ def mock_api(monkeypatch):
                  "final_cost_usd": 3.0,
                  "criterion_verdict": {"met": True, "metric": "score", "operator": "gt", "threshold": 0.5, "value": 0.9, "measurable": True},
                  "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.5}},
+                {"id": "cjob-ddd0-0000-0000-000000000004",
+                 "status": "SUCCEEDED", "task_title": "List-arms job",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 7.5,
+                 "experiment": "exp-list-arms",
+                 "criterion_verdict": {"met": True, "metric": "score", "operator": "gt", "threshold": 0.7, "value": 0.88, "measurable": True},
+                 "polling_metadata": {"result_metrics": {"score": 0.88, "arms": [
+                     {"label": "variant-a", "note": "first variant", "log": "variant-a run log\nall checks passed", "score": 0.82},
+                     {"label": "variant-b", "note": "second variant", "log": "variant-b run log\nperformance improved", "score": 0.88},
+                 ]}},
+                 "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.7}},
             ]
             job = next((j for j in _ALL_MOCK_JOBS if j["id"] == job_id), None)
             if job is None:
@@ -787,6 +798,8 @@ def mock_api(monkeypatch):
                      "status": "RUNNING", "task_title": "GPU benchmark alpha",
                      "task_type": "compute_experiment",
                      "final_cost_usd": None,
+                     "started_at": "2020-01-01T00:00:00Z",
+                     "accrued_cost_usd": 5.0,
                      "experiment": "exp-alpha",
                      "benchmark": "bench-1",
                      "hypothesis": "GPU is faster",
@@ -3412,3 +3425,49 @@ def test_compute_show_resolves_job_beyond_200_cap(mock_api, capsys):
     # Verify the detail endpoint was called (not just the list)
     detail_calls = [p for m, p, _ in mock_api if m == "GET" and f"/compute-jobs/{job_id}" in p]
     assert detail_calls, "Expected GET /api/admin/compute-jobs/{id} to be called"
+
+
+def test_compute_list_burn_rate_column(mock_api, capsys):
+    """compute list shows a burn-rate column for an active job with accrued cost and sufficient elapsed time."""
+    rc = blueprint.main(["compute", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The RUNNING job has started_at=2020-01-01 and accrued_cost_usd=5.0, so burn rate is non-None
+    assert "burn=$" in out
+    assert "/hr" in out
+
+
+def test_compute_list_status_filter_footer_reconciled(mock_api, capsys):
+    """compute list --status footer counts reflect only the filtered rows, not the server summary."""
+    rc = blueprint.main(["compute", "list", "--status", "RUNNING"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Only the RUNNING job is shown
+    assert "GPU benchmark alpha" in out
+    assert "GPU benchmark beta" not in out
+    # Footer reflects the 1 filtered job (RUNNING, no cost, no verdict)
+    assert "1 jobs" in out
+    assert "1 active" in out
+    assert "$0.00 total spend" in out
+    assert "0/0 criteria met" in out
+    # Misleading 'more jobs available' hint suppressed for filtered view
+    assert "more jobs available" not in out
+
+
+def test_compute_show_list_shaped_arms(mock_api, capsys):
+    """compute show renders list-shaped per-arm result_metrics with label, note, and log fields."""
+    job_id = "cjob-ddd0-0000-0000-000000000004"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "per-arm results" in out
+    # Both entries should appear under their labels
+    assert "[variant-a]" in out
+    assert "[variant-b]" in out
+    # label/note/log fields rendered for each entry
+    assert "label: variant-a" in out
+    assert "label: variant-b" in out
+    assert "first variant" in out
+    assert "second variant" in out
+    assert "variant-a run log" in out
+    assert "variant-b run log" in out
