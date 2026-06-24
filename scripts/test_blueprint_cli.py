@@ -683,26 +683,38 @@ def mock_api(monkeypatch):
                 "source_kind": "web_research",
                 "direction_id": "d-abc12345",
                 "created_at": "2026-06-15T00:00:00Z",
+                "topic": "testing",
+                "tags": ["coverage", "reliability"],
+                "summary": "Key findings on test coverage practices.",
                 "body": "## Findings\n\nTest coverage is important for reliability.",
+                "source_citations": [
+                    {"ref": "RFC-001", "url": "https://example.com/rfc-001", "title": "Test coverage guide"},
+                    "https://example.com/plain-url",
+                ],
             }
         if "/knowledge-documents" in path and method == "GET":
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(path).query)
             docs = [
                 {"id": "kdoc-001", "title": "API Rate Limiting", "source_kind": "web_research",
-                 "direction_id": "d-abc12345", "created_at": "2026-06-15T00:00:00Z"},
+                 "direction_id": "d-abc12345", "created_at": "2026-06-15T00:00:00Z",
+                 "topic": "api", "tags": ["rate-limiting", "resilience"]},
                 {"id": "kdoc-002", "title": "Design Patterns", "source_kind": "design",
-                 "direction_id": "d-def67890", "created_at": "2026-06-14T00:00:00Z"},
+                 "direction_id": "d-def67890", "created_at": "2026-06-14T00:00:00Z",
+                 "topic": "architecture", "tags": []},
             ]
             direction_f = qs.get("direction", [None])[0]
             source_kind_f = qs.get("source_kind", [None])[0]
             q_f = qs.get("q", [None])[0]
+            tag_f = qs.get("tag", [None])[0]
             if direction_f:
                 docs = [d for d in docs if d.get("direction_id") == direction_f]
             if source_kind_f:
                 docs = [d for d in docs if d.get("source_kind") == source_kind_f]
             if q_f:
                 docs = [d for d in docs if q_f.lower() in (d.get("title") or "").lower()]
+            if tag_f:
+                docs = [d for d in docs if tag_f in (d.get("tags") or [])]
             return {"documents": docs, "total": len(docs)}
         if "/compute-jobs/" in path and "/kill" in path and method == "POST":
             job_id = path.split("/compute-jobs/")[1].split("/")[0]
@@ -2983,6 +2995,86 @@ def test_compute_show_renders_result_and_tolerates_missing_fields(mock_api, caps
 def test_compute_show_registers_in_help_invocations():
     """'compute show' is in HELP_INVOCATIONS so --help parsing is verified."""
     assert ["compute", "show"] in HELP_INVOCATIONS
+
+
+# ── knowledge subcommand tests ────────────────────────────────────────────────
+
+def test_knowledge_list_includes_topic_and_tags(mock_api, capsys):
+    """knowledge list output includes topic and tags when present on a document."""
+    rc = blueprint.main(["knowledge", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "KNOWLEDGE LIBRARY" in out
+    # kdoc-001 has topic=api and tags=[rate-limiting, resilience]
+    assert "topic=api" in out
+    assert "#rate-limiting" in out
+    assert "#resilience" in out
+    # kdoc-002 has topic=architecture and empty tags
+    assert "topic=architecture" in out
+
+
+def test_knowledge_list_tag_filter_passed_to_api(mock_api, capsys):
+    """knowledge list --tag passes the tag param to the API request path."""
+    rc = blueprint.main(["knowledge", "list", "--tag", "rate-limiting"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Only kdoc-001 has the rate-limiting tag
+    assert "API Rate Limiting" in out
+    assert "Design Patterns" not in out
+    # The tag filter must appear in the API call path
+    assert any("tag=rate-limiting" in path for _, path, _ in mock_api)
+
+
+def test_knowledge_show_includes_metadata(mock_api, capsys):
+    """knowledge show renders summary, topic, tags, and source_citations."""
+    rc = blueprint.main(["knowledge", "show", "kdoc-001"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "KNOWLEDGE:" in out
+    assert "Topic:" in out
+    assert "testing" in out
+    assert "Tags:" in out
+    assert "#coverage" in out
+    assert "#reliability" in out
+    assert "Summary:" in out
+    assert "Key findings on test coverage" in out
+    assert "Citations:" in out
+    assert "RFC-001" in out
+    assert "https://example.com/plain-url" in out
+
+
+def test_knowledge_show_resolves_id_prefix(mock_api, capsys):
+    """knowledge show resolves an 8-char prefix from the list to the full document."""
+    # "kdoc-001" is 8 chars, well under the 36-char UUID threshold
+    rc = blueprint.main(["knowledge", "show", "kdoc-001"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The detail endpoint was reached and body is rendered
+    assert "KNOWLEDGE:" in out
+    assert "Research on test coverage" in out
+    assert "## Findings" in out
+    # The list endpoint must have been called to resolve the prefix
+    list_calls = [p for _, p, _ in mock_api if "/knowledge-documents" in p and "limit=200" in p]
+    assert list_calls, "Expected a list call with limit=200 for prefix resolution"
+    # The detail endpoint must have been called with the resolved full id
+    detail_calls = [p for _, p, _ in mock_api if "/knowledge-documents/kdoc-001" in p]
+    assert detail_calls, "Expected a detail GET call for /knowledge-documents/kdoc-001"
+
+
+def test_knowledge_show_prefix_no_match_prints_error(monkeypatch, capsys):
+    """knowledge show with an unmatched prefix prints a clear error and returns 0."""
+    def fake_api(method, path, body=None, timeout=30):
+        if "/knowledge-documents" in path and method == "GET":
+            return {"documents": [], "total": 0}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["knowledge", "show", "no-match"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "no-match" in err
 
 
 def test_compute_kill_aborts_without_yes(mock_api, monkeypatch, capsys):

@@ -3262,6 +3262,9 @@ def _knowledge_list(args: argparse.Namespace) -> None:
     if getattr(args, "topic", None):
         from urllib.parse import quote
         path += f"&topic={quote(args.topic)}"
+    if getattr(args, "tag", None):
+        from urllib.parse import quote
+        path += f"&tag={quote(args.tag)}"
     resp = api("GET", path)
     docs = resp.get("documents", resp) if isinstance(resp, dict) else resp
     total = resp.get("total") if isinstance(resp, dict) else None
@@ -3282,13 +3285,26 @@ def _render_knowledge_list(data: dict) -> None:
         title = (d.get("title") or "")[:60]
         direction = (d.get("direction_id") or "")[:12]
         created = (d.get("created_at") or "")[:10]
+        topic = d.get("topic") or ""
+        tags = d.get("tags") or []
         dir_str = f"  dir={direction}" if direction else ""
-        print(f"  {did}  [{kind:12}] {created}  {title}{dir_str}")
+        topic_str = f"  topic={topic}" if topic else ""
+        tag_str = "  " + " ".join(f"#{t}" for t in tags[:2]) if tags else ""
+        print(f"  {did}  [{kind:12}] {created}  {title}{dir_str}{topic_str}{tag_str}")
 
 
 def _knowledge_show(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
-    doc = api("GET", f"/api/admin/projects/{pid}/knowledge-documents/{args.doc_id}")
+    doc_id = args.doc_id
+    if len(doc_id) < 36:
+        resp = api("GET", f"/api/admin/projects/{pid}/knowledge-documents?limit=200")
+        docs = resp.get("documents", resp) if isinstance(resp, dict) else resp
+        match = next((d for d in (docs or []) if (d.get("id") or "").startswith(doc_id)), None)
+        if match is None:
+            print(f"No knowledge document found matching '{doc_id}'.", file=sys.stderr)
+            return
+        doc_id = match["id"]
+    doc = api("GET", f"/api/admin/projects/{pid}/knowledge-documents/{doc_id}")
     _emit(args, doc, _render_knowledge_doc)
 
 
@@ -3302,9 +3318,29 @@ def _render_knowledge_doc(doc: dict) -> None:
     direction = doc.get("direction_id")
     if direction:
         print(f"  Direction:   {direction}")
+    topic = doc.get("topic")
+    if topic:
+        print(f"  Topic:       {topic}")
+    tags = doc.get("tags") or []
+    if tags:
+        print(f"  Tags:        {' '.join(f'#{t}' for t in tags)}")
+    summary = doc.get("summary")
+    if summary:
+        print("\n  Summary:")
+        for line in summary.splitlines():
+            print(f"    {line}")
     body = doc.get("body") or doc.get("content") or ""
     if body:
         print(f"\n{body}")
+    citations = doc.get("source_citations") or []
+    if citations:
+        print("\n  Citations:")
+        for i, c in enumerate(citations, 1):
+            if isinstance(c, dict):
+                ref = c.get("ref") or c.get("url") or c.get("title") or str(c)
+            else:
+                ref = str(c)
+            print(f"    {i}. {ref}")
 
 
 # ── compute ───────────────────────────────────────────────────────────────────
@@ -4010,6 +4046,7 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Filter by source kind (e.g. web_research, design).")
     p_kl.add_argument("--q", help="Full-text search query.")
     p_kl.add_argument("--topic", help="Filter by topic.")
+    p_kl.add_argument("--tag", help="Filter by tag (exact match).")
     p_kl.add_argument("--limit", type=int, default=20,
                       help="Max documents to return (default 20).")
     p_ks = knowledge_sub.add_parser("show", parents=[common],
