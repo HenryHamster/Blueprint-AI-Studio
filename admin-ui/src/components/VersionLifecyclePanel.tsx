@@ -338,7 +338,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
       {refreshError && (
         <VersionLifecycleRefreshBanner kind="stale" message={refreshError} lastSuccessfulRefreshAt={lastSuccessfulRefreshAt} refreshing={refreshing} canRetry={!!projectId} onRefresh={onRefresh} />
       )}
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-xs">
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-ui-sm">
         <div className="flex flex-wrap items-center gap-2">
           {data.promotion_enabled !== undefined && (
             <>
@@ -422,7 +422,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
           <div className="space-y-1">
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-bold text-neutral-200">v{cv.version_number}</span>
-              <span className={`text-xs font-semibold px-1.5 py-0.5 rounded border ${cv.phase === 'stabilize' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-400'}`}>{cv.phase}</span>
+              <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${cv.phase === 'stabilize' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-400'}`}>{cv.phase}</span>
               {cv.phase_changed_at && <span className="text-ui-sm text-neutral-500">{timeAgo(cv.phase_changed_at)}</span>}
               <span className="text-ui-sm text-neutral-500">{cv.merged_task_count} tasks merged</span>
               {cv.qualification_attempts > 0 && <span className="text-ui-sm text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
@@ -540,7 +540,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
             {cv.qualification_state && (
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className={`text-xs font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700'}`}>
+                  <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700'}`}>
                     {cv.qualification_state.state.replace(/_/g, ' ')}
                   </span>
                   <ServingStatusBadge
@@ -674,7 +674,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               <div>
                 <button
                   onClick={() => setChangelogExpanded(v => !v)}
-                  className="flex items-center gap-1.5 text-xs text-neutral-400 hover:text-neutral-200 transition-colors py-0.5"
+                  className="flex items-center gap-1.5 text-ui-sm text-neutral-400 hover:text-neutral-200 transition-colors py-0.5"
                   data-testid="changelog-toggle"
                   data-viewport-allow-small-target
                 >
@@ -809,7 +809,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         )}
         {verdicts.length > 0 && (
           <div data-testid="verdict-history">
-            <p className="text-xs text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
+            <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
             <ConfidenceSparkline verdicts={verdicts.slice(0, 8)} />
             <div className="space-y-1">
               {verdicts.slice(0, 8).map(v => (
@@ -835,7 +835,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         )}
         {recent.length > 0 && (
           <div>
-            <p className="text-xs text-neutral-500 uppercase tracking-wide mb-1">History</p>
+            <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">History</p>
             <div className="space-y-1">
               {recent.slice(0, 4).map((v: RecentVersion) => {
                 const isExpanded = !!v.id && expandedVersionId === v.id;

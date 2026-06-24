@@ -601,11 +601,21 @@ DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD = int(
     os.getenv("DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD", "3")
 )
 
-# How long the worker may go without a progress heartbeat before /health
-# reports it as wedged (→ Cloud Run liveness restart). Must comfortably exceed
-# the longest single awaited step in a cycle (a CI GitHub call + its retries,
-# the 30s session-acquire timeout, etc.) so a slow-but-progressing worker is
-# never killed — only a truly hung one. Env-overridable for ops tuning.
+# Per-step heartbeat gate: how long the worker may go without a progress
+# heartbeat (_mark_orchestrator_progress) before /health reports it as wedged
+# (→ Cloud Run liveness restart). This is NOT a full-cycle timeout — a long
+# cycle with many sequential CI polls is healthy as long as each individual step
+# heartbeats within this window. Must comfortably exceed the longest single
+# awaited step (a CI GitHub call + its retries, the 30s session-acquire
+# timeout, etc.) so a slow-but-progressing worker is never killed — only a
+# truly hung one. Env-overridable for ops tuning.
+#
+# 180 s (tightened from 300 s): the reduction is a liveness tightening — a
+# genuinely stuck step is caught and abandoned ~2 min sooner. It is safe
+# because LEADER_STEP_BUDGET_SECONDS (90 s) bounds each monitoring step to
+# well under half this threshold, and the dispatch loop heartbeats once per
+# CI-poll task (also far below 180 s under normal load). REAPER_HANG_SECONDS
+# remains 300 s (the original value) so the two workers are independently tuned.
 ORCHESTRATOR_HANG_SECONDS = int(os.getenv("ORCHESTRATOR_HANG_SECONDS", "180"))
 
 

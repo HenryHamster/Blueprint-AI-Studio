@@ -61,6 +61,7 @@ from app.task_capabilities import (
     agent_capability_slice,
 )
 import app.shared_state as _shared_state
+from app.compute_experiment_contract import resolve_compute_spend_approval
 from app.storage import generate_upload_signed_url, ARTIFACT_BUCKET_NAME
 from app.artifact_prerequisites import (
     ARTIFACT_PREREQUISITES_KEY,
@@ -4988,6 +4989,20 @@ async def spawn_subtask(
                 parent_payload.get("prompt") or parent_payload.get("description") or ""
             )[:500],
         }
+        if payload.get("type") == "compute_experiment":
+            try:
+                spend_cap = float(payload.get("spend_cap_usd") or 0)
+                if spend_cap <= 0:
+                    raise ValueError("spend_cap_usd must be positive")
+                task_requires_approval, _ = resolve_compute_spend_approval(
+                    runtime_config=_shared_state.runtime_config,
+                    direction=None,
+                    spend_cap_usd=spend_cap,
+                )
+            except (TypeError, ValueError):
+                task_requires_approval = True
+        else:
+            task_requires_approval = req.requires_approval
         new_task = Task(
             project_id=parent_task.project_id,
             title=payload.get("title", f"Subtask of {parent_task.title}"),
@@ -5005,7 +5020,7 @@ async def spawn_subtask(
             # constraint chk_task_created_by (alembic 0065) only allows the
             # canonical set, of which "AGENT" is the spawn-by-running-agent member.
             created_by="AGENT",
-            requires_approval=req.requires_approval,
+            requires_approval=task_requires_approval,
             parent_task_id=parent_task.id,
             **({"priority": req.priority} if req.priority is not None else {}),
         )
