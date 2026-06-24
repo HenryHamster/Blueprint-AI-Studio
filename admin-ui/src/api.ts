@@ -2985,6 +2985,41 @@ export async function fetchComputeJobs(
   return Array.isArray(data.compute_jobs) ? data.compute_jobs : [];
 }
 
+export interface ComputeJobsPagedResponse {
+  jobs: ComputeJob[];
+  hasMore: boolean;
+}
+
+export async function fetchComputeJobsPaged(
+  projectId: string,
+  signal?: AbortSignal,
+  opts?: { allTerminal?: boolean; includeFinishedMinutes?: number; offset?: number },
+): Promise<ComputeJobsPagedResponse> {
+  const query = new URLSearchParams();
+  if (opts?.allTerminal) {
+    query.set('all_terminal', 'true');
+  } else if (typeof opts?.includeFinishedMinutes === 'number') {
+    query.set('include_finished_minutes', String(opts.includeFinishedMinutes));
+  }
+  if (typeof opts?.offset === 'number' && opts.offset > 0) {
+    query.set('offset', String(opts.offset));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs${suffix}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch compute jobs: ${res.status}`);
+  const data = await res.json();
+  return {
+    jobs: Array.isArray(data.compute_jobs) ? data.compute_jobs : [],
+    hasMore: !!data.has_more,
+  };
+}
+
 export interface BuildConfigCommandEntry {
   path: string | null;
   type: string | null;

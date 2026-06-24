@@ -3,6 +3,7 @@ import {
   previewOnboardProject,
   createComputeExperiment,
   fetchComputeJobs,
+  fetchComputeJobsPaged,
   analyzeComputeJob,
   retryProjectBootstrap,
   resolveViewportFailureDownloadUrl,
@@ -186,6 +187,38 @@ describe('fetchComputeJobs', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(String(fetchMock.mock.calls[0][0])).toContain('/api/admin/projects/proj-1/compute-jobs?include_finished_minutes=1440');
+  });
+});
+
+describe('fetchComputeJobsPaged', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('omits all_terminal when opts not provided', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ compute_jobs: [], has_more: false }), { status: 200 }),
+    );
+
+    await fetchComputeJobsPaged('proj-1');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('/api/admin/projects/proj-1/compute-jobs');
+    expect(url).not.toContain('all_terminal');
+  });
+
+  it('includes all_terminal=true when opts.allTerminal is set', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ compute_jobs: [], has_more: true }), { status: 200 }),
+    );
+
+    const result = await fetchComputeJobsPaged('proj-1', undefined, { allTerminal: true });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0][0])).toContain('all_terminal=true');
+    expect(result.hasMore).toBe(true);
+    expect(result.jobs).toEqual([]);
   });
 });
 

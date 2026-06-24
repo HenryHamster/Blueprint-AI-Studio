@@ -21,6 +21,10 @@ const resolveArtifactDownloadUrl = vi.fn();
 
 vi.mock('../api', () => ({
   fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
+  fetchComputeJobsPaged: async (...args: unknown[]) => {
+    const r = await fetchComputeJobs(...args);
+    return Array.isArray(r) ? { jobs: r, hasMore: false } : r;
+  },
   killComputeJob: (...args: unknown[]) => killComputeJob(...args),
   analyzeComputeJob: (...args: unknown[]) => analyzeComputeJob(...args),
   fetchKnowledgeDocument: (...args: unknown[]) => fetchKnowledgeDocument(...args),
@@ -1211,7 +1215,7 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(selector.textContent).toContain('3d');
     expect(selector.textContent).toContain('7d');
     // Initially fetched with default (no window arg or default 360)
-    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), 360);
+    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), { includeFinishedMinutes: 360 });
   });
 
   test('clicking 7d window selector triggers refetch with 10080 minutes', async () => {
@@ -1221,7 +1225,7 @@ describe('ComputeJobsPanel render + kill', () => {
     const btn7d = await findByTestId('compute-window-7d');
     await act(async () => { btn7d.click(); });
     await waitFor(() =>
-      expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), 10080),
+      expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), { includeFinishedMinutes: 10080 }),
     );
   });
 
@@ -1478,6 +1482,57 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(armsSection.textContent).toContain('experimental');
     expect(armsSection.textContent).toContain('auc:');
     expect(armsSection.textContent).toContain('0.85');
+  });
+
+  test('clicking All window button calls fetchComputeJobsPaged with allTerminal=true and clears window highlight', async () => {
+    fetchComputeJobs.mockResolvedValue([]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const allBtn = await findByTestId('compute-window-all');
+    await act(async () => { allBtn.click(); });
+    await waitFor(() =>
+      expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), { allTerminal: true, offset: 0 }),
+    );
+    // The All button should now be active (highlighted)
+    expect(allBtn.className).toContain('bg-neutral-700');
+    // The 6h button should not be active
+    const btn6h = await findByTestId('compute-window-6h');
+    expect(btn6h.className).not.toContain('bg-neutral-700');
+  });
+
+  test('Load more button appears when hasMore is true and clicking appends jobs', async () => {
+    const job1 = makeJob({ id: 'job-1', task_title: 'Job One' });
+    const job2 = makeJob({ id: 'job-2', task_title: 'Job Two', status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs
+      .mockResolvedValueOnce([])  // initial render (window mode)
+      .mockResolvedValueOnce({ jobs: [job1], hasMore: true })  // after clicking All
+      .mockResolvedValueOnce({ jobs: [job2], hasMore: false });  // after Load more
+    const { findByTestId, findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const allBtn = await findByTestId('compute-window-all');
+    await act(async () => { allBtn.click(); });
+    const loadMoreBtn = await findByTestId('compute-load-more');
+    expect(loadMoreBtn).toBeTruthy();
+    await act(async () => { loadMoreBtn.click(); });
+    await waitFor(() => expect(queryByTestId('compute-load-more')).toBeNull());
+    expect(await findByText('Job One')).toBeTruthy();
+    expect(await findByText('Job Two')).toBeTruthy();
+  });
+
+  test('Load more in window mode passes offset so second page is appended without duplicates', async () => {
+    const job1 = makeJob({ id: 'win-job-1', task_title: 'Window Job One' });
+    const job2 = makeJob({ id: 'win-job-2', task_title: 'Window Job Two', status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs
+      .mockResolvedValueOnce({ jobs: [job1], hasMore: true })  // initial window-mode load
+      .mockResolvedValueOnce({ jobs: [job2], hasMore: false }); // Load more with offset=1
+    const { findByTestId, findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const loadMoreBtn = await findByTestId('compute-load-more');
+    expect(loadMoreBtn).toBeTruthy();
+    await act(async () => { loadMoreBtn.click(); });
+    await waitFor(() => expect(queryByTestId('compute-load-more')).toBeNull());
+    // Both jobs must be visible (not duplicated)
+    expect(await findByText('Window Job One')).toBeTruthy();
+    expect(await findByText('Window Job Two')).toBeTruthy();
+    // Second call must include offset=1 to avoid page 0 duplication
+    expect(fetchComputeJobs).toHaveBeenNthCalledWith(2, 'proj-1', expect.anything(), { includeFinishedMinutes: 360, offset: 1 });
   });
 
   test('job with external_compute_id shows it in the machine info subtitle', async () => {

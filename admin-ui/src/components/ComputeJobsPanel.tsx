@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobs, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, fetchComputeJobsPaged, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -363,6 +363,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [finishedWindowMinutes, setFinishedWindowMinutes] = useState(360);
+  const [allTerminal, setAllTerminal] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
   const [killingId, setKillingId] = useState<string | null>(null);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
@@ -380,11 +382,23 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   }, []);
 
   const load = useCallback(
-    async (signal?: AbortSignal) => {
+    async (signal?: AbortSignal, appendOffset?: number) => {
       if (!projectId) return;
       try {
-        const next = await fetchComputeJobs(projectId, signal, finishedWindowMinutes);
-        setJobs(next);
+        const currentOffset = appendOffset ?? 0;
+        const result = await fetchComputeJobsPaged(
+          projectId,
+          signal,
+          allTerminal
+            ? { allTerminal: true, offset: currentOffset }
+            : { includeFinishedMinutes: finishedWindowMinutes, offset: currentOffset },
+        );
+        if (currentOffset > 0) {
+          setJobs((prev) => [...prev, ...result.jobs]);
+        } else {
+          setJobs(result.jobs);
+        }
+        setHasMore(result.hasMore);
         setError(null);
       } catch (e) {
         if (e instanceof Error && e.name === 'AbortError') return;
@@ -393,13 +407,17 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         setLoaded(true);
       }
     },
-    [projectId, finishedWindowMinutes],
+    [projectId, finishedWindowMinutes, allTerminal],
   );
 
+  const handleLoadMore = useCallback(async () => {
+    await load(undefined, jobs.length);
+  }, [load, jobs.length]);
+
   usePoller((signal) => load(signal), {
-    intervalMs: POLL_INTERVAL_MS,
+    intervalMs: allTerminal ? 300_000 : POLL_INTERVAL_MS,
     enabled: !!projectId,
-    deps: [projectId, finishedWindowMinutes],
+    deps: [projectId, finishedWindowMinutes, allTerminal],
   });
 
   // Auto-fetch durable knowledge docs for terminal jobs that have a knowledge_document_id.
@@ -510,13 +528,21 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
             <button
               key={minutes}
               type="button"
-              onClick={() => setFinishedWindowMinutes(minutes)}
-              className={`min-h-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${finishedWindowMinutes === minutes ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+              onClick={() => { setAllTerminal(false); setFinishedWindowMinutes(minutes); setHasMore(false); }}
+              className={`min-h-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${!allTerminal && finishedWindowMinutes === minutes ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
               data-testid={`compute-window-${label}`}
             >
               {label}
             </button>
           ))}
+          <button
+            type="button"
+            onClick={() => { setAllTerminal(true); setHasMore(false); }}
+            className={`min-h-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${allTerminal ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+            data-testid="compute-window-all"
+          >
+            All
+          </button>
         </div>
       </div>
 
@@ -1160,6 +1186,19 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           );
         })}
       </div>
+
+      {hasMore && (
+        <div className="mt-2 flex justify-center">
+          <button
+            type="button"
+            onClick={() => void handleLoadMore()}
+            className="min-h-[44px] rounded bg-neutral-800 px-4 text-ui-sm font-semibold text-neutral-300 hover:bg-neutral-700 transition-colors"
+            data-testid="compute-load-more"
+          >
+            Load more
+          </button>
+        </div>
+      )}
     </div>
   );
 }

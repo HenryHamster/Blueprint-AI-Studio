@@ -1011,24 +1011,29 @@ async def list_compute_jobs(
     include_finished_within: timedelta = timedelta(hours=6),
     limit: int = 50,
     offset: int = 0,
+    all_terminal: bool = False,
 ) -> tuple[list[ComputeJob], bool]:
     """Return a project's active compute jobs plus recently-finished ones.
 
-    Active jobs are always included; terminal jobs are included only when they
-    completed within ``include_finished_within``. Ordered newest-first so the
-    live operator view leads with the most recent launches.
+    Active jobs are always included. When ``all_terminal=True``, ALL terminal
+    jobs are included regardless of age (``include_finished_within`` is ignored
+    for the terminal filter). Otherwise only terminal jobs completed within
+    ``include_finished_within`` are returned. Ordered newest-first.
     """
-    cutoff = _utcnow() - include_finished_within
+    if all_terminal:
+        terminal_filter = ComputeJob.completed_at.is_not(None)
+    else:
+        cutoff = _utcnow() - include_finished_within
+        terminal_filter = ComputeJob.completed_at.is_not(None) & (
+            ComputeJob.completed_at >= cutoff
+        )
     result = await session.execute(
         select(ComputeJob)
         .where(
             ComputeJob.project_id == project_id,
             (
                 ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)
-                | (
-                    ComputeJob.completed_at.is_not(None)
-                    & (ComputeJob.completed_at >= cutoff)
-                )
+                | terminal_filter
             ),
         )
         .order_by(ComputeJob.created_at.desc(), ComputeJob.id.desc())

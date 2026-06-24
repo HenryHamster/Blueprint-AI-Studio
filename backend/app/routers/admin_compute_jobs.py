@@ -217,10 +217,16 @@ async def get_project_compute_jobs(
     include_finished_minutes: int = Query(360, ge=0, le=10080),
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    all_terminal: bool = Query(False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """List a project's active and recently-finished compute jobs (viewer+)."""
+    """List a project's active and recently-finished compute jobs (viewer+).
+
+    When ``all_terminal=true``, all terminal jobs are returned regardless of
+    age — ``include_finished_minutes`` is accepted but ignored for the terminal
+    filter, allowing deep-history browsing of past experiments.
+    """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
@@ -230,6 +236,7 @@ async def get_project_compute_jobs(
         include_finished_within=timedelta(minutes=include_finished_minutes),
         limit=limit,
         offset=offset,
+        all_terminal=all_terminal,
     )
     built_payload = await _build_compute_job_payload(session, jobs)
     return {

@@ -3399,10 +3399,14 @@ def cmd_compute(args: argparse.Namespace) -> None:
 
 def _compute_list(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
-    finished = getattr(args, "include_finished", 360)
     limit = getattr(args, "limit", 20)
-    resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
-               f"?include_finished_minutes={finished}&limit={limit}")
+    if getattr(args, "all_terminal", False):
+        resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
+                   f"?all_terminal=true&limit={limit}")
+    else:
+        finished = getattr(args, "include_finished", 360)
+        resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
+                   f"?include_finished_minutes={finished}&limit={limit}")
     jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
     has_more = resp.get("has_more", False) if isinstance(resp, dict) else False
     _emit(args, {"compute_jobs": jobs, "has_more": has_more}, _render_compute_list)
@@ -3430,7 +3434,7 @@ def _render_compute_list(data: dict) -> None:
         burn_str = f"  burn=${burn:.2f}/hr" if burn is not None else ""
         print(f"  {jid}  {status:12} [{task_type}]  {title}{cost_str}{verdict_str}{exp_str}{burn_str}")
     if data.get("has_more"):
-        print("  (more jobs available; increase --limit or --include-finished)")
+        print("  (more jobs available; increase --limit, --include-finished, or use --all-terminal)")
 
 
 def _compute_kill(args: argparse.Namespace) -> None:
@@ -3447,7 +3451,7 @@ def _compute_kill(args: argparse.Namespace) -> None:
 def _compute_show(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
     job_id = args.job_id
-    resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs?include_finished_minutes=10080&limit=200")
+    resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs?all_terminal=true&limit=200")
     jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
     job = next((j for j in jobs if j.get("id", "").startswith(job_id) or j.get("id") == job_id), None)
     if job is None:
@@ -4084,11 +4088,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_compute_list.add_argument(
         "--include-finished", dest="include_finished", type=int, default=360,
         help="Include jobs that finished within this many minutes (default 360).")
+    p_compute_list.add_argument(
+        "--all-terminal", dest="all_terminal", action="store_true",
+        help="List all terminal jobs regardless of age (bypasses the 7-day window limit).")
     p_compute_list.add_argument("--limit", type=int, default=20,
                                 help="Max jobs to return (default 20).")
     p_compute_show = compute_sub.add_parser(
         "show", parents=[common],
-        help="Show full details for one compute job (metrics, verdict, knowledge doc).")
+        help="Show full details for one compute job (metrics, verdict, knowledge doc). "
+             "Searches all history regardless of age.")
     p_compute_show.add_argument("job_id", help="Compute job id prefix or full UUID.")
     p_compute_kill = compute_sub.add_parser(
         "kill", parents=[common],

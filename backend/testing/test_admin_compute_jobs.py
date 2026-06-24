@@ -7,7 +7,7 @@ test seeds the role it exercises.
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -668,6 +668,43 @@ async def test_list_compute_jobs_criterion_verdict_recovered_from_stdout(
     assert verdict["met"] is True
     assert verdict["value"] == pytest.approx(0.88)
     assert verdict["measurable"] is True
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_all_terminal_returns_old_jobs(
+    client: AsyncClient, db_session
+):
+    """Terminal jobs older than the default 7-day window must be excluded by
+    default but returned when ?all_terminal=true is passed.
+
+    Creates a job with completed_at 30 days ago (well outside the 7-day cap),
+    confirms the default endpoint excludes it, then confirms ?all_terminal=true
+    surfaces it alongside any active jobs.
+    """
+    project = await _make_project(db_session, name="Old Jobs Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Seed a terminal job completed 30 days ago — beyond any allowed window.
+    _task, old_job, _artifact = await _make_job(
+        db_session, project, status=ComputeJobStatus.SUCCEEDED
+    )
+    old_job.completed_at = datetime.now(tz=timezone.utc) - timedelta(days=30)
+    db_session.add(old_job)
+    await db_session.commit()
+
+    # Default (time-windowed) request must NOT include the old job.
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    ids = [j["id"] for j in resp.json()["compute_jobs"]]
+    assert str(old_job.id) not in ids, "old terminal job must be excluded by default"
+
+    # ?all_terminal=true must include the old job.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs?all_terminal=true"
+    )
+    assert resp.status_code == 200
+    ids = [j["id"] for j in resp.json()["compute_jobs"]]
+    assert str(old_job.id) in ids, "old terminal job must appear with all_terminal=true"
 
 
 # ---------------------------------------------------------------------------
