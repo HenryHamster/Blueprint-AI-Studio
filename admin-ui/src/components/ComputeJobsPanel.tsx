@@ -60,6 +60,16 @@ function jobMetricValue(job: ComputeJob, key: string, criterionMetric: string | 
   if (key === '__runtime__') return computeJobRuntimeSec(job);
   if (key === criterionMetric && job.criterion_verdict?.value != null) return job.criterion_verdict.value;
   const rm = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
+  if (key.startsWith('arms.')) {
+    const dot = key.indexOf('.', 5);
+    if (dot === -1) return null;
+    const arms = rm?.['arms'];
+    if (!arms || typeof arms !== 'object' || Array.isArray(arms)) return null;
+    const armData = (arms as Record<string, unknown>)[key.slice(5, dot)];
+    if (!armData || typeof armData !== 'object' || Array.isArray(armData)) return null;
+    const v = (armData as Record<string, unknown>)[key.slice(dot + 1)];
+    return typeof v === 'number' ? v : null;
+  }
   const v = rm?.[key];
   return typeof v === 'number' ? v : null;
 }
@@ -67,6 +77,10 @@ function jobMetricValue(job: ComputeJob, key: string, criterionMetric: string | 
 function formatMetricLabel(key: string): string {
   if (key === '__cost__') return 'Cost';
   if (key === '__runtime__') return 'Runtime';
+  if (key.startsWith('arms.')) {
+    const dot = key.indexOf('.', 5);
+    if (dot !== -1) return `${key.slice(5, dot)} / ${key.slice(dot + 1)}`;
+  }
   return key;
 }
 

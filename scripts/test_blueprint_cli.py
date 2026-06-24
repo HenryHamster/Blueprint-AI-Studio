@@ -3001,6 +3001,23 @@ def test_compute_show_renders_result_and_tolerates_missing_fields(mock_api, caps
     assert "GPU benchmark alpha" in out3
 
 
+def test_compute_show_renders_criterion_and_arms(mock_api, capsys):
+    """compute show renders full criterion verdict (expression, value, margin) and per-arm breakdown."""
+    job_id = "cjob-bbb0-0000-0000-000000000002"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Criterion must show the expression, measured value, and margin
+    assert "latency_ms lt 100" in out
+    assert "got 80.0" in out
+    assert "margin=" in out
+    # Per-arm breakdown must print both arms
+    assert "[arm_a]" in out
+    assert "[arm_b]" in out
+    # Scalar metrics also appear (latency_ms=80.0 in scalars dict)
+    assert "latency_ms" in out
+
+
 def test_compute_show_registers_in_help_invocations():
     """'compute show' is in HELP_INVOCATIONS so --help parsing is verified."""
     assert ["compute", "show"] in HELP_INVOCATIONS
