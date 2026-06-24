@@ -11,7 +11,6 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
-
 import pytest
 
 import blueprint

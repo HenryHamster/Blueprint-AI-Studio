@@ -3459,7 +3459,8 @@ def _compute_show(args: argparse.Namespace) -> None:
 def _render_compute_show(data: dict) -> None:
     j = data.get("compute_job") or {}
     print(f"=== COMPUTE JOB: {j.get('id', '?')} ===")
-    print(f"  status    : {j.get('status', '?')}")
+    status = j.get("status", "?")
+    print(f"  status    : {status}")
     print(f"  title     : {j.get('task_title') or j.get('title') or '—'}")
     print(f"  type      : {j.get('task_type', '?')}")
     experiment = j.get("experiment")
