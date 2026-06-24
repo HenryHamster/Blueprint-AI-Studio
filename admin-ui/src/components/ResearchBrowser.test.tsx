@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ResearchBrowser } from './ResearchBrowser';
 import type { Task, ResearchFinding } from '../types/task';
@@ -619,15 +619,18 @@ describe('ResearchBrowser quality card interactivity', () => {
     expect(screen.getByText('High finding')).toBeInTheDocument();
     expect(screen.getByText('Low finding')).toBeInTheDocument();
 
-    // Click the HIGH grade filter button
-    await user.click(screen.getByRole('button', { name: /HIGH/ }));
+    // Click the HIGH grade-filter chip. Both the filter chip ("1 HIGH (50%)")
+    // and the finding row ("HIGH High finding") expose "HIGH" in their
+    // accessible name, so scope by the chip's distribution-percentage text.
+    const highFilterChip = () => screen.getByRole('button', { name: /HIGH \(\d+%\)/ });
+    await user.click(highFilterChip());
 
     // Only HIGH finding visible; LOW hidden
     expect(screen.getByText('High finding')).toBeInTheDocument();
     expect(screen.queryByText('Low finding')).not.toBeInTheDocument();
 
     // Clicking again clears the filter
-    await user.click(screen.getByRole('button', { name: /HIGH/ }));
+    await user.click(highFilterChip());
     expect(screen.getByText('Low finding')).toBeInTheDocument();
   });
 
@@ -655,8 +658,11 @@ describe('ResearchBrowser quality card interactivity', () => {
     // Description not visible yet
     expect(screen.queryByText('important detail here')).not.toBeInTheDocument();
 
-    // Click the finding row in the quality card
-    await user.click(screen.getByRole('button', { name: /Actionable finding/ }));
+    // Click the finding row in the quality card. The same title also renders as
+    // a row in the main findings list, so scope the query to the quality card
+    // (the container holding the "Research quality" header) to target the right one.
+    const qualityCard = screen.getByText('Research quality').closest('div') as HTMLElement;
+    await user.click(within(qualityCard).getByRole('button', { name: /Actionable finding/ }));
 
     // Finding detail (description) is now expanded
     await waitFor(() => expect(screen.getByText('important detail here')).toBeInTheDocument());

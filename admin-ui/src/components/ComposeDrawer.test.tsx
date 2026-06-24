@@ -76,10 +76,14 @@ describe('ComposeDrawer', () => {
       return calls.some(([, arming]) => arming === 'steering');
     });
 
-    // Open the type dropdown and pick a different type
-    const dropdownButton = screen.getByRole('button', { name: /FEEDBACK/i });
+    // Open the type dropdown and pick a different type. The type-selector
+    // renders title-case labels ("Feedback"/"Note"), whereas the Recent-message
+    // rows render the raw uppercase message_type ("FEEDBACK"/"NOTE") as part of
+    // a longer name — so match the dropdown's exact label to avoid the Recent
+    // rows that also surface those types.
+    const dropdownButton = screen.getByRole('button', { name: 'Feedback' });
     fireEvent.click(dropdownButton);
-    const noteOption = await screen.findByRole('button', { name: /NOTE/i });
+    const noteOption = await screen.findByRole('button', { name: 'Note' });
     fireEvent.click(noteOption);
 
     await waitFor(() => {
