@@ -1744,7 +1744,7 @@ def _qualification_infra_usd(versions: list[Any]) -> float | None:
 
 
 def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | None:
-    """Panel review gate effectiveness: overturn, confirmation, and revision counts.
+    """Panel review gate effectiveness: overturn, confirmation, revision, and fail-open counts.
 
     Reads ``context["review_second_opinion"]`` from every terminal task in the
     window and buckets each record by its reconciliation state:
@@ -1753,10 +1753,18 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
       * ``challenged_rejected``   — panel overturns the verdict direction (the ROI signal).
 
     The plain ``unchallenged`` state (gate off or primary was not an APPROVE) is
-    excluded because it does not represent a gate invocation.  However, records
-    where ``unchallenged`` is combined with ``escalated=True`` capture a distinct
-    failure class — the challenger task itself failed or returned an unparseable
-    verdict — and are counted separately as ``challenged_escalated`` (fail-opens).
+    excluded because it does not represent a gate invocation.  Records where
+    ``unchallenged`` is combined with ``escalated=True`` capture a distinct class:
+    the challenger task crashed or returned an unparseable verdict, so the merge was
+    BLOCKED and escalated for manual review (fail-CLOSED/safe).  These are counted
+    as ``challenged_escalated`` for operator awareness but are excluded from
+    ``fail_open_rate`` because no auto-merge occurred.
+
+    Records with ``state == 'degraded_model_unavailable'`` represent the true
+    fail-open path: the challenger's model was inaccessible, so the primary verdict
+    was adopted and (for APPROVE + trunk target) the PR was auto-merged with no
+    independent second opinion.  These are counted as ``challenged_degraded`` and
+    drive ``fail_open_rate``.
 
     Returns ``None`` when no gate invocations exist in the window.
 
@@ -1768,9 +1776,15 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
     ``cost_per_challenge_usd`` = total LLM cost of panel_review tasks / total_challenged.
     Provides the spend-per-invocation needed to compute gate ROI alongside overturn_rate.
 
-    ``challenged_escalated`` — count of invocations where the challenger failed
-    (unparseable/crashed) and the primary verdict was adopted as a fail-open.  These
-    are excluded from ``total_challenged`` because no independent verdict was reached.
+    ``challenged_escalated`` — count of invocations where the challenger crashed or
+    returned an unparseable verdict, triggering a manual escalation (merge BLOCKED).
+    Informational only; excluded from ``fail_open_rate``.
+
+    ``challenged_degraded`` — count of invocations where the challenger's model was
+    unavailable, causing a silent auto-merge with no independent second opinion.
+    This is the true fail-open path.
+
+    ``fail_open_rate`` = challenged_degraded / (total_challenged + challenged_degraded).
     """
     from app.task_completion import (  # noqa: PLC0415
         REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
@@ -1780,6 +1794,7 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
     revised = 0
     rejected = 0
     escalated = 0
+    degraded = 0
     for t in tasks:
         recon = (t.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
         if not isinstance(recon, dict):
@@ -1793,9 +1808,11 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
             rejected += 1
         elif state == "unchallenged" and recon.get("escalated"):
             escalated += 1
+        elif state == "degraded_model_unavailable":
+            degraded += 1
 
     total = confirmed + revised + rejected
-    if total == 0 and escalated == 0:
+    if total == 0 and escalated == 0 and degraded == 0:
         return None
 
     # Sum LLM cost across panel_review challenger tasks in the window.
@@ -1806,7 +1823,6 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
     )
     cost_per_challenge = round(panel_review_llm_cost / total, 4) if total > 0 else None
 
-    total_plus_escalated = total + escalated
     return {
         "challenged_confirmed": confirmed,
         "challenged_revised": revised,
@@ -1815,9 +1831,9 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
         "overturn_rate": round(rejected / total, 4) if total > 0 else None,
         "cost_per_challenge_usd": cost_per_challenge,
         "challenged_escalated": escalated,
-        "fail_open_rate": round(escalated / total_plus_escalated, 4)
-        if total_plus_escalated > 0
-        else None,
+        "challenged_degraded": degraded,
+        # None when no degraded events observed (distinguishes "0 measured" from "unknown").
+        "fail_open_rate": round(degraded / (total + degraded), 4) if degraded > 0 else None,
     }
 
 

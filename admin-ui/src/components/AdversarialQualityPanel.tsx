@@ -23,9 +23,12 @@ function GateHealthBadge({ failOpen, total }: { failOpen: number; total: number 
 
 function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
   const total = data.total_challenged;
-  const failOpen = data.challenged_escalated ?? 0;
-  const failOpenRate = total + failOpen > 0 ? ((failOpen / (total + failOpen)) * 100).toFixed(1) : null;
+  const failOpen = data.challenged_degraded ?? 0;
+  const failOpenRate = data.fail_open_rate != null
+    ? (data.fail_open_rate * 100).toFixed(1)
+    : (total + failOpen > 0 ? ((failOpen / (total + failOpen)) * 100).toFixed(1) : null);
   const overturnRate = data.overturn_rate != null ? (data.overturn_rate * 100).toFixed(1) : null;
+  const escalated = data.challenged_escalated ?? 0;
 
   return (
     <div className="space-y-2">
@@ -51,7 +54,12 @@ function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
       )}
       {failOpen > 0 && (
         <div data-testid="fail-open-row" className="text-ui-sm text-red-400/80">
-          fail-open: {failOpen}{failOpenRate != null ? ` (${failOpenRate}%)` : ''} — challenger failed, primary adopted
+          fail-open: {failOpen}{failOpenRate != null ? ` (${failOpenRate}%)` : ''} — silent merge (model degraded, primary adopted)
+        </div>
+      )}
+      {escalated > 0 && (
+        <div data-testid="escalated-row" className="text-ui-sm text-amber-400/80">
+          escalated to manual review: {escalated}
         </div>
       )}
       {data.cost_per_challenge_usd != null && (

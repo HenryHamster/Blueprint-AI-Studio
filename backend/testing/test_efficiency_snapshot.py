@@ -7170,18 +7170,23 @@ def test_panel_review_effectiveness_cost_per_challenge_usd():
 
 
 def test_panel_review_effectiveness_escalated_fail_open():
-    """Escalated fail-open records (unchallenged + escalated=True) are counted in
-    challenged_escalated and excluded from total_challenged.
+    """Escalated records (unchallenged + escalated=True) are counted in
+    challenged_escalated (informational) and excluded from total_challenged and fail_open_rate.
+
+    These records represent a BLOCKED/fail-CLOSED path: the challenger crashed or
+    returned an unparseable verdict, so the merge was blocked and escalated for manual
+    review.  They are NOT auto-merges and must NOT inflate fail_open_rate.
 
     Setup:
       - 2 challenged_confirmed (normal gate invocations)
       - 1 challenged_rejected  (normal gate invocation)
-      - 2 unchallenged + escalated=True (challenger failed — fail-open)
+      - 2 unchallenged + escalated=True (challenger crashed — merge BLOCKED, not fail-open)
       - 1 unchallenged without escalated (gate not invoked — must be ignored)
 
     Expected:
       total_challenged = 3 (only the three successful gate invocations)
-      challenged_escalated = 2 (the two fail-open records)
+      challenged_escalated = 2 (safe/blocked escalations, informational)
+      fail_open_rate = None (no degraded_model_unavailable records — no true fail-opens)
       overturn_rate = 1/3
     """
     from app.efficiency_snapshot import compute_panel_review_effectiveness
@@ -7218,18 +7223,32 @@ def test_panel_review_effectiveness_escalated_fail_open():
     assert result["overturn_rate"] == round(1 / 3, 4), (
         f"overturn_rate must be computed from total_challenged only, got {result['overturn_rate']}"
     )
+    # unchallenged+escalated=True records are safe (merge BLOCKED); fail_open_rate must not count them
+    assert result["fail_open_rate"] is None, (
+        f"fail_open_rate must be None when no degraded_model_unavailable records exist, got {result['fail_open_rate']}"
+    )
+    assert result.get("challenged_degraded", 0) == 0, (
+        "challenged_degraded must be 0 when no degraded_model_unavailable records exist"
+    )
 
 
 def test_panel_review_effectiveness_fail_open_rate():
-    """fail_open_rate = escalated / (total_challenged + escalated).
+    """fail_open_rate = challenged_degraded / (total_challenged + challenged_degraded).
+
+    degraded_model_unavailable records are the true fail-open path: the challenger's
+    model was inaccessible so the primary verdict was adopted and the PR auto-merged.
+    unchallenged+escalated=True records are safe (merge BLOCKED) and must NOT drive
+    fail_open_rate.
 
     Setup:
       - 3 challenged_confirmed (successful gate invocations)
-      - 2 unchallenged + escalated=True (challenger failed — fail-open)
+      - 2 degraded_model_unavailable (silent auto-merges — true fail-opens)
+      - 1 unchallenged + escalated=True (challenger crashed — merge BLOCKED, not counted in fail_open_rate)
 
     Expected:
       total_challenged = 3
-      challenged_escalated = 2
+      challenged_degraded = 2
+      challenged_escalated = 1 (informational; does NOT affect fail_open_rate)
       fail_open_rate = 2 / (3 + 2) = 0.4
       Zero-invocations case (no tasks) returns None for fail_open_rate.
     """
@@ -7251,21 +7270,88 @@ def test_panel_review_effectiveness_fail_open_rate():
         _task({"state": "challenged_confirmed"}),
         _task({"state": "challenged_confirmed"}),
         _task({"state": "challenged_confirmed"}),
-        _task({"state": "unchallenged", "escalated": True}),
-        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "degraded_model_unavailable"}),
+        _task({"state": "degraded_model_unavailable"}),
+        _task({"state": "unchallenged", "escalated": True}),  # safe — must not affect fail_open_rate
     ]
 
     result = compute_panel_review_effectiveness(tasks)
     assert result is not None
     assert result["total_challenged"] == 3
-    assert result["challenged_escalated"] == 2
+    assert result["challenged_degraded"] == 2, (
+        f"expected challenged_degraded=2, got {result.get('challenged_degraded')}"
+    )
+    assert result["challenged_escalated"] == 1, (
+        f"expected challenged_escalated=1 (informational), got {result.get('challenged_escalated')}"
+    )
     expected_rate = round(2 / 5, 4)
     assert result["fail_open_rate"] == expected_rate, (
-        f"expected fail_open_rate={expected_rate}, got {result['fail_open_rate']}"
+        f"expected fail_open_rate={expected_rate} (degraded only), got {result['fail_open_rate']}"
     )
 
     # Zero-invocations: no tasks with gate records returns None
     assert compute_panel_review_effectiveness([]) is None
+
+
+def test_panel_review_effectiveness_degraded_fail_open_rate():
+    """degraded_model_unavailable is the true fail-open path; escalated is safe.
+
+    Mixed scenario with all three state classes to verify bucket separation:
+      - 4 challenged_confirmed
+      - 1 challenged_rejected
+      - 3 degraded_model_unavailable (silent auto-merges — true fail-opens)
+      - 2 unchallenged + escalated=True (merge BLOCKED — safe, not fail-open)
+      - 1 unchallenged (gate not invoked — ignored)
+
+    Expected:
+      total_challenged = 5
+      challenged_degraded = 3
+      challenged_escalated = 2
+      fail_open_rate = 3 / (5 + 3) = 0.375
+      overturn_rate = 1 / 5 = 0.2
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _task(recon):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    tasks = [
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_rejected"}),
+        _task({"state": "degraded_model_unavailable"}),
+        _task({"state": "degraded_model_unavailable"}),
+        _task({"state": "degraded_model_unavailable"}),
+        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "unchallenged"}),  # ignored
+    ]
+
+    result = compute_panel_review_effectiveness(tasks)
+    assert result is not None
+    assert result["total_challenged"] == 5, f"got {result['total_challenged']}"
+    assert result["challenged_degraded"] == 3, f"got {result.get('challenged_degraded')}"
+    assert result["challenged_escalated"] == 2, f"got {result.get('challenged_escalated')}"
+    assert result["overturn_rate"] == round(1 / 5, 4), f"got {result['overturn_rate']}"
+    expected_rate = round(3 / 8, 4)
+    assert result["fail_open_rate"] == expected_rate, (
+        f"expected fail_open_rate={expected_rate}, got {result['fail_open_rate']}"
+    )
+    # Verify escalated records do NOT bleed into fail_open_rate numerator
+    assert result["fail_open_rate"] != round(5 / 10, 4), (
+        "fail_open_rate must not include challenged_escalated in the numerator"
+    )
 
 
 # ---------------------------------------------------------------------------
