@@ -1022,6 +1022,15 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
             "dominant_task_type": by_type[0] if by_type else None,
             "dominant_failure_class": dominant_failure_class,
         }
+    raw_peff = snapshot.get("panel_review_effectiveness") or {}
+    if raw_peff:
+        result["panel_review_effectiveness"] = {
+            "gate_health": raw_peff.get("gate_health"),
+            "fail_open_rate": raw_peff.get("fail_open_rate"),
+            "total_challenged": raw_peff.get("total_challenged"),
+            "challenged_degraded": raw_peff.get("challenged_degraded"),
+            "effective_coverage": raw_peff.get("effective_coverage"),
+        }
     return result
 
 

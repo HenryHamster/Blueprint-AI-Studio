@@ -13421,6 +13421,57 @@ def test_summarize_efficiency_snapshot_includes_dominant_failure_class():
     }
 
 
+def test_summarize_efficiency_snapshot_forwards_gate_health():
+    """panel_review_effectiveness gate_health verdict is forwarded by _summarize_efficiency_snapshot.
+
+    The gate-health block is the canonical way for the strategic agent to
+    autonomously confirm the adversarial-second-opinion gate's fail-open rate
+    after a version promotion, without an explicit manual fetch.
+    """
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    gate_health = {
+        "state": "HEALTHY",
+        "fail_open_rate": 0.02,
+        "total_invocations": 50,
+        "min_sample": 30,
+    }
+    snapshot = {
+        "axes": {
+            "cost_per_merged_pr": {
+                "current": 1.5,
+                "baseline": 2.0,
+                "drift_pct": -25.0,
+                "history": [],
+            }
+        },
+        "baseline_captured_at": "2026-04-05T00:00:00",
+        "last_snapshot_at": "2026-05-01T00:00:00",
+        "panel_review_effectiveness": {
+            "gate_health": gate_health,
+            "fail_open_rate": 0.02,
+            "total_challenged": 49,
+            "challenged_degraded": 1,
+            "effective_coverage": 0.85,
+            # raw history arrays stripped by summarize
+            "history": [{"captured_at": "2026-04-01", "value": 0.01}],
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    assert "panel_review_effectiveness" in result, (
+        "panel_review_effectiveness missing from summarized snapshot"
+    )
+    peff = result["panel_review_effectiveness"]
+    assert peff["gate_health"] == gate_health, (
+        "gate_health verdict not forwarded faithfully"
+    )
+    assert peff["fail_open_rate"] == 0.02
+    assert peff["total_challenged"] == 49
+    assert peff["challenged_degraded"] == 1
+    assert peff["effective_coverage"] == 0.85
+    assert "history" not in peff, "history array must be stripped from summarized payload"
+
+
 # ── direction-linked knowledge in strategist payload ──────────────────────────
 
 

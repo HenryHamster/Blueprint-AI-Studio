@@ -1267,6 +1267,25 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
     }
   }
 
+  const peff = snap.panel_review_effectiveness && typeof snap.panel_review_effectiveness === 'object'
+    ? snap.panel_review_effectiveness as Record<string, unknown>
+    : null;
+  if (peff) {
+    const gh = peff.gate_health && typeof peff.gate_health === 'object'
+      ? peff.gate_health as Record<string, unknown>
+      : null;
+    const state = gh && typeof gh.state === 'string' ? gh.state : 'NO_DATA';
+    const failOpenRate = typeof peff.fail_open_rate === 'number'
+      ? `${(peff.fail_open_rate * 100).toFixed(2)}%`
+      : 'n/a';
+    const totalChallenged = typeof peff.total_challenged === 'number' ? String(peff.total_challenged) : 'n/a';
+    const coverage = typeof peff.effective_coverage === 'number'
+      ? `${(peff.effective_coverage * 100).toFixed(1)}%`
+      : 'n/a';
+    lines.push('');
+    lines.push(`**Adversarial gate health:** ${state} — fail_open_rate ${failOpenRate} (n=${totalChallenged}, coverage ${coverage})`);
+  }
+
   return lines.join('\n') + '\n';
 }
 

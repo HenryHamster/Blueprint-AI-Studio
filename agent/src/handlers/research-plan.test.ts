@@ -2411,6 +2411,32 @@ describe('buildEfficiencySnapshotSection', () => {
     expect(result).toContain('rework_share: n/a');
     expect(result).toContain('self_repair_burn_share: n/a');
   });
+
+  it('renders panel_review_effectiveness gate_health when present', () => {
+    const snapshot = {
+      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
+      panel_review_effectiveness: {
+        gate_health: { state: 'HEALTHY' },
+        fail_open_rate: 0.03,
+        total_challenged: 120,
+        effective_coverage: 0.85,
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('Adversarial gate health:');
+    expect(result).toContain('HEALTHY');
+    expect(result).toContain('3.00%');
+    expect(result).toContain('n=120');
+    expect(result).toContain('85.0%');
+  });
+
+  it('omits Adversarial gate health line when panel_review_effectiveness is absent', () => {
+    const snapshot = {
+      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).not.toContain('Adversarial gate health');
+  });
 });
 
 describe('Strategic executor set-retirement-critiques verification', () => {
