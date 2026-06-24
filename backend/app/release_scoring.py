@@ -494,11 +494,12 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
 
     Returns ``audit_score`` (None when report is absent/unusable) and a
     ``test_erosion_score`` in [0,1] where 1.0 == no erosion.  ``test_erosion``
-    is None — the hard-blocker sentinel — when any deleted test file is classified as
-    ``genuine_erosion``, absent, or ambiguous (via ``report["deleted_test_file_classifications"]``).
-    The gate is fail-CLOSED: only an explicit ``dead_code_removal`` classification passes;
-    absent, ambiguous, or ``genuine_erosion`` classifications all hard-block.
-    A net reduction in tests or assertions applies a graded penalty.
+    is None — the hard-blocker sentinel — ONLY when a deleted test file is
+    explicitly classified ``genuine_erosion`` (via
+    ``report["deleted_test_file_classifications"]``).
+    The gate is fail-OPEN: an explicit ``dead_code_removal`` tag, an absent tag,
+    and an ambiguous tag all pass; only an explicit ``genuine_erosion`` tag
+    hard-blocks.  A net reduction in tests or assertions applies a graded penalty.
     """
     if not isinstance(report, dict):
         return None, None
@@ -583,12 +584,14 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
         # subject is demonstrably still present and the test was removed to stop
         # failing tests from blocking a build).
         #
-        # Disposition is FAIL-CLOSED: every deleted test file must carry an
-        # explicit ``dead_code_removal`` classification to pass.  An absent,
-        # empty, or ambiguous classification blocks just like ``genuine_erosion``
-        # — the caller must provide a positive authorisation, not rely on silence.
-        # ``dead_code_removal`` is the only non-blocking outcome; all other
-        # values (including the empty string from a missing key) hard-block.
+        # Disposition is FAIL-OPEN (operator steer): the ONLY blocking outcome is
+        # an explicit ``genuine_erosion`` classification.  ``dead_code_removal``,
+        # absent, empty, and ambiguous classifications all pass.  This reverts the
+        # short-lived fail-closed disposition (#11268), which blocked legitimate
+        # co-deletions whenever the auditor simply didn't emit a tag — the common
+        # case for the operator's dead-code/declutter cuts.  Deterministic
+        # detection of the deleted set is unchanged, so nothing is missed; only
+        # the default disposition for an un-flagged deletion flips to allow.
         #
         # The candidate-bound per-file classification path introduced in 84b965a9
         # is preserved: the gate reads ``deleted_test_file_classifications`` from
@@ -603,10 +606,17 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
                     classifications[item["path"]] = str(item.get("classification", ""))
         for f in deleted:
             cls = classifications.get(str(f), "")
-            if cls == "dead_code_removal":
-                continue  # explicit non-erosion authorisation — allow
-            # genuine_erosion or absent/ambiguous — hard block
-            return audit_score, None
+            if cls == "genuine_erosion":
+                # FAIL-OPEN (operator steer): ONLY an explicit ``genuine_erosion``
+                # classification hard-blocks.  ``dead_code_removal``, absent, empty,
+                # and ambiguous classifications all PASS — a co-deleted or dead-code
+                # test removal must never block promotion, and the operator is
+                # permissive about test deletion ("we have too many tests").  The
+                # rare deliberate-erosion case (subject demonstrably still present,
+                # test stripped to hide a failing build) still blocks, but only when
+                # the auditor affirmatively says so.
+                return audit_score, None
+            # dead_code_removal / absent / ambiguous — allow (fail-open).
 
     # Graded penalty for net assertion / test-count reduction.  Each negative
     # delta knocks the score down; positive deltas leave it at the ceiling.

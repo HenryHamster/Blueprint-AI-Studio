@@ -9878,28 +9878,26 @@ def test_main_py_admin_endpoints_auth_and_401_path():
     )
 
 
-def test_deleted_test_file_classification_fails_closed_without_authorization():
-    """The deleted-test-file gate must FAIL CLOSED on unclassified deletions.
+def test_deleted_test_file_classification_fails_open_without_genuine_erosion():
+    """The deleted-test-file gate must FAIL OPEN on unclassified deletions.
 
-    With the hardcoded allowlist retired, the escape hatch for a legitimate
-    test deletion is an explicit ``dead_code_removal`` classification emitted
-    by the release audit agent.  This invariant proves the gate is fail-closed:
-    when ``_score_audit()`` sees ``deleted_test_files`` but the report carries
-    NO ``deleted_test_file_classifications`` entry (or an empty one), it must
-    return ``erosion=None`` (the hard-blocker sentinel) — just like an explicit
-    ``genuine_erosion`` classification would.
+    Operator steer (reverting #11268's short-lived fail-closed disposition): the
+    ONLY blocking outcome is an explicit ``genuine_erosion`` classification from
+    the release audit agent.  When ``_score_audit()`` sees ``deleted_test_files``
+    but the report carries NO ``deleted_test_file_classifications`` entry (or an
+    empty one), it must return a NON-None erosion score — the deletion passes.
+    A co-deleted/dead-code test removal must not block promotion merely because
+    the auditor didn't emit a tag (the common case for declutter/dead-code cuts).
 
-    The v14/v17 deadlock is avoided by a different mechanism: the audit agent
-    classifies per-file at qualification time (candidate-bound), so the
-    authorisation lives in the audit report rather than a backend allowlist.
-    A ``dead_code_removal`` classification in the report is all that is needed
-    to allow the deletion; no backend deploy is required.  Fail-closed on
-    absent/ambiguous classification ensures that a missed classification does
-    not silently promote an eroding deletion.
+    Deterministic DETECTION of the deleted set is unchanged, so nothing is
+    missed; only the default disposition for an un-flagged deletion is allow.
+    The narrow erosion case (subject demonstrably still present, test stripped to
+    hide a failing build) still hard-blocks — but only when the auditor
+    affirmatively classifies it ``genuine_erosion`` (Part 3).
     """
     from app.release_scoring import _score_audit
 
-    # Part 1: absent classifications key → fail-closed
+    # Part 1: absent classifications key → fail-OPEN (passes)
     report_absent = {
         "audit_score": 0.9,
         "test_erosion": {
@@ -9911,10 +9909,9 @@ def test_deleted_test_file_classification_fails_closed_without_authorization():
         "findings": [],
     }
     _, erosion_absent = _score_audit(report_absent)
-    assert erosion_absent is None, (
-        "An unclassified deleted test file must fail closed (erosion=None). "
-        "The allowlist was retired; the escape hatch is now an explicit "
-        "dead_code_removal classification in the audit report."
+    assert erosion_absent is not None, (
+        "An unclassified deleted test file must fail open (non-None erosion). "
+        "Only an explicit genuine_erosion classification hard-blocks."
     )
 
     # Part 2: explicit dead_code_removal classification → gate passes (non-None)
@@ -9936,8 +9933,30 @@ def test_deleted_test_file_classification_fails_closed_without_authorization():
     }
     _, erosion_authorized = _score_audit(report_authorized)
     assert erosion_authorized is not None, (
-        "A dead_code_removal-classified deletion must pass (non-None erosion). "
-        "This is the non-deadlock escape hatch replacing the old allowlist."
+        "A dead_code_removal-classified deletion must pass (non-None erosion)."
+    )
+
+    # Part 3: explicit genuine_erosion → still the hard-blocker sentinel (None)
+    report_erosion = {
+        "audit_score": 0.9,
+        "test_erosion": {
+            "deleted_test_files": ["testing/test_some_module.py"],
+            "assertion_delta": 0,
+            "test_count_delta": 0,
+        },
+        "deleted_test_file_classifications": [
+            {
+                "path": "testing/test_some_module.py",
+                "classification": "genuine_erosion",
+                "rationale": "app/some_module.py present and unchanged.",
+            }
+        ],
+        "findings": [],
+    }
+    _, erosion_genuine = _score_audit(report_erosion)
+    assert erosion_genuine is None, (
+        "An explicit genuine_erosion classification must still hard-block "
+        "(erosion=None) — the one case fail-open preserves."
     )
 
 
