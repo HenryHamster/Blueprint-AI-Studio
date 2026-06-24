@@ -3334,7 +3334,7 @@ def _render_knowledge_list(data: dict) -> None:
         print("  (none)")
         return
     for d in docs:
-        did = (d.get("id") or "?")[:12]
+        did = (d.get("id") or "?")
         kind = d.get("source_kind", "?")
         title = (d.get("title") or "")[:60]
         direction = (d.get("direction_id") or "")[:12]

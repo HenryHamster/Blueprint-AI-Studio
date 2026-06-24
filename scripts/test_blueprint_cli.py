@@ -2991,6 +2991,15 @@ def test_knowledge_list_applies_filters(mock_api, capsys):
     assert "Design Patterns" not in out
 
 
+def test_knowledge_list_prints_full_uuid(mock_api, capsys):
+    """knowledge list prints the full document ID, not a 12-char prefix."""
+    rc = blueprint.main(["knowledge", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "kdoc-001" in out
+    assert "kdoc-002" in out
+
+
 def test_knowledge_show_renders_document_body(mock_api, capsys):
     """knowledge show <id> renders the document title, metadata, and body text."""
     rc = blueprint.main(["knowledge", "show", "kdoc-001"])
