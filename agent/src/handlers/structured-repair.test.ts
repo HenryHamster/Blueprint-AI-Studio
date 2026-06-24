@@ -39,7 +39,28 @@ describe('attemptStructuredRepair', () => {
       mockRun, vi.fn(),
     );
 
-    expect(recordFormatRepairTokens).toHaveBeenCalledWith(200, 70);
+    // No schemaLabel passed → recorded without per-schema attribution.
+    expect(recordFormatRepairTokens).toHaveBeenCalledWith(200, 70, undefined);
+  });
+
+  it('forwards schemaLabel to recordFormatRepairTokens so callers do not double-record', async () => {
+    const mockRun = vi.fn().mockResolvedValue({
+      exitCode: 0, allOutput: '{"result":"ok"}', lastResultText: '{"result":"ok"}',
+    });
+    vi.mocked(getLlmTelemetry)
+      .mockReturnValueOnce({ llm_call_count: 1, total_input_tokens: 100, total_output_tokens: 50, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 })
+      .mockReturnValueOnce({ llm_call_count: 2, total_input_tokens: 300, total_output_tokens: 120, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 });
+
+    await attemptStructuredRepair(
+      'prior text', '{"result":"..."}', 'repair-status',
+      WS, STATUS_REF(), undefined, undefined, [],
+      mockRun, vi.fn(), 'strategic',
+    );
+
+    // The helper is the SINGLE recorder; it carries the caller's schemaLabel so
+    // callers must not wrap it with their own getLlmTelemetry/recordFormatRepairTokens.
+    expect(recordFormatRepairTokens).toHaveBeenCalledTimes(1);
+    expect(recordFormatRepairTokens).toHaveBeenCalledWith(200, 70, 'strategic');
   });
 
   it('returns the run result from runFn', async () => {

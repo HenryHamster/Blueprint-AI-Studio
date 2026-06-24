@@ -1,7 +1,7 @@
 import type WebSocket from 'ws';
 import { sendLog as _sendLog, runClaudeCode as _runClaudeCode } from '../index.js';
 import { DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
-import { getLlmTelemetry, recordFormatRepairTokens } from '../telemetry.js';
+import { getLlmTelemetry, recordFormatRepairTokens, type SchemaLabel } from '../telemetry.js';
 
 type RunClaudeCodeFn = (
   prompt: string,
@@ -34,6 +34,11 @@ type SendLogFn = (ws: WebSocket | null, message: string) => void;
 // resolved imports — callers should pass their locally-imported runClaudeCode
 // and sendLog so that test mocks applied to the caller's module scope are
 // honoured here too.
+//
+// This helper is the SINGLE recorder of repair-call token deltas
+// (recordFormatRepairTokens) — callers must NOT wrap it with their own
+// getLlmTelemetry/recordFormatRepairTokens snapshots or the tokens double-count.
+// Pass `schemaLabel` so the recording carries per-schema attribution.
 export async function attemptStructuredRepair(
   priorText: string,
   schemaHint: string,
@@ -45,6 +50,7 @@ export async function attemptStructuredRepair(
   disallowedTools: string[],
   runFn: RunClaudeCodeFn = _runClaudeCode,
   logFn: SendLogFn = _sendLog,
+  schemaLabel?: SchemaLabel,
 ): Promise<{ exitCode: number; allOutput: string; lastResultText: string; codexTurnCompleted?: boolean; stderrTail?: string }> {
   const context = (priorText || '').slice(-8000);
   logFn(ws, `[INFO] Handler produced no parseable structured output (context=${context.length}b). Reopening with focused continuation.\n`);
@@ -69,6 +75,7 @@ Output ONLY the JSON object now — no preamble, no markdown code fences, no com
   recordFormatRepairTokens(
     tokensAfter.total_input_tokens - tokensBefore.total_input_tokens,
     tokensAfter.total_output_tokens - tokensBefore.total_output_tokens,
+    schemaLabel,
   );
   return result;
 }

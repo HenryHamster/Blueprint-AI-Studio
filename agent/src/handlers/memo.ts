@@ -26,9 +26,8 @@ import {
 import { extractJsonObjectDetailed, describeJsonExtractionResult, JsonExtractionError } from '../json-extract.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
-  recordFormatRepairTokens, recordFormatRepairMiss,
+  recordFormatRepairMiss,
   type FormatMissReason,
-  getLlmTelemetry,
 } from '../telemetry.js';
 import { attemptStructuredRepair } from './structured-repair.js';
 
@@ -293,18 +292,14 @@ Rules:
     // Whether it succeeded is recorded after re-extraction below.
     if (firstAttempt.missReason !== null) recordFormatMiss(firstAttempt.missReason, 'memo');
     recordFormatRepairAttempt('memo');
-    const tokensBefore = getLlmTelemetry();
+    // attemptStructuredRepair is the single recorder of repair-call token deltas
+    // (recordFormatRepairTokens) — passing schemaLabel keeps the per-schema
+    // attribution. Do NOT re-snapshot here or tokens double-count.
     const retryRun = await attemptStructuredRepair(
       lastResultText || allOutput, MEMO_SCHEMA_HINT,
       'Writing memo (retry)...',
       ws, statusRef, model, effort, disallowedTools,
-      runClaudeCode, sendLog,
-    );
-    const tokensAfter = getLlmTelemetry();
-    recordFormatRepairTokens(
-      tokensAfter.total_input_tokens - tokensBefore.total_input_tokens,
-      tokensAfter.total_output_tokens - tokensBefore.total_output_tokens,
-      'memo',
+      runClaudeCode, sendLog, 'memo',
     );
     retryExitCode = retryRun.exitCode;
     retryAllOutput = retryRun.allOutput;

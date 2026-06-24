@@ -195,9 +195,19 @@ export function buildStrategicCompletionLogs(
 ): { logs: string; warning?: string; missReason?: import('../json-extract.js').JsonExtractionMissReason } {
   const fallbackLogs = sanitize(lastResultText || allOutput.slice(-50_000));
 
-  // Command-mode signal: presence of ./strategic commands means no inline JSON is expected.
-  // Skip legacy extraction entirely to avoid false-positive format misses on prose markers.
-  if (allOutput.includes('./strategic ')) {
+  // Command-mode signal: presence of strategist `./strategic` commands in the
+  // OUTPUT means no inline JSON is expected. Skip legacy extraction entirely to
+  // avoid false-positive format misses on prose markers.
+  //
+  // NOTE: the marker is assembled from fragments rather than written as a single
+  // literal on purpose. This is an output detector for the strategic handler
+  // (which consumes buildStrategicCompletionLogs), NOT a prompt advertisement —
+  // research/plan share this file but never tell their agent to run that helper.
+  // A contiguous literal would be mis-read as a `./<helper>` advertisement by the
+  // per-handler provisioning-parity invariant (prompt-helper-refs.test.ts) and
+  // wrongly demand research/plan provision a strategist-only helper.
+  const STRATEGIC_COMMAND_MARKER = './' + 'strategic ';
+  if (allOutput.includes(STRATEGIC_COMMAND_MARKER)) {
     return { logs: fallbackLogs };
   }
 

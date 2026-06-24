@@ -21,7 +21,6 @@ import {
 } from './strategic-helpers.js';
 import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
-  recordFormatRepairTokens, getLlmTelemetry,
 } from '../telemetry.js';
 import { attemptStructuredRepair } from './structured-repair.js';
 import { parseBackendTimestamp } from '../utils/time.js';
@@ -1060,18 +1059,14 @@ ${strategicChallengeSection}
       if (completionLogs.warning && exitCode === 0) {
         recordFormatMiss(completionLogs.missReason ?? 'no_matching_candidate', 'strategic');
         recordFormatRepairAttempt('strategic');
-        const tokensBefore = getLlmTelemetry();
+        // attemptStructuredRepair is the single recorder of repair-call token
+        // deltas (recordFormatRepairTokens) — passing schemaLabel keeps the
+        // per-schema attribution. Do NOT re-snapshot here or tokens double-count.
         const retryRun = await attemptStructuredRepair(
           lastResultText || allOutput, STRATEGIC_COMPLETION_SCHEMA_HINT,
           'Running strategic execution (retry: emitting decisions)...',
           ws, statusRef, model, effort, disallowedTools,
-          runClaudeCode, sendLog,
-        );
-        const tokensAfter = getLlmTelemetry();
-        recordFormatRepairTokens(
-          tokensAfter.total_input_tokens - tokensBefore.total_input_tokens,
-          tokensAfter.total_output_tokens - tokensBefore.total_output_tokens,
-          'strategic',
+          runClaudeCode, sendLog, 'strategic',
         );
         // For JSON-stream providers, lastResultText is the clean final answer
         // while allOutput is the raw provider stream where JSON keys may be
