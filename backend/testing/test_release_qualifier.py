@@ -1132,12 +1132,13 @@ class TestScoreAudit:
             "An explicit genuine_erosion classification must hard-block"
         )
 
-    def test_absent_classifications_fail_closed(self):
-        """A deleted test file with NO classifications entry must fail closed.
+    def test_absent_classifications_fail_open(self):
+        """A deleted test file with NO classifications entry must fail OPEN.
 
-        Fail-closed: every deleted test file must carry an explicit
-        ``dead_code_removal`` classification to pass.  Absent/ambiguous
-        classifications block promotion the same way as ``genuine_erosion``.
+        Fail-open (operator steer): only an explicit ``genuine_erosion``
+        classification hard-blocks.  An absent/ambiguous classification passes
+        — a co-deleted/dead-code test removal must not block promotion just
+        because the auditor didn't emit a tag.
         """
         report = {
             "audit_score": 0.9,
@@ -1150,8 +1151,8 @@ class TestScoreAudit:
             "findings": [],
         }
         _, erosion = rq._score_audit(report)
-        assert erosion is None, (
-            "An unclassified deleted test file must fail closed (erosion=None)"
+        assert erosion is not None, (
+            "An unclassified deleted test file must fail open (non-None erosion)"
         )
 
     def test_mixed_classifications_any_genuine_blocks(self):
@@ -1185,11 +1186,11 @@ class TestScoreAudit:
             "Any single genuine_erosion among mixed classifications must hard-block"
         )
 
-    def test_empty_classifications_list_fails_closed(self):
-        """An empty deleted_test_file_classifications list must fail closed.
+    def test_empty_classifications_list_fails_open(self):
+        """An empty deleted_test_file_classifications list must fail OPEN.
 
-        An empty list provides no explicit ``dead_code_removal`` authorisation
-        for the deleted file — gate must block (erosion=None).
+        An empty list carries no explicit ``genuine_erosion`` tag, so under the
+        fail-open disposition the deletion passes (erosion is non-None).
         """
         report = {
             "audit_score": 0.9,
@@ -1202,8 +1203,8 @@ class TestScoreAudit:
             "findings": [],
         }
         _, erosion = rq._score_audit(report)
-        assert erosion is None, (
-            "An empty classifications list must fail closed (erosion=None)"
+        assert erosion is not None, (
+            "An empty classifications list must fail open (non-None erosion)"
         )
 
     def test_all_dead_code_removal_passes(self):
