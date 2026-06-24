@@ -235,6 +235,31 @@ async def get_project_compute_jobs(
     }
 
 
+@router.get("/compute-jobs/{job_id}")
+async def get_compute_job_by_id(
+    job_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Fetch a single compute job by id (viewer+).
+
+    Returns the full job detail including its per-arm result block, task title,
+    success criterion, and criterion verdict. Normalizes 403 to 404 so job
+    existence is not leaked to callers without viewer access (IDOR protection).
+    """
+    job = await session.get(ComputeJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Compute job not found")
+    try:
+        await _get_user_project_with_role(
+            job.project_id, current_user["user_id"], session, "viewer"
+        )
+    except HTTPException as exc:
+        raise HTTPException(status_code=404, detail="Compute job not found") from exc
+    built = await _build_compute_job_payload(session, [job])
+    return {"compute_job": built[0]}
+
+
 @router.post("/compute-jobs/{job_id}/kill")
 async def kill_project_compute_job(
     job_id: uuid.UUID,

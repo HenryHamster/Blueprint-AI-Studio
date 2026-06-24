@@ -3520,7 +3520,15 @@ def _render_compute_show(data: dict) -> None:
     exit_code = (j.get("polling_metadata") or {}).get("exit_code")
     if exit_code is not None:
         print(f"  exit_code : {exit_code}")
-    metrics = (j.get("polling_metadata") or {}).get("result_metrics") or j.get("result_metrics")
+    polling_meta = j.get("polling_metadata") or {}
+    command_log = polling_meta.get("command_log")
+    if isinstance(command_log, dict):
+        text = command_log.get("text")
+        if isinstance(text, str) and text.strip():
+            print("  Command log:")
+            for line in text.split("\n"):
+                print(f"    {line}")
+    metrics = polling_meta.get("result_metrics") or j.get("result_metrics")
     if metrics:
         arms = metrics.get("arms") if isinstance(metrics, dict) else None
         scalar_items = {k: v for k, v in metrics.items() if k != "arms"} if isinstance(metrics, dict) else {}
@@ -3529,7 +3537,25 @@ def _render_compute_show(data: dict) -> None:
         if arms:
             print("  per-arm results:")
             for arm_name, arm_metrics in (arms.items() if isinstance(arms, dict) else []):
-                print(f"    [{arm_name}] {arm_metrics}")
+                if isinstance(arm_metrics, dict):
+                    label = arm_metrics.get("label")
+                    note = arm_metrics.get("note")
+                    log = arm_metrics.get("log")
+                    scalar_metrics = {k: v for k, v in arm_metrics.items() if k not in ("label", "note", "log")}
+                    print(f"    [{arm_name}]", end="")
+                    if scalar_metrics:
+                        print(f" {scalar_metrics}", end="")
+                    print()
+                    if label:
+                        print(f"      label: {label}")
+                    if note:
+                        print(f"      note: {note}")
+                    if log:
+                        print("      log:")
+                        for log_line in log.split("\n"):
+                            print(f"        {log_line}")
+                else:
+                    print(f"    [{arm_name}] {arm_metrics}")
     verdict = j.get("criterion_verdict")
     if isinstance(verdict, dict):
         met = verdict.get("met")

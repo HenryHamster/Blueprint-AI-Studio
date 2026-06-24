@@ -620,6 +620,21 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
             live_output = dict(live_output)
             live_output["text"] = redact_command_log_text(live_output["text"])
             metadata["live_output"] = live_output
+        result_metrics = metadata.get("result_metrics")
+        if isinstance(result_metrics, dict):
+            arms = result_metrics.get("arms")
+            if isinstance(arms, dict):
+                redacted_arms = {}
+                for arm_name, arm_data in arms.items():
+                    if isinstance(arm_data, dict):
+                        arm_data = dict(arm_data)
+                        for field in ("log", "note", "label"):
+                            if isinstance(arm_data.get(field), str):
+                                arm_data[field] = redact_command_log_text(arm_data[field])
+                    redacted_arms[arm_name] = arm_data
+                result_metrics = dict(result_metrics)
+                result_metrics["arms"] = redacted_arms
+                metadata["result_metrics"] = result_metrics
 
     # Sanitize the promoted diagnostic — may carry raw provider exception text
     # with signed URLs or credential values.  Overwrite both the top-level

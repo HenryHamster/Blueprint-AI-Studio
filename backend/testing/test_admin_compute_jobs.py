@@ -410,6 +410,51 @@ async def test_list_compute_jobs_strips_non_dict_env_payload(
 
 
 @pytest.mark.asyncio
+async def test_compute_job_arm_log_credentials_redacted(
+    client: AsyncClient, db_session
+):
+    """Credentials in per-arm log/note/label must be redacted; numeric fields unchanged."""
+    project = await _make_project(db_session, name="Arm Redact")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "result_metrics": {
+                "arms": {
+                    "arm_a": {
+                        "log": "run complete TOKEN=secret-token-abc123 done",
+                        "note": "export API_KEY=my-secret-key",
+                        "label": "clean label",
+                        "score": 0.87,
+                    },
+                    "arm_b": {
+                        "log": "normal log",
+                        "score": 0.91,
+                    },
+                },
+                "best_arm": "arm_b",
+            }
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    pm = resp.json()["compute_jobs"][0]["polling_metadata"]
+    arms = pm["result_metrics"]["arms"]
+
+    # Credentials must be redacted.
+    assert "secret-token-abc123" not in arms["arm_a"]["log"]
+    assert "my-secret-key" not in arms["arm_a"]["note"]
+    # Clean text and numeric values must be preserved.
+    assert arms["arm_a"]["label"] == "clean label"
+    assert arms["arm_a"]["score"] == 0.87
+    assert arms["arm_b"]["log"] == "normal log"
+    assert arms["arm_b"]["score"] == 0.91
+    assert pm["result_metrics"]["best_arm"] == "arm_b"
+
+
+@pytest.mark.asyncio
 async def test_kill_peer_terminal_returns_final_state(client: AsyncClient, db_session):
     """When a peer drives the job terminal during the lock-free RPC window,
     kill_compute_job returns None. The router must re-fetch and return the
@@ -705,6 +750,117 @@ async def test_list_compute_jobs_all_terminal_returns_old_jobs(
     assert resp.status_code == 200
     ids = [j["id"] for j in resp.json()["compute_jobs"]]
     assert str(old_job.id) in ids, "old terminal job must appear with all_terminal=true"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/compute-jobs/{job_id} — single-job detail endpoint tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_returns_arms(client: AsyncClient, db_session):
+    """Fetching one job by id returns the full detail including per-arm result block."""
+    project = await _make_project(db_session, name="Detail Arms Project")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "result_metrics": {
+                "arms": {
+                    "arm_a": {"log": "arm_a complete", "score": 0.87},
+                    "arm_b": {"log": "arm_b complete", "score": 0.91},
+                },
+                "best_arm": "arm_b",
+            }
+        },
+    )
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job.id}")
+    assert resp.status_code == 200
+    body = resp.json()["compute_job"]
+    assert body["id"] == str(job.id)
+    arms = body["polling_metadata"]["result_metrics"]["arms"]
+    assert "arm_a" in arms
+    assert "arm_b" in arms
+    assert arms["arm_a"]["score"] == pytest.approx(0.87)
+    assert arms["arm_b"]["score"] == pytest.approx(0.91)
+    assert body["polling_metadata"]["result_metrics"]["best_arm"] == "arm_b"
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_viewer_ok(client: AsyncClient, db_session):
+    """Viewer-role user can fetch job detail including task_title and task_type."""
+    project = await _make_project(db_session, name="Detail Viewer OK")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job, _artifact = await _make_job(db_session, project, with_artifact=True)
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job.id}")
+    assert resp.status_code == 200
+    body = resp.json()["compute_job"]
+    assert body["id"] == str(job.id)
+    assert body["task_title"] == "compute_experiment task"
+    assert body["task_type"] == "compute_experiment"
+    assert body["artifact"] is not None
+    assert body["artifact"]["storage_uri"] == "gs://bucket/jobs/job-1/result.parquet"
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_missing_404(client: AsyncClient, db_session):
+    """Unknown job id returns 404."""
+    resp = await client.get(f"/api/admin/compute-jobs/{uuid.uuid4()}")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_non_member_404(client: AsyncClient, db_session):
+    """User with no project membership gets 404 (IDOR protection)."""
+    project = await _make_project(db_session, name="Detail Non Member")
+    # Deliberately no membership for TEST_USER_ID.
+    _task, job, _artifact = await _make_job(db_session, project)
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job.id}")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_cross_project_404(client: AsyncClient, db_session):
+    """Member of project A fetching project B's job gets 404 (IDOR protection)."""
+    project_a = await _make_project(db_session, name="Detail Project A")
+    await _add_member(db_session, project_a.id, "viewer")
+
+    project_b = await _make_project(db_session, name="Detail Project B")
+    _task_b, job_b, _artifact_b = await _make_job(db_session, project_b)
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job_b.id}")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_redacts_polling_metadata(
+    client: AsyncClient, db_session
+):
+    """env/command/cwd are stripped from the single-job detail response."""
+    project = await _make_project(db_session, name="Detail Redact")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "command": ["python3", "run.py"],
+            "cwd": "/workspace",
+            "env": {"SECRET": "top-secret"},
+            "status_message": "running",
+        },
+    )
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job.id}")
+    assert resp.status_code == 200
+    pm = resp.json()["compute_job"]["polling_metadata"]
+    assert "command" not in pm
+    assert "cwd" not in pm
+    assert "env" not in pm
+    assert pm.get("status_message") == "running"
 
 
 # ---------------------------------------------------------------------------

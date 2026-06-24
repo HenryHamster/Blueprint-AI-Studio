@@ -741,8 +741,18 @@ def mock_api(monkeypatch):
                      "benchmark": "bench-2",
                      "hypothesis": "Quantization works",
                      "criterion_verdict": {"met": True, "metric": "latency_ms", "operator": "lt", "threshold": 100, "value": 80.0, "measurable": True},
-                     "polling_metadata": {"result_metrics": {"latency_ms": 80.0, "arms": {"arm_a": {"latency_ms": 75.0}, "arm_b": {"latency_ms": 85.0}}}},
+                     "polling_metadata": {"result_metrics": {"latency_ms": 80.0, "arms": {"arm_a": {"latency_ms": 75.0}, "arm_b": {"latency_ms": 85.0}}},
+                                          "command_log": {"text": "Starting GPU benchmark...\nRunning test 1\nTest passed", "truncated": False}},
                      "success_criterion": {"metric": "latency_ms", "operator": "lt", "threshold": 100}},
+                    {"id": "cjob-ccc0-0000-0000-000000000003",
+                     "status": "SUCCEEDED", "task_title": "Arm transcript test",
+                     "task_type": "compute_experiment",
+                     "final_cost_usd": 5.2,
+                     "experiment": "exp-gamma",
+                     "criterion_verdict": {"met": True, "metric": "score", "operator": "gt", "threshold": 0.8, "value": 0.95, "measurable": True},
+                     "polling_metadata": {"result_metrics": {"score": 0.95, "arms": {"baseline": {"score": 0.85, "label": "baseline version", "note": "original implementation", "log": "baseline test output\nall checks passed"}, "optimized": {"score": 0.95, "label": "optimized version", "note": "after refactoring", "log": "optimized test output\nperformance improved"}}},
+                                          "command_log": {"text": "Setup phase complete\nRunning comprehensive benchmark\nResults collected\nAnalysis complete", "truncated": False}},
+                     "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.8}},
                 ],
                 "has_more": False,
                 "limit": 20,
@@ -2899,16 +2909,18 @@ def test_compute_list_json(mock_api, capsys):
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
     jobs = parsed["compute_jobs"]
-    assert len(jobs) == 2
+    assert len(jobs) == 3
     # running job has no cost yet
     running = next(j for j in jobs if j["status"] == "RUNNING")
     assert running["task_title"] == "GPU benchmark alpha"
     assert running["experiment"] == "exp-alpha"
     assert running["final_cost_usd"] is None
-    # succeeded job has cost and a criterion verdict
-    done = next(j for j in jobs if j["status"] == "SUCCEEDED")
-    assert done["final_cost_usd"] == 12.5
-    assert done["criterion_verdict"]["met"] is True
+    # succeeded jobs have cost and a criterion verdict
+    done_jobs = [j for j in jobs if j["status"] == "SUCCEEDED"]
+    assert len(done_jobs) == 2
+    gpu_benchmark = next(j for j in done_jobs if j["task_title"] == "GPU benchmark beta")
+    assert gpu_benchmark["final_cost_usd"] == 12.5
+    assert gpu_benchmark["criterion_verdict"]["met"] is True
     assert any("/compute-jobs" in path for _, path, _ in mock_api)
 
 
@@ -3063,6 +3075,29 @@ def test_compute_show_renders_criterion_and_arms(mock_api, capsys):
     assert "[arm_b]" in out
     # Scalar metrics also appear (latency_ms=80.0 in scalars dict)
     assert "latency_ms" in out
+
+
+def test_compute_show_renders_per_arm_transcript(mock_api, capsys):
+    """compute show renders per-arm log/label/note transcript readably and renders list-shaped arms."""
+    job_id = "cjob-ccc0-0000-0000-000000000003"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Command log must appear
+    assert "Command log" in out
+    assert "Setup phase complete" in out
+    assert "Results collected" in out
+    # Per-arm breakdown must appear with labels
+    assert "baseline" in out
+    assert "optimized" in out
+    assert "baseline version" in out
+    assert "optimized version" in out
+    # Per-arm notes must appear
+    assert "original implementation" in out
+    assert "after refactoring" in out
+    # Per-arm logs must appear (rendered as transcripts)
+    assert "baseline test output" in out
+    assert "optimized test output" in out
 
 
 def test_compute_show_registers_in_help_invocations():
