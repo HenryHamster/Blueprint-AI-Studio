@@ -202,6 +202,7 @@ vi.mock('../api', async (importOriginal) => {
   return {
     ...actual,
     fetchComputeJobs: vi.fn(async () => jobsToReturn),
+    fetchComputeJobsPaged: vi.fn(async () => ({ jobs: jobsToReturn, hasMore: false })),
     killComputeJob: vi.fn(async () => stressJobs[0]),
     analyzeComputeJob: vi.fn(),
   };

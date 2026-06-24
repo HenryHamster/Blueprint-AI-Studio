@@ -1233,7 +1233,7 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(selector.textContent).toContain('3d');
     expect(selector.textContent).toContain('7d');
     // Initially fetched with default (no window arg or default 360)
-    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), { includeFinishedMinutes: 360 });
+    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), { includeFinishedMinutes: 360, offset: 0 });
   });
 
   test('clicking 7d window selector triggers refetch with 10080 minutes', async () => {
@@ -1243,7 +1243,7 @@ describe('ComputeJobsPanel render + kill', () => {
     const btn7d = await findByTestId('compute-window-7d');
     await act(async () => { btn7d.click(); });
     await waitFor(() =>
-      expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), { includeFinishedMinutes: 10080 }),
+      expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), { includeFinishedMinutes: 10080, offset: 0 }),
     );
   });
 
@@ -1550,7 +1550,7 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(await findByText('Window Job One')).toBeTruthy();
     expect(await findByText('Window Job Two')).toBeTruthy();
     // Second call must include offset=1 to avoid page 0 duplication
-    expect(fetchComputeJobs).toHaveBeenNthCalledWith(2, 'proj-1', expect.anything(), { includeFinishedMinutes: 360, offset: 1 });
+    expect(fetchComputeJobs).toHaveBeenNthCalledWith(2, 'proj-1', undefined, { includeFinishedMinutes: 360, offset: 1 });
   });
 
   test('job with external_compute_id shows it in the machine info subtitle', async () => {
@@ -1638,6 +1638,6 @@ describe('ComputeJobsPanel render + kill', () => {
     // Load-more button gone after last page
     await waitFor(() => expect(document.querySelector('[data-testid="compute-load-more"]')).toBeNull());
     // fetchComputeJobs called with offset=1 for the second page
-    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', undefined, 360, 1);
+    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', undefined, { includeFinishedMinutes: 360, offset: 1 });
   });
 });
