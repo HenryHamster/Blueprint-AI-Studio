@@ -99,8 +99,8 @@ export function DependencyItem({ dep, depTask, hasCycle, onNavigateToTask }: { d
         <span className={`text-ui-sm uppercase font-semibold ${statusColor}`}>{depTask.status}</span>
         {hasCycle && <span className="text-ui-sm font-semibold text-orange-400">Cycle detected</span>}
       </>) : (<>
-        <span className="text-neutral-500">{dep}</span>
-        <span className="text-ui-sm text-neutral-600">(not found)</span>
+        <span className="text-neutral-500 break-all min-w-0">{dep}</span>
+        <span className="text-ui-sm text-neutral-600 shrink-0">(not found)</span>
       </>)}
     </div>
   );

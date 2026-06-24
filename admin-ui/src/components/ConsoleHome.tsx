@@ -154,7 +154,7 @@ export function ConsoleHome({
       <div className="flex justify-end pt-1">
         <button
           onClick={onShowAnalytics}
-          className="flex items-center gap-1.5 text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
+          className="flex items-center gap-1.5 min-h-11 text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
         >
           <BarChart2 className="w-3.5 h-3.5" />
           Detailed Analytics
