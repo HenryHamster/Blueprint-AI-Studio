@@ -6688,6 +6688,54 @@ class TestEvergreenFillSettingsPersist:
         # Junk value is ignored — original default survives
         assert _shared_state.runtime_config["evergreen_fill_mode"] == "off"
 
+    @pytest.mark.asyncio
+    async def test_structural_health_audit_mode_persists_across_sync(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH structural_health_audit_mode=enforce writes to runtime_config_json;
+        sync_runtime_config_from_state restores it on a fresh in-memory config."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "structural_health_audit_mode": "enforce",
+                "structural_health_audit_interval_minutes": 120,
+                "structural_health_audit_fat_row_bytes": 2097152,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        # GET /settings returns the updated values
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["structural_health_audit_mode"] == "enforce"
+        assert body["structural_health_audit_interval_minutes"] == 120
+        assert body["structural_health_audit_fat_row_bytes"] == 2097152
+
+        # Values are persisted to DeploymentState.runtime_config_json
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        assert row.runtime_config_json["structural_health_audit_mode"] == "enforce"
+        assert row.runtime_config_json["structural_health_audit_interval_minutes"] == 120
+        assert row.runtime_config_json["structural_health_audit_fat_row_bytes"] == 2097152
+
+        # Config-sync restore applies persisted values to a fresh in-memory config
+        _shared_state.runtime_config["structural_health_audit_mode"] = "off"
+        _shared_state.runtime_config["structural_health_audit_interval_minutes"] = 60
+        _shared_state.runtime_config["structural_health_audit_fat_row_bytes"] = 1048576
+
+        await sync_runtime_config_from_state(row)
+
+        assert _shared_state.runtime_config["structural_health_audit_mode"] == "enforce"
+        assert _shared_state.runtime_config["structural_health_audit_interval_minutes"] == 120
+        assert _shared_state.runtime_config["structural_health_audit_fat_row_bytes"] == 2097152
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # dispatch_external_notification — webhook dispatch logic

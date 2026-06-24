@@ -1387,6 +1387,28 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                     if raw_mode in ("off", "observe", "enforce"):
                         _set("evergreen_fill_mode", raw_mode)
+                if "structural_health_audit_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["structural_health_audit_mode"] or "").strip().lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("structural_health_audit_mode", raw_mode)
+                if "structural_health_audit_interval_minutes" in config_json:
+                    try:
+                        _set(
+                            "structural_health_audit_interval_minutes",
+                            int(config_json["structural_health_audit_interval_minutes"]),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                if "structural_health_audit_fat_row_bytes" in config_json:
+                    try:
+                        _set(
+                            "structural_health_audit_fat_row_bytes",
+                            int(config_json["structural_health_audit_fat_row_bytes"]),
+                        )
+                    except (TypeError, ValueError):
+                        pass
                 if "cochange_decomposition_enabled" in config_json:
                     _set(
                         "cochange_decomposition_enabled",

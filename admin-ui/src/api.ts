@@ -3615,6 +3615,18 @@ export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSet
   }
 }
 
+export async function patchStructuralHealthSettings(patch: { structural_health_audit_mode?: string }): Promise<void> {
+  const res = await apiFetch('/api/admin/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update structural health settings: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update structural health settings: ${res.status}`);
+  }
+}
+
 export async function declareCapabilityVerdict(
   projectId: string,
   capName: string,

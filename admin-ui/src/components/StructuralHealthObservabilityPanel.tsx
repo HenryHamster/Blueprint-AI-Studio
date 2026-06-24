@@ -32,7 +32,13 @@ function DecisionCard({ label, decision }: { label: string; decision: Record<str
   );
 }
 
-export function StructuralHealthObservabilityPanel() {
+export function StructuralHealthObservabilityPanel({
+  auditMode,
+  onAuditModeChange,
+}: {
+  auditMode?: string;
+  onAuditModeChange?: (mode: string) => Promise<void>;
+} = {}) {
   const [data, setData] = useState<StructuralHealthObservabilityResponse | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
@@ -73,6 +79,27 @@ export function StructuralHealthObservabilityPanel() {
 
       {!collapsed && (
         <div className="px-4 py-3 space-y-4">
+          {auditMode != null && onAuditModeChange != null && (
+            <div>
+              <label className="block text-xs font-medium text-neutral-400 mb-1.5">Mode</label>
+              <div className="flex gap-1 bg-neutral-950 border border-neutral-700 rounded-lg p-1 w-fit">
+                {(['off', 'observe', 'enforce'] as const).map(mode => (
+                  <button
+                    key={mode}
+                    onClick={() => void onAuditModeChange(mode)}
+                    className={`px-3 py-1.5 text-xs rounded-md transition-colors capitalize ${
+                      auditMode === mode
+                        ? 'bg-neutral-700 text-neutral-100'
+                        : 'text-neutral-500 hover:text-neutral-300'
+                    }`}
+                  >
+                    {mode}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {fetchError && (
             <p className="text-xs text-red-400">{fetchError}</p>
           )}

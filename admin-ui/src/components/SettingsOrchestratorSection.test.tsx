@@ -13,6 +13,13 @@ vi.mock('../api', () => ({
     evergreen_fill_deferred_memo_enrollment: false,
   }),
   patchEvergreenFillSettings: vi.fn().mockResolvedValue(undefined),
+  patchStructuralHealthSettings: vi.fn().mockResolvedValue(undefined),
+  apiFetch: vi.fn().mockResolvedValue({
+    ok: true,
+    json: vi.fn().mockResolvedValue({
+      structural_health_audit_mode: 'off',
+    }),
+  }),
   fetchEvergreenFillObservability: vi.fn().mockResolvedValue({
     created_count: 0,
     reason_counts: {},
@@ -68,6 +75,13 @@ const baseProps = {
 };
 
 describe('SettingsOrchestratorSection', () => {
+  it('renders structural health observability panel with mode toggle', async () => {
+    render(<SettingsOrchestratorSection {...baseProps} />);
+    // Panel should be rendered
+    const panel = screen.getByTestId('structural-health-observability-panel');
+    expect(panel).toBeTruthy();
+  });
+
   it('calls onUpdateMaxVMs when max VMs input is blurred with a valid value', () => {
     const onUpdateMaxVMs = vi.fn();
     render(<SettingsOrchestratorSection {...baseProps} onUpdateMaxVMs={onUpdateMaxVMs} />);
