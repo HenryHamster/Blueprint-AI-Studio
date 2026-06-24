@@ -265,6 +265,84 @@ class TestAuditChallengeTsContract:
 
 
 @pytest.mark.asyncio
+async def test_spawn_release_audit_challenge_defaults_to_opus_quality_tier(db_session):
+    """``_spawn_release_audit_challenge_task`` must NOT set quality_tier in the
+    spawned task's payload, so it defaults to Opus via DEFAULT_QUALITY_TIER —
+    regression guard against a cost-saving edit silently downgrading this
+    binding adversarial second-opinion gate below Opus."""
+    from app import release_qualifier as rq
+    from app.models import Project
+
+    project = Project(
+        name="RQ-Challenge-Tier",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "cafe0011" * 5  # 40-char placeholder SHA
+    task = await rq._spawn_release_audit_challenge_task(
+        db_session,
+        project.id,
+        version_id=uuid.uuid4(),
+        base_branch="main",
+        diff_range=f"main...{candidate}",
+        candidate_sha=candidate,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert (task.first_payload or {}).get("quality_tier") is None, (
+        "Spawned release_audit_challenge must NOT carry an explicit quality_tier "
+        "— it must fall back to DEFAULT_QUALITY_TIER (Opus)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_release_audit_task_defaults_to_opus_quality_tier(db_session):
+    """``_spawn_release_audit_task`` must NOT set quality_tier in the spawned
+    task's payload, so it defaults to Opus via DEFAULT_QUALITY_TIER —
+    regression guard against a cost-saving edit silently downgrading the
+    primary release-audit judgment gate below Opus."""
+    from app import release_qualifier as rq
+    from app.models import Project
+
+    project = Project(
+        name="RQ-Audit-Tier",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "dead1234" * 5  # 40-char placeholder SHA
+    task = await rq._spawn_release_audit_task(
+        db_session,
+        project.id,
+        version_id=uuid.uuid4(),
+        base_branch="main",
+        diff_range=f"main...{candidate}",
+        candidate_sha=candidate,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert (task.first_payload or {}).get("quality_tier") is None, (
+        "Spawned release_audit must NOT carry an explicit quality_tier "
+        "— it must fall back to DEFAULT_QUALITY_TIER (Opus)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_spawn_release_audit_challenge_pins_candidate(db_session):
     """``_spawn_release_audit_challenge_task`` pins the challenge child to the
     exact candidate SHA + diff range, mirroring the release_audit spawn."""
