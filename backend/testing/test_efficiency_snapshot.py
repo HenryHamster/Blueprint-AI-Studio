@@ -7410,6 +7410,88 @@ def test_fail_open_rate_distinguishes_confirmed_zero_from_insufficient_data():
     )
 
 
+def test_fail_open_rate_scoped_to_post_deploy_window():
+    """compute_panel_review_effectiveness respects since_dt to scope to post-deploy traffic.
+
+    Setup: mix of pre-deploy and post-deploy tasks with gate records.
+      Pre-deploy (before deploy boundary):
+        - 2 challenged_confirmed
+        - 1 degraded_model_unavailable (fail-open)
+      Post-deploy (after deploy boundary):
+        - 3 challenged_confirmed
+        - 1 degraded_model_unavailable (fail-open)
+
+    Without since_dt (7-day window):
+      total_challenged = 5, challenged_degraded = 2
+      fail_open_rate = 2 / (5 + 2) = 2/7
+
+    With since_dt = deploy boundary (post-deploy only):
+      total_challenged = 3, challenged_degraded = 1
+      fail_open_rate = 1 / (3 + 1) = 0.25
+
+    This confirms an operator can isolate the v18-specific rate from the rolling
+    window that mixes pre- and post-deployment traffic.
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+    deploy_boundary = now - timedelta(days=2)
+    pre_deploy = now - timedelta(days=5)
+
+    def _task(recon, updated_at):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=updated_at - timedelta(minutes=5),
+            vm_stopped_at=updated_at,
+            updated_at=updated_at,
+        )
+
+    pre_tasks = [
+        _task({"state": "challenged_confirmed"}, pre_deploy),
+        _task({"state": "challenged_confirmed"}, pre_deploy),
+        _task({"state": "degraded_model_unavailable"}, pre_deploy),
+    ]
+    post_tasks = [
+        _task({"state": "challenged_confirmed"}, now - timedelta(hours=12)),
+        _task({"state": "challenged_confirmed"}, now - timedelta(hours=6)),
+        _task({"state": "challenged_confirmed"}, now - timedelta(hours=1)),
+        _task({"state": "degraded_model_unavailable"}, now - timedelta(hours=3)),
+    ]
+    all_tasks = pre_tasks + post_tasks
+
+    # Full 7-day window: pre + post traffic mixed
+    full = compute_panel_review_effectiveness(all_tasks)
+    assert full is not None
+    assert full["total_challenged"] == 5
+    assert full["challenged_degraded"] == 2
+    assert full["fail_open_rate"] == round(2 / 7, 4), (
+        f"7-day window: expected fail_open_rate={round(2/7, 4)}, got {full['fail_open_rate']}"
+    )
+
+    # Post-deploy only: tasks before deploy_boundary are excluded
+    post_deploy_only = compute_panel_review_effectiveness(all_tasks, since_dt=deploy_boundary)
+    assert post_deploy_only is not None
+    assert post_deploy_only["total_challenged"] == 3, (
+        f"post-deploy: expected total_challenged=3, got {post_deploy_only['total_challenged']}"
+    )
+    assert post_deploy_only["challenged_degraded"] == 1, (
+        f"post-deploy: expected challenged_degraded=1, got {post_deploy_only.get('challenged_degraded')}"
+    )
+    expected_post_rate = round(1 / 4, 4)
+    assert post_deploy_only["fail_open_rate"] == expected_post_rate, (
+        f"post-deploy: expected fail_open_rate={expected_post_rate}, got {post_deploy_only['fail_open_rate']}"
+    )
+
+    # A deploy boundary after all tasks → no gate invocations → None
+    future = compute_panel_review_effectiveness(all_tasks, since_dt=now + timedelta(days=1))
+    assert future is None, (
+        "since_dt beyond all task timestamps must return None (no gate invocations in window)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # compute_recommended_challenger_sample_rate
 # ---------------------------------------------------------------------------

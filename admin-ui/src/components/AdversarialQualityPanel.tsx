@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { fetchEfficiencyAxes, type PanelReviewEffectiveness } from '../api';
+import { fetchEfficiencyAxes, type EfficiencyAxesResponse, type PanelReviewEffectiveness } from '../api';
 
 function DistributionBar({ confirmed, revised, rejected }: { confirmed: number; revised: number; rejected: number }) {
   const total = confirmed + revised + rejected;
@@ -74,7 +74,7 @@ function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
 }
 
 export function AdversarialQualityPanel({ projectId }: { projectId: string | null }) {
-  const [data, setData] = useState<PanelReviewEffectiveness | null>(null);
+  const [axes, setAxes] = useState<EfficiencyAxesResponse | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -83,8 +83,8 @@ export function AdversarialQualityPanel({ projectId }: { projectId: string | nul
     setLoading(true);
     (async () => {
       try {
-        const axes = await fetchEfficiencyAxes(projectId);
-        if (mounted) setData(axes.panel_review_effectiveness ?? null);
+        const result = await fetchEfficiencyAxes(projectId);
+        if (mounted) setAxes(result);
       } catch {
         // silent fail — panel is advisory
       } finally {
@@ -93,6 +93,9 @@ export function AdversarialQualityPanel({ projectId }: { projectId: string | nul
     })();
     return () => { mounted = false; };
   }, [projectId]);
+
+  const data = axes?.panel_review_effectiveness ?? null;
+  const postDeploy = axes?.panel_review_effectiveness_post_deploy ?? null;
 
   if (!projectId || (!loading && !data)) return null;
 
@@ -105,7 +108,19 @@ export function AdversarialQualityPanel({ projectId }: { projectId: string | nul
         {loading ? (
           <div data-testid="panel-loading" className="text-neutral-600 text-ui-sm">Loading…</div>
         ) : (
-          data && <PanelReviewView data={data} />
+          data && (
+            <>
+              <PanelReviewView data={data} />
+              {postDeploy && (
+                <div data-testid="post-deploy-row" className="mt-2 pt-2 border-t border-neutral-700/50 text-ui-sm text-neutral-500">
+                  post-deploy: <GateHealthBadge failOpen={postDeploy.challenged_degraded ?? 0} total={postDeploy.total_challenged} />
+                  {postDeploy.fail_open_rate != null && (
+                    <span className="ml-1">({(postDeploy.fail_open_rate * 100).toFixed(1)}% fail-open, {postDeploy.total_challenged + (postDeploy.challenged_degraded ?? 0)} gate invocations)</span>
+                  )}
+                </div>
+              )}
+            </>
+          )
         )}
       </div>
     </section>

@@ -333,6 +333,9 @@ async def _load_recent_tasks(
                 # strategic_cycle_id: required for strategic_cycle_cost_per_event
                 # aggregation in _compact_llm_cost_attribution.
                 Task.strategic_cycle_id,
+                # updated_at: loaded so compute_panel_review_effectiveness can
+                # filter tasks to a post-deploy window via the since_dt parameter.
+                Task.updated_at,
                 raiseload=True,
             )
         )
@@ -1743,7 +1746,9 @@ def _qualification_infra_usd(versions: list[Any]) -> float | None:
     return round(total_usd, 6) if found_any else None
 
 
-def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | None:
+def compute_panel_review_effectiveness(
+    tasks: list[Task], *, since_dt: datetime | None = None
+) -> Dict[str, Any] | None:
     """Panel review gate effectiveness: overturn, confirmation, revision, and fail-open counts.
 
     Reads ``context["review_second_opinion"]`` from every terminal task in the
@@ -1796,6 +1801,8 @@ def compute_panel_review_effectiveness(tasks: list[Task]) -> Dict[str, Any] | No
     escalated = 0
     degraded = 0
     for t in tasks:
+        if since_dt is not None and t.updated_at is not None and t.updated_at < since_dt:
+            continue
         recon = (t.context or {}).get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
         if not isinstance(recon, dict):
             continue
@@ -2038,6 +2045,26 @@ async def compute_current_axes(
     lanes = await _load_project_lanes(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
 
+    # Deploy-scoped boundary: find the earliest snapshot captured under the
+    # current serving SHA so panel_review_effectiveness can be computed for
+    # post-deployment traffic only. None when the SHA is unknown or this is the
+    # first snapshot under the current build.
+    from app.deployed_sha import get_serving_sha  # noqa: PLC0415
+
+    _serving_sha = get_serving_sha()
+    _deploy_since: datetime | None = None
+    if _serving_sha:
+        _project_row = await session.get(Project, project_id)
+        if _project_row is not None:
+            _eb_container = (_project_row.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+            for _snap in _eb_container.get("snapshots") or []:
+                if _snap.get("serving_sha") == _serving_sha:
+                    try:
+                        _deploy_since = datetime.fromisoformat(_snap["captured_at"])
+                    except (KeyError, ValueError, TypeError):
+                        pass
+                    break
+
     axis_cutoff_pre = _utcnow() - timedelta(days=_AXIS_WINDOW_DAYS)
     _recent_versions = (
         (
@@ -2157,6 +2184,16 @@ async def compute_current_axes(
         # which the task_lifecycle path stamps on every challenged review task.
         "panel_review_effectiveness": (
             _peff := compute_panel_review_effectiveness(tasks)
+        ),
+        # Deploy-scoped companion: same metric but restricted to tasks completed
+        # after the earliest snapshot captured under the current serving SHA.
+        # Lets an operator confirm the <=5% fail_open_rate target for the current
+        # deployment specifically, independent of the rolling 7-day window.
+        # None when no deploy boundary is known (first snapshot under this SHA).
+        "panel_review_effectiveness_post_deploy": (
+            compute_panel_review_effectiveness(tasks, since_dt=_deploy_since)
+            if _deploy_since is not None
+            else None
         ),
         # Data-driven recommended sample_rate for the challenger gate, derived from
         # the live overturn_rate in the same window. Status is one of: no_data,
@@ -2802,6 +2839,11 @@ async def read_baseline_with_drift(
         # outcome (confirmed/revised/rejected), and total gate invocations. Null
         # when no gate invocations exist in the window.
         "panel_review_effectiveness": latest.get("panel_review_effectiveness"),
+        # Deploy-scoped companion: same metric restricted to post-deployment traffic.
+        # None on snapshots predating this field or when the deploy boundary is unknown.
+        "panel_review_effectiveness_post_deploy": latest.get(
+            "panel_review_effectiveness_post_deploy"
+        ),
         # Recommended sample_rate for the challenger gate, computed on-the-fly from
         # the latest snapshot's panel_review_effectiveness so operators always see a
         # fresh recommendation without waiting for the next daily snapshot write.

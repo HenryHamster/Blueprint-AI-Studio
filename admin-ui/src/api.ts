@@ -1570,6 +1570,10 @@ export interface EfficiencyAxesResponse {
   // total gate invocations from the latest snapshot. Null when no gate
   // invocations exist in the window. Optional for older backends.
   panel_review_effectiveness?: PanelReviewEffectiveness | null;
+  // Deploy-scoped companion: same metric restricted to tasks after the earliest
+  // snapshot under the current serving SHA. Null on older backends or when the
+  // deploy boundary is unknown (first snapshot under this build).
+  panel_review_effectiveness_post_deploy?: PanelReviewEffectiveness | null;
   // Data-driven recommended sample_rate for the challenger gate, computed from
   // the latest snapshot's overturn_rate. Optional for older backends.
   panel_review_recommended_sample_rate?: ChallengerSampleRateRecommendation | null;
