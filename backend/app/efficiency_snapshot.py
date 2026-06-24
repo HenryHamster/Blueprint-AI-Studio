@@ -2788,6 +2788,12 @@ async def read_baseline_with_drift(
             SELF_REPAIR_BURN_SHARE_KEY: (snap.get("llm_cost_attribution") or {}).get(
                 SELF_REPAIR_BURN_SHARE_KEY
             ),
+            "by_failure_class": (snap.get("llm_cost_attribution") or {}).get(
+                "by_failure_class"
+            ),
+            "merged_count": (snap.get("llm_cost_attribution") or {}).get(
+                "merged_count"
+            ),
         }
         for snap in snapshots
         if snap.get("llm_cost_attribution")

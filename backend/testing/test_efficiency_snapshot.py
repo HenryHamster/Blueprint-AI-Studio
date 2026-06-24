@@ -6745,6 +6745,81 @@ async def test_read_baseline_surfaces_llm_cost_attribution_breakdown(db_session)
 
 
 @pytest.mark.asyncio
+async def test_cost_attribution_trend_includes_failure_class_and_merged_count(
+    db_session,
+):
+    """llm_cost_attribution_trend entries include by_failure_class and merged_count.
+
+    Writes a snapshot with one MERGED task and one COMPLETED_NO_PR task, then
+    asserts that every trend entry exposes by_failure_class (with the MERGED and
+    COMPLETED_NO_PR buckets) and merged_count equal to the number of merged tasks.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # One merged task
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "pr_number": 1}],
+            api_call_summary={
+                "total_input_tokens": 2000,
+                "total_output_tokens": 1000,
+                "llm_call_count": 8,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    # One completed but no PR (research task)
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            payloads=[{"type": "research"}],
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 4,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+
+    trend = drift.get("llm_cost_attribution_trend")
+    assert isinstance(trend, list), "llm_cost_attribution_trend must be a list"
+    assert len(trend) >= 1
+
+    for entry in trend:
+        assert "by_failure_class" in entry, "trend entry must include by_failure_class"
+        assert "merged_count" in entry, "trend entry must include merged_count"
+
+        fc_rows = entry["by_failure_class"]
+        assert isinstance(fc_rows, list), "by_failure_class must be a list"
+        fc_classes = {r["failure_class"] for r in fc_rows}
+        assert "MERGED" in fc_classes, "MERGED bucket must appear in by_failure_class"
+        assert (
+            "COMPLETED_NO_PR" in fc_classes
+        ), "COMPLETED_NO_PR bucket must appear in by_failure_class"
+
+        merged_row = next(r for r in fc_rows if r["failure_class"] == "MERGED")
+        assert merged_row["task_count"] == 1
+        assert entry["merged_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_read_baseline_surfaces_vm_cost_attribution_trend(db_session):
     """read_baseline_with_drift surfaces vm_cost_attribution_trend as a
     day-over-day series mirroring llm_cost_attribution_trend but for VM spend.

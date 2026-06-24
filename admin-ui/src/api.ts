@@ -1574,6 +1574,8 @@ export interface LlmCostAttributionTrendEntry {
   rework_share?: number | null;
   total_llm_usd?: number | null;
   self_repair_burn_share?: number | null;
+  by_failure_class?: LlmCostByFailureClassEntry[] | null;
+  merged_count?: number | null;
 }
 
 /** Per-scalar slot in a cost-attribution delta (baseline/recent/prior vs current). */
