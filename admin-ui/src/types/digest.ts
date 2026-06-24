@@ -49,6 +49,8 @@ export interface NeedsAttentionItem {
   direction_text?: string | null;
   merge_retries_saved?: number;
   waiting_hours?: number;
+  spend_cap_usd?: number | null;
+  deadline_seconds?: number | null;
 }
 
 export interface FailureGroupTask {

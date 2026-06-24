@@ -414,7 +414,13 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     [load, projectId],
   );
 
-  if (!projectId) return null;
+  if (!projectId) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-neutral-500 text-ui-sm">
+        Select a project to view compute experiments
+      </div>
+    );
+  }
   const showEmptyState = loaded && !error && jobs.length === 0;
 
   return (

@@ -29,6 +29,8 @@ import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { DashboardHome } from './components/DashboardHome';
 import { ConsoleHome } from './components/ConsoleHome';
+import { ComputeJobsPanel } from './components/ComputeJobsPanel';
+import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import { ProjectSwitcherDropdown } from './components/ProjectSwitcherDropdown';
 import type { PrimaryTab } from './hooks/useUIState';
 import { BulkActionBar } from './components/BulkActionBar';
@@ -810,7 +812,7 @@ export default function App() {
           onSelectProject={s.setSelectedProjectId}
         />
         <nav className="flex items-center gap-0.5 flex-1">
-          {(['home', 'board', 'directions', 'settings'] as const).map(tab => {
+          {(['home', 'board', 'directions', 'compute', 'settings'] as const).map(tab => {
             const isActive = tab === 'settings' ? s.showSettings : activeTab === tab;
             const label = tab.charAt(0).toUpperCase() + tab.slice(1);
             return (
@@ -934,6 +936,29 @@ export default function App() {
               const target = s.tasks.find(t => t.id === taskId);
               if (target) s.handleViewLogs(target);
               else fetchTask(taskId).then(s.handleViewLogs).catch(() => { s.addToast('Could not load task — it may have been deleted', 'error'); });
+            }}
+          />
+        </ErrorBoundary>
+      ) : activeTab === 'compute' ? (
+        <ErrorBoundary level="panel">
+          <ComputeJobsPanel
+            projectId={s.selectedProjectId}
+            onNavigateToTask={(taskId) => {
+              const target = s.tasks.find(t => t.id === taskId);
+              if (target) s.handleViewLogs(target);
+              else fetchTask(taskId).then(s.handleViewLogs).catch(() => { s.addToast('Could not load task — it may have been deleted', 'error'); });
+            }}
+            onLaunchCompute={() => {
+              s.setComputeExperiment(defaultComputeExperimentForm());
+              s.openPrefilledTaskModal({ taskType: 'compute_experiment', title: '', prompt: '' });
+            }}
+            onDuplicateTask={async (taskId) => {
+              const target = s.tasks.find(t => t.id === taskId);
+              if (target) {
+                s.openDuplicateTaskModal(target);
+              } else {
+                fetchTask(taskId).then(s.openDuplicateTaskModal).catch(() => { s.addToast('Could not load task — it may have been deleted', 'error'); });
+              }
             }}
           />
         </ErrorBoundary>

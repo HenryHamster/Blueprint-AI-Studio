@@ -7768,6 +7768,100 @@ class TestEditRunningUpdate:
         assert resp.status_code == 404
 
 
+class TestDismissPendingConfirmation:
+    """POST /pending-confirm/{id}/dismiss removes a pending_user_confirmation
+    item from problem_model and bumps the revision."""
+
+    @pytest.mark.asyncio
+    async def test_dismiss_removes_item_and_bumps_revision(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 3,
+            "last_updated": "2026-01-01T00:00:00",
+            "last_updated_by": "agent",
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [
+                {
+                    "id": "p-abc12345",
+                    "type": "major_decision",
+                    "proposal": "Should we migrate to Postgres 16?",
+                    "rationale": "Performance improvements.",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+                {
+                    "id": "p-def67890",
+                    "type": "credentials_needed",
+                    "proposal": "Need AWS credentials.",
+                    "created_at": "2026-01-02T00:00:00",
+                },
+            ],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-abc12345/dismiss"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "dismissed"
+        assert data["pending_id"] == "p-abc12345"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert len(pm["pending_user_confirmation"]) == 1
+        assert pm["pending_user_confirmation"][0]["id"] == "p-def67890"
+        assert pm["revision"] == 4
+        assert pm["last_updated_by"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_dismiss_unknown_id_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 1,
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-notexist/dismiss"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_dismiss_requires_project_access(
+        self, client: AsyncClient, db_session
+    ):
+        other = Project(name="Other", user_id="other-user")
+        db_session.add(other)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/pending-confirm/p-abc12345/dismiss"
+        )
+        assert resp.status_code == 404
+
+
 class TestBuildDeployStatePayload:
     """Regression: WS broadcasts use websocket.send_json which lacks FastAPI's
     JSON encoder, so any datetime in the payload raised

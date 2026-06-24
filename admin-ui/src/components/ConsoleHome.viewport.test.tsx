@@ -22,7 +22,16 @@ vi.mock('../api', () => ({
           trend: 'stable',
           trend_history: [],
           completed_count: 10,
-          needs_attention: [],
+          needs_attention: [
+            {
+              task_id: 'task-approval-1',
+              title: 'compute_experiment: benchmark new inference pipeline on GPU cluster',
+              reason: 'approval_required',
+              spend_cap_usd: 250.0,
+              deadline_seconds: 86400,
+              waiting_hours: 2,
+            },
+          ],
         }),
         { status: 200 },
       );
@@ -109,6 +118,19 @@ describe('ConsoleHome — viewport regression', () => {
       document.body.appendChild(host);
       root = createRoot(host);
       await act(async () => { render(root!); });
+    });
+  });
+
+  test('NeedsAttentionSection renders spend cap and deadline at 1280px without overflow', async () => {
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { render(root!); });
+      // Verify spend cap and deadline text are present
+      const capText = host.textContent ?? '';
+      if (!capText.includes('$250.00')) throw new Error('spend_cap_usd not rendered');
+      if (!capText.includes('24h')) throw new Error('deadline_seconds not rendered');
     });
   });
 });

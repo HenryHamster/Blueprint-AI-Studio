@@ -772,6 +772,47 @@ async def edit_running_update(
     }
 
 
+@router.post("/projects/{project_id}/pending-confirm/{pending_id}/dismiss")
+@limiter.limit("30/minute")
+async def dismiss_pending_confirmation(
+    request: Request,
+    project_id: uuid.UUID,
+    pending_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Dismiss a strategist pending_user_confirmation item in-place.
+
+    The strategist posts pending_user_confirmation items for external blockers
+    (credentials needed, access needed, major decisions). Once the operator
+    takes action they can dismiss the item here rather than waiting for the
+    next autonomous strategic cycle to clear it.
+    """
+    from app.problem_model import parse_problem_model
+    from app.time_utils import _utcnow
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    current_model = parse_problem_model(project.problem_model)
+    before = len(current_model.pending_user_confirmation)
+    current_model.pending_user_confirmation = [
+        p for p in current_model.pending_user_confirmation if p.id != pending_id
+    ]
+    if len(current_model.pending_user_confirmation) == before:
+        raise HTTPException(
+            status_code=404, detail=f"Pending confirmation '{pending_id}' not found"
+        )
+    current_model.revision += 1
+    current_model.last_updated = _utcnow().isoformat()
+    current_model.last_updated_by = "user"
+    project.problem_model = current_model.model_dump()
+    flag_modified(project, "problem_model")
+    session.add(project)
+    await session.commit()
+    return {"status": "dismissed", "pending_id": pending_id}
+
+
 @router.delete("/projects/{project_id}")
 @limiter.limit("10/minute")
 async def delete_project_admin(

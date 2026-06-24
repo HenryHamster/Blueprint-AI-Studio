@@ -428,14 +428,15 @@ export function MessageBubble({
                   type="text"
                   value={resolveInput}
                   onChange={e => onSetResolveInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter') onResolve(msg.id, resolveInput); if (e.key === 'Escape') onCancelResolve(); }}
-                  placeholder="Note (optional)..."
+                  onKeyDown={e => { if (e.key === 'Enter' && (msg.message_type !== 'QUESTION' || resolveInput.trim())) onResolve(msg.id, resolveInput); if (e.key === 'Escape') onCancelResolve(); }}
+                  placeholder={msg.message_type === 'QUESTION' ? 'Your answer (required)...' : 'Note (optional)...'}
                   className="bg-transparent text-neutral-300 text-xs focus:outline-none w-36 md:w-48 placeholder-neutral-600"
                   autoFocus
                 />
                 <button
                   onClick={() => onResolve(msg.id, resolveInput)}
-                  className="text-emerald-400 hover:text-emerald-300 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                  disabled={msg.message_type === 'QUESTION' && !resolveInput.trim()}
+                  className="text-emerald-400 hover:text-emerald-300 p-1 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                   title="Confirm resolve"
                 >
                   <Check className="w-3 h-3" />

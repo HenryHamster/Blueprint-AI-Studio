@@ -52,6 +52,19 @@ function NeedsAttentionSection({
               {item.error_snippet && (
                 <p className="text-ui-sm text-neutral-500 mt-0.5 truncate font-mono">{item.error_snippet}</p>
               )}
+              {(item.spend_cap_usd != null || item.deadline_seconds != null) && (
+                <p className="text-ui-sm text-neutral-400 mt-0.5">
+                  {item.spend_cap_usd != null && <span>Cap: ${item.spend_cap_usd.toFixed(2)}</span>}
+                  {item.spend_cap_usd != null && item.deadline_seconds != null && <span className="mx-1">·</span>}
+                  {item.deadline_seconds != null && (
+                    <span>
+                      Deadline: {item.deadline_seconds < 3600
+                        ? `${Math.round(item.deadline_seconds / 60)}m`
+                        : `${Math.round(item.deadline_seconds / 3600)}h`}
+                    </span>
+                  )}
+                </p>
+              )}
             </div>
             {item.waiting_hours != null && item.waiting_hours > 0 && (
               <span className="shrink-0 flex items-center gap-1 text-ui-sm text-neutral-500">

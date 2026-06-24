@@ -3630,3 +3630,13 @@ export async function declareCapabilityVerdict(
   if (!res.ok) throw new Error(`Failed to declare capability verdict: ${res.status}`);
 }
 
+export async function dismissPendingConfirmation(
+  projectId: string,
+  pendingId: string,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/pending-confirm/${encodeURIComponent(pendingId)}/dismiss`,
+    { method: 'POST' },
+  );
+  if (!res.ok) throw new Error(`Failed to dismiss pending confirmation: ${res.status}`);
+}

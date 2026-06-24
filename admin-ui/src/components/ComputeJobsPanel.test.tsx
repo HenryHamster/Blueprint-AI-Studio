@@ -1180,6 +1180,13 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('criterion-margin')).toBeNull();
   });
 
+  test('renders empty-state prompt when projectId is null', async () => {
+    const { findByText, queryByRole } = render(<ComputeJobsPanel projectId={null} />);
+    await findByText('Select a project to view compute experiments');
+    expect(queryByRole('button', { name: 'Kill' })).toBeNull();
+    expect(fetchComputeJobs).not.toHaveBeenCalled();
+  });
+
   test('terminal job with null measured value does not show margin', async () => {
     fetchComputeJobs.mockResolvedValue([
       makeJob({
