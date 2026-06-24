@@ -738,6 +738,48 @@ def mock_api(monkeypatch):
         if "/compute-jobs/" in path and "/analyze" in path and method == "POST":
             job_id = path.split("/compute-jobs/")[1].split("/")[0]
             return {"outcome": "success", "knowledge_document_id": "kdoc-abc123", "job_id": job_id}
+        if "/compute-jobs/" in path and method == "GET":
+            # Detail endpoint: GET /api/admin/compute-jobs/{id}
+            job_id = path.split("/compute-jobs/")[1].split("/")[0]
+            _ALL_MOCK_JOBS = [
+                {"id": "cjob-aaa0-0000-0000-000000000001",
+                 "status": "RUNNING", "task_title": "GPU benchmark alpha",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": None,
+                 "experiment": "exp-alpha",
+                 "hypothesis": "GPU is faster",
+                 "criterion_verdict": None,
+                 "success_criterion": {"metric": "latency_ms", "operator": "lt", "threshold": 100}},
+                {"id": "cjob-bbb0-0000-0000-000000000002",
+                 "status": "SUCCEEDED", "task_title": "GPU benchmark beta",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 12.5,
+                 "experiment": "exp-beta",
+                 "hypothesis": "Quantization works",
+                 "criterion_verdict": {"met": True, "metric": "latency_ms", "operator": "lt", "threshold": 100, "value": 80.0, "measurable": True},
+                 "polling_metadata": {"result_metrics": {"latency_ms": 80.0, "arms": {"arm_a": {"latency_ms": 75.0}, "arm_b": {"latency_ms": 85.0}}},
+                                      "command_log": {"text": "Starting GPU benchmark...\nRunning test 1\nTest passed", "truncated": False}},
+                 "success_criterion": {"metric": "latency_ms", "operator": "lt", "threshold": 100}},
+                {"id": "cjob-ccc0-0000-0000-000000000003",
+                 "status": "SUCCEEDED", "task_title": "Arm transcript test",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 5.2,
+                 "experiment": "exp-gamma",
+                 "criterion_verdict": {"met": True, "metric": "score", "operator": "gt", "threshold": 0.8, "value": 0.95, "measurable": True},
+                 "polling_metadata": {"result_metrics": {"score": 0.95, "arms": {"baseline": {"score": 0.85, "label": "baseline version", "note": "original implementation", "log": "baseline test output\nall checks passed"}, "optimized": {"score": 0.95, "label": "optimized version", "note": "after refactoring", "log": "optimized test output\nperformance improved"}}},
+                                      "command_log": {"text": "Setup phase complete\nRunning comprehensive benchmark\nResults collected\nAnalysis complete", "truncated": False}},
+                 "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.8}},
+                {"id": "cjob-old0-0000-0000-000000000201",
+                 "status": "SUCCEEDED", "task_title": "Old job beyond 200 cap",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 3.0,
+                 "criterion_verdict": {"met": True, "metric": "score", "operator": "gt", "threshold": 0.5, "value": 0.9, "measurable": True},
+                 "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.5}},
+            ]
+            job = next((j for j in _ALL_MOCK_JOBS if j["id"] == job_id), None)
+            if job is None:
+                raise Exception(f"404 compute job not found: {job_id}")
+            return {"compute_job": job}
         if "/compute-jobs" in path:
             return {
                 "compute_jobs": [
@@ -3328,6 +3370,8 @@ def test_compute_show_live_cost_telemetry(monkeypatch, capsys):
     }
 
     def fake_api(method, path, body=None, timeout=30):
+        if method == "GET" and f"/compute-jobs/{active_job['id']}" in path:
+            return {"compute_job": active_job}
         return {"compute_jobs": [active_job], "has_more": False}
 
     monkeypatch.setattr(blueprint, "api", fake_api)
@@ -3353,3 +3397,18 @@ def test_compute_show_live_cost_telemetry(monkeypatch, capsys):
     # deadline displayed
     assert "deadline" in out
     assert "2099" in out
+
+
+def test_compute_show_resolves_job_beyond_200_cap(mock_api, capsys):
+    """compute show resolves a job whose id is not in the list-endpoint results (beyond the 200 cap)."""
+    # This job id is served by the detail endpoint mock but NOT in the list response
+    job_id = "cjob-old0-0000-0000-000000000201"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert job_id in out
+    assert "SUCCEEDED" in out
+    assert "Old job beyond 200 cap" in out
+    # Verify the detail endpoint was called (not just the list)
+    detail_calls = [p for m, p, _ in mock_api if m == "GET" and f"/compute-jobs/{job_id}" in p]
+    assert detail_calls, "Expected GET /api/admin/compute-jobs/{id} to be called"

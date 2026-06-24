@@ -3525,9 +3525,21 @@ def _compute_kill(args: argparse.Namespace) -> None:
 def _compute_show(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
     job_id = args.job_id
-    resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs?all_terminal=true&limit=200")
-    jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
-    job = next((j for j in jobs if j.get("id", "").startswith(job_id) or j.get("id") == job_id), None)
+    # Prefix-match: fetch list and resolve when a short prefix is given.
+    # Full IDs have 4 dashes (e.g. cjob-aaa0-0000-0000-000000000001); fewer
+    # dashes means the caller supplied a prefix.
+    if job_id.count("-") < 4:
+        resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs?all_terminal=true&limit=200")
+        jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
+        job = next((j for j in jobs if j.get("id", "").startswith(job_id)), None)
+        if job is None:
+            print(f"No compute job found matching '{job_id}'.")
+            return
+        full_id = job["id"]
+    else:
+        full_id = job_id
+    resp2 = api("GET", f"/api/admin/compute-jobs/{full_id}")
+    job = resp2.get("compute_job") if isinstance(resp2, dict) else None
     if job is None:
         print(f"No compute job found matching '{job_id}'.")
         return
