@@ -190,7 +190,7 @@ export function ComposeDrawer({
               <button
                 type="button"
                 onClick={() => { setNewType(msg.message_type); setNewContent(msg.content); }}
-                className="flex items-start gap-2 flex-1 text-left min-h-[44px]"
+                className="flex items-start gap-2 flex-1 min-w-0 text-left min-h-[44px]"
               >
                 <span className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 font-medium shrink-0 uppercase">{msg.message_type}</span>
                 <span className="text-xs text-neutral-300 truncate flex-1">{msg.content}</span>
@@ -198,12 +198,11 @@ export function ComposeDrawer({
                   <span className="text-ui-sm text-neutral-600 shrink-0">{timeAgo(msg.created_at)}</span>
                 )}
               </button>
-              {/* eslint-disable-next-line viewport/min-touch-target */}
               <button
                 type="button"
                 onClick={() => { void handleResend(msg); }}
                 disabled={submitting}
-                className="p-1 text-neutral-500 hover:text-neutral-300 transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="p-1 text-neutral-500 hover:text-neutral-300 transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] flex items-center justify-center"
                 title="Resend message"
               >
                 <Send className="w-4 h-4" />
