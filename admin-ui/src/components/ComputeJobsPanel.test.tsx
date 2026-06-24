@@ -18,6 +18,7 @@ const killComputeJob = vi.fn();
 const analyzeComputeJob = vi.fn();
 const fetchKnowledgeDocument = vi.fn();
 const resolveArtifactDownloadUrl = vi.fn();
+const fetchComputeJobsAggregateSummary = vi.fn();
 
 vi.mock('../api', () => ({
   fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
@@ -29,6 +30,7 @@ vi.mock('../api', () => ({
   analyzeComputeJob: (...args: unknown[]) => analyzeComputeJob(...args),
   fetchKnowledgeDocument: (...args: unknown[]) => fetchKnowledgeDocument(...args),
   resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
+  fetchComputeJobsAggregateSummary: (...args: unknown[]) => fetchComputeJobsAggregateSummary(...args),
 }));
 
 function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
@@ -189,6 +191,7 @@ describe('ComputeJobsPanel render + kill', () => {
     analyzeComputeJob.mockReset();
     fetchKnowledgeDocument.mockReset();
     resolveArtifactDownloadUrl.mockReset();
+    fetchComputeJobsAggregateSummary.mockReset();
     vi.restoreAllMocks();
   });
 
@@ -1639,5 +1642,105 @@ describe('ComputeJobsPanel render + kill', () => {
     await waitFor(() => expect(document.querySelector('[data-testid="compute-load-more"]')).toBeNull());
     // fetchComputeJobs called with offset=1 for the second page
     expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', undefined, { includeFinishedMinutes: 360, offset: 1 });
+  });
+
+  test('renders lifetime aggregate summary via fetchComputeJobsAggregateSummary', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 2.5,
+      }),
+    ]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue({
+      total_jobs: 150,
+      active_jobs: 0,
+      terminal_jobs: 150,
+      total_spend_usd: 87.50,
+      outcome_breakdown: { SUCCESS: 120, FAILURE: 30 },
+      criterion_measured: 100,
+      criterion_met: 85,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const lifetime = await findByTestId('compute-lifetime-summary');
+    expect(lifetime.textContent).toContain('Lifetime');
+    expect(lifetime.textContent).toContain('150');
+    expect(lifetime.textContent).toContain('$87.50');
+    expect(lifetime.textContent).toContain('85/100');
+    // Verify lifetime summary is fetched for the project
+    expect(fetchComputeJobsAggregateSummary).toHaveBeenCalledWith('proj-1');
+  });
+
+  test('lifetime summary and windowed summary are distinct', async () => {
+    const windowedJob = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.5,
+    });
+    fetchComputeJobs.mockResolvedValue({
+      jobs: [windowedJob],
+      hasMore: false,
+      summary: {
+        total_jobs: 5,
+        active_jobs: 0,
+        terminal_jobs: 5,
+        total_spend_usd: 12.50,
+        outcome_breakdown: { SUCCESS: 4, FAILURE: 1 },
+        criterion_measured: 3,
+        criterion_met: 2,
+      },
+      limit: 50,
+      offset: 0,
+    });
+    fetchComputeJobsAggregateSummary.mockResolvedValue({
+      total_jobs: 150,
+      active_jobs: 0,
+      terminal_jobs: 150,
+      total_spend_usd: 87.50,
+      outcome_breakdown: { SUCCESS: 120, FAILURE: 30 },
+      criterion_measured: 100,
+      criterion_met: 85,
+    });
+    const { findByTestId, container } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Both summaries should render
+    await findByTestId('compute-lifetime-summary');
+    await findByTestId('compute-jobs-summary');
+    // Lifetime totals: 150 total, $87.50 spend
+    const lifetime = container.querySelector('[data-testid="compute-lifetime-summary"]');
+    expect(lifetime?.textContent).toContain('150');
+    expect(lifetime?.textContent).toContain('$87.50');
+    // Windowed totals: 5 total, $12.50 spend
+    const windowed = container.querySelector('[data-testid="compute-jobs-summary"]');
+    expect(windowed?.textContent).toContain('5');
+    expect(windowed?.textContent).toContain('$12.50');
+    // Labels must be present to distinguish them
+    expect(lifetime?.textContent).toContain('Lifetime');
+    expect(windowed?.textContent).toContain('Windowed');
+  });
+
+  test('lifetime summary gracefully handles fetch errors', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchComputeJobsAggregateSummary.mockRejectedValue(new Error('network error'));
+    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Component still renders without crashing despite the fetch error
+    await findByText('No compute jobs');
+    // Lifetime summary block is absent (no data)
+    expect(document.querySelector('[data-testid="compute-lifetime-summary"]')).toBeNull();
+  });
+
+  test('lifetime summary does not render when total_jobs is 0', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue({
+      total_jobs: 0,
+      active_jobs: 0,
+      terminal_jobs: 0,
+      total_spend_usd: 0,
+      outcome_breakdown: {},
+      criterion_measured: 0,
+      criterion_met: 0,
+    });
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('No compute jobs');
+    expect(queryByTestId('compute-lifetime-summary')).toBeNull();
   });
 });

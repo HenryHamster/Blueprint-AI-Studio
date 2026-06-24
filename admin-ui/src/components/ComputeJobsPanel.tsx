@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobsPaged, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -362,6 +362,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [summary, setSummary] = useState<ComputeJobsSummary | null>(null);
+  const [lifetimeSummary, setLifetimeSummary] = useState<ComputeJobsSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [finishedWindowMinutes, setFinishedWindowMinutes] = useState(360);
@@ -421,6 +422,18 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     enabled: !!projectId,
     deps: [projectId, finishedWindowMinutes, allTerminal],
   });
+
+  // Fetch lifetime aggregate summary once per project (unbounded lifetime totals).
+  useEffect(() => {
+    if (!projectId) return;
+    let aborted = false;
+    Promise.resolve(fetchComputeJobsAggregateSummary(projectId)).then((summary) => {
+      if (!aborted) setLifetimeSummary(summary);
+    }).catch(() => {
+      // Non-fatal: lifetime summary is informational, doesn't block the panel
+    });
+    return () => { aborted = true; };
+  }, [projectId]);
 
   // Auto-fetch durable knowledge docs for terminal jobs that have a knowledge_document_id.
   useEffect(() => {
@@ -548,11 +561,35 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         </div>
       </div>
 
+      {lifetimeSummary && lifetimeSummary.total_jobs > 0 && (
+        <div
+          className="mb-2 flex flex-wrap gap-x-4 gap-y-0.5 text-ui-sm font-mono text-neutral-400"
+          data-testid="compute-lifetime-summary"
+        >
+          <span className="text-neutral-500 text-xs uppercase tracking-widest">Lifetime</span>
+          <span>
+            <span className="text-neutral-500">total</span> {lifetimeSummary.total_jobs}
+          </span>
+          {lifetimeSummary.total_spend_usd > 0 && (
+            <span>
+              <span className="text-neutral-500">spend</span> {fmtUsd(lifetimeSummary.total_spend_usd)}
+            </span>
+          )}
+          {lifetimeSummary.criterion_measured > 0 && (
+            <span>
+              <span className="text-neutral-500">criterion</span>{' '}
+              {lifetimeSummary.criterion_met}/{lifetimeSummary.criterion_measured} met
+            </span>
+          )}
+        </div>
+      )}
+
       {summary && summary.total_jobs > 0 && (
         <div
           className="mb-3 flex flex-wrap gap-x-4 gap-y-0.5 text-ui-sm font-mono text-neutral-400"
           data-testid="compute-jobs-summary"
         >
+          <span className="text-neutral-500 text-xs uppercase tracking-widest">Windowed</span>
           <span>
             <span className="text-neutral-500">total</span> {summary.total_jobs}
           </span>
