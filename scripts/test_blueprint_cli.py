@@ -130,6 +130,7 @@ HELP_INVOCATIONS = [
     ["messages"],
     ["messages", "list"],
     ["messages", "send"],
+    ["messages", "answer"],
     ["fleet"],
     ["fleet", "pool"],
     ["fleet", "warm"],
@@ -138,6 +139,9 @@ HELP_INVOCATIONS = [
     ["envelope"],
     ["envelope", "show"],
     ["envelope", "set"],
+    ["knowledge"],
+    ["knowledge", "list"],
+    ["knowledge", "show"],
     ["compute"],
     ["compute", "list"],
     ["compute", "kill"],
@@ -491,6 +495,10 @@ def mock_api(monkeypatch):
                 "active_vm_count": 3,
                 "is_throttled": False,
             }
+        if "/messages" in path and "/answer" in path and method == "POST":
+            msg_id = path.split("/messages/")[1].split("/answer")[0]
+            return {"id": f"answer-{msg_id[:8]}", "parent_message_id": msg_id,
+                    "status": "created", "type": "ANSWER"}
         if "/messages" in path and method == "POST":
             return {"id": "msg-abc", "status": "created", "arming": "not_armed"}
         if "/messages" in path:
@@ -666,6 +674,35 @@ def mock_api(monkeypatch):
                 "window_minutes": 15,
                 "generated_at": "2026-06-18T00:00:00",
             }
+        if "/knowledge/" in path and method == "GET":
+            doc_id = path.split("/knowledge/")[1].split("?")[0]
+            return {
+                "id": doc_id,
+                "title": "Research on test coverage",
+                "source_kind": "web_research",
+                "direction_id": "d-abc12345",
+                "created_at": "2026-06-15T00:00:00Z",
+                "body": "## Findings\n\nTest coverage is important for reliability.",
+            }
+        if "/knowledge" in path and method == "GET":
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(path).query)
+            docs = [
+                {"id": "kdoc-001", "title": "API Rate Limiting", "source_kind": "web_research",
+                 "direction_id": "d-abc12345", "created_at": "2026-06-15T00:00:00Z"},
+                {"id": "kdoc-002", "title": "Design Patterns", "source_kind": "design",
+                 "direction_id": "d-def67890", "created_at": "2026-06-14T00:00:00Z"},
+            ]
+            direction_f = qs.get("direction_id", [None])[0]
+            source_kind_f = qs.get("source_kind", [None])[0]
+            q_f = qs.get("q", [None])[0]
+            if direction_f:
+                docs = [d for d in docs if d.get("direction_id") == direction_f]
+            if source_kind_f:
+                docs = [d for d in docs if d.get("source_kind") == source_kind_f]
+            if q_f:
+                docs = [d for d in docs if q_f.lower() in (d.get("title") or "").lower()]
+            return {"documents": docs, "total": len(docs)}
         if "/compute-jobs/" in path and "/kill" in path and method == "POST":
             job_id = path.split("/compute-jobs/")[1].split("/")[0]
             return {"compute_job": {"id": job_id, "status": "CANCELLED"}}
@@ -2555,6 +2592,39 @@ def test_messages_group(mock_api, monkeypatch, capsys):
     assert exc.value.code == 1
 
 
+def test_messages_answer(mock_api, monkeypatch, capsys):
+    """messages answer sends a threaded reply linked to the target message id."""
+
+    # --- answer posts correct body with message_id in URL ---
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    mock_api.clear()
+    rc = blueprint.main(["messages", "answer", "msg-002", "yes, we are stuck"])
+    assert rc == 0
+    post_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/answer" in p]
+    assert len(post_calls) == 1
+    _, path, body = post_calls[0]
+    assert "/messages/msg-002/answer" in path
+    assert body["content"] == "yes, we are stuck"
+    out = capsys.readouterr().out
+    assert "answer-msg" in out
+
+    # --- answer with --json emits valid JSON with parent_message_id ---
+    mock_api.clear()
+    rc = blueprint.main(["--json", "messages", "answer", "msg-002", "response text"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["parent_message_id"] == "msg-002"
+    assert parsed["type"] == "ANSWER"
+
+    # --- read-only config refuses answer ---
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["messages", "answer", "msg-002", "blocked answer"])
+    assert exc.value.code == 1
+
+
 # ── envelope group ────────────────────────────────────────────────────────────
 
 def test_envelope_show(mock_api, monkeypatch, capsys):
@@ -2764,6 +2834,38 @@ def test_envelope_set_patches_envelope(mock_api, monkeypatch, capsys):
         m == "PATCH" and "resource-envelope" in p
         for m, p, _ in mock_api
     )
+
+
+# ── knowledge ─────────────────────────────────────────────────────────────────
+
+def test_knowledge_list_applies_filters(mock_api, capsys):
+    """knowledge list applies direction and source-kind filters to the API request path."""
+    rc = blueprint.main([
+        "knowledge", "list",
+        "--direction", "d-abc12345",
+        "--source-kind", "web_research",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "KNOWLEDGE LIBRARY" in out
+    # Both filter params must appear in the request URL
+    assert any("direction_id=d-abc12345" in path for _, path, _ in mock_api)
+    assert any("source_kind=web_research" in path for _, path, _ in mock_api)
+    # The matching document is rendered; the design doc (different direction) is not
+    assert "API Rate Limiting" in out
+    assert "Design Patterns" not in out
+
+
+def test_knowledge_show_renders_document_body(mock_api, capsys):
+    """knowledge show <id> renders the document title, metadata, and body text."""
+    rc = blueprint.main(["knowledge", "show", "kdoc-001"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "KNOWLEDGE" in out
+    assert "Research on test coverage" in out
+    # body is rendered verbatim
+    assert "## Findings" in out
+    assert "Test coverage is important for reliability" in out
 
 
 # ── compute command group ─────────────────────────────────────────────────────

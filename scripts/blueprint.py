@@ -1822,10 +1822,12 @@ def _render_envelope(data: dict) -> None:
 # ── messages ─────────────────────────────────────────────────────────────────
 
 def cmd_messages(args: argparse.Namespace) -> None:
-    """Dispatch messages subcommands: list / send."""
+    """Dispatch messages subcommands: list / send / answer."""
     sub = getattr(args, "messages_cmd", None) or "list"
     if sub == "send":
         _messages_send(args)
+    elif sub == "answer":
+        _messages_answer(args)
     else:
         _messages_list(args)
 
@@ -1872,6 +1874,24 @@ def _messages_send(args: argparse.Namespace) -> None:
         "message_type": getattr(args, "type", "FEEDBACK"),
     })
     _emit(args, result, lambda d: print(f"  Message sent: {d.get('id', '?')}"))
+
+
+def _messages_answer(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if cfg.get("read_only"):
+        print(
+            "ERROR: 'answer' is a mutating action but the resolved config is "
+            "read-only (agent-JWT fallback). Provide an admin API key "
+            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    pid = get_project_id(getattr(args, "project_id", None))
+    message_id = args.message_id
+    result = api("POST", f"/api/admin/projects/{pid}/messages/{message_id}/answer", {
+        "content": args.content,
+    })
+    _emit(args, result, lambda d: print(f"  Answer sent: {d.get('id', '?')}"))
 
 
 # ── fleet (pool / warm / accounts / zones) ────────────────────────────────────
@@ -3218,6 +3238,75 @@ def _render_playbook(data: dict) -> None:
         print(f"  {k}: {(content or '')[:120]}")
 
 
+# ── knowledge ────────────────────────────────────────────────────────────────
+
+def cmd_knowledge(args: argparse.Namespace) -> None:
+    """Dispatch knowledge subcommands: list / show."""
+    sub = getattr(args, "knowledge_cmd", None) or "list"
+    if sub == "show":
+        _knowledge_show(args)
+    else:
+        _knowledge_list(args)
+
+
+def _knowledge_list(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    path = f"/api/admin/projects/{pid}/knowledge?limit={getattr(args, 'limit', 20)}"
+    if getattr(args, "direction", None):
+        path += f"&direction_id={args.direction}"
+    if getattr(args, "source_kind", None):
+        path += f"&source_kind={args.source_kind}"
+    if getattr(args, "q", None):
+        from urllib.parse import quote
+        path += f"&q={quote(args.q)}"
+    if getattr(args, "topic", None):
+        from urllib.parse import quote
+        path += f"&topic={quote(args.topic)}"
+    resp = api("GET", path)
+    docs = resp.get("documents", resp) if isinstance(resp, dict) else resp
+    total = resp.get("total") if isinstance(resp, dict) else None
+    _emit(args, {"documents": docs, "total": total}, _render_knowledge_list)
+
+
+def _render_knowledge_list(data: dict) -> None:
+    docs = data.get("documents") or []
+    total = data.get("total")
+    suffix = f" / {total} total" if total is not None else ""
+    print(f"=== KNOWLEDGE LIBRARY ({len(docs)} shown{suffix}) ===")
+    if not docs:
+        print("  (none)")
+        return
+    for d in docs:
+        did = (d.get("id") or "?")[:12]
+        kind = d.get("source_kind", "?")
+        title = (d.get("title") or "")[:60]
+        direction = (d.get("direction_id") or "")[:12]
+        created = (d.get("created_at") or "")[:10]
+        dir_str = f"  dir={direction}" if direction else ""
+        print(f"  {did}  [{kind:12}] {created}  {title}{dir_str}")
+
+
+def _knowledge_show(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    doc = api("GET", f"/api/admin/projects/{pid}/knowledge/{args.doc_id}")
+    _emit(args, doc, _render_knowledge_doc)
+
+
+def _render_knowledge_doc(doc: dict) -> None:
+    print(f"=== KNOWLEDGE: {doc.get('id', '?')} ===")
+    print(f"  Title:       {doc.get('title', '?')}")
+    print(f"  Source kind: {doc.get('source_kind', '?')}")
+    created = (doc.get("created_at") or "")[:19]
+    if created:
+        print(f"  Created:     {created}")
+    direction = doc.get("direction_id")
+    if direction:
+        print(f"  Direction:   {direction}")
+    body = doc.get("body") or doc.get("content") or ""
+    if body:
+        print(f"\n{body}")
+
+
 # ── compute ───────────────────────────────────────────────────────────────────
 
 def cmd_compute(args: argparse.Namespace) -> None:
@@ -3611,6 +3700,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--type", default="FEEDBACK",
         help="Message type: FEEDBACK|NOTE|BUG_REPORT|QUESTION|BLOCKER (default FEEDBACK).",
     )
+    p_msgs_answer = msgs_sub.add_parser("answer", parents=[common],
+                                        help="Answer a QUESTION message with a threaded reply.")
+    p_msgs_answer.add_argument("message_id", help="ID of the message to answer.")
+    p_msgs_answer.add_argument("content", help="Answer content.")
 
     # logs
     p_logs = sub.add_parser("logs", parents=[common], help="Read Cloud Run logs via gcloud.",
@@ -3792,6 +3885,26 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Close all open cases with a matching class prefix.")
     p_rc.add_argument("--reason", help="Reason for closing (recorded on the case).")
 
+    # knowledge
+    p_knowledge = sub.add_parser(
+        "knowledge", parents=[common],
+        help="Browse the knowledge library (web_research / design documents).",
+        description="List and show knowledge documents accumulated across research cycles. "
+                    "Defaults to `list` when no subcommand is given.")
+    knowledge_sub = p_knowledge.add_subparsers(dest="knowledge_cmd")
+    p_kl = knowledge_sub.add_parser("list", parents=[common],
+                                    help="List knowledge documents with optional filters.")
+    p_kl.add_argument("--direction", help="Filter by direction id.")
+    p_kl.add_argument("--source-kind", dest="source_kind",
+                      help="Filter by source kind (e.g. web_research, design).")
+    p_kl.add_argument("--q", help="Full-text search query.")
+    p_kl.add_argument("--topic", help="Filter by topic.")
+    p_kl.add_argument("--limit", type=int, default=20,
+                      help="Max documents to return (default 20).")
+    p_ks = knowledge_sub.add_parser("show", parents=[common],
+                                    help="Show a knowledge document with its full body.")
+    p_ks.add_argument("doc_id", help="Knowledge document id.")
+
     # compute
     p_compute = sub.add_parser(
         "compute", parents=[common],
@@ -3862,6 +3975,7 @@ _DISPATCH = {
     "fingerprints": cmd_fingerprints,
     "regression-cases": cmd_regression_cases,
     "playbook": cmd_playbook,
+    "knowledge": cmd_knowledge,
     "compute": cmd_compute,
 }
 

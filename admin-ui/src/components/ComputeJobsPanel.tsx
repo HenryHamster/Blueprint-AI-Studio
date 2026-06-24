@@ -12,6 +12,8 @@ import {
   computeJobRpcDiagnostic,
   computeJobSpent,
   computeJobRuntimeSec,
+  computeJobBurnRate,
+  computeJobProjectedSpend,
   computeJobMargin,
   fmtUsd,
   fmtCountdown,
@@ -508,6 +510,43 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 </div>
               </div>
 
+              {(() => {
+                if (!active) return null;
+                const burnRate = computeJobBurnRate(job, nowMs);
+                if (burnRate == null) return null;
+                const projected = computeJobProjectedSpend(job, burnRate, nowMs);
+                const cap = job.spend_cap_usd ?? 0;
+                const willExceedCap = projected != null && cap > 0 && projected > cap;
+                return (
+                  <>
+                    <div className="mb-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-400 font-mono" data-testid="compute-burn-rate">
+                      <span>
+                        <span className="text-neutral-500">rate</span>{' '}
+                        {fmtUsd(burnRate)}/hr
+                      </span>
+                      {projected != null && (
+                        <span>
+                          <span className="text-neutral-500">projected</span>{' '}
+                          {fmtUsd(projected)}
+                        </span>
+                      )}
+                    </div>
+                    {willExceedCap && (
+                      <div
+                        className="mb-1.5 rounded border border-red-500/40 bg-red-500/10 px-2 py-1.5 text-ui-sm text-red-200"
+                        data-testid="compute-budget-kill-warning"
+                      >
+                        <div className="flex items-start gap-1.5">
+                          <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+                          <span>
+                            At current burn rate ({fmtUsd(burnRate)}/hr), this job will hit the spend cap ({fmtUsd(cap)}) before its deadline and be killed.
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
               {(() => {
                 if (active) return null;
                 const runtimeSec = computeJobRuntimeSec(job);

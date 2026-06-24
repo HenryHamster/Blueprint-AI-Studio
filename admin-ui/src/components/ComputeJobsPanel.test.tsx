@@ -973,6 +973,45 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('experiment-sweep-summary')).toBeNull();
   });
 
+  test('running job projected to exceed spend cap before deadline shows a budget-kill warning', async () => {
+    // Job started 1 hour ago, has accrued $3 of a $4 cap, deadline is 2h away.
+    // Burn rate = $3/hr; projected additional = $3 * 2hr = $6; total projected = $9 > $4 cap.
+    const startedAt = new Date(Date.now() - 3600 * 1000).toISOString();
+    const deadline = new Date(Date.now() + 2 * 3600 * 1000).toISOString();
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'RUNNING',
+        accrued_cost_usd: 3.0,
+        spend_cap_usd: 4.0,
+        started_at: startedAt,
+        wall_clock_deadline: deadline,
+      }),
+    ]);
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const warning = await findByTestId('compute-budget-kill-warning');
+    expect(warning.textContent).toContain('$4.00');
+    expect(warning.textContent).toContain('/hr');
+  });
+
+  test('running job on track to finish within budget shows no budget-kill warning', async () => {
+    // Job started 1 hour ago, accrued $1 of $10 cap, deadline 1hr away.
+    // Burn rate = $1/hr; projected total = $2 < $10 cap.
+    const startedAt = new Date(Date.now() - 3600 * 1000).toISOString();
+    const deadline = new Date(Date.now() + 3600 * 1000).toISOString();
+    fetchComputeJobs.mockResolvedValue([
+      makeJob({
+        status: 'RUNNING',
+        accrued_cost_usd: 1.0,
+        spend_cap_usd: 10.0,
+        started_at: startedAt,
+        wall_clock_deadline: deadline,
+      }),
+    ]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-budget-kill-warning')).toBeNull();
+  });
+
   test('renders run comparison matrix with per-metric best highlight', async () => {
     // job1: accuracy=0.85 (unmet), loss=0.3, cost=$1.00
     // job2: accuracy=0.93 (met), loss=0.2, cost=$2.00
