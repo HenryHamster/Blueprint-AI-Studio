@@ -1566,6 +1566,107 @@ export interface LlmCostAttribution {
   by_task_type?: LlmCostCompactTaskTypeRow[] | null;
 }
 
+/** One entry in the day-over-day LLM cost attribution trend. */
+export interface LlmCostAttributionTrendEntry {
+  captured_at?: string | null;
+  by_model?: LlmCostCompactModelRow[] | null;
+  by_task_type?: LlmCostCompactTaskTypeRow[] | null;
+  rework_share?: number | null;
+  total_llm_usd?: number | null;
+  self_repair_burn_share?: number | null;
+}
+
+/** Per-scalar slot in a cost-attribution delta (baseline/recent/prior vs current). */
+export interface LlmCostScalarDelta {
+  baseline?: number | null;
+  current?: number | null;
+  abs_delta?: number | null;
+  rel_pct?: number | null;
+}
+
+/** Per-scalar slot specific to the window delta (prior vs recent). */
+export interface LlmCostWindowScalarDelta {
+  prior?: number | null;
+  recent?: number | null;
+  abs_delta?: number | null;
+  rel_pct?: number | null;
+}
+
+/** Per-model row in a cost-attribution delta. */
+export interface LlmCostModelDeltaRow {
+  provider: string;
+  model: string;
+  baseline_cost_usd?: number | null;
+  current_cost_usd?: number | null;
+  cost_delta_usd: number;
+  baseline_share?: number | null;
+  current_share?: number | null;
+}
+
+/** Per-model row in the trailing-window cost delta. */
+export interface LlmCostModelWindowDeltaRow {
+  provider: string;
+  model: string;
+  prior_cost_usd?: number | null;
+  recent_cost_usd?: number | null;
+  cost_delta_usd: number;
+  prior_share?: number | null;
+  recent_share?: number | null;
+  share_delta?: number | null;
+}
+
+/** Per-task-type row in a cost-attribution delta. */
+export interface LlmCostTaskTypeDeltaRow {
+  task_type: string;
+  baseline_cost_usd?: number | null;
+  current_cost_usd?: number | null;
+  cost_delta_usd: number;
+  baseline_share?: number | null;
+  current_share?: number | null;
+  share_delta?: number | null;
+}
+
+/** Per-task-type row in the trailing-window cost delta. */
+export interface LlmCostTaskTypeWindowDeltaRow {
+  task_type: string;
+  prior_cost_usd?: number | null;
+  recent_cost_usd?: number | null;
+  cost_delta_usd: number;
+  prior_share?: number | null;
+  recent_share?: number | null;
+  share_delta?: number | null;
+}
+
+/** Genesis-baseline-vs-current LLM cost-mix delta. */
+export interface LlmCostAttributionDelta {
+  total_llm_usd?: LlmCostScalarDelta | null;
+  rework_share?: LlmCostScalarDelta | null;
+  self_repair_burn_share?: LlmCostScalarDelta | null;
+  by_model_delta?: LlmCostModelDeltaRow[] | null;
+  by_task_type_delta?: LlmCostTaskTypeDeltaRow[] | null;
+}
+
+/** Window metadata for the trailing-window cost delta. */
+export interface LlmCostWindowMeta {
+  recent_n: number;
+  prior_count: number;
+  recent_count: number;
+  prior_start?: string | null;
+  prior_end?: string | null;
+  recent_start?: string | null;
+  recent_end?: string | null;
+}
+
+/** Recent-vs-prior trailing-window LLM cost-mix delta. */
+export interface LlmCostAttributionWindowDelta {
+  total_llm_usd?: LlmCostWindowScalarDelta | null;
+  rework_share?: LlmCostWindowScalarDelta | null;
+  self_repair_burn_share?: LlmCostWindowScalarDelta | null;
+  by_model_delta?: LlmCostModelWindowDeltaRow[] | null;
+  by_task_type_delta?: LlmCostTaskTypeWindowDeltaRow[] | null;
+  window_meta?: LlmCostWindowMeta | null;
+}
+
 export interface EfficiencyAxesResponse {
   axes: Record<string, EfficiencyAxis>;
   baseline_captured_at: string | null;
@@ -1613,6 +1714,16 @@ export interface EfficiencyAxesResponse {
   // LLM cost attribution from the latest snapshot: per-terminal-outcome
   // (MERGED vs each failure class) breakdown. Null on older snapshots.
   llm_cost_attribution?: LlmCostAttribution | null;
+  // Day-over-day trend of LLM cost attribution headline scalars (oldest-first).
+  // Optional/null for older backends that omit it.
+  llm_cost_attribution_trend?: LlmCostAttributionTrendEntry[] | null;
+  // Baseline-vs-current delta for LLM cost attribution (genesis baseline vs latest).
+  // Complements llm_cost_attribution_window_delta. Null when either side is absent.
+  llm_cost_attribution_baseline_delta?: LlmCostAttributionDelta | null;
+  // Recent-vs-prior trailing-window cost-mix delta (most-recent-K vs prior-K snapshots).
+  // Complements the genesis-baseline delta — distinguishes recent regression from
+  // cumulative drift. Null when trend depth is insufficient or backend is older.
+  llm_cost_attribution_window_delta?: LlmCostAttributionWindowDelta | null;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {

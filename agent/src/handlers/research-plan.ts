@@ -1205,13 +1205,66 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
       return `${label} ${cost}${share}`;
     };
     lines.push('');
-    lines.push('**LLM cost attribution:**');
+    lines.push('**LLM cost attribution (vs genesis baseline):**');
     lines.push(`  total: $${typeof costAttr.total_llm_usd === 'number' ? costAttr.total_llm_usd.toFixed(4) : 'n/a'}`);
     lines.push(`  dominant model: ${fmtRow(costAttr.dominant_model, 'model')}`);
     lines.push(`  dominant task type: ${fmtRow(costAttr.dominant_task_type, 'task_type')}`);
     lines.push(`  dominant failure class: ${fmtRow(costAttr.dominant_failure_class, 'failure_class')}`);
     lines.push(`  rework_share: ${fmtShare(costAttr.rework_share)}`);
     lines.push(`  self_repair_burn_share: ${fmtShare(costAttr.self_repair_burn_share)}`);
+  }
+
+  const windowDelta = snap.llm_cost_attribution_window_delta && typeof snap.llm_cost_attribution_window_delta === 'object'
+    ? snap.llm_cost_attribution_window_delta as Record<string, unknown>
+    : null;
+  if (windowDelta) {
+    const meta = windowDelta.window_meta && typeof windowDelta.window_meta === 'object'
+      ? windowDelta.window_meta as Record<string, unknown>
+      : null;
+    const windowLabel = meta && typeof meta.recent_n === 'number' && typeof meta.prior_count === 'number'
+      ? `recent ${meta.recent_n} vs prior ${meta.prior_count} snapshots`
+      : 'recent vs prior window';
+    lines.push('');
+    lines.push(`**LLM cost-mix shift (${windowLabel}):**`);
+
+    const fmtScalarDelta = (field: unknown): string => {
+      if (!field || typeof field !== 'object') return 'n/a';
+      const f = field as Record<string, unknown>;
+      const abs = typeof f.abs_delta === 'number' ? f.abs_delta : null;
+      const rel = typeof f.rel_pct === 'number' ? f.rel_pct : null;
+      if (abs == null) return 'n/a';
+      const sign = abs >= 0 ? '+' : '';
+      return rel != null ? `${sign}${abs.toFixed(4)} (${sign}${rel.toFixed(1)}%)` : `${sign}${abs.toFixed(4)}`;
+    };
+
+    const totalWd = windowDelta.total_llm_usd;
+    const reworkWd = windowDelta.rework_share;
+    const repairWd = windowDelta.self_repair_burn_share;
+    lines.push(`  total_llm_usd avg/snapshot: ${fmtScalarDelta(totalWd)}`);
+    lines.push(`  rework_share: ${fmtScalarDelta(reworkWd)}`);
+    lines.push(`  self_repair_burn_share: ${fmtScalarDelta(repairWd)}`);
+
+    const byModelDelta = Array.isArray(windowDelta.by_model_delta) ? windowDelta.by_model_delta : [];
+    if (byModelDelta.length > 0) {
+      const top = byModelDelta[0] as Record<string, unknown>;
+      const model = typeof top.model === 'string' ? top.model : 'unknown';
+      const costDelta = typeof top.cost_delta_usd === 'number' ? top.cost_delta_usd : null;
+      const shareDelta = typeof top.share_delta === 'number' ? top.share_delta : null;
+      const sign = costDelta != null && costDelta >= 0 ? '+' : '';
+      const costStr = costDelta != null ? `${sign}$${costDelta.toFixed(4)}` : 'n/a';
+      const shareStr = shareDelta != null ? ` (${shareDelta >= 0 ? '+' : ''}${(shareDelta * 100).toFixed(1)}% share)` : '';
+      lines.push(`  top model mover: ${model} ${costStr}${shareStr}`);
+    }
+
+    const byTypeDelta = Array.isArray(windowDelta.by_task_type_delta) ? windowDelta.by_task_type_delta : [];
+    if (byTypeDelta.length > 0) {
+      const top = byTypeDelta[0] as Record<string, unknown>;
+      const taskType = typeof top.task_type === 'string' ? top.task_type : 'unknown';
+      const costDelta = typeof top.cost_delta_usd === 'number' ? top.cost_delta_usd : null;
+      const sign = costDelta != null && costDelta >= 0 ? '+' : '';
+      const costStr = costDelta != null ? `${sign}$${costDelta.toFixed(4)}` : 'n/a';
+      lines.push(`  top task-type mover: ${taskType} ${costStr}`);
+    }
   }
 
   return lines.join('\n') + '\n';

@@ -47,6 +47,7 @@ from app.efficiency_snapshot import (
     _task_llm_attempts,
     compute_current_axes,
     compute_llm_cost_attribution_baseline_delta,
+    compute_llm_cost_attribution_window_delta,
     compute_llm_cost_breakdown,
     compute_llm_cost_by_task_type,
     compute_pr_rework_chain_breakdown,
@@ -8573,4 +8574,238 @@ async def test_llm_cost_attribution_baseline_delta_in_read_baseline(db_session):
 
     # by_model_delta must include the sonnet model that ran in both windows.
     model_keys = {(r["provider"], r["model"]) for r in delta["by_model_delta"]}
+    assert ("anthropic", "claude-sonnet-4-6") in model_keys
+
+
+# ---------------------------------------------------------------------------
+# compute_llm_cost_attribution_window_delta — pure unit tests
+# ---------------------------------------------------------------------------
+
+def _make_trend_entry(
+    captured_at: str,
+    total_llm_usd: float,
+    rework_share: float,
+    self_repair_burn_share: float,
+    by_model: list | None = None,
+    by_task_type: list | None = None,
+) -> dict:
+    """Build a synthetic trend entry matching the shape assembled by read_baseline_with_drift."""
+    return {
+        "captured_at": captured_at,
+        "total_llm_usd": total_llm_usd,
+        "rework_share": rework_share,
+        SELF_REPAIR_BURN_SHARE_KEY: self_repair_burn_share,
+        "by_model": by_model or [
+            {"provider": "anthropic", "model": "claude-sonnet-4-6", "cost_usd": total_llm_usd * 0.8},
+            {"provider": "anthropic", "model": "claude-opus-4-8", "cost_usd": total_llm_usd * 0.2},
+        ],
+        "by_task_type": by_task_type or [
+            {"task_type": "create", "cost_usd": total_llm_usd * 0.6},
+            {"task_type": "review", "cost_usd": total_llm_usd * 0.4},
+        ],
+    }
+
+
+def test_compute_llm_cost_attribution_window_delta_returns_none_on_short_trend():
+    """Returns None when trend has fewer than 2*recent_n entries."""
+    assert compute_llm_cost_attribution_window_delta([]) is None
+    assert compute_llm_cost_attribution_window_delta([_make_trend_entry("2026-01-01", 10.0, 0.1, 0.05)]) is None
+    # Exactly recent_n * 2 - 1 entries (5 with default recent_n=3) → None
+    short = [_make_trend_entry(f"2026-01-0{i}", float(i), 0.1, 0.05) for i in range(1, 6)]
+    assert compute_llm_cost_attribution_window_delta(short) is None
+    # Exactly recent_n * 2 entries (6) → not None
+    six = [_make_trend_entry(f"2026-01-0{i}", float(i), 0.1, 0.05) for i in range(1, 7)]
+    assert compute_llm_cost_attribution_window_delta(six) is not None
+
+
+def test_compute_llm_cost_attribution_window_delta_scalar_fields():
+    """Scalar fields (total_llm_usd, rework_share, self_repair_burn_share) are
+    averaged within each window and compared correctly.
+
+    Acceptance criterion: asserts the recent-vs-prior window split and correct
+    scalar deltas for a synthetic 6-entry trend.
+    """
+    # prior window: entries 1-3 (total 10 each); recent window: entries 4-6 (total 20 each)
+    trend = [
+        _make_trend_entry("2026-01-01", 10.0, 0.10, 0.04),
+        _make_trend_entry("2026-01-02", 10.0, 0.12, 0.05),
+        _make_trend_entry("2026-01-03", 10.0, 0.08, 0.03),
+        _make_trend_entry("2026-01-04", 20.0, 0.20, 0.08),
+        _make_trend_entry("2026-01-05", 20.0, 0.22, 0.09),
+        _make_trend_entry("2026-01-06", 20.0, 0.18, 0.07),
+    ]
+
+    delta = compute_llm_cost_attribution_window_delta(trend)
+    assert delta is not None
+
+    # total_llm_usd: prior avg = 10.0, recent avg = 20.0 → abs_delta = +10.0, rel_pct = +100%
+    total_d = delta["total_llm_usd"]
+    assert total_d["prior"] == pytest.approx(10.0, abs=1e-4)
+    assert total_d["recent"] == pytest.approx(20.0, abs=1e-4)
+    assert total_d["abs_delta"] == pytest.approx(10.0, abs=1e-4)
+    assert total_d["rel_pct"] == pytest.approx(100.0, abs=0.1)
+
+    # rework_share: prior avg = (0.10+0.12+0.08)/3 = 0.10; recent avg = (0.20+0.22+0.18)/3 = 0.20
+    rework_d = delta["rework_share"]
+    assert rework_d["prior"] == pytest.approx(0.10, abs=1e-5)
+    assert rework_d["recent"] == pytest.approx(0.20, abs=1e-5)
+    assert rework_d["abs_delta"] == pytest.approx(0.10, abs=1e-5)
+
+    # self_repair_burn_share: prior avg = (0.04+0.05+0.03)/3 ≈ 0.04; recent avg ≈ 0.08
+    repair_d = delta[SELF_REPAIR_BURN_SHARE_KEY]
+    assert repair_d["abs_delta"] is not None
+    assert repair_d["abs_delta"] > 0
+
+
+def test_compute_llm_cost_attribution_window_delta_list_fields():
+    """Per-model and per-task-type deltas use averaged cost sums and are sorted
+    by abs(cost_delta_usd) descending (biggest mover first).
+
+    Acceptance criterion: asserts correct per-model and per-task-type cost delta
+    values and ordering for a synthetic trend where opus grows more than sonnet.
+    """
+    # prior: sonnet=8, opus=2 per snapshot; recent: sonnet=9, opus=5 per snapshot
+    def _entry(ts: str, sonnet: float, opus: float) -> dict:
+        return _make_trend_entry(
+            ts, sonnet + opus, 0.1, 0.05,
+            by_model=[
+                {"provider": "anthropic", "model": "claude-sonnet-4-6", "cost_usd": sonnet},
+                {"provider": "anthropic", "model": "claude-opus-4-8", "cost_usd": opus},
+            ],
+            by_task_type=[
+                {"task_type": "create", "cost_usd": (sonnet + opus) * 0.6},
+                {"task_type": "review", "cost_usd": (sonnet + opus) * 0.4},
+            ],
+        )
+
+    trend = [
+        _entry("2026-01-01", 8.0, 2.0),
+        _entry("2026-01-02", 8.0, 2.0),
+        _entry("2026-01-03", 8.0, 2.0),
+        _entry("2026-01-04", 9.0, 5.0),
+        _entry("2026-01-05", 9.0, 5.0),
+        _entry("2026-01-06", 9.0, 5.0),
+    ]
+
+    delta = compute_llm_cost_attribution_window_delta(trend)
+    assert delta is not None
+
+    by_model = delta["by_model_delta"]
+    assert len(by_model) == 2
+    # opus cost delta = 5-2 = +3; sonnet delta = 9-8 = +1 → opus is first
+    assert by_model[0]["model"] == "claude-opus-4-8"
+    assert by_model[0]["cost_delta_usd"] == pytest.approx(3.0, abs=1e-4)
+    assert by_model[1]["model"] == "claude-sonnet-4-6"
+    assert by_model[1]["cost_delta_usd"] == pytest.approx(1.0, abs=1e-4)
+
+    # share fields are present
+    assert by_model[0]["prior_share"] is not None
+    assert by_model[0]["recent_share"] is not None
+    assert by_model[0]["share_delta"] is not None
+    # opus share grew: 2/10 = 0.2 → 5/14 ≈ 0.357 → share_delta > 0
+    assert by_model[0]["share_delta"] > 0
+
+    # by_task_type_delta: both types grew proportionally; create grew more (larger abs USD)
+    by_type = delta["by_task_type_delta"]
+    assert len(by_type) == 2
+    type_map = {r["task_type"]: r for r in by_type}
+    assert "create" in type_map
+    assert "review" in type_map
+    # create: prior 6, recent 8.4 → delta +2.4; review: prior 4, recent 5.6 → delta +1.6
+    assert type_map["create"]["cost_delta_usd"] > type_map["review"]["cost_delta_usd"]
+
+
+def test_compute_llm_cost_attribution_window_delta_window_meta():
+    """window_meta includes snapshot counts and captured_at bounds."""
+    trend = [_make_trend_entry(f"2026-01-0{i}", 10.0 + i, 0.1, 0.05) for i in range(1, 7)]
+    delta = compute_llm_cost_attribution_window_delta(trend)
+    assert delta is not None
+
+    meta = delta["window_meta"]
+    assert meta is not None
+    assert meta["recent_n"] == 3
+    assert meta["prior_count"] == 3
+    assert meta["recent_count"] == 3
+    assert meta["prior_start"] == "2026-01-01"
+    assert meta["prior_end"] == "2026-01-03"
+    assert meta["recent_start"] == "2026-01-04"
+    assert meta["recent_end"] == "2026-01-06"
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_attribution_window_delta_in_read_baseline(db_session):
+    """read_baseline_with_drift exposes llm_cost_attribution_window_delta when
+    the stored trend has sufficient depth (at least 2*recent_n snapshots).
+
+    Seeds a project with 6 write_snapshot calls using different LLM cost loads
+    so that the recent window differs from the prior window.  Asserts the key is
+    present and the shape is correct.
+
+    Acceptance criterion (from task spec): efficiency_snapshot computes a
+    trailing-window (recent-vs-prior) cost-mix delta from the stored trend over
+    a synthetic multi-snapshot series.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    async def _write_with_task(tokens_in: int, tokens_out: int, pr_num: int) -> None:
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+                payloads=[{"type": "create", "pr_number": pr_num}],
+                api_call_summary={
+                    "total_input_tokens": tokens_in,
+                    "total_output_tokens": tokens_out,
+                    "llm_call_count": 4,
+                },
+                provider="anthropic",
+                model="claude-sonnet-4-6",
+            )
+        )
+        await db_session.commit()
+        await write_snapshot(db_session, project.id)
+        await db_session.commit()
+
+    # Write 3 low-cost snapshots (prior window)
+    for i in range(3):
+        await _write_with_task(1000, 200, i + 1)
+
+    # Write 3 higher-cost snapshots (recent window)
+    for i in range(3):
+        await _write_with_task(5000, 1000, i + 10)
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+
+    wd = drift.get("llm_cost_attribution_window_delta")
+    assert wd is not None, "llm_cost_attribution_window_delta must be present when trend depth >= 6"
+
+    assert "total_llm_usd" in wd
+    assert "rework_share" in wd
+    assert SELF_REPAIR_BURN_SHARE_KEY in wd
+    assert "by_model_delta" in wd
+    assert "by_task_type_delta" in wd
+    assert "window_meta" in wd
+
+    meta = wd["window_meta"]
+    assert meta["recent_n"] == 3
+    assert meta["recent_count"] == 3
+    assert meta["prior_count"] == 3
+
+    # Recent window had higher LLM cost than prior → abs_delta must be positive
+    total_d = wd["total_llm_usd"]
+    assert total_d["recent"] is not None
+    assert total_d["prior"] is not None
+    assert total_d["abs_delta"] is not None
+    assert total_d["abs_delta"] > 0, (
+        "recent window had heavier tasks so avg cost must exceed prior window"
+    )
+
+    # sonnet model must appear in the by_model_delta list
+    model_keys = {(r["provider"], r["model"]) for r in wd["by_model_delta"]}
     assert ("anthropic", "claude-sonnet-4-6") in model_keys

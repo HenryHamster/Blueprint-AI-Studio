@@ -2513,6 +2513,161 @@ def compute_llm_cost_attribution_baseline_delta(
     }
 
 
+def compute_llm_cost_attribution_window_delta(
+    trend: list,
+    *,
+    recent_n: int = 3,
+) -> Dict[str, Any] | None:
+    """Recent-vs-prior trailing-window cost-mix delta derived from the stored trend.
+
+    Complements ``compute_llm_cost_attribution_baseline_delta`` (which compares
+    the immutable genesis baseline against the current snapshot).  This function
+    compares the RECENT window (the most recent ``recent_n`` snapshots) against
+    the PRIOR window (the ``recent_n`` snapshots immediately preceding them),
+    both windows averaged/aggregated, so a '+X% cost' claim can be decomposed as
+    "did this happen recently or is it cumulative drift since genesis?".
+
+    Returns None when the trend is too short to populate both windows (i.e. fewer
+    than ``recent_n * 2`` entries after filtering to entries that carry attribution
+    data).  Scalar fields (``total_llm_usd``, ``rework_share``,
+    ``self_repair_burn_share``) are averaged across the window; per-model and
+    per-task-type ``cost_usd`` values are summed then compared.  Output shape is
+    the same as ``compute_llm_cost_attribution_baseline_delta`` with an additional
+    ``window_meta`` key describing the snapshot counts and captured_at bounds.
+    """
+    if not trend or len(trend) < recent_n * 2:
+        return None
+
+    prior_window = trend[-(recent_n * 2):-recent_n]
+    recent_window = trend[-recent_n:]
+
+    if len(prior_window) < recent_n or len(recent_window) < recent_n:
+        return None
+
+    def _mean_scalar(window: list, key: str) -> float | None:
+        vals = [e[key] for e in window if isinstance(e.get(key), (int, float))]
+        return round(sum(vals) / len(vals), 6) if vals else None
+
+    def _sum_rows_by_key(window: list, row_field: str, label_key: str) -> Dict[str, float]:
+        totals: Dict[str, float] = {}
+        for entry in window:
+            for row in (entry.get(row_field) or []):
+                k = row.get(label_key)
+                if k is not None:
+                    totals[k] = totals.get(k, 0.0) + float(row.get("cost_usd") or 0.0)
+        return totals
+
+    def _scalar_delta(p: Any, r: Any) -> Dict[str, Any]:
+        p_val = p if isinstance(p, (int, float)) else None
+        r_val = r if isinstance(r, (int, float)) else None
+        abs_delta: float | None = None
+        rel_pct: float | None = None
+        if p_val is not None and r_val is not None:
+            abs_delta = round(r_val - p_val, 6)
+            if p_val != 0:
+                rel_pct = round((r_val - p_val) / p_val * 100.0, 2)
+        return {"prior": p_val, "recent": r_val, "abs_delta": abs_delta, "rel_pct": rel_pct}
+
+    p_total = _mean_scalar(prior_window, "total_llm_usd") or 0.0
+    r_total = _mean_scalar(recent_window, "total_llm_usd") or 0.0
+
+    def _share(cost: float, total: float) -> float | None:
+        if total <= 0:
+            return None
+        return round(cost / total, 4)
+
+    def _model_delta(prior_window: list, recent_window: list) -> list:
+        def _sum_models(window: list) -> Dict[tuple, float]:
+            totals: Dict[tuple, float] = {}
+            for entry in window:
+                for row in (entry.get("by_model") or []):
+                    k = (row.get("provider"), row.get("model"))
+                    totals[k] = totals.get(k, 0.0) + float(row.get("cost_usd") or 0.0)
+            n = len(window)
+            return {k: round(v / n, 6) for k, v in totals.items()} if n else {}
+
+        p_map = _sum_models(prior_window)
+        r_map = _sum_models(recent_window)
+        all_keys = set(p_map) | set(r_map)
+        rows = []
+        for k in all_keys:
+            p_cost = p_map.get(k, 0.0)
+            r_cost = r_map.get(k, 0.0)
+            rows.append({
+                "provider": k[0],
+                "model": k[1],
+                "prior_cost_usd": round(p_cost, 6),
+                "recent_cost_usd": round(r_cost, 6),
+                "cost_delta_usd": round(r_cost - p_cost, 6),
+                "prior_share": _share(p_cost, p_total),
+                "recent_share": _share(r_cost, r_total),
+                "share_delta": (
+                    round(_share(r_cost, r_total) - _share(p_cost, p_total), 4)
+                    if _share(r_cost, r_total) is not None and _share(p_cost, p_total) is not None
+                    else None
+                ),
+            })
+        rows.sort(key=lambda r: abs(r["cost_delta_usd"]), reverse=True)
+        return rows
+
+    def _task_type_delta(prior_window: list, recent_window: list) -> list:
+        def _sum_types(window: list) -> Dict[str, float]:
+            totals: Dict[str, float] = {}
+            for entry in window:
+                for row in (entry.get("by_task_type") or []):
+                    k = row.get("task_type")
+                    if k is not None:
+                        totals[k] = totals.get(k, 0.0) + float(row.get("cost_usd") or 0.0)
+            n = len(window)
+            return {k: round(v / n, 6) for k, v in totals.items()} if n else {}
+
+        p_map = _sum_types(prior_window)
+        r_map = _sum_types(recent_window)
+        all_keys = set(p_map) | set(r_map)
+        rows = []
+        for k in all_keys:
+            p_cost = p_map.get(k, 0.0)
+            r_cost = r_map.get(k, 0.0)
+            rows.append({
+                "task_type": k,
+                "prior_cost_usd": round(p_cost, 6),
+                "recent_cost_usd": round(r_cost, 6),
+                "cost_delta_usd": round(r_cost - p_cost, 6),
+                "prior_share": _share(p_cost, p_total),
+                "recent_share": _share(r_cost, r_total),
+                "share_delta": (
+                    round(_share(r_cost, r_total) - _share(p_cost, p_total), 4)
+                    if _share(r_cost, r_total) is not None and _share(p_cost, p_total) is not None
+                    else None
+                ),
+            })
+        rows.sort(key=lambda r: abs(r["cost_delta_usd"]), reverse=True)
+        return rows
+
+    prior_captured = [e.get("captured_at") for e in prior_window if e.get("captured_at")]
+    recent_captured = [e.get("captured_at") for e in recent_window if e.get("captured_at")]
+
+    return {
+        "total_llm_usd": _scalar_delta(_mean_scalar(prior_window, "total_llm_usd"), _mean_scalar(recent_window, "total_llm_usd")),
+        "rework_share": _scalar_delta(_mean_scalar(prior_window, "rework_share"), _mean_scalar(recent_window, "rework_share")),
+        SELF_REPAIR_BURN_SHARE_KEY: _scalar_delta(
+            _mean_scalar(prior_window, SELF_REPAIR_BURN_SHARE_KEY),
+            _mean_scalar(recent_window, SELF_REPAIR_BURN_SHARE_KEY),
+        ),
+        "by_model_delta": _model_delta(prior_window, recent_window),
+        "by_task_type_delta": _task_type_delta(prior_window, recent_window),
+        "window_meta": {
+            "recent_n": recent_n,
+            "prior_count": len(prior_window),
+            "recent_count": len(recent_window),
+            "prior_start": prior_captured[0] if prior_captured else None,
+            "prior_end": prior_captured[-1] if prior_captured else None,
+            "recent_start": recent_captured[0] if recent_captured else None,
+            "recent_end": recent_captured[-1] if recent_captured else None,
+        },
+    }
+
+
 async def read_baseline_with_drift(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
@@ -2934,9 +3089,17 @@ async def read_baseline_with_drift(
         # Baseline-vs-current delta for the llm_cost_attribution decomposition:
         # which model/task-type share shifted, how much rework or self-repair moved,
         # and what the absolute USD change was.  None when either side is absent.
+        # NOTE: this delta compares against the IMMUTABLE genesis baseline.
         "llm_cost_attribution_baseline_delta": compute_llm_cost_attribution_baseline_delta(
             baseline.get("llm_cost_attribution"),
             latest.get("llm_cost_attribution"),
+        ),
+        # Recent-vs-prior trailing-window cost-mix delta: compares the most recent K
+        # snapshots against the K snapshots immediately before them. Complements the
+        # genesis-baseline delta above — together they distinguish a RECENT regression
+        # from cumulative project-evolution drift. None when trend depth is insufficient.
+        "llm_cost_attribution_window_delta": compute_llm_cost_attribution_window_delta(
+            llm_cost_attribution_trend
         ),
         # Panel review effectiveness: the overturn rate, count of challenges by
         # outcome (confirmed/revised/rejected), and total gate invocations. Null
