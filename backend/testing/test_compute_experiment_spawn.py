@@ -1401,3 +1401,88 @@ async def test_agent_spawn_compute_experiment_below_threshold_no_approval(
             _shared_state.runtime_config.pop(
                 "compute_experiment_spend_threshold_usd", None
             )
+
+
+# --- Chokepoint: create_compute_job spend-gate ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_launch_refuses_above_threshold_unapproved_compute_job(db_session):
+    """Chokepoint: create_compute_job raises ComputeLaunchPreconditionFailed when
+    spend_cap_usd exceeds the project threshold and spend_approval_cleared_at is None,
+    regardless of the requires_approval flag on the Task."""
+    from app.compute_jobs import ComputeLaunchPreconditionFailed
+
+    project = Project(
+        name="ChokeGateRefuse",
+        user_id="test-user",
+        runtime_config_json={"compute_experiment_spend_threshold_usd": 5.0},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: chokepoint refuse",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "command": "python bench.py"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        requires_approval=False,
+        spend_approval_cleared_at=None,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with pytest.raises(ComputeLaunchPreconditionFailed) as exc_info:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python bench.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=10.0,
+            deadline_seconds=300,
+        )
+
+    detail = exc_info.value.args[0]
+    assert detail["error"] == "spend_cap_requires_approval"
+    assert detail["spend_cap_usd"] == 10.0
+    assert detail["threshold_usd"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_launch_allows_operator_approved_above_threshold_compute_job(db_session):
+    """Chokepoint: create_compute_job proceeds when spend_approval_cleared_at is set,
+    even if spend_cap_usd exceeds the project threshold."""
+    project = Project(
+        name="ChokeGateAllow",
+        user_id="test-user",
+        runtime_config_json={"compute_experiment_spend_threshold_usd": 5.0},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: chokepoint allow",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "command": "python bench.py"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        requires_approval=False,
+        spend_approval_cleared_at=datetime.utcnow(),
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=10.0,
+        deadline_seconds=300,
+    )
+    assert job is not None

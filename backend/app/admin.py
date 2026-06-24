@@ -945,6 +945,7 @@ async def bulk_action_tasks(
             elif body.action == "approve":
                 was_blocked = task.requires_approval
                 task.requires_approval = False
+                task.spend_approval_cleared_at = _utcnow()
 
                 if was_blocked:
                     logger.info(

@@ -919,6 +919,7 @@ class Task(SQLModel, table=True):
         default=None, sa_column=Column(String(255), nullable=True)
     )
     requires_approval: bool = Field(default=False)
+    spend_approval_cleared_at: datetime | None = Field(default=None, nullable=True)
 
     status: TaskStatus = Field(
         default=TaskStatus.QUEUED, sa_column=Column(String, default=TaskStatus.QUEUED)
