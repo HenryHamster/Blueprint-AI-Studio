@@ -15,12 +15,36 @@ function DistributionBar({ confirmed, revised, rejected }: { confirmed: number; 
 }
 
 const GATE_MIN_SAMPLE = 30;
+const GATE_MIN_COVERAGE = 0.5; // Require 50% effective coverage for HEALTHY verdict
 
-function GateHealthBadge({ failOpen, total }: { failOpen: number; total: number }) {
+function GateHealthBadge({
+  failOpen,
+  total,
+  effectiveCoverage,
+  backendVerdict,
+}: {
+  failOpen: number;
+  total: number;
+  effectiveCoverage?: number | null;
+  backendVerdict?: { state: string; fail_open_rate: number | null; total_invocations: number; min_sample: number };
+}) {
+  if (backendVerdict) {
+    const colors: Record<string, string> = {
+      NO_DATA: 'text-neutral-500',
+      DEGRADED: 'text-red-400',
+      INSUFFICIENT: 'text-neutral-400',
+      LOW_COVERAGE: 'text-neutral-400',
+      PARTIAL: 'text-amber-400',
+      HEALTHY: 'text-emerald-400',
+    };
+    const label = backendVerdict.state.replace(/_/g, ' ');
+    return <span data-testid="health-badge" className={`${colors[backendVerdict.state] || 'text-neutral-400'} font-mono text-ui-sm`}>{label}</span>;
+  }
   if (total + failOpen === 0) return <span data-testid="health-badge" className="text-neutral-500 font-mono text-ui-sm">NO DATA</span>;
   const rate = failOpen / (total + failOpen);
   if (rate >= 0.05) return <span data-testid="health-badge" className="text-red-400 font-mono text-ui-sm">DEGRADED</span>;
   if (total + failOpen < GATE_MIN_SAMPLE) return <span data-testid="health-badge" className="text-neutral-400 font-mono text-ui-sm">INSUFFICIENT</span>;
+  if (effectiveCoverage !== null && effectiveCoverage !== undefined && effectiveCoverage < GATE_MIN_COVERAGE) return <span data-testid="health-badge" className="text-neutral-400 font-mono text-ui-sm">LOW COVERAGE</span>;
   if (rate >= 0.01) return <span data-testid="health-badge" className="text-amber-400 font-mono text-ui-sm">PARTIAL</span>;
   return <span data-testid="health-badge" className="text-emerald-400 font-mono text-ui-sm">HEALTHY</span>;
 }
@@ -33,12 +57,13 @@ function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
     : (total + failOpen > 0 ? ((failOpen / (total + failOpen)) * 100).toFixed(1) : null);
   const overturnRate = data.overturn_rate != null ? (data.overturn_rate * 100).toFixed(1) : null;
   const escalated = data.challenged_escalated ?? 0;
+  const coverage = data.effective_coverage != null ? (data.effective_coverage * 100).toFixed(0) : null;
 
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <span className="text-neutral-400 text-ui-sm">Gate health</span>
-        <GateHealthBadge failOpen={failOpen} total={total} />
+        <GateHealthBadge failOpen={failOpen} total={total} backendVerdict={data.gate_health} effectiveCoverage={data.effective_coverage} />
       </div>
       {total > 0 && (
         <>
@@ -68,6 +93,9 @@ function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
       )}
       {data.cost_per_challenge_usd != null && (
         <div className="text-ui-sm text-neutral-500">cost/challenge: ${data.cost_per_challenge_usd.toFixed(4)}</div>
+      )}
+      {coverage != null && (
+        <div className="text-ui-sm text-neutral-500">effective coverage: {coverage}%</div>
       )}
     </div>
   );
@@ -113,7 +141,7 @@ export function AdversarialQualityPanel({ projectId }: { projectId: string | nul
               <PanelReviewView data={data} />
               {postDeploy && (
                 <div data-testid="post-deploy-row" className="mt-2 pt-2 border-t border-neutral-700/50 text-ui-sm text-neutral-500">
-                  post-deploy: <GateHealthBadge failOpen={postDeploy.challenged_degraded ?? 0} total={postDeploy.total_challenged} />
+                  post-deploy: <GateHealthBadge failOpen={postDeploy.challenged_degraded ?? 0} total={postDeploy.total_challenged} backendVerdict={postDeploy.gate_health} />
                   {postDeploy.fail_open_rate != null && (
                     <span className="ml-1">({(postDeploy.fail_open_rate * 100).toFixed(1)}% fail-open, {postDeploy.total_challenged + (postDeploy.challenged_degraded ?? 0)} gate invocations)</span>
                   )}

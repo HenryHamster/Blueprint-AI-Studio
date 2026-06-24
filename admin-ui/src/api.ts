@@ -1504,7 +1504,15 @@ export interface PanelReviewEffectiveness {
   cost_per_challenge_usd?: number | null;
   challenged_escalated?: number;
   challenged_degraded?: number;
+  sampled_out_count?: number;
+  effective_coverage?: number | null;
   fail_open_rate?: number | null;
+  gate_health?: {
+    state: 'NO_DATA' | 'DEGRADED' | 'INSUFFICIENT' | 'LOW_COVERAGE' | 'PARTIAL' | 'HEALTHY';
+    fail_open_rate: number | null;
+    total_invocations: number;
+    min_sample: number;
+  };
 }
 
 export interface ChallengerSampleRateRecommendation {

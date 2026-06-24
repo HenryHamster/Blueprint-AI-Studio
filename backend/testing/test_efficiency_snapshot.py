@@ -7188,6 +7188,148 @@ def test_panel_review_effectiveness_returns_none_when_no_gate_invocations():
     )
 
 
+def _peff(*, total_challenged, challenged_degraded):
+    """Minimal panel_review_effectiveness-shaped dict for classifier tests.
+
+    Mirrors compute_panel_review_effectiveness's fail_open_rate accounting:
+    fail_open_rate = degraded / (total + degraded), or None when both are zero.
+    """
+    invocations = total_challenged + challenged_degraded
+    return {
+        "total_challenged": total_challenged,
+        "challenged_degraded": challenged_degraded,
+        "fail_open_rate": (
+            round(challenged_degraded / invocations, 4) if invocations > 0 else None
+        ),
+    }
+
+
+def test_gate_health_verdict_no_data_on_none():
+    """None input → NO_DATA with zero invocations and a null rate."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    verdict = compute_gate_health_verdict(None)
+    assert verdict["state"] == "NO_DATA"
+    assert verdict["fail_open_rate"] is None
+    assert verdict["total_invocations"] == 0
+    assert verdict["min_sample"] == 30
+
+
+def test_gate_health_verdict_no_data_on_zero_invocations():
+    """A dict with zero gate invocations → NO_DATA (never HEALTHY)."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=0, challenged_degraded=0)
+    )
+    assert verdict["state"] == "NO_DATA"
+    assert verdict["total_invocations"] == 0
+
+
+def test_gate_health_verdict_degraded_below_min_sample():
+    """fail_open_rate >= 5% on a sub-min-sample window classifies DEGRADED.
+
+    DEGRADED takes priority over the min-sample gate: a degraded rate on a tiny
+    sample must NOT be reported as INSUFFICIENT or HEALTHY.
+    """
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    # 1 degraded / 10 invocations = 10% fail-open on only 10 invocations (< 30).
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=9, challenged_degraded=1)
+    )
+    assert verdict["state"] == "DEGRADED", (
+        f"5%+ fail-open on a small sample must be DEGRADED, got {verdict['state']}"
+    )
+    assert verdict["fail_open_rate"] == 0.1
+    assert verdict["total_invocations"] == 10
+
+
+def test_gate_health_verdict_insufficient_requires_min_sample():
+    """A clean, low-rate window below the min sample is INSUFFICIENT, never HEALTHY."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    # Zero fail-open but only 10 invocations — too few to certify HEALTHY.
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=10, challenged_degraded=0)
+    )
+    assert verdict["state"] == "INSUFFICIENT", (
+        f"low-rate window below 30 invocations must be INSUFFICIENT, got {verdict['state']}"
+    )
+    assert verdict["total_invocations"] == 10
+
+
+def test_gate_health_verdict_partial_at_min_sample():
+    """>= 30 invocations with 0.01 <= rate < 0.05 → PARTIAL."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    # 1 degraded / 50 invocations = 2% fail-open on a sufficient sample.
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=49, challenged_degraded=1)
+    )
+    assert verdict["state"] == "PARTIAL", (
+        f"2% fail-open on >=30 invocations must be PARTIAL, got {verdict['state']}"
+    )
+    assert verdict["fail_open_rate"] == 0.02
+    assert verdict["total_invocations"] == 50
+
+
+def test_gate_health_verdict_healthy_requires_min_sample_and_low_rate():
+    """>= 30 invocations with rate < 0.01 → HEALTHY."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    # Zero fail-open over 40 invocations — clean and sufficient.
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=40, challenged_degraded=0)
+    )
+    assert verdict["state"] == "HEALTHY"
+    assert verdict["fail_open_rate"] == 0.0
+    assert verdict["total_invocations"] == 40
+    assert verdict["min_sample"] == 30
+
+
+def test_gate_health_verdict_low_coverage_after_sufficient_sample():
+    """Sufficient sample, zero fail-open, but effective_coverage < 0.5 → LOW_COVERAGE."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    peff = {
+        **_peff(total_challenged=40, challenged_degraded=0),
+        "effective_coverage": 0.3,  # below 0.5 threshold
+    }
+    verdict = compute_gate_health_verdict(peff)
+    assert verdict["state"] == "LOW_COVERAGE", (
+        f"sufficient sample + zero fail-open + low effective_coverage must be LOW_COVERAGE, got {verdict['state']}"
+    )
+    assert verdict["total_invocations"] == 40
+
+    # Boundary: exactly 0.5 coverage should NOT trigger LOW_COVERAGE.
+    peff_boundary = {
+        **_peff(total_challenged=40, challenged_degraded=0),
+        "effective_coverage": 0.5,
+    }
+    verdict_boundary = compute_gate_health_verdict(peff_boundary)
+    assert verdict_boundary["state"] == "HEALTHY", (
+        f"effective_coverage == 0.5 must be HEALTHY, got {verdict_boundary['state']}"
+    )
+
+
+def test_gate_health_verdict_degraded_priority_over_insufficient_at_boundary():
+    """5% exactly on a small sample → DEGRADED; min_sample override respected."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    # 1 degraded / 20 = 5% exactly, only 20 invocations.
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=19, challenged_degraded=1)
+    )
+    assert verdict["state"] == "DEGRADED"
+    # min_sample override flows through to the returned supporting field.
+    custom = compute_gate_health_verdict(
+        _peff(total_challenged=10, challenged_degraded=0), min_sample=5
+    )
+    assert custom["state"] == "HEALTHY"
+    assert custom["min_sample"] == 5
+
+
 def test_panel_review_effectiveness_cost_per_challenge_usd():
     """compute_panel_review_effectiveness includes cost_per_challenge_usd.
 
@@ -8650,6 +8792,72 @@ async def test_llm_cost_attribution_baseline_delta_in_read_baseline(db_session):
     # by_model_delta must include the sonnet model that ran in both windows.
     model_keys = {(r["provider"], r["model"]) for r in delta["by_model_delta"]}
     assert ("anthropic", "claude-sonnet-4-6") in model_keys
+
+
+def test_low_coverage_not_healthy():
+    """Effective coverage-aware gate health: low coverage prevents HEALTHY verdict.
+
+    When sample_rate < 1.0, many merges are sampled_out (never challenged).
+    The fail_open_rate computed over only the challenged population can look
+    low (<=5%) even when most merges were never reviewed.
+
+    Scenario: 100 merges total
+      - 80 sampled_out (sample_rate=0.2, 80% skipped)
+      - 19 challenged_confirmed (low fail_open rate)
+      - 1 challenged_degraded (fail-open)
+
+    Metrics:
+      fail_open_rate = 1 / (19 + 1) = 0.05 = 5% (looks HEALTHY)
+      effective_coverage = 20 / 100 = 0.20 (only 20% actually reviewed)
+
+    Gate health verdict must account for low coverage and NOT return HEALTHY
+    when effective_coverage is below threshold. effective_coverage must be
+    exposed in the result so frontends can display it.
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _task(recon):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    tasks = [
+        # 80 sampled_out (not challenged, due to low sample_rate)
+        *[_task({"state": "sampled_out", "sample_rate": 0.2}) for _ in range(80)],
+        # 19 challenged_confirmed (low fail_open)
+        *[_task({"state": "challenged_confirmed"}) for _ in range(19)],
+        # 1 challenged_degraded (fail-open)
+        _task({"state": "degraded_model_unavailable"}),
+    ]
+
+    result = compute_panel_review_effectiveness(tasks)
+    assert result is not None, "must compute metrics with mix of sampled_out and challenged"
+
+    # fail_open_rate looks low: 1 / (19 + 1) = 5%
+    assert result["total_challenged"] == 19
+    assert result["challenged_degraded"] == 1
+    assert result["fail_open_rate"] == round(1 / 20, 4), (
+        f"expected fail_open_rate=0.05, got {result['fail_open_rate']}"
+    )
+
+    # Effective coverage: only 20 out of 100 total invocation opportunities
+    assert "sampled_out_count" in result, "must track sampled_out verdicts"
+    assert result["sampled_out_count"] == 80, (
+        f"expected sampled_out_count=80, got {result.get('sampled_out_count')}"
+    )
+
+    assert "effective_coverage" in result, "must compute and expose effective_coverage"
+    expected_coverage = round(20 / 100, 4)  # (challenged + degraded) / (all invocation opportunities)
+    assert result["effective_coverage"] == expected_coverage, (
+        f"expected effective_coverage={expected_coverage}, got {result.get('effective_coverage')}"
+    )
 
 
 # ---------------------------------------------------------------------------
