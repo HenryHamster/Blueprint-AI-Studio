@@ -1186,6 +1186,34 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
     lines.push(`**Agent timeout rate:** ${overallStr}${dominantStr}`);
   }
 
+  const costAttr = snap.llm_cost_attribution && typeof snap.llm_cost_attribution === 'object'
+    ? snap.llm_cost_attribution as Record<string, unknown>
+    : null;
+  if (costAttr) {
+    const fmtShare = (v: unknown): string => {
+      if (v === null || v === undefined) return 'n/a';
+      if (typeof v === 'number') return `${(v * 100).toFixed(1)}%`;
+      if (typeof v === 'string') return v;
+      return 'n/a';
+    };
+    const fmtRow = (row: unknown, labelKey: string): string => {
+      if (!row || typeof row !== 'object') return 'n/a';
+      const r = row as Record<string, unknown>;
+      const label = typeof r[labelKey] === 'string' || typeof r[labelKey] === 'number' ? String(r[labelKey]) : 'n/a';
+      const cost = typeof r.cost_usd === 'number' ? `$${r.cost_usd.toFixed(4)}` : 'n/a';
+      const share = typeof r.share === 'number' ? ` (${(r.share * 100).toFixed(1)}%)` : '';
+      return `${label} ${cost}${share}`;
+    };
+    lines.push('');
+    lines.push('**LLM cost attribution:**');
+    lines.push(`  total: $${typeof costAttr.total_llm_usd === 'number' ? costAttr.total_llm_usd.toFixed(4) : 'n/a'}`);
+    lines.push(`  dominant model: ${fmtRow(costAttr.dominant_model, 'model')}`);
+    lines.push(`  dominant task type: ${fmtRow(costAttr.dominant_task_type, 'task_type')}`);
+    lines.push(`  dominant failure class: ${fmtRow(costAttr.dominant_failure_class, 'failure_class')}`);
+    lines.push(`  rework_share: ${fmtShare(costAttr.rework_share)}`);
+    lines.push(`  self_repair_burn_share: ${fmtShare(costAttr.self_repair_burn_share)}`);
+  }
+
   return lines.join('\n') + '\n';
 }
 

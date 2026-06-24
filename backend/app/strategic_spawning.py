@@ -1013,6 +1013,7 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
         result["llm_cost_attribution"] = {
             "total_llm_usd": raw_attr.get("total_llm_usd"),
             "rework_share": raw_attr.get("rework_share"),
+            "self_repair_burn_share": raw_attr.get("self_repair_burn_share"),
             # Dominant driver signals: the single highest-cost model, task type,
             # and failure class so the strategist sees WHY llm_cost_per_merged_pr
             # drifted, not just THAT it did. All are sorted desc by cost_usd by

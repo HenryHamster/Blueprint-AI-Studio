@@ -707,6 +707,30 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
               </div>
             ))}
           </div>
+          {(() => {
+            const attr = data.llm_cost_attribution;
+            const dominantModel = attr.by_model?.length
+              ? [...attr.by_model].sort((a, b) => b.cost_usd - a.cost_usd)[0]
+              : null;
+            const dominantTaskType = attr.by_task_type?.length
+              ? [...attr.by_task_type].sort((a, b) => b.cost_usd - a.cost_usd)[0]
+              : null;
+            const hasDecomp = dominantModel != null || dominantTaskType != null
+              || attr.rework_share != null || attr.self_repair_burn_share != null;
+            if (!hasDecomp) return null;
+            return (
+              <div data-testid="llm-cost-decomposition" className="mt-2 pt-2 border-t border-neutral-700/50 text-ui-sm text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
+                {dominantModel && (
+                  <span>top model: <span className="text-neutral-400 font-mono">{dominantModel.model}</span> ${dominantModel.cost_usd.toFixed(2)}</span>
+                )}
+                {dominantTaskType && (
+                  <span>top type: <span className="text-neutral-400 font-mono">{dominantTaskType.task_type}</span> ${dominantTaskType.cost_usd.toFixed(2)}</span>
+                )}
+                <span>rework: {attr.rework_share != null ? `${(attr.rework_share * 100).toFixed(0)}%` : '—'}</span>
+                <span>self-repair burn: {attr.self_repair_burn_share != null ? `${(attr.self_repair_burn_share * 100).toFixed(0)}%` : '—'}</span>
+              </div>
+            );
+          })()}
         </div>
       )}
       {data.format_compliance && (

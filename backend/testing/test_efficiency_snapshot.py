@@ -46,6 +46,7 @@ from app.efficiency_snapshot import (
     _last_run_due,
     _task_llm_attempts,
     compute_current_axes,
+    compute_llm_cost_attribution_baseline_delta,
     compute_llm_cost_breakdown,
     compute_llm_cost_by_task_type,
     compute_pr_rework_chain_breakdown,
@@ -8409,3 +8410,168 @@ def test_llm_cost_by_outcome_separates_completed_no_pr_from_other():
 
     assert "MERGED" in by_class
     assert by_class["MERGED"]["task_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# llm_cost_attribution_baseline_delta tests
+# ---------------------------------------------------------------------------
+
+
+def test_compute_llm_cost_attribution_baseline_delta_returns_none_on_missing():
+    """Returns None when either block is absent."""
+    assert compute_llm_cost_attribution_baseline_delta(None, None) is None
+    assert compute_llm_cost_attribution_baseline_delta({"total_llm_usd": 1.0}, None) is None
+    assert compute_llm_cost_attribution_baseline_delta(None, {"total_llm_usd": 1.0}) is None
+
+
+def test_llm_cost_attribution_baseline_delta():
+    """compute_llm_cost_attribution_baseline_delta computes correct deltas for
+    total_llm_usd, rework_share, self_repair_burn_share, by_model_delta, and
+    by_task_type_delta between a synthetic baseline and current attribution block.
+
+    Acceptance criterion: the named test must run green and exercise non-test
+    production code (compute_llm_cost_attribution_baseline_delta in
+    efficiency_snapshot.py).
+    """
+    baseline_attr = {
+        "total_llm_usd": 10.0,
+        "rework_share": 0.20,
+        SELF_REPAIR_BURN_SHARE_KEY: 0.05,
+        "by_model": [
+            {"provider": "anthropic", "model": "claude-sonnet-4-6", "cost_usd": 8.0},
+            {"provider": "anthropic", "model": "claude-opus-4-8", "cost_usd": 2.0},
+        ],
+        "by_task_type": [
+            {"task_type": "create", "cost_usd": 6.0},
+            {"task_type": "review", "cost_usd": 4.0},
+        ],
+    }
+    current_attr = {
+        "total_llm_usd": 12.6,
+        "rework_share": 0.25,
+        SELF_REPAIR_BURN_SHARE_KEY: 0.07,
+        "by_model": [
+            {"provider": "anthropic", "model": "claude-sonnet-4-6", "cost_usd": 9.0},
+            {"provider": "anthropic", "model": "claude-opus-4-8", "cost_usd": 3.6},
+        ],
+        "by_task_type": [
+            {"task_type": "create", "cost_usd": 7.0},
+            {"task_type": "review", "cost_usd": 5.6},
+        ],
+    }
+
+    delta = compute_llm_cost_attribution_baseline_delta(baseline_attr, current_attr)
+    assert delta is not None
+
+    # total_llm_usd delta
+    total_d = delta["total_llm_usd"]
+    assert total_d["baseline"] == pytest.approx(10.0)
+    assert total_d["current"] == pytest.approx(12.6)
+    assert total_d["abs_delta"] == pytest.approx(2.6, abs=1e-5)
+    assert total_d["rel_pct"] == pytest.approx(26.0, abs=0.01)
+
+    # rework_share delta
+    rework_d = delta["rework_share"]
+    assert rework_d["abs_delta"] == pytest.approx(0.05, abs=1e-6)
+
+    # self_repair_burn_share delta
+    repair_d = delta[SELF_REPAIR_BURN_SHARE_KEY]
+    assert repair_d["baseline"] == pytest.approx(0.05)
+    assert repair_d["current"] == pytest.approx(0.07)
+    assert repair_d["abs_delta"] == pytest.approx(0.02, abs=1e-6)
+
+    # by_model_delta sorted by abs(cost_delta_usd) desc; opus grew by 1.6, sonnet by 1.0
+    by_model = delta["by_model_delta"]
+    assert len(by_model) == 2
+    assert by_model[0]["model"] == "claude-opus-4-8"
+    assert by_model[0]["cost_delta_usd"] == pytest.approx(1.6, abs=1e-5)
+    assert by_model[0]["baseline_share"] == pytest.approx(0.2, abs=1e-4)
+    assert by_model[0]["current_share"] == pytest.approx(round(3.6 / 12.6, 4), abs=1e-4)
+
+    # by_task_type_delta
+    by_type = delta["by_task_type_delta"]
+    assert len(by_type) == 2
+    type_map = {r["task_type"]: r for r in by_type}
+    assert type_map["review"]["cost_delta_usd"] == pytest.approx(1.6, abs=1e-5)
+    assert type_map["create"]["cost_delta_usd"] == pytest.approx(1.0, abs=1e-5)
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_attribution_baseline_delta_in_read_baseline(db_session):
+    """read_baseline_with_drift exposes llm_cost_attribution_baseline_delta comparing
+    the baseline's llm_cost_attribution to the latest snapshot's block.
+
+    Two snapshots are written with different task sets so that the current
+    attribution differs from the baseline, and the delta is verified to reflect
+    the actual shift.  Exercises both write_snapshot and read_baseline_with_drift.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    # First snapshot (becomes baseline): one merged sonnet task.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "pr_number": 1}],
+            api_call_summary={
+                "total_input_tokens": 2000,
+                "total_output_tokens": 500,
+                "llm_call_count": 8,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    # Second snapshot (becomes latest/current): heavier task set, higher total cost.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "pr_number": 2}],
+            api_call_summary={
+                "total_input_tokens": 6000,
+                "total_output_tokens": 1500,
+                "llm_call_count": 20,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+
+    delta = drift.get("llm_cost_attribution_baseline_delta")
+    assert delta is not None, "llm_cost_attribution_baseline_delta must be present"
+
+    assert "total_llm_usd" in delta
+    assert "rework_share" in delta
+    assert SELF_REPAIR_BURN_SHARE_KEY in delta
+    assert "by_model_delta" in delta
+    assert "by_task_type_delta" in delta
+
+    # current window has both tasks so total_llm_usd grows; delta must be positive.
+    total_d = delta["total_llm_usd"]
+    assert total_d["current"] is not None
+    assert total_d["baseline"] is not None
+    assert total_d["abs_delta"] is not None
+    assert total_d["abs_delta"] > 0, (
+        "current LLM cost must exceed baseline when more tasks are in the window"
+    )
+
+    # by_model_delta must include the sonnet model that ran in both windows.
+    model_keys = {(r["provider"], r["model"]) for r in delta["by_model_delta"]}
+    assert ("anthropic", "claude-sonnet-4-6") in model_keys

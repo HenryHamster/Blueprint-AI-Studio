@@ -2417,6 +2417,102 @@ async def write_snapshot(
     return snapshot
 
 
+def compute_llm_cost_attribution_baseline_delta(
+    baseline_attr: Dict[str, Any] | None,
+    current_attr: Dict[str, Any] | None,
+) -> Dict[str, Any] | None:
+    """Baseline-vs-current delta for a compact llm_cost_attribution block.
+
+    Returns None when either attribution block is absent.  The delta answers
+    *what* shifted when llm_cost_per_merged_pr drifts: which model's share grew,
+    whether rework or self-repair rose, and whether the move is in total spend.
+
+    Each scalar field carries ``{baseline, current, abs_delta, rel_pct}``.
+    Per-model and per-task-type rows carry absolute cost delta and share-point
+    shift so the dominant driver is immediately readable.  Both lists are sorted
+    by abs(cost_delta_usd) descending so the biggest mover is first.
+    """
+    if not baseline_attr or not current_attr:
+        return None
+
+    def _scalar_delta(b: Any, c: Any) -> Dict[str, Any]:
+        b_val = b if isinstance(b, (int, float)) else None
+        c_val = c if isinstance(c, (int, float)) else None
+        abs_delta: float | None = None
+        rel_pct: float | None = None
+        if b_val is not None and c_val is not None:
+            abs_delta = round(c_val - b_val, 6)
+            if b_val != 0:
+                rel_pct = round((c_val - b_val) / b_val * 100.0, 2)
+        return {"baseline": b_val, "current": c_val, "abs_delta": abs_delta, "rel_pct": rel_pct}
+
+    b_total = baseline_attr.get("total_llm_usd") or 0.0
+    c_total = current_attr.get("total_llm_usd") or 0.0
+
+    def _share(cost: Any, total: float) -> float | None:
+        if not isinstance(cost, (int, float)) or total <= 0:
+            return None
+        return round(cost / total, 4)
+
+    def _list_delta(b_rows: list, c_rows: list, key: str) -> list:
+        b_map = {r[key]: r.get("cost_usd", 0.0) for r in (b_rows or [])}
+        c_map = {r[key]: r.get("cost_usd", 0.0) for r in (c_rows or [])}
+        all_keys = set(b_map) | set(c_map)
+        rows = []
+        for k in all_keys:
+            b_cost = b_map.get(k, 0.0)
+            c_cost = c_map.get(k, 0.0)
+            rows.append({
+                key: k,
+                "baseline_cost_usd": round(b_cost, 6),
+                "current_cost_usd": round(c_cost, 6),
+                "cost_delta_usd": round(c_cost - b_cost, 6),
+                "baseline_share": _share(b_cost, b_total),
+                "current_share": _share(c_cost, c_total),
+                "share_delta": (
+                    round(_share(c_cost, c_total) - _share(b_cost, b_total), 4)
+                    if _share(c_cost, c_total) is not None and _share(b_cost, b_total) is not None
+                    else None
+                ),
+            })
+        rows.sort(key=lambda r: abs(r["cost_delta_usd"]), reverse=True)
+        return rows
+
+    b_by_model = baseline_attr.get("by_model") or []
+    c_by_model = current_attr.get("by_model") or []
+    b_map_model = {(r["provider"], r["model"]): r.get("cost_usd", 0.0) for r in b_by_model}
+    c_map_model = {(r["provider"], r["model"]): r.get("cost_usd", 0.0) for r in c_by_model}
+    all_model_keys = set(b_map_model) | set(c_map_model)
+    by_model_delta = sorted(
+        [
+            {
+                "provider": k[0],
+                "model": k[1],
+                "baseline_cost_usd": round(b_map_model.get(k, 0.0), 6),
+                "current_cost_usd": round(c_map_model.get(k, 0.0), 6),
+                "cost_delta_usd": round(c_map_model.get(k, 0.0) - b_map_model.get(k, 0.0), 6),
+                "baseline_share": _share(b_map_model.get(k, 0.0), b_total),
+                "current_share": _share(c_map_model.get(k, 0.0), c_total),
+            }
+            for k in all_model_keys
+        ],
+        key=lambda r: abs(r["cost_delta_usd"]),
+        reverse=True,
+    )
+
+    return {
+        "total_llm_usd": _scalar_delta(baseline_attr.get("total_llm_usd"), current_attr.get("total_llm_usd")),
+        "rework_share": _scalar_delta(baseline_attr.get("rework_share"), current_attr.get("rework_share")),
+        SELF_REPAIR_BURN_SHARE_KEY: _scalar_delta(
+            baseline_attr.get(SELF_REPAIR_BURN_SHARE_KEY), current_attr.get(SELF_REPAIR_BURN_SHARE_KEY)
+        ),
+        "by_model_delta": by_model_delta,
+        "by_task_type_delta": _list_delta(
+            baseline_attr.get("by_task_type"), current_attr.get("by_task_type"), "task_type"
+        ),
+    }
+
+
 async def read_baseline_with_drift(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
@@ -2835,6 +2931,13 @@ async def read_baseline_with_drift(
         # of only reading that llm_cost_per_merged_pr changed.
         "llm_cost_attribution": latest.get("llm_cost_attribution"),
         "llm_cost_attribution_trend": llm_cost_attribution_trend,
+        # Baseline-vs-current delta for the llm_cost_attribution decomposition:
+        # which model/task-type share shifted, how much rework or self-repair moved,
+        # and what the absolute USD change was.  None when either side is absent.
+        "llm_cost_attribution_baseline_delta": compute_llm_cost_attribution_baseline_delta(
+            baseline.get("llm_cost_attribution"),
+            latest.get("llm_cost_attribution"),
+        ),
         # Panel review effectiveness: the overturn rate, count of challenges by
         # outcome (confirmed/revised/rejected), and total gate invocations. Null
         # when no gate invocations exist in the window.

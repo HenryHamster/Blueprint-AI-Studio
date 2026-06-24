@@ -1539,9 +1539,31 @@ export interface LlmCostByFailureClassEntry {
   total_cost_usd: number;
 }
 
+/** Compact per-model row emitted by _compact_llm_cost_attribution (uses cost_usd, not total_cost_usd). */
+export interface LlmCostCompactModelRow {
+  provider: string;
+  model: string;
+  cost_usd: number;
+}
+
+/** Compact per-task-type row emitted by _compact_llm_cost_attribution. */
+export interface LlmCostCompactTaskTypeRow {
+  task_type: string;
+  cost_usd: number;
+  mean_input_tokens_per_call?: number | null;
+}
+
 export interface LlmCostAttribution {
   by_failure_class: LlmCostByFailureClassEntry[];
   total_llm_usd: number;
+  /** Fraction of total LLM spend attributable to rework chains. Null when no chain data. */
+  rework_share?: number | null;
+  /** Fraction of total LLM tokens consumed by self-repair (format fix) loops. Null when no data. */
+  self_repair_burn_share?: number | null;
+  /** Per-(provider, model) compact cost breakdown. Absent on older snapshots. */
+  by_model?: LlmCostCompactModelRow[] | null;
+  /** Per-task-type compact cost breakdown. Absent on older snapshots. */
+  by_task_type?: LlmCostCompactTaskTypeRow[] | null;
 }
 
 export interface EfficiencyAxesResponse {

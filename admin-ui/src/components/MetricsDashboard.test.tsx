@@ -587,6 +587,118 @@ describe('MetricsDashboard', () => {
     }
   });
 
+  it('renders llm cost decomposition (dominant model/task-type, rework, self-repair) when present', async () => {
+    const original = apiFetch.getMockImplementation();
+    if (!original) throw new Error('apiFetch mock implementation missing');
+    apiFetch.mockImplementation(async (url: string) => {
+      if (url.includes('/efficiency-axes')) {
+        return new Response(JSON.stringify({
+          axes: { cost_per_merged_pr: { current: 45.2, baseline: 50.0, drift_pct: -9.6, history: [] } },
+          baseline_captured_at: '2026-05-01T00:00:00Z',
+          last_snapshot_at: '2026-05-08T00:00:00Z',
+          llm_cost_attribution: {
+            total_llm_usd: 5.00,
+            by_failure_class: [
+              { failure_class: 'MERGED', task_count: 10, total_cost_usd: 3.50 },
+            ],
+            by_model: [
+              { provider: 'anthropic', model: 'claude-sonnet-4-6', cost_usd: 3.20 },
+              { provider: 'anthropic', model: 'claude-haiku-4-5', cost_usd: 0.80 },
+            ],
+            by_task_type: [
+              { task_type: 'create', cost_usd: 2.80 },
+              { task_type: 'review', cost_usd: 1.40 },
+            ],
+            rework_share: 0.12,
+            self_repair_burn_share: 0.05,
+          },
+        }), { status: 200 });
+      }
+      return original(url);
+    });
+
+    try {
+      render(
+        <MetricsDashboard
+          metricsHistory={[]}
+          cumulativeCost={0}
+          cumulativeVmHours={0}
+          maxConcurrentVMs={4}
+          tasks={[]}
+          metricsWindow="6h"
+          onWindowChange={vi.fn()}
+          projectId="project-1"
+        />,
+      );
+      await act(async () => { await Promise.resolve(); });
+
+      const block = screen.getByTestId('llm-cost-by-outcome-block');
+      // failure-class slice still present
+      expect(block).toHaveTextContent('MERGED');
+      expect(block).toHaveTextContent('$3.50');
+
+      const decomp = screen.getByTestId('llm-cost-decomposition');
+      // dominant model (claude-sonnet-4-6 has higher cost_usd)
+      expect(decomp).toHaveTextContent('claude-sonnet-4-6');
+      expect(decomp).toHaveTextContent('$3.20');
+      // dominant task type
+      expect(decomp).toHaveTextContent('create');
+      expect(decomp).toHaveTextContent('$2.80');
+      // rework_share 12%
+      expect(decomp).toHaveTextContent('12%');
+      // self_repair_burn_share 5%
+      expect(decomp).toHaveTextContent('5%');
+    } finally {
+      apiFetch.mockImplementation(original);
+    }
+  });
+
+  it('renders failure-class slice and no crash when decomposition fields absent', async () => {
+    const original = apiFetch.getMockImplementation();
+    if (!original) throw new Error('apiFetch mock implementation missing');
+    apiFetch.mockImplementation(async (url: string) => {
+      if (url.includes('/efficiency-axes')) {
+        return new Response(JSON.stringify({
+          axes: { cost_per_merged_pr: { current: 10.0, baseline: 10.0, drift_pct: 0.0, history: [] } },
+          baseline_captured_at: '2026-05-01T00:00:00Z',
+          last_snapshot_at: '2026-05-08T00:00:00Z',
+          llm_cost_attribution: {
+            total_llm_usd: 1.00,
+            by_failure_class: [
+              { failure_class: 'MERGED', task_count: 5, total_cost_usd: 1.00 },
+            ],
+            // by_model, by_task_type, rework_share, self_repair_burn_share absent
+          },
+        }), { status: 200 });
+      }
+      return original(url);
+    });
+
+    try {
+      render(
+        <MetricsDashboard
+          metricsHistory={[]}
+          cumulativeCost={0}
+          cumulativeVmHours={0}
+          maxConcurrentVMs={4}
+          tasks={[]}
+          metricsWindow="6h"
+          onWindowChange={vi.fn()}
+          projectId="project-1"
+        />,
+      );
+      await act(async () => { await Promise.resolve(); });
+
+      // failure-class slice renders
+      const block = screen.getByTestId('llm-cost-by-outcome-block');
+      expect(block).toHaveTextContent('MERGED');
+      // decomposition sub-block absent (no data to show)
+      expect(screen.queryByTestId('llm-cost-decomposition')).toBeNull();
+    } finally {
+      apiFetch.mockImplementation(original);
+    }
+  });
+
   it('omits the origin breakdown when the axes response lacks it', async () => {
     const original = apiFetch.getMockImplementation();
     if (!original) throw new Error('apiFetch mock implementation missing');
