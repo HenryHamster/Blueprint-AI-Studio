@@ -456,6 +456,9 @@ async def _spawn_release_merge_grade_task(
         # merged-PR discovery theme evidence uses); the agent fetches each PR's
         # diff to grade goal coverage.
         "merged_prs": list(merged_pr_numbers),
+        # Explicitly pin to Opus — regression guard against silent downgrade
+        # (mirrors release_audit / release_audit_challenge).
+        "quality_tier": "opus",
     }
     # Blindness guard — see the contract note above. No payload key may carry
     # the strategist running-update narrative into a grade that must be blind to

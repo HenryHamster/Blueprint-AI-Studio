@@ -5754,6 +5754,11 @@ async def test_run_qualification_spawns_merge_grade_child_when_goal_set(
     assert payload["candidate_sha"] == candidate
     assert payload["version_goal"] == "deliver user analytics dashboard"
     assert payload["merged_prs"] == [101, 102]
+    # Regression guard: promotion judgment must be pinned to Opus so a future
+    # cost-saving runtime-config edit cannot silently downgrade it.
+    assert payload.get("quality_tier") == "opus", (
+        f"release_merge_grade must pin quality_tier=opus; got {payload.get('quality_tier')!r}"
+    )
 
 
 @pytest.mark.asyncio

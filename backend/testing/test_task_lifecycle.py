@@ -10818,3 +10818,97 @@ async def test_requeue_llm_cost_zero_for_unpriced_provider_model(tl_db, mocker):
     assert clone_ctx.get("_prior_attempts_llm_cost", 0.0) == 0.0, (
         "Unpriced provider/model must contribute $0, not fail the requeue"
     )
+
+
+@pytest.mark.asyncio
+async def test_adversarial_gate_fail_open_emits_deduplicated_alert(tl_db, mocker):
+    """When the second-opinion challenger model is unavailable, the gate degrades
+    to the primary verdict and an operator-visible Alert is created. Re-entering
+    the degraded path does NOT create a duplicate alert."""
+    from app.failure_classification import (
+        EXTERNAL_API,
+        EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
+    )
+
+    (
+        session,
+        factory,
+        project,
+        _original,
+        review_task,
+        merge_mock,
+        _captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7799)
+
+    # Mock classify helpers so the challenger's FAILED status looks like a
+    # provider model-config rejection (the exact condition that triggers fail-open).
+    mocker.patch(
+        "app.task_lifecycle.classify_failure", return_value=EXTERNAL_API
+    )
+    mocker.patch(
+        "app.task_lifecycle.classify_external_api_subtype",
+        return_value=EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
+    )
+
+    # Drive review to APPROVE — parks and spawns challenger.
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None, "challenger must be spawned"
+
+    # Drive challenger to FAILED with the model-unavailable condition.
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.FAILED,
+        logs="model does not exist or you do not have access",
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+
+    # Gate must have degraded and emitted the alert.
+    alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title
+                    == "Adversarial gate failed open: second-opinion model unavailable",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, (
+        "Exactly one fail-open alert must be created when the challenger model "
+        "is unavailable"
+    )
+    assert alerts[0].task_id == review_task.id, (
+        "Alert must be linked to the review task"
+    )
+    assert str(challenger.id)[:8] in alerts[0].message, (
+        "Alert message must reference the challenger task id"
+    )
+
+    # Deduplication: re-entering the same path must not create a second alert.
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+    alerts2 = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title
+                    == "Adversarial gate failed open: second-opinion model unavailable",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts2) == 1, "Re-entering the path must not create a duplicate alert"
