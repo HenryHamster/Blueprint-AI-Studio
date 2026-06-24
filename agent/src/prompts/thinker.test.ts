@@ -474,6 +474,22 @@ describe('buildThinkerPrompt', () => {
     // This verifies our structural test WOULD catch such a regression
     expect(prompt).toContain('## 1. State assessment'); // original still passes
   });
+
+  it('test_thinker_prompt_instructs_new_version_goal_emission', () => {
+    const prompt = buildThinkerPrompt(base);
+    // The prompt must instruct the thinker that it can emit new_version_goal
+    expect(prompt).toContain('new_version_goal');
+    // The instruction must be in Section 6 (Problem model output)
+    expect(prompt).toContain('Optional sibling fields: new_version_goal');
+    // Must explain when to emit it (when Goal is unset)
+    expect(prompt).toContain('when the Goal is currently unset');
+    // Must show example JSON format
+    expect(prompt).toContain('"new_version_goal":');
+    // Must note that once set, it is frozen
+    expect(prompt).toContain('frozen');
+    // Must specify the character limit
+    expect(prompt).toContain('500 characters');
+  });
 });
 
 // ── runThinkerWithGate ────────────────────────────────────────────────────────

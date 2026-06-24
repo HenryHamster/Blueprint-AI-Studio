@@ -344,6 +344,18 @@ Source = {type (user_message|friction_promotion|agent_observation|self_reflectio
 
 When describing changes in prose, be precise: "opening gap g-strategic-mem (from user_message msg-42)", "retiring direction d-auth-middleware (gap g-auth closed by merged PR #82)".
 
+**Optional sibling fields: new_version_goal.** If the open version has no Goal shown in the context above, you may propose one by emitting a \`new_version_goal\` field as a top-level sibling in your Section 6 problem_model update:
+
+\`\`\`json
+{
+  "new_version_goal": "One concise sentence stating what this version is for.",
+  "intent": { ... },
+  "capabilities": [ ... ]
+}
+\`\`\`
+
+Only emit \`new_version_goal\` when the Goal is currently unset — once authored, the goal is frozen and a re-emit is silently ignored. Keep it under 500 characters and avoid placeholder or generic text.
+
 Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
 
 ${PLAYBOOK_GUIDANCE}
