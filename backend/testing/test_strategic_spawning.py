@@ -13521,3 +13521,281 @@ async def test_strategist_context_surfaces_direction_linked_knowledge(db_session
         "direction_knowledge missing from direction outcome — linked knowledge not surfaced"
     )
     assert matched["direction_knowledge"][0]["title"] == "Auth research findings"
+
+
+# ── spawn_fix op: one-time direction-free implementation dispatch ──────────────
+#
+# spawn_fix lets the strategist dispatch a ONE-TIME implementation task (bug fix,
+# CI remediation, isolated cleanup) with NO strategic direction. These tests
+# exercise the production handler in routers/admin_agent_ops.py end-to-end over
+# the real /api/agent/strategic endpoint, mirroring the spawn_task harness in
+# test_pipeline.py but asserting the direction-free, one_time_fix provenance.
+
+
+async def _make_strategic_review_task(db_session):
+    """Create a project + IN_PROGRESS strategic_review task; return
+    (project, review_id) for spawn_fix endpoint tests."""
+    project = Project(name="P", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    review = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    db_session.add(review)
+    await db_session.commit()
+    await db_session.refresh(review)
+    return project, str(review.id)
+
+
+async def _post_spawn_fix(
+    db_session, task_id, *, title, prompt, spawn_type="create", expect_status=200
+):
+    """POST a strategic spawn_fix op against the test app over the real endpoint.
+
+    Returns the parsed JSON body (success body on 200, FastAPI error envelope on
+    an expected error status)."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "spawn_fix",
+                    "task_id": task_id,
+                    "data": {"type": spawn_type, "title": title, "prompt": prompt},
+                },
+            )
+        assert resp.status_code == expect_status, resp.text
+        return resp.json()
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+def test_one_time_spawnable_registry_set_is_implementation_types():
+    """STRATEGIST_ONE_TIME_SPAWNABLE_TYPES is exactly the PR-producing
+    implementation types, and is disjoint from the investigation/knowledge types
+    spawn_task accepts (no overlap between the two dispatch lanes)."""
+    from app.task_capabilities import (
+        STRATEGIST_ONE_TIME_SPAWNABLE_TYPES,
+        STRATEGIST_SPAWNABLE_TASK_TYPES,
+    )
+
+    assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES == {"create", "refactor", "fix", "qa"}
+    # The two lanes are mutually exclusive: a one-time fix is direction-free and
+    # PR-producing; a spawn_task spawn is a read-only investigation.
+    assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES.isdisjoint(
+        STRATEGIST_SPAWNABLE_TASK_TYPES
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_fix_creates_task_without_direction_id(db_session):
+    """spawn_fix with a valid implementation type (create) creates a QUEUED task
+    carrying created_by=STRATEGIC_AGENT and the one-time-fix provenance, and with
+    NO direction_id anywhere — neither in context nor in the payload — so it can
+    never surface in any direction portfolio logic."""
+    _project, review_id = await _make_strategic_review_task(db_session)
+
+    body = await _post_spawn_fix(
+        db_session,
+        review_id,
+        title="Fix red CI test on automain",
+        prompt="The launch test clamps the spend cap; fix the assertion.",
+        spawn_type="create",
+    )
+    assert body["status"] == "ok"
+    assert body["op"] == "spawn_fix"
+    assert body["type"] == "create"
+    assert body["deduplicated"] is False
+    assert body["priority"] == 100
+
+    spawned = (
+        await db_session.execute(select(Task).where(Task.id == body["task_id"]))
+    ).scalar_one()
+    assert spawned.status == TaskStatus.QUEUED
+    assert spawned.created_by == "STRATEGIC_AGENT"
+    assert spawned.first_payload.get("type") == "create"
+
+    # Direction-free provenance: spawned_by marks the one-time-fix lane and the
+    # one_time_fix flag is set; NO direction_id key exists in context.
+    ctx = spawned.context or {}
+    assert ctx.get("spawned_by") == "strategic_direct_fix"
+    assert ctx.get("one_time_fix") is True
+    assert ctx.get("parent_strategic_task_id") == review_id
+    assert "direction_id" not in ctx
+
+    # The payload itself carries no direction_id key (direction-free by construction).
+    assert "direction_id" not in spawned.first_payload
+
+
+@pytest.mark.asyncio
+async def test_spawn_fix_rejects_direction_only_investigation_type(db_session):
+    """A research task is a strategist_spawnable investigation type, NOT a
+    one-time implementation type, so spawn_fix must reject it with a 400 listing
+    the registry-derived allowed types."""
+    from app.task_capabilities import STRATEGIST_ONE_TIME_SPAWNABLE_TYPES
+
+    _project, review_id = await _make_strategic_review_task(db_session)
+
+    body = await _post_spawn_fix(
+        db_session,
+        review_id,
+        title="Investigate something",
+        prompt="research the codebase",
+        spawn_type="research",
+        expect_status=400,
+    )
+    detail = body["error"]["message"]
+    assert "must be one of" in detail
+    assert "research" in detail  # echoes the rejected type
+    assert str(sorted(STRATEGIST_ONE_TIME_SPAWNABLE_TYPES)) in detail
+
+
+@pytest.mark.asyncio
+async def test_spawn_fix_fix_type_without_pr_context_fails_cleanly(db_session):
+    """``fix`` is in the one-time-spawnable allowlist, but its FixPayload requires
+    pr_number + branch — a prompt-only one-time spawn cannot supply them. The
+    handler must surface that as a clean 400 (not an opaque 500), and create NO
+    task."""
+    from sqlalchemy import func as _f
+
+    _project, review_id = await _make_strategic_review_task(db_session)
+
+    body = await _post_spawn_fix(
+        db_session,
+        review_id,
+        title="Fix the thing",
+        prompt="patch the bug",
+        spawn_type="fix",
+        expect_status=400,
+    )
+    detail = body["error"]["message"]
+    assert "cannot build a valid 'fix' payload" in detail
+
+    # No task was created by the failed validation.
+    count = (
+        await db_session.execute(
+            select(_f.count())
+            .select_from(Task)
+            .where(Task.created_by == "STRATEGIC_AGENT")
+        )
+    ).scalar()
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_fix_idempotent_on_retry_duplicate(db_session):
+    """A retried spawn_fix (same source review, type and title within 30 min)
+    returns the existing task instead of creating a duplicate, keyed on the
+    strategic_direct_fix provenance."""
+    from sqlalchemy import func as _f
+
+    _project, review_id = await _make_strategic_review_task(db_session)
+
+    title = "Fix flaky compute spawn test"
+    prompt = "Reset the spend-gate global config in the fixture."
+
+    first = await _post_spawn_fix(
+        db_session, review_id, title=title, prompt=prompt, spawn_type="create"
+    )
+    assert first["status"] == "ok"
+    assert first["deduplicated"] is False
+    first_id = first["task_id"]
+
+    second = await _post_spawn_fix(
+        db_session, review_id, title=title, prompt=prompt, spawn_type="create"
+    )
+    assert second["status"] == "ok"
+    assert second["deduplicated"] is True
+    assert second["task_id"] == first_id
+
+    # Exactly one one-time-fix child exists for this review.
+    count = (
+        await db_session.execute(
+            select(_f.count())
+            .select_from(Task)
+            .where(Task.created_by == "STRATEGIC_AGENT", Task.title == title)
+        )
+    ).scalar()
+    assert count == 1
+
+    # The parent's spawn counter incremented exactly once (dedup does not double-count).
+    review = (
+        await db_session.execute(select(Task).where(Task.id == review_id))
+    ).scalar_one()
+    assert (review.context or {}).get("_strategic_tasks_spawned") == 1
+
+
+@pytest.mark.asyncio
+async def test_spawn_fix_per_review_budget_enforced(db_session, mocker):
+    """One strategic review may spawn at most the per-review cap of one-time
+    fixes; the next is refused with 429 status='skipped' and an observable budget
+    flag stamped on the review."""
+    from sqlalchemy import func as _f
+
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"strategist_spawn_per_review_cap": 2, "strategist_spawn_window_cap": 50},
+    )
+
+    _project, review_id = await _make_strategic_review_task(db_session)
+
+    # Distinct titles (overlap below threshold) so semantic dedup never fires.
+    for n in ("alpha", "beta"):
+        body = await _post_spawn_fix(
+            db_session, review_id, title=f"Fix {n}", prompt=f"do {n}"
+        )
+        assert body["status"] == "ok"
+        assert body["deduplicated"] is False
+
+    refused = await _post_spawn_fix(
+        db_session,
+        review_id,
+        title="Fix gamma",
+        prompt="do gamma",
+        expect_status=429,
+    )
+    assert refused["status"] == "skipped"
+    assert refused["op"] == "spawn_fix"
+    assert refused["scope"] == "per_review"
+
+    # Only the two budgeted tasks exist; the third was not created.
+    count = (
+        await db_session.execute(
+            select(_f.count())
+            .select_from(Task)
+            .where(Task.created_by == "STRATEGIC_AGENT")
+        )
+    ).scalar()
+    assert count == 2
+
+    # The refusal is observable: the review carries the exhaustion flag.
+    review = (
+        await db_session.execute(select(Task).where(Task.id == review_id))
+    ).scalar_one()
+    flag = (review.context or {}).get("_strategic_spawn_budget_exhausted")
+    assert flag is not None
+    assert flag["scope"] == "per_review"

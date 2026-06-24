@@ -16,7 +16,7 @@ function generateStrategicScript(taskIdRaw: string): string {
   return `#!/bin/bash
 # Strategic review tool — updates problem_model, running_update, directions,
 # messages via API. Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env.
-OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|stage-direction|approve-direction|reject-direction|create-message|resolve-message|spawn-task|set-retirement-critiques|set-evidence-progress <json-or-file>}"
+OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|stage-direction|approve-direction|reject-direction|create-message|resolve-message|spawn-task|spawn-fix|set-retirement-critiques|set-evidence-progress <json-or-file>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
@@ -76,6 +76,7 @@ case "$OP" in
   create-message)            _call "create_message" ;;
   resolve-message)           _call "resolve_message" ;;
   spawn-task)                _call "spawn_task" ;;
+  spawn-fix)                 _call "spawn_fix" ;;
   set-retirement-critiques)  _call "set_retirement_critiques" ;;
   set-evidence-progress)     _call "set_evidence_progress" ;;
   *) echo "Unknown op: $OP" >&2; exit 1 ;;

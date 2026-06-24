@@ -78,6 +78,19 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('reject-direction');
   });
 
+  it('routes the spawn-fix op to the spawn_fix backend operation', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+    // The one-time-fix dispatch arm exists and maps the CLI verb to the API op.
+    expect(content).toContain('spawn-fix)');
+    expect(content).toContain('_call "spawn_fix"');
+    // It is advertised in the usage string alongside spawn-task.
+    expect(content).toContain('spawn-fix');
+  });
+
   it('embeds projectId in fetch script safely', () => {
     const taskId = 'test-task-123';
     const projectId = 'test-project-456';

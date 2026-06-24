@@ -4927,3 +4927,61 @@ async def test_sweep_orphaned_provider_task_no_direction_row_not_cancelled(
     assert cancelled == 0
     await eval_db.refresh(task)
     assert task.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_sweep_orphaned_provider_task_with_open_pr_not_cancelled(
+    eval_db, mocker
+):
+    """An EVALUATING task with a retired direction but an open PR must be orphaned, not cancelled.
+
+    When a direction expires/completes, tasks that have already opened a PR have
+    salvageable work — the PR should be allowed to land rather than the task being
+    killed. The sweep should clear the direction_id from context (orphaning it so
+    subsequent sweeps skip it) but preserve the task's EVALUATING status and PR.
+    """
+    from app.reaper_evaluating_sweeps import sweep_orphaned_direction_provider_tasks
+
+    project = Project(name="Orphan With PR Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    direction_key = "d-with-pr01"
+    direction = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        status="expired",
+        data={"id": direction_key, "status": "expired"},
+    )
+    eval_db.add(direction)
+    await eval_db.commit()
+
+    # EVALUATING task tied to that direction with an open PR.
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "implementation task",
+                "pr_number": 12345,
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        context={"direction_id": direction_key},
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    # Sweep should count it as 0 cancelled (it was orphaned, not cancelled).
+    cancelled = await sweep_orphaned_direction_provider_tasks(eval_db)
+
+    assert cancelled == 0
+    await eval_db.refresh(task)
+    # Task must NOT be cancelled.
+    assert task.status == TaskStatus.EVALUATING
+    # Direction_id should be removed from context.
+    assert (task.context or {}).get("direction_id") is None
+    # The PR should still be in the payload.
+    assert (task.payloads or [{}])[0].get("pr_number") == 12345
