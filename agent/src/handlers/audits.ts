@@ -558,6 +558,7 @@ export async function handleReleaseAudit(
     deleted_test_files: string[];
     assertion_delta: number;
     test_count_delta: number;
+    deleted_test_file_classifications?: { path: string; classification: string; rationale: string }[];
   };
   let computedTestErosion: ComputedTestErosion | null = null;
   try {
@@ -568,11 +569,71 @@ export async function handleReleaseAudit(
     const nameStatus = execFileSync('git', ['diff', '--name-status', diffRange], {
       cwd: WORKSPACE, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const deletedTestFiles = nameStatus
-      .split('\n')
-      .filter((line: string) => line.startsWith('D\t'))
-      .map((line: string) => line.slice(2).trim())
-      .filter((p: string) => TEST_PATH_RE.test(p));
+    // All deleted files (test and non-test) — used for co-deletion subject checks.
+    const allDeletedFiles = new Set<string>(
+      nameStatus
+        .split('\n')
+        .filter((line: string) => line.startsWith('D\t'))
+        .map((line: string) => line.slice(2).trim())
+        .filter((p: string) => p.length > 0)
+    );
+    const deletedTestFiles = [...allDeletedFiles].filter((p: string) => TEST_PATH_RE.test(p));
+
+    // Derive the subject source file path(s) for a given test file path.
+    // Returns candidate paths; caller checks which (if any) are co-deleted.
+    const deriveSubjectPaths = (testPath: string): string[] => {
+      const lastSlash = testPath.lastIndexOf('/');
+      const dir = lastSlash >= 0 ? testPath.slice(0, lastSlash + 1) : '';
+      const base = lastSlash >= 0 ? testPath.slice(lastSlash + 1) : testPath;
+
+      // Frontend: X.test.tsx / X.viewport.test.tsx / X.test.ts / X.viewport.test.ts
+      // -> subject X.tsx and X.ts in the same directory.
+      const frontendMatch = base.match(/^(.+?)(?:\.viewport)?\.test\.(tsx?)$/);
+      if (frontendMatch) {
+        const stem = frontendMatch[1];
+        return [`${dir}${stem}.tsx`, `${dir}${stem}.ts`];
+      }
+
+      // Backend: testing/test_foo.py -> app/foo.py
+      // Replace the 'testing' directory segment with 'app'.
+      const backendMatch = base.match(/^test_(.+)\.py$/);
+      if (backendMatch) {
+        const module = backendMatch[1];
+        const appDir = dir.replace(/^(.*)testing\/$/, '$1app/');
+        if (appDir !== dir) {
+          return [`${appDir}${module}.py`];
+        }
+      }
+
+      // __tests__/foo.test.ts -> ../foo.ts (parent of __tests__ directory).
+      if (dir.endsWith('__tests__/')) {
+        const tsMatch = base.match(/^(.+)\.test\.(tsx?)$/);
+        if (tsMatch) {
+          const stem = tsMatch[1];
+          const parentDir = dir.slice(0, dir.length - '__tests__/'.length);
+          return [`${parentDir}${stem}.ts`, `${parentDir}${stem}.tsx`];
+        }
+      }
+
+      return [];
+    };
+
+    // Classify each deleted test file deterministically: if ANY derived subject
+    // is also a D-line in the diff, it is unambiguously dead_code_removal.
+    // Files whose subject cannot be derived or is still present are left unclassified
+    // so the LLM can assess them (fail-closed for those cases).
+    const deterministicClassifications: { path: string; classification: string; rationale: string }[] = [];
+    for (const testPath of deletedTestFiles) {
+      const subjects = deriveSubjectPaths(testPath);
+      const coDeleted = subjects.find(s => allDeletedFiles.has(s));
+      if (coDeleted) {
+        deterministicClassifications.push({
+          path: testPath,
+          classification: 'dead_code_removal',
+          rationale: `Subject ${coDeleted} is also a D-line in git diff --name-status; co-deletion confirms dead code removal.`,
+        });
+      }
+    }
 
     const diffText = execFileSync('git', ['diff', diffRange], {
       cwd: WORKSPACE, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'],
@@ -619,8 +680,11 @@ export async function handleReleaseAudit(
       deleted_test_files: deletedTestFiles,
       assertion_delta: assertionDelta,
       test_count_delta: testCountDelta,
+      ...(deterministicClassifications.length > 0 && {
+        deleted_test_file_classifications: deterministicClassifications,
+      }),
     };
-    sendLog(ws, `[AUDIT] Computed test erosion: ${deletedTestFiles.length} deleted test file(s), assertion_delta=${assertionDelta}, test_count_delta=${testCountDelta}\n`);
+    sendLog(ws, `[AUDIT] Computed test erosion: ${deletedTestFiles.length} deleted test file(s), ${deterministicClassifications.length} deterministic classification(s), assertion_delta=${assertionDelta}, test_count_delta=${testCountDelta}\n`);
   } catch (e) {
     sendLog(ws, `[WARNING] Could not compute deterministic test erosion: ${e instanceof Error ? e.message : String(e)}\n`);
   }
@@ -731,7 +795,7 @@ Rules:
   const handlerOutput = readHandlerOutput(taskId, 'release_audit_report', ws) as {
     audit_score?: number;
     test_erosion?: { deleted_test_files?: unknown[]; assertion_delta?: number; test_count_delta?: number };
-    computed_test_erosion?: { deleted_test_files: string[]; assertion_delta: number; test_count_delta: number };
+    computed_test_erosion?: { deleted_test_files: string[]; assertion_delta: number; test_count_delta: number; deleted_test_file_classifications?: { path: string; classification: string; rationale: string }[] };
     deleted_test_file_classifications?: { path: string; classification: string; rationale: string }[];
     findings?: unknown[];
   } | null;

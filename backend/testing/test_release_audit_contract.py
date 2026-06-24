@@ -64,6 +64,120 @@ class TestReleaseAuditFixtureShape:
             )
 
 
+class TestDeterministicCoDeleteClassification:
+    """_score_audit prefers computed_test_erosion.deleted_test_file_classifications
+    over the LLM's deleted_test_file_classifications for co-deleted test files."""
+
+    def _make_report(
+        self,
+        deleted_test_files: list,
+        computed_classifications: list | None = None,
+        llm_classifications: list | None = None,
+    ) -> dict:
+        report: dict = {
+            "audit_score": 1.0,
+            "findings": [],
+            "computed_test_erosion": {
+                "deleted_test_files": deleted_test_files,
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "test_erosion": {
+                "deleted_test_files": deleted_test_files,
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        }
+        if computed_classifications is not None:
+            report["computed_test_erosion"]["deleted_test_file_classifications"] = computed_classifications
+        if llm_classifications is not None:
+            report["deleted_test_file_classifications"] = llm_classifications
+        return report
+
+    def test_deterministic_dead_code_removal_passes_without_llm_tag(self):
+        """A file classified dead_code_removal in computed_test_erosion passes
+        even when the LLM emits no deleted_test_file_classifications at all."""
+        report = self._make_report(
+            deleted_test_files=["admin-ui/src/components/Foo.test.tsx"],
+            computed_classifications=[
+                {
+                    "path": "admin-ui/src/components/Foo.test.tsx",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject Foo.tsx is also a D-line in git diff --name-status.",
+                }
+            ],
+            llm_classifications=None,  # LLM produced no classifications
+        )
+        _, test_erosion = _score_audit(report)
+        assert test_erosion is not None, (
+            "Expected a numeric test_erosion score when the deterministic "
+            "classification clears the file as dead_code_removal; got None (hard-block)."
+        )
+
+    def test_subject_still_present_blocks_without_llm_tag(self):
+        """A deleted test file whose subject is NOT co-deleted still hard-blocks
+        when the LLM produces no classification (fail-closed semantics preserved)."""
+        report = self._make_report(
+            deleted_test_files=["admin-ui/src/components/Foo.test.tsx"],
+            computed_classifications=None,  # no deterministic classification (subject still present)
+            llm_classifications=None,  # LLM also produced nothing
+        )
+        _, test_erosion = _score_audit(report)
+        assert test_erosion is None, (
+            "Expected None (hard-block) when the deleted test file has no "
+            "dead_code_removal classification from either deterministic or LLM path."
+        )
+
+    def test_deterministic_overrides_absent_llm_for_multiple_files(self):
+        """Multiple files all cleared deterministically all pass, even with no LLM tags."""
+        report = self._make_report(
+            deleted_test_files=[
+                "admin-ui/src/components/Foo.test.tsx",
+                "admin-ui/src/components/Bar.viewport.test.tsx",
+            ],
+            computed_classifications=[
+                {
+                    "path": "admin-ui/src/components/Foo.test.tsx",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject Foo.tsx deleted.",
+                },
+                {
+                    "path": "admin-ui/src/components/Bar.viewport.test.tsx",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject Bar.tsx deleted.",
+                },
+            ],
+            llm_classifications=None,
+        )
+        _, test_erosion = _score_audit(report)
+        assert test_erosion is not None, (
+            "Expected numeric test_erosion when all deleted files cleared deterministically."
+        )
+
+    def test_partial_deterministic_coverage_blocks_uncovered_file(self):
+        """When one file is cleared deterministically but a second is not, the
+        uncovered file still hard-blocks (fail-closed for uncovered files)."""
+        report = self._make_report(
+            deleted_test_files=[
+                "admin-ui/src/components/Foo.test.tsx",
+                "admin-ui/src/components/Live.test.tsx",  # subject still present
+            ],
+            computed_classifications=[
+                {
+                    "path": "admin-ui/src/components/Foo.test.tsx",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject Foo.tsx deleted.",
+                },
+                # Live.test.tsx NOT classified (subject still present)
+            ],
+            llm_classifications=None,
+        )
+        _, test_erosion = _score_audit(report)
+        assert test_erosion is None, (
+            "Expected None (hard-block) when at least one file is not deterministically cleared."
+        )
+
+
 def _resolve_audits_ts_path() -> "str | None":
     """Locate ``agent/src/handlers/audits.ts`` across local + Docker envs.
 

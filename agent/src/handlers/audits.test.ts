@@ -873,6 +873,127 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
       expect(stored.computed_test_erosion?.assertion_delta).toBe(-1);
     });
   });
+
+  // ── co-deletion classification — deterministic dead_code_removal ───────────
+  describe('computed_test_erosion — co-deletion classifications', () => {
+    beforeEach(() => vi.clearAllMocks());
+
+    it('emits dead_code_removal classification when test and subject are both D-lines (frontend .tsx)', async () => {
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') {
+          return 'D\tadmin-ui/src/components/Foo.tsx\nD\tadmin-ui/src/components/Foo.test.tsx\n';
+        }
+        if (Array.isArray(a) && a[0] === 'diff') return '';
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: {
+          deleted_test_files: string[];
+          deleted_test_file_classifications?: { path: string; classification: string; rationale: string }[];
+        };
+      };
+      const cls = stored.computed_test_erosion?.deleted_test_file_classifications;
+      expect(cls).toBeDefined();
+      const entry = cls?.find(c => c.path === 'admin-ui/src/components/Foo.test.tsx');
+      expect(entry?.classification).toBe('dead_code_removal');
+    });
+
+    it('emits dead_code_removal for viewport test when subject tsx is also deleted', async () => {
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') {
+          return 'D\tadmin-ui/src/components/Bar.tsx\nD\tadmin-ui/src/components/Bar.viewport.test.tsx\n';
+        }
+        if (Array.isArray(a) && a[0] === 'diff') return '';
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: {
+          deleted_test_file_classifications?: { path: string; classification: string }[];
+        };
+      };
+      const entry = stored.computed_test_erosion?.deleted_test_file_classifications?.find(
+        c => c.path === 'admin-ui/src/components/Bar.viewport.test.tsx'
+      );
+      expect(entry?.classification).toBe('dead_code_removal');
+    });
+
+    it('emits NO classification when test is deleted but subject tsx is still present', async () => {
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') {
+          return 'D\tadmin-ui/src/components/Foo.test.tsx\n';
+        }
+        if (Array.isArray(a) && a[0] === 'diff') return '';
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: {
+          deleted_test_file_classifications?: { path: string; classification: string }[];
+        };
+      };
+      const cls = stored.computed_test_erosion?.deleted_test_file_classifications;
+      const entry = cls?.find(c => c.path === 'admin-ui/src/components/Foo.test.tsx');
+      expect(entry).toBeUndefined();
+    });
+
+    it('emits dead_code_removal for backend test when subject module is co-deleted', async () => {
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') {
+          return 'D\ttesting/test_bar.py\nD\tapp/bar.py\n';
+        }
+        if (Array.isArray(a) && a[0] === 'diff') return '';
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_count: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: {
+          deleted_test_file_classifications?: { path: string; classification: string }[];
+        };
+      };
+      const entry = stored.computed_test_erosion?.deleted_test_file_classifications?.find(
+        c => c.path === 'testing/test_bar.py'
+      );
+      expect(entry?.classification).toBe('dead_code_removal');
+    });
+  });
 });
 
 // ── resolveCandidateSha — payload/context SHA resolution + validation ─────────
