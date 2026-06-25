@@ -1057,7 +1057,8 @@ ${strategicChallengeSection}
           'Your previous attempt did not execute any ./strategic create-direction commands.\n\n' +
           'The strategic analysis recommended creating new directions. Run the create-direction commands NOW:\n\n' +
           'For each new direction in the analysis, run:\n' +
-          './strategic create-direction \'{"text": "...", "priority": "high|medium|low", "category": "product|structural", "system_id": "sys-x", "rationale": "..."}\' \n\n' +
+          './strategic create-direction \'{"text": "...", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)"}\' \n\n' +
+          'success_evidence and retirement_condition are required fields — the backend will reject the call with HTTP 400 if either is missing.\n\n' +
           'Extract the directions from the analysis and call the commands. Nothing else.',
           ws, statusRef, model, effort, disallowedTools
         );

@@ -1229,3 +1229,50 @@ describe('handleStrategic executor prompt: arms-based compute_experiment commiss
     expect(executorPrompt).toContain('declared_metric');
   });
 });
+
+describe('handleStrategic create-direction recovery prompt', () => {
+  it('recovery prompt includes gap_id, success_evidence, retirement_condition and omits system_id', async () => {
+    vi.mocked(runClaudeCode).mockReset();
+    // Thinker returns analysisText with a ## Structured Output section referencing create-direction
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText:
+        'Some analysis text.\n\n## Structured Output\n\ncreate-direction: build new feature\n',
+    });
+    // Executor (call 0): exits 0 with no direction ops in output → triggers recovery
+    // Executor output must include the required calls (set-problem-model, set-running-update,
+    // set-retirement-critiques) so the required-calls retry does NOT fire as call 1.
+    // The create-direction recovery is call 1 only when required calls are satisfied.
+    const requiredCallsOutput =
+      './strategic set-problem-model "..." \n' +
+      './strategic set-running-update /tmp/running_update_task-recovery-schema.md\n' +
+      './strategic set-retirement-critiques \'{"no_eligible_retirements": true}\'';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
+      // Recovery (call 1): exits 0
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-recovery-schema',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    // The recovery prompt is the second runClaudeCode call
+    const recoveryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(recoveryPrompt).toBeDefined();
+    expect(recoveryPrompt).toContain('success_evidence');
+    expect(recoveryPrompt).toContain('retirement_condition');
+    expect(recoveryPrompt).toContain('gap_id');
+    expect(recoveryPrompt).not.toContain('system_id');
+
+    // Restore shared default for subsequent tests
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+});
