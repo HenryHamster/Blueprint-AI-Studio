@@ -8,7 +8,9 @@ import noFixedWidthOverflow from './eslint-rules/no-fixed-width-overflow.js'
 import minTouchTarget from './eslint-rules/min-touch-target.js'
 import noOversizedFile from './eslint-rules/no-oversized-file.js'
 import noArbitraryFontSize from './eslint-rules/no-arbitrary-font-size.js'
+import noDisabledReactHooks from './eslint-rules/no-disabled-react-hooks.js'
 
+const hooksGuardPlugin = { rules: { 'no-disabled-react-hooks': noDisabledReactHooks } }
 const viewportPlugin = {
   rules: {
     'no-fixed-width': noFixedWidthOverflow,
@@ -40,11 +42,11 @@ export default defineConfig([
       'viewport/min-touch-target': 'error',
       'viewport/no-arbitrary-font-size': 'error',
       'size/no-oversized-file': 'error',
-      'react-hooks/set-state-in-effect': 'off',
-      'react-hooks/refs': 'off',
-      'react-hooks/purity': 'off',
-      'react-hooks/preserve-manual-memoization': 'off',
-      'react-hooks/immutability': 'off',
     },
+  },
+  {
+    files: ['eslint.config.js'],
+    plugins: { hooksGuard: hooksGuardPlugin },
+    rules: { 'hooksGuard/no-disabled-react-hooks': 'error' },
   },
 ])
