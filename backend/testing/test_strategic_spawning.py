@@ -13472,6 +13472,82 @@ def test_summarize_efficiency_snapshot_forwards_gate_health():
     assert "history" not in peff, "history array must be stripped from summarized payload"
 
 
+def test_summarize_efficiency_snapshot_forwards_format_miss_attribution():
+    """strategist efficiency payload includes per-handler format-miss attribution.
+
+    dominant_schema / dominant_reason / dominant_share are extracted from the
+    format_miss_by_schema_and_reason cross-product and forwarded compactly so a
+    format-compliance regression can be attributed to the producing handler
+    without phantom low-sample noise driving the global delta.
+    """
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "axes": {},
+        "baseline_captured_at": "2026-04-05T00:00:00",
+        "last_snapshot_at": "2026-05-01T00:00:00",
+        "format_compliance": {
+            "format_compliance_rate": {
+                "current": 0.88,
+                "baseline": 0.92,
+                "drift_pct": -4.3,
+                "history": [],
+            },
+            "self_repair_success_rate": {
+                "current": 0.70,
+                "baseline": 0.75,
+                "drift_pct": -6.7,
+                "history": [],
+            },
+            "repair_attempts": 20,
+            # strategic handler has 10 misses (8 schema_missing + 2 extra_key),
+            # research handler has 3 misses (all schema_missing).
+            "format_miss_by_schema_and_reason": {
+                "strategic": {"schema_missing": 8, "extra_key": 2},
+                "research": {"schema_missing": 3},
+            },
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    assert "format_compliance" in result
+    fc = result["format_compliance"]
+
+    # dominant_schema is "strategic" (10 misses vs 3)
+    assert fc["dominant_schema"] == "strategic"
+    # dominant_reason within "strategic" is "schema_missing" (8 vs 2)
+    assert fc["dominant_reason"] == "schema_missing"
+    # dominant_share = 10 / 13 ≈ 0.769
+    assert fc["dominant_share"] == round(10 / 13, 3)
+
+    # rates still forwarded
+    assert fc["format_compliance_rate"]["current"] == 0.88
+    assert fc["repair_attempts"] == 20
+
+
+def test_summarize_efficiency_snapshot_format_miss_absent_no_dominant():
+    """When format_miss_by_schema_and_reason is absent, no dominant_* keys are emitted."""
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    snapshot = {
+        "axes": {},
+        "format_compliance": {
+            "format_compliance_rate": {
+                "current": 0.90,
+                "baseline": 0.90,
+                "drift_pct": 0.0,
+                "history": [],
+            },
+            "repair_attempts": 5,
+            # no format_miss_by_schema_and_reason key
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    fc = result["format_compliance"]
+    assert "dominant_schema" not in fc
+    assert "dominant_reason" not in fc
+    assert "dominant_share" not in fc
+
+
 # ── direction-linked knowledge in strategist payload ──────────────────────────
 
 

@@ -3076,6 +3076,9 @@ async def read_baseline_with_drift(
         "repair_successes": latest_format.get("repair_successes"),
         "repair_infra_failures": latest_format.get("repair_infra_failures"),
         "by_schema": latest_format.get("by_schema"),
+        "format_miss_by_schema_and_reason": latest_format.get(
+            "format_miss_by_schema_and_reason"
+        ),
     }
 
     return {

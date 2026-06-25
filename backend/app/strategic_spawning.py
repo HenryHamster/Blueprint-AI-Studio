@@ -986,6 +986,27 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
                 }
         if fc_trimmed:
             fc_trimmed["repair_attempts"] = raw_fc.get("repair_attempts")
+            miss_by_schema_and_reason = (
+                raw_fc.get("format_miss_by_schema_and_reason") or {}
+            )
+            if miss_by_schema_and_reason:
+                schema_totals = {
+                    schema: sum(reasons.values())
+                    for schema, reasons in miss_by_schema_and_reason.items()
+                    if isinstance(reasons, dict)
+                }
+                total_misses = sum(schema_totals.values())
+                if schema_totals and total_misses > 0:
+                    dominant_schema = max(schema_totals, key=schema_totals.__getitem__)
+                    schema_reasons = miss_by_schema_and_reason[dominant_schema]
+                    dominant_reason = max(
+                        schema_reasons, key=schema_reasons.__getitem__
+                    )
+                    fc_trimmed["dominant_schema"] = dominant_schema
+                    fc_trimmed["dominant_reason"] = dominant_reason
+                    fc_trimmed["dominant_share"] = round(
+                        schema_totals[dominant_schema] / total_misses, 3
+                    )
             result["format_compliance"] = fc_trimmed
     raw_atr = snapshot.get("agent_timeout_rate") or {}
     if raw_atr:
