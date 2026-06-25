@@ -66,10 +66,11 @@ async def run_post_orphan_sweep(
     # keeps every attribute access inside the async greenlet bridge and
     # reflects the committed (or rolled-back) state of each task.
     post_reap_tasks: list[Task] = []
-    for _post_id in orphaned_task_ids:
-        _refetched = await session.get(Task, _post_id)
-        if _refetched is not None:
-            post_reap_tasks.append(_refetched)
+    if orphaned_task_ids:
+        _rows = await session.execute(
+            select(Task).where(Task.id.in_(orphaned_task_ids))
+        )
+        post_reap_tasks = list(_rows.scalars().all())
 
     # Audit A8: now that the orphan-row lock is released, do the
     # slow parent-requeue work (child clone + dep remap). Heartbeats

@@ -870,13 +870,29 @@ async def _check_candidate_task_deps(
     # on the live replacement clone, not a satisfied no-op).
     from app.failure_classification import is_non_death_cancellation
 
+    # Batch-fetch all replacement tasks up front to avoid N+1 queries.
+    _replacement_uuids: list[uuid.UUID] = []
+    for _dt in dep_tasks:
+        if _dt.status == TaskStatus.CANCELLED:
+            _rid = (_dt.context or {}).get("_replaced_by_task_id")
+            if _rid:
+                with contextlib.suppress(ValueError, AttributeError):
+                    _replacement_uuids.append(uuid.UUID(_rid))
+    _replacement_cache: dict[uuid.UUID, Task] = {}
+    if _replacement_uuids:
+        _rows = await session.execute(
+            select(Task).where(Task.id.in_(_replacement_uuids))
+        )
+        for _t in _rows.scalars().all():
+            _replacement_cache[_t.id] = _t
+
     for dt in dep_tasks:
         effective_dt = dt
         if dt.status == TaskStatus.CANCELLED:
             replacement_id_str = (dt.context or {}).get("_replaced_by_task_id")
             if replacement_id_str:
                 try:
-                    replacement = await session.get(Task, uuid.UUID(replacement_id_str))
+                    replacement = _replacement_cache.get(uuid.UUID(replacement_id_str))
                 except (ValueError, AttributeError):
                     replacement = None
                 if replacement:

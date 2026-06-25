@@ -13423,6 +13423,7 @@ async def _seed_pending_qualification(
     audit_status: TaskStatus = TaskStatus.COMPLETED,
     smoke_status: TaskStatus = TaskStatus.COMPLETED,
     started_at: str | None = None,
+    candidate_sha: str | None = None,
 ) -> tuple[Task, Task]:
     """Create the two child tasks in the requested statuses and stamp
     version.last_qualification as 'pending' pointing to them.
@@ -13435,6 +13436,8 @@ async def _seed_pending_qualification(
     qualification-timeout window — sweep tests for the both-children-terminal
     path must not accidentally trip the age-bound timeout.  Pass an explicit
     old timestamp to exercise the timeout path.
+
+    ``candidate_sha`` defaults to a dummy value; override for testing specific SHAs.
     """
     from app.time_utils import _utcnow
 
@@ -13462,7 +13465,7 @@ async def _seed_pending_qualification(
 
     version.last_qualification = {
         "status": "pending",
-        "candidate_sha": "abcd" * 10,
+        "candidate_sha": candidate_sha or "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": True,
         "started_at": started_at or _utcnow().isoformat(),
@@ -15587,6 +15590,116 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     )
     assert len(alerts) == 1
     assert "timed out" in alerts[0].title.lower()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_already_promoted_uses_qualification_superseded(db_session, mocker):
+    """When a qualification times out but the candidate is already reachable
+    from the promotion target (out-of-band force-promotion), record
+    qualification_superseded blocker instead of the generic qualification_timeout.
+    This allows the already-promoted exemption to engage on re-qualification."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "abc123def456"
+
+    # Seed a pending qualification that is well past the timeout.
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+        candidate_sha=candidate_sha,
+    )
+
+    # Mock GitHub to report that the candidate is already on the promotion target.
+    mocker.patch(
+        "app.release_qualifier_sweep._resolve_github_with_session",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.release_promotion._candidate_already_on_main",
+        new=AsyncMock(return_value=True),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    # Should record qualification_superseded, not qualification_timeout.
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "qualification_superseded"
+    assert "already reachable" in version.last_qualification["detail"]
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+
+
+@pytest.mark.asyncio
+async def test_timed_out_not_promoted_uses_qualification_timeout(db_session, mocker):
+    """When a qualification times out and the candidate is NOT reachable from
+    the promotion target, record the generic qualification_timeout blocker."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "notpromoted123"
+
+    # Seed a pending qualification that is well past the timeout.
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+        candidate_sha=candidate_sha,
+    )
+
+    # Mock GitHub to report that the candidate is NOT on the promotion target.
+    mocker.patch(
+        "app.release_qualifier_sweep._resolve_github_with_session",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.release_promotion._candidate_already_on_main",
+        new=AsyncMock(return_value=False),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    # Should record the generic qualification_timeout blocker.
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "qualification_timeout"
+    assert "qualifier child never reached" in version.last_qualification["detail"]
+    assert version.status == "open"
+    assert version.phase == "stabilize"
 
 
 # ===========================================================================
