@@ -100,6 +100,27 @@ def _coerce_provider_context_values(raw: object) -> list[str]:
     return values
 
 
+def check_model_kwargs(model_cls: type, kwargs: dict) -> None:
+    """Raise TypeError if any key in *kwargs* is not a declared field of *model_cls*.
+
+    SQLModel table=True models silently discard unknown constructor keywords,
+    which lets stale tests reference removed columns without failing.  Call this
+    helper in tests that construct model instances to surface that staleness
+    immediately rather than at the next schema migration.
+
+    Usage::
+        check_model_kwargs(Project, {"name": "my-proj"})         # OK
+        check_model_kwargs(Project, {"removed_column": "value"}) # TypeError
+    """
+    known = set(model_cls.model_fields.keys())
+    unknown = set(kwargs.keys()) - known
+    if unknown:
+        raise TypeError(
+            f"{model_cls.__name__}() received unknown field(s): "
+            f"{sorted(unknown)}.  Known fields: {sorted(known)}."
+        )
+
+
 class ProjectStatus(str, Enum):
     DRAFT = "DRAFT"
     DEPLOYING = "DEPLOYING"

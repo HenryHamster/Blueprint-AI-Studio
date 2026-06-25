@@ -190,6 +190,32 @@ def test_no_pydantic_v1_idioms_in_app_source():
     )
 
 
+def test_sqlmodel_table_model_rejects_unknown_constructor_kwargs():
+    """check_model_kwargs must raise TypeError for fields that no longer exist.
+
+    SQLModel table=True models silently discard unknown constructor keywords,
+    so a stale test that passes a removed column name still 'passes'.
+    check_model_kwargs is the static ratchet: call it whenever you construct a
+    model in a test and the constructor will surface unknown fields immediately.
+
+    Canary: if check_model_kwargs is removed or weakened, this test fails.
+    Production-code anchor: app.models.check_model_kwargs (exercises the
+    model_fields introspection on a real table=True model).
+    """
+    from app.models import Project, check_model_kwargs
+
+    # A field that was removed (Project never had runtime_config_json).
+    with pytest.raises(TypeError, match="unknown field"):
+        check_model_kwargs(Project, {"runtime_config_json": "stale-value"})
+
+    # Multiple unknown fields are all reported together.
+    with pytest.raises(TypeError, match="unknown field"):
+        check_model_kwargs(Project, {"removed_col_a": 1, "removed_col_b": 2})
+
+    # Known field does NOT raise.
+    check_model_kwargs(Project, {"name": "valid-project-name"})
+
+
 def test_pyproject_toml_filterwarnings_present():
     """pyproject.toml must declare a filterwarnings list under [tool.pytest.ini_options]."""
     import sys

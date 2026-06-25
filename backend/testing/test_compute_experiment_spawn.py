@@ -1677,9 +1677,10 @@ async def test_launch_allows_operator_approved_above_threshold_compute_job(db_se
 
 @pytest.mark.asyncio
 async def test_launch_allows_zero_config_project_below_global_threshold(db_session):
-    """Chokepoint reads global runtime_config: a project with runtime_config_json=None
-    uses the global threshold (default 10.0), so a spend below that launches without
-    a precondition failure."""
+    """Chokepoint reads global runtime_config: threshold comes from
+    ``runtime_config_state.runtime_config``, not any per-project column (Project has no
+    such column). A spend below the global threshold launches without a precondition
+    failure; a spend above it is refused even for the same project."""
     from app import runtime_config_state as rcs
     from app.compute_jobs import ComputeLaunchPreconditionFailed
 
@@ -1689,7 +1690,6 @@ async def test_launch_allows_zero_config_project_below_global_threshold(db_sessi
         project = Project(
             name="ZeroConfigGate",
             user_id="test-user",
-            runtime_config_json=None,
         )
         db_session.add(project)
         await db_session.commit()

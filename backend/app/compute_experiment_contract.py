@@ -169,8 +169,10 @@ def resolve_compute_spend_threshold(
     """Resolve the compute_experiment approval threshold (USD).
 
     A positive per-direction ``compute_experiment_spend_threshold_usd`` override
-    wins; otherwise the global runtime-config default applies. Malformed config
-    degrades to ``0.0`` so any positive proposed spend requires approval.
+    wins; otherwise the global runtime-config default applies. Per-project threshold
+    overrides were removed in v19 — threshold never comes from Project fields.
+    Malformed config degrades to ``0.0`` so any positive proposed spend requires
+    approval.
     """
     if direction:
         override = direction.get("compute_experiment_spend_threshold_usd")
