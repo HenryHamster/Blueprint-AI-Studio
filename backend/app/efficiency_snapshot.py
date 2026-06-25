@@ -1830,7 +1830,7 @@ def compute_panel_review_effectiveness(
         "sampled_out_count": sampled_out,
         "effective_coverage": effective_coverage,
         # 0.0 when gate invoked and no degraded events (confirmed-zero, distinct from no-data).
-        # None only when the window has no gate invocations at all.
+        # None when total_challenged == 0 and degraded == 0 — includes escalated-only windows.
         "fail_open_rate": round(degraded / (total + degraded), 4) if (total > 0 or degraded > 0) else None,
     }
 
@@ -2632,15 +2632,6 @@ def compute_llm_cost_attribution_window_delta(
     def _mean_scalar(window: list, key: str) -> float | None:
         vals = [e[key] for e in window if isinstance(e.get(key), (int, float))]
         return round(sum(vals) / len(vals), 6) if vals else None
-
-    def _sum_rows_by_key(window: list, row_field: str, label_key: str) -> Dict[str, float]:
-        totals: Dict[str, float] = {}
-        for entry in window:
-            for row in (entry.get(row_field) or []):
-                k = row.get(label_key)
-                if k is not None:
-                    totals[k] = totals.get(k, 0.0) + float(row.get("cost_usd") or 0.0)
-        return totals
 
     def _scalar_delta(p: Any, r: Any) -> Dict[str, Any]:
         p_val = p if isinstance(p, (int, float)) else None
@@ -3553,13 +3544,16 @@ async def get_efficiency_axes(
 ) -> Dict[str, Any]:
     """Return per-axis current/baseline/drift/history for the project's efficiency baseline.
 
-    Reads ``project.design_doc["efficiency_baseline"]`` (populated weekly by
-    the ``_efficiency_snapshot_service``) and returns each of the five
+    Reads ``project.design_doc["efficiency_baseline"]`` (populated daily by
+    the ``_efficiency_snapshot_service``) and returns each of the ten
     foundational axes — ``cost_per_merged_pr``, ``vm_cold_start_p50_ms``,
     ``vm_reuse_rate``, ``median_api_calls_per_task``,
-    ``median_review_iterations`` — with the latest snapshot value, the
-    immutable baseline value, percentage drift from baseline, and a
-    time-series of up to 26 weekly snapshots for trend rendering.
+    ``median_review_iterations``, ``llm_cost_per_merged_pr``,
+    ``lane_cost_per_merged_pr``, ``lane_warm_resume_rate``,
+    ``checkpoint_loss_rate``, ``prompt_static_bytes`` — with the latest
+    snapshot value, the immutable baseline value, percentage drift from
+    baseline, and a time-series of up to 365 daily snapshots for trend
+    rendering.
 
     Also returns ``vm_cold_start_breakdown``: a per-stage p50 ms breakdown of
     the cold-start interval from the latest snapshot.  ``dispatch_to_slot_ms``

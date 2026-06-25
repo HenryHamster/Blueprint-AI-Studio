@@ -7612,6 +7612,47 @@ def test_fail_open_rate_scoped_to_post_deploy_window():
     )
 
 
+def test_panel_review_effectiveness_fail_open_rate_none_with_only_escalated():
+    """fail_open_rate is None for escalated-only windows (total==0, degraded==0, escalated>0).
+
+    An escalated-only window (all gate invocations crashed/failed and the merge was
+    BLOCKED for manual review) has gate activity, so the function returns a non-None
+    result dict.  But fail_open_rate requires at least one successful gate invocation
+    (total>0) or a real fail-open (degraded>0) to be meaningful — neither holds in an
+    escalated-only window, so fail_open_rate is None rather than 0.0.
+
+    This distinguishes "no-data" (fail_open_rate=None, no successful gate runs) from
+    "confirmed-zero" (fail_open_rate=0.0, gate ran and found zero degraded events).
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _escalated_task():
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "unchallenged", "escalated": True}},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    tasks = [_escalated_task(), _escalated_task(), _escalated_task()]
+
+    result = compute_panel_review_effectiveness(tasks)
+    assert result is not None, (
+        "escalated-only window must return non-None (escalated>0 bypasses early return)"
+    )
+    assert result["total_challenged"] == 0, f"got {result['total_challenged']}"
+    assert result["challenged_escalated"] == 3, f"got {result['challenged_escalated']}"
+    assert result["challenged_degraded"] == 0, f"got {result.get('challenged_degraded')}"
+    assert result["fail_open_rate"] is None, (
+        f"fail_open_rate must be None (no successful gate invocations or degraded events), "
+        f"got {result['fail_open_rate']}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # compute_recommended_challenger_sample_rate
 # ---------------------------------------------------------------------------
