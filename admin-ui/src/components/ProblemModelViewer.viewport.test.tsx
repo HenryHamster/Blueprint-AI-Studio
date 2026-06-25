@@ -8,6 +8,12 @@ import type { ProblemModel, SelfReflectionEntry } from '../types';
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
   authGet: vi.fn(async () => ({ ok: true, json: async () => ({}) })),
+  // ProblemModelViewer statically imports dismissPendingConfirmation from
+  // '../api' (used in the dismiss-pending click path). In browser-mode ESM,
+  // the mock factory must expose every named export the component imports or
+  // the module linker throws "does not provide an export named
+  // 'dismissPendingConfirmation'" at import time.
+  dismissPendingConfirmation: vi.fn(async () => {}),
 }));
 
 function makeProblemModel(overrides: Partial<ProblemModel> = {}): ProblemModel {
