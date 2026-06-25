@@ -2531,6 +2531,24 @@ describe('buildEfficiencySnapshotSection', () => {
     expect(result).not.toContain('post-deploy');
     expect(result).not.toContain('rolling;');
   });
+
+  it('labels post-deploy source when rolling window absent and post-deploy low-sample', () => {
+    // No rolling peff; post-deploy present but INSUFFICIENT — primary data source is peffPd,
+    // so label must say post-deploy (low-sample), not rolling.
+    const snapshot = {
+      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
+      panel_review_effectiveness_post_deploy: {
+        gate_health: { state: 'INSUFFICIENT', total_invocations: 8, min_sample: 30 },
+        fail_open_rate: 0.05,
+        total_challenged: 8,
+        effective_coverage: 0.4,
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('(post-deploy low-sample: 8/30 invocations)');
+    expect(result).not.toContain('(rolling;');
+    expect(result).not.toContain('(post-deploy)');
+  });
 });
 
 describe('Strategic executor set-retirement-critiques verification', () => {

@@ -1286,11 +1286,16 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
     let label: string;
     if (usePostDeploy) {
       label = 'Adversarial gate health (post-deploy)';
-    } else if (peffPd !== null) {
-      // Post-deploy present but low-sample (INSUFFICIENT or NO_DATA) — annotate rolling source.
+    } else if (peffPd !== null && peff !== null) {
+      // Post-deploy present but low-sample — primary is rolling; annotate accumulation progress.
       const pdTotal = pdGh && typeof pdGh.total_invocations === 'number' ? pdGh.total_invocations : 0;
       const pdMinSample = pdGh && typeof pdGh.min_sample === 'number' ? pdGh.min_sample : 30;
       label = `Adversarial gate health (rolling; post-deploy accumulating ${pdTotal}/${pdMinSample} invocations)`;
+    } else if (peffPd !== null && peff === null) {
+      // No rolling window; post-deploy present but low-sample — label must name the actual source.
+      const pdTotal = pdGh && typeof pdGh.total_invocations === 'number' ? pdGh.total_invocations : 0;
+      const pdMinSample = pdGh && typeof pdGh.min_sample === 'number' ? pdGh.min_sample : 30;
+      label = `Adversarial gate health (post-deploy low-sample: ${pdTotal}/${pdMinSample} invocations)`;
     } else {
       label = 'Adversarial gate health';
     }
