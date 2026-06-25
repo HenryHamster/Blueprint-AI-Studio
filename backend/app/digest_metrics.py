@@ -3441,7 +3441,7 @@ TIMEOUT_RATE_METRIC_MANIFEST: dict[str, dict] = {
         "consumer": "efficiency_snapshot.read_baseline_with_drift (agent_timeout_rate block provenance)",
     },
     "denominator": {
-        "ground_truth": "Task.started_at presence over the windowed terminal task set",
+        "ground_truth": "started_at IS NOT NULL OR persisted AGENT_TIMEOUT subtype (execution-or-timed-out population) over the windowed terminal task set",
         "consumer": "efficiency-axes response (agent_timeout_rate.current denominator), strategic layer",
     },
     "denominator_definition": {
@@ -3453,11 +3453,11 @@ TIMEOUT_RATE_METRIC_MANIFEST: dict[str, dict] = {
         "consumer": "efficiency-axes response (agent_timeout_rate numerator)",
     },
     "overall_rate": {
-        "ground_truth": "timeout_count / execution-reached denominator (both persisted ground truth)",
+        "ground_truth": "timeout_count / execution-or-timed-out denominator (both persisted ground truth)",
         "consumer": "digest narrative AGENT_TIMEOUT before/after sentence (admin_digest.py), efficiency-axes agent_timeout_rate.overall drift",
     },
     "by_subtype": {
-        "ground_truth": "persisted ctx['timeout_subtype'] per AGENT_TIMEOUT task, over the execution-reached denominator",
+        "ground_truth": "persisted ctx['timeout_subtype'] per AGENT_TIMEOUT task, over the execution-or-timed-out denominator",
         "consumer": "efficiency-axes agent_timeout_rate.by_subtype drift (per-subtype current-vs-baseline)",
     },
     "dominant_subtype": {
