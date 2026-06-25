@@ -9053,6 +9053,192 @@ async def test_finalize_merge_grade_suppressed_via_direct_on_main_check(
 
 
 @pytest.mark.asyncio
+async def test_finalize_already_on_main_resolved_pre_lock(db_session, mocker):
+    """_candidate_already_on_main is resolved BEFORE the FOR UPDATE lock.
+
+    Verifies the pre-gates refactor: the direct already-on-main ancestry check
+    (merge-grade exemption fallback) is hoisted out of _finalize_qualification
+    (which runs under the lock) into the pre-lock block in _finalize_locked_version.
+
+    Scenarios tested:
+      (a) pre_merge_grade_already_on_main=True in _pre_gates → block suppressed,
+          no second call to _candidate_already_on_main under the lock.
+      (b) pre_merge_grade_already_on_main=False in _pre_gates → gate still fires,
+          merge_grade_goal_coverage blocker set.
+      (c) Direct call with _pre_gates=None → inline fallback path still works
+          (fail-closed preserved for direct/timeout callers).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    clean_audit = {
+        "audit_score": 1.0,
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 5,
+            "test_count_delta": 2,
+        },
+    }
+    clean_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+    failing_merge_grade = {
+        "covers_goal": False,
+        "coverage_score": 0.05,
+        "biggest_gap": "Feature content already on main.",
+        "candidate_sha": "feed" * 10,
+    }
+    goal = "Deliver the pre-lock ancestry refactor"
+
+    # ── (a) Pre-gates path: _candidate_already_on_main called before lock, ──
+    #        block suppressed, NOT re-called inside _finalize_qualification.
+    project_a, version_a = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_a,
+        version_a,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    await db_session.commit()
+    await db_session.refresh(version_a)
+
+    call_log: list[str] = []
+    fq_entered = [False]
+    orig_fq = rq._finalize_qualification
+
+    async def tracking_fq_a(session, version, *, _pre_gates=None):
+        fq_entered[0] = True
+        call_log.append("finalize_qualification")
+        return await orig_fq(session, version, _pre_gates=_pre_gates)
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+
+    ancestry_call_count = [0]
+
+    async def tracked_already_on_main(*args, **kwargs):
+        if fq_entered[0]:
+            raise AssertionError(
+                "_candidate_already_on_main called inside _finalize_qualification "
+                "(under the lock) — must be called pre-lock only"
+            )
+        ancestry_call_count[0] += 1
+        call_log.append("already_on_main")
+        return True
+
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        side_effect=tracked_already_on_main,
+    )
+    mocker.patch(
+        "app.release_qualifier._finalize_qualification",
+        side_effect=tracking_fq_a,
+    )
+    promote_a = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    factory = _shared_session_factory(db_session)
+    result_a = await rq._finalize_in_dedicated_session(
+        version_a.id, timeout_now=None, session_factory=factory
+    )
+    await db_session.commit()
+
+    assert "already_on_main" in call_log, (
+        "_candidate_already_on_main was not called pre-lock"
+    )
+    assert "finalize_qualification" in call_log, (
+        "_finalize_qualification was not called"
+    )
+    assert call_log.index("already_on_main") < call_log.index("finalize_qualification"), (
+        f"_candidate_already_on_main called AFTER _finalize_qualification: {call_log}"
+    )
+    promote_a.assert_called_once()
+    assert result_a == {"status": "promoted"}, (
+        f"Expected promotion via pre-lock ancestry check but got: {result_a}"
+    )
+
+    # ── (b) Pre-gates path: _candidate_already_on_main=False → gate fires ──
+    project_b, version_b = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_b,
+        version_b,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    await db_session.commit()
+    await db_session.refresh(version_b)
+
+    fq_entered[0] = False
+
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier._finalize_qualification",
+        side_effect=tracking_fq_a,
+    )
+    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result_b = await rq._finalize_in_dedicated_session(
+        version_b.id, timeout_now=None, session_factory=factory
+    )
+    await db_session.commit()
+
+    assert result_b is not None and result_b.get("blocker") == "merge_grade_goal_coverage", (
+        f"Expected merge_grade_goal_coverage blocker when already_on_main=False, got: {result_b}"
+    )
+    promote_b.assert_not_called()
+
+    # ── (c) Direct call with _pre_gates=None → inline fallback path still works ──
+    project_c, version_c = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_c,
+        version_c,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    await db_session.commit()
+    await db_session.refresh(version_c)
+
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=True),
+    )
+    promote_c = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    result_c = await rq._finalize_qualification(db_session, version_c, _pre_gates=None)
+    await db_session.commit()
+
+    promote_c.assert_called_once()
+    assert result_c == {"status": "promoted"}, (
+        f"Direct call with _pre_gates=None: expected promotion via inline fallback, got: {result_c}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocker):
     """Fail-safe: when the apply gate cannot determine safety (prod state
     unreadable, candidate fetch failed, scratch DB unprovisionable) it returns
