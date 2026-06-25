@@ -3914,3 +3914,251 @@ def test_compute_run_local_arms_one_failure_captured(tmp_path, monkeypatch, caps
     # The bad arm is marked as failed, not silently dropped
     assert "bad_arm" in out
     assert "FAILED" in out
+
+
+# ── GPU detection tests ───────────────────────────────────────────────────────
+
+
+def test_detect_local_gpu_no_gpu(monkeypatch):
+    """_detect_local_gpu returns detected=False when neither nvidia-smi nor rocm-smi is present."""
+    monkeypatch.setattr(blueprint.shutil, "which", lambda cmd: None)
+    result = blueprint._detect_local_gpu()
+    assert result["detected"] is False
+    assert result["backend"] is None
+    assert result["devices"] == []
+
+
+def test_detect_local_gpu_nvidia_found(monkeypatch):
+    """_detect_local_gpu returns detected=True with backend=nvidia and device name from nvidia-smi."""
+    import subprocess as _subprocess
+
+    def fake_which(cmd):
+        return "/usr/bin/nvidia-smi" if cmd == "nvidia-smi" else None
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 0
+            stdout = "Tesla T4\n"
+        return R()
+
+    monkeypatch.setattr(blueprint.shutil, "which", fake_which)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    result = blueprint._detect_local_gpu()
+    assert result["detected"] is True
+    assert result["backend"] == "nvidia"
+    assert "Tesla T4" in result["devices"]
+
+
+def test_detect_local_gpu_nvidia_fails_gracefully(monkeypatch):
+    """_detect_local_gpu returns detected=False when nvidia-smi is present but returns non-zero."""
+    import subprocess as _subprocess
+
+    def fake_which(cmd):
+        return "/usr/bin/nvidia-smi" if cmd == "nvidia-smi" else None
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 1
+            stdout = ""
+        return R()
+
+    monkeypatch.setattr(blueprint.shutil, "which", fake_which)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    result = blueprint._detect_local_gpu()
+    assert result["detected"] is False
+
+
+def test_detect_local_gpu_nvidia_exception_soft_fail(monkeypatch):
+    """_detect_local_gpu returns detected=False when subprocess.run raises (e.g. timeout)."""
+    import subprocess as _subprocess
+
+    def fake_which(cmd):
+        return "/usr/bin/nvidia-smi" if cmd == "nvidia-smi" else None
+
+    def fake_run(cmd, **kwargs):
+        raise _subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(blueprint.shutil, "which", fake_which)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    result = blueprint._detect_local_gpu()
+    assert result["detected"] is False
+
+
+def test_compute_run_detects_and_reports_local_gpu(tmp_path, monkeypatch, capsys):
+    """compute run reports the detected GPU in output and injects BLUEPRINT_LOCAL_GPU into the subprocess env."""
+    import subprocess as _subprocess
+
+    injected_env = {}
+
+    def fake_run(cmd, env=None, **kwargs):
+        if env:
+            injected_env.update(env)
+            rf = env.get("BLUEPRINT_RESULT_FILE")
+            if rf:
+                import json as _json
+                with open(rf, "w") as f:
+                    _json.dump({"accuracy": 0.9}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": True, "backend": "nvidia", "devices": ["Tesla T4"],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "echo hi"])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    assert "gpu" in out
+    assert "Tesla T4" in out
+    assert injected_env.get("BLUEPRINT_LOCAL_GPU") == "Tesla T4"
+
+
+def test_compute_run_no_gpu_reports_none(tmp_path, monkeypatch, capsys):
+    """compute run reports 'gpu : none' and injects BLUEPRINT_LOCAL_GPU=none when no GPU detected."""
+    import subprocess as _subprocess
+
+    injected_env = {}
+
+    def fake_run(cmd, env=None, **kwargs):
+        if env:
+            injected_env.update(env)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "echo hi"])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    assert "gpu         : none" in out
+    assert injected_env.get("BLUEPRINT_LOCAL_GPU") == "none"
+
+
+def test_compute_run_gpu_in_json_result(tmp_path, monkeypatch, capsys):
+    """compute run --json includes 'gpu' key with detected field in the emitted JSON."""
+    import subprocess as _subprocess
+
+    def fake_run(cmd, env=None, **kwargs):
+        if env:
+            rf = env.get("BLUEPRINT_RESULT_FILE")
+            if rf:
+                import json as _json
+                with open(rf, "w") as f:
+                    _json.dump({"loss": 0.3}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": True, "backend": "nvidia", "devices": ["RTX 4090"],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "echo hi"])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert "gpu" in data
+    assert data["gpu"]["detected"] is True
+    assert data["gpu"]["backend"] == "nvidia"
+    assert "RTX 4090" in data["gpu"]["devices"]
+
+
+def test_compute_run_arms_gpu_detected(tmp_path, monkeypatch, capsys):
+    """compute run with arms also reports the GPU line when a GPU is detected."""
+    import subprocess as _subprocess
+
+    spec = {
+        "arms": [
+            {"name": "arm_a", "command": "echo hi"},
+        ],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, **kwargs):
+        if env:
+            rf = env.get("BLUEPRINT_RESULT_FILE")
+            if rf:
+                import json as _json
+                with open(rf, "w") as f:
+                    _json.dump({"score": 1.0}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": True, "backend": "nvidia", "devices": ["Tesla V100"],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    assert "gpu" in out
+    assert "Tesla V100" in out
+
+
+def test_compute_run_arms_json_mode_produces_valid_json(tmp_path, monkeypatch, capsys):
+    """compute run --json with a multi-arm spec emits valid JSON with no extra text."""
+    import subprocess as _subprocess
+
+    spec = {
+        "arms": [
+            {"name": "arm_a", "command": "echo hi"},
+            {"name": "arm_b", "command": "echo bye"},
+        ],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, **kwargs):
+        if env:
+            rf = env.get("BLUEPRINT_RESULT_FILE")
+            if rf:
+                import json as _json
+                with open(rf, "w") as f:
+                    _json.dump({"score": 0.9}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    # Must be parseable as JSON with no leading text from per-arm prints
+    data = json.loads(out)
+    assert "status" in data
+    assert "metrics" in data
+    arms_block = data["metrics"]["arms"]
+    assert "arm_a" in arms_block
+    assert "arm_b" in arms_block

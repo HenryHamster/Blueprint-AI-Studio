@@ -3861,6 +3861,45 @@ def _evaluate_criterion(metrics: dict | None, criterion: dict) -> dict:
             "threshold": thr, "value": value, "met": met}
 
 
+def _detect_local_gpu() -> dict:
+    """Probe for a local GPU using nvidia-smi or rocm-smi.
+
+    Guarded by shutil.which so no subprocess is spawned in environments where
+    the tools are absent (e.g., CI/test VMs). Fail-soft by contract — never
+    raises; returns detected=False on any error.
+
+    Returns a dict with keys:
+      detected (bool), backend (str|None), devices (list[str])
+    """
+    if shutil.which("nvidia-smi"):
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                devices = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
+                return {"detected": True, "backend": "nvidia", "devices": devices}
+        except Exception:  # noqa: BLE001
+            pass
+
+    if shutil.which("rocm-smi"):
+        try:
+            result = subprocess.run(
+                ["rocm-smi", "--showproductname"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                devices = [line.strip() for line in result.stdout.strip().splitlines()
+                           if line.strip() and "GPU" in line]
+                if devices:
+                    return {"detected": True, "backend": "rocm", "devices": devices}
+        except Exception:  # noqa: BLE001
+            pass
+
+    return {"detected": False, "backend": None, "devices": []}
+
+
 def _compute_run_local(args: argparse.Namespace) -> None:
     """Execute a compute_experiment command locally without the orchestrator.
 
@@ -3915,12 +3954,24 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     env = os.environ.copy()
     env["BLUEPRINT_ARTIFACT_DIR"] = artifact_dir
 
+    gpu_info = _detect_local_gpu()
+    if gpu_info["detected"]:
+        device_label = gpu_info["devices"][0] if gpu_info["devices"] else "unknown"
+        env["BLUEPRINT_LOCAL_GPU"] = device_label
+    else:
+        env["BLUEPRINT_LOCAL_GPU"] = "none"
+
     if arms:
         arm_names = [a.get("name", f"arm_{i}") for i, a in enumerate(arms)]
-        print(f"arms        : {arm_names}")
-        if declared_metric:
-            print(f"declared    : {declared_metric}")
-        print("running arms...")
+        if not _json_mode(args):
+            print(f"arms        : {arm_names}")
+            if gpu_info["detected"]:
+                print(f"gpu         : {env['BLUEPRINT_LOCAL_GPU']}")
+            else:
+                print("gpu         : none")
+            if declared_metric:
+                print(f"declared    : {declared_metric}")
+            print("running arms...")
 
         arm_results: dict[str, dict] = {}
         overall_exit_code = 0
@@ -3931,7 +3982,8 @@ def _compute_run_local(args: argparse.Namespace) -> None:
             arm_env = env.copy()
             arm_env["BLUEPRINT_RESULT_FILE"] = arm_result_file
 
-            print(f"  [{arm_name}] running...")
+            if not _json_mode(args):
+                print(f"  [{arm_name}] running...")
             arm_proc = subprocess.run(["bash", "-lc", arm_cmd], env=arm_env)
             arm_exit_code = arm_proc.returncode
 
@@ -3946,7 +3998,8 @@ def _compute_run_local(args: argparse.Namespace) -> None:
                     with open(arm_result_file) as f:
                         arm_metrics = json.load(f)
                 except Exception as exc:  # noqa: BLE001
-                    print(f"  [{arm_name}] warning: could not parse result file: {exc}")
+                    if not _json_mode(args):
+                        print(f"  [{arm_name}] warning: could not parse result file: {exc}")
 
             arm_results[arm_name] = arm_metrics if arm_metrics is not None else {}
 
@@ -3954,7 +4007,7 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         metrics: dict | None = {"arms": arm_results}
         verdict: dict | None = None
         result = {"status": status, "exit_code": overall_exit_code, "metrics": metrics,
-                  "declared_metric": declared_metric, "verdict": verdict}
+                  "declared_metric": declared_metric, "verdict": verdict, "gpu": gpu_info}
 
         def _render(r: dict) -> None:
             print(f"status      : {r['status']} (exit_code={r['exit_code']})")
@@ -3983,14 +4036,20 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     result_file = os.path.join(tmpdir, "result.json")
     env["BLUEPRINT_RESULT_FILE"] = result_file
 
-    print(f"command     : {command}")
-    print(f"result_file : {result_file}")
-    if declared_metric:
-        print(f"declared    : {declared_metric}")
-    if success_criterion:
+    if not _json_mode(args):
+        print(f"command     : {command}")
+        print(f"result_file : {result_file}")
+        if gpu_info["detected"]:
+            print(f"gpu         : {env['BLUEPRINT_LOCAL_GPU']}")
+        else:
+            print("gpu         : none")
+        if declared_metric:
+            print(f"declared    : {declared_metric}")
+    if not _json_mode(args) and success_criterion:
         sc = success_criterion
         print(f"criterion   : {sc.get('metric')} {sc.get('operator')} {sc.get('threshold')}")
-    print("running...")
+    if not _json_mode(args):
+        print("running...")
 
     proc = subprocess.run(["bash", "-lc", command], env=env)
     exit_code = proc.returncode
@@ -4009,7 +4068,7 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         verdict = _evaluate_criterion(metrics, success_criterion)
 
     result = {"status": status, "exit_code": exit_code, "metrics": metrics,
-              "declared_metric": declared_metric, "verdict": verdict}
+              "declared_metric": declared_metric, "verdict": verdict, "gpu": gpu_info}
 
     def _render(r: dict) -> None:
         print(f"status      : {r['status']} (exit_code={r['exit_code']})")
