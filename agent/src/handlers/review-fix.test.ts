@@ -1145,6 +1145,7 @@ describe('handleReview — verdict file parsing', () => {
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
       format_repair_miss_by_schema: {},
+      format_miss_by_schema_and_reason: { review_verdict: { malformed_json: 1 } },
     });
   });
 
@@ -1204,6 +1205,7 @@ describe('handleReview — verdict file parsing', () => {
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
       format_repair_miss_by_schema: {},
+      format_miss_by_schema_and_reason: { review_verdict: { missing_required_key: 1 } },
     });
   });
 
