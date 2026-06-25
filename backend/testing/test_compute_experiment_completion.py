@@ -603,6 +603,107 @@ async def test_hollow_compute_knowledge_does_not_deliver_to_dependents(
 
 
 @pytest.mark.asyncio
+async def test_compute_knowledge_stamps_sweep_identity_from_payload(
+    db_session, _quiet_compute_io
+):
+    """A completed compute_experiment doc carries sweep_id + arm_label.
+
+    sweep_id mirrors task.first_payload['sweep_id']; arm_label prefers the
+    explicit experiment name over the hypothesis fallback.
+    """
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    project = Project(name="SweepIdentityStamp", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: arm A",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": "sw-deadbeef",
+                "experiment": "arm-A-baseline",
+                "hypothesis": "baseline beats treatment",
+            }
+        ],
+        context={"finding_hash": "compute-sweep-identity"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        doc = await persist_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.11,
+            criterion=None,
+            result_reference="https://signed.example.com/jobs/result.json",
+            session=db_session,
+            logs=None,
+        )
+
+    assert doc is not None
+    assert doc.sweep_id == "sw-deadbeef"
+    # Explicit experiment name wins over the hypothesis fallback.
+    assert doc.arm_label == "arm-A-baseline"
+
+
+@pytest.mark.asyncio
+async def test_compute_knowledge_arm_label_is_none_when_no_experiment_or_arm_label(
+    db_session, _quiet_compute_io
+):
+    """arm_label is derived from payload 'experiment' or 'arm_label' only.
+    When neither is present (e.g. only 'hypothesis' is set), arm_label is None."""
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+
+    project = Project(name="SweepArmFallback", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    long_hyp = "h" * 200
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: arm B",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": "sw-cafebabe",
+                "hypothesis": long_hyp,
+            }
+        ],
+        context={"finding_hash": "compute-sweep-fallback"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+        doc = await persist_compute_experiment_knowledge(
+            task,
+            outcome="SUCCESS",
+            cost=0.11,
+            criterion=None,
+            result_reference="https://signed.example.com/jobs/result.json",
+            session=db_session,
+            logs=None,
+        )
+
+    assert doc is not None
+    assert doc.sweep_id == "sw-cafebabe"
+    # No 'experiment' or 'arm_label' in payload → arm_label_val is None.
+    assert doc.arm_label is None
+
+
+@pytest.mark.asyncio
 async def test_grounded_negative_compute_knowledge_delivers_to_dependents(
     db_session, _quiet_compute_io
 ):

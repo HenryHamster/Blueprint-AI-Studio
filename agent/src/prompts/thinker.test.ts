@@ -102,6 +102,13 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('## 6. Problem model');
   });
 
+  it('includes sweep synthesis guidance for reading back completed experiments', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('Sweep synthesis');
+    expect(prompt).toContain('compute_experiment_sweeps');
+    expect(prompt).toContain('MET or NOT MET');
+  });
+
   it('documents the gap deferral shape and the direction→gap linkage', () => {
     const prompt = buildThinkerPrompt(base);
     // Gap quick-reference lists the optional deferral field.

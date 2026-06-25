@@ -2525,6 +2525,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # drops it whole under budget rather than trimming — mirroring
     # staged_directions / operator_overrides. Full bodies fetched on demand.
     "knowledge_index": {"priority": "medium"},
+    # Per-sweep comparative arm grouping — bounded at build time so the packer
+    # drops it whole under budget rather than trimming. Same tier as
+    # knowledge_index.
+    "compute_experiment_sweeps": {"priority": "medium"},
     "capability_trial_verdicts": {"priority": "medium"},
     "outcome_evaluation": {
         "priority": "medium",
@@ -2636,6 +2640,9 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Capped at build time, dropped
     # whole under budget; full bodies fetched on demand.
     "knowledge_index": {"priority": "medium"},
+    # Per-sweep comparative arm grouping — bounded at build time, dropped whole
+    # under budget; full bodies fetched on demand.
+    "compute_experiment_sweeps": {"priority": "medium"},
     # Shared capability vocabulary — see _STRATEGIC_REVIEW_SCHEMA. Small, bounded.
     "available_capabilities": {"priority": "medium"},
 }

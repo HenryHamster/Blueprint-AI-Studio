@@ -2203,6 +2203,10 @@ async def _make_knowledge_doc(
     direction_id=None,
     source_kind="web_research",
     created_at=None,
+    sweep_id=None,
+    arm_label=None,
+    forward_quality_verdict=None,
+    source_citations=None,
 ):
     """Persist one KnowledgeDocument for index tests, with optional explicit
     created_at so ordering is deterministic within a single transaction."""
@@ -2215,6 +2219,10 @@ async def _make_knowledge_doc(
         topic=topic,
         direction_id=direction_id,
         source_kind=source_kind,
+        sweep_id=sweep_id,
+        arm_label=arm_label,
+        forward_quality_verdict=forward_quality_verdict,
+        source_citations=source_citations,
     )
     if created_at is not None:
         doc.created_at = created_at
@@ -2225,8 +2233,8 @@ async def _make_knowledge_doc(
 
 
 @pytest.mark.asyncio
-async def test_build_knowledge_index_compact_fields_no_body(db_session):
-    """The index carries only the compact navigation fields and never the body."""
+async def test_knowledge_index_entry_shape(db_session):
+    """The index entry carries exactly the expected navigation fields (including sweep_id and arm_label) and never the body."""
     from app.knowledge_query import build_knowledge_index
 
     project, task = await _make_web_research_task(db_session, project_name="KI1")
@@ -2418,6 +2426,142 @@ async def test_build_knowledge_index_excludes_cross_project(db_session):
     )
     index_a = await build_knowledge_index(db_session, project_a.id)
     assert [e["title"] for e in index_a] == ["A doc"]
+
+
+# ── build_compute_sweep_groups: per-sweep comparative arm grouping ───────────
+def _acceptance_verdict():
+    """forward_quality_verdict that classifies a compute doc as acceptance."""
+    return {
+        "analysis_mode": "llm",
+        "probes": {"grounding": {"grounded": 1}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_groups_arms_by_sweep_id(db_session):
+    """Compute docs sharing a sweep_id group into one comparative block, with
+    criterion_met derived from the acceptance grade."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, task = await _make_web_research_task(db_session, project_name="SWG1")
+    # Two arms in one sweep: one accepted (criterion met), one measured-only.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="arm baseline",
+        source_kind="compute_experiment",
+        sweep_id="sw-1111",
+        arm_label="baseline",
+        forward_quality_verdict=None,  # not llm → measured_only → not met
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="arm treatment",
+        source_kind="compute_experiment",
+        sweep_id="sw-1111",
+        arm_label="treatment",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    # Returns {sweep_id: [_knowledge_index_entry, ...]}
+    assert "sw-1111" in groups
+    assert len(groups) == 1
+    entries = groups["sw-1111"]
+    assert len(entries) == 2
+    by_label = {e["arm_label"]: e for e in entries}
+    # baseline has no forward_quality_verdict → measured_only → not acceptance
+    assert by_label["baseline"]["compute_acceptance_grade"] != "acceptance"
+    # treatment has acceptance verdict → grade 'acceptance'
+    assert by_label["treatment"]["compute_acceptance_grade"] == "acceptance"
+    assert by_label["treatment"]["id"]
+    assert by_label["treatment"]["title"] == "arm treatment"
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_excludes_null_sweep_and_single_arm(
+    db_session,
+):
+    """Docs with no sweep_id are excluded; single-arm sweeps are not comparative."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, task = await _make_web_research_task(db_session, project_name="SWG2")
+    # Null-sweep compute doc — excluded.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="no-sweep",
+        source_kind="compute_experiment",
+        sweep_id=None,
+        arm_label="lonely",
+    )
+    # Single-arm sweep — excluded (not comparative).
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="solo arm",
+        source_kind="compute_experiment",
+        sweep_id="sw-solo",
+        arm_label="only-arm",
+    )
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert groups == {}
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_newest_first_and_bounded(db_session):
+    """Sweep groups are newest-first by latest arm and capped at the limit."""
+    from datetime import datetime, timedelta
+
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, task = await _make_web_research_task(db_session, project_name="SWG3")
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    # Three sweeps, each with two arms, at increasing timestamps.
+    for i in range(3):
+        for arm in ("a", "b"):
+            await _make_knowledge_doc(
+                db_session,
+                project_id=project.id,
+                source_task_id=task.id,
+                title=f"sweep{i}-{arm}",
+                source_kind="compute_experiment",
+                sweep_id=f"sw-{i}",
+                arm_label=arm,
+                created_at=base + timedelta(hours=i),
+            )
+    groups = await build_compute_sweep_groups(db_session, project.id, limit=2)
+    # Returns {sweep_id: [entries]}; capped at 2, newest sweep first (sw-2 has the latest arm).
+    assert len(groups) == 2
+    sweep_ids = list(groups.keys())
+    assert sweep_ids[0] == "sw-2"
+    assert sweep_ids[1] == "sw-1"
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_excludes_cross_project(db_session):
+    """Sweep docs from other projects are never included."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project_a, task_a = await _make_web_research_task(db_session, project_name="SWGA")
+    project_b, task_b = await _make_web_research_task(db_session, project_name="SWGB")
+    for arm in ("a", "b"):
+        await _make_knowledge_doc(
+            db_session,
+            project_id=project_b.id,
+            source_task_id=task_b.id,
+            title=f"b-{arm}",
+            source_kind="compute_experiment",
+            sweep_id="sw-b",
+            arm_label=arm,
+        )
+    assert await build_compute_sweep_groups(db_session, project_a.id) == {}
 
 
 @pytest.mark.asyncio

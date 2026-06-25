@@ -71,6 +71,35 @@ describe('buildContextPrefix', () => {
     expect(prefix).not.toContain('## Existing knowledge documents');
   });
 
+  it('renders compute_experiment_sweeps section with arm comparison', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        // compute_experiment_sweeps is a dict {sweepId: [_knowledge_index_entry, ...]}
+        compute_experiment_sweeps: {
+          'sw-abcd1234': [
+            { id: 'kd-aaa', title: 'arm baseline', arm_label: 'baseline', compute_acceptance_grade: 'measured_only', summary: 'accuracy 0.88' },
+            { id: 'kd-bbb', title: 'arm treatment', arm_label: 'treatment', compute_acceptance_grade: 'acceptance', summary: 'accuracy 0.93' },
+          ],
+        },
+      }],
+    });
+    expect(prefix).toContain('## Completed experiment sweeps');
+    expect(prefix).toContain('Sweep sw-abcd1234');
+    expect(prefix).toContain('**baseline**');
+    expect(prefix).toContain('[NOT MET]');
+    expect(prefix).toContain('accuracy 0.88');
+    expect(prefix).toContain('**treatment**');
+    expect(prefix).toContain('[MET]');
+    expect(prefix).toContain('[kd-aaa]');
+    expect(prefix).toContain('[kd-bbb]');
+  });
+
+  it('omits sweep section when compute_experiment_sweeps is absent', () => {
+    const prefix = buildContextPrefix({ payloads: [{ type: 'strategic_review' }] });
+    expect(prefix).not.toContain('## Completed experiment sweeps');
+  });
+
   it('renders acceptance-grade badge for accepted compute_experiment entry', () => {
     const prefix = buildContextPrefix({
       payloads: [{
