@@ -1807,6 +1807,28 @@ describe('buildVersionPhaseSection', () => {
     expect(blank).not.toContain('Theme:');
   });
 
+  it('emits explicit author-the-goal instruction when goal_needed flag is true', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'build',
+      goal_needed: true,
+    });
+    expect(result).toContain('ACTION NEEDED: Author the version goal');
+    expect(result).toContain('new_version_goal');
+    expect(result).not.toContain('Goal:');
+  });
+
+  it('emits explicit author-the-theme instruction when theme_needed flag is true', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'build',
+      theme_needed: true,
+    });
+    expect(result).toContain('ACTION NEEDED: Author the version theme');
+    expect(result).toContain('new_version_theme');
+    expect(result).not.toContain('Theme:');
+  });
+
   it('instructs agent to emit version_phase_decision when flipping', () => {
     const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
     expect(result).toContain('version_phase_decision');

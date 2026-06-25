@@ -783,6 +783,8 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     ? versionPhase.goal.trim() : null;
   const theme = typeof versionPhase.theme === 'string' && versionPhase.theme.trim()
     ? versionPhase.theme.trim() : null;
+  const goalNeeded = versionPhase.goal_needed === true;
+  const themeNeeded = versionPhase.theme_needed === true;
   // The backend always sends last_qualification as an object (the structured
   // qualification record: {status, candidate_sha, confidence, blocker, ...}) or
   // null — never a string. Render a compact summary line so the agent can see
@@ -810,9 +812,13 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   parts.push(`Current: **v${versionNumber} — ${phase.toUpperCase()}**`);
   if (goal) {
     parts.push(`Goal: ${goal}`);
+  } else if (goalNeeded) {
+    parts.push(`**ACTION NEEDED: Author the version goal.** Emit \`new_version_goal\` in Section 6 problem_model update (a one-sentence statement of what this version is for).`);
   }
   if (theme) {
     parts.push(`Theme: ${theme}`);
+  } else if (themeNeeded) {
+    parts.push(`**ACTION NEEDED: Author the version theme.** Emit \`new_version_theme\` in Section 6 problem_model update (one of: leanness, reliability, performance, feature, mixed, none).`);
   }
 
   if (phaseChangedAt) {

@@ -2598,6 +2598,12 @@ async def strategic_operation(
                 "task %s — applied to open version at strategic completion",
                 task.id,
             )
+        if new_version_theme is not None:
+            logger.info(
+                "[STRATEGIC API] new_version_theme routed to task.context for "
+                "task %s — applied to open version at strategic completion",
+                task.id,
+            )
         return _resp(
             {
                 "status": "ok",
@@ -2607,6 +2613,7 @@ async def strategic_operation(
                 "version_phase_decision_received": version_phase_decision is not None,
                 "qualify_request_received": qualify_request is not None,
                 "new_version_goal_received": new_version_goal is not None,
+                "new_version_theme_received": new_version_theme is not None,
             }
         )
 

@@ -15178,3 +15178,134 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
         f"Goal must be frozen once authored; a second emit must not clobber it. "
         f"Got {version.goal!r}"
     )
+
+
+async def test_set_problem_model_lifts_new_version_theme_api_path(
+    client, db_session, mocker
+):
+    """Full API-path regression: new_version_theme lifts past ProblemModel extra=forbid,
+    stows in task.context, and the completion handler applies it to a null-theme version.
+
+    Exercises the seam end-to-end using the real HTTP transport (not a mocked
+    context write) so that a future regression in any of the three layers
+    (endpoint strip, context stow, completion apply) will fail this test.
+    """
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app.strategic_completion import (
+        NEW_VERSION_THEME_CONTEXT_KEY,
+        _handle_strategic_completion,
+    )
+    from app import release_version as rv
+    from app import strategic_cycle
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="NVT-E2E",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Open ReleaseVersion with no theme — the strategist should be able to author it.
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.theme is None
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-nvt-e2e",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-nvt-e2e", task_type="strategic_review")
+
+    theme_text = "reliability"
+
+    # The agent embeds new_version_theme as a TOP-LEVEL SIBLING of the
+    # problem_model fields. The endpoint must strip it before ProblemModel
+    # validation (extra="forbid" would 400 if it reaches apply_agent_update).
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship the thing", "current_focus": "build"},
+                "capabilities": [],
+                "gaps": [],
+                "new_version_theme": theme_text,
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["op"] == "set_problem_model"
+    assert body["new_version_theme_received"] is True, (
+        "Response must confirm new_version_theme was received"
+    )
+
+    # The transient signal must NOT linger in the stored problem_model.
+    await db_session.refresh(project)
+    assert "new_version_theme" not in (project.problem_model or {}), (
+        "new_version_theme must be stripped before ProblemModel validation"
+    )
+    assert (project.problem_model or {}).get("intent", {}).get("purpose") == (
+        "Ship the thing"
+    )
+
+    # It must ride task.context to the completion handler.
+    await db_session.refresh(task)
+    stored = (task.context or {}).get(NEW_VERSION_THEME_CONTEXT_KEY)
+    assert stored == theme_text, (
+        f"Expected new_version_theme stowed in task.context[{NEW_VERSION_THEME_CONTEXT_KEY!r}]; "
+        f"got {stored!r}"
+    )
+
+    # Completion handler's API path must apply the theme to the null-theme version.
+    await _handle_strategic_completion(task, "", db_session)
+
+    await db_session.refresh(version)
+    assert version.theme == theme_text, (
+        f"Expected open version theme to be set to {theme_text!r}; got {version.theme!r}"
+    )
+
+    # A second call with a different theme must NOT clobber the already-set theme.
+    resp2 = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship the thing", "current_focus": "build"},
+                "capabilities": [],
+                "gaps": [],
+                "new_version_theme": "feature",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200, resp2.text
+    await db_session.refresh(task)
+    await _handle_strategic_completion(task, "", db_session)
+    await db_session.refresh(version)
+    assert version.theme == theme_text, (
+        f"Theme must be frozen once authored; a second emit must not clobber it. "
+        f"Got {version.theme!r}"
+    )
