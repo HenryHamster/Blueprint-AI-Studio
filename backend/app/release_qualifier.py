@@ -3250,6 +3250,36 @@ async def _finalize_qualification(
             )
             merge_grade_blocked = False
             merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
+        # Fallback: direct GitHub ancestry check when prior_superseded was not
+        # set (e.g. GitHub-cred outage let the 6h timeout beat the supersession
+        # reconciler).  Fail-closed: cred unavailable or any error → leave
+        # merge_grade_blocked as-is.
+        if merge_grade_blocked and candidate_sha:
+            try:
+                _mg_project = await session.get(Project, version.project_id)
+                _mg_resolved = await _resolve_github_with_session(session, _mg_project)
+                if _mg_resolved is not None:
+                    _mg_token, _mg_owner, _mg_repo = _mg_resolved
+                    if await _candidate_already_on_main(
+                        _mg_token, _mg_owner, _mg_repo, candidate_sha, version, project=_mg_project
+                    ):
+                        logger.warning(
+                            "[RELEASE_QUALIFIER] v%d merge_grade_goal_coverage suppressed: "
+                            "direct GitHub ancestry check confirms candidate %s is already "
+                            "on main (prior_superseded was not set — likely GitHub-cred outage "
+                            "during force-promote window)",
+                            version.version_number,
+                            candidate_sha[:8],
+                        )
+                        merge_grade_blocked = False
+                        merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
+            except Exception:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] v%d direct already-on-main check failed "
+                    "(fail-closed): merge_grade_goal_coverage block preserved",
+                    version.version_number,
+                    exc_info=True,
+                )
 
     # --- Compute the composite ---------------------------------------------
     # Whether an UNRESOLVED candidate CI (pending / no check-runs) hard-blocks

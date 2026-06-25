@@ -8939,6 +8939,120 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
 
 
 @pytest.mark.asyncio
+async def test_finalize_merge_grade_suppressed_via_direct_on_main_check(
+    db_session, mocker
+):
+    """Direct GitHub ancestry fallback: when prior_superseded is NOT set (e.g.
+    GitHub-cred outage let the 6h timeout beat the supersession reconciler),
+    the merge-grade block is still suppressed when _candidate_already_on_main
+    returns True.
+
+    Scenarios:
+      (a) _candidate_already_on_main=True + prior_superseded absent -> suppressed,
+          promote proceeds
+      (b) _candidate_already_on_main=False + prior_superseded absent -> gate fires,
+          merge_grade_goal_coverage blocker set
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    clean_audit = {
+        "audit_score": 1.0,
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 5,
+            "test_count_delta": 2,
+        },
+    }
+    clean_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+    failing_merge_grade = {
+        "covers_goal": False,
+        "coverage_score": 0.05,
+        "biggest_gap": "Stabilization-only tail commits; feature content already on main.",
+        "candidate_sha": "feed" * 10,
+    }
+    goal = "Deliver the direct on-main ancestry exemption"
+
+    # --- (a) _candidate_already_on_main=True -> block suppressed, promote ---
+    project_a, version_a = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_a,
+        version_a,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    # Stamp blocker='qualification_timeout' WITHOUT prior_superseded (simulates
+    # cred-outage timeout race winning over the supersession reconciler).
+    version_a.last_qualification = {
+        **version_a.last_qualification,
+        "blocker": "qualification_timeout",
+        # prior_superseded intentionally absent
+    }
+    db_session.add(version_a)
+    await db_session.commit()
+    await db_session.refresh(version_a)
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=True),
+    )
+    promote_a = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+    result_a = await rq._finalize_qualification(db_session, version_a)
+    await db_session.commit()
+
+    promote_a.assert_called_once()
+    assert result_a == {"status": "promoted"}, (
+        f"Expected promotion via direct on-main check but got: {result_a}"
+    )
+
+    # --- (b) _candidate_already_on_main=False -> gate still fires ---
+    project_b, version_b = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_b,
+        version_b,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=False),
+    )
+    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result_b = await rq._finalize_qualification(db_session, version_b)
+    await db_session.commit()
+
+    assert result_b["status"] == "not_promoted"
+    assert result_b["blocker"] == "merge_grade_goal_coverage"
+    promote_b.assert_not_called()
+    await db_session.refresh(version_b)
+    assert version_b.last_qualification["blocker"] == "merge_grade_goal_coverage"
+
+
+@pytest.mark.asyncio
 async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocker):
     """Fail-safe: when the apply gate cannot determine safety (prod state
     unreadable, candidate fetch failed, scratch DB unprovisionable) it returns
