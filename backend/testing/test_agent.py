@@ -742,6 +742,7 @@ async def test_agent_compute_job_launch_creates_pending_row(
         payloads=[{"type": TaskType.compute_experiment.value}],
         status=TaskStatus.IN_PROGRESS,
         vm_instance_id="agent-vm-compute-1",
+        spend_approval_cleared_at=datetime.utcnow(),
     )
     db_session.add(task)
     await db_session.commit()

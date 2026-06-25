@@ -1009,7 +1009,7 @@ def compute_llm_cost_by_failure_class(tasks: list[Task]) -> list[Dict[str, Any]]
 
 
 def _compact_llm_cost_attribution(
-    tasks: list[Task], qualification_infra_usd: float | None = None
+    tasks: list[Task],
 ) -> Dict[str, Any]:
     """Compact per-driver LLM cost breakdown for durable daily snapshot storage.
 
@@ -1108,14 +1108,19 @@ def _compact_llm_cost_attribution(
         else None
     )
 
+    by_failure_class = compute_llm_cost_by_failure_class(tasks)
+    merged_count = sum(
+        r["task_count"] for r in by_failure_class if r["failure_class"] == "MERGED"
+    )
+
     return {
         "by_model": by_model,
         "by_task_type": by_task_type,
-        "by_failure_class": compute_llm_cost_by_failure_class(tasks),
+        "by_failure_class": by_failure_class,
+        "merged_count": merged_count,
         "rework_share": rework.get("rework_share_of_total_llm_cost"),
         "total_llm_usd": total_usd,
         "unpriced_coverage": breakdown["totals"].get("unpriced_coverage_fraction"),
         SELF_REPAIR_BURN_SHARE_KEY: self_repair_burn_share,
-        "qualification_infra_usd": qualification_infra_usd,
         "strategic_cycle_cost_per_event": strategic_cycle_cost_per_event,
     }

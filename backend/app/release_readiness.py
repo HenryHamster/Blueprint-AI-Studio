@@ -56,6 +56,12 @@ _RESOLVED_LEDGER_STATES = frozenset({"resolved", "stale"})
 # findings are advisory and ignored by the readiness computation.
 _REQUALIFICATION_GATING_SEVERITIES = frozenset({"high", "critical", "medium"})
 
+# Sentinel ledger key used for gating findings that carry no content key (e.g.
+# challenger-independent blockers written by _handle_independent_blocker).
+# All keyless gating findings for a version collapse to this single ledger row.
+# Must stay in sync with the write side in release_qualifier_sweep.
+_KEYLESS_FINDING_SENTINEL = "__keyless__"
+
 # Task statuses that count as an in-flight promotion-CI remediation.
 _ACTIVE_TASK_STATUSES = (
     TaskStatus.QUEUED,
@@ -998,10 +1004,13 @@ async def compute_requalification_readiness(
             continue
         key = f.get("key")
         if not key:
-            # No content key (legacy carried finding) — cannot be matched against
-            # the ledger, so it must read as unresolved (conservative).
-            key = ""
-        ledger = ledger_by_key.get(key) if key else None
+            # No content key (e.g. challenger-independent blocker persisted
+            # without a hash key).  Expose the sentinel so callers can pass
+            # it directly to the resolution endpoint without reading internals.
+            key = _KEYLESS_FINDING_SENTINEL
+            ledger = ledger_by_key.get(_KEYLESS_FINDING_SENTINEL)
+        else:
+            ledger = ledger_by_key.get(key)
         state = (
             ledger.state
             if ledger is not None and ledger.state in _RESOLVED_LEDGER_STATES

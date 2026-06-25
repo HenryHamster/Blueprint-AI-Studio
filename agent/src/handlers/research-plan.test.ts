@@ -1791,6 +1791,44 @@ describe('buildVersionPhaseSection', () => {
     expect(blank).not.toContain('Goal:');
   });
 
+  it('renders the version theme when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'build',
+      theme: 'reliability',
+    });
+    expect(result).toContain('Theme: reliability');
+  });
+
+  it('omits the Theme line when theme is absent or blank', () => {
+    const absent = buildVersionPhaseSection({ version_number: 4, phase: 'build' });
+    expect(absent).not.toContain('Theme:');
+    const blank = buildVersionPhaseSection({ version_number: 4, phase: 'build', theme: '   ' });
+    expect(blank).not.toContain('Theme:');
+  });
+
+  it('emits explicit author-the-goal instruction when goal_needed flag is true', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'build',
+      goal_needed: true,
+    });
+    expect(result).toContain('ACTION NEEDED: Author the version goal');
+    expect(result).toContain('new_version_goal');
+    expect(result).not.toContain('Goal:');
+  });
+
+  it('emits explicit author-the-theme instruction when theme_needed flag is true', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'build',
+      theme_needed: true,
+    });
+    expect(result).toContain('ACTION NEEDED: Author the version theme');
+    expect(result).toContain('new_version_theme');
+    expect(result).not.toContain('Theme:');
+  });
+
   it('instructs agent to emit version_phase_decision when flipping', () => {
     const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
     expect(result).toContain('version_phase_decision');
@@ -2361,6 +2399,81 @@ describe('buildEfficiencySnapshotSection', () => {
     expect(result).toContain('LLM cost/merged PR');
     expect(result).toContain('0.85');
     expect(result).toContain('+28.8%');
+  });
+
+  it('renders llm_cost_attribution block with dominant model/task-type/failure-class, rework_share, self_repair_burn_share', () => {
+    const snapshot = {
+      axes: { llm_cost_per_merged_pr: { current: 1.2, baseline: 1.0, drift_pct: 20.0 } },
+      llm_cost_attribution: {
+        total_llm_usd: 42.5,
+        rework_share: 0.18,
+        self_repair_burn_share: 0.07,
+        dominant_model: { model: 'claude-opus-4-8', cost_usd: 30.1, share: 0.71 },
+        dominant_task_type: { task_type: 'create', cost_usd: 25.0, share: 0.59 },
+        dominant_failure_class: { failure_class: 'AGENT_TIMEOUT', cost_usd: 12.3, share: 0.29 },
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('LLM cost attribution');
+    expect(result).toContain('claude-opus-4-8');
+    expect(result).toContain('create');
+    expect(result).toContain('AGENT_TIMEOUT');
+    expect(result).toContain('18.0%'); // rework_share
+    expect(result).toContain('7.0%'); // self_repair_burn_share
+    expect(result).toContain('42.5'); // total_llm_usd
+  });
+
+  it('omits llm_cost_attribution block when absent', () => {
+    const snapshot = {
+      axes: { llm_cost_per_merged_pr: { current: 1.2, baseline: 1.0, drift_pct: 20.0 } },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).not.toContain('LLM cost attribution');
+  });
+
+  it('renders llm_cost_attribution gracefully when dominant rows are null', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 0.5, baseline: 0.4, drift_pct: 25.0 } },
+      llm_cost_attribution: {
+        total_llm_usd: 10.0,
+        rework_share: null,
+        self_repair_burn_share: null,
+        dominant_model: null,
+        dominant_task_type: null,
+        dominant_failure_class: null,
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('LLM cost attribution');
+    expect(result).toContain('dominant model: n/a');
+    expect(result).toContain('rework_share: n/a');
+    expect(result).toContain('self_repair_burn_share: n/a');
+  });
+
+  it('renders panel_review_effectiveness gate_health when present', () => {
+    const snapshot = {
+      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
+      panel_review_effectiveness: {
+        gate_health: { state: 'HEALTHY' },
+        fail_open_rate: 0.03,
+        total_challenged: 120,
+        effective_coverage: 0.85,
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('Adversarial gate health:');
+    expect(result).toContain('HEALTHY');
+    expect(result).toContain('3.00%');
+    expect(result).toContain('n=120');
+    expect(result).toContain('85.0%');
+  });
+
+  it('omits Adversarial gate health line when panel_review_effectiveness is absent', () => {
+    const snapshot = {
+      axes: { llm_cost_per_merged_pr: { current: 1.0, baseline: 1.0, drift_pct: 0.0 } },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).not.toContain('Adversarial gate health');
   });
 });
 

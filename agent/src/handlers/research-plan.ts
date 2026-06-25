@@ -781,6 +781,10 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     ? versionPhase.tasks_merged_this_version : null;
   const goal = typeof versionPhase.goal === 'string' && versionPhase.goal.trim()
     ? versionPhase.goal.trim() : null;
+  const theme = typeof versionPhase.theme === 'string' && versionPhase.theme.trim()
+    ? versionPhase.theme.trim() : null;
+  const goalNeeded = versionPhase.goal_needed === true;
+  const themeNeeded = versionPhase.theme_needed === true;
   // The backend always sends last_qualification as an object (the structured
   // qualification record: {status, candidate_sha, confidence, blocker, ...}) or
   // null — never a string. Render a compact summary line so the agent can see
@@ -808,6 +812,13 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   parts.push(`Current: **v${versionNumber} — ${phase.toUpperCase()}**`);
   if (goal) {
     parts.push(`Goal: ${goal}`);
+  } else if (goalNeeded) {
+    parts.push(`**ACTION NEEDED: Author the version goal.** Emit \`new_version_goal\` in Section 6 problem_model update (a one-sentence statement of what this version is for).`);
+  }
+  if (theme) {
+    parts.push(`Theme: ${theme}`);
+  } else if (themeNeeded) {
+    parts.push(`**ACTION NEEDED: Author the version theme.** Emit \`new_version_theme\` in Section 6 problem_model update (one of: leanness, reliability, performance, feature, mixed, none).`);
   }
 
   if (phaseChangedAt) {
@@ -952,7 +963,32 @@ Only request qualification from the **stabilize** phase — it is ignored in **b
 
 **Do NOT re-request while a qualification is in flight.** If the "Last qualification" line above shows \`status=pending\`, a qualification is already running for this version — the orchestrator has snapshotted a candidate and spawned the audit + smoketest. Do NOT emit \`qualify_request\` again; wait for the in-flight run to finalize (its status will change to \`promoted\`, \`not_promoted\`, \`dry_run\`, or an error). Re-requesting while \`status=pending\` is wasted work and is ignored.
 
-**Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit, smoketest) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns two agent VMs to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.`);
+**Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit, smoketest) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns two agent VMs to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.
+
+**Four distinct version-authoring concepts — keep them separate:**
+- \`intent.purpose\` = enduring PROJECT north star, operator-owned, spans all versions — never change it here.
+- \`version.goal\` = THIS version's frozen objective — a derivative of purpose, authored once per version.
+- \`version.theme\` = the falsifiable DELIVERY SHAPE (leanness | reliability | performance | feature | mixed | none).
+- \`intent.current_focus\` = live "working on now" status — NOT the goal, advances across cycles.
+
+**Authoring the version goal (when none is set):**
+If the open version has no Goal shown above, you may propose one by emitting a \`new_version_goal\` field as a top-level sibling in your Section 6 problem_model update:
+\`\`\`json
+{
+  "new_version_goal": "One concise sentence stating what this version is for."
+}
+\`\`\`
+Only emit \`new_version_goal\` when the Goal is currently unset — once authored, the goal is frozen and a re-emit is silently ignored. Keep it under 500 characters and avoid placeholder or generic text. \`new_version_goal\` is independent of \`version_phase_decision\` and \`qualify_request\` — you may emit any combination.
+
+**Authoring the version theme (when none is set):**
+If the open version has no Theme shown above, you may propose one by emitting a \`new_version_theme\` field as a top-level sibling in your Section 6 problem_model update:
+\`\`\`json
+{
+  "new_version_theme": "leanness"
+}
+\`\`\`
+Allowed values: \`leanness\` | \`reliability\` | \`performance\` | \`feature\` | \`mixed\` | \`none\`. Any other value is silently ignored.
+Only emit \`new_version_theme\` when the Theme is currently unset — once authored, the theme is frozen and a re-emit is silently ignored. \`new_version_theme\` is independent of all other siblings — you may emit any combination.`);
 
   return parts.join('\n');
 }
@@ -1175,6 +1211,106 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
       : '';
     lines.push('');
     lines.push(`**Agent timeout rate:** ${overallStr}${dominantStr}`);
+  }
+
+  const costAttr = snap.llm_cost_attribution && typeof snap.llm_cost_attribution === 'object'
+    ? snap.llm_cost_attribution as Record<string, unknown>
+    : null;
+  if (costAttr) {
+    const fmtShare = (v: unknown): string => {
+      if (v === null || v === undefined) return 'n/a';
+      if (typeof v === 'number') return `${(v * 100).toFixed(1)}%`;
+      if (typeof v === 'string') return v;
+      return 'n/a';
+    };
+    const fmtRow = (row: unknown, labelKey: string): string => {
+      if (!row || typeof row !== 'object') return 'n/a';
+      const r = row as Record<string, unknown>;
+      const label = typeof r[labelKey] === 'string' || typeof r[labelKey] === 'number' ? String(r[labelKey]) : 'n/a';
+      const cost = typeof r.cost_usd === 'number' ? `$${r.cost_usd.toFixed(4)}` : 'n/a';
+      const share = typeof r.share === 'number' ? ` (${(r.share * 100).toFixed(1)}%)` : '';
+      return `${label} ${cost}${share}`;
+    };
+    lines.push('');
+    lines.push('**LLM cost attribution (vs genesis baseline):**');
+    lines.push(`  total: $${typeof costAttr.total_llm_usd === 'number' ? costAttr.total_llm_usd.toFixed(4) : 'n/a'}`);
+    lines.push(`  dominant model: ${fmtRow(costAttr.dominant_model, 'model')}`);
+    lines.push(`  dominant task type: ${fmtRow(costAttr.dominant_task_type, 'task_type')}`);
+    lines.push(`  dominant failure class: ${fmtRow(costAttr.dominant_failure_class, 'failure_class')}`);
+    lines.push(`  rework_share: ${fmtShare(costAttr.rework_share)}`);
+    lines.push(`  self_repair_burn_share: ${fmtShare(costAttr.self_repair_burn_share)}`);
+  }
+
+  const windowDelta = snap.llm_cost_attribution_window_delta && typeof snap.llm_cost_attribution_window_delta === 'object'
+    ? snap.llm_cost_attribution_window_delta as Record<string, unknown>
+    : null;
+  if (windowDelta) {
+    const meta = windowDelta.window_meta && typeof windowDelta.window_meta === 'object'
+      ? windowDelta.window_meta as Record<string, unknown>
+      : null;
+    const windowLabel = meta && typeof meta.recent_n === 'number' && typeof meta.prior_count === 'number'
+      ? `recent ${meta.recent_n} vs prior ${meta.prior_count} snapshots`
+      : 'recent vs prior window';
+    lines.push('');
+    lines.push(`**LLM cost-mix shift (${windowLabel}):**`);
+
+    const fmtScalarDelta = (field: unknown): string => {
+      if (!field || typeof field !== 'object') return 'n/a';
+      const f = field as Record<string, unknown>;
+      const abs = typeof f.abs_delta === 'number' ? f.abs_delta : null;
+      const rel = typeof f.rel_pct === 'number' ? f.rel_pct : null;
+      if (abs == null) return 'n/a';
+      const sign = abs >= 0 ? '+' : '';
+      return rel != null ? `${sign}${abs.toFixed(4)} (${sign}${rel.toFixed(1)}%)` : `${sign}${abs.toFixed(4)}`;
+    };
+
+    const totalWd = windowDelta.total_llm_usd;
+    const reworkWd = windowDelta.rework_share;
+    const repairWd = windowDelta.self_repair_burn_share;
+    lines.push(`  total_llm_usd avg/snapshot: ${fmtScalarDelta(totalWd)}`);
+    lines.push(`  rework_share: ${fmtScalarDelta(reworkWd)}`);
+    lines.push(`  self_repair_burn_share: ${fmtScalarDelta(repairWd)}`);
+
+    const byModelDelta = Array.isArray(windowDelta.by_model_delta) ? windowDelta.by_model_delta : [];
+    if (byModelDelta.length > 0) {
+      const top = byModelDelta[0] as Record<string, unknown>;
+      const model = typeof top.model === 'string' ? top.model : 'unknown';
+      const costDelta = typeof top.cost_delta_usd === 'number' ? top.cost_delta_usd : null;
+      const shareDelta = typeof top.share_delta === 'number' ? top.share_delta : null;
+      const sign = costDelta != null && costDelta >= 0 ? '+' : '';
+      const costStr = costDelta != null ? `${sign}$${costDelta.toFixed(4)}` : 'n/a';
+      const shareStr = shareDelta != null ? ` (${shareDelta >= 0 ? '+' : ''}${(shareDelta * 100).toFixed(1)}% share)` : '';
+      lines.push(`  top model mover: ${model} ${costStr}${shareStr}`);
+    }
+
+    const byTypeDelta = Array.isArray(windowDelta.by_task_type_delta) ? windowDelta.by_task_type_delta : [];
+    if (byTypeDelta.length > 0) {
+      const top = byTypeDelta[0] as Record<string, unknown>;
+      const taskType = typeof top.task_type === 'string' ? top.task_type : 'unknown';
+      const costDelta = typeof top.cost_delta_usd === 'number' ? top.cost_delta_usd : null;
+      const sign = costDelta != null && costDelta >= 0 ? '+' : '';
+      const costStr = costDelta != null ? `${sign}$${costDelta.toFixed(4)}` : 'n/a';
+      lines.push(`  top task-type mover: ${taskType} ${costStr}`);
+    }
+  }
+
+  const peff = snap.panel_review_effectiveness && typeof snap.panel_review_effectiveness === 'object'
+    ? snap.panel_review_effectiveness as Record<string, unknown>
+    : null;
+  if (peff) {
+    const gh = peff.gate_health && typeof peff.gate_health === 'object'
+      ? peff.gate_health as Record<string, unknown>
+      : null;
+    const state = gh && typeof gh.state === 'string' ? gh.state : 'NO_DATA';
+    const failOpenRate = typeof peff.fail_open_rate === 'number'
+      ? `${(peff.fail_open_rate * 100).toFixed(2)}%`
+      : 'n/a';
+    const totalChallenged = typeof peff.total_challenged === 'number' ? String(peff.total_challenged) : 'n/a';
+    const coverage = typeof peff.effective_coverage === 'number'
+      ? `${(peff.effective_coverage * 100).toFixed(1)}%`
+      : 'n/a';
+    lines.push('');
+    lines.push(`**Adversarial gate health:** ${state} — fail_open_rate ${failOpenRate} (n=${totalChallenged}, coverage ${coverage})`);
   }
 
   return lines.join('\n') + '\n';

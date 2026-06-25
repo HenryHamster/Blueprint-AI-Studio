@@ -2,7 +2,7 @@ import { useMemo, useState, useEffect, useCallback, useRef } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
-import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry, type FormatComplianceBySchemaEntry, type ChallengerSampleRateRecommendation } from '../api';
+import { apiFetch, type EfficiencyAxis, type EfficiencyAxesResponse, type EfficiencyHistoryPoint, type FormatComplianceByTypeEntry, type FormatComplianceBySchemaEntry, type ChallengerSampleRateRecommendation, type LlmCostAttributionWindowDelta } from '../api';
 import { LaneDiagPanel } from './LaneDiagPanel';
 import { WarmStartOriginRow } from './WarmStartOriginRow';
 import { usePoller } from '../hooks/usePoller';
@@ -707,8 +707,74 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
               </div>
             ))}
           </div>
+          {(() => {
+            const attr = data.llm_cost_attribution;
+            const dominantModel = attr.by_model?.length
+              ? [...attr.by_model].sort((a, b) => b.cost_usd - a.cost_usd)[0]
+              : null;
+            const dominantTaskType = attr.by_task_type?.length
+              ? [...attr.by_task_type].sort((a, b) => b.cost_usd - a.cost_usd)[0]
+              : null;
+            const hasDecomp = dominantModel != null || dominantTaskType != null
+              || attr.rework_share != null || attr.self_repair_burn_share != null;
+            if (!hasDecomp) return null;
+            return (
+              <div data-testid="llm-cost-decomposition" className="mt-2 pt-2 border-t border-neutral-700/50 text-ui-sm text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
+                {dominantModel && (
+                  <span>top model: <span className="text-neutral-400 font-mono">{dominantModel.model}</span> ${dominantModel.cost_usd.toFixed(2)}</span>
+                )}
+                {dominantTaskType && (
+                  <span>top type: <span className="text-neutral-400 font-mono">{dominantTaskType.task_type}</span> ${dominantTaskType.cost_usd.toFixed(2)}</span>
+                )}
+                <span>rework: {attr.rework_share != null ? `${(attr.rework_share * 100).toFixed(0)}%` : '—'}</span>
+                <span>self-repair burn: {attr.self_repair_burn_share != null ? `${(attr.self_repair_burn_share * 100).toFixed(0)}%` : '—'}</span>
+              </div>
+            );
+          })()}
         </div>
       )}
+      {data.llm_cost_attribution_window_delta && (() => {
+        const wd: LlmCostAttributionWindowDelta = data.llm_cost_attribution_window_delta;
+        const meta = wd.window_meta;
+        const topModel = wd.by_model_delta?.length ? wd.by_model_delta[0] : null;
+        const topType = wd.by_task_type_delta?.length ? wd.by_task_type_delta[0] : null;
+        const totalDelta = wd.total_llm_usd;
+        const reworkDelta = wd.rework_share;
+        const repairDelta = wd.self_repair_burn_share;
+        const hasContent = topModel != null || topType != null || totalDelta != null || reworkDelta != null;
+        if (!hasContent) return null;
+        const fmtPct = (v: number | null | undefined) => v != null ? `${v > 0 ? '+' : ''}${(v * 100).toFixed(1)}%` : '—';
+        const fmtUsd = (v: number | null | undefined) => v != null ? `${v >= 0 ? '+' : ''}$${Math.abs(v).toFixed(2)}` : '—';
+        const windowLabel = meta
+          ? `recent ${meta.recent_n} vs prior ${meta.prior_count}`
+          : 'recent vs prior';
+        return (
+          <div data-testid="llm-cost-window-delta-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+            <div className="flex justify-between items-center gap-4 mb-1.5">
+              <span className="text-neutral-400">LLM cost-mix shift <span className="text-neutral-600">({windowLabel} snapshots)</span></span>
+              {totalDelta?.abs_delta != null && (
+                <span className={`font-mono ${totalDelta.abs_delta > 0 ? 'text-amber-400' : 'text-emerald-400'}`}>
+                  {fmtUsd(totalDelta.abs_delta)} avg/snapshot
+                </span>
+              )}
+            </div>
+            <div className="text-ui-sm text-neutral-500 flex flex-wrap gap-x-3 gap-y-1">
+              {topModel && (
+                <span>top model mover: <span className="text-neutral-400 font-mono">{topModel.model}</span> {fmtUsd(topModel.cost_delta_usd)}{topModel.share_delta != null ? ` (${fmtPct(topModel.share_delta)} share)` : ''}</span>
+              )}
+              {topType && (
+                <span>top type mover: <span className="text-neutral-400 font-mono">{topType.task_type}</span> {fmtUsd(topType.cost_delta_usd)}</span>
+              )}
+              {reworkDelta?.abs_delta != null && (
+                <span>rework: {fmtPct(reworkDelta.abs_delta)}</span>
+              )}
+              {repairDelta?.abs_delta != null && (
+                <span>self-repair burn: {fmtPct(repairDelta.abs_delta)}</span>
+              )}
+            </div>
+          </div>
+        );
+      })()}
       {data.format_compliance && (
         <div data-testid="format-compliance-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
           <div className="flex justify-between items-center gap-4">

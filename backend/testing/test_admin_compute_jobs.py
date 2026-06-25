@@ -7,7 +7,7 @@ test seeds the role it exercises.
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -385,6 +385,56 @@ async def test_kill_compute_job_redacts_launch_secrets(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
+async def test_list_compute_jobs_redacts_credentials_in_per_arm_text_fields(
+    client: AsyncClient, db_session
+):
+    """serialize_compute_job_response_safe must redact credential-bearing patterns
+    from per-arm log/note/label text inside result_metrics.arms so VM stdout that
+    echoed a secret does not reach the operator-facing API."""
+    project = await _make_project(db_session, name="Arm Redact")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "result_metrics": {
+                "accuracy": 0.9,
+                "arms": {
+                    "control": {
+                        "accuracy": 0.85,
+                        "log": "run ok\nexport ANTHROPIC_API_KEY=sk-ant-api03-REDACTME\ndone",
+                        "note": "baseline run",
+                        "label": "control-arm",
+                    },
+                    "treatment": {
+                        "accuracy": 0.92,
+                        "log": "completed with ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH token",
+                        "note": "treatment note",
+                        "label": "treatment-arm",
+                    },
+                },
+            }
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    pm = resp.json()["compute_jobs"][0]["polling_metadata"]
+    arms = pm["result_metrics"]["arms"]
+
+    # Credential-bearing patterns must be scrubbed from log text.
+    assert "sk-ant-api03-REDACTME" not in arms["control"]["log"]
+    assert "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH" not in arms["treatment"]["log"]
+
+    # Non-sensitive fields survive intact.
+    assert arms["control"]["note"] == "baseline run"
+    assert arms["control"]["label"] == "control-arm"
+    assert arms["treatment"]["note"] == "treatment note"
+    assert arms["treatment"]["label"] == "treatment-arm"
+    assert pm["result_metrics"]["accuracy"] == 0.9
+
+
+@pytest.mark.asyncio
 async def test_list_compute_jobs_strips_non_dict_env_payload(
     client: AsyncClient, db_session
 ):
@@ -407,6 +457,51 @@ async def test_list_compute_jobs_strips_non_dict_env_payload(
     assert "env" not in metadata
     assert "command" not in metadata
     assert "cwd" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_compute_job_arm_log_credentials_redacted(
+    client: AsyncClient, db_session
+):
+    """Credentials in per-arm log/note/label must be redacted; numeric fields unchanged."""
+    project = await _make_project(db_session, name="Arm Redact")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "result_metrics": {
+                "arms": {
+                    "arm_a": {
+                        "log": "run complete TOKEN=secret-token-abc123 done",
+                        "note": "export API_KEY=my-secret-key",
+                        "label": "clean label",
+                        "score": 0.87,
+                    },
+                    "arm_b": {
+                        "log": "normal log",
+                        "score": 0.91,
+                    },
+                },
+                "best_arm": "arm_b",
+            }
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    pm = resp.json()["compute_jobs"][0]["polling_metadata"]
+    arms = pm["result_metrics"]["arms"]
+
+    # Credentials must be redacted.
+    assert "secret-token-abc123" not in arms["arm_a"]["log"]
+    assert "my-secret-key" not in arms["arm_a"]["note"]
+    # Clean text and numeric values must be preserved.
+    assert arms["arm_a"]["label"] == "clean label"
+    assert arms["arm_a"]["score"] == 0.87
+    assert arms["arm_b"]["log"] == "normal log"
+    assert arms["arm_b"]["score"] == 0.91
+    assert pm["result_metrics"]["best_arm"] == "arm_b"
 
 
 @pytest.mark.asyncio
@@ -670,6 +765,223 @@ async def test_list_compute_jobs_criterion_verdict_recovered_from_stdout(
     assert verdict["measurable"] is True
 
 
+@pytest.mark.asyncio
+async def test_list_compute_jobs_all_terminal_returns_old_jobs(
+    client: AsyncClient, db_session
+):
+    """Terminal jobs older than the default 7-day window must be excluded by
+    default but returned when ?all_terminal=true is passed.
+
+    Creates a job with completed_at 30 days ago (well outside the 7-day cap),
+    confirms the default endpoint excludes it, then confirms ?all_terminal=true
+    surfaces it alongside any active jobs.
+    """
+    project = await _make_project(db_session, name="Old Jobs Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Seed a terminal job completed 30 days ago — beyond any allowed window.
+    _task, old_job, _artifact = await _make_job(
+        db_session, project, status=ComputeJobStatus.SUCCEEDED
+    )
+    old_job.completed_at = datetime.now(tz=timezone.utc) - timedelta(days=30)
+    db_session.add(old_job)
+    await db_session.commit()
+
+    # Default (time-windowed) request must NOT include the old job.
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    ids = [j["id"] for j in resp.json()["compute_jobs"]]
+    assert str(old_job.id) not in ids, "old terminal job must be excluded by default"
+
+    # ?all_terminal=true must include the old job.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs?all_terminal=true"
+    )
+    assert resp.status_code == 200
+    ids = [j["id"] for j in resp.json()["compute_jobs"]]
+    assert str(old_job.id) in ids, "old terminal job must appear with all_terminal=true"
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_all_terminal_summary_matches_list(
+    client: AsyncClient, db_session
+):
+    """When ?all_terminal=true, the summary totals must match the returned job list.
+
+    Seeds one old terminal job (30 days ago, outside any default window) plus one
+    active job, then asserts:
+    - Default request: old terminal job excluded from both list AND summary.
+    - ?all_terminal=true: old terminal job counted in summary terminal_jobs/total_jobs
+      and total_spend_usd matches the combined spend of the full returned list.
+    """
+    project = await _make_project(db_session, name="Summary Alignment Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Old terminal job completed 30 days ago with a known cost.
+    _task_old, old_job, _art = await _make_job(
+        db_session, project, status=ComputeJobStatus.SUCCEEDED
+    )
+    old_job.completed_at = datetime.now(tz=timezone.utc) - timedelta(days=30)
+    old_job.final_cost_usd = 3.0
+    db_session.add(old_job)
+    await db_session.commit()
+
+    # Active job (still running, no final_cost).
+    _task_run, running_job, _art2 = await _make_job(
+        db_session, project, status=ComputeJobStatus.RUNNING
+    )
+    running_job.accrued_cost_usd = 1.0
+    db_session.add(running_job)
+    await db_session.commit()
+
+    # --- Default request: old terminal job must NOT appear in list or summary ---
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    body = resp.json()
+    default_ids = {j["id"] for j in body["compute_jobs"]}
+    assert str(old_job.id) not in default_ids, "old job excluded from default list"
+    default_summary = body["summary"]
+    # Only the running job is in scope; terminal_jobs count must not include the old one.
+    assert default_summary["terminal_jobs"] == 0, (
+        f"default summary must exclude old terminal job; got {default_summary}"
+    )
+
+    # --- ?all_terminal=true: summary totals must align with the returned list ---
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs?all_terminal=true"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    all_ids = {j["id"] for j in body["compute_jobs"]}
+    assert str(old_job.id) in all_ids, "old job must appear with all_terminal=true"
+
+    summary = body["summary"]
+    returned_jobs = body["compute_jobs"]
+    # Summary total_jobs must equal the number of jobs in the list.
+    assert summary["total_jobs"] == len(returned_jobs), (
+        f"summary total_jobs={summary['total_jobs']} != list len={len(returned_jobs)}"
+    )
+    # Old terminal job must be counted in terminal_jobs.
+    assert summary["terminal_jobs"] >= 1, (
+        f"terminal_jobs must include old job; got {summary['terminal_jobs']}"
+    )
+    # total_spend_usd must include the old job's cost (3.0) plus running accrued (1.0).
+    assert summary["total_spend_usd"] == pytest.approx(4.0), (
+        f"expected spend=4.0 (old 3.0 + running 1.0), got {summary['total_spend_usd']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/compute-jobs/{job_id} — single-job detail endpoint tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_returns_arms(client: AsyncClient, db_session):
+    """Fetching one job by id returns the full detail including per-arm result block."""
+    project = await _make_project(db_session, name="Detail Arms Project")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "result_metrics": {
+                "arms": {
+                    "arm_a": {"log": "arm_a complete", "score": 0.87},
+                    "arm_b": {"log": "arm_b complete", "score": 0.91},
+                },
+                "best_arm": "arm_b",
+            }
+        },
+    )
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job.id}")
+    assert resp.status_code == 200
+    body = resp.json()["compute_job"]
+    assert body["id"] == str(job.id)
+    arms = body["polling_metadata"]["result_metrics"]["arms"]
+    assert "arm_a" in arms
+    assert "arm_b" in arms
+    assert arms["arm_a"]["score"] == pytest.approx(0.87)
+    assert arms["arm_b"]["score"] == pytest.approx(0.91)
+    assert body["polling_metadata"]["result_metrics"]["best_arm"] == "arm_b"
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_viewer_ok(client: AsyncClient, db_session):
+    """Viewer-role user can fetch job detail including task_title and task_type."""
+    project = await _make_project(db_session, name="Detail Viewer OK")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job, _artifact = await _make_job(db_session, project, with_artifact=True)
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job.id}")
+    assert resp.status_code == 200
+    body = resp.json()["compute_job"]
+    assert body["id"] == str(job.id)
+    assert body["task_title"] == "compute_experiment task"
+    assert body["task_type"] == "compute_experiment"
+    assert body["artifact"] is not None
+    assert body["artifact"]["storage_uri"] == "gs://bucket/jobs/job-1/result.parquet"
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_missing_404(client: AsyncClient, db_session):
+    """Unknown job id returns 404."""
+    resp = await client.get(f"/api/admin/compute-jobs/{uuid.uuid4()}")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_non_member_404(client: AsyncClient, db_session):
+    """User with no project membership gets 404 (IDOR protection)."""
+    project = await _make_project(db_session, name="Detail Non Member")
+    # Deliberately no membership for TEST_USER_ID.
+    _task, job, _artifact = await _make_job(db_session, project)
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job.id}")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_cross_project_404(client: AsyncClient, db_session):
+    """Member of project A fetching project B's job gets 404 (IDOR protection)."""
+    project_a = await _make_project(db_session, name="Detail Project A")
+    await _add_member(db_session, project_a.id, "viewer")
+
+    project_b = await _make_project(db_session, name="Detail Project B")
+    _task_b, job_b, _artifact_b = await _make_job(db_session, project_b)
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job_b.id}")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_redacts_polling_metadata(
+    client: AsyncClient, db_session
+):
+    """env/command/cwd are stripped from the single-job detail response."""
+    project = await _make_project(db_session, name="Detail Redact")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "command": ["python3", "run.py"],
+            "cwd": "/workspace",
+            "env": {"SECRET": "top-secret"},
+            "status_message": "running",
+        },
+    )
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job.id}")
+    assert resp.status_code == 200
+    pm = resp.json()["compute_job"]["polling_metadata"]
+    assert "command" not in pm
+    assert "cwd" not in pm
+    assert "env" not in pm
+    assert pm.get("status_message") == "running"
+
+
 # ---------------------------------------------------------------------------
 # Analyze endpoint tests
 # ---------------------------------------------------------------------------
@@ -795,6 +1107,127 @@ async def test_analyze_compute_job_member_ok(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_list_compute_jobs_includes_summary(client: AsyncClient, db_session):
+    """The list response includes a summary block aggregating job_count,
+    total_spend_usd, criterion_met_count, measured_count, and outcome_breakdown
+    computed over the returned page without altering existing per-job fields."""
+    project = await _make_project(db_session, name="Summary Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Job 1: terminal (succeeded), criterion met, measurable, final_cost_usd set.
+    criterion_met = {
+        "metric": "accuracy",
+        "operator": ">=",
+        "threshold": 0.9,
+        "value": 0.95,
+        "met": True,
+        "measurable": True,
+    }
+    task1 = Task(
+        project_id=project.id,
+        title="met task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}}],
+        plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": criterion_met}},
+    )
+    db_session.add(task1)
+    await db_session.commit()
+    await db_session.refresh(task1)
+    job1 = ComputeJob(
+        task_id=task1.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=1.0,
+        final_cost_usd=1.5,
+        completed_at=datetime.utcnow(),
+    )
+    db_session.add(job1)
+    await db_session.commit()
+
+    # Job 2: terminal (failed), criterion unmet (measurable but not met).
+    criterion_unmet = {
+        "metric": "accuracy",
+        "operator": ">=",
+        "threshold": 0.9,
+        "value": 0.75,
+        "met": False,
+        "measurable": True,
+    }
+    task2 = Task(
+        project_id=project.id,
+        title="unmet task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}}],
+        plan_output={"compute_result": {"outcome": "FAILURE", "criterion": criterion_unmet}},
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+    job2 = ComputeJob(
+        task_id=task2.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.FAILED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=0.8,
+        final_cost_usd=0.8,
+        completed_at=datetime.utcnow(),
+    )
+    db_session.add(job2)
+    await db_session.commit()
+
+    # Job 3: running (no criterion, only accrued cost).
+    task3 = Task(
+        project_id=project.id,
+        title="running task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task3)
+    await db_session.commit()
+    await db_session.refresh(task3)
+    job3 = ComputeJob(
+        task_id=task3.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=0.3,
+    )
+    db_session.add(job3)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Existing keys must be preserved.
+    assert "compute_jobs" in body
+    assert "has_more" in body
+    assert "limit" in body
+    assert "offset" in body
+    assert len(body["compute_jobs"]) == 3
+
+    summary = body["summary"]
+    assert summary["total_jobs"] == 3
+    # total_spend: job1 final=1.5, job2 final=0.8, job3 accrued=0.3 (no final)
+    assert summary["total_spend_usd"] == pytest.approx(2.6)
+    # criterion_met: only job1 (plan_output.compute_result.criterion.met = true)
+    assert summary["criterion_met"] == 1
+    # measured: job1 + job2 (both have plan_output.compute_result.criterion set)
+    assert summary["criterion_measured"] == 2
+    breakdown = summary["outcome_breakdown"]
+    assert breakdown[ComputeJobStatus.SUCCEEDED.value] == 1
+    assert breakdown[ComputeJobStatus.FAILED.value] == 1
+    assert breakdown[ComputeJobStatus.RUNNING.value] == 1
+
+
+@pytest.mark.asyncio
 async def test_analyze_endpoint_persists_unavailable_cause(
     client: AsyncClient, db_session
 ):
@@ -828,3 +1261,145 @@ async def test_analyze_endpoint_persists_unavailable_cause(
     assert verdict.get("analysis_attempted_at") is not None
     # analysis_mode must not have changed.
     assert verdict.get("analysis_mode") == original_mode
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_redacts_credentials_in_result_metrics(
+    client: AsyncClient, db_session
+):
+    """result_metrics string values must have credentials redacted recursively."""
+    project = await _make_project(db_session, name="Redact Result Metrics")
+    await _add_member(db_session, project.id, "viewer")
+    # Seed a job whose result_metrics contains credential-bearing strings at
+    # various nesting depths, plus a safe numeric value that must survive.
+    await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "result_metrics": {
+                "accuracy": 0.95,
+                "log": "export ANTHROPIC_API_KEY=sk-ant-abc123 run complete",
+                "arms": {
+                    "arm_a": {
+                        "note": "Authorization: Bearer ghp_token123 step done",
+                        "score": 0.88,
+                    }
+                },
+            }
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    rm = resp.json()["compute_jobs"][0]["polling_metadata"]["result_metrics"]
+
+    # Numeric values survive unchanged.
+    assert rm["accuracy"] == 0.95
+    # Top-level credential string must be redacted.
+    assert "sk-ant-abc123" not in rm["log"]
+    assert "ANTHROPIC_API_KEY" not in rm["log"] or "***" in rm["log"]
+    # Nested string inside arms must also be redacted.
+    assert "ghp_token123" not in rm["arms"]["arm_a"]["note"]
+    # Numeric field inside arms survives.
+    assert rm["arms"]["arm_a"]["score"] == 0.88
+
+
+@pytest.mark.asyncio
+async def test_aggregate_summary_endpoint_returns_all_jobs(
+    client: AsyncClient, db_session
+):
+    """The /compute-jobs/summary endpoint returns totals over ALL jobs regardless of age."""
+    project = await _make_project(db_session, name="Agg Summary Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Old terminal job (would be outside any include_finished_minutes window).
+    old_task = Task(
+        project_id=project.id,
+        title="old task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "success_criterion": {"metric": "acc", "operator": ">=", "threshold": 0.9}}],
+        plan_output={"compute_result": {"outcome": "SUCCESS", "criterion": {"met": True, "measurable": True}}},
+    )
+    db_session.add(old_task)
+    await db_session.commit()
+    await db_session.refresh(old_task)
+    old_job = ComputeJob(
+        task_id=old_task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        final_cost_usd=2.0,
+        completed_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+    )
+    db_session.add(old_job)
+    await db_session.commit()
+
+    # Recent running job.
+    new_task = Task(
+        project_id=project.id,
+        title="new task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(new_task)
+    await db_session.commit()
+    await db_session.refresh(new_task)
+    new_job = ComputeJob(
+        task_id=new_task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=0.5,
+    )
+    db_session.add(new_job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/summary")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Both jobs are included (old terminal + new running).
+    assert body["total_jobs"] == 2
+    assert body["active_jobs"] == 1
+    assert body["terminal_jobs"] == 1
+    assert body["total_spend_usd"] == pytest.approx(2.5)  # 2.0 final + 0.5 accrued
+    assert body["outcome_breakdown"][ComputeJobStatus.SUCCEEDED.value] == 1
+    assert body["outcome_breakdown"][ComputeJobStatus.RUNNING.value] == 1
+    # old_task has criterion data.
+    assert body["criterion_measured"] == 1
+    assert body["criterion_met"] == 1
+
+
+@pytest.mark.asyncio
+async def test_aggregate_summary_endpoint_non_member_returns_404(
+    client: AsyncClient, db_session
+):
+    """The summary endpoint returns 404 for users without project access."""
+    project = await _make_project(db_session, name="Agg Summary No-Access")
+    # No member row — request must be rejected.
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/summary")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_aggregate_summary_endpoint_empty_project(
+    client: AsyncClient, db_session
+):
+    """The summary endpoint returns zero-value fields when no jobs exist."""
+    project = await _make_project(db_session, name="Agg Summary Empty")
+    await _add_member(db_session, project.id, "viewer")
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/summary")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_jobs"] == 0
+    assert body["active_jobs"] == 0
+    assert body["terminal_jobs"] == 0
+    assert body["total_spend_usd"] == pytest.approx(0.0)
+    assert body["outcome_breakdown"] == {}
+    assert body["criterion_measured"] == 0
+    assert body["criterion_met"] == 0

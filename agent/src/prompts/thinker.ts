@@ -267,6 +267,13 @@ Directions to retire (one-sentence reason each) and to create (name the gap_id e
 
 **Knowledge commissions.** You can also direct the Executor to spawn a \`web_research\` or \`design\` knowledge task (it has the spawn-task command). These are HIGH-ROI and chronically under-used: one durable, citation-grounded document de-risks every later task in its area and compounds across cycles. Plan one when a direction hinges on external facts nobody has documented (APIs, vendors, pricing/quotas, standards, how mature OSS solves the same problem), when an area keeps producing failed or churning implementation work (settle the structure once in a design doc instead of re-deriving it per task), or when the knowledge index is thin for a direction you are actively advancing. Name the task type, title, and what the document must answer.
 
+**Experiment commissions.** When you hold a MEASURABLE conjecture — a hypothesis that can be settled empirically by running a command and observing a declared metric, rather than by reading code or the web — you can commission a budget-gated \`compute_experiment\` directly (the Executor has the spawn-task command for it). Use this move when all four conditions hold: (1) the conjecture is falsifiable (there is a clear success criterion expressible as a metric + comparator + threshold), (2) the only way to resolve it is to run compute and measure an output, (3) a reasonable spend cap and deadline can be stated up front, and (4) no cheaper read-only research would settle it first. The launch contract the Executor sends requires: a \`command\` string to execute, a positive \`spend_cap_usd\`, a positive \`deadline_seconds\`, and an OPTIONAL \`success_criterion\` of \`{metric, operator, threshold}\` (where \`operator\` is one of \`<\`, \`>\`, \`<=\`, \`>=\`). For multi-arm (A/B) comparisons, use \`arms: [{name, command}]\` instead of a single \`command\`, and supply \`declared_metric\` (the exact key each arm's command writes to \`$BLUEPRINT_RESULT_FILE\`); \`declared_metric\` is required when \`arms\` is present. A free-text \`prompt\` is optional because \`hypothesis\` serves as the description. Note: experiments above the configured per-experiment spend threshold require operator spend-approval — the backend gates this automatically and will pause the task for approval if needed. Name the hypothesis, the command (or arms), the metric being measured, and what the outcome changes.
+
+**Pick the right dispatch for the work — three distinct moves:**
+- **\`spawn-fix\`** (the Executor's \`./strategic spawn-fix\` command, types \`create\`/\`refactor\`/\`qa\`) — for ONE-TIME implementation work: a bug fix, a CI remediation, a single isolated cleanup. It carries NO direction, has no evidence/retirement lifecycle, and never appears in the portfolio — it fires once and lands a PR. Use this for a discrete fix you can describe and finish, instead of inventing a direction just to staff one task.
+- **\`spawn-task\`** (research/plan/\`web_research\`/\`design\`/\`compute_experiment\` types) — for read-only INVESTIGATION that informs a direction (research/plan/web_research/design) or for empirical measurement of a falsifiable hypothesis (\`compute_experiment\`), as described under Knowledge commissions and Experiment commissions above.
+- **\`create-direction\`** — ONLY for persistent strategic intent where you can articulate a measurable \`success_evidence\` and a \`retirement_condition\`. If the work is a single fix with no ongoing intent, prefer \`spawn-fix\` and do NOT manufacture a direction for it.
+
 **Staging (next-version work).** A fourth move exists alongside create/update/retire: you can **stage** a direction to begin only after the current version promotes and the next one opens. A staged direction is inert — it spawns no work — until that version-open transition auto-activates it. The "Staged for next version" block above lists what is already staged; **do not re-propose work that is already staged there.**
 
 Staging is NOT deferral, and it is not an escape from the "you're not allowed to defer" rule. Staging is itself a DECISION — a hard call that the work genuinely belongs to the NEXT version's scope, not this one. The natural case: the project is in its stabilize/hardening phase (see the version-phase section, when present) and a strong *build-phase* idea appears that would pollute the current version's scope if started now — stage it so it activates cleanly when the next build phase opens. Use it for genuinely next-version-scoped work. Do NOT use it to dodge a within-cycle call: if work belongs to THIS version, create it active now; if it's not worth doing, retire/don't-create it. "I'm not sure, I'll stage it" is deferral wearing staging's clothes — make the call instead.
@@ -346,16 +353,57 @@ When describing changes in prose, be precise: "opening gap g-strategic-mem (from
 
 Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
 
+## 7. Version goal + theme (conditional — only when unset)
+
+**Four distinct concepts — keep them separate:**
+- \`intent.purpose\` = enduring PROJECT north star, operator-owned, spans all versions. Never touch this.
+- \`version.goal\` = THIS version's frozen objective — a derivative of purpose, authored once per version.
+- \`version.theme\` = the falsifiable DELIVERY SHAPE for this version (leanness | reliability | performance | feature | mixed | none).
+- \`intent.current_focus\` = live "working on now" status — NOT the goal, advances across cycles.
+
+**Version goal (only when the Goal shown in Version Phase is unset):**
+
+**Skip if the version already has a goal** — the goal is frozen once set; re-emitting is silently ignored.
+
+**Only when the goal is currently unset:** write one concise version objective to \`/tmp/new_version_goal_${p.taskId}.txt\` ${READ_ONLY_BASH_WRITE_NOTE}. Single line, under 500 characters.
+
+The goal must be SUBSTANTIVE and DIRECTIONAL — a concrete deliverable statement that orients a new contributor reading it cold. It becomes the frozen scoring target for every merge in this version.
+
+Bad: "Fix CI, improve quality, pass audit." — feature list / status echo, rejected by the contentless-goal guard.
+Good: "Deliver autonomous cross-project coordination so Blueprint manages 3+ concurrent projects with fewer than 1 operator intervention per day." — outcome-framed, measurable, non-trivial.
+
+Write only the goal text — no JSON, no label, no quotes. Omit the file entirely if the goal is already set.
+
+**Version theme (only when the Theme shown in Version Phase is unset):**
+
+**Skip if the version already has a theme** — the theme is frozen once set; re-emitting is silently ignored.
+
+**Only when the theme is currently unset:** write one of the following values to \`/tmp/new_version_theme_${p.taskId}.txt\` ${READ_ONLY_BASH_WRITE_NOTE}: \`leanness\` | \`reliability\` | \`performance\` | \`feature\` | \`mixed\` | \`none\`
+
+Choose the value that best describes the PRIMARY delivery shape of this version:
+- \`leanness\` — simplification, removal of dead code, reducing complexity or surface area
+- \`reliability\` — stability, correctness, error handling, test coverage, hardening
+- \`performance\` — throughput, latency, efficiency improvements
+- \`feature\` — new user-visible capabilities or significant enhancements
+- \`mixed\` — roughly equal mix of the above (use sparingly — be specific when possible)
+- \`none\` — maintenance cycle with no dominant delivery theme
+
+Write only the theme value — no JSON, no label, no quotes. Omit the file entirely if the theme is already set.
+
 ${PLAYBOOK_GUIDANCE}
 
 ${DEFAULT_TOOL_GUIDANCE}`;
 }
 
 // ── Pass-1 gate: run thinker, verify artifacts, retry once if missing ────────
-// Exported for unit testing. Returns { ok: true, analysisText } when both
-// /tmp/problem_model_<taskId>.json and /tmp/running_update_<taskId>.md exist
-// after the thinker (or its focused retry) completes. On any failure path it
-// calls persistAndPostStatus(FAILED, failure_category=strategic_thinker_artifacts_missing)
+// Exported for unit testing. Returns { ok: true, analysisText, newVersionGoal?,
+// newVersionTheme? } when both /tmp/problem_model_<taskId>.json and
+// /tmp/running_update_<taskId>.md exist after the thinker (or its focused retry)
+// completes. Also reads the optional /tmp/new_version_goal_<taskId>.txt (Section 7
+// output) and /tmp/new_version_theme_<taskId>.txt (Section 7 output) and surfaces
+// their content so the caller can pre-merge them into the problem_model JSON before
+// the executor runs. On any failure path it calls
+// persistAndPostStatus(FAILED, failure_category=strategic_thinker_artifacts_missing)
 // and returns { ok: false } so the caller can simply return.
 export async function runThinkerWithGate(
   thinkerPrompt: string,
@@ -365,7 +413,7 @@ export async function runThinkerWithGate(
   model: string | undefined,
   effort: string | undefined,
   disallowedTools: string[],
-): Promise<{ ok: true; analysisText: string } | { ok: false }> {
+): Promise<{ ok: true; analysisText: string; newVersionGoal?: string; newVersionTheme?: string } | { ok: false }> {
   const problemModelPath = `/tmp/problem_model_${taskId}.json`;
   const runningUpdatePath = `/tmp/running_update_${taskId}.md`;
 
@@ -581,5 +629,31 @@ export async function runThinkerWithGate(
     }
   }
 
-  return { ok: true, analysisText };
+  // Read the optional Section 7 version-goal file if the thinker wrote it.
+  const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+  let newVersionGoal: string | undefined;
+  if (fs.existsSync(newVersionGoalPath)) {
+    try {
+      const raw = fs.readFileSync(newVersionGoalPath, 'utf8').trim();
+      if (raw) newVersionGoal = raw;
+    } catch (e) {
+      sendLog(ws, `[WARNING] Failed to read ${newVersionGoalPath}: ${String(e)}\n`);
+    }
+  }
+
+  // Read the optional Section 7 version-theme file if the thinker wrote it.
+  const validThemeValues = new Set(['leanness', 'reliability', 'performance', 'feature', 'mixed', 'none']);
+  const newVersionThemePath = `/tmp/new_version_theme_${taskId}.txt`;
+  let newVersionTheme: string | undefined;
+  if (fs.existsSync(newVersionThemePath)) {
+    try {
+      const raw = fs.readFileSync(newVersionThemePath, 'utf8').trim().toLowerCase();
+      if (raw && validThemeValues.has(raw)) newVersionTheme = raw;
+      else if (raw) sendLog(ws, `[WARNING] Ignoring invalid new_version_theme value: "${raw}"\n`);
+    } catch (e) {
+      sendLog(ws, `[WARNING] Failed to read ${newVersionThemePath}: ${String(e)}\n`);
+    }
+  }
+
+  return { ok: true, analysisText, newVersionGoal, newVersionTheme };
 }

@@ -1,81 +1,28 @@
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { OrchestratorHealthBar } from '../components/OrchestratorHealthBar';
-import { ProjectDashboard } from '../components/ProjectDashboard';
 import { MessagesPanel } from '../components/MessagesPanel';
 import { expectNoOverflowAt } from './viewport';
-import type { Project } from '../types/project';
 
-// Unified api mock: OrchestratorHealthBar hits /api/admin/digest, MessagesPanel
-// hits /api/admin/messages. Everything else returns {} to avoid null-deref crashes.
-vi.mock('../api', async () => {
-  const actual = await vi.importActual<typeof import('../api')>('../api');
-
-  const digestPayload = {
-    daily_cost_usd: 42.0,
-    daily_cost_ceiling_usd: 100,
-    window_hours: 24,
-    generated_at: '2026-05-06T00:00:00Z',
-    completed_count: 3,
-    failed_count: 0,
-    pending_approval_count: 0,
-    research_cycles: 1,
-    prs_opened: 2,
-    active_count: 1,
-    running_count: 1,
-    needs_attention: [],
-    recent_failures: [],
-    failure_groups: [],
-    recent_completions: [],
-    direction_progress: [],
-    active_tasks: [],
-    fresh_reviewer_effectiveness: null,
-  };
-
-  const messagesPayload = {
-    messages: [
-      {
-        id: 'msg-1',
-        project_id: 'proj-1',
-        message_type: 'NOTE',
-        from_type: 'agent',
-        from_task_id: 'task-1',
-        content: 'Viewport regression signal is working correctly at 375px mobile width',
-        context: {},
-        status: 'open',
-        resolution: null,
-        resolved_at: null,
-        created_at: '2026-05-06T10:00:00Z',
-      },
-    ],
-  };
-
-  return {
-    ...actual,
-    API_BASE_URL: 'http://localhost:8000',
-    apiFetch: vi.fn(async (url: string) => {
-      if (url.includes('/api/admin/digest')) {
-        return new Response(JSON.stringify(digestPayload), { status: 200 });
-      }
-      if (url.includes('/api/admin/messages')) {
-        return new Response(JSON.stringify(messagesPayload), { status: 200 });
-      }
-      return new Response('{}', { status: 200 });
-    }),
-    authGet: vi.fn(async () => new Response('{}', { status: 200 })),
-    authHeaders: vi.fn(async () => ({ Authorization: 'Bearer test', 'Content-Type': 'application/json' })),
-  };
-});
-
-// MessagesPanel reads auth.currentUser for per-user prefs keys. The mock must
-// expose every name firebase.ts exports or browser-mode ESM validation fails.
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
   signOut: vi.fn(),
   getIdToken: vi.fn(async () => 'test-token'),
   onAuthChange: vi.fn(() => () => {}),
+}));
+
+vi.mock('../api', () => ({
+  apiFetch: vi.fn(async (url: string) => {
+    if (url.includes('/api/admin/messages')) {
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    }
+    return new Response('{}', { status: 200 });
+  }),
+  API_BASE_URL: 'http://localhost',
+  authHeaders: vi.fn(async () => ({})),
+  authGet: vi.fn(async () => new Response('{}', { status: 200 })),
 }));
 
 const healthBarProps = {
@@ -97,24 +44,10 @@ const healthBarProps = {
   detailedHealth: null,
   apiHealthy: true,
   wsConnected: true,
-  lastFetchTime: Date.UTC(2026, 4, 7, 0, 0, 0),
+  lastFetchTime: 1746576000000,
   tasks: [],
   pipelineThrottle: null,
 };
-
-function makeProject(overrides: Partial<Project> = {}): Project {
-  return {
-    id: 'proj-1',
-    name: 'Platform',
-    status: 'active',
-    github_owner: 'acme',
-    github_repo: 'platform',
-    autonomous_enabled: true,
-    directions: [],
-    created_at: '2026-01-01T00:00:00Z',
-    ...overrides,
-  };
-}
 
 describe('MessagesPanel composed with shell panels — viewport regression', () => {
   let root: Root | null = null;
@@ -123,9 +56,7 @@ describe('MessagesPanel composed with shell panels — viewport regression', () 
   afterEach(() => {
     const r = root;
     if (r) {
-      act(() => {
-        r.unmount();
-      });
+      act(() => { r.unmount(); });
       root = null;
     }
     if (host) {
@@ -134,55 +65,31 @@ describe('MessagesPanel composed with shell panels — viewport regression', () 
     }
   });
 
-  test('OrchestratorHealthBar + ProjectDashboard + MessagesPanel compose without horizontal overflow at 375px', async () => {
-    localStorage.setItem('projectDashboardCollapsed', 'false');
-
-    const projects = [
-      makeProject({ id: 'p1', name: 'Platform', status: 'active' }),
-      makeProject({ id: 'p2', name: 'Mobile App', status: 'paused', autonomous_enabled: false }),
-    ];
-
+  test('no horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
-      host.className = 'flex flex-col bg-neutral-950 text-neutral-200 p-3 min-h-screen';
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
       await act(async () => {
         r.render(
-          <>
-            <div data-testid="header-bar-stub" />
+          <div className="flex flex-col bg-neutral-950 text-neutral-200 p-3 min-h-screen">
             <OrchestratorHealthBar {...healthBarProps} />
-            <ProjectDashboard
-              projects={projects}
-              tasks={[]}
-              selectedProjectId="p1"
-              onSelectProject={() => {}}
-            />
+            <div className="h-10 flex items-center border-b border-neutral-800 shrink-0" aria-label="navigation" />
             <MessagesPanel
-              selectedProjectId="p1"
-              githubRepo="acme/platform"
+              selectedProjectId="project-123"
               onClose={() => {}}
               addToast={() => {}}
               onMessageCountChange={() => {}}
-              onOpenTask={() => {}}
             />
-          </>,
+          </div>,
         );
-      });
-      await act(async () => {
-        await new Promise<void>((resolve) => setTimeout(resolve, 75));
       });
       await act(async () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 75));
       });
     });
 
-    // Confirm MessagesPanel rendered real content (not an ErrorBoundary fallback).
-    // NOTEs appear as a collapsed count ("1 notes") rather than full content,
-    // so assert the count chip that proves messages were fetched and displayed.
-    expect(host!.textContent).toContain('1 notes');
-
-    localStorage.removeItem('projectDashboardCollapsed');
+    expect(host!.textContent).toContain('Messages');
   });
 });

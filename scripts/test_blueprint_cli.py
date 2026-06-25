@@ -11,7 +11,6 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
-
 import pytest
 
 import blueprint
@@ -147,6 +146,7 @@ HELP_INVOCATIONS = [
     ["compute", "show"],
     ["compute", "kill"],
     ["compute", "analyze"],
+    ["compute", "run"],
 ]
 
 
@@ -468,34 +468,6 @@ def mock_api(monkeypatch):
                      "active_tasks": 0, "rl_hit_count": 1, "disabled_models": {}},
                 ],
             }
-        if "/resource-envelope" in path and method == "PATCH":
-            return {
-                "project_id": "proj-1",
-                "max_concurrent_vms": 8,
-                "max_concurrent_compute_jobs": 3,
-                "spend_ceiling_usd": 200.0,
-                "spend_window_days": 7,
-                "recent_spend_usd": 42.5,
-                "recent_spend_compute_usd": 10.0,
-                "recent_spend_agent_vm_usd": 30.0,
-                "recent_spend_idle_usd": 2.5,
-                "active_vm_count": 2,
-                "is_throttled": False,
-            }
-        if "/resource-envelope" in path:
-            return {
-                "project_id": "proj-1",
-                "max_concurrent_vms": 5,
-                "max_concurrent_compute_jobs": 2,
-                "spend_ceiling_usd": 100.0,
-                "spend_window_days": 7,
-                "recent_spend_usd": 42.1234,
-                "recent_spend_compute_usd": 10.0,
-                "recent_spend_agent_vm_usd": 30.0,
-                "recent_spend_idle_usd": 2.1234,
-                "active_vm_count": 3,
-                "is_throttled": False,
-            }
         if "/messages" in path and "/answer" in path and method == "POST":
             msg_id = path.split("/messages/")[1].split("/answer")[0]
             return {"id": f"answer-{msg_id[:8]}", "parent_message_id": msg_id,
@@ -571,6 +543,23 @@ def mock_api(monkeypatch):
                 {"id": "q-task-111", "task_type": "create", "title": "queued task",
                  "status": "QUEUED", "context": {}},
             ], "total": 1}
+        if "/tasks" in path and "limit=500" in path:
+            # Failure-class filtering raises the internal fetch limit to 500 and
+            # narrows client-side; return a mixed set carrying failure_class.
+            return {
+                "tasks": [
+                    {"id": "fc-code-0000-0000-000000000000",
+                     "task_type": "create", "title": "code error task",
+                     "status": "FAILED", "failure_class": "CODE_ERROR"},
+                    {"id": "fc-timeout-00-0000-000000000000",
+                     "task_type": "fix", "title": "timeout task",
+                     "status": "FAILED", "failure_class": "AGENT_TIMEOUT"},
+                    {"id": "fc-none-0000-0000-000000000000",
+                     "task_type": "create", "title": "running task",
+                     "status": "IN_PROGRESS", "failure_class": None},
+                ],
+                "total": 3,
+            }
         if "/tasks" in path:
             return {"tasks": [{"id": "task-123", "task_type": "create",
                                "status": "IN_PROGRESS", "title": "demo"}],
@@ -675,34 +664,46 @@ def mock_api(monkeypatch):
                 "window_minutes": 15,
                 "generated_at": "2026-06-18T00:00:00",
             }
-        if "/knowledge/" in path and method == "GET":
-            doc_id = path.split("/knowledge/")[1].split("?")[0]
+        if "/knowledge-documents/" in path and method == "GET":
+            doc_id = path.split("/knowledge-documents/")[1].split("?")[0]
             return {
                 "id": doc_id,
                 "title": "Research on test coverage",
                 "source_kind": "web_research",
                 "direction_id": "d-abc12345",
                 "created_at": "2026-06-15T00:00:00Z",
+                "topic": "testing",
+                "tags": ["coverage", "reliability"],
+                "summary": "Key findings on test coverage practices.",
                 "body": "## Findings\n\nTest coverage is important for reliability.",
+                "source_citations": [
+                    {"ref": "RFC-001", "url": "https://example.com/rfc-001", "title": "Test coverage guide"},
+                    "https://example.com/plain-url",
+                ],
             }
-        if "/knowledge" in path and method == "GET":
+        if "/knowledge-documents" in path and method == "GET":
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(path).query)
             docs = [
                 {"id": "kdoc-001", "title": "API Rate Limiting", "source_kind": "web_research",
-                 "direction_id": "d-abc12345", "created_at": "2026-06-15T00:00:00Z"},
+                 "direction_id": "d-abc12345", "created_at": "2026-06-15T00:00:00Z",
+                 "topic": "api", "tags": ["rate-limiting", "resilience"]},
                 {"id": "kdoc-002", "title": "Design Patterns", "source_kind": "design",
-                 "direction_id": "d-def67890", "created_at": "2026-06-14T00:00:00Z"},
+                 "direction_id": "d-def67890", "created_at": "2026-06-14T00:00:00Z",
+                 "topic": "architecture", "tags": []},
             ]
-            direction_f = qs.get("direction_id", [None])[0]
+            direction_f = qs.get("direction", [None])[0]
             source_kind_f = qs.get("source_kind", [None])[0]
             q_f = qs.get("q", [None])[0]
+            tag_f = qs.get("tag", [None])[0]
             if direction_f:
                 docs = [d for d in docs if d.get("direction_id") == direction_f]
             if source_kind_f:
                 docs = [d for d in docs if d.get("source_kind") == source_kind_f]
             if q_f:
                 docs = [d for d in docs if q_f.lower() in (d.get("title") or "").lower()]
+            if tag_f:
+                docs = [d for d in docs if tag_f in (d.get("tags") or [])]
             return {"documents": docs, "total": len(docs)}
         if "/compute-jobs/" in path and "/kill" in path and method == "POST":
             job_id = path.split("/compute-jobs/")[1].split("/")[0]
@@ -710,6 +711,59 @@ def mock_api(monkeypatch):
         if "/compute-jobs/" in path and "/analyze" in path and method == "POST":
             job_id = path.split("/compute-jobs/")[1].split("/")[0]
             return {"outcome": "success", "knowledge_document_id": "kdoc-abc123", "job_id": job_id}
+        if "/compute-jobs/" in path and method == "GET":
+            # Detail endpoint: GET /api/admin/compute-jobs/{id}
+            job_id = path.split("/compute-jobs/")[1].split("/")[0]
+            _ALL_MOCK_JOBS = [
+                {"id": "cjob-aaa0-0000-0000-000000000001",
+                 "status": "RUNNING", "task_title": "GPU benchmark alpha",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": None,
+                 "experiment": "exp-alpha",
+                 "hypothesis": "GPU is faster",
+                 "criterion_verdict": None,
+                 "success_criterion": {"metric": "latency_ms", "operator": "lt", "threshold": 100}},
+                {"id": "cjob-bbb0-0000-0000-000000000002",
+                 "status": "SUCCEEDED", "task_title": "GPU benchmark beta",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 12.5,
+                 "experiment": "exp-beta",
+                 "hypothesis": "Quantization works",
+                 "criterion_verdict": {"met": True, "metric": "latency_ms", "operator": "lt", "threshold": 100, "value": 80.0, "measurable": True},
+                 "polling_metadata": {"result_metrics": {"latency_ms": 80.0, "arms": {"arm_a": {"latency_ms": 75.0}, "arm_b": {"latency_ms": 85.0}}},
+                                      "command_log": {"text": "Starting GPU benchmark...\nRunning test 1\nTest passed", "truncated": False}},
+                 "success_criterion": {"metric": "latency_ms", "operator": "lt", "threshold": 100}},
+                {"id": "cjob-ccc0-0000-0000-000000000003",
+                 "status": "SUCCEEDED", "task_title": "Arm transcript test",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 5.2,
+                 "experiment": "exp-gamma",
+                 "criterion_verdict": {"met": True, "metric": "score", "operator": "gt", "threshold": 0.8, "value": 0.95, "measurable": True},
+                 "polling_metadata": {"result_metrics": {"score": 0.95, "arms": {"baseline": {"score": 0.85, "label": "baseline version", "note": "original implementation", "log": "baseline test output\nall checks passed"}, "optimized": {"score": 0.95, "label": "optimized version", "note": "after refactoring", "log": "optimized test output\nperformance improved"}}},
+                                      "command_log": {"text": "Setup phase complete\nRunning comprehensive benchmark\nResults collected\nAnalysis complete", "truncated": False}},
+                 "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.8}},
+                {"id": "cjob-old0-0000-0000-000000000201",
+                 "status": "SUCCEEDED", "task_title": "Old job beyond 200 cap",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 3.0,
+                 "criterion_verdict": {"met": True, "metric": "score", "operator": "gt", "threshold": 0.5, "value": 0.9, "measurable": True},
+                 "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.5}},
+                {"id": "cjob-ddd0-0000-0000-000000000004",
+                 "status": "SUCCEEDED", "task_title": "List-arms job",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 7.5,
+                 "experiment": "exp-list-arms",
+                 "criterion_verdict": {"met": True, "metric": "score", "operator": "gt", "threshold": 0.7, "value": 0.88, "measurable": True},
+                 "polling_metadata": {"result_metrics": {"score": 0.88, "arms": [
+                     {"label": "variant-a", "note": "first variant", "log": "variant-a run log\nall checks passed", "score": 0.82},
+                     {"label": "variant-b", "note": "second variant", "log": "variant-b run log\nperformance improved", "score": 0.88},
+                 ]}},
+                 "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.7}},
+            ]
+            job = next((j for j in _ALL_MOCK_JOBS if j["id"] == job_id), None)
+            if job is None:
+                raise Exception(f"404 compute job not found: {job_id}")
+            return {"compute_job": job}
         if "/compute-jobs" in path:
             return {
                 "compute_jobs": [
@@ -717,6 +771,8 @@ def mock_api(monkeypatch):
                      "status": "RUNNING", "task_title": "GPU benchmark alpha",
                      "task_type": "compute_experiment",
                      "final_cost_usd": None,
+                     "started_at": "2020-01-01T00:00:00Z",
+                     "accrued_cost_usd": 5.0,
                      "experiment": "exp-alpha",
                      "benchmark": "bench-1",
                      "hypothesis": "GPU is faster",
@@ -729,12 +785,32 @@ def mock_api(monkeypatch):
                      "experiment": "exp-beta",
                      "benchmark": "bench-2",
                      "hypothesis": "Quantization works",
-                     "criterion_verdict": {"met": True, "measured_value": 80.0},
+                     "criterion_verdict": {"met": True, "metric": "latency_ms", "operator": "lt", "threshold": 100, "value": 80.0, "measurable": True},
+                     "polling_metadata": {"result_metrics": {"latency_ms": 80.0, "arms": {"arm_a": {"latency_ms": 75.0}, "arm_b": {"latency_ms": 85.0}}},
+                                          "command_log": {"text": "Starting GPU benchmark...\nRunning test 1\nTest passed", "truncated": False}},
                      "success_criterion": {"metric": "latency_ms", "operator": "lt", "threshold": 100}},
+                    {"id": "cjob-ccc0-0000-0000-000000000003",
+                     "status": "SUCCEEDED", "task_title": "Arm transcript test",
+                     "task_type": "compute_experiment",
+                     "final_cost_usd": 5.2,
+                     "experiment": "exp-gamma",
+                     "criterion_verdict": {"met": True, "metric": "score", "operator": "gt", "threshold": 0.8, "value": 0.95, "measurable": True},
+                     "polling_metadata": {"result_metrics": {"score": 0.95, "arms": {"baseline": {"score": 0.85, "label": "baseline version", "note": "original implementation", "log": "baseline test output\nall checks passed"}, "optimized": {"score": 0.95, "label": "optimized version", "note": "after refactoring", "log": "optimized test output\nperformance improved"}}},
+                                          "command_log": {"text": "Setup phase complete\nRunning comprehensive benchmark\nResults collected\nAnalysis complete", "truncated": False}},
+                     "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.8}},
                 ],
                 "has_more": False,
                 "limit": 20,
                 "offset": 0,
+                "summary": {
+                    "total_jobs": 2,
+                    "active_jobs": 1,
+                    "terminal_jobs": 1,
+                    "total_spend_usd": 12.5,
+                    "criterion_measured": 1,
+                    "criterion_met": 1,
+                    "outcome_breakdown": {"success": 1},
+                },
             }
         if "/directions/" in path and "/unhold" in path:
             return {"status": "unheld", "direction_id": "d-abc12345", "was_held": True}
@@ -924,6 +1000,91 @@ def test_tasks_list_json(mock_api, capsys):
     assert parsed["tasks"][0]["id"] == "task-123"
     # the status filter must have been threaded into the request path
     assert any("status=IN_PROGRESS" in path for _, path, _ in mock_api)
+
+
+def test_tasks_list_blocked_flag(mock_api, capsys):
+    """`tasks list --blocked` threads status=BLOCKED into the request."""
+    rc = blueprint.main(["--json", "tasks", "list", "--blocked"])
+    assert rc == 0
+    assert any("status=BLOCKED" in path for _, path, _ in mock_api)
+
+
+def test_tasks_list_blocked_appends_to_status(mock_api, capsys):
+    """--blocked appends BLOCKED rather than replacing an explicit --status."""
+    rc = blueprint.main(["--json", "tasks", "list", "--status", "QUEUED", "--blocked"])
+    assert rc == 0
+    paths = [path for _, path, _ in mock_api]
+    assert any("status=QUEUED" in p and "status=BLOCKED" in p for p in paths)
+
+
+def test_tasks_list_approval_needed_flag(mock_api, capsys):
+    """`tasks list --approval-needed` threads approval_needed=true."""
+    rc = blueprint.main(["--json", "tasks", "list", "--approval-needed"])
+    assert rc == 0
+    assert any("approval_needed=true" in path for _, path, _ in mock_api)
+
+
+def test_tasks_list_offset(mock_api, capsys):
+    """`tasks list --offset 50` threads offset=50 into the request."""
+    rc = blueprint.main(["--json", "tasks", "list", "--offset", "50"])
+    assert rc == 0
+    assert any("offset=50" in path for _, path, _ in mock_api)
+
+
+def test_tasks_list_offset_zero_omitted(mock_api, capsys):
+    """offset=0 (the default) is not appended to the request path."""
+    rc = blueprint.main(["--json", "tasks", "list"])
+    assert rc == 0
+    assert not any("offset=" in path for _, path, _ in mock_api)
+
+
+def test_tasks_list_filters(mock_api, capsys):
+    """`--failure-class CODE_ERROR` keeps only matching tasks and raises the fetch limit."""
+    rc = blueprint.main(["--json", "tasks", "list", "--failure-class", "CODE_ERROR"])
+    assert rc == 0
+    # internal fetch limit raised to 500 so the client-side filter has rows
+    assert any("limit=500" in path for _, path, _ in mock_api)
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["filtered_client_side"] is True
+    ids = [t["id"] for t in parsed["tasks"]]
+    assert ids == ["fc-code-0000-0000-000000000000"]
+    assert all(t["failure_class"] == "CODE_ERROR" for t in parsed["tasks"])
+
+
+def test_tasks_list_failure_class_repeatable(mock_api, capsys):
+    """Two --failure-class values union-filter the returned list."""
+    rc = blueprint.main(["--json", "tasks", "list",
+                         "--failure-class", "CODE_ERROR",
+                         "--failure-class", "AGENT_TIMEOUT"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    ids = sorted(t["id"] for t in parsed["tasks"])
+    assert ids == ["fc-code-0000-0000-000000000000",
+                   "fc-timeout-00-0000-000000000000"]
+
+
+def test_tasks_list_failure_class_warns_on_impossible_status(mock_api, capsys):
+    """--failure-class with a non-FAILED/CANCELLED status warns on stderr."""
+    rc = blueprint.main(["--json", "tasks", "list", "--status", "IN_PROGRESS",
+                         "--failure-class", "CODE_ERROR"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "IN_PROGRESS" in err
+
+
+def test_tasks_list_failure_class_no_warn_for_failed_status(mock_api, capsys):
+    """No warning when --failure-class is paired with FAILED."""
+    rc = blueprint.main(["--json", "tasks", "list", "--status", "FAILED",
+                         "--failure-class", "CODE_ERROR"])
+    assert rc == 0
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_tasks_list_invalid_failure_class_rejected(mock_api, capsys):
+    """An unknown --failure-class value errors at parse time (SystemExit 2)."""
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "list", "--failure-class", "NOT_A_CLASS"])
+    assert exc.value.code == 2
 
 
 def test_tasks_show_json(mock_api, capsys):
@@ -1678,7 +1839,7 @@ def test_changelog_to_markdown_no_pr():
     tasks = [{"task_type": "other", "title": "Internal cleanup", "pr_number": None}]
     md = blueprint._changelog_to_markdown(tasks)
     assert "- Internal cleanup" in md
-    assert "#" not in md
+    assert "- #" not in md
 
 
 # ── power-user task subcommands ───────────────────────────────────────────────
@@ -2637,7 +2798,7 @@ def test_envelope_show(mock_api, monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "RESOURCE ENVELOPE" in out
-    assert "proj-1" in out
+    assert "proj-test-uuid" in out
     assert "max_concurrent_vms" in out
     assert "spend_ceiling_usd" in out
     assert "is_throttled" in out
@@ -2648,8 +2809,8 @@ def test_envelope_show(mock_api, monkeypatch, capsys):
     rc = blueprint.main(["--json", "envelope", "show"])
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
-    assert parsed["max_concurrent_vms"] == 5
-    assert parsed["spend_ceiling_usd"] == 100.0
+    assert parsed["max_concurrent_vms"] == 4
+    assert parsed["spend_ceiling_usd"] == 50.0
     assert parsed["is_throttled"] is False
 
     # set with read-only config is refused
@@ -2849,12 +3010,22 @@ def test_knowledge_list_applies_filters(mock_api, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "KNOWLEDGE LIBRARY" in out
-    # Both filter params must appear in the request URL
-    assert any("direction_id=d-abc12345" in path for _, path, _ in mock_api)
+    # Both filter params must appear in the request URL using the correct backend param names
+    assert any("/knowledge-documents" in path for _, path, _ in mock_api)
+    assert any("direction=d-abc12345" in path for _, path, _ in mock_api)
     assert any("source_kind=web_research" in path for _, path, _ in mock_api)
     # The matching document is rendered; the design doc (different direction) is not
     assert "API Rate Limiting" in out
     assert "Design Patterns" not in out
+
+
+def test_knowledge_list_prints_full_uuid(mock_api, capsys):
+    """knowledge list prints the full document ID, not a 12-char prefix."""
+    rc = blueprint.main(["knowledge", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "kdoc-001" in out
+    assert "kdoc-002" in out
 
 
 def test_knowledge_show_renders_document_body(mock_api, capsys):
@@ -2877,16 +3048,18 @@ def test_compute_list_json(mock_api, capsys):
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
     jobs = parsed["compute_jobs"]
-    assert len(jobs) == 2
+    assert len(jobs) == 3
     # running job has no cost yet
     running = next(j for j in jobs if j["status"] == "RUNNING")
     assert running["task_title"] == "GPU benchmark alpha"
     assert running["experiment"] == "exp-alpha"
     assert running["final_cost_usd"] is None
-    # succeeded job has cost and a criterion verdict
-    done = next(j for j in jobs if j["status"] == "SUCCEEDED")
-    assert done["final_cost_usd"] == 12.5
-    assert done["criterion_verdict"]["met"] is True
+    # succeeded jobs have cost and a criterion verdict
+    done_jobs = [j for j in jobs if j["status"] == "SUCCEEDED"]
+    assert len(done_jobs) == 2
+    gpu_benchmark = next(j for j in done_jobs if j["task_title"] == "GPU benchmark beta")
+    assert gpu_benchmark["final_cost_usd"] == 12.5
+    assert gpu_benchmark["criterion_verdict"]["met"] is True
     assert any("/compute-jobs" in path for _, path, _ in mock_api)
 
 
@@ -2910,6 +3083,44 @@ def test_compute_list_defaults_to_list(mock_api, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "COMPUTE JOBS" in out
+
+
+def test_compute_list_summary_line(mock_api, capsys):
+    """compute list human output shows aggregate summary line with total, active, spend, and criteria counts."""
+    rc = blueprint.main(["compute", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "2 jobs" in out
+    assert "1 active" in out
+    assert "$12.50 total spend" in out
+    assert "1/1 criteria met" in out
+
+
+def test_compute_list_shows_measured_metric_value(mock_api, capsys):
+    """compute list shows the measured criterion metric and value for each job that has a verdict."""
+    rc = blueprint.main(["compute", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # SUCCEEDED job has criterion_verdict with metric=latency_ms, value=80.0
+    assert "latency_ms=80.0" in out
+
+
+def test_compute_list_status_filter(mock_api, capsys):
+    """compute list --status RUNNING shows only jobs with that status."""
+    rc = blueprint.main(["compute", "list", "--status", "RUNNING"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "GPU benchmark alpha" in out
+    assert "GPU benchmark beta" not in out
+
+
+def test_compute_list_status_filter_case_insensitive(mock_api, capsys):
+    """compute list --status is case-insensitive."""
+    rc = blueprint.main(["compute", "list", "--status", "succeeded"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "GPU benchmark beta" in out
+    assert "GPU benchmark alpha" not in out
 
 
 def test_compute_kill_read_only_refused(mock_api, monkeypatch):
@@ -2950,7 +3161,7 @@ def test_compute_analyze_with_yes_posts_analyze(mock_api, monkeypatch, capsys):
 
 
 def test_compute_show_renders_result_and_tolerates_missing_fields(mock_api, capsys):
-    """compute show <id-prefix> renders metrics, verdict, and knowledge doc; missing fields are omitted."""
+    """compute show <id-prefix> renders metrics, verdict, per-arm results, and verdict margin; missing fields are omitted."""
     # Full-match job id for the SUCCEEDED job in mock_api fixture
     job_id = "cjob-bbb0-0000-0000-000000000002"
     rc = blueprint.main(["compute", "show", job_id])
@@ -2962,10 +3173,19 @@ def test_compute_show_renders_result_and_tolerates_missing_fields(mock_api, caps
     assert "GPU benchmark beta" in out
     # Cost rendered
     assert "12.5" in out
-    # Criterion verdict rendered
+    # Criterion verdict rendered with metric, value, threshold, and margin
     assert "met=True" in out
+    assert "latency_ms lt 100" in out
+    assert "got 80.0" in out
+    assert "margin=" in out
     # Hypothesis rendered
     assert "Quantization works" in out
+    # result_metrics from polling_metadata rendered (scalar)
+    assert "latency_ms" in out
+    # Per-arm breakdown rendered
+    assert "per-arm results" in out
+    assert "arm_a" in out
+    assert "arm_b" in out
     # Test prefix-match: short prefix also resolves
     rc2 = blueprint.main(["compute", "show", "cjob-bbb0"])
     assert rc2 == 0
@@ -2979,9 +3199,129 @@ def test_compute_show_renders_result_and_tolerates_missing_fields(mock_api, caps
     assert "GPU benchmark alpha" in out3
 
 
+def test_compute_show_renders_criterion_and_arms(mock_api, capsys):
+    """compute show renders full criterion verdict (expression, value, margin) and per-arm breakdown."""
+    job_id = "cjob-bbb0-0000-0000-000000000002"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Criterion must show the expression, measured value, and margin
+    assert "latency_ms lt 100" in out
+    assert "got 80.0" in out
+    assert "margin=" in out
+    # Per-arm breakdown must print both arms
+    assert "[arm_a]" in out
+    assert "[arm_b]" in out
+    # Scalar metrics also appear (latency_ms=80.0 in scalars dict)
+    assert "latency_ms" in out
+
+
+def test_compute_show_renders_per_arm_transcript(mock_api, capsys):
+    """compute show renders per-arm log/label/note transcript readably and renders list-shaped arms."""
+    job_id = "cjob-ccc0-0000-0000-000000000003"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Command log must appear
+    assert "Command log" in out
+    assert "Setup phase complete" in out
+    assert "Results collected" in out
+    # Per-arm breakdown must appear with labels
+    assert "baseline" in out
+    assert "optimized" in out
+    assert "baseline version" in out
+    assert "optimized version" in out
+    # Per-arm notes must appear
+    assert "original implementation" in out
+    assert "after refactoring" in out
+    # Per-arm logs must appear (rendered as transcripts)
+    assert "baseline test output" in out
+    assert "optimized test output" in out
+
+
 def test_compute_show_registers_in_help_invocations():
     """'compute show' is in HELP_INVOCATIONS so --help parsing is verified."""
     assert ["compute", "show"] in HELP_INVOCATIONS
+
+
+# ── knowledge subcommand tests ────────────────────────────────────────────────
+
+def test_knowledge_list_includes_topic_and_tags(mock_api, capsys):
+    """knowledge list output includes topic and tags when present on a document."""
+    rc = blueprint.main(["knowledge", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "KNOWLEDGE LIBRARY" in out
+    # kdoc-001 has topic=api and tags=[rate-limiting, resilience]
+    assert "topic=api" in out
+    assert "#rate-limiting" in out
+    assert "#resilience" in out
+    # kdoc-002 has topic=architecture and empty tags
+    assert "topic=architecture" in out
+
+
+def test_knowledge_list_tag_filter_passed_to_api(mock_api, capsys):
+    """knowledge list --tag passes the tag param to the API request path."""
+    rc = blueprint.main(["knowledge", "list", "--tag", "rate-limiting"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Only kdoc-001 has the rate-limiting tag
+    assert "API Rate Limiting" in out
+    assert "Design Patterns" not in out
+    # The tag filter must appear in the API call path
+    assert any("tag=rate-limiting" in path for _, path, _ in mock_api)
+
+
+def test_knowledge_show_includes_metadata(mock_api, capsys):
+    """knowledge show renders summary, topic, tags, and source_citations."""
+    rc = blueprint.main(["knowledge", "show", "kdoc-001"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "KNOWLEDGE:" in out
+    assert "Topic:" in out
+    assert "testing" in out
+    assert "Tags:" in out
+    assert "#coverage" in out
+    assert "#reliability" in out
+    assert "Summary:" in out
+    assert "Key findings on test coverage" in out
+    assert "Citations:" in out
+    assert "RFC-001" in out
+    assert "https://example.com/plain-url" in out
+
+
+def test_knowledge_show_resolves_id_prefix(mock_api, capsys):
+    """knowledge show resolves an 8-char prefix from the list to the full document."""
+    # "kdoc-001" is 8 chars, well under the 36-char UUID threshold
+    rc = blueprint.main(["knowledge", "show", "kdoc-001"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The detail endpoint was reached and body is rendered
+    assert "KNOWLEDGE:" in out
+    assert "Research on test coverage" in out
+    assert "## Findings" in out
+    # The list endpoint must have been called to resolve the prefix
+    list_calls = [p for _, p, _ in mock_api if "/knowledge-documents" in p and "limit=200" in p]
+    assert list_calls, "Expected a list call with limit=200 for prefix resolution"
+    # The detail endpoint must have been called with the resolved full id
+    detail_calls = [p for _, p, _ in mock_api if "/knowledge-documents/kdoc-001" in p]
+    assert detail_calls, "Expected a detail GET call for /knowledge-documents/kdoc-001"
+
+
+def test_knowledge_show_prefix_no_match_prints_error(monkeypatch, capsys):
+    """knowledge show with an unmatched prefix prints a clear error and returns 0."""
+    def fake_api(method, path, body=None, timeout=30):
+        if "/knowledge-documents" in path and method == "GET":
+            return {"documents": [], "total": 0}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["knowledge", "show", "no-match"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "no-match" in err
 
 
 def test_compute_kill_aborts_without_yes(mock_api, monkeypatch, capsys):
@@ -2994,3 +3334,385 @@ def test_compute_kill_aborts_without_yes(mock_api, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Aborted" in out
     assert not any(m == "POST" and "/kill" in p for m, p, _ in mock_api)
+
+
+def test_compute_show_live_cost_telemetry(monkeypatch, capsys):
+    """compute show renders burn rate, projected spend, and cap-hit warning for active jobs with cost data."""
+    active_job = {
+        "id": "cjob-live-0000-0000-000000000099",
+        "status": "RUNNING",
+        "task_title": "live GPU experiment",
+        "task_type": "compute_experiment",
+        # started far in the past so elapsed >> 60s in any test run
+        "started_at": "2020-01-01T00:00:00Z",
+        "accrued_cost_usd": 5.0,
+        # cap below accrued so projected spend will always exceed it
+        "spend_cap_usd": 3.0,
+        "wall_clock_deadline": "2099-01-01T00:00:00Z",
+        "final_cost_usd": None,
+        "experiment": "exp-live",
+        "hypothesis": None,
+        "criterion_verdict": None,
+    }
+
+    def fake_api(method, path, body=None, timeout=30):
+        if method == "GET" and f"/compute-jobs/{active_job['id']}" in path:
+            return {"compute_job": active_job}
+        return {"compute_jobs": [active_job], "has_more": False}
+
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+
+    rc = blueprint.main(["compute", "show", "cjob-live"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "RUNNING" in out
+    # accrued cost shown for active job
+    assert "accrued" in out
+    assert "5.0000" in out
+    # burn rate shown ($/hr)
+    assert "burn rate" in out
+    assert "/hr" in out
+    # projected spend shown
+    assert "projected" in out
+    # cap-hit warning shown because projected > spend_cap
+    assert "cap" in out
+    # spend cap displayed
+    assert "spend cap" in out
+    assert "$3.00" in out
+    # deadline displayed
+    assert "deadline" in out
+    assert "2099" in out
+
+
+def test_compute_show_resolves_job_beyond_200_cap(mock_api, capsys):
+    """compute show resolves a job whose id is not in the list-endpoint results (beyond the 200 cap)."""
+    # This job id is served by the detail endpoint mock but NOT in the list response
+    job_id = "cjob-old0-0000-0000-000000000201"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert job_id in out
+    assert "SUCCEEDED" in out
+    assert "Old job beyond 200 cap" in out
+    # Verify the detail endpoint was called (not just the list)
+    detail_calls = [p for m, p, _ in mock_api if m == "GET" and f"/compute-jobs/{job_id}" in p]
+    assert detail_calls, "Expected GET /api/admin/compute-jobs/{id} to be called"
+
+
+def test_compute_list_burn_rate_column(mock_api, capsys):
+    """compute list shows a burn-rate column for an active job with accrued cost and sufficient elapsed time."""
+    rc = blueprint.main(["compute", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The RUNNING job has started_at=2020-01-01 and accrued_cost_usd=5.0, so burn rate is non-None
+    assert "burn=$" in out
+    assert "/hr" in out
+
+
+def test_compute_list_status_filter_footer_reconciled(mock_api, capsys):
+    """compute list --status footer counts reflect only the filtered rows, not the server summary."""
+    rc = blueprint.main(["compute", "list", "--status", "RUNNING"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Only the RUNNING job is shown
+    assert "GPU benchmark alpha" in out
+    assert "GPU benchmark beta" not in out
+    # Footer reflects the 1 filtered job (RUNNING, no cost, no verdict)
+    assert "1 jobs" in out
+    assert "1 active" in out
+    assert "$0.00 total spend" in out
+    assert "0/0 criteria met" in out
+    # Misleading 'more jobs available' hint suppressed for filtered view
+    assert "more jobs available" not in out
+
+
+def test_compute_show_list_shaped_arms(mock_api, capsys):
+    """compute show renders list-shaped per-arm result_metrics with label, note, and log fields."""
+    job_id = "cjob-ddd0-0000-0000-000000000004"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "per-arm results" in out
+    # Both entries should appear under their labels
+    assert "[variant-a]" in out
+    assert "[variant-b]" in out
+    # label/note/log fields rendered for each entry
+    assert "label: variant-a" in out
+    assert "label: variant-b" in out
+    assert "first variant" in out
+    assert "second variant" in out
+    assert "variant-a run log" in out
+    assert "variant-b run log" in out
+
+
+def test_compute_run_local(capsys):
+    """compute run executes a trivial command locally and reports its emitted metric."""
+    # Write {"accuracy": 0.95} to the result file that the wrapper provides via $BLUEPRINT_RESULT_FILE
+    command = 'python3 -c "import json, os; open(os.environ[\'BLUEPRINT_RESULT_FILE\'], \'w\').write(json.dumps({\'accuracy\': 0.95}))"'
+    rc = blueprint.main(["compute", "run", command])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "SUCCEEDED" in out
+    assert "accuracy" in out
+    assert "0.95" in out
+    # No API call required — runs entirely locally
+    assert "metrics" in out
+
+
+def test_compute_run_local_reads_spec_and_executes(tmp_path, monkeypatch):
+    """compute run --local <spec.json> reads spec, runs command, reports metrics."""
+    import subprocess as _subprocess
+
+    spec = {"command": "echo hi", "declared_metric": "loss"}
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf:
+            with open(rf, "w") as f:
+                json.dump({"loss": 0.5}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    captured = io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured)
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = captured.getvalue()
+    assert "SUCCEEDED" in out
+    assert "loss" in out
+    assert "0.5" in out
+
+
+def test_compute_run_no_args_exits(capsys):
+    """compute run with no positional and no --local should exit with error."""
+    with pytest.raises(SystemExit) as exc_info:
+        blueprint.main(["compute", "run"])
+    assert exc_info.value.code != 0
+    out = capsys.readouterr().out
+    assert "error" in out
+
+
+def test_compute_run_local_missing_spec_file_exits(tmp_path, capsys):
+    """compute run --local with a non-existent spec file exits with error."""
+    missing = str(tmp_path / "nonexistent.json")
+    with pytest.raises(SystemExit) as exc_info:
+        blueprint.main(["compute", "run", "--local", missing])
+    assert exc_info.value.code != 0
+    out = capsys.readouterr().out
+    assert "error" in out and "could not read spec file" in out
+
+
+def test_compute_run_local_missing_command_field_exits(tmp_path, capsys):
+    """compute run --local with a spec file missing 'command' exits with error."""
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps({"declared_metric": "loss"}))
+    with pytest.raises(SystemExit) as exc_info:
+        blueprint.main(["compute", "run", "--local", str(spec_file)])
+    assert exc_info.value.code != 0
+    out = capsys.readouterr().out
+    assert "error" in out and "command" in out
+
+
+def test_compute_run_local_not_captured_metric(tmp_path, monkeypatch, capsys):
+    """compute run --local prints NOT CAPTURED when declared_metric is absent from emitted metrics."""
+    import subprocess as _subprocess
+
+    spec = {"command": "echo hi", "declared_metric": "auc"}
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf:
+            with open(rf, "w") as f:
+                json.dump({"loss": 0.5}, f)  # 'auc' not present
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "NOT CAPTURED" in out
+
+
+# ---------------------------------------------------------------------------
+# Success-criterion verdict tests (case-insensitive capture->eval loop)
+# ---------------------------------------------------------------------------
+
+def _make_fake_run(metrics: dict | None, returncode: int = 0):
+    """Return a fake subprocess.run that writes metrics to BLUEPRINT_RESULT_FILE."""
+    def fake_run(cmd, env=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf and metrics is not None:
+            with open(rf, "w") as f:
+                json.dump(metrics, f)
+
+        class R:
+            pass
+        R.returncode = returncode
+        return R()
+    return fake_run
+
+
+def test_compute_run_local_criterion_verdict_case_mismatch(tmp_path, monkeypatch, capsys):
+    """Case-insensitive capture->eval loop: emits Accuracy=0.95, criterion accuracy >= 0.9 => MET."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    # Command emits upper-camel-case key; criterion uses lowercase — must match case-insensitively
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"Accuracy": 0.95}))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "MET" in out
+    assert "NOT MET" not in out
+    assert "NOT EVALUABLE" not in out
+    assert "0.95" in out
+
+
+def test_compute_run_local_criterion_not_met(tmp_path, monkeypatch, capsys):
+    """Criterion NOT MET: emits loss=0.8, criterion loss <= 0.5 => NOT MET."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "success_criterion": {"metric": "loss", "operator": "<=", "threshold": 0.5},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"loss": 0.8}))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "NOT MET" in out
+    assert "0.8" in out
+
+
+def test_compute_run_local_criterion_not_evaluable_missing_metric(tmp_path, monkeypatch, capsys):
+    """NOT EVALUABLE (fail-closed): criterion metric absent from emitted result."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    # Result file contains a different metric — 'accuracy' not present
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"loss": 0.1}))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "NOT EVALUABLE" in out
+
+
+def test_compute_run_local_criterion_not_evaluable_no_result_file(tmp_path, monkeypatch, capsys):
+    """NOT EVALUABLE (fail-closed): no result file written at all."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    # fake_run writes nothing to BLUEPRINT_RESULT_FILE
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run(None))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "NOT EVALUABLE" in out
+
+
+def test_compute_run_local_criterion_via_cli_flags(tmp_path, monkeypatch, capsys):
+    """Criterion supplied via --criterion-metric/--criterion-op/--criterion-threshold."""
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"f1": 0.88}))
+
+    args = blueprint.build_parser().parse_args([
+        "compute", "run", "echo hi",
+        "--criterion-metric", "f1",
+        "--criterion-op", ">=",
+        "--criterion-threshold", "0.8",
+    ])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "MET" in out
+    assert "0.88" in out
+
+
+def test_compute_run_local_no_criterion_unchanged(tmp_path, monkeypatch, capsys):
+    """Back-compat: spec with only command/declared_metric and no success_criterion emits no verdict."""
+    import subprocess as _subprocess
+
+    spec = {"command": "echo hi", "declared_metric": "loss"}
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"loss": 0.3}))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "verdict" not in out.lower() or "NOT EVALUABLE" not in out
+    assert "MET" not in out
+    assert "SUCCEEDED" in out
+
+
+def test_compute_run_local_criterion_verdict_auc_case_mismatch(tmp_path, monkeypatch, capsys):
+    """Case-insensitive capture->eval loop: emits AUC=0.9, criterion auc >= 0.8 => MET."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "success_criterion": {"metric": "auc", "operator": ">=", "threshold": 0.8},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    # Command emits uppercase key; criterion uses lowercase — must match case-insensitively
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"AUC": 0.9}))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "MET" in out
+    assert "NOT MET" not in out
+    assert "0.9" in out

@@ -203,6 +203,23 @@ async def test_reopened_retired_finding_is_requeued(db_session):
 # --------------------------------------------------------------------------- #
 
 
+async def test_sweep_default_mode_is_observe(db_session):
+    """When no runtime_config key is set, DEFAULT_AUDIT_MODE ('observe') is used.
+    The sweep must run (return non-None), record observations, and enroll nothing."""
+    project = await _make_project(db_session)
+    await _make_task(db_session, project, blob_bytes=5000)
+    # setup_function already popped the key — no explicit mode set.
+    runtime_config["structural_health_audit_fat_row_bytes"] = 1000
+
+    result = await run_structural_health_audit(db_session)
+    assert result is not None, "observe mode must run the sweep (not return None)"
+    assert result["fat_row"]["enrolled"] == 0, "observe mode must not enroll findings"
+    assert await _enrolled_fat_row_items(db_session, project.id) == []
+    snap = sha.get_structural_health_observability()
+    assert snap["cycles"] >= 1
+    assert snap["last_decision"]["offenders"] >= 1
+
+
 async def test_sweep_mode_off_is_inert(db_session):
     project = await _make_project(db_session)
     await _make_task(db_session, project, blob_bytes=5000)
@@ -239,6 +256,36 @@ async def test_sweep_cadence_gate_skips_within_interval(db_session):
     # A second immediate call is gated out by the cadence timestamp.
     second = await run_structural_health_audit(db_session)
     assert second is None
+
+
+# --------------------------------------------------------------------------- #
+# Default mode configuration.
+# --------------------------------------------------------------------------- #
+
+
+async def test_default_mode_is_observe(db_session):
+    """When STRUCTURAL_HEALTH_AUDIT_MODE env var is unset, the default mode is
+    'observe' and the observe-mode code path runs without errors and enrolls nothing."""
+    project = await _make_project(db_session)
+    await _make_task(db_session, project, blob_bytes=5000)
+
+    # setup_function pops the mode from runtime_config, so we don't explicitly set it.
+    # This test verifies that run_structural_health_audit defaults to 'observe' mode.
+    # We set the threshold to detect the fat row we created above.
+    runtime_config["structural_health_audit_fat_row_bytes"] = 1000
+    result = await run_structural_health_audit(db_session)
+
+    # With default observe mode, the audit runs and records the decision...
+    assert result is not None
+    assert result["fat_row"]["offenders"] >= 1
+    # ...but enrolls nothing.
+    assert result["fat_row"]["enrolled"] == 0
+    assert await _enrolled_fat_row_items(db_session, project.id) == []
+    # Observability recorded the measurement + decision.
+    snap = sha.get_structural_health_observability()
+    assert snap["cycles"] >= 1
+    assert snap["last_decision"]["offenders"] >= 1
+    assert snap["last_decision"]["enrolled"] == 0
 
 
 # --------------------------------------------------------------------------- #

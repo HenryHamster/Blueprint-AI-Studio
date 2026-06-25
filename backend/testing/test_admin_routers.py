@@ -3368,6 +3368,68 @@ class TestComputeJobsPanel:
         data = resp.json()["compute_jobs"][0]
         assert data.get("vm_phase") == "runtime"
 
+    @pytest.mark.asyncio
+    async def test_compute_jobs_summary_across_window_boundary(
+        self, client: AsyncClient, db_session
+    ):
+        """Summary block counts/spend/criterion are correct for mixed active+terminal
+        jobs, and jobs outside the time window are excluded from totals."""
+        from datetime import timezone
+        from app.models import ComputeJobStatus, ComputeJobOutcome
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        # Active job — always included regardless of time window
+        active_job = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.RUNNING,
+        )
+        # Terminal job inside the default 360-minute window
+        terminal_in = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.SUCCEEDED,
+            outcome=ComputeJobOutcome.SUCCESS,
+            final_cost_usd=2.50,
+            completed_at=now - timedelta(minutes=60),
+        )
+        # Terminal job outside the window (>360 min ago) — must be excluded
+        terminal_out = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.FAILED,
+            outcome=ComputeJobOutcome.FAILURE,
+            final_cost_usd=1.00,
+            completed_at=now - timedelta(minutes=500),
+        )
+        for obj in (active_job, terminal_in, terminal_out):
+            db_session.add(obj)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "summary" in body, "response must include a 'summary' block"
+        s = body["summary"]
+
+        assert s["total_jobs"] == 2, f"expected 2 in-window jobs, got {s['total_jobs']}"
+        assert s["active_jobs"] == 1, f"expected 1 active job, got {s['active_jobs']}"
+        assert s["terminal_jobs"] == 1, f"expected 1 terminal job, got {s['terminal_jobs']}"
+        assert abs(s["total_spend_usd"] - 2.50) < 0.01, (
+            f"expected spend $2.50, got {s['total_spend_usd']}"
+        )
+        assert s["outcome_breakdown"].get("SUCCEEDED") == 1, (
+            f"outcome_breakdown must show SUCCEEDED=1; got {s['outcome_breakdown']}"
+        )
+        assert "FAILED" not in s["outcome_breakdown"], (
+            "out-of-window FAILED job must not appear in outcome_breakdown"
+        )
+        # criterion_measured/met: no tasks with criteria in this fixture → both 0
+        assert s["criterion_measured"] == 0
+        assert s["criterion_met"] == 0
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_notifications.py — Alerts, Messages, Playbook
@@ -6688,6 +6750,54 @@ class TestEvergreenFillSettingsPersist:
         # Junk value is ignored — original default survives
         assert _shared_state.runtime_config["evergreen_fill_mode"] == "off"
 
+    @pytest.mark.asyncio
+    async def test_structural_health_audit_mode_persists_across_sync(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH structural_health_audit_mode=enforce writes to runtime_config_json;
+        sync_runtime_config_from_state restores it on a fresh in-memory config."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "structural_health_audit_mode": "enforce",
+                "structural_health_audit_interval_minutes": 120,
+                "structural_health_audit_fat_row_bytes": 2097152,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        # GET /settings returns the updated values
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["structural_health_audit_mode"] == "enforce"
+        assert body["structural_health_audit_interval_minutes"] == 120
+        assert body["structural_health_audit_fat_row_bytes"] == 2097152
+
+        # Values are persisted to DeploymentState.runtime_config_json
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        assert row.runtime_config_json["structural_health_audit_mode"] == "enforce"
+        assert row.runtime_config_json["structural_health_audit_interval_minutes"] == 120
+        assert row.runtime_config_json["structural_health_audit_fat_row_bytes"] == 2097152
+
+        # Config-sync restore applies persisted values to a fresh in-memory config
+        _shared_state.runtime_config["structural_health_audit_mode"] = "off"
+        _shared_state.runtime_config["structural_health_audit_interval_minutes"] = 60
+        _shared_state.runtime_config["structural_health_audit_fat_row_bytes"] = 1048576
+
+        await sync_runtime_config_from_state(row)
+
+        assert _shared_state.runtime_config["structural_health_audit_mode"] == "enforce"
+        assert _shared_state.runtime_config["structural_health_audit_interval_minutes"] == 120
+        assert _shared_state.runtime_config["structural_health_audit_fat_row_bytes"] == 2097152
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # dispatch_external_notification — webhook dispatch logic
@@ -7768,6 +7878,100 @@ class TestEditRunningUpdate:
         assert resp.status_code == 404
 
 
+class TestDismissPendingConfirmation:
+    """POST /pending-confirm/{id}/dismiss removes a pending_user_confirmation
+    item from problem_model and bumps the revision."""
+
+    @pytest.mark.asyncio
+    async def test_dismiss_removes_item_and_bumps_revision(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 3,
+            "last_updated": "2026-01-01T00:00:00",
+            "last_updated_by": "agent",
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [
+                {
+                    "id": "p-abc12345",
+                    "type": "major_decision",
+                    "proposal": "Should we migrate to Postgres 16?",
+                    "rationale": "Performance improvements.",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+                {
+                    "id": "p-def67890",
+                    "type": "credentials_needed",
+                    "proposal": "Need AWS credentials.",
+                    "created_at": "2026-01-02T00:00:00",
+                },
+            ],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-abc12345/dismiss"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "dismissed"
+        assert data["pending_id"] == "p-abc12345"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert len(pm["pending_user_confirmation"]) == 1
+        assert pm["pending_user_confirmation"][0]["id"] == "p-def67890"
+        assert pm["revision"] == 4
+        assert pm["last_updated_by"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_dismiss_unknown_id_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 1,
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-notexist/dismiss"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_dismiss_requires_project_access(
+        self, client: AsyncClient, db_session
+    ):
+        other = Project(name="Other", user_id="other-user")
+        db_session.add(other)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/pending-confirm/p-abc12345/dismiss"
+        )
+        assert resp.status_code == 404
+
+
 class TestBuildDeployStatePayload:
     """Regression: WS broadcasts use websocket.send_json which lacks FastAPI's
     JSON encoder, so any datetime in the payload raised
@@ -8633,6 +8837,101 @@ class TestSetVersionGoal:
         # Verify state is persisted (evidence that the locked row was mutated).
         await db_session.refresh(version)
         assert version.goal == "locked goal"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_release_version.py — Set Version Theme
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestSetVersionTheme:
+    @pytest.mark.asyncio
+    async def test_operator_can_set_version_theme(
+        self, client: AsyncClient, db_session
+    ):
+        """Member can override the version theme; the new theme is persisted."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-theme",
+            json={"theme": "reliability"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["theme"] == "reliability"
+        assert data["version_number"] == version.version_number
+
+        await db_session.refresh(version)
+        assert version.theme == "reliability"
+        assert version.theme_editor_info == f"[operator:{TEST_USER_EMAIL}]"
+
+    @pytest.mark.asyncio
+    async def test_set_theme_invalid_value_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """An unrecognised theme value is rejected with 422."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-theme",
+            json={"theme": "bogus_theme"},
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_set_theme_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when no open release version exists."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-theme",
+            json={"theme": "feature"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_set_theme_idempotent_same_value(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-posting the identical theme is a no-op that returns 200."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        for _ in range(2):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/version-theme",
+                json={"theme": "leanness"},
+            )
+            assert resp.status_code == 200
+
+        await db_session.refresh(version)
+        assert version.theme == "leanness"
+
+    @pytest.mark.asyncio
+    async def test_set_theme_clear_with_null(
+        self, client: AsyncClient, db_session
+    ):
+        """Posting null theme clears it back to None."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        await client.post(
+            f"/api/admin/projects/{project.id}/version-theme",
+            json={"theme": "performance"},
+        )
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-theme",
+            json={"theme": None},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["theme"] is None
+
+        await db_session.refresh(version)
+        assert version.theme is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -17114,7 +17413,7 @@ class TestStrategistSpawnableRegistry:
     def test_allowlist_equals_expected_knowledge_types(self):
         from app.task_capabilities import STRATEGIST_SPAWNABLE_TASK_TYPES
 
-        expected = frozenset({"research", "plan", "web_research", "design"})
+        expected = frozenset({"research", "plan", "web_research", "design", "compute_experiment"})
         assert expected == STRATEGIST_SPAWNABLE_TASK_TYPES
 
     def test_allowlist_is_derived_from_capability_flag(self):
@@ -17146,6 +17445,105 @@ class TestStrategistSpawnableRegistry:
         assert STRATEGIST_SPAWNABLE_TASK_TYPES.isdisjoint(WRITE_TASK_TYPES)
         for impl in ("create", "fix", "refactor", "migrate", "qa"):
             assert impl not in STRATEGIST_SPAWNABLE_TASK_TYPES
+
+    @pytest.mark.asyncio
+    async def test_strategist_spawn_compute_experiment_persists_launch_contract(
+        self, client: AsyncClient, db_session
+    ):
+        """Strategic spawn_task for compute_experiment persists launch contract fields
+        in the task payload, applies the spend-gate, and does not require a prompt
+        (hypothesis is the description).
+
+        This exercises the spawn_task handler's compute_experiment branch:
+        _author_compute_launch_contract + _validate_compute_launch_contract +
+        resolve_compute_spend_approval, verifying the contract lands in the DB.
+        """
+        import app.shared_state as _shared_state
+        from app.auth import create_agent_token
+
+        project = Project(name="StrategistContractPersist", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for compute spawn",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-strat-contract-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-strat-contract-test",
+            task_type="strategic_review",
+        )
+
+        prev_threshold = _shared_state.runtime_config.get(
+            "compute_experiment_spend_threshold_usd"
+        )
+        _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/agent/strategic",
+                headers={"x-agent-token": token},
+                json={
+                    "task_id": str(strategic_task.id),
+                    "op": "spawn_task",
+                    "data": {
+                        "type": "compute_experiment",
+                        "title": "Benchmark: throughput under load",
+                        # No prompt — compute_experiment uses hypothesis instead
+                        "hypothesis": "Batching requests reduces p99 latency by 30%",
+                        "command": "python3 bench/run.py --batch 32",
+                        "spend_cap_usd": 8.0,
+                        "deadline_seconds": 900,
+                        "success_criterion": {
+                            "metric": "p99_latency_ms",
+                            "operator": "<",
+                            "threshold": 200,
+                        },
+                    },
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["op"] == "spawn_task"
+            assert body["type"] == "compute_experiment"
+
+            child_id = uuid.UUID(body["task_id"])
+            child = await db_session.get(Task, child_id)
+            assert child is not None
+
+            # Launch contract fields must be persisted in the task payload
+            payload = child.first_payload
+            assert payload["type"] == "compute_experiment"
+            assert payload["command"] == "python3 bench/run.py --batch 32"
+            assert payload["spend_cap_usd"] == 8.0
+            assert payload["deadline_seconds"] == 900
+            assert payload["success_criterion"]["metric"] == "p99_latency_ms"
+            assert payload["success_criterion"]["operator"] == "<"
+            assert payload["success_criterion"]["threshold"] == 200
+
+            # Spend gate: 8.0 > threshold 5.0 → requires_approval=True
+            assert child.requires_approval is True
+
+            # Spawned with strategic_direct context
+            assert child.context["spawned_by"] == "strategic_direct"
+            assert child.context["parent_strategic_task_id"] == str(strategic_task.id)
+        finally:
+            if prev_threshold is not None:
+                _shared_state.runtime_config[
+                    "compute_experiment_spend_threshold_usd"
+                ] = prev_threshold
+            else:
+                _shared_state.runtime_config.pop(
+                    "compute_experiment_spend_threshold_usd", None
+                )
 
 
 @pytest.mark.asyncio
@@ -19651,6 +20049,58 @@ class TestPostCommitPendingField:
         resp = await client.get(f"/api/admin/tasks/{task.id}")
         assert resp.status_code == 200, resp.text
         assert resp.json()["post_commit_pending"] is False
+
+
+class TestApprovalNeededFilter:
+    """GET /api/admin/tasks supports the approval_needed triage filter."""
+
+    @pytest.mark.asyncio
+    async def test_admin_tasks_approval_needed_filter(
+        self, client: AsyncClient, db_session
+    ):
+        """approval_needed narrows the list in both directions; omitting it
+        returns both tasks (backward-compatible default)."""
+        project = await _make_project(db_session)
+        needs_approval = Task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+            requires_approval=True,
+        )
+        no_approval = Task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+            requires_approval=False,
+        )
+        db_session.add_all([needs_approval, no_approval])
+        await db_session.commit()
+        await db_session.refresh(needs_approval)
+        await db_session.refresh(no_approval)
+
+        needs_id = str(needs_approval.id)
+        no_id = str(no_approval.id)
+
+        # Default (param omitted) — both tasks are returned unchanged.
+        resp = await client.get("/api/admin/tasks")
+        assert resp.status_code == 200, resp.text
+        all_ids = {t["id"] for t in resp.json()["tasks"]}
+        assert needs_id in all_ids
+        assert no_id in all_ids
+
+        # approval_needed=true — only the requires_approval task.
+        resp = await client.get("/api/admin/tasks?approval_needed=true")
+        assert resp.status_code == 200, resp.text
+        true_ids = {t["id"] for t in resp.json()["tasks"]}
+        assert needs_id in true_ids
+        assert no_id not in true_ids
+
+        # approval_needed=false — only the non-approval task.
+        resp = await client.get("/api/admin/tasks?approval_needed=false")
+        assert resp.status_code == 200, resp.text
+        false_ids = {t["id"] for t in resp.json()["tasks"]}
+        assert no_id in false_ids
+        assert needs_id not in false_ids
 
 
 class TestPoolAccountMutationsRequireAdmin:

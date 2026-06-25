@@ -808,6 +808,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             requires_approval=child.requires_approval,
+            spend_approval_cleared_at=child.spend_approval_cleared_at,
         )
         session.add(new_child)
         await session.flush()  # Assigns new_child.id

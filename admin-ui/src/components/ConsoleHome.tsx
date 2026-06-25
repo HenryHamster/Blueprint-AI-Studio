@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { AlertTriangle, BarChart2, Clock, ExternalLink, Layers } from 'lucide-react';
 import { useDashboardDigest } from '../hooks/useDashboardDigest';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
-import { fetchFleetUtilization } from '../api';
+import { fetchFleetUtilization, fetchTask } from '../api';
 import { MetricCard, SuccessRateCard, CostCard, Skeleton } from './DashboardMetricCards';
 import { FleetCapacityCard, type FleetUtilizationResponse } from './FleetCapacityCard';
 import { SystemStatusCard } from './SystemStatusCard';
@@ -52,6 +52,19 @@ function NeedsAttentionSection({
               {item.error_snippet && (
                 <p className="text-ui-sm text-neutral-500 mt-0.5 truncate font-mono">{item.error_snippet}</p>
               )}
+              {(item.spend_cap_usd != null || item.deadline_seconds != null) && (
+                <p className="text-ui-sm text-neutral-400 mt-0.5">
+                  {item.spend_cap_usd != null && <span>Cap: ${item.spend_cap_usd.toFixed(2)}</span>}
+                  {item.spend_cap_usd != null && item.deadline_seconds != null && <span className="mx-1">·</span>}
+                  {item.deadline_seconds != null && (
+                    <span>
+                      Deadline: {item.deadline_seconds < 3600
+                        ? `${Math.round(item.deadline_seconds / 60)}m`
+                        : `${Math.round(item.deadline_seconds / 3600)}h`}
+                    </span>
+                  )}
+                </p>
+              )}
             </div>
             {item.waiting_hours != null && item.waiting_hours > 0 && (
               <span className="shrink-0 flex items-center gap-1 text-ui-sm text-neutral-500">
@@ -99,9 +112,21 @@ export function ConsoleHome({
   const totalCost = digest?.spot_cost_usd;
   const trendHistory = digest?.trend_history ?? [];
 
+  const [fetchError, setFetchError] = useState<string | null>(null);
+
   const handleViewTaskById = (taskId: string) => {
     const task = tasks.find(t => t.id === taskId);
-    if (task) onViewTask(task);
+    if (task) {
+      setFetchError(null);
+      onViewTask(task);
+      return;
+    }
+    fetchTask(taskId).then(t => {
+      setFetchError(null);
+      onViewTask(t);
+    }).catch(() => {
+      setFetchError(`Could not load task ${taskId}.`);
+    });
   };
 
   return (
@@ -126,6 +151,11 @@ export function ConsoleHome({
 
       {/* System status */}
       <SystemStatusCard digest={digest} loading={loading} />
+
+      {/* Task fetch error */}
+      {fetchError && (
+        <p className="text-xs text-red-400 px-1">{fetchError}</p>
+      )}
 
       {/* Needs attention */}
       <NeedsAttentionSection

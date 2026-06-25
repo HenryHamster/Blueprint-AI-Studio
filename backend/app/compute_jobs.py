@@ -59,6 +59,8 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.compute_experiment_contract import resolve_compute_spend_approval
+from app.runtime_config_state import runtime_config as _global_runtime_config
 from app.schemas import redact_command_log_text
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
@@ -194,6 +196,60 @@ def normalize_provisioning_model(raw_value: str | None) -> str:
     return value
 
 
+async def _assert_compute_spend_not_gated(
+    session,
+    task: Task,
+    spend_cap_usd: float,
+) -> None:
+    """Terminal chokepoint: reject compute_experiment job creation when spend
+    approval is required but has not been operator-cleared.
+
+    Fires regardless of which spawn site created the Task, so a spawn site
+    that forgets to call resolve_compute_spend_approval() cannot silently
+    bypass the gate.
+    """
+    task_type = str((task.first_payload or {}).get("type") or "")
+    if task_type != "compute_experiment":
+        return
+    project = await session.get(Project, task.project_id)
+    # Start from the global runtime_config (same source as the four spawn sites),
+    # then layer any per-project overrides on top so project-level config wins.
+    runtime_config: dict = dict(_global_runtime_config)
+    direction: dict | None = None
+    if project is not None:
+        project_overrides = dict(getattr(project, "runtime_config_json", None) or {})
+        runtime_config.update(project_overrides)
+        direction_id = str((task.context or {}).get("direction_id") or "")
+        if direction_id:
+            direction = next(
+                (
+                    d
+                    for d in (getattr(project, "directions", None) or [])
+                    if d.get("id") == direction_id
+                ),
+                None,
+            )
+    requires_approval, threshold = resolve_compute_spend_approval(
+        runtime_config=runtime_config,
+        direction=direction,
+        spend_cap_usd=spend_cap_usd,
+    )
+    if not requires_approval:
+        return
+    if task.spend_approval_cleared_at is not None:
+        return
+    raise ComputeLaunchPreconditionFailed({
+        "error": "spend_cap_requires_approval",
+        "message": (
+            f"compute_experiment spend_cap_usd={spend_cap_usd:.2f} exceeds "
+            f"project threshold of {threshold:.2f} USD — "
+            "operator approval is required before this job can launch"
+        ),
+        "spend_cap_usd": spend_cap_usd,
+        "threshold_usd": threshold,
+    })
+
+
 async def create_compute_job(
     session,
     task: Task,
@@ -249,6 +305,7 @@ async def create_compute_job(
         raise ValueError("task not found")
     if locked_task.status in _TASK_TERMINAL_STATUSES:
         raise ValueError("cannot launch a compute job for a terminal task")
+    await _assert_compute_spend_not_gated(session, locked_task, capped_spend)
     live_proof_requirement = _resolve_live_proof_requirement(
         locked_task,
         explicit_values=(live_proof_marker, live_proof),
@@ -958,24 +1015,29 @@ async def list_compute_jobs(
     include_finished_within: timedelta = timedelta(hours=6),
     limit: int = 50,
     offset: int = 0,
+    all_terminal: bool = False,
 ) -> tuple[list[ComputeJob], bool]:
     """Return a project's active compute jobs plus recently-finished ones.
 
-    Active jobs are always included; terminal jobs are included only when they
-    completed within ``include_finished_within``. Ordered newest-first so the
-    live operator view leads with the most recent launches.
+    Active jobs are always included. When ``all_terminal=True``, ALL terminal
+    jobs are included regardless of age (``include_finished_within`` is ignored
+    for the terminal filter). Otherwise only terminal jobs completed within
+    ``include_finished_within`` are returned. Ordered newest-first.
     """
-    cutoff = _utcnow() - include_finished_within
+    if all_terminal:
+        terminal_filter = ComputeJob.completed_at.is_not(None)
+    else:
+        cutoff = _utcnow() - include_finished_within
+        terminal_filter = ComputeJob.completed_at.is_not(None) & (
+            ComputeJob.completed_at >= cutoff
+        )
     result = await session.execute(
         select(ComputeJob)
         .where(
             ComputeJob.project_id == project_id,
             (
                 ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)
-                | (
-                    ComputeJob.completed_at.is_not(None)
-                    & (ComputeJob.completed_at >= cutoff)
-                )
+                | terminal_filter
             ),
         )
         .order_by(ComputeJob.created_at.desc(), ComputeJob.id.desc())
@@ -985,6 +1047,15 @@ async def list_compute_jobs(
     jobs = list(result.scalars().all())
     has_more = len(jobs) > limit
     return jobs[:limit], has_more
+
+
+# Aggregate helpers live in compute_jobs_aggregation.py (extracted to keep this
+# module under the line-count cap). Re-export for backwards-compatibility.
+from app.compute_jobs_aggregation import (  # noqa: E402,F401
+    aggregate_all_compute_jobs_summary,
+    aggregate_compute_jobs_summary,
+    aggregate_criterion_summary,
+)
 
 
 async def get_recent_terminal_compute_spend_usd(

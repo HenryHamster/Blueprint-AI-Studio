@@ -208,6 +208,8 @@ async def _spawn_release_audit_task(
         # Audit C4: pin the audit to the exact qualified commit.  The agent
         # reads this from the payload and checks out this SHA.
         "candidate_sha": candidate_sha,
+        # Explicitly pin to Opus — regression guard against silent downgrade.
+        "quality_tier": "opus",
     }
     if version_goal:
         payload["version_goal"] = version_goal
@@ -285,6 +287,8 @@ async def _spawn_release_audit_challenge_task(
         "base_branch": base_branch,
         "diff_range": diff_range,
         "candidate_sha": candidate_sha,
+        # Explicitly pin to Opus — regression guard against silent downgrade.
+        "quality_tier": "opus",
     }
     if version_goal:
         payload["version_goal"] = version_goal
@@ -452,6 +456,9 @@ async def _spawn_release_merge_grade_task(
         # merged-PR discovery theme evidence uses); the agent fetches each PR's
         # diff to grade goal coverage.
         "merged_prs": list(merged_pr_numbers),
+        # Explicitly pin to Opus — regression guard against silent downgrade
+        # (mirrors release_audit / release_audit_challenge).
+        "quality_tier": "opus",
     }
     # Blindness guard — see the contract note above. No payload key may carry
     # the strategist running-update narrative into a grade that must be blind to

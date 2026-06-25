@@ -146,6 +146,13 @@ logger = logging.getLogger(__name__)
 
 _CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retirement signal
 
+# Minimum clean repair attempts (repair_attempts - infra_failures) for a per-type
+# self_repair_success_rate to be considered reliable.  Mirrors the same threshold
+# in efficiency_snapshot.SELF_REPAIR_MIN_ATTEMPTS (efficiency_snapshot imports
+# digest_metrics only lazily inside a function, so a module-level import here would
+# not create a cycle, but duplicating the literal keeps the dependency one-directional).
+_SELF_REPAIR_MIN_ATTEMPTS = 10
+
 _FAILURE_CLASS_LABELS = {
     CODE_ERROR: "Code Error",
     PROVISION_FAILURE: "Provision Failure",
@@ -417,6 +424,9 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
     miss_by_reason: defaultdict[str, int] = defaultdict(int)
     repair_miss_by_reason: defaultdict[str, int] = defaultdict(int)
     miss_by_schema: defaultdict[str, int] = defaultdict(int)
+    miss_by_schema_and_reason: defaultdict[str, defaultdict[str, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
     repair_attempts_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_successes_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_infra_failures_by_schema: defaultdict[str, int] = defaultdict(int)
@@ -450,6 +460,10 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
             repair_miss_by_reason[str(reason)] += int(count)
         for schema, count in (summary.get("format_miss_by_schema") or {}).items():
             miss_by_schema[str(schema)] += int(count)
+        for schema, reasons in (summary.get("format_miss_by_schema_and_reason") or {}).items():
+            if isinstance(reasons, dict):
+                for reason, count in reasons.items():
+                    miss_by_schema_and_reason[str(schema)][str(reason)] += int(count)
         for schema, count in (
             summary.get("format_repair_attempts_by_schema") or {}
         ).items():
@@ -484,6 +498,11 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         | set(repair_miss_by_schema)
     )
 
+    # Minimum clean repair attempts per schema before self_repair_success_rate
+    # is meaningful. Below this threshold the ratio is too noisy (1-2 repairs
+    # flip the rate between 0% and 100%) and the value is suppressed to None.
+    _SCHEMA_MIN_REPAIR_ATTEMPTS = 3
+
     def _schema_entry(schema: str) -> dict:
         attempts = repair_attempts_by_schema.get(schema, 0)
         successes = repair_successes_by_schema.get(schema, 0)
@@ -498,7 +517,7 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
             "repair_input_tokens": repair_input_tokens_by_schema.get(schema, 0),
             "repair_output_tokens": repair_output_tokens_by_schema.get(schema, 0),
             "self_repair_success_rate": round(successes / clean, 3)
-            if clean > 0
+            if clean >= _SCHEMA_MIN_REPAIR_ATTEMPTS
             else None,
         }
 
@@ -551,6 +570,9 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         "by_schema": by_schema,
         "format_miss_by_reason": dict(miss_by_reason),
         "format_repair_miss_by_reason": dict(repair_miss_by_reason),
+        "format_miss_by_schema_and_reason": {
+            schema: dict(reasons) for schema, reasons in miss_by_schema_and_reason.items()
+        },
     }
 
 
@@ -615,6 +637,15 @@ def compute_format_compliance_metrics(
         task_type: _accumulate_format_compliance(tasks)
         for task_type, tasks in by_type_groups.items()
     }
+    # Suppress self_repair_success_rate on per-type blocks with fewer than the
+    # minimum clean attempts — small-volume task types (e.g. strategic_review with
+    # ~2 repairs/window) produce phantom regression deltas that are pure noise.
+    for _block in by_type.values():
+        _clean = (_block.get("repair_attempts") or 0) - (
+            _block.get("repair_infra_failures") or 0
+        )
+        if _clean < _SELF_REPAIR_MIN_ATTEMPTS:
+            _block["self_repair_success_rate"] = None
 
     if prev_terminal_tasks is not None:
         prev_overall = _accumulate_format_compliance(prev_terminal_tasks)
@@ -3324,26 +3355,30 @@ def compute_timeout_rate(
 ) -> Dict[str, Any]:
     """Windowed AGENT_TIMEOUT rate, decomposed by persisted subtype.
 
-    DENOMINATOR — ``execution_reached``: terminal tasks in the window that
-    actually reached execution, i.e. carry a ``started_at`` timestamp. This makes
-    the rate a fraction over tasks that COULD have timed out (a task that never
-    started cannot time out), so it is comparable over time and not inflated or
-    deflated by queued/never-dispatched volume. Callers pass the already-windowed
-    terminal task set (e.g. efficiency_snapshot._load_recent_tasks); ``tasks`` is
-    not re-filtered by time here.
+    DENOMINATOR — ``execution_or_timed_out``: terminal tasks in the window that
+    either reached execution (carry a ``started_at`` timestamp) or persisted as
+    AGENT_TIMEOUT without reaching execution. This makes the rate a fraction over
+    tasks that COULD have timed out (a never-started AGENT_TIMEOUT is still a task
+    that timed out, just before dispatching), so numerator and denominator remain
+    consistent and rates are not inflated by never-dispatched volume. Callers pass
+    the already-windowed terminal task set (e.g. efficiency_snapshot._load_recent_tasks);
+    ``tasks`` is not re-filtered by time here.
 
     NUMERATOR — ``timeout_count``: tasks whose persisted
     ``ctx['failure_category']`` is AGENT_TIMEOUT. Read from durable ground truth
     only — never re-derived from logs.
 
     Returns a block with the overall rate, a per-subtype ``{count, rate}`` map
-    covering all seven subtypes (rate over the SAME execution-reached denominator,
+    covering all seven subtypes (rate over the SAME execution-or-timed-out denominator,
     so the per-subtype rates sum to the overall rate), and the dominant subtype +
     its share among timeouts. ``overall_rate`` / per-subtype ``rate`` are None
-    only when the denominator is 0 (no tasks reached execution — rate undefined,
-    distinct from a real 0.0). ``window_days`` is echoed for provenance.
+    only when the denominator is 0 (no tasks reached execution or timed out —
+    rate undefined, distinct from a real 0.0). ``window_days`` is echoed for provenance.
     """
-    denominator = sum(1 for t in tasks if getattr(t, "started_at", None) is not None)
+    denominator = sum(
+        1 for t in tasks
+        if getattr(t, "started_at", None) is not None or _persisted_timeout_subtype(t) is not None
+    )
     subtype_counts: Dict[str, int] = {s: 0 for s in TIMEOUT_SUBTYPES}
     timeout_count = 0
     for t in tasks:
@@ -3364,8 +3399,9 @@ def compute_timeout_rate(
         "window_days": window_days,
         "denominator": denominator,
         "denominator_definition": (
-            "terminal tasks in the window that reached execution (started_at "
-            "present); a task that never started cannot time out"
+            "terminal tasks in the window that either reached execution (started_at "
+            "present) or timed out before execution (persisted AGENT_TIMEOUT without "
+            "started_at); a task in this set could have timed out"
         ),
         "timeout_count": timeout_count,
         "overall_rate": _rate(timeout_count),
@@ -3405,7 +3441,7 @@ TIMEOUT_RATE_METRIC_MANIFEST: dict[str, dict] = {
         "consumer": "efficiency_snapshot.read_baseline_with_drift (agent_timeout_rate block provenance)",
     },
     "denominator": {
-        "ground_truth": "Task.started_at presence over the windowed terminal task set",
+        "ground_truth": "started_at IS NOT NULL OR persisted AGENT_TIMEOUT subtype (execution-or-timed-out population) over the windowed terminal task set",
         "consumer": "efficiency-axes response (agent_timeout_rate.current denominator), strategic layer",
     },
     "denominator_definition": {
@@ -3417,11 +3453,11 @@ TIMEOUT_RATE_METRIC_MANIFEST: dict[str, dict] = {
         "consumer": "efficiency-axes response (agent_timeout_rate numerator)",
     },
     "overall_rate": {
-        "ground_truth": "timeout_count / execution-reached denominator (both persisted ground truth)",
+        "ground_truth": "timeout_count / execution-or-timed-out denominator (both persisted ground truth)",
         "consumer": "digest narrative AGENT_TIMEOUT before/after sentence (admin_digest.py), efficiency-axes agent_timeout_rate.overall drift",
     },
     "by_subtype": {
-        "ground_truth": "persisted ctx['timeout_subtype'] per AGENT_TIMEOUT task, over the execution-reached denominator",
+        "ground_truth": "persisted ctx['timeout_subtype'] per AGENT_TIMEOUT task, over the execution-or-timed-out denominator",
         "consumer": "efficiency-axes agent_timeout_rate.by_subtype drift (per-subtype current-vs-baseline)",
     },
     "dominant_subtype": {

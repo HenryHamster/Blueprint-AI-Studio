@@ -16,9 +16,8 @@ Hard invariants (mirrors evergreen_backlog.py's design):
   ``(project_id, finding_key)``); measurements live in the process-local,
   bounded in-memory observability singleton below — no table, no column, no
   Alembic migration.
-* Mode gating (``structural_health_audit_mode``): ``off`` never acts (default,
-  so the whole feature is inert until an operator flips it); ``observe``
-  measures and records the would-be finding but enrolls nothing; ``enforce``
+* Mode gating (``structural_health_audit_mode``): ``off`` never acts; ``observe``
+  measures and records the would-be finding but enrolls nothing (default); ``enforce``
   enrolls.
 * Detection must not itself become a load problem. The fat-row check measures
   per-row context byte size DB-SIDE using a dialect-safe byte/length aggregate
@@ -87,8 +86,8 @@ STRUCTURAL_AUDIT_PROVENANCE = "structural_audit"
 
 # --- Defaults (operator-overridable via runtime_config / PATCH settings) -----
 
-#: Default mode — OFF so the whole feature is inert until an operator flips it.
-DEFAULT_AUDIT_MODE = "off"
+#: Default mode — OBSERVE to measure and record findings without enrolling.
+DEFAULT_AUDIT_MODE = "observe"
 #: Default cadence between audit sweeps.
 DEFAULT_INTERVAL_MINUTES = 60
 #: Default fat-row byte threshold (1 MiB). A ``task.context`` above this is a

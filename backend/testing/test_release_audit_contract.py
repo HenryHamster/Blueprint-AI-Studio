@@ -64,6 +64,184 @@ class TestReleaseAuditFixtureShape:
             )
 
 
+class TestDeterministicCoDeleteClassification:
+    """_score_audit prefers computed_test_erosion.deleted_test_file_classifications
+    over the LLM's deleted_test_file_classifications for co-deleted test files."""
+
+    def _make_report(
+        self,
+        deleted_test_files: list,
+        computed_classifications: list | None = None,
+        llm_classifications: list | None = None,
+    ) -> dict:
+        report: dict = {
+            "audit_score": 1.0,
+            "findings": [],
+            "computed_test_erosion": {
+                "deleted_test_files": deleted_test_files,
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "test_erosion": {
+                "deleted_test_files": deleted_test_files,
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        }
+        if computed_classifications is not None:
+            report["computed_test_erosion"]["deleted_test_file_classifications"] = computed_classifications
+        if llm_classifications is not None:
+            report["deleted_test_file_classifications"] = llm_classifications
+        return report
+
+    def test_deterministic_dead_code_removal_passes_without_llm_tag(self):
+        """A file classified dead_code_removal in computed_test_erosion passes
+        even when the LLM emits no deleted_test_file_classifications at all."""
+        report = self._make_report(
+            deleted_test_files=["admin-ui/src/components/Foo.test.tsx"],
+            computed_classifications=[
+                {
+                    "path": "admin-ui/src/components/Foo.test.tsx",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject Foo.tsx is also a D-line in git diff --name-status.",
+                }
+            ],
+            llm_classifications=None,  # LLM produced no classifications
+        )
+        _, test_erosion = _score_audit(report)
+        assert test_erosion is not None, (
+            "Expected a numeric test_erosion score when the deterministic "
+            "classification clears the file as dead_code_removal; got None (hard-block)."
+        )
+
+    def test_unflagged_deletion_passes_but_genuine_erosion_blocks(self):
+        """Fail-open disposition (operator steer, #11722): a deleted test file with
+        NO classification from either the deterministic or LLM path PASSES — only an
+        explicit ``genuine_erosion`` tag hard-blocks.
+
+        This was previously asserted fail-closed (absent → block) but #11722 flipped
+        the default disposition to fail-open so the auditor's frequent failure to
+        emit a tag stops false-blocking legitimate co-deletion/declutter cuts. The
+        deterministic-detection-and-overlay path added in #11721 is unchanged; only
+        the default for an un-flagged deletion is allow. The narrow erosion case
+        (subject demonstrably present, test stripped) still blocks — but only when
+        the auditor affirmatively classifies it ``genuine_erosion``.
+        """
+        # Part 1: no deterministic and no LLM classification → fail-OPEN (passes).
+        report_unflagged = self._make_report(
+            deleted_test_files=["admin-ui/src/components/Foo.test.tsx"],
+            computed_classifications=None,  # no deterministic classification
+            llm_classifications=None,  # LLM also produced nothing
+        )
+        _, test_erosion = _score_audit(report_unflagged)
+        assert test_erosion is not None, (
+            "Expected a non-None erosion score (fail-open) when the deleted test "
+            "file carries no classification — only explicit genuine_erosion blocks."
+        )
+
+        # Part 2: explicit genuine_erosion (subject still present) → still hard-blocks.
+        report_erosion = self._make_report(
+            deleted_test_files=["admin-ui/src/components/Live.test.tsx"],
+            computed_classifications=None,  # deterministic path never emits genuine_erosion
+            llm_classifications=[
+                {
+                    "path": "admin-ui/src/components/Live.test.tsx",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject Live.tsx is present and unchanged.",
+                }
+            ],
+        )
+        _, erosion_genuine = _score_audit(report_erosion)
+        assert erosion_genuine is None, (
+            "Expected None (hard-block) for an explicit genuine_erosion "
+            "classification — the one case fail-open preserves."
+        )
+
+    def test_deterministic_overrides_absent_llm_for_multiple_files(self):
+        """Multiple files all cleared deterministically all pass, even with no LLM tags."""
+        report = self._make_report(
+            deleted_test_files=[
+                "admin-ui/src/components/Foo.test.tsx",
+                "admin-ui/src/components/Bar.viewport.test.tsx",
+            ],
+            computed_classifications=[
+                {
+                    "path": "admin-ui/src/components/Foo.test.tsx",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject Foo.tsx deleted.",
+                },
+                {
+                    "path": "admin-ui/src/components/Bar.viewport.test.tsx",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject Bar.tsx deleted.",
+                },
+            ],
+            llm_classifications=None,
+        )
+        _, test_erosion = _score_audit(report)
+        assert test_erosion is not None, (
+            "Expected numeric test_erosion when all deleted files cleared deterministically."
+        )
+
+    def test_partial_deterministic_coverage_passes_unflagged_blocks_genuine_erosion(self):
+        """Partial deterministic coverage under the fail-open disposition (#11722):
+        one file cleared deterministically as ``dead_code_removal``, a second file
+        left unflagged.
+
+        Fail-open: the unflagged file PASSES (no longer hard-blocks merely because
+        the auditor didn't tag it). A second file is hard-blocked ONLY when it
+        carries an explicit ``genuine_erosion`` classification.
+        """
+        # Part 1: one file cleared deterministically, second unflagged → passes.
+        report_unflagged = self._make_report(
+            deleted_test_files=[
+                "admin-ui/src/components/Foo.test.tsx",
+                "admin-ui/src/components/Live.test.tsx",  # unflagged
+            ],
+            computed_classifications=[
+                {
+                    "path": "admin-ui/src/components/Foo.test.tsx",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject Foo.tsx deleted.",
+                },
+                # Live.test.tsx NOT classified — unflagged passes under fail-open.
+            ],
+            llm_classifications=None,
+        )
+        _, test_erosion = _score_audit(report_unflagged)
+        assert test_erosion is not None, (
+            "Expected non-None erosion (fail-open): one file is cleared "
+            "deterministically and the second is unflagged, which now passes."
+        )
+
+        # Part 2: second file flagged genuine_erosion (subject present) → blocks.
+        report_genuine = self._make_report(
+            deleted_test_files=[
+                "admin-ui/src/components/Foo.test.tsx",
+                "admin-ui/src/components/Live.test.tsx",  # subject still present
+            ],
+            computed_classifications=[
+                {
+                    "path": "admin-ui/src/components/Foo.test.tsx",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject Foo.tsx deleted.",
+                },
+            ],
+            llm_classifications=[
+                {
+                    "path": "admin-ui/src/components/Live.test.tsx",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject Live.tsx is present and unchanged.",
+                }
+            ],
+        )
+        _, erosion_genuine = _score_audit(report_genuine)
+        assert erosion_genuine is None, (
+            "Expected None (hard-block) when a deleted file is explicitly "
+            "classified genuine_erosion, even alongside a deterministically cleared file."
+        )
+
+
 def _resolve_audits_ts_path() -> "str | None":
     """Locate ``agent/src/handlers/audits.ts`` across local + Docker envs.
 
@@ -265,6 +443,84 @@ class TestAuditChallengeTsContract:
 
 
 @pytest.mark.asyncio
+async def test_spawn_release_audit_challenge_defaults_to_opus_quality_tier(db_session):
+    """``_spawn_release_audit_challenge_task`` MUST explicitly set quality_tier
+    to Opus in the spawned task's payload — regression guard against a
+    cost-saving edit silently downgrading this binding adversarial
+    second-opinion gate below Opus."""
+    from app import release_qualifier as rq
+    from app.models import Project
+
+    project = Project(
+        name="RQ-Challenge-Tier",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "cafe0011" * 5  # 40-char placeholder SHA
+    task = await rq._spawn_release_audit_challenge_task(
+        db_session,
+        project.id,
+        version_id=uuid.uuid4(),
+        base_branch="main",
+        diff_range=f"main...{candidate}",
+        candidate_sha=candidate,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert (task.first_payload or {}).get("quality_tier") == "opus", (
+        "Spawned release_audit_challenge must explicitly carry quality_tier='opus' "
+        "— regression guard against silent downgrade"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_release_audit_task_defaults_to_opus_quality_tier(db_session):
+    """``_spawn_release_audit_task`` MUST explicitly set quality_tier to Opus
+    in the spawned task's payload — regression guard against a cost-saving
+    edit silently downgrading the primary release-audit judgment gate below
+    Opus."""
+    from app import release_qualifier as rq
+    from app.models import Project
+
+    project = Project(
+        name="RQ-Audit-Tier",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "dead1234" * 5  # 40-char placeholder SHA
+    task = await rq._spawn_release_audit_task(
+        db_session,
+        project.id,
+        version_id=uuid.uuid4(),
+        base_branch="main",
+        diff_range=f"main...{candidate}",
+        candidate_sha=candidate,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert (task.first_payload or {}).get("quality_tier") == "opus", (
+        "Spawned release_audit must explicitly carry quality_tier='opus' "
+        "— regression guard against silent downgrade"
+    )
+
+
+@pytest.mark.asyncio
 async def test_spawn_release_audit_challenge_pins_candidate(db_session):
     """``_spawn_release_audit_challenge_task`` pins the challenge child to the
     exact candidate SHA + diff range, mirroring the release_audit spawn."""
@@ -376,4 +632,94 @@ async def test_get_latest_release_audit_challenge_scoped_by_sha(db_session):
             db_session, project.id, candidate_sha=None
         )
         is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_audit_resolves_to_opus_end_to_end(db_session):
+    """Spawned release_audit gates resolve to Opus tier end-to-end via
+    resolve_task_quality_tier, confirming the explicit quality_tier='opus'
+    payload value is honored."""
+    from app import release_qualifier as rq
+    from app.max_plan_pool import resolve_task_quality_tier
+    from app.models import Project
+
+    project = Project(
+        name="RQ-Audit-Resolve",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "aabbccdd" * 5  # 40-char placeholder SHA
+    task = await rq._spawn_release_audit_task(
+        db_session,
+        project.id,
+        version_id=uuid.uuid4(),
+        base_branch="main",
+        diff_range=f"main...{candidate}",
+        candidate_sha=candidate,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resolved_tier = resolve_task_quality_tier(task, {})
+    assert resolved_tier == "opus", (
+        f"release_audit must resolve to Opus tier end-to-end, got {resolved_tier!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_audit_challenge_resolves_to_opus_end_to_end(db_session):
+    """Spawned release_audit_challenge gates resolve to Opus tier end-to-end via
+    resolve_task_quality_tier, confirming the explicit quality_tier='opus'
+    payload value is honored."""
+    from app import release_qualifier as rq
+    from app.max_plan_pool import resolve_task_quality_tier
+    from app.models import Project
+
+    project = Project(
+        name="RQ-Challenge-Resolve",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "eeff0011" * 5  # 40-char placeholder SHA
+    task = await rq._spawn_release_audit_challenge_task(
+        db_session,
+        project.id,
+        version_id=uuid.uuid4(),
+        base_branch="main",
+        diff_range=f"main...{candidate}",
+        candidate_sha=candidate,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resolved_tier = resolve_task_quality_tier(task, {})
+    assert resolved_tier == "opus", (
+        f"release_audit_challenge must resolve to Opus tier end-to-end, got {resolved_tier!r}"
+    )
+
+
+def test_default_quality_tier_is_opus():
+    """DEFAULT_QUALITY_TIER must be Opus — regression guard against a
+    cost-saving edit downgrading all quality_tier fallbacks."""
+    from app.max_plan_pool import DEFAULT_QUALITY_TIER
+
+    assert DEFAULT_QUALITY_TIER == "opus", (
+        f"DEFAULT_QUALITY_TIER downgrade detected: {DEFAULT_QUALITY_TIER!r} "
+        "— release gates rely on opus-tier fallback; "
+        "explicit quality_tier='opus' payloads will be overridden if default changes"
     )

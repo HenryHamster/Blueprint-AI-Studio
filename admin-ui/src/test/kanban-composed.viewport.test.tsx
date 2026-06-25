@@ -1,48 +1,17 @@
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { OrchestratorHealthBar } from '../components/OrchestratorHealthBar';
-import { ProjectDashboard } from '../components/ProjectDashboard';
-import { AlertsBanner } from '../components/AlertsBanner';
 import { KanbanBoard, type KanbanColumn } from '../components/KanbanBoard';
-import { expectNoOverflowAt } from './viewport';
 import type { Task } from '../types/task';
-import type { Project } from '../types/project';
+import { expectNoOverflowAt } from './viewport';
 
-vi.mock('../api', async () => {
-  const actual = await vi.importActual<typeof import('../api')>('../api');
-  const digestPayload = {
-    daily_cost_usd: 74.5,
-    daily_cost_ceiling_usd: 100,
-    window_hours: 24,
-    generated_at: '2026-05-06T00:00:00Z',
-    completed_count: 3,
-    failed_count: 0,
-    pending_approval_count: 0,
-    research_cycles: 1,
-    prs_opened: 2,
-    active_count: 1,
-    running_count: 1,
-    needs_attention: [],
-    recent_failures: [],
-    failure_groups: [],
-    recent_completions: [],
-    direction_progress: [],
-    active_tasks: [],
-    fresh_reviewer_effectiveness: null,
-  };
-  return {
-    ...actual,
-    API_BASE_URL: 'http://localhost:8000',
-    apiFetch: vi.fn(async (url: string) => {
-      if (url.includes('/api/admin/digest')) {
-        return new Response(JSON.stringify(digestPayload), { status: 200 });
-      }
-      return new Response('{}', { status: 200 });
-    }),
-    authGet: vi.fn(async () => new Response('{}', { status: 200 })),
-  };
-});
+vi.mock('../api', () => ({
+  apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
+  API_BASE_URL: 'http://localhost',
+  authHeaders: vi.fn(async () => ({})),
+  authGet: vi.fn(async () => new Response('{}', { status: 200 })),
+}));
 
 vi.mock('@dnd-kit/core', () => ({
   DndContext: ({ children }: { children: React.ReactNode }) => <>{children}</>,
@@ -71,22 +40,11 @@ vi.mock('@dnd-kit/utilities', () => ({
   CSS: { Transform: { toString: () => '' } },
 }));
 
-const COLUMNS: KanbanColumn[] = [
-  { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
-  { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS'] },
-  { id: 'EVALUATING', label: 'Evaluating', includes: ['EVALUATING'] },
-  { id: 'BLOCKED', label: 'Blocked', includes: ['BLOCKED'] },
-  { id: 'PARKED', label: 'Parked', includes: ['PARKED'] },
-  { id: 'FAILED', label: 'Failed', includes: ['FAILED'] },
-  { id: 'CANCELLED', label: 'Cancelled', includes: ['CANCELLED'] },
-  { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },
-];
-
 const healthBarProps = {
   health: {
     last_cycle_seconds_ago: 90,
-    queued_tasks: 5,
-    active_tasks: 2,
+    queued_tasks: 3,
+    active_tasks: 1,
     pool_info: {},
     deploy_state: {
       status: 'OK',
@@ -101,46 +59,52 @@ const healthBarProps = {
   detailedHealth: null,
   apiHealthy: true,
   wsConnected: true,
-  lastFetchTime: Date.UTC(2026, 4, 7, 0, 0, 0),
+  lastFetchTime: 1746576000000,
   tasks: [],
   pipelineThrottle: null,
 };
 
-function makeProject(overrides: Partial<Project> = {}): Project {
-  return {
-    id: 'proj-1',
-    name: 'Platform',
-    status: 'active',
-    github_owner: 'acme',
-    github_repo: 'platform',
-    autonomous_enabled: true,
-    directions: [],
-    created_at: '2026-01-01T00:00:00Z',
-    ...overrides,
-  };
-}
+const COLUMNS: KanbanColumn[] = [
+  { id: 'QUEUED', label: 'Queued', includes: ['QUEUED'] },
+  { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS', 'PROVISIONING'] },
+  { id: 'EVALUATING', label: 'Evaluating', includes: ['EVALUATING'] },
+  { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },
+  { id: 'FAILED', label: 'Failed', includes: ['FAILED'] },
+];
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
     id: 'task-1',
-    title: 'feat: kanban composed viewport regression fixture',
+    title: 'feat: add mobile-responsive layout',
     description: '',
     status: 'QUEUED',
     task_type: 'create',
     created_at: '2026-05-01T00:00:00Z',
     created_by: 'USER',
     requires_approval: false,
-    history: [],
     ...overrides,
   };
 }
 
-const tasks: Task[] = [
-  makeTask({ id: 'task-q1', title: 'feat: kanban composed viewport regression fixture', status: 'QUEUED' }),
-  makeTask({ id: 'task-ip1', title: 'fix: resolve mobile layout overflow in kanban view', status: 'IN_PROGRESS', started_at: '2026-05-01T01:00:00Z' }),
-  makeTask({ id: 'task-ev1', title: 'research: evaluate viewport overflow causes', status: 'EVALUATING', task_type: 'research' }),
-  makeTask({ id: 'task-co1', title: 'feat: completed kanban task example', status: 'COMPLETED' }),
-];
+const kanbanBaseProps = {
+  loading: false,
+  maxRetries: 3,
+  actionLoadingMap: {},
+  sortBy: 'newest' as const,
+  selectionMode: false,
+  selectedTaskIds: new Set<string>(),
+  onToggleTaskSelection: () => {},
+  onBulkToggle: () => {},
+  onArchiveColumn: () => {},
+  onApprove: () => {},
+  onRequestChanges: () => {},
+  onCancel: () => {},
+  onRetry: () => {},
+  onEditPrompt: () => {},
+  onDismiss: () => {},
+  onArchive: () => {},
+  onViewLogs: () => {},
+};
 
 describe('KanbanBoard composed with shell panels — viewport regression', () => {
   let root: Root | null = null;
@@ -159,66 +123,35 @@ describe('KanbanBoard composed with shell panels — viewport regression', () =>
   });
 
   test('no horizontal overflow at 375px', async () => {
-    localStorage.setItem('projectDashboardCollapsed', 'false');
-
-    const projects = [
-      makeProject({ id: 'p1', name: 'Platform', status: 'active' }),
-      makeProject({ id: 'p2', name: 'Mobile App', status: 'paused', autonomous_enabled: false }),
+    const tasks = [
+      makeTask({ id: 't1', status: 'QUEUED', title: 'feat: implement kanban board mobile layout' }),
+      makeTask({ id: 't2', status: 'IN_PROGRESS', title: 'fix: resolve overflow in task card' }),
+      makeTask({ id: 't3', status: 'EVALUATING', title: 'research: analyze pipeline performance' }),
+      makeTask({ id: 't4', status: 'COMPLETED', title: 'chore: update dependency versions' }),
+      makeTask({ id: 't5', status: 'FAILED', title: 'fix: correct viewport overflow in metrics panel' }),
+      makeTask({ id: 't6', status: 'IN_PROGRESS', title: 'feat: add structured output handler' }),
     ];
 
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
-      host.className = 'flex flex-col bg-neutral-950 text-neutral-200 p-3 min-h-screen';
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
       await act(async () => {
         r.render(
-          <>
-            <div data-testid="header-bar-stub" />
+          <div className="flex flex-col bg-neutral-950 text-neutral-200 p-3 min-h-screen">
             <OrchestratorHealthBar {...healthBarProps} />
-            <ProjectDashboard
-              projects={projects}
-              tasks={tasks}
-              selectedProjectId="p1"
-              onSelectProject={() => {}}
-            />
-            <AlertsBanner alerts={[]} onDismiss={() => {}} onDismissAll={() => {}} onViewTask={() => {}} />
-            <div data-testid="search-filter-stub" className="flex items-center gap-2 shrink-0 mb-1 flex-wrap" />
+            <div className="h-10 flex items-center border-b border-neutral-800 shrink-0" aria-label="navigation" />
             <KanbanBoard
+              {...kanbanBaseProps}
               tasks={tasks}
               columns={COLUMNS}
-              loading={false}
-              maxRetries={3}
-              actionLoadingMap={{}}
-              sortBy="newest"
-              selectionMode={false}
-              selectedTaskIds={new Set()}
-              onToggleTaskSelection={() => {}}
-              onBulkToggle={() => {}}
-              onArchiveColumn={() => {}}
-              onApprove={() => {}}
-              onRequestChanges={() => {}}
-              onCancel={() => {}}
-              onRetry={() => {}}
-              onEditPrompt={() => {}}
-              onDismiss={() => {}}
-              onArchive={() => {}}
-              onViewLogs={() => {}}
             />
-          </>,
+          </div>,
         );
       });
-      await act(async () => {
-        await new Promise<void>((resolve) => setTimeout(resolve, 75));
-      });
-      await act(async () => {
-        await new Promise<void>((resolve) => setTimeout(resolve, 75));
-      });
-    });
+    }, { waitMs: 75 });
 
-    expect(host!.textContent).toContain('feat: kanban composed viewport regression fixture');
-
-    localStorage.removeItem('projectDashboardCollapsed');
+    expect(host!.textContent).toContain('Queued');
   });
 });

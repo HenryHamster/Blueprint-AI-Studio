@@ -1093,6 +1093,38 @@ def test_decode_result_metrics_filters_non_numeric_and_bounds():
     assert compute_backends_module._decode_result_metrics("") is None
 
 
+def test_decode_preserves_arms_block():
+    # An arms dict (multi-arm comparison) survives decode verbatim alongside
+    # numeric scalar metrics; other nested objects are still dropped.
+    arms_dict = {"control": {"accuracy": 0.80}, "treatment": {"accuracy": 0.88}}
+    marker = _metrics_marker(
+        {
+            "accuracy": 0.84,
+            "arms": arms_dict,
+            "ignored_nested": {"x": 1},
+        }
+    )
+    result = compute_backends_module._decode_result_metrics(marker)
+    assert result is not None
+    assert result["accuracy"] == 0.84
+    assert result["arms"] == arms_dict
+    assert "ignored_nested" not in result
+
+    # An arms list (list of arm records) also survives.
+    arms_list = [{"name": "a", "score": 0.9}, {"name": "b", "score": 0.7}]
+    marker_list = _metrics_marker({"loss": 0.1, "arms": arms_list})
+    result_list = compute_backends_module._decode_result_metrics(marker_list)
+    assert result_list is not None
+    assert result_list["arms"] == arms_list
+    assert result_list["loss"] == 0.1
+
+    # An empty arms value is not preserved (no comparison block to surface).
+    marker_empty = _metrics_marker({"accuracy": 0.5, "arms": {}})
+    result_empty = compute_backends_module._decode_result_metrics(marker_empty)
+    assert result_empty is not None
+    assert "arms" not in result_empty
+
+
 # ── Durable terminal record (terminal.json) — closes the poweroff-vs-serial
 # race where a fast successful GCP job powers off before its serial SUCCEEDED
 # marker is captured and is misclassified FAILURE. ──────────────────────────
@@ -9897,6 +9929,24 @@ def test_serialize_compute_job_response_safe_redacts_command_log():
     data = schemas.serialize_compute_job_response_safe(job)
     text = data["polling_metadata"]["command_log"]["text"]
     assert "TOP_SECRET" not in text
+    assert "result: 42" in text
+
+
+def test_serialize_compute_job_response_agent_returns_raw_command_log():
+    """serialize_compute_job_response (non-safe, agent-facing) passes command_log text through.
+
+    Agents own their job and need the full metadata — the non-safe variant intentionally
+    omits redaction. This test documents the safe/agent asymmetry so a future refactor
+    cannot collapse both serializers into a single redacting path without notice.
+    """
+    raw = "Bearer token=TOP_SECRET\nresult: 42\n"
+    job = _make_job_with_command_log(raw)
+    data = schemas.serialize_compute_job_response(job)
+    text = data["polling_metadata"]["command_log"]["text"]
+    # Non-safe: raw text is returned intact for agent callers (agents own the job).
+    assert "TOP_SECRET" in text, (
+        "agent-facing serialize_compute_job_response must not redact command_log.text"
+    )
     assert "result: 42" in text
 
 

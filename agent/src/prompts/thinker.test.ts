@@ -265,6 +265,24 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('Staging is NOT deferral');
   });
 
+  it('Section 3 documents experiment commissions move with compute_experiment type', () => {
+    const prompt = buildThinkerPrompt(base);
+    // The new paragraph must be present and appear after Knowledge commissions
+    expect(prompt).toContain('**Experiment commissions.**');
+    expect(prompt).toContain('compute_experiment');
+    // The launch contract fields must be described
+    expect(prompt).toContain('spend_cap_usd');
+    expect(prompt).toContain('deadline_seconds');
+    expect(prompt).toContain('success_criterion');
+    // The section must explain the hypothesis/falsifiable-conjecture framing
+    expect(prompt).toContain('hypothesis');
+    // Experiment commissions must appear after Knowledge commissions
+    const knowledgeIdx = prompt.indexOf('**Knowledge commissions.**');
+    const experimentIdx = prompt.indexOf('**Experiment commissions.**');
+    expect(knowledgeIdx).toBeGreaterThan(-1);
+    expect(experimentIdx).toBeGreaterThan(knowledgeIdx);
+  });
+
   it('staging guidance directs new next-version ideas to the atomic staged flag (not create-then-stage)', () => {
     const prompt = buildThinkerPrompt(base);
     // A genuinely new idea is created with the staged flag in a single atomic
@@ -441,14 +459,16 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('/tmp/problem_model_abc-456.json');
     expect(prompt).toContain('/tmp/running_update_abc-456.md');
     expect(prompt).toContain('/tmp/research_progress_abc-456.md');
+    expect(prompt).toContain('/tmp/new_version_goal_abc-456.txt');
   });
 
   it('includes READ_ONLY_BASH_WRITE_NOTE next to each /tmp output path', () => {
     const prompt = buildThinkerPrompt({ ...base, taskId: 'abc-789' });
     expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
-    // Note should appear multiple times (once per output file path)
+    // Note should appear multiple times (once per output file path):
+    // running_update, problem_model, research_progress, new_version_goal
     const count = prompt.split(READ_ONLY_BASH_WRITE_NOTE).length - 1;
-    expect(count).toBeGreaterThanOrEqual(3);
+    expect(count).toBeGreaterThanOrEqual(4);
   });
 
   it('includes PLAYBOOK_GUIDANCE (structural invariant: strategic_review class)', () => {
@@ -473,6 +493,56 @@ describe('buildThinkerPrompt', () => {
     expect(broken).not.toContain('## 1. State assessment');
     // This verifies our structural test WOULD catch such a regression
     expect(prompt).toContain('## 1. State assessment'); // original still passes
+  });
+
+  it('test_thinker_prompt_instructs_new_version_goal_emission', () => {
+    const prompt = buildThinkerPrompt(base);
+    // The prompt must instruct the thinker to write new_version_goal
+    expect(prompt).toContain('new_version_goal');
+    // Section 7 is the dedicated output section for the version goal and theme
+    expect(prompt).toContain('## 7. Version goal');
+    // Must reference the dedicated handoff file
+    expect(prompt).toContain('/tmp/new_version_goal_');
+    // Must explain when to write it (only when goal is unset)
+    expect(prompt).toContain('goal is currently unset');
+    // Must note that once set, it is frozen (skip if already set)
+    expect(prompt).toContain('frozen once set');
+    // Must specify the character limit
+    expect(prompt).toContain('500 characters');
+    // Must steer toward substantive/directional goals (operator requirement)
+    expect(prompt).toContain('SUBSTANTIVE and DIRECTIONAL');
+    // Must explain what a bad goal looks like
+    expect(prompt).toContain('contentless-goal guard');
+    // Section 7 must appear AFTER Section 6 in the prompt
+    const sec6Idx = prompt.indexOf('## 6. Problem model');
+    const sec7Idx = prompt.indexOf('## 7. Version goal');
+    expect(sec6Idx).toBeGreaterThan(-1);
+    expect(sec7Idx).toBeGreaterThan(-1);
+    expect(sec7Idx).toBeGreaterThan(sec6Idx);
+  });
+
+  it('test_thinker_prompt_instructs_new_version_theme_emission', () => {
+    const prompt = buildThinkerPrompt(base);
+    // The prompt must instruct the thinker to write new_version_theme
+    expect(prompt).toContain('new_version_theme');
+    // Must reference the dedicated handoff file
+    expect(prompt).toContain('/tmp/new_version_theme_');
+    // Must list the valid theme values
+    expect(prompt).toContain('leanness');
+    expect(prompt).toContain('reliability');
+    expect(prompt).toContain('performance');
+    expect(prompt).toContain('feature');
+    expect(prompt).toContain('mixed');
+    expect(prompt).toContain('none');
+    // Must explain when to write it (only when theme is unset)
+    expect(prompt).toContain('theme is currently unset');
+    // Must note that once set, it is frozen
+    expect(prompt).toContain('theme is frozen once set');
+    // Must teach the 4-concept boundary
+    expect(prompt).toContain('intent.purpose');
+    expect(prompt).toContain('version.goal');
+    expect(prompt).toContain('version.theme');
+    expect(prompt).toContain('intent.current_focus');
   });
 });
 
@@ -676,6 +746,119 @@ describe('runThinkerWithGate', () => {
     const statusArg = mockPersistAndPostStatus.mock.calls[0][1];
     expect(statusArg.status).toBe('FAILED');
     expect(statusArg.failure_category).toBe('strategic_thinker_artifacts_missing');
+  });
+
+  it('(g) Section 7 new_version_goal file present → returned in newVersionGoal field', async () => {
+    const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+    const goalText = 'Deliver autonomous cross-project coordination so Blueprint manages 3+ projects with fewer than 1 operator intervention per day.';
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.presentFiles.add(newVersionGoalPath);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === newVersionGoalPath) return goalText;
+        return '{"intent":{"purpose":"ok"},"gaps":[]}';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionGoal).toBe(goalText);
+    }
+  });
+
+  it('(h) Section 7 new_version_goal file absent → newVersionGoal undefined in result', async () => {
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    // new_version_goal_<taskId>.txt NOT in presentFiles
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionGoal).toBeUndefined();
+    }
+  });
+
+  it('(i) Section 7 file present but empty → newVersionGoal undefined (empty content rejected)', async () => {
+    const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.presentFiles.add(newVersionGoalPath);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === newVersionGoalPath) return '   \n  '; // whitespace only
+        return '{"intent":{"purpose":"ok"},"gaps":[]}';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionGoal).toBeUndefined();
+    }
+  });
+
+  it('(j) Section 7 new_version_theme file present with valid value → returned in newVersionTheme field (lowercased)', async () => {
+    const newVersionThemePath = `/tmp/new_version_theme_${taskId}.txt`;
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.presentFiles.add(newVersionThemePath);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === newVersionThemePath) return 'Reliability'; // mixed case → should be lowercased
+        return '{"intent":{"purpose":"ok"},"gaps":[]}';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionTheme).toBe('reliability');
+    }
+  });
+
+  it('(k) Section 7 new_version_theme file absent → newVersionTheme undefined in result', async () => {
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    // new_version_theme_<taskId>.txt NOT in presentFiles
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionTheme).toBeUndefined();
+    }
+  });
+
+  it('(l) Section 7 new_version_theme file present with invalid value → newVersionTheme undefined (invalid value rejected)', async () => {
+    const newVersionThemePath = `/tmp/new_version_theme_${taskId}.txt`;
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.presentFiles.add(newVersionThemePath);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === newVersionThemePath) return 'speed'; // not a valid theme value
+        return '{"intent":{"purpose":"ok"},"gaps":[]}';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionTheme).toBeUndefined();
+    }
   });
 });
 
@@ -960,5 +1143,53 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
     const additionalIdx = thinkerPromptWithSuffix.indexOf('Additional instructions:');
     const jobIdx = thinkerPrompt.indexOf('# Your job');
     expect(additionalIdx).toBeGreaterThan(jobIdx);
+  });
+});
+
+describe('spawn-fix allowlist sync', () => {
+  const base: ThinkerPromptParams = {
+    contextPrefix: '',
+    projectName: 'Test Project',
+    clockHeader: '',
+    isSelfRepo: false,
+    userStateLine: '',
+    packerMetaSection: '',
+    strategicContext: '',
+    problemModelSection: '',
+    problemModelRecovery: 'empty',
+    reflectionSection: '',
+    selfImprovementBlock: '',
+    runningUpdateSection: '',
+    designDocJson: '',
+    visionJson: '',
+    outcomeSection: '',
+    previousDecisionOutcomes: '',
+    pastRetirementCritiquesSection: '',
+    retiredDirectionsSummarySection: '',
+    dirSummaryText: '',
+    dirHealthSummary: '',
+    userPausedSection: '',
+    rejectedProposalsSection: '',
+    operatorOverridesSection: '',
+    portfolioCompositionText: '',
+    modelHealthSection: '',
+    systemMaturitySection: '',
+    driftSection: '',
+    recentWorkSection: '',
+    feedbackSection: '',
+    questionSection: '',
+    threadSection: '',
+    taskId: 'test-task',
+    versionPhaseSection: '',
+    memoCitationsSection: '',
+    efficiencySnapshotSection: '',
+  };
+
+  it('advertises create/refactor/qa for spawn-fix — not fix — matching backend STRATEGIST_ONE_TIME_SPAWNABLE_TYPES', () => {
+    const prompt = buildThinkerPrompt(base);
+    // spawn-fix section must list exactly the backend-allowed types (create, refactor, qa)
+    expect(prompt).toContain("types `create`/`refactor`/`qa`");
+    // 'fix' must not appear as an advertised spawn-fix type
+    expect(prompt).not.toMatch(/`spawn-fix`[^)]*types[^)]*`fix`/);
   });
 });

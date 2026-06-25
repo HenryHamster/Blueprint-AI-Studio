@@ -41,6 +41,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 from blueprint_api import APIError, api, get_project_id, load_config
@@ -310,11 +311,44 @@ def cmd_tasks(args: argparse.Namespace) -> None:
         _tasks_list(args)
 
 
+# Valid failure_class values the backend's classify_failure can emit. Used as
+# argparse choices for `tasks list --failure-class` and to drive the client-side
+# filter. Only FAILED/CANCELLED tasks ever carry a failure_class.
+FAILURE_CLASSES = frozenset({
+    "CODE_ERROR", "PROVISION_FAILURE", "AGENT_TIMEOUT", "EXTERNAL_API",
+    "RATE_LIMIT", "SCOPE_OVERFLOW", "MIGRATION_ERROR", "VIEWPORT_REGRESSION",
+    "agent_stalled", "BLOCKED_PRECONDITION", "SCOPE_EMPTY",
+    "park_wake_timeout", "park_wake_stranded",
+})
+
+# Statuses whose tasks can carry a failure_class (backend only classifies
+# FAILED/CANCELLED). A --failure-class combined with any other status filter
+# can never match, so we warn.
+_FAILURE_CLASS_STATUSES = frozenset({"FAILED", "CANCELLED"})
+
+
 def _tasks_list(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
-    path = f"/api/admin/tasks?project_id={pid}&limit={getattr(args, 'limit', 50)}"
+    failure_classes = set(getattr(args, "failure_class", None) or [])
+    # When client-side failure-class filtering is active, fetch a wider page so
+    # the post-fetch narrowing has enough rows to work with (mirrors the web
+    # console, which also filters failure_class client-side).
+    display_limit = getattr(args, "limit", 50)
+    fetch_limit = max(display_limit, 500) if failure_classes else display_limit
+    path = f"/api/admin/tasks?project_id={pid}&limit={fetch_limit}"
+    # --status and --blocked both contribute repeatable status= params; the
+    # backend accepts a List[TaskStatus], so BLOCKED appends rather than replaces.
+    requested_statuses = []
     if getattr(args, "status", None):
         path += f"&status={args.status}"
+        requested_statuses.append(str(args.status).upper())
+    if getattr(args, "blocked", False):
+        path += "&status=BLOCKED"
+        requested_statuses.append("BLOCKED")
+    if getattr(args, "approval_needed", False):
+        path += "&approval_needed=true"
+    if getattr(args, "offset", 0):
+        path += f"&offset={args.offset}"
     if getattr(args, "task_type", None):
         path += f"&task_type={args.task_type}"
     if getattr(args, "direction", None):
@@ -323,6 +357,19 @@ def _tasks_list(args: argparse.Namespace) -> None:
         from urllib.parse import quote
 
         path += f"&search={quote(args.search)}"
+
+    # A failure-class filter only matches FAILED/CANCELLED tasks; warn (do not
+    # hard-error) when paired with a status that can never carry a failure_class.
+    if failure_classes:
+        impossible = [s for s in requested_statuses
+                      if s not in _FAILURE_CLASS_STATUSES]
+        if impossible:
+            print(
+                "WARNING: --failure-class only matches FAILED/CANCELLED tasks; "
+                f"status filter(s) {', '.join(impossible)} can never carry a "
+                "failure_class, so results may be empty.",
+                file=sys.stderr,
+            )
 
     # IMPORTANT API GAP: the Task model has NO release-version linkage (its
     # `version` column is an optimistic-lock counter, not a release version),
@@ -339,7 +386,15 @@ def _tasks_list(args: argparse.Namespace) -> None:
     resp = api("GET", path)
     tasks = resp.get("tasks", resp) if isinstance(resp, dict) else resp
     total = resp.get("total") if isinstance(resp, dict) else None
-    _emit(args, {"tasks": tasks, "total": total}, _render_task_list)
+    payload = {"tasks": tasks, "total": total}
+    if failure_classes:
+        # Client-side narrowing to the requested failure classes, then re-trim
+        # to the display limit the operator asked for.
+        filtered = [t for t in (tasks or [])
+                    if t.get("failure_class") in failure_classes]
+        payload["tasks"] = filtered[:display_limit]
+        payload["filtered_client_side"] = True
+    _emit(args, payload, _render_task_list)
 
 
 def _render_task_list(data: dict) -> None:
@@ -3251,9 +3306,9 @@ def cmd_knowledge(args: argparse.Namespace) -> None:
 
 def _knowledge_list(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
-    path = f"/api/admin/projects/{pid}/knowledge?limit={getattr(args, 'limit', 20)}"
+    path = f"/api/admin/projects/{pid}/knowledge-documents?limit={getattr(args, 'limit', 20)}"
     if getattr(args, "direction", None):
-        path += f"&direction_id={args.direction}"
+        path += f"&direction={args.direction}"
     if getattr(args, "source_kind", None):
         path += f"&source_kind={args.source_kind}"
     if getattr(args, "q", None):
@@ -3262,6 +3317,9 @@ def _knowledge_list(args: argparse.Namespace) -> None:
     if getattr(args, "topic", None):
         from urllib.parse import quote
         path += f"&topic={quote(args.topic)}"
+    if getattr(args, "tag", None):
+        from urllib.parse import quote
+        path += f"&tag={quote(args.tag)}"
     resp = api("GET", path)
     docs = resp.get("documents", resp) if isinstance(resp, dict) else resp
     total = resp.get("total") if isinstance(resp, dict) else None
@@ -3277,18 +3335,31 @@ def _render_knowledge_list(data: dict) -> None:
         print("  (none)")
         return
     for d in docs:
-        did = (d.get("id") or "?")[:12]
+        did = (d.get("id") or "?")
         kind = d.get("source_kind", "?")
         title = (d.get("title") or "")[:60]
         direction = (d.get("direction_id") or "")[:12]
         created = (d.get("created_at") or "")[:10]
+        topic = d.get("topic") or ""
+        tags = d.get("tags") or []
         dir_str = f"  dir={direction}" if direction else ""
-        print(f"  {did}  [{kind:12}] {created}  {title}{dir_str}")
+        topic_str = f"  topic={topic}" if topic else ""
+        tag_str = "  " + " ".join(f"#{t}" for t in tags[:2]) if tags else ""
+        print(f"  {did}  [{kind:12}] {created}  {title}{dir_str}{topic_str}{tag_str}")
 
 
 def _knowledge_show(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
-    doc = api("GET", f"/api/admin/projects/{pid}/knowledge/{args.doc_id}")
+    doc_id = args.doc_id
+    if len(doc_id) < 36:
+        resp = api("GET", f"/api/admin/projects/{pid}/knowledge-documents?limit=200")
+        docs = resp.get("documents", resp) if isinstance(resp, dict) else resp
+        match = next((d for d in (docs or []) if (d.get("id") or "").startswith(doc_id)), None)
+        if match is None:
+            print(f"No knowledge document found matching '{doc_id}'.", file=sys.stderr)
+            return
+        doc_id = match["id"]
+    doc = api("GET", f"/api/admin/projects/{pid}/knowledge-documents/{doc_id}")
     _emit(args, doc, _render_knowledge_doc)
 
 
@@ -3302,15 +3373,74 @@ def _render_knowledge_doc(doc: dict) -> None:
     direction = doc.get("direction_id")
     if direction:
         print(f"  Direction:   {direction}")
+    topic = doc.get("topic")
+    if topic:
+        print(f"  Topic:       {topic}")
+    tags = doc.get("tags") or []
+    if tags:
+        print(f"  Tags:        {' '.join(f'#{t}' for t in tags)}")
+    summary = doc.get("summary")
+    if summary:
+        print("\n  Summary:")
+        for line in summary.splitlines():
+            print(f"    {line}")
     body = doc.get("body") or doc.get("content") or ""
     if body:
         print(f"\n{body}")
+    citations = doc.get("source_citations") or []
+    if citations:
+        print("\n  Citations:")
+        for i, c in enumerate(citations, 1):
+            if isinstance(c, dict):
+                ref = c.get("ref") or c.get("url") or c.get("title") or str(c)
+            else:
+                ref = str(c)
+            print(f"    {i}. {ref}")
 
 
 # ── compute ───────────────────────────────────────────────────────────────────
 
+_ACTIVE_COMPUTE_STATUSES = frozenset({"QUEUED", "STARTING", "RUNNING", "POLLING"})
+
+
+def _compute_job_burn_rate(j: dict, now: "datetime") -> "float | None":
+    """Return $/hr burn rate for an active job; None if data is insufficient (<60s elapsed or no accrued cost)."""
+    if j.get("status") not in _ACTIVE_COMPUTE_STATUSES:
+        return None
+    started_at_str = j.get("started_at")
+    if not started_at_str:
+        return None
+    accrued = j.get("accrued_cost_usd")
+    if accrued is None or accrued <= 0:
+        return None
+    try:
+        started_at = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+        elapsed_sec = (now - started_at).total_seconds()
+    except (ValueError, TypeError):
+        return None
+    if elapsed_sec < 60:
+        return None
+    return (accrued / elapsed_sec) * 3600
+
+
+def _compute_job_projected_spend(j: dict, burn_rate: "float | None", now: "datetime") -> "float | None":
+    """Return projected total spend at the wall-clock deadline given current burn rate; None if unavailable."""
+    if burn_rate is None:
+        return None
+    deadline_str = j.get("wall_clock_deadline")
+    if not deadline_str:
+        return None
+    try:
+        deadline = datetime.fromisoformat(deadline_str.replace("Z", "+00:00"))
+        remaining_sec = max(0.0, (deadline - now).total_seconds())
+    except (ValueError, TypeError):
+        return None
+    accrued = j.get("accrued_cost_usd") or 0.0
+    return accrued + burn_rate * (remaining_sec / 3600)
+
+
 def cmd_compute(args: argparse.Namespace) -> None:
-    """Dispatch compute subcommands: list / show / kill / analyze."""
+    """Dispatch compute subcommands: list / show / kill / analyze / run."""
     sub = getattr(args, "compute_cmd", None) or "list"
     if sub == "kill":
         _compute_kill(args)
@@ -3318,19 +3448,29 @@ def cmd_compute(args: argparse.Namespace) -> None:
         _compute_analyze(args)
     elif sub == "show":
         _compute_show(args)
+    elif sub == "run":
+        _compute_run_local(args)
     else:
         _compute_list(args)
 
 
 def _compute_list(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
-    finished = getattr(args, "include_finished", 360)
     limit = getattr(args, "limit", 20)
-    resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
-               f"?include_finished_minutes={finished}&limit={limit}")
+    status_filter = getattr(args, "status_filter", None)
+    if getattr(args, "all_terminal", False):
+        resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
+                   f"?all_terminal=true&limit={limit}")
+    else:
+        finished = getattr(args, "include_finished", 360)
+        resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
+                   f"?include_finished_minutes={finished}&limit={limit}")
     jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
     has_more = resp.get("has_more", False) if isinstance(resp, dict) else False
-    _emit(args, {"compute_jobs": jobs, "has_more": has_more}, _render_compute_list)
+    summary = resp.get("summary") if isinstance(resp, dict) else None
+    if status_filter:
+        jobs = [j for j in jobs if j.get("status", "").upper() == status_filter.upper()]
+    _emit(args, {"compute_jobs": jobs, "has_more": has_more, "summary": summary, "status_filter": status_filter}, _render_compute_list)
 
 
 def _render_compute_list(data: dict) -> None:
@@ -3339,6 +3479,7 @@ def _render_compute_list(data: dict) -> None:
     if not jobs:
         print("  (none)")
         return
+    now = datetime.now(timezone.utc)
     for j in jobs:
         jid = (j.get("id") or "?")[:8]
         status = j.get("status", "?")
@@ -3346,13 +3487,40 @@ def _render_compute_list(data: dict) -> None:
         task_type = j.get("task_type") or "?"
         cost = j.get("final_cost_usd")
         cost_str = f"  ${cost:.2f}" if cost is not None else ""
-        verdict = (j.get("criterion_verdict") or {}).get("met") if isinstance(j.get("criterion_verdict"), dict) else None
-        verdict_str = f"  met={verdict}" if verdict is not None else ""
+        cv = j.get("criterion_verdict") if isinstance(j.get("criterion_verdict"), dict) else None
+        if cv is not None:
+            metric = cv.get("metric")
+            value = cv.get("value")
+            if metric and value is not None:
+                verdict_str = f"  met={cv.get('met')} ({metric}={value})"
+            else:
+                verdict_str = f"  met={cv.get('met')}"
+        else:
+            verdict_str = ""
         exp = (j.get("experiment") or "")[:20]
         exp_str = f"  exp={exp}" if exp else ""
-        print(f"  {jid}  {status:12} [{task_type}]  {title}{cost_str}{verdict_str}{exp_str}")
-    if data.get("has_more"):
-        print("  (more jobs available; increase --limit or --include-finished)")
+        burn = _compute_job_burn_rate(j, now)
+        burn_str = f"  burn=${burn:.2f}/hr" if burn is not None else ""
+        print(f"  {jid}  {status:12} [{task_type}]  {title}{cost_str}{verdict_str}{exp_str}{burn_str}")
+    status_filter = data.get("status_filter")
+    if data.get("has_more") and not status_filter:
+        print("  (more jobs available; increase --limit, --include-finished, or use --all-terminal)")
+    if status_filter:
+        total = len(jobs)
+        active = sum(1 for j in jobs if j.get("status", "").upper() in _ACTIVE_COMPUTE_STATUSES)
+        spend = sum(j.get("final_cost_usd") or 0.0 for j in jobs)
+        measured = sum(1 for j in jobs if isinstance(j.get("criterion_verdict"), dict) and j["criterion_verdict"].get("measurable"))
+        met = sum(1 for j in jobs if isinstance(j.get("criterion_verdict"), dict) and j["criterion_verdict"].get("met"))
+        print(f"  --- {total} jobs | {active} active | ${spend:.2f} total spend | {met}/{measured} criteria met ---")
+    else:
+        summary = data.get("summary") or {}
+        if summary:
+            total = summary.get("total_jobs", len(jobs))
+            active = summary.get("active_jobs", 0)
+            spend = summary.get("total_spend_usd", 0.0)
+            measured = summary.get("criterion_measured", 0)
+            met = summary.get("criterion_met", 0)
+            print(f"  --- {total} jobs | {active} active | ${spend:.2f} total spend | {met}/{measured} criteria met ---")
 
 
 def _compute_kill(args: argparse.Namespace) -> None:
@@ -3369,9 +3537,21 @@ def _compute_kill(args: argparse.Namespace) -> None:
 def _compute_show(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
     job_id = args.job_id
-    resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs?include_finished_minutes=10080&limit=200")
-    jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
-    job = next((j for j in jobs if j.get("id", "").startswith(job_id) or j.get("id") == job_id), None)
+    # Prefix-match: fetch list and resolve when a short prefix is given.
+    # Full IDs have 4 dashes (e.g. cjob-aaa0-0000-0000-000000000001); fewer
+    # dashes means the caller supplied a prefix.
+    if job_id.count("-") < 4:
+        resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs?all_terminal=true&limit=200")
+        jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
+        job = next((j for j in jobs if j.get("id", "").startswith(job_id)), None)
+        if job is None:
+            print(f"No compute job found matching '{job_id}'.")
+            return
+        full_id = job["id"]
+    else:
+        full_id = job_id
+    resp2 = api("GET", f"/api/admin/compute-jobs/{full_id}")
+    job = resp2.get("compute_job") if isinstance(resp2, dict) else None
     if job is None:
         print(f"No compute job found matching '{job_id}'.")
         return
@@ -3381,7 +3561,8 @@ def _compute_show(args: argparse.Namespace) -> None:
 def _render_compute_show(data: dict) -> None:
     j = data.get("compute_job") or {}
     print(f"=== COMPUTE JOB: {j.get('id', '?')} ===")
-    print(f"  status    : {j.get('status', '?')}")
+    status = j.get("status", "?")
+    print(f"  status    : {status}")
     print(f"  title     : {j.get('task_title') or j.get('title') or '—'}")
     print(f"  type      : {j.get('task_type', '?')}")
     experiment = j.get("experiment")
@@ -3390,20 +3571,108 @@ def _render_compute_show(data: dict) -> None:
     hypothesis = j.get("hypothesis")
     if hypothesis:
         print(f"  hypothesis: {hypothesis}")
-    cost = j.get("final_cost_usd")
-    if cost is not None:
-        print(f"  cost      : ${cost:.4f}")
+    status = j.get("status", "")
+    if status in _ACTIVE_COMPUTE_STATUSES:
+        now = datetime.now(timezone.utc)
+        accrued = j.get("accrued_cost_usd")
+        if accrued is not None:
+            print(f"  accrued   : ${accrued:.4f}")
+        burn = _compute_job_burn_rate(j, now)
+        if burn is not None:
+            print(f"  burn rate : ${burn:.2f}/hr")
+            proj = _compute_job_projected_spend(j, burn, now)
+            if proj is not None:
+                cap = j.get("spend_cap_usd")
+                cap_warn = "  ⚠ projected to exceed cap" if (cap is not None and proj > cap) else ""
+                print(f"  projected : ${proj:.2f}{cap_warn}")
+        cap = j.get("spend_cap_usd")
+        if cap is not None:
+            print(f"  spend cap : ${cap:.2f}")
+        deadline = j.get("wall_clock_deadline")
+        if deadline:
+            print(f"  deadline  : {deadline}")
+    else:
+        cost = j.get("final_cost_usd")
+        if cost is not None:
+            print(f"  cost      : ${cost:.4f}")
     exit_code = (j.get("polling_metadata") or {}).get("exit_code")
     if exit_code is not None:
         print(f"  exit_code : {exit_code}")
-    metrics = j.get("result_metrics")
+    polling_meta = j.get("polling_metadata") or {}
+    command_log = polling_meta.get("command_log")
+    if isinstance(command_log, dict):
+        text = command_log.get("text")
+        if isinstance(text, str) and text.strip():
+            print("  Command log:")
+            for line in text.split("\n"):
+                print(f"    {line}")
+    metrics = polling_meta.get("result_metrics") or j.get("result_metrics")
     if metrics:
-        print(f"  metrics   : {metrics}")
+        arms = metrics.get("arms") if isinstance(metrics, dict) else None
+        scalar_items = {k: v for k, v in metrics.items() if k != "arms"} if isinstance(metrics, dict) else {}
+        if scalar_items:
+            print(f"  metrics   : {scalar_items}")
+        if arms:
+            print("  per-arm results:")
+            if isinstance(arms, dict):
+                for arm_name, arm_metrics in arms.items():
+                    if isinstance(arm_metrics, dict):
+                        label = arm_metrics.get("label")
+                        note = arm_metrics.get("note")
+                        log = arm_metrics.get("log")
+                        scalar_metrics = {k: v for k, v in arm_metrics.items() if k not in ("label", "note", "log")}
+                        print(f"    [{arm_name}]", end="")
+                        if scalar_metrics:
+                            print(f" {scalar_metrics}", end="")
+                        print()
+                        if label:
+                            print(f"      label: {label}")
+                        if note:
+                            print(f"      note: {note}")
+                        if log:
+                            print("      log:")
+                            for log_line in log.split("\n"):
+                                print(f"        {log_line}")
+                    else:
+                        print(f"    [{arm_name}] {arm_metrics}")
+            elif isinstance(arms, list):
+                for i, arm_entry in enumerate(arms):
+                    if isinstance(arm_entry, dict):
+                        heading = arm_entry.get("label") or arm_entry.get("name") or arm_entry.get("arm") or f"[{i}]"
+                        label = arm_entry.get("label")
+                        note = arm_entry.get("note")
+                        log = arm_entry.get("log")
+                        scalar_metrics = {k: v for k, v in arm_entry.items() if k not in ("label", "name", "arm", "note", "log")}
+                        print(f"    [{heading}]", end="")
+                        if scalar_metrics:
+                            print(f" {scalar_metrics}", end="")
+                        print()
+                        if label:
+                            print(f"      label: {label}")
+                        if note:
+                            print(f"      note: {note}")
+                        if log:
+                            print("      log:")
+                            for log_line in log.split("\n"):
+                                print(f"        {log_line}")
+                    else:
+                        print(f"    [{i}] {arm_entry}")
     verdict = j.get("criterion_verdict")
     if isinstance(verdict, dict):
         met = verdict.get("met")
-        reason = verdict.get("reason") or ""
-        print(f"  criterion : met={met}  {reason}")
+        metric = verdict.get("metric", "")
+        value = verdict.get("value")
+        threshold = verdict.get("threshold")
+        op = verdict.get("operator", "")
+        margin_str = ""
+        if value is not None and threshold is not None:
+            try:
+                margin = float(value) - float(threshold)
+                margin_str = f"  margin={margin:+.4g}"
+            except (TypeError, ValueError):
+                pass
+        val_str = f"  {metric} {op} {threshold} (got {value})" if metric else ""
+        print(f"  criterion : met={met}{val_str}{margin_str}")
     ref = j.get("result_reference")
     if ref:
         print(f"  result_ref: {ref}")
@@ -3424,6 +3693,182 @@ def _compute_analyze(args: argparse.Namespace) -> None:
         f"outcome={r.get('outcome', '?')}  "
         f"knowledge_doc={r.get('knowledge_document_id', 'none')}"
     ))
+
+
+_CRITERION_OPS = {
+    ">=": lambda a, b: a >= b,
+    "<=": lambda a, b: a <= b,
+    ">": lambda a, b: a > b,
+    "<": lambda a, b: a < b,
+    "==": lambda a, b: a == b,
+    "!=": lambda a, b: a != b,
+}
+
+
+def _coerce_number(value: object) -> float | None:
+    """Return value as float when it is a real number (bool excluded), else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _find_metric_case_insensitive(metrics: dict, metric: str) -> object:
+    """Return the value for metric using case/whitespace-normalized key lookup.
+
+    Returns None when no key matches or multiple distinct keys match (fail closed).
+    """
+    normalized = metric.strip().lower()
+    matches = [(k, v) for k, v in metrics.items() if k.strip().lower() == normalized]
+    if len(matches) == 1:
+        return matches[0][1]
+    return None  # missing or ambiguous
+
+
+def _evaluate_criterion(metrics: dict | None, criterion: dict) -> dict:
+    """Evaluate a success criterion against captured metrics.
+
+    Returns a dict with keys: verdict ("MET"|"NOT MET"|"NOT EVALUABLE"),
+    metric, operator, threshold, value (float|None), met (bool).
+    Fail-closed: any missing/invalid/ambiguous input yields NOT EVALUABLE + met=False.
+    """
+    metric_name = criterion.get("metric")
+    op = criterion.get("operator")
+    threshold = criterion.get("threshold")
+
+    base = {"metric": metric_name, "operator": op, "threshold": threshold,
+            "value": None, "met": False}
+
+    fn = _CRITERION_OPS.get(op) if op else None
+    thr = _coerce_number(threshold)
+
+    if not metric_name or fn is None or thr is None:
+        return {"verdict": "NOT EVALUABLE", **base}
+
+    if metrics is None:
+        return {"verdict": "NOT EVALUABLE", **base}
+
+    raw_value = _find_metric_case_insensitive(metrics, metric_name)
+    value = _coerce_number(raw_value)
+    if value is None:
+        return {"verdict": "NOT EVALUABLE", **base}
+
+    met = fn(value, thr)
+    verdict = "MET" if met else "NOT MET"
+    return {"verdict": verdict, "metric": metric_name, "operator": op,
+            "threshold": thr, "value": value, "met": met}
+
+
+def _compute_run_local(args: argparse.Namespace) -> None:
+    """Execute a compute_experiment command locally without the orchestrator.
+
+    Sets BLUEPRINT_RESULT_FILE and BLUEPRINT_ARTIFACT_DIR so the command can
+    emit metrics and artifacts via the standard file-contract, then reports the
+    result inline.
+    """
+    declared_metric: str | None = None
+    success_criterion: dict | None = None
+    if getattr(args, "local_spec", None):
+        # --local <spec.json>: read spec file; validate_backend_name is bypassed
+        # because we call subprocess.run directly (no DB-backed flow).
+        if getattr(args, "run_command", None):
+            print("warning: both a positional command and --local were given; --local takes precedence")
+        try:
+            with open(args.local_spec) as f:
+                spec = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: could not read spec file {args.local_spec!r}: {exc}")
+            sys.exit(1)
+        command = spec.get("command")
+        if not command:
+            print("error: spec JSON must contain a 'command' field")
+            sys.exit(1)
+        declared_metric = spec.get("declared_metric")
+        raw_sc = spec.get("success_criterion")
+        if isinstance(raw_sc, dict):
+            success_criterion = raw_sc
+        elif raw_sc is not None:
+            print("error: spec 'success_criterion' must be an object with metric/operator/threshold")
+            sys.exit(1)
+    else:
+        command = args.run_command
+
+    # CLI flags as fallback criterion source (spec takes precedence)
+    if success_criterion is None:
+        cm = getattr(args, "criterion_metric", None)
+        co = getattr(args, "criterion_op", None)
+        ct = getattr(args, "criterion_threshold", None)
+        if cm is not None and co is not None and ct is not None:
+            success_criterion = {"metric": cm, "operator": co, "threshold": ct}
+
+    if command is None:
+        print("error: provide a run command or --local <spec.json>")
+        sys.exit(1)
+
+    tmpdir = tempfile.mkdtemp(prefix="blueprint-compute-run-")
+    result_file = os.path.join(tmpdir, "result.json")
+    artifact_dir = os.path.join(tmpdir, "artifacts")
+    os.makedirs(artifact_dir, exist_ok=True)
+    env = os.environ.copy()
+    env["BLUEPRINT_RESULT_FILE"] = result_file
+    env["BLUEPRINT_ARTIFACT_DIR"] = artifact_dir
+
+    print(f"command     : {command}")
+    print(f"result_file : {result_file}")
+    if declared_metric:
+        print(f"declared    : {declared_metric}")
+    if success_criterion:
+        sc = success_criterion
+        print(f"criterion   : {sc.get('metric')} {sc.get('operator')} {sc.get('threshold')}")
+    print("running...")
+
+    proc = subprocess.run(["bash", "-lc", command], env=env)
+    exit_code = proc.returncode
+    status = "SUCCEEDED" if exit_code == 0 else "FAILED"
+
+    metrics: dict | None = None
+    if os.path.exists(result_file):
+        try:
+            with open(result_file) as f:
+                metrics = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  warning: could not parse result file: {exc}")
+
+    verdict: dict | None = None
+    if success_criterion is not None:
+        verdict = _evaluate_criterion(metrics, success_criterion)
+
+    result = {"status": status, "exit_code": exit_code, "metrics": metrics,
+              "declared_metric": declared_metric, "verdict": verdict}
+
+    def _render(r: dict) -> None:
+        print(f"status      : {r['status']} (exit_code={r['exit_code']})")
+        m = r.get("metrics")
+        dm = r.get("declared_metric")
+        if m:
+            print(f"metrics     : {m}")
+            if dm:
+                val = m.get(dm)
+                if val is not None:
+                    print(f"  {dm} (declared) : {val}")
+                else:
+                    print(f"  {dm} (declared) : NOT CAPTURED")
+        else:
+            print("metrics     : (none emitted)")
+        v = r.get("verdict")
+        if v:
+            vstr = v["verdict"]
+            val = v.get("value")
+            op = v.get("operator")
+            thr = v.get("threshold")
+            mn = v.get("metric")
+            if val is not None:
+                print(f"verdict     : {vstr}  ({mn}={val} {op} {thr})")
+            else:
+                print(f"verdict     : {vstr}  ({mn} not evaluable)")
+
+    _emit(args, result, _render)
 
 
 # ── argument parser ──────────────────────────────────────────────────────────
@@ -3493,6 +3938,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_tasks_list.add_argument("--direction", help="Filter by direction id.")
     p_tasks_list.add_argument("--search", help="Substring search over title/desc/message.")
     p_tasks_list.add_argument("--limit", type=int, default=50, help="Max tasks (default 50).")
+    p_tasks_list.add_argument("--offset", type=int, default=0,
+                              help="Skip the first N tasks (server-side pagination; "
+                                   "combine with --limit to page through results).")
+    p_tasks_list.add_argument("--blocked", action="store_true",
+                              help="Show only tasks in BLOCKED status (dependency "
+                                   "unresolved). Appends BLOCKED to any --status values.")
+    p_tasks_list.add_argument("--approval-needed", dest="approval_needed",
+                              action="store_true",
+                              help="Show only tasks that require human approval.")
+    p_tasks_list.add_argument("--failure-class", dest="failure_class", action="append",
+                              default=[], choices=sorted(FAILURE_CLASSES), metavar="CLASS",
+                              help="Keep only tasks whose failure_class matches (repeatable). "
+                                   "Filters CLIENT-SIDE after fetching (matches the web "
+                                   "console); raises the internal fetch limit to 500 so "
+                                   "filtering has enough rows. Only FAILED/CANCELLED tasks "
+                                   "carry a failure_class.")
     p_tasks_list.add_argument("--version", help="UNSUPPORTED by the API — prints a notice "
                                                 "(Task has no release-version linkage).")
     p_tasks_show = tasks_sub.add_parser("show", parents=[common], help="Show one task by id.")
@@ -3947,6 +4408,7 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Filter by source kind (e.g. web_research, design).")
     p_kl.add_argument("--q", help="Full-text search query.")
     p_kl.add_argument("--topic", help="Filter by topic.")
+    p_kl.add_argument("--tag", help="Filter by tag (exact match).")
     p_kl.add_argument("--limit", type=int, default=20,
                       help="Max documents to return (default 20).")
     p_ks = knowledge_sub.add_parser("show", parents=[common],
@@ -3965,11 +4427,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_compute_list.add_argument(
         "--include-finished", dest="include_finished", type=int, default=360,
         help="Include jobs that finished within this many minutes (default 360).")
+    p_compute_list.add_argument(
+        "--all-terminal", dest="all_terminal", action="store_true",
+        help="List all terminal jobs regardless of age (bypasses the 7-day window limit).")
     p_compute_list.add_argument("--limit", type=int, default=20,
                                 help="Max jobs to return (default 20).")
+    p_compute_list.add_argument("--status", dest="status_filter", default=None,
+                                help="Filter rows by status (e.g. RUNNING, SUCCEEDED, FAILED).")
     p_compute_show = compute_sub.add_parser(
         "show", parents=[common],
-        help="Show full details for one compute job (metrics, verdict, knowledge doc).")
+        help="Show full details for one compute job (metrics, verdict, knowledge doc). "
+             "Searches all history regardless of age.")
     p_compute_show.add_argument("job_id", help="Compute job id prefix or full UUID.")
     p_compute_kill = compute_sub.add_parser(
         "kill", parents=[common],
@@ -3983,6 +4451,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_compute_analyze.add_argument("job_id", help="Compute job id (UUID).")
     p_compute_analyze.add_argument("--yes", action="store_true",
                                    help="Skip the confirmation prompt.")
+    p_compute_run = compute_sub.add_parser(
+        "run", parents=[common],
+        help="Run a compute_experiment command locally (no orchestrator, no DB, no GCP).",
+        description="Execute a compute_experiment command locally on this machine. "
+                    "Sets BLUEPRINT_RESULT_FILE and BLUEPRINT_ARTIFACT_DIR so the command "
+                    "can emit metrics via the standard file contract, then reports the result.")
+    p_compute_run.add_argument(
+        "run_command", nargs="?", default=None,
+        help="Bash command string to execute. "
+             "Write a flat JSON object of {metric: value} to $BLUEPRINT_RESULT_FILE to report metrics.")
+    p_compute_run.add_argument(
+        "--local", dest="local_spec", metavar="SPEC_JSON",
+        help="Path to a spec JSON file. The JSON must contain 'command' (str), and "
+             "optionally 'declared_metric' (str) and 'success_criterion' (object with "
+             "metric/operator/threshold). Runs the command locally without the orchestrator."
+    )
+    p_compute_run.add_argument(
+        "--criterion-metric", dest="criterion_metric", default=None, metavar="METRIC",
+        help="Metric name for success criterion (positional form only; spec takes precedence).")
+    p_compute_run.add_argument(
+        "--criterion-op", dest="criterion_op", default=None, metavar="OP",
+        help="Operator for success criterion: >= <= > < == !=")
+    p_compute_run.add_argument(
+        "--criterion-threshold", dest="criterion_threshold", type=float, default=None,
+        metavar="THRESHOLD",
+        help="Threshold for success criterion.")
 
     # playbook
     p_pb = sub.add_parser("playbook", parents=[common],

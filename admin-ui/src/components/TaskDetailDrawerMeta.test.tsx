@@ -3,6 +3,7 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/re
 import { DetailsTab } from './TaskDetailDrawerMeta';
 import type { Task } from '../types/task';
 import { authGet, fetchComputeJobs, resolveArtifactDownloadUrl, resolveViewportFailureDownloadUrl, resolveViewportShotDownloadUrl } from '../api';
+import type { ComputeJob, ComputeJobsListResponse } from '../api';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -16,13 +17,31 @@ vi.mock('../api', () => ({
   authGet: vi.fn(async () => new Response(JSON.stringify({ stats: {} }), { status: 200 })),
   apiFetch: vi.fn(async () => new Response(JSON.stringify({ task_id: 'task-1', fix_loop_history: {}, summary: {} }), { status: 200 })),
   API_BASE_URL: 'http://localhost:8000',
-  fetchComputeJobs: vi.fn(async () => []),
+  fetchComputeJobs: vi.fn(async () => ({ jobs: [], hasMore: false, summary: { total_jobs: 0, active_jobs: 0, terminal_jobs: 0, total_spend_usd: 0, outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0 }, limit: 50, offset: 0 })),
   fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
   resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
   resolveViewportFailureDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport/screenshot.png'),
   resolveViewportShotDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport-shots/shot.png'),
   fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
 }));
+
+function wrapJobs(jobs: ComputeJob[], hasMore = false): ComputeJobsListResponse {
+  return {
+    jobs,
+    hasMore,
+    summary: {
+      total_jobs: jobs.length,
+      active_jobs: 0,
+      terminal_jobs: jobs.length,
+      total_spend_usd: 0,
+      outcome_breakdown: {},
+      criterion_measured: 0,
+      criterion_met: 0,
+    },
+    limit: 50,
+    offset: 0,
+  };
+}
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -564,7 +583,7 @@ describe('DetailsTab — Merge Test Gate', () => {
   });
 
   it('renders the terminal compute result reference when present', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       {
         id: 'job-1',
         project_id: 'proj-1',
@@ -588,7 +607,7 @@ describe('DetailsTab — Merge Test Gate', () => {
         task_title: 'compute_experiment: run a budgeted job',
         task_type: 'compute_experiment',
       },
-    ]);
+    ]));
     const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
     render(<DetailsTab task={task} />);
     expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', undefined, 10_080);
@@ -599,12 +618,12 @@ describe('DetailsTab — Merge Test Gate', () => {
   });
 
   it('surfaces COMPUTE_RESULT artifact as the primary outcome with a resolvable reference', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       makeComputeJob({
         artifact_id: 'artifact-xyz',
         result_reference: 'https://storage.example.com/jobs/job-1/result.json',
       }),
-    ]);
+    ]));
     const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
     render(<DetailsTab task={task} />);
     const artifact = await screen.findByText('COMPUTE_RESULT artifact');
@@ -617,9 +636,9 @@ describe('DetailsTab — Merge Test Gate', () => {
   });
 
   it('surfaces COMPUTE_RESULT artifact even when result_reference is null (non-openable)', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       makeComputeJob({ artifact_id: 'artifact-xyz', result_reference: null }),
-    ]);
+    ]));
     const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
     render(<DetailsTab task={task} />);
     const artifact = await screen.findByText('COMPUTE_RESULT artifact');
@@ -629,9 +648,9 @@ describe('DetailsTab — Merge Test Gate', () => {
   });
 
   it('shows no artifact affordance when artifact_id is absent', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       makeComputeJob({ artifact_id: null, result_reference: null }),
-    ]);
+    ]));
     const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
     render(<DetailsTab task={task} />);
     await screen.findByText('gcp_compute_engine');
@@ -640,7 +659,7 @@ describe('DetailsTab — Merge Test Gate', () => {
 
   it('resolves a gs:// compute result through the admin API before opening', async () => {
     const openSpy = vi.spyOn(window, 'open').mockReturnValue({ opener: null, location: { replace: vi.fn() }, close: vi.fn() } as never);
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       {
         id: 'job-1',
         project_id: 'proj-1',
@@ -666,7 +685,7 @@ describe('DetailsTab — Merge Test Gate', () => {
         task_title: 'compute_experiment: run a budgeted job',
         task_type: 'compute_experiment',
       },
-    ]);
+    ]));
     const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
     render(<DetailsTab task={task} />);
     const button = await screen.findByRole('button', { name: /gs:\/\/blueprint-agent-artifacts\/tasks\/task-verify-1\/result\.json/i });
@@ -680,7 +699,7 @@ describe('DetailsTab — Merge Test Gate', () => {
   });
 
   it('renders linked compute-result artifacts distinctly from raw result references', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       {
         id: 'job-1',
         project_id: 'proj-1',
@@ -737,7 +756,7 @@ describe('DetailsTab — Merge Test Gate', () => {
         task_title: 'compute_experiment: run a budgeted job',
         task_type: 'compute_experiment',
       },
-    ]);
+    ]));
     const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
     render(<DetailsTab task={task} />);
     expect(await screen.findByText('Compute Result Artifact')).toBeInTheDocument();
@@ -1385,7 +1404,7 @@ describe('DetailsTab — Compute Experiment Contract', () => {
   afterEach(() => cleanup());
 
   it('renders the launch contract block for compute_experiment tasks', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([makeComputeJob()]);
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([makeComputeJob()]));
     const task = makeTask({
       task_type: 'compute_experiment',
       project_id: 'proj-1' as unknown as Task['project_id'],
@@ -1404,7 +1423,7 @@ describe('DetailsTab — Compute Experiment Contract', () => {
   });
 
   it('renders success criterion row when present on the payload', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([makeComputeJob()]);
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([makeComputeJob()]));
     const task = makeTask({
       task_type: 'compute_experiment',
       project_id: 'proj-1' as unknown as Task['project_id'],
@@ -1422,7 +1441,7 @@ describe('DetailsTab — Compute Experiment Contract', () => {
   });
 
   it('renders machine type from the ComputeJob for compute_experiment tasks', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([makeComputeJob({ machine_type: 'n1-highmem-8' })]);
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([makeComputeJob({ machine_type: 'n1-highmem-8' })]));
     const task = makeTask({
       task_type: 'compute_experiment',
       project_id: 'proj-1' as unknown as Task['project_id'],
@@ -1433,9 +1452,9 @@ describe('DetailsTab — Compute Experiment Contract', () => {
   });
 
   it('renders accelerator type and count from the ComputeJob', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       makeComputeJob({ accelerator_type: 'T4', accelerator_count: 2 }),
-    ]);
+    ]));
     const task = makeTask({
       task_type: 'compute_experiment',
       project_id: 'proj-1' as unknown as Task['project_id'],
@@ -1447,9 +1466,9 @@ describe('DetailsTab — Compute Experiment Contract', () => {
   });
 
   it('styles a SPEND_CAP_EXCEEDED kill as amber, not red', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       makeComputeJob({ status: 'FAILED', outcome: 'SPEND_CAP_EXCEEDED', terminal_reason: 'budget exhausted' }),
-    ]);
+    ]));
     const task = makeTask({
       task_type: 'compute_experiment',
       project_id: 'proj-1' as unknown as Task['project_id'],
@@ -1462,9 +1481,9 @@ describe('DetailsTab — Compute Experiment Contract', () => {
   });
 
   it('styles a TIMED_OUT kill as amber, not red', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       makeComputeJob({ status: 'TIMED_OUT', outcome: 'TIMED_OUT', terminal_reason: 'deadline exceeded' }),
-    ]);
+    ]));
     const task = makeTask({
       task_type: 'compute_experiment',
       project_id: 'proj-1' as unknown as Task['project_id'],
@@ -1477,9 +1496,9 @@ describe('DetailsTab — Compute Experiment Contract', () => {
   });
 
   it('styles an operator-cancelled job as amber, not red', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       makeComputeJob({ status: 'CANCELLED', outcome: 'CANCELLED', terminal_reason: 'cancelled by operator' }),
-    ]);
+    ]));
     const task = makeTask({
       task_type: 'compute_experiment',
       project_id: 'proj-1' as unknown as Task['project_id'],
@@ -1492,9 +1511,9 @@ describe('DetailsTab — Compute Experiment Contract', () => {
   });
 
   it('styles a genuine FAILURE as red, not amber', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       makeComputeJob({ status: 'FAILED', outcome: 'FAILURE', terminal_reason: 'process exited with code 1' }),
-    ]);
+    ]));
     const task = makeTask({
       task_type: 'compute_experiment',
       project_id: 'proj-1' as unknown as Task['project_id'],
@@ -1507,9 +1526,9 @@ describe('DetailsTab — Compute Experiment Contract', () => {
   });
 
   it('shows terminal_reason text when non-null on a terminal job', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([
       makeComputeJob({ status: 'FAILED', outcome: 'FAILURE', terminal_reason: 'OOM killed at epoch 5' }),
-    ]);
+    ]));
     const task = makeTask({
       task_type: 'compute_experiment',
       project_id: 'proj-1' as unknown as Task['project_id'],
@@ -1520,7 +1539,7 @@ describe('DetailsTab — Compute Experiment Contract', () => {
   });
 
   it('omits the launch contract block for non-compute_experiment task types', async () => {
-    vi.mocked(fetchComputeJobs).mockResolvedValueOnce([makeComputeJob({ task_type: 'create' })]);
+    vi.mocked(fetchComputeJobs).mockResolvedValueOnce(wrapJobs([makeComputeJob({ task_type: 'create' })]));
     const task = makeTask({
       task_type: 'create',
       project_id: 'proj-1' as unknown as Task['project_id'],

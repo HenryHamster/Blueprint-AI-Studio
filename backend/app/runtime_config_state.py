@@ -132,15 +132,15 @@ runtime_config: Dict = {
     # growth in task.context. When it trips, it enrolls a DEDUPLICATED finding
     # into the EXISTING evergreen ledger (same triage as a correctness finding)
     # — no new queue, no schema change. Mirrors evergreen_fill_mode exactly.
-    #   off     — never act (default; whole feature inert until an operator flips).
-    #   observe — measure + record the would-be finding, enroll nothing.
+    #   off     — never act.
+    #   observe — measure + record the would-be finding, enroll nothing (default).
     #   enforce — enroll the deduped finding.
     "structural_health_audit_mode": os.getenv(
-        "STRUCTURAL_HEALTH_AUDIT_MODE", "off"
+        "STRUCTURAL_HEALTH_AUDIT_MODE", "observe"
     ).lower()
-    if os.getenv("STRUCTURAL_HEALTH_AUDIT_MODE", "off").lower()
+    if os.getenv("STRUCTURAL_HEALTH_AUDIT_MODE", "observe").lower()
     in ("off", "observe", "enforce")
-    else "off",
+    else "observe",
     # Cadence (minutes) between structural-health audit sweeps in the reaper loop.
     "structural_health_audit_interval_minutes": int(
         os.getenv("STRUCTURAL_HEALTH_AUDIT_INTERVAL_MINUTES", "60")
@@ -1387,6 +1387,28 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                     if raw_mode in ("off", "observe", "enforce"):
                         _set("evergreen_fill_mode", raw_mode)
+                if "structural_health_audit_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["structural_health_audit_mode"] or "").strip().lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("structural_health_audit_mode", raw_mode)
+                if "structural_health_audit_interval_minutes" in config_json:
+                    try:
+                        _set(
+                            "structural_health_audit_interval_minutes",
+                            int(config_json["structural_health_audit_interval_minutes"]),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                if "structural_health_audit_fat_row_bytes" in config_json:
+                    try:
+                        _set(
+                            "structural_health_audit_fat_row_bytes",
+                            int(config_json["structural_health_audit_fat_row_bytes"]),
+                        )
+                    except (TypeError, ValueError):
+                        pass
                 if "cochange_decomposition_enabled" in config_json:
                     _set(
                         "cochange_decomposition_enabled",

@@ -1268,14 +1268,17 @@ exit "$EXIT_CODE"
 """
 
 
-def _decode_result_metrics(raw_b64: str | None) -> dict[str, float] | None:
-    """Decode a base64 metrics marker into a bounded, numeric-only dict.
+def _decode_result_metrics(raw_b64: str | None) -> dict[str, Any] | None:
+    """Decode a base64 metrics marker into a bounded dict.
 
     Defensive by contract: any decode/parse/shape error — missing, oversized,
     non-base64, non-JSON, non-object — yields ``None`` (metrics simply ABSENT).
     Per-entry, only numeric and boolean values survive (bool coerced to a
-    number); strings, nulls, and nested objects/arrays are dropped. The monitor
-    must NEVER raise on a garbled marker, so all failure modes funnel to ``None``.
+    number); strings, nulls, and other nested objects/arrays are dropped.
+    Exception: the ``arms`` key (an A/B multi-arm comparison block — a dict or
+    list) is preserved verbatim so downstream consumers can render per-arm
+    results. The monitor must NEVER raise on a garbled marker, so all failure
+    modes funnel to ``None``.
     """
     if not raw_b64:
         return None
@@ -1294,11 +1297,17 @@ def _decode_result_metrics(raw_b64: str | None) -> dict[str, float] | None:
         return None
     if not isinstance(parsed, dict):
         return None
-    metrics: dict[str, float] = {}
+    metrics: dict[str, Any] = {}
     for key, value in parsed.items():
         if len(metrics) >= _MAX_RESULT_METRICS:
             break
         if not isinstance(key, str):
+            continue
+        # Preserve the arms block verbatim — it is a structured A/B comparison
+        # block (dict or non-empty list) and must survive into polling_metadata
+        # so _extract_experiment_arms can find and surface it.
+        if key == "arms" and isinstance(value, (dict, list)) and value:
+            metrics[key] = value
             continue
         # bool is a subclass of int — coerce explicitly before the int/float test.
         if isinstance(value, bool):
@@ -1308,7 +1317,7 @@ def _decode_result_metrics(raw_b64: str | None) -> dict[str, float] | None:
             if not math.isfinite(numeric):
                 continue
             metrics[key] = numeric
-        # strings, None, nested dict/list → dropped (not numeric)
+        # strings, None, other nested dict/list → dropped (not numeric)
     return metrics or None
 
 

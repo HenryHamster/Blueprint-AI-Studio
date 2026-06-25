@@ -447,6 +447,7 @@ async def _auto_stale_not_promoted_findings(
     """
     from app import github, release_qualifier
     from app.release_readiness import (
+        _KEYLESS_FINDING_SENTINEL,
         _REQUALIFICATION_GATING_SEVERITIES,
         _latest_carried_audit_findings,
         apply_finding_resolution,
@@ -503,9 +504,10 @@ async def _auto_stale_not_promoted_findings(
             return 0
 
         candidate_sha = qual.get("candidate_sha") or ""
-        if not head_sha or head_sha == candidate_sha:
-            # HEAD has not advanced — stale rows would be premature.
+        if not head_sha:
             return 0
+
+        head_advanced = head_sha != candidate_sha
 
         # Load the latest carried gating findings via the same resolution path
         # that compute_requalification_readiness uses.
@@ -519,7 +521,6 @@ async def _auto_stale_not_promoted_findings(
             if isinstance(f, dict)
             and str(f.get("severity") or "").lower()
             in _REQUALIFICATION_GATING_SEVERITIES
-            and f.get("key")
         ]
         if not gating_findings:
             return 0
@@ -542,9 +543,30 @@ async def _auto_stale_not_promoted_findings(
 
         written = 0
         for f in gating_findings:
-            key = f["key"]
+            # Findings without a content key (e.g. challenger-independent blockers
+            # persisted by _handle_independent_blocker) use a sentinel so they can
+            # be tracked in the ledger and resolved by the readiness check.
+            key = f.get("key") or _KEYLESS_FINDING_SENTINEL
             if key in existing_keys:
                 continue
+            # Keyed findings are anchored to specific code — only stale them when
+            # HEAD has genuinely advanced past the candidate SHA so the finding is
+            # no longer relevant to the current integration branch.
+            # Keyless findings have no code anchor (they are challenger-confirmed
+            # independent blockers without a hash key). When HEAD has NOT advanced
+            # they can still be auto-staled: re-qualification on the same HEAD will
+            # re-confirm or refute the finding, preventing permanent strand when
+            # the finding was a false positive.
+            if not head_advanced and key != _KEYLESS_FINDING_SENTINEL:
+                continue
+            note = (
+                "auto-staled: automain advanced past not_promoted candidate SHA"
+                if head_advanced
+                else (
+                    "auto-staled: keyless gating blocker on current HEAD — "
+                    "no code anchor; re-qualification will re-confirm or refute"
+                )
+            )
             await apply_finding_resolution(
                 session,
                 version.project_id,
@@ -552,21 +574,39 @@ async def _auto_stale_not_promoted_findings(
                 key,
                 "stale",
                 severity=str(f.get("severity") or "").lower() or None,
-                note=("auto-staled: automain advanced past not_promoted candidate SHA"),
+                note=note,
                 verified_against_sha=head_sha,
             )
             written += 1
 
         if written:
+            if head_advanced:
+                notify_msg = (
+                    f"v{version.version_number} auto-staled {written} finding(s): "
+                    f"automain advanced past candidate {candidate_sha[:12]} "
+                    f"to {head_sha[:12]}. A fresh qualification will be triggered."
+                )
+                log_msg = (
+                    "[RELEASE_QUALIFIER] auto_stale: wrote %d stale ledger row(s) "
+                    "for version %s (automain %s advanced past candidate %s)"
+                )
+                log_args = (written, version_id, head_sha[:12], candidate_sha[:12])
+            else:
+                notify_msg = (
+                    f"v{version.version_number} auto-staled {written} keyless "
+                    f"finding(s) on current HEAD {head_sha[:12]}: no code anchor — "
+                    "re-qualification will re-confirm or refute."
+                )
+                log_msg = (
+                    "[RELEASE_QUALIFIER] auto_stale: wrote %d stale ledger row(s) "
+                    "for version %s (keyless findings on current HEAD %s — no code anchor)"
+                )
+                log_args = (written, version_id, head_sha[:12])
             await _notify_operator(
                 session,
                 version,
                 "release_qualification_auto_stale",
-                (
-                    f"v{version.version_number} auto-staled {written} finding(s): "
-                    f"automain advanced past candidate {candidate_sha[:12]} "
-                    f"to {head_sha[:12]}. A fresh qualification will be triggered."
-                ),
+                notify_msg,
                 extra={
                     "written": written,
                     "candidate_sha": candidate_sha,
@@ -574,14 +614,7 @@ async def _auto_stale_not_promoted_findings(
                 },
             )
             await session.commit()
-            logger.info(
-                "[RELEASE_QUALIFIER] auto_stale: wrote %d stale ledger row(s) "
-                "for version %s (automain %s advanced past candidate %s)",
-                written,
-                version_id,
-                head_sha[:12],
-                candidate_sha[:12],
-            )
+            logger.info(log_msg, *log_args)
 
         return written
 

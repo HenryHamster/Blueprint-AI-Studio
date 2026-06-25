@@ -332,6 +332,14 @@ if [ "$USE_DOCKER" = "1" ] && [ -d ../agent/src ]; then
   ENV_ARGS="$ENV_ARGS -v ${AGENT_SRC_HOST_PATH}:/agent/src:ro"
 fi
 
+# Mount the repo root read-only so the operator CLI test suite
+# (scripts/test_blueprint_cli.py) can resolve REPO_ROOT to /repo and find
+# the ./check and ./blueprint wrappers it tests for existence/syntax.
+if [ "$USE_DOCKER" = "1" ] && [ -d .. ]; then
+  MSYS_NO_PATHCONV=1 REPO_HOST_PATH="$(cd .. && pwd)"
+  ENV_ARGS="$ENV_ARGS -v ${REPO_HOST_PATH}:/repo:ro"
+fi
+
 ENV_VARS="DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
   GCP_PROJECT_ID=test-project \
   LOCAL_MODE=true \
@@ -404,7 +412,7 @@ _run python3 -c "from app.main import app; print(f'OK: {len(app.routes)} routes'
 
 if [ "${1:-}" = "--standalone" ]; then
   echo "=== Standalone tests (no DB) ==="
-  _run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_admin_auth_invariant.py -v --noconftest
+  _run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_admin_auth_invariant.py /repo/scripts/test_blueprint_cli.py -v --noconftest
   exit 0
 fi
 
@@ -415,7 +423,7 @@ if [ $# -gt 0 ]; then
 fi
 
 echo "=== Standalone tests ==="
-_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_admin_auth_invariant.py -v --noconftest
+_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_admin_auth_invariant.py /repo/scripts/test_blueprint_cli.py -v --noconftest
 
 echo "=== Full test suite ==="
 if [ "${#TESTMON_ARGS[@]}" -gt 0 ]; then

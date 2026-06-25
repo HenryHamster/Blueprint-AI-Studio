@@ -598,12 +598,30 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
         # the audit report at scoring time, so the deadlock that afflicted the
         # old AUTHORIZED_TEST_DELETIONS allowlist (which required a backend
         # deploy to widen) cannot return.
+        # Start with LLM classifications (lowest priority).
         classifications: dict[str, str] = {}
         raw_cls = report.get("deleted_test_file_classifications")
         if isinstance(raw_cls, list):
             for item in raw_cls:
                 if isinstance(item, dict) and isinstance(item.get("path"), str):
                     classifications[item["path"]] = str(item.get("classification", ""))
+        # Overlay deterministic co-deletion classifications from computed_test_erosion
+        # (higher authority: derived from git diff --name-status, not LLM re-derivation).
+        # Only dead_code_removal is emitted deterministically; never genuine_erosion.
+        # A file cleared here passes without needing an LLM tag.
+        raw_det_cls = (
+            computed_erosion.get("deleted_test_file_classifications")
+            if isinstance(computed_erosion, dict)
+            else None
+        )
+        if isinstance(raw_det_cls, list):
+            for item in raw_det_cls:
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("path"), str)
+                    and str(item.get("classification", "")) == "dead_code_removal"
+                ):
+                    classifications[item["path"]] = "dead_code_removal"
         for f in deleted:
             cls = classifications.get(str(f), "")
             if cls == "genuine_erosion":

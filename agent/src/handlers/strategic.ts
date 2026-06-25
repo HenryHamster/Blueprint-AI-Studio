@@ -657,6 +657,27 @@ prompts, schemas, tools, or orchestration.` : '';
     if (!thinkerGateResult.ok) return;
     const analysisText = thinkerGateResult.analysisText;
 
+    // If the thinker emitted a version goal or theme (Section 7 files), pre-merge
+    // them into the problem_model JSON now so the executor's set-problem-model call
+    // carries them without needing to search prose. Non-fatal: if the merge fails
+    // (malformed JSON, write error) the executor can still proceed; the goal/theme
+    // stays unset this cycle and the thinker can retry next cycle.
+    const { newVersionGoal, newVersionTheme } = thinkerGateResult;
+    if (newVersionGoal || newVersionTheme) {
+      const pmPath = `/tmp/problem_model_${taskId}.json`;
+      try {
+        const pmRaw = fs.readFileSync(pmPath, 'utf8');
+        const pm = JSON.parse(pmRaw) as Record<string, unknown>;
+        if (newVersionGoal) pm.new_version_goal = newVersionGoal;
+        if (newVersionTheme) pm.new_version_theme = newVersionTheme;
+        fs.writeFileSync(pmPath, `${JSON.stringify(pm, null, 2)}\n`);
+        const merged = [newVersionGoal && 'new_version_goal', newVersionTheme && 'new_version_theme'].filter(Boolean).join(', ');
+        sendLog(ws, `[INFO] Pre-merged ${merged} into problem_model JSON\n`);
+      } catch (e) {
+        sendLog(ws, `[WARNING] Failed to pre-merge version goal/theme into problem_model JSON (executor will handle it): ${String(e)}\n`);
+      }
+    }
+
     // Scan thinker analysis for cited memo handles and persist them via the API.
     // The completion handler reads task.context["_strategic_cited_memo_ids"] to
     // count memos_cited — scanning the analysis text (where memos were shown
@@ -831,12 +852,16 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # Spawn a targeted investigation/knowledge task when something from the Recent
 # Work section needs attention NOW instead of waiting for the next autonomous
 # cycle. Choose the type by what you need:
-#   research     — codebase investigation that yields implementation findings
-#   plan         — decompose a large change into implementation subtasks
-#   web_research — external / web knowledge (best practices, unfamiliar
-#                  protocols/APIs/vendors); produces a citation-grounded doc
-#   design       — codebase-grounded design exploration for a subsystem before
-#                  implementation; produces a design document
+#   research          — codebase investigation that yields implementation findings
+#   plan              — decompose a large change into implementation subtasks
+#   web_research      — external / web knowledge (best practices, unfamiliar
+#                       protocols/APIs/vendors); produces a citation-grounded doc
+#   design            — codebase-grounded design exploration for a subsystem before
+#                       implementation; produces a design document
+#   compute_experiment — run a command and measure a declared metric to resolve a
+#                       falsifiable hypothesis; requires command, spend_cap_usd,
+#                       deadline_seconds; optional success_criterion {metric,
+#                       operator (<|>|<=|>=), threshold}
 # web_research and design are HIGH-ROI and chronically under-used: one durable
 # knowledge document de-risks every later task in the area and compounds across
 # cycles. Spawn them PROACTIVELY, not only reactively — signals that warrant one:
@@ -846,11 +871,19 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #     should be settled by a design doc instead of re-derived per task)
 #   - the "Existing knowledge documents" index is empty or thin for a direction
 #     you are actively advancing
-# (Implementation/PR types are intentionally NOT spawnable here — they flow
-# through the normal direction → research → plan → create path.)
+# (Implementation/PR types — create/fix/refactor/migrate/qa — are intentionally
+# NOT spawnable here; they flow through the normal direction → research → plan →
+# create path. compute_experiment is the exception: it is empirical measurement,
+# not implementation, so it IS spawnable directly from the strategist.)
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "web_research", "title": "...", "prompt": "What external knowledge to gather...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "design", "title": "...", "prompt": "Design question grounded in the codebase...", "direction_id": "d-xxx"}'
+./strategic spawn-task '{"type": "compute_experiment", "title": "Measure effect of batch size on throughput", "hypothesis": "Doubling batch size from 32 to 64 increases throughput by ≥20% without OOM on 16 GB GPU", "command": "python3 scripts/train.py --batch-size 64 --epochs 1 --output /tmp/metrics.json", "spend_cap_usd": 2.50, "deadline_seconds": 1800, "success_criterion": {"metric": "throughput_samples_per_sec", "operator": ">=", "threshold": 480}, "direction_id": "d-xxx"}'
+# Multi-arm variant: use "arms" + "declared_metric" instead of a single "command".
+# Arms run sequentially in a single compute job. Each arm should write the declared_metric
+# key to $BLUEPRINT_RESULT_FILE; the value captured is whatever the last arm emits.
+# "declared_metric" (required with arms) is the exact metric key written to the result file.
+./strategic spawn-task '{"type": "compute_experiment", "title": "Compare optimiser: Adam vs SGD on val_loss", "hypothesis": "Adam converges to lower val_loss than SGD in 5 epochs on this dataset", "arms": [{"name": "adam", "command": "python3 scripts/train.py --optimizer adam --epochs 5"}, {"name": "sgd", "command": "python3 scripts/train.py --optimizer sgd --epochs 5"}], "declared_metric": "val_loss", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "direction_id": "d-xxx"}'
 
 # Pull full detail for items the strategic packer trimmed (see "Context not
 # shipped this cycle" section in your prompt). Use only when you actually
@@ -890,7 +923,7 @@ ${strategicChallengeSection}
 
 # Instructions
 
-1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\` and/or \`qualify_request\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
+1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\`, \`qualify_request\`, \`new_version_goal\`, and/or \`new_version_theme\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
 
    Fallback (use judgment): if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen, you may construct a corrected problem_model yourself — but ground it STRICTLY in the thinker's analysis below (Sections 1-6) and in the project described by CLAUDE.md. Verify findings against the analysis before writing. If even the analysis is insufficient, call \`./strategic pending-confirm\` with type "major_decision" to surface the gap rather than ship bad state. NEVER describe this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands — the problem_model describes the managed project from CLAUDE.md.${executorFetchRecoveryNote}
 
@@ -927,7 +960,13 @@ ${strategicChallengeSection}
 
    Likewise, if the Thinker's analysis includes a \`qualify_request\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key too:
    \`{"qualify_request": {"reason": "..."}, ...rest_of_problem_model}\`
-   If the Thinker did NOT emit \`qualify_request\`, SKIP — do not fabricate one, and do not add the field. Absence means "do not qualify this cycle." \`version_phase_decision\` and \`qualify_request\` are independent siblings; add whichever the Thinker emitted (either, both, or neither).
+   If the Thinker did NOT emit \`qualify_request\`, SKIP — do not fabricate one, and do not add the field. Absence means "do not qualify this cycle."
+
+   Likewise, if \`new_version_goal\` is already present as a top-level key in \`/tmp/problem_model_${taskId}.json\` (pre-merged from the Thinker's Section 7 output file before this executor pass), it is already set — the \`cat\` in step 1 will carry it through automatically. Do NOT overwrite or re-add it. If it is absent from the file, the Thinker did not set a version goal this cycle; do NOT fabricate one.
+
+   Likewise, if \`new_version_theme\` is already present as a top-level key in \`/tmp/problem_model_${taskId}.json\` (pre-merged from the Thinker's Section 7 output file before this executor pass), it is already set — the \`cat\` in step 1 will carry it through automatically. Do NOT overwrite or re-add it. If it is absent from the file, the Thinker did not set a version theme this cycle; do NOT fabricate one.
+
+   \`version_phase_decision\`, \`qualify_request\`, \`new_version_goal\`, and \`new_version_theme\` are independent siblings; add whichever the Thinker emitted (any, all, or none).
 
    Because step 1 passes \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\`, editing the file here is what carries these siblings through — step 1 will re-read the file and the fields will be included. If the file is missing/malformed and you took step 1's fallback (constructing the model inline), include these siblings in that inline JSON instead.
 

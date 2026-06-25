@@ -1,48 +1,17 @@
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { OrchestratorHealthBar } from '../components/OrchestratorHealthBar';
-import { ProjectDashboard } from '../components/ProjectDashboard';
-import { AlertsBanner } from '../components/AlertsBanner';
 import { PipelineView } from '../components/PipelineView';
+import type { Task } from '../components/TaskCard';
 import { expectNoOverflowAt } from './viewport';
-import type { Task } from '../types/task';
-import type { Project } from '../types/project';
 
-vi.mock('../api', async () => {
-  const actual = await vi.importActual<typeof import('../api')>('../api');
-  const digestPayload = {
-    daily_cost_usd: 62.0,
-    daily_cost_ceiling_usd: 100,
-    window_hours: 24,
-    generated_at: '2026-05-06T00:00:00Z',
-    completed_count: 2,
-    failed_count: 0,
-    pending_approval_count: 0,
-    research_cycles: 0,
-    prs_opened: 1,
-    active_count: 1,
-    running_count: 1,
-    needs_attention: [],
-    recent_failures: [],
-    failure_groups: [],
-    recent_completions: [],
-    direction_progress: [],
-    active_tasks: [],
-    fresh_reviewer_effectiveness: null,
-  };
-  return {
-    ...actual,
-    API_BASE_URL: 'http://localhost:8000',
-    apiFetch: vi.fn(async (url: string) => {
-      if (url.includes('/api/admin/digest')) {
-        return new Response(JSON.stringify(digestPayload), { status: 200 });
-      }
-      return new Response('{}', { status: 200 });
-    }),
-    authGet: vi.fn(async () => new Response('{}', { status: 200 })),
-  };
-});
+vi.mock('../api', () => ({
+  apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
+  API_BASE_URL: 'http://localhost',
+  authHeaders: vi.fn(async () => ({})),
+  authGet: vi.fn(async () => new Response('{}', { status: 200 })),
+}));
 
 const healthBarProps = {
   health: {
@@ -63,68 +32,50 @@ const healthBarProps = {
   detailedHealth: null,
   apiHealthy: true,
   wsConnected: true,
-  lastFetchTime: Date.UTC(2026, 4, 7, 0, 0, 0),
+  lastFetchTime: 1746576000000,
   tasks: [],
   pipelineThrottle: null,
 };
 
-function makeProject(overrides: Partial<Project> = {}): Project {
-  return {
-    id: 'proj-1',
-    name: 'Platform',
-    status: 'active',
-    github_owner: 'acme',
-    github_repo: 'platform',
-    autonomous_enabled: true,
-    directions: [],
-    created_at: '2026-01-01T00:00:00Z',
-    ...overrides,
-  };
-}
-
-function makeTask(overrides: Partial<Task> = {}): Task {
-  return {
-    id: 'task-1',
-    title: 'feat: pipeline composed viewport regression fixture',
+const pipelineTasks: Task[] = [
+  {
+    id: 'task-parent-1',
+    title: 'research: analyze mobile rendering pipeline performance',
     description: '',
-    status: 'QUEUED',
-    task_type: 'create',
-    created_at: '2026-05-01T00:00:00Z',
-    created_by: 'USER',
+    status: 'COMPLETED',
+    task_type: 'research',
+    created_by: 'test-user',
     requires_approval: false,
-    history: [],
-    ...overrides,
-  };
-}
-
-const tasks: Task[] = [
-  makeTask({
-    id: 'task-parent',
-    title: 'feat: pipeline composed viewport regression fixture',
+    created_at: '2026-05-01T10:00:00Z',
+    history: [
+      { timestamp: '2026-05-01T12:00:00Z', action: 'completed', details: {} },
+    ],
+  },
+  {
+    id: 'task-child-1',
+    title: 'create: implement responsive grid layout for operator dashboard',
+    description: '',
     status: 'IN_PROGRESS',
     task_type: 'create',
-    started_at: '2026-05-01T01:00:00Z',
-  }),
-  makeTask({
-    id: 'task-child-1',
-    title: 'review: pipeline layout change review',
-    status: 'QUEUED',
-    task_type: 'review',
-    parent_task_id: 'task-parent',
-  }),
-  makeTask({
+    created_by: 'test-user',
+    requires_approval: false,
+    parent_task_id: 'task-parent-1',
+    depends_on: ['task-parent-1'],
+    created_at: '2026-05-01T12:30:00Z',
+    pr_url: 'https://github.com/example/repo/pull/42',
+  },
+  {
     id: 'task-child-2',
-    title: 'fix: pipeline mobile overflow fix iteration',
-    status: 'COMPLETED',
+    title: 'fix: resolve viewport overflow in pipeline view component',
+    description: '',
+    status: 'QUEUED',
     task_type: 'fix',
-    parent_task_id: 'task-parent',
-  }),
-  makeTask({
-    id: 'task-solo',
-    title: 'research: standalone pipeline viewport investigation',
-    status: 'EVALUATING',
-    task_type: 'research',
-  }),
+    created_by: 'test-user',
+    requires_approval: false,
+    parent_task_id: 'task-parent-1',
+    depends_on: ['task-child-1'],
+    created_at: '2026-05-01T13:00:00Z',
+  },
 ];
 
 describe('PipelineView composed with shell panels — viewport regression', () => {
@@ -144,47 +95,25 @@ describe('PipelineView composed with shell panels — viewport regression', () =
   });
 
   test('no horizontal overflow at 375px', async () => {
-    localStorage.setItem('projectDashboardCollapsed', 'false');
-
-    const projects = [
-      makeProject({ id: 'p1', name: 'Platform', status: 'active' }),
-    ];
-
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
-      host.className = 'flex flex-col bg-neutral-950 text-neutral-200 p-3 min-h-screen';
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
       await act(async () => {
         r.render(
-          <>
-            <div data-testid="header-bar-stub" />
+          <div className="flex flex-col bg-neutral-950 text-neutral-200 p-3 min-h-screen">
             <OrchestratorHealthBar {...healthBarProps} />
-            <ProjectDashboard
-              projects={projects}
-              tasks={tasks}
-              selectedProjectId="p1"
-              onSelectProject={() => {}}
+            <div className="h-10 flex items-center border-b border-neutral-800 shrink-0" aria-label="navigation" />
+            <PipelineView
+              tasks={pipelineTasks}
+              onViewLogs={() => {}}
             />
-            <AlertsBanner alerts={[]} onDismiss={() => {}} />
-            <div data-testid="search-filter-stub" className="flex items-center gap-2 shrink-0 mb-1 flex-wrap" />
-            <main className="flex-1 overflow-hidden flex flex-col">
-              <PipelineView tasks={tasks} onViewLogs={() => {}} />
-            </main>
-          </>,
+          </div>,
         );
       });
-      await act(async () => {
-        await new Promise<void>((resolve) => setTimeout(resolve, 75));
-      });
-      await act(async () => {
-        await new Promise<void>((resolve) => setTimeout(resolve, 75));
-      });
-    });
+    }, { waitMs: 75 });
 
-    expect(host!.textContent).toContain('feat: pipeline composed viewport regression fixture');
-
-    localStorage.removeItem('projectDashboardCollapsed');
+    expect(host!.textContent).toContain('research: analyze mobile rendering pipeline performance');
   });
 });

@@ -1950,6 +1950,98 @@ async def test_audit_finding_resolution_rejects_stale_task_version(
     assert row is None
 
 
+@pytest.mark.asyncio
+async def test_keyless_finding_key_round_trips_through_resolution_endpoint(
+    client: AsyncClient, db_session
+):
+    """A keyless finding surfaced in finding_resolution carries the __keyless__
+    sentinel as its key, which the resolution endpoint accepts without error.
+
+    This validates the full round-trip: GET qualification → read finding_key →
+    POST audit-finding-resolution with that key → GET qualification again and
+    confirm the finding now shows as stale.
+    """
+    from app.release_readiness import _KEYLESS_FINDING_SENTINEL
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-keyless-rt"
+    )
+
+    # A keyless gating finding: severity HIGH, no 'key' field (challenger-independent).
+    keyless_finding = {"severity": "HIGH", "summary": "Fail-open rate false positive"}
+
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="a" * 40,
+        confidence=0.5,
+        sub_scores={"audit": 0.4},
+        terminal_status="not_promoted",
+        audit_findings=[keyless_finding],
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+
+    read_token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": read_token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    # The finding_resolution list must expose the sentinel key (not empty string)
+    # so the caller can pass it directly to the resolution endpoint.
+    assert len(body["finding_resolution"]) == 1
+    finding_key_from_api = body["finding_resolution"][0]["key"]
+    assert finding_key_from_api == _KEYLESS_FINDING_SENTINEL, (
+        f"Expected sentinel '{_KEYLESS_FINDING_SENTINEL}', got '{finding_key_from_api}'"
+    )
+    assert body["finding_resolution"][0]["state"] == "unresolved"
+    assert body["requalification_ready"] is False
+
+    # Use the key exactly as surfaced by the API to call the resolution endpoint.
+    audit_task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-keyless-audit",
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    write_token = create_agent_token(
+        str(audit_task.id), audit_task.vm_instance_id, task_type="research"
+    )
+
+    res2 = await client.post(
+        "/api/agent/audit-finding-resolution",
+        json={
+            "task_id": str(audit_task.id),
+            "finding_key": finding_key_from_api,
+            "state": "stale",
+            "note": "False positive — fail_open_rate formula verified correct at HEAD",
+        },
+        headers={"x-agent-token": write_token},
+    )
+    assert res2.status_code == 200, res2.text
+    body2 = res2.json()
+    assert body2["status"] == "ok"
+    assert body2["finding_key"] == _KEYLESS_FINDING_SENTINEL
+
+    # Re-read qualification: the keyless finding should now show as stale and
+    # requalification_ready should flip to True.
+    res3 = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": read_token},
+    )
+    assert res3.status_code == 200, res3.text
+    body3 = res3.json()
+    assert body3["finding_resolution"][0]["key"] == _KEYLESS_FINDING_SENTINEL
+    assert body3["finding_resolution"][0]["state"] == "stale"
+    assert body3["requalification_ready"] is True
+
+
 # ---------------------------------------------------------------------------
 # resolve_message_ref DB-side prefix filter tests
 # ---------------------------------------------------------------------------
@@ -2364,6 +2456,112 @@ async def test_fetch_efficiency_snapshot_includes_llm_cost_attribution(
 
     # panel_review_effectiveness key present (may be None when no gate invocations)
     assert "panel_review_effectiveness" in data
+
+    # Rolling-window gate-health verdict present with a valid state. No gate
+    # invocations in this fixture, so the verdict is NO_DATA.
+    assert "gate_health" in data
+    assert data["gate_health"]["state"] in {
+        "NO_DATA",
+        "DEGRADED",
+        "INSUFFICIENT",
+        "PARTIAL",
+        "HEALTHY",
+    }
+    assert data["gate_health"]["state"] == "NO_DATA"
+    assert data["gate_health"]["min_sample"] == 30
+
+    # Deploy-scoped companion keys are present and null when no deploy boundary
+    # is known (no efficiency_baseline snapshot under a serving SHA here).
+    assert "panel_review_effectiveness_post_deploy" in data
+    assert data["panel_review_effectiveness_post_deploy"] is None
+    assert "gate_health_post_deploy" in data
+    assert data["gate_health_post_deploy"] is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot_post_deploy_verdict(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """When a deploy boundary exists, the endpoint returns a deploy-scoped
+    panel_review_effectiveness_post_deploy block AND its own gate_health verdict,
+    restricted to tasks completed after the boundary."""
+    from datetime import timedelta
+
+    from app.models import TaskStatus, _utcnow
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    serving_sha = "deadbeef1234"
+    monkeypatch.setenv("DEPLOY_SHA", serving_sha)
+
+    # captured_at is stored naive-UTC by write_snapshot (_utcnow().isoformat());
+    # mirror that here so the resolved boundary matches the naive task timestamps.
+    now = _utcnow()
+    boundary = now - timedelta(hours=2)
+
+    # Project carries an efficiency_baseline snapshot captured under the current
+    # serving SHA — this is the deploy boundary the endpoint resolves.
+    project = Project(
+        name="Post-Deploy Verdict",
+        user_id="test-user-postdeploy",
+        design_doc={
+            "efficiency_baseline": {
+                "snapshots": [
+                    {
+                        "serving_sha": serving_sha,
+                        "captured_at": boundary.isoformat(),
+                    }
+                ]
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token_task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-postdeploy"
+    )
+    db_session.add(token_task)
+
+    # Post-boundary challenged reviews: one degraded (fail-open) among several.
+    def _review(state, updated_at):
+        return Task(
+            project_id=project.id,
+            payloads=[{"type": "review"}],
+            status=TaskStatus.COMPLETED,
+            updated_at=updated_at,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": state}},
+        )
+
+    post = now - timedelta(minutes=30)
+    db_session.add_all(
+        [
+            _review("challenged_confirmed", post),
+            _review("challenged_confirmed", post),
+            _review("degraded_model_unavailable", post),
+        ]
+    )
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-postdeploy")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    # Deploy boundary resolved → post-deploy block is present and non-null.
+    post_deploy = data["panel_review_effectiveness_post_deploy"]
+    assert post_deploy is not None
+    assert post_deploy["total_challenged"] == 2
+    assert post_deploy["challenged_degraded"] == 1
+    # 1 degraded / 3 invocations ≈ 33% fail-open on a tiny sample → DEGRADED.
+    verdict = data["gate_health_post_deploy"]
+    assert verdict is not None
+    assert verdict["state"] == "DEGRADED"
+    assert verdict["total_invocations"] == 3
 
 
 @pytest.mark.asyncio

@@ -59,10 +59,32 @@ describe('AdversarialQualityPanel', () => {
     expect(el.querySelector('[data-testid="adversarial-quality-panel"]')).toBeNull();
   });
 
-  test('shows HEALTHY badge when no fail-opens', async () => {
+  test('shows NO DATA badge when no gate invocations', async () => {
+    axesPayload = {
+      ...BASE_AXES,
+      panel_review_effectiveness: makeEffectiveness({ total_challenged: 0, challenged_confirmed: 0, challenged_revised: 0, challenged_rejected: 0 }),
+    };
+    const el = render(<AdversarialQualityPanel projectId="proj-1" />);
+    await act(async () => {});
+    expect(el.querySelector('[data-testid="health-badge"]')?.textContent).toBe('NO DATA');
+  });
+
+  test('shows INSUFFICIENT badge when sample below minimum', async () => {
+    // 13 challenges < 30 minimum — not enough data to confirm <=5%
     axesPayload = {
       ...BASE_AXES,
       panel_review_effectiveness: makeEffectiveness({ challenged_escalated: 0 }),
+    };
+    const el = render(<AdversarialQualityPanel projectId="proj-1" />);
+    await act(async () => {});
+    expect(el.querySelector('[data-testid="health-badge"]')?.textContent).toBe('INSUFFICIENT');
+  });
+
+  test('shows HEALTHY badge when no fail-opens and sufficient sample', async () => {
+    // total_challenged=35 >= 30 minimum, challenged_degraded=0 → confirmed-zero
+    axesPayload = {
+      ...BASE_AXES,
+      panel_review_effectiveness: makeEffectiveness({ total_challenged: 35, challenged_confirmed: 30, challenged_revised: 3, challenged_rejected: 2 }),
     };
     const el = render(<AdversarialQualityPanel projectId="proj-1" />);
     await act(async () => {});
@@ -70,11 +92,11 @@ describe('AdversarialQualityPanel', () => {
   });
 
   test('shows PARTIAL badge when fail-open rate is between 1% and 5%', async () => {
-    // 1 fail-open out of 49 normal = 1/50 = 2% — between 1% PARTIAL and 5% DEGRADED thresholds
+    // 1 degraded out of 49 normal = 1/50 = 2% — between 1% PARTIAL and 5% DEGRADED thresholds
     axesPayload = {
       ...BASE_AXES,
       panel_review_effectiveness: makeEffectiveness({
-        challenged_escalated: 1,
+        challenged_degraded: 1,
         total_challenged: 49,
       }),
     };
@@ -84,11 +106,11 @@ describe('AdversarialQualityPanel', () => {
   });
 
   test('shows DEGRADED badge when fail-open rate >= 5%', async () => {
-    // 1 fail-open out of 19 normal = 1/20 = 5% — at the operator-action threshold
+    // 1 degraded out of 19 normal = 1/20 = 5% — at the operator-action threshold
     axesPayload = {
       ...BASE_AXES,
       panel_review_effectiveness: makeEffectiveness({
-        challenged_escalated: 1,
+        challenged_degraded: 1,
         total_challenged: 19,
       }),
     };
@@ -97,10 +119,10 @@ describe('AdversarialQualityPanel', () => {
     expect(el.querySelector('[data-testid="health-badge"]')?.textContent).toBe('DEGRADED');
   });
 
-  test('shows fail-open row when escalated > 0', async () => {
+  test('shows fail-open row when challenged_degraded > 0', async () => {
     axesPayload = {
       ...BASE_AXES,
-      panel_review_effectiveness: makeEffectiveness({ challenged_escalated: 2, total_challenged: 10 }),
+      panel_review_effectiveness: makeEffectiveness({ challenged_degraded: 2, total_challenged: 10 }),
     };
     const el = render(<AdversarialQualityPanel projectId="proj-1" />);
     await act(async () => {});

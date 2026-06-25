@@ -890,6 +890,28 @@ def _declared_success_criterion(task: Task) -> tuple[str, str, float] | None:
     return metric.strip(), op, threshold
 
 
+def _find_metric_case_insensitive(obj: dict, metric: str) -> object:
+    """Find a metric value by case/whitespace-normalized key.
+
+    Returns the matched value, or None when no key matches or multiple
+    distinct keys match (ambiguity guard: a collision is more likely a
+    schema mistake than an intentional overload; fail closed).
+    """
+    normalized = metric.strip().lower()
+    matches = [(k, v) for k, v in obj.items() if k.strip().lower() == normalized]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        logger.warning(
+            "[EVAL] Ambiguous case-insensitive metric match for %r: found keys %r "
+            "— failing closed",
+            metric,
+            [k for k, _ in matches],
+        )
+        return None
+    return matches[0][1]
+
+
 def evaluate_compute_success_criterion(
     task: Task,
     artifact_text: str | None,
@@ -929,6 +951,8 @@ def evaluate_compute_success_criterion(
     else:
         obj = _parse_artifact_json(artifact_text) or {}
         raw_value = obj.get(metric)
+        if raw_value is None:
+            raw_value = _find_metric_case_insensitive(obj, metric)
         value = _coerce_number(raw_value)
     # Shared fail-closed core: a metric absent/non-numeric in the result is never
     # "met" (and ``criterion_met`` enforces that identically for the code gate).
@@ -988,6 +1012,37 @@ def _parse_artifact_json(artifact_text: str | None) -> dict | None:
     except (json.JSONDecodeError, ValueError):
         pass
     return scan_balanced_json_objects(text)
+
+
+# Fields that are always present in a COMPUTE_RESULT but are NOT
+# experiment-emitted metric keys (they are operational/job-level fields).
+_COMPUTE_RESULT_NON_METRIC_KEYS: frozenset[str] = (
+    _RESERVED_COMPUTE_RESULT_KEYS
+    | frozenset({"outcome", "status", "job_id", "intentional_terminal"})
+)
+
+
+def describe_emitted_compute_metric_keys(artifact_text: str | None) -> str:
+    """Produce a one-line diagnostic of what experiment metric keys the agent emitted.
+
+    Used by the compute_unmeasured_criterion failure path to tell the operator
+    what the command actually wrote so a case-mismatch is instantly visible:
+    declared 'auc' but emitted 'AUC' shows up as "emitted_keys=['AUC']".
+
+    Two distinguishable cases:
+    * no COMPUTE_RESULT parsed at all → experiment likely crashed before writing
+      its result JSON (happens when the command fails at startup and emits only
+      a traceback with no terminal JSON block).
+    * result parsed but declared key absent → command completed, wrote a result,
+      but the metric name differs (case mismatch, typo) or was never written.
+    """
+    obj = _parse_artifact_json(artifact_text)
+    if obj is None:
+        return "no COMPUTE_RESULT parsed — experiment likely crashed before emitting result"
+    emitted = sorted(k for k in obj if k not in _COMPUTE_RESULT_NON_METRIC_KEYS)
+    if not emitted:
+        return "emitted_keys=[] (command wrote no experiment metrics to COMPUTE_RESULT)"
+    return f"emitted_keys={emitted!r} (declared key absent — possible case/name mismatch)"
 
 
 # ---------------------------------------------------------------------------

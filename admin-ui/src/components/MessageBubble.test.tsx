@@ -231,6 +231,79 @@ describe('MessageBubble', () => {
     expect(screen.queryByText('citations could not be verified')).toBeNull();
   });
 
+  test('QUESTION resolve: placeholder says "Your answer (required)..."', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({ message_type: 'QUESTION' }),
+      resolvingId: 'msg-1',
+      resolveInput: '',
+    })} />);
+    const input = screen.getByPlaceholderText('Your answer (required)...');
+    expect(input).toBeTruthy();
+  });
+
+  test('QUESTION resolve: confirm button is disabled when input is empty', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({ message_type: 'QUESTION' }),
+      resolvingId: 'msg-1',
+      resolveInput: '',
+    })} />);
+    const confirmBtn = screen.getByTitle('Confirm resolve') as HTMLButtonElement;
+    expect(confirmBtn.disabled).toBe(true);
+  });
+
+  test('QUESTION resolve: confirm button is enabled when input has text', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({ message_type: 'QUESTION' }),
+      resolvingId: 'msg-1',
+      resolveInput: 'my answer',
+    })} />);
+    const confirmBtn = screen.getByTitle('Confirm resolve') as HTMLButtonElement;
+    expect(confirmBtn.disabled).toBe(false);
+  });
+
+  test('QUESTION resolve: Enter key with empty input does not call onResolve', () => {
+    const onResolve = vi.fn();
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({ message_type: 'QUESTION' }),
+      resolvingId: 'msg-1',
+      resolveInput: '',
+      onResolve,
+    })} />);
+    const input = screen.getByPlaceholderText('Your answer (required)...');
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(onResolve).not.toHaveBeenCalled();
+  });
+
+  test('QUESTION resolve: Enter key with non-empty input calls onResolve', () => {
+    const onResolve = vi.fn();
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({ message_type: 'QUESTION' }),
+      resolvingId: 'msg-1',
+      resolveInput: 'my answer',
+      onResolve,
+    })} />);
+    const input = screen.getByPlaceholderText('Your answer (required)...');
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(onResolve).toHaveBeenCalledWith('msg-1', 'my answer');
+  });
+
+  test('non-QUESTION resolve: placeholder says "Note (optional)..."', () => {
+    render(<MessageBubble {...makeProps({
+      resolvingId: 'msg-1',
+      resolveInput: '',
+    })} />);
+    expect(screen.getByPlaceholderText('Note (optional)...')).toBeTruthy();
+  });
+
+  test('non-QUESTION resolve: confirm button enabled with empty input', () => {
+    render(<MessageBubble {...makeProps({
+      resolvingId: 'msg-1',
+      resolveInput: '',
+    })} />);
+    const confirmBtn = screen.getByTitle('Confirm resolve') as HTMLButtonElement;
+    expect(confirmBtn.disabled).toBe(false);
+  });
+
   test('data-testid message-bubble is set', () => {
     render(<MessageBubble {...makeProps()} />);
     expect(screen.getByTestId('message-bubble')).toBeTruthy();

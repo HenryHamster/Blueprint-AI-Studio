@@ -40,6 +40,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.release_version import _VALID_THEMES as _VALID_THEME_VALUES
 from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import strategic_phase_for
 from app.time_utils import _utcnow
@@ -406,6 +407,19 @@ _QUALIFY_REQUEST_REASON_MAX = 500
 # VERSION_PHASE_DECISION_CONTEXT_KEY — one source of truth so producer + consumer
 # never drift.
 QUALIFY_REQUEST_CONTEXT_KEY = "_strategic_qualify_request"
+
+# Transient task.context key carrying an agent-emitted new_version_goal from the
+# set_problem_model endpoint to _handle_strategic_completion's API path. Mirrors
+# QUALIFY_REQUEST_CONTEXT_KEY — one source of truth so producer + consumer never drift.
+NEW_VERSION_GOAL_CONTEXT_KEY = "_strategic_new_version_goal"
+
+# Cap on the new_version_goal string stored in task.context (and eventually on
+# ReleaseVersion.goal).  Matches the display budget for version goal UI surfaces.
+_NEW_VERSION_GOAL_MAX = 500
+
+# Transient task.context key carrying an agent-emitted new_version_theme from the
+# set_problem_model endpoint to _handle_strategic_completion's API path.
+NEW_VERSION_THEME_CONTEXT_KEY = "_strategic_new_version_theme"
 
 # OPTIONAL agent verdict that refines the deterministic outcome-progress
 # (scaffolding) detector. For each long-running ACTIVE direction the strategic
@@ -1053,6 +1067,232 @@ def extract_qualify_request(raw: object) -> dict | None:
         else ""
     )
     return {"reason": reason}
+
+
+def extract_new_version_goal(raw: object) -> str | None:
+    """Validate + normalize a raw ``new_version_goal`` value.
+
+    Accepts the string the strategic agent embeds as a top-level sibling in the
+    ``set-problem-model`` payload and returns a clean, bounded string, or ``None``
+    when the input is absent, contentless, or unusable.
+
+    Used by the ``set_problem_model`` endpoint to lift the field out of the
+    problem_model JSON *before* ``ProblemModel`` validation (``extra="forbid"``,
+    which would otherwise reject the whole update). ``_apply_new_version_goal``
+    re-checks the open-version / goal-already-set guards, so a no-op is safe.
+    """
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()[:_NEW_VERSION_GOAL_MAX]
+    if not cleaned:
+        return None
+    from app.release_scoring import is_contentless_goal
+
+    if is_contentless_goal(cleaned):
+        return None
+    return cleaned
+
+
+async def _apply_new_version_goal(
+    goal: object,
+    task: Task,
+    project: Project,
+    session: AsyncSession,
+    *,
+    path: str,
+) -> None:
+    """Apply an optional ``new_version_goal`` from the strategic agent.
+
+    ``goal`` is the raw value from either:
+      - the API path: ``task.context.get(NEW_VERSION_GOAL_CONTEXT_KEY)``
+      - the fallback parse path: ``parsed.get("new_version_goal")``
+
+    When valid, sets the goal with ``source='strategist'`` and ``session.add``s
+    the row — the caller's surrounding ``await session.commit()`` persists it.
+    A strategist-set goal may be corrected by a subsequent strategist call;
+    only operator-set goals (``goal_editor_info`` starts with ``'[operator:'``)
+    are frozen against strategist overwrite.
+
+    Silently no-ops when:
+      - ``goal`` is None / not a non-empty string
+      - ``is_contentless_goal`` returns True
+      - The project has no open ``ReleaseVersion``
+      - The open version has an operator-set goal (operator goals are frozen to strategist)
+
+    All errors are logged and swallowed — a bad or absent goal must never
+    block vision/direction writes.
+    """
+    if not goal or not isinstance(goal, str):
+        return
+    _nvg_text = goal.strip()
+    if not _nvg_text:
+        return
+    try:
+        from app.release_scoring import is_contentless_goal
+        from app.release_version import (
+            current_open_version as _cur_open_version,
+            set_version_goal as _set_version_goal,
+        )
+
+        if is_contentless_goal(_nvg_text):
+            return
+        _open_ver = await _cur_open_version(session, project.id)
+        if _open_ver is None:
+            logger.debug(
+                "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project %s "
+                "— skipping new_version_goal",
+                task.id,
+                path,
+                project.id,
+            )
+            return
+        if _open_ver.goal is not None:
+            _ei = _open_ver.goal_editor_info or ""
+            if _ei.startswith("[operator:"):
+                logger.debug(
+                    "[STRATEGIC] Task %s (%s path): open version v%d has an operator-set goal "
+                    "— skipping new_version_goal (operator goals are frozen to strategist)",
+                    task.id,
+                    path,
+                    _open_ver.version_number,
+                )
+                return
+            logger.info(
+                "[STRATEGIC] Task %s (%s path): open version v%d has a non-operator goal "
+                "— allowing strategist correction",
+                task.id,
+                path,
+                _open_ver.version_number,
+            )
+        _set_version_goal(
+            _open_ver,
+            _nvg_text,
+            editor_id=str(task.id)[:8],
+            source="strategist",
+        )
+        session.add(_open_ver)
+        logger.info(
+            "[STRATEGIC] Task %s (%s path): authored version goal for v%d project=%s: %.80s",
+            task.id,
+            path,
+            _open_ver.version_number,
+            project.id,
+            _nvg_text,
+        )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] Task %s (%s path): failed to apply new_version_goal (non-fatal)",
+            task.id,
+            path,
+        )
+
+
+def extract_new_version_theme(raw: object) -> str | None:
+    """Validate + normalize a raw ``new_version_theme`` value.
+
+    Accepts the string the strategic agent embeds as a top-level sibling in the
+    ``set-problem-model`` payload and returns a clean lowercase string, or ``None``
+    when the input is absent, not a string, or not one of the allowed theme values.
+
+    Used by the ``set_problem_model`` endpoint to lift the field out of the
+    problem_model JSON (ProblemModel is extra="forbid", which would otherwise
+    reject the whole update). ``_apply_new_version_theme`` re-checks the
+    open-version / theme-already-set guards, so a no-op is safe.
+    """
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip().lower()
+    if cleaned not in _VALID_THEME_VALUES:
+        return None
+    return cleaned
+
+
+async def _apply_new_version_theme(
+    theme: object,
+    task: Task,
+    project: Project,
+    session: AsyncSession,
+    *,
+    path: str,
+) -> None:
+    """Apply an optional ``new_version_theme`` from the strategic agent.
+
+    ``theme`` is the raw value from either:
+      - the API path: ``task.context.get(NEW_VERSION_THEME_CONTEXT_KEY)``
+      - the fallback parse path: ``parsed.get("new_version_theme")``
+
+    When valid, sets the theme and ``session.add``s the row — the caller's
+    surrounding ``await session.commit()`` persists it.
+
+    Silently no-ops when:
+      - ``theme`` is None / not a non-empty string
+      - the value is not one of the valid theme values
+      - The project has no open ``ReleaseVersion``
+      - The open version has an operator-set theme (theme_editor_info starts with "[operator:")
+
+    All errors are logged and swallowed — a bad or absent theme must never
+    block vision/direction writes.
+    """
+    if not theme or not isinstance(theme, str):
+        return
+    _nvt_text = theme.strip().lower()
+    if _nvt_text not in _VALID_THEME_VALUES:
+        return
+    try:
+        from app.release_version import (
+            current_open_version as _cur_open_version,
+            set_version_theme as _set_version_theme,
+        )
+
+        _open_ver = await _cur_open_version(session, project.id)
+        if _open_ver is None:
+            logger.debug(
+                "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project %s "
+                "— skipping new_version_theme",
+                task.id,
+                path,
+                project.id,
+            )
+            return
+        if _open_ver.theme is not None:
+            _ei = _open_ver.theme_editor_info or ""
+            if _ei.startswith("[operator:"):
+                logger.debug(
+                    "[STRATEGIC] Task %s (%s path): open version v%d has an operator-set theme "
+                    "— skipping new_version_theme (operator themes are frozen to strategist)",
+                    task.id,
+                    path,
+                    _open_ver.version_number,
+                )
+                return
+            logger.info(
+                "[STRATEGIC] Task %s (%s path): open version v%d has a non-operator theme "
+                "— allowing strategist correction",
+                task.id,
+                path,
+                _open_ver.version_number,
+            )
+        _set_version_theme(
+            _open_ver,
+            _nvt_text,
+            editor_id=str(task.id)[:8],
+            source="strategist",
+        )
+        session.add(_open_ver)
+        logger.info(
+            "[STRATEGIC] Task %s (%s path): authored version theme for v%d project=%s: %s",
+            task.id,
+            path,
+            _open_ver.version_number,
+            project.id,
+            _nvt_text,
+        )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] Task %s (%s path): failed to apply new_version_theme (non-fatal)",
+            task.id,
+            path,
+        )
 
 
 async def _apply_version_phase_decision(
@@ -3486,6 +3726,20 @@ async def _handle_strategic_completion(
         # qualifier.
         _qr_ctx = (task.context or {}).get(QUALIFY_REQUEST_CONTEXT_KEY)
         await _apply_qualify_request(_qr_ctx, task, project, session, path="api")
+        # Apply new_version_goal if the agent supplied one via the API. Same
+        # transport as qualify_request: the ``set_problem_model`` endpoint lifts
+        # the field out of the problem_model JSON (ProblemModel extra="forbid")
+        # and stows the sanitized string under ``NEW_VERSION_GOAL_CONTEXT_KEY``.
+        # Sets the open version's goal with source="strategist" when null.
+        _nvg_ctx = (task.context or {}).get(NEW_VERSION_GOAL_CONTEXT_KEY)
+        await _apply_new_version_goal(_nvg_ctx, task, project, session, path="api")
+        # Apply new_version_theme if the agent supplied one via the API. Same
+        # transport as new_version_goal: the ``set_problem_model`` endpoint lifts
+        # the field out of the problem_model JSON and stows the validated value
+        # under ``NEW_VERSION_THEME_CONTEXT_KEY``. Sets the open version's theme
+        # (leanness|reliability|performance|feature|mixed|none) when null.
+        _nvt_ctx = (task.context or {}).get(NEW_VERSION_THEME_CONTEXT_KEY)
+        await _apply_new_version_theme(_nvt_ctx, task, project, session, path="api")
 
         # Per-cycle message post removed: the strategic agent now maintains
         # project.running_update as a living markdown document it rewrites
@@ -3584,6 +3838,7 @@ async def _handle_strategic_completion(
     new_problem_model = parsed.get("problem_model")
     new_running_update = parsed.get("running_update")
     new_version_goal = parsed.get("new_version_goal")
+    new_version_theme = parsed.get("new_version_theme")
     direction_ops = parsed.get("direction_operations", [])
 
     # Lock project row to prevent concurrent direction/vision mutations.
@@ -3799,39 +4054,15 @@ async def _handle_strategic_completion(
             )
 
     # Apply new_version_goal when the strategist explicitly authors the version
-    # objective (new_version_goal field in agent output).  Only applies when the
-    # open version has no goal yet (goal is None) — once set the goal is frozen;
-    # operator can override via POST /api/admin/projects/{id}/version-goal.
-    if new_version_goal and isinstance(new_version_goal, str):
-        _nvg_text = new_version_goal.strip()
-        if _nvg_text:
-            try:
-                from app.release_scoring import is_contentless_goal
-                from app.release_version import (
-                    current_open_version as _cur_open_version,
-                    set_version_goal as _set_version_goal,
-                )
-
-                if not is_contentless_goal(_nvg_text):
-                    _open_ver = await _cur_open_version(session, project.id)
-                    if _open_ver is not None and _open_ver.goal is None:
-                        _set_version_goal(
-                            _open_ver,
-                            _nvg_text,
-                            editor_id=str(task.id)[:8],
-                            source="strategist",
-                        )
-                        session.add(_open_ver)
-                        logger.info(
-                            "[STRATEGIC] authored version goal for v%d project=%s: %.80s",
-                            _open_ver.version_number,
-                            project.id,
-                            _nvg_text,
-                        )
-            except Exception:
-                logger.exception(
-                    "[STRATEGIC] Failed to apply new_version_goal (non-fatal)"
-                )
+    # objective (new_version_goal field in agent output).  Delegates to the
+    # shared helper used by the API path so both paths behave identically.
+    await _apply_new_version_goal(
+        new_version_goal, task, project, session, path="fallback"
+    )
+    # Apply new_version_theme when the strategist authors the delivery theme.
+    await _apply_new_version_theme(
+        new_version_theme, task, project, session, path="fallback"
+    )
 
     # Reconcile project.running_update operator-wins via the same shared helper
     # the live set_running_update op uses, so the two write paths cannot drift.

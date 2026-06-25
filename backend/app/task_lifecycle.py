@@ -1048,6 +1048,18 @@ async def _resolve_review_second_opinion(
                 review.id,
                 primary_verdict,
             )
+            try:
+                from app.alert_dispatch import (
+                    _maybe_create_adversarial_gate_fail_open_alert,
+                )
+
+                await _maybe_create_adversarial_gate_fail_open_alert(
+                    review, challenger, session
+                )
+            except Exception as _ae:
+                logger.warning(
+                    "[REVIEW SECOND-OPINION] fail-open alert dispatch failed: %s", _ae
+                )
             _deg_record: dict = {
                 "state": "degraded_model_unavailable",
                 "reconciled_verdict": primary_verdict,

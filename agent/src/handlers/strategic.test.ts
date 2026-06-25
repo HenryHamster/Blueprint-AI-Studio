@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import fs from 'fs';
 
 // Capture the prompt the handler hands to the thinker (analysis) pass.
 let capturedThinkerPrompt: string | undefined;
@@ -1081,6 +1082,96 @@ describe('handleStrategic prompt_suffix wiring', () => {
   });
 });
 
+describe('handleStrategic executor prompt: version-signal sibling passthrough', () => {
+  it('instructs executor to carry new_version_goal/version_phase_decision/qualify_request as top-level siblings', async () => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-sibling-pass',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toBeDefined();
+
+    // All three sibling fields must be named in the executor instructions.
+    expect(executorPrompt).toContain('new_version_goal');
+    expect(executorPrompt).toContain('version_phase_decision');
+    expect(executorPrompt).toContain('qualify_request');
+
+    // The instruction must tell the executor to add them as top-level sibling keys
+    // (not nested under problem_model content).
+    expect(executorPrompt).toContain('top-level sibling');
+
+    // The instruction must reference the problem_model file edit mechanism
+    // (editing /tmp/problem_model_<id>.json IN PLACE) so the siblings reach
+    // the backend via the set-problem-model cat call.
+    expect(executorPrompt).toContain('IN PLACE');
+
+    // Each field's absence must mean skip (not fabricate).
+    expect(executorPrompt).toContain('do not fabricate');
+  });
+});
+
+describe('handleStrategic pre-merge: new_version_theme written into problem_model JSON', () => {
+  it('pre-merges new_version_theme (and new_version_goal) into problem_model JSON when thinker emits them', async () => {
+    const taskId = 'task-premerge-theme';
+    const pmPath = `/tmp/problem_model_${taskId}.json`;
+    const initialPm = { intent: { purpose: 'ok' }, gaps: [] };
+
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+      newVersionGoal: 'Ship reliable error recovery so ops incidents drop by 50%.',
+      newVersionTheme: 'reliability',
+    } as unknown as { ok: boolean; analysisText: string; newVersionGoal?: string; newVersionTheme?: string });
+
+    // fs.readFileSync returns the initial problem_model JSON for the pre-merge read.
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === pmPath) return JSON.stringify(initialPm);
+        return '';
+      },
+    );
+
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+
+    const statusRef = { value: '' };
+    await handleStrategic(taskId, { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    // writeFileSync must have been called with the pm path and a JSON that contains both fields.
+    const writeCalls = vi.mocked(fs.writeFileSync).mock.calls;
+    const pmWrite = writeCalls.find((c) => c[0] === pmPath);
+    expect(pmWrite).toBeDefined();
+    const writtenStr = pmWrite?.[1];
+    expect(typeof writtenStr).toBe('string');
+    const written = JSON.parse(writtenStr as string) as Record<string, unknown>;
+    expect(written.new_version_goal).toBe('Ship reliable error recovery so ops incidents drop by 50%.');
+    expect(written.new_version_theme).toBe('reliability');
+  });
+});
+
 describe('handleStrategic infra-error propagation (vm_config_missing)', () => {
   it('propagates a vm_config_missing death from the required-calls retry instead of swallowing it', async () => {
     // The swallowing retry-catch previously turned a vm_config_missing death into a
@@ -1109,5 +1200,61 @@ describe('handleStrategic infra-error propagation (vm_config_missing)', () => {
 
     // Restore the shared default so later tests are unaffected.
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+});
+
+describe('handleStrategic executor prompt: arms-based compute_experiment commission', () => {
+  beforeEach(() => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+  });
+
+  it('executor prompt contains the arms-based spawn-task example', async () => {
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-arms-commission',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toBeDefined();
+    expect(executorPrompt).toContain('"arms"');
+    expect(executorPrompt).toContain('"declared_metric"');
+  });
+
+  it('executor prompt arms example includes name and command fields', async () => {
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-arms-fields',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toBeDefined();
+    // Arms example must include specific arm names unique to the arms example (not the single-command example).
+    expect(executorPrompt).toContain('"name": "adam"');
+    expect(executorPrompt).toContain('"name": "sgd"');
+    // declared_metric documents what the command emits
+    expect(executorPrompt).toContain('declared_metric');
   });
 });

@@ -919,6 +919,7 @@ class Task(SQLModel, table=True):
         default=None, sa_column=Column(String(255), nullable=True)
     )
     requires_approval: bool = Field(default=False)
+    spend_approval_cleared_at: datetime | None = Field(default=None, nullable=True)
 
     status: TaskStatus = Field(
         default=TaskStatus.QUEUED, sa_column=Column(String, default=TaskStatus.QUEUED)
@@ -3673,11 +3674,10 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(32), nullable=False, server_default="open"),
     )
 
-    # The version's goal — a point-in-time snapshot of
-    # ProblemModel.intent.current_focus captured when this version opened.
+    # The version's goal — a concise statement of what this version is for,
+    # authored by the strategist (new_version_goal field) or an operator.
     # Frozen for the version's lifetime so each version keeps a stable record
-    # of what it was for, even after current_focus drifts on.  Nullable:
-    # pre-0111 rows and projects with no current_focus carry no goal.
+    # of its objective. Nullable: pre-0111 rows carry no goal.
     goal: str | None = Field(
         default=None,
         sa_column=Column(Text, nullable=True),
@@ -3692,6 +3692,21 @@ class ReleaseVersion(SQLModel, table=True):
     # Editor provenance for the goal: "[operator:email]" format, mirroring phase_reasoning.
     # Populated only when an operator edits the goal; auto-derived goals carry no editor info.
     goal_editor_info: str | None = Field(
+        default=None,
+        sa_column=Column(String(255), nullable=True),
+    )
+
+    # Delivery theme authored by the strategist (new_version_theme field).
+    # One of: leanness | reliability | performance | feature | mixed | none.
+    # Nullable: pre-0332 rows carry no theme.
+    theme: str | None = Field(
+        default=None,
+        sa_column=Column(String(32), nullable=True),
+    )
+
+    # Editor provenance for the theme: "[operator:email]" or "[strategist:id]" format,
+    # mirroring goal_editor_info. Operator-set themes are frozen to strategist overwrites.
+    theme_editor_info: str | None = Field(
         default=None,
         sa_column=Column(String(255), nullable=True),
     )

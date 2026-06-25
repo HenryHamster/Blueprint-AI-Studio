@@ -986,6 +986,27 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
                 }
         if fc_trimmed:
             fc_trimmed["repair_attempts"] = raw_fc.get("repair_attempts")
+            miss_by_schema_and_reason = (
+                raw_fc.get("format_miss_by_schema_and_reason") or {}
+            )
+            if miss_by_schema_and_reason:
+                schema_totals = {
+                    schema: sum(reasons.values())
+                    for schema, reasons in miss_by_schema_and_reason.items()
+                    if isinstance(reasons, dict)
+                }
+                total_misses = sum(schema_totals.values())
+                if schema_totals and total_misses > 0:
+                    dominant_schema = max(schema_totals, key=schema_totals.__getitem__)
+                    schema_reasons = miss_by_schema_and_reason[dominant_schema]
+                    dominant_reason = max(
+                        schema_reasons, key=schema_reasons.__getitem__
+                    )
+                    fc_trimmed["dominant_schema"] = dominant_schema
+                    fc_trimmed["dominant_reason"] = dominant_reason
+                    fc_trimmed["dominant_share"] = round(
+                        schema_totals[dominant_schema] / total_misses, 3
+                    )
             result["format_compliance"] = fc_trimmed
     raw_atr = snapshot.get("agent_timeout_rate") or {}
     if raw_atr:
@@ -1013,6 +1034,7 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
         result["llm_cost_attribution"] = {
             "total_llm_usd": raw_attr.get("total_llm_usd"),
             "rework_share": raw_attr.get("rework_share"),
+            "self_repair_burn_share": raw_attr.get("self_repair_burn_share"),
             # Dominant driver signals: the single highest-cost model, task type,
             # and failure class so the strategist sees WHY llm_cost_per_merged_pr
             # drifted, not just THAT it did. All are sorted desc by cost_usd by
@@ -1020,6 +1042,15 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
             "dominant_model": by_model[0] if by_model else None,
             "dominant_task_type": by_type[0] if by_type else None,
             "dominant_failure_class": dominant_failure_class,
+        }
+    raw_peff = snapshot.get("panel_review_effectiveness") or {}
+    if raw_peff:
+        result["panel_review_effectiveness"] = {
+            "gate_health": raw_peff.get("gate_health"),
+            "fail_open_rate": raw_peff.get("fail_open_rate"),
+            "total_challenged": raw_peff.get("total_challenged"),
+            "challenged_degraded": raw_peff.get("challenged_degraded"),
+            "effective_coverage": raw_peff.get("effective_coverage"),
         }
     return result
 
@@ -4799,6 +4830,13 @@ async def _spawn_strategic_review(
                     **(
                         {"goal_needed": True}
                         if _open_version.goal is None
+                        else {}
+                    ),
+                    # Signals the strategist to author the delivery theme this cycle.
+                    # Absent once the theme is set (null theme → action needed).
+                    **(
+                        {"theme_needed": True}
+                        if _open_version.theme is None
                         else {}
                     ),
                 }

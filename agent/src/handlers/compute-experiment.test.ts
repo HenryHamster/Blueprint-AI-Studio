@@ -214,4 +214,40 @@ describe('handleComputeExperiment', () => {
     const req = park.park_request as Record<string, unknown>;
     expect(req.deadline_seconds).toBe(600 + 600); // fallback: deadline + COMPUTE_PARK_GRACE_SECONDS
   });
+
+  it('does not expose raw polling_metadata fields in park source_metadata', async () => {
+    // The agent-facing endpoint returns full polling_metadata (agents own the job and
+    // need the full metadata). Verify the handler does NOT forward raw polling_metadata
+    // fields — including sensitive ones like env, command_log, and live_output — into
+    // the park source_metadata that gets stored on the task record.
+    vi.mocked(apiPost).mockResolvedValue(jobResponse({
+      status: 'QUEUED',
+      polling_metadata: {
+        park_deadline_seconds: 1200,
+        env: { SECRET_API_KEY: 'super-secret-value' },
+        command: 'bash run.sh --key=super-secret',
+        command_log: { text: 'Authorization: Bearer ghp_SECRETTOKEN\n', truncated: false },
+        live_output: { text: 'partial output ghp_SECRETTOKEN\n', truncated: true },
+      },
+    }));
+
+    await handleComputeExperiment('task-1', { ...VALID_PAYLOAD }, TASK, '', 'o', 'r', null, { value: '' });
+
+    const park = lastCompletionPayload();
+    expect(park.status).toBe('PARKED');
+    const req = park.park_request as Record<string, unknown>;
+    const srcMetaStr = JSON.stringify(req.source_metadata);
+
+    // source_metadata must only carry {job_id, experiment} — raw polling_metadata
+    // fields must never flow into the stored task record.
+    expect(srcMetaStr).not.toContain('super-secret-value');
+    expect(srcMetaStr).not.toContain('ghp_SECRETTOKEN');
+    expect(srcMetaStr).not.toContain('command_log');
+    expect(srcMetaStr).not.toContain('live_output');
+    expect(srcMetaStr).not.toContain('SECRET_API_KEY');
+
+    // Park deadline still uses the backend-supplied value.
+    expect(req.deadline_seconds).toBe(1200);
+    expect(req.wake_source_ref).toBe('job-123');
+  });
 });

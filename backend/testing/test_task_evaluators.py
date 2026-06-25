@@ -496,6 +496,41 @@ def test_compute_criterion_can_gate_on_cost_metric():
     assert "final_cost_usd=10.0" in v.reason
 
 
+def test_compute_criterion_case_insensitive_match_met():
+    """A criterion declared as 'auc' is matched when the artifact emits 'AUC'."""
+    artifact = _compute_result(AUC=0.95)
+    v = ArtifactDeliveryStrategy().evaluate(
+        _criterion_task("auc", ">=", 0.9), artifact
+    )
+    assert v.passed is True
+    assert "criterion met" in v.reason
+    assert "auc >= 0.9" in v.reason
+
+
+def test_compute_criterion_case_insensitive_match_unmet():
+    """Case-insensitive match works even when the criterion is not met."""
+    artifact = _compute_result(Accuracy=0.7)
+    v = ArtifactDeliveryStrategy().evaluate(
+        _criterion_task("accuracy", ">=", 0.9), artifact
+    )
+    assert v.passed is True
+    assert "not met" in v.reason
+    assert "accuracy=0.7" in v.reason
+
+
+def test_compute_criterion_ambiguous_case_match_fails_closed():
+    """When 'auc' and 'AUC' both exist and criterion is 'Auc' (no exact match),
+    the ambiguity guard treats the metric as absent rather than guessing."""
+    payload = json.dumps(
+        {"job_id": "j", "outcome": "SUCCESS", "final_cost_usd": 0.1, "auc": 0.95, "AUC": 0.85}
+    )
+    # Declared as 'Auc' — no exact match; case-fold finds both 'auc' and 'AUC'.
+    v = ArtifactDeliveryStrategy().evaluate(_criterion_task("Auc", ">=", 0.9), payload)
+    assert v.passed is True
+    # ambiguous → metric treated as absent
+    assert "not reported" in v.reason
+
+
 def test_compute_no_criterion_preserves_presence_based_pass():
     """With no declared criterion, the gate keeps its presence-based behavior."""
     v = ArtifactDeliveryStrategy().evaluate(

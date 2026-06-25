@@ -1503,6 +1503,16 @@ export interface PanelReviewEffectiveness {
   overturn_rate: number | null;
   cost_per_challenge_usd?: number | null;
   challenged_escalated?: number;
+  challenged_degraded?: number;
+  sampled_out_count?: number;
+  effective_coverage?: number | null;
+  fail_open_rate?: number | null;
+  gate_health?: {
+    state: 'NO_DATA' | 'DEGRADED' | 'INSUFFICIENT' | 'LOW_COVERAGE' | 'PARTIAL' | 'HEALTHY';
+    fail_open_rate: number | null;
+    total_invocations: number;
+    min_sample: number;
+  };
 }
 
 export interface ChallengerSampleRateRecommendation {
@@ -1537,9 +1547,134 @@ export interface LlmCostByFailureClassEntry {
   total_cost_usd: number;
 }
 
+/** Compact per-model row emitted by _compact_llm_cost_attribution (uses cost_usd, not total_cost_usd). */
+export interface LlmCostCompactModelRow {
+  provider: string;
+  model: string;
+  cost_usd: number;
+}
+
+/** Compact per-task-type row emitted by _compact_llm_cost_attribution. */
+export interface LlmCostCompactTaskTypeRow {
+  task_type: string;
+  cost_usd: number;
+  mean_input_tokens_per_call?: number | null;
+}
+
 export interface LlmCostAttribution {
   by_failure_class: LlmCostByFailureClassEntry[];
   total_llm_usd: number;
+  /** Fraction of total LLM spend attributable to rework chains. Null when no chain data. */
+  rework_share?: number | null;
+  /** Fraction of total LLM tokens consumed by self-repair (format fix) loops. Null when no data. */
+  self_repair_burn_share?: number | null;
+  /** Per-(provider, model) compact cost breakdown. Absent on older snapshots. */
+  by_model?: LlmCostCompactModelRow[] | null;
+  /** Per-task-type compact cost breakdown. Absent on older snapshots. */
+  by_task_type?: LlmCostCompactTaskTypeRow[] | null;
+}
+
+/** One entry in the day-over-day LLM cost attribution trend. */
+export interface LlmCostAttributionTrendEntry {
+  captured_at?: string | null;
+  by_model?: LlmCostCompactModelRow[] | null;
+  by_task_type?: LlmCostCompactTaskTypeRow[] | null;
+  rework_share?: number | null;
+  total_llm_usd?: number | null;
+  self_repair_burn_share?: number | null;
+  by_failure_class?: LlmCostByFailureClassEntry[] | null;
+  merged_count?: number | null;
+}
+
+/** Per-scalar slot in a cost-attribution delta (baseline/recent/prior vs current). */
+export interface LlmCostScalarDelta {
+  baseline?: number | null;
+  current?: number | null;
+  abs_delta?: number | null;
+  rel_pct?: number | null;
+}
+
+/** Per-scalar slot specific to the window delta (prior vs recent). */
+export interface LlmCostWindowScalarDelta {
+  prior?: number | null;
+  recent?: number | null;
+  abs_delta?: number | null;
+  rel_pct?: number | null;
+}
+
+/** Per-model row in a cost-attribution delta. */
+export interface LlmCostModelDeltaRow {
+  provider: string;
+  model: string;
+  baseline_cost_usd?: number | null;
+  current_cost_usd?: number | null;
+  cost_delta_usd: number;
+  baseline_share?: number | null;
+  current_share?: number | null;
+}
+
+/** Per-model row in the trailing-window cost delta. */
+export interface LlmCostModelWindowDeltaRow {
+  provider: string;
+  model: string;
+  prior_cost_usd?: number | null;
+  recent_cost_usd?: number | null;
+  cost_delta_usd: number;
+  prior_share?: number | null;
+  recent_share?: number | null;
+  share_delta?: number | null;
+}
+
+/** Per-task-type row in a cost-attribution delta. */
+export interface LlmCostTaskTypeDeltaRow {
+  task_type: string;
+  baseline_cost_usd?: number | null;
+  current_cost_usd?: number | null;
+  cost_delta_usd: number;
+  baseline_share?: number | null;
+  current_share?: number | null;
+  share_delta?: number | null;
+}
+
+/** Per-task-type row in the trailing-window cost delta. */
+export interface LlmCostTaskTypeWindowDeltaRow {
+  task_type: string;
+  prior_cost_usd?: number | null;
+  recent_cost_usd?: number | null;
+  cost_delta_usd: number;
+  prior_share?: number | null;
+  recent_share?: number | null;
+  share_delta?: number | null;
+}
+
+/** Genesis-baseline-vs-current LLM cost-mix delta. */
+export interface LlmCostAttributionDelta {
+  total_llm_usd?: LlmCostScalarDelta | null;
+  rework_share?: LlmCostScalarDelta | null;
+  self_repair_burn_share?: LlmCostScalarDelta | null;
+  by_model_delta?: LlmCostModelDeltaRow[] | null;
+  by_task_type_delta?: LlmCostTaskTypeDeltaRow[] | null;
+}
+
+/** Window metadata for the trailing-window cost delta. */
+export interface LlmCostWindowMeta {
+  recent_n: number;
+  prior_count: number;
+  recent_count: number;
+  prior_start?: string | null;
+  prior_end?: string | null;
+  recent_start?: string | null;
+  recent_end?: string | null;
+}
+
+/** Recent-vs-prior trailing-window LLM cost-mix delta. */
+export interface LlmCostAttributionWindowDelta {
+  total_llm_usd?: LlmCostWindowScalarDelta | null;
+  rework_share?: LlmCostWindowScalarDelta | null;
+  self_repair_burn_share?: LlmCostWindowScalarDelta | null;
+  by_model_delta?: LlmCostModelWindowDeltaRow[] | null;
+  by_task_type_delta?: LlmCostTaskTypeWindowDeltaRow[] | null;
+  window_meta?: LlmCostWindowMeta | null;
 }
 
 export interface EfficiencyAxesResponse {
@@ -1568,6 +1703,10 @@ export interface EfficiencyAxesResponse {
   // total gate invocations from the latest snapshot. Null when no gate
   // invocations exist in the window. Optional for older backends.
   panel_review_effectiveness?: PanelReviewEffectiveness | null;
+  // Deploy-scoped companion: same metric restricted to tasks after the earliest
+  // snapshot under the current serving SHA. Null on older backends or when the
+  // deploy boundary is unknown (first snapshot under this build).
+  panel_review_effectiveness_post_deploy?: PanelReviewEffectiveness | null;
   // Data-driven recommended sample_rate for the challenger gate, computed from
   // the latest snapshot's overturn_rate. Optional for older backends.
   panel_review_recommended_sample_rate?: ChallengerSampleRateRecommendation | null;
@@ -1585,6 +1724,16 @@ export interface EfficiencyAxesResponse {
   // LLM cost attribution from the latest snapshot: per-terminal-outcome
   // (MERGED vs each failure class) breakdown. Null on older snapshots.
   llm_cost_attribution?: LlmCostAttribution | null;
+  // Day-over-day trend of LLM cost attribution headline scalars (oldest-first).
+  // Optional/null for older backends that omit it.
+  llm_cost_attribution_trend?: LlmCostAttributionTrendEntry[] | null;
+  // Baseline-vs-current delta for LLM cost attribution (genesis baseline vs latest).
+  // Complements llm_cost_attribution_window_delta. Null when either side is absent.
+  llm_cost_attribution_baseline_delta?: LlmCostAttributionDelta | null;
+  // Recent-vs-prior trailing-window cost-mix delta (most-recent-K vs prior-K snapshots).
+  // Complements the genesis-baseline delta — distinguishes recent regression from
+  // cumulative drift. Null when trend depth is insufficient or backend is older.
+  llm_cost_attribution_window_delta?: LlmCostAttributionWindowDelta | null;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {
@@ -2499,63 +2648,6 @@ export interface StagingBranchPrefixesResponse {
   is_default: boolean;
 }
 
-export interface ApprovalGateConfig {
-  infra_files: string[];
-  critical_files: string[];
-}
-
-export interface ApprovalGateConfigResponse {
-  project_id: string;
-  approval_gate_config: ApprovalGateConfig;
-  /** True when both lists are empty (freshly onboarded repo, never customized). */
-  is_default: boolean;
-}
-
-/**
- * Validate a single approval-gate path against the same rules the API enforces
- * (admin_project_config._validate_approval_gate_paths): no leading slash, no
- * parent-directory traversal segment, and only `[A-Za-z0-9._-/]` characters
- * (rejects shell metacharacters). Returns a human-readable error string, or
- * `null` when the path is valid. Lets the editor surface feedback inline
- * instead of only failing on submit.
- */
-export function validateApprovalGatePath(path: string): string | null {
-  const trimmed = path.trim();
-  if (!trimmed) return 'Path must not be empty';
-  if (trimmed.startsWith('/')) return 'Path must be repo-relative (no leading "/")';
-  if (trimmed.split('/').includes('..')) return 'Path must not contain ".." traversal';
-  if (!/^[A-Za-z0-9._\-/]+$/.test(trimmed)) return 'Path may only contain letters, digits, and . _ - /';
-  return null;
-}
-
-export async function fetchApprovalGateConfig(
-  projectId: string,
-): Promise<ApprovalGateConfigResponse> {
-  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/approval-gate-config`);
-  if (!res.ok) throw new Error(`Failed to fetch approval-gate config: ${res.status}`);
-  return res.json();
-}
-
-/**
- * Partial update of the approval-gate file lists (owner-only on the server).
- * Pass only the list(s) you want to change. Takes effect for agents
- * immediately via the existing claim-response seam.
- */
-export async function updateApprovalGateConfig(
-  projectId: string,
-  config: Partial<ApprovalGateConfig>,
-): Promise<ApprovalGateConfigResponse> {
-  const res = await apiFetch(
-    `/api/admin/projects/${encodeURIComponent(projectId)}/approval-gate-config`,
-    { method: 'PATCH', body: JSON.stringify(config) },
-  );
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    const msg = (data?.error?.message) || (data?.detail) || `Failed to update approval-gate config: ${res.status}`;
-    throw new Error(typeof msg === 'string' ? msg : `Failed to update approval-gate config: ${res.status}`);
-  }
-  return res.json();
-}
 
 /**
  * Owner-only project delete. The backend cascades to tasks/artifacts/history
@@ -2935,14 +3027,77 @@ export interface ComputeJob {
   hypothesis?: string | null;
 }
 
+export interface ComputeJobsSummary {
+  total_jobs: number;
+  active_jobs: number;
+  terminal_jobs: number;
+  total_spend_usd: number;
+  outcome_breakdown: Record<string, number>;
+  criterion_measured: number;
+  criterion_met: number;
+}
+
+export interface ComputeJobsListResponse {
+  jobs: ComputeJob[];
+  hasMore: boolean;
+  summary: ComputeJobsSummary;
+  limit: number;
+  offset: number;
+}
+
 export async function fetchComputeJobs(
   projectId: string,
   signal?: AbortSignal,
   includeFinishedMinutes?: number,
-): Promise<ComputeJob[]> {
+  offset = 0,
+): Promise<ComputeJobsListResponse> {
   const query = new URLSearchParams();
   if (typeof includeFinishedMinutes === 'number') {
     query.set('include_finished_minutes', String(includeFinishedMinutes));
+  }
+  if (offset > 0) query.set('offset', String(offset));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs${suffix}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch compute jobs: ${res.status}`);
+  const data = await res.json();
+  const emptySummary: ComputeJobsSummary = {
+    total_jobs: 0, active_jobs: 0, terminal_jobs: 0, total_spend_usd: 0,
+    outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0,
+  };
+  return {
+    jobs: Array.isArray(data.compute_jobs) ? data.compute_jobs : [],
+    hasMore: data.has_more ?? false,
+    summary: data.summary ?? emptySummary,
+    limit: data.limit ?? 50,
+    offset: data.offset ?? offset,
+  };
+}
+
+export interface ComputeJobsPagedResponse {
+  jobs: ComputeJob[];
+  hasMore: boolean;
+  summary: ComputeJobsSummary;
+}
+
+export async function fetchComputeJobsPaged(
+  projectId: string,
+  signal?: AbortSignal,
+  opts?: { allTerminal?: boolean; includeFinishedMinutes?: number; offset?: number },
+): Promise<ComputeJobsPagedResponse> {
+  const query = new URLSearchParams();
+  if (opts?.allTerminal) {
+    query.set('all_terminal', 'true');
+  } else if (typeof opts?.includeFinishedMinutes === 'number') {
+    query.set('include_finished_minutes', String(opts.includeFinishedMinutes));
+  }
+  if (typeof opts?.offset === 'number' && opts.offset > 0) {
+    query.set('offset', String(opts.offset));
   }
   const suffix = query.toString() ? `?${query.toString()}` : '';
   const res = await apiFetch(
@@ -2954,7 +3109,30 @@ export async function fetchComputeJobs(
   );
   if (!res.ok) throw new Error(`Failed to fetch compute jobs: ${res.status}`);
   const data = await res.json();
-  return Array.isArray(data.compute_jobs) ? data.compute_jobs : [];
+  const emptySummary: ComputeJobsSummary = {
+    total_jobs: 0, active_jobs: 0, terminal_jobs: 0, total_spend_usd: 0,
+    outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0,
+  };
+  return {
+    jobs: Array.isArray(data.compute_jobs) ? data.compute_jobs : [],
+    hasMore: !!data.has_more,
+    summary: data.summary ?? emptySummary,
+  };
+}
+
+export async function fetchComputeJobsAggregateSummary(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ComputeJobsSummary> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs/summary`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch compute jobs summary: ${res.status}`);
+  return res.json();
 }
 
 export interface BuildConfigCommandEntry {
@@ -3613,6 +3791,18 @@ export async function patchEvergreenFillSettings(patch: Partial<EvergreenFillSet
   }
 }
 
+export async function patchStructuralHealthSettings(patch: { structural_health_audit_mode?: string }): Promise<void> {
+  const res = await apiFetch('/api/admin/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update structural health settings: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update structural health settings: ${res.status}`);
+  }
+}
+
 export async function declareCapabilityVerdict(
   projectId: string,
   capName: string,
@@ -3630,3 +3820,13 @@ export async function declareCapabilityVerdict(
   if (!res.ok) throw new Error(`Failed to declare capability verdict: ${res.status}`);
 }
 
+export async function dismissPendingConfirmation(
+  projectId: string,
+  pendingId: string,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/pending-confirm/${encodeURIComponent(pendingId)}/dismiss`,
+    { method: 'POST' },
+  );
+  if (!res.ok) throw new Error(`Failed to dismiss pending confirmation: ${res.status}`);
+}

@@ -808,6 +808,95 @@ async def test_compute_unmeasured_criterion_spawns_followon(
 
 
 @pytest.mark.asyncio
+async def test_unmeasured_criterion_surfaces_emitted_keys(
+    db_session, _quiet_compute_io
+):
+    """compute_unmeasured_criterion failure message surfaces what the command
+    actually emitted so a case/name mismatch is instantly visible.
+
+    Case A: COMPUTE_RESULT emitted a differently-NAMED metric ('roc_auc_score')
+            while the criterion declares 'auc' → the metric stays unmeasured and
+            miss_reason lists emitted_keys=['roc_auc_score'] hinting at the
+            name mismatch. (A pure case difference such as 'AUC' vs 'auc' is now
+            tolerated by the case-insensitive matcher in
+            evaluate_compute_success_criterion (#11745) and is therefore measured,
+            not surfaced here — only a genuine name divergence reaches this path.)
+    Case B: COMPUTE_RESULT has no experiment metrics at all (only cost fields)
+            → miss_reason reports emitted_keys=[].
+    Case C: no COMPUTE_RESULT parsed (crash before result) — exercised separately
+            by test_unmeasured_criterion_no_artifact_is_crash_path.
+    """
+    # --- Case A: differently-named metric key emitted (not a pure case diff) ---
+    task_a = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "auc-experiment",
+            "success_criterion": {
+                "kind": "metric",
+                "metric": "auc",
+                "operator": ">=",
+                "threshold": 0.8,
+            },
+        },
+    )
+    result_with_name_mismatch = json.dumps(
+        {
+            "outcome": "SUCCESS",
+            "final_cost_usd": 0.10,
+            # declared as 'auc' but emitted under a different NAME (not just case),
+            # so the case-insensitive matcher does not resolve it → unmeasured.
+            "roc_auc_score": 0.85,
+        }
+    )
+    await _handle_compute_experiment_completion(
+        task_a, result_with_name_mismatch, db_session
+    )
+    await db_session.refresh(task_a)
+    assert task_a.status == TaskStatus.FAILED
+    assert task_a.context["failure_category"] == "compute_unmeasured_criterion"
+    gate_reason = task_a.context["evaluation_gate"]["reason"]
+    # Must name the declared metric, the emitted keys, and hint at a name mismatch.
+    assert "auc" in gate_reason
+    assert "roc_auc_score" in gate_reason
+    assert "emitted_keys" in gate_reason
+    assert "case" in gate_reason.lower() or "name" in gate_reason.lower()
+
+    # --- Case B: no experiment metrics in result at all ---
+    task_b = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "empty-metrics-experiment",
+            "success_criterion": {
+                "kind": "metric",
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+            },
+        },
+    )
+    result_no_metrics = json.dumps(
+        {
+            "outcome": "SUCCESS",
+            "final_cost_usd": 0.05,
+            # intentionally no 'accuracy' or any other experiment metric key
+        }
+    )
+    await _handle_compute_experiment_completion(
+        task_b, result_no_metrics, db_session
+    )
+    await db_session.refresh(task_b)
+    assert task_b.status == TaskStatus.FAILED
+    assert task_b.context["failure_category"] == "compute_unmeasured_criterion"
+    gate_reason_b = task_b.context["evaluation_gate"]["reason"]
+    assert "accuracy" in gate_reason_b
+    assert "emitted_keys=[]" in gate_reason_b
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kill_outcome", ["TIMED_OUT", "SPEND_CAP_EXCEEDED"])
 async def test_intentional_kill_spawns_no_followon(
     db_session, _quiet_compute_io, kill_outcome
@@ -1330,6 +1419,15 @@ async def test_agent_spawn_compute_experiment_above_threshold_requires_approval(
         child = await db_session.get(Task, child_id)
         assert child is not None
         assert child.requires_approval is True
+        # Verify TaskHistory SPAWNED entry records the enforced value, not the caller request
+        history_rows = await db_session.execute(
+            select(TaskHistory).where(
+                (TaskHistory.task_id == child_id) & (TaskHistory.action == "SPAWNED")
+            )
+        )
+        history = history_rows.scalar_one_or_none()
+        assert history is not None
+        assert history.details["requires_approval"] is True
     finally:
         if prev_threshold is not None:
             _shared_state.runtime_config[
@@ -1401,3 +1499,578 @@ async def test_agent_spawn_compute_experiment_below_threshold_no_approval(
             _shared_state.runtime_config.pop(
                 "compute_experiment_spend_threshold_usd", None
             )
+
+
+# --- Chokepoint: create_compute_job spend-gate ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_launch_refuses_above_threshold_unapproved_compute_job(db_session):
+    """Chokepoint: create_compute_job raises ComputeLaunchPreconditionFailed when
+    spend_cap_usd exceeds the project threshold and spend_approval_cleared_at is None,
+    regardless of the requires_approval flag on the Task.
+
+    The approval threshold lives in the GLOBAL runtime_config
+    (``compute_experiment_spend_threshold_usd``) — the same source the four
+    autonomous spawn sites and the chokepoint both read, per #11678. There is no
+    per-project ``Project.runtime_config_json`` column (``runtime_config_json``
+    is a column on ``DeploymentState``, not ``Project``), so the threshold is set
+    here via the global config with save/restore, mirroring the sibling
+    test_launch_allows_zero_config_project_below_global_threshold.
+    """
+    from app import runtime_config_state as rcs
+    from app.compute_jobs import ComputeLaunchPreconditionFailed
+
+    prev = rcs.runtime_config.get("compute_experiment_spend_threshold_usd")
+    rcs.runtime_config["compute_experiment_spend_threshold_usd"] = 5.0
+    try:
+        project = Project(
+            name="ChokeGateRefuse",
+            user_id="test-user",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="compute_experiment: chokepoint refuse",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "compute_experiment", "command": "python bench.py"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            requires_approval=False,
+            spend_approval_cleared_at=None,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        with pytest.raises(ComputeLaunchPreconditionFailed) as exc_info:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task,
+                command="python bench.py",
+                machine_type="e2-standard-2",
+                spend_cap_usd=10.0,
+                deadline_seconds=300,
+            )
+
+        detail = exc_info.value.detail
+        assert detail["error"] == "spend_cap_requires_approval"
+        assert detail["spend_cap_usd"] == 10.0
+        assert detail["threshold_usd"] == 5.0
+    finally:
+        if prev is not None:
+            rcs.runtime_config["compute_experiment_spend_threshold_usd"] = prev
+        else:
+            rcs.runtime_config.pop("compute_experiment_spend_threshold_usd", None)
+
+
+@pytest.mark.asyncio
+async def test_launch_allows_operator_approved_above_threshold_compute_job(db_session):
+    """Chokepoint: create_compute_job proceeds when spend_approval_cleared_at is set,
+    even if spend_cap_usd exceeds the (global) threshold.
+
+    Threshold is set via the global runtime_config (see the refuse test) so this
+    genuinely exercises the above-threshold-but-operator-approved path rather than
+    relying on a no-op per-project column.
+    """
+    from app import runtime_config_state as rcs
+
+    prev = rcs.runtime_config.get("compute_experiment_spend_threshold_usd")
+    rcs.runtime_config["compute_experiment_spend_threshold_usd"] = 5.0
+    try:
+        project = Project(
+            name="ChokeGateAllow",
+            user_id="test-user",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="compute_experiment: chokepoint allow",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "compute_experiment", "command": "python bench.py"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            requires_approval=False,
+            spend_approval_cleared_at=datetime.utcnow(),
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python bench.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=10.0,
+            deadline_seconds=300,
+        )
+        assert job is not None
+    finally:
+        if prev is not None:
+            rcs.runtime_config["compute_experiment_spend_threshold_usd"] = prev
+        else:
+            rcs.runtime_config.pop("compute_experiment_spend_threshold_usd", None)
+
+
+@pytest.mark.asyncio
+async def test_launch_allows_zero_config_project_below_global_threshold(db_session):
+    """Chokepoint reads global runtime_config: a project with runtime_config_json=None
+    uses the global threshold (default 10.0), so a spend below that launches without
+    a precondition failure."""
+    from app import runtime_config_state as rcs
+    from app.compute_jobs import ComputeLaunchPreconditionFailed
+
+    prev = rcs.runtime_config.get("compute_experiment_spend_threshold_usd")
+    rcs.runtime_config["compute_experiment_spend_threshold_usd"] = 10.0
+    try:
+        project = Project(
+            name="ZeroConfigGate",
+            user_id="test-user",
+            runtime_config_json=None,
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task_below = Task(
+            project_id=project.id,
+            title="compute_experiment: zero-config below threshold",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "compute_experiment", "command": "python bench.py"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            spend_approval_cleared_at=None,
+        )
+        db_session.add(task_below)
+        await db_session.commit()
+        await db_session.refresh(task_below)
+
+        # Below global threshold (9.0 < 10.0) — must succeed
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task_below,
+            command="python bench.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=9.0,
+            deadline_seconds=300,
+        )
+        assert job is not None
+
+        # Above global threshold (11.0 > 10.0) — must be refused
+        task_above = Task(
+            project_id=project.id,
+            title="compute_experiment: zero-config above threshold",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "compute_experiment", "command": "python bench.py"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            spend_approval_cleared_at=None,
+        )
+        db_session.add(task_above)
+        await db_session.commit()
+        await db_session.refresh(task_above)
+
+        with pytest.raises(ComputeLaunchPreconditionFailed) as exc_info:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task_above,
+                command="python bench.py",
+                machine_type="e2-standard-2",
+                spend_cap_usd=11.0,
+                deadline_seconds=300,
+            )
+        detail = exc_info.value.detail
+        assert detail["error"] == "spend_cap_requires_approval"
+        assert detail["threshold_usd"] == pytest.approx(10.0)
+    finally:
+        if prev is not None:
+            rcs.runtime_config["compute_experiment_spend_threshold_usd"] = prev
+        else:
+            rcs.runtime_config.pop("compute_experiment_spend_threshold_usd", None)
+
+
+# ---------------------------------------------------------------------------
+# Strategist spawn_task spend-gate regression tests
+# ---------------------------------------------------------------------------
+
+
+async def _make_strategic_task(db_session) -> tuple:
+    """Create a project and a strategic_review task; return (project, task, token)."""
+    project = Project(name="StrategistSpawnGate", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Strategic review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-strategic-spawn",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-strategic-spawn", task_type="strategic_review"
+    )
+    return project, task, token
+
+
+@pytest.mark.asyncio
+async def test_strategist_spawn_compute_experiment_above_threshold_requires_approval(
+    client: AsyncClient, db_session
+):
+    """Strategic spawn_task for compute_experiment with spend_cap above threshold
+    must set requires_approval=True on the created task."""
+    import app.shared_state as _shared_state
+
+    project, task, token = await _make_strategic_task(db_session)
+    prev = _shared_state.runtime_config.get("compute_experiment_spend_threshold_usd")
+    _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = 5.0
+    try:
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "compute_experiment",
+                    "title": "Strategist above-threshold experiment",
+                    "prompt": "Run the benchmark to measure throughput improvement",
+                    "command": "python bench.py",
+                    "spend_cap_usd": 10.0,
+                    "deadline_seconds": 600,
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        child_id = uuid.UUID(resp.json()["task_id"])
+        child = await db_session.get(Task, child_id)
+        assert child is not None
+        assert child.requires_approval is True
+    finally:
+        if prev is not None:
+            _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = prev
+        else:
+            _shared_state.runtime_config.pop(
+                "compute_experiment_spend_threshold_usd", None
+            )
+
+
+@pytest.mark.asyncio
+async def test_strategist_spawn_compute_experiment_below_threshold_no_approval(
+    client: AsyncClient, db_session
+):
+    """Strategic spawn_task for compute_experiment with spend_cap at or below
+    threshold must NOT set requires_approval."""
+    import app.shared_state as _shared_state
+
+    project, task, token = await _make_strategic_task(db_session)
+    prev = _shared_state.runtime_config.get("compute_experiment_spend_threshold_usd")
+    _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = 5.0
+    try:
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "compute_experiment",
+                    "title": "Strategist below-threshold experiment",
+                    "prompt": "Run the benchmark to measure throughput improvement",
+                    "command": "python bench.py",
+                    "spend_cap_usd": 3.0,
+                    "deadline_seconds": 600,
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        child_id = uuid.UUID(resp.json()["task_id"])
+        child = await db_session.get(Task, child_id)
+        assert child is not None
+        assert child.requires_approval is False
+    finally:
+        if prev is not None:
+            _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = prev
+        else:
+            _shared_state.runtime_config.pop(
+                "compute_experiment_spend_threshold_usd", None
+            )
+
+
+@pytest.mark.asyncio
+async def test_strategist_spawn_compute_experiment_invalid_contract_rejected(
+    client: AsyncClient, db_session
+):
+    """Strategic spawn_task for compute_experiment with a malformed contract
+    (missing command) must be rejected with 400 before any task is created."""
+    project, task, token = await _make_strategic_task(db_session)
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "spawn_task",
+            "data": {
+                "type": "compute_experiment",
+                "title": "Invalid contract experiment",
+                "prompt": "Run something",
+                "command": "",
+                "spend_cap_usd": 2.0,
+                "deadline_seconds": 300,
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    error_text = (
+        body.get("detail")
+        or (body.get("error") or {}).get("message")
+        or ""
+    ).lower()
+    assert "contract invalid" in error_text
+
+
+# ---------------------------------------------------------------------------
+# Arms + declared_metric contract tests
+# ---------------------------------------------------------------------------
+
+
+def test_arms_contract_authoring_flat():
+    """arms and declared_metric are picked up from flat finding fields."""
+    finding = {
+        "arms": [{"name": "adam", "command": "python train.py --opt adam"}],
+        "declared_metric": "val_loss",
+        "spend_cap_usd": 3.0,
+        "deadline_seconds": 600,
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["arms"] == [{"name": "adam", "command": "python train.py --opt adam"}]
+    assert contract["declared_metric"] == "val_loss"
+
+
+def test_arms_contract_authoring_nested():
+    """arms and declared_metric are picked up from nested compute_experiment dict."""
+    finding = {
+        "compute_experiment": {
+            "arms": [
+                {"name": "a", "command": "python a.py"},
+                {"name": "b", "command": "python b.py"},
+            ],
+            "declared_metric": "accuracy",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        }
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert len(contract["arms"]) == 2
+    assert contract["declared_metric"] == "accuracy"
+
+
+def test_arms_contract_authoring_omits_absent_arms():
+    """When no arms key is present, the contract omits it."""
+    finding = {"command": "python run.py", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    contract = _author_compute_launch_contract(finding)
+    assert "arms" not in contract
+    assert "declared_metric" not in contract
+
+
+def test_arms_contract_validation_ok():
+    """A well-formed two-arm contract with declared_metric passes validation."""
+    contract = {
+        "arms": [
+            {"name": "adam", "command": "python train.py --optimizer adam --epochs 5"},
+            {"name": "sgd", "command": "python train.py --optimizer sgd --epochs 5"},
+        ],
+        "declared_metric": "val_loss",
+        "spend_cap_usd": 5.0,
+        "deadline_seconds": 3600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+    assert reason == ""
+
+
+def test_arms_contract_validation_synthesizes_command():
+    """Validation synthesizes a base64-encoded command from arms so the compute job always has one."""
+    import base64
+    import re
+
+    contract = {
+        "arms": [
+            {"name": "a", "command": "python a.py"},
+            {"name": "b", "command": "python b.py"},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+    assert "command" in contract
+    cmd = contract["command"]
+    # Command must use base64 to avoid shell-quoting issues.
+    assert "base64" in cmd
+    m = re.search(r"echo (\S+) \| base64 -d \| bash", cmd)
+    assert m is not None, f"command did not match base64-decode pattern: {cmd!r}"
+    decoded = base64.b64decode(m.group(1)).decode()
+    assert "python a.py" in decoded
+    assert "python b.py" in decoded
+
+
+def test_arms_contract_validation_single_quote_safe():
+    """Arms with single quotes in commands produce a safe base64-encoded command."""
+    import base64
+    import re
+
+    contract = {
+        "arms": [
+            {"name": "a", "command": "python -c 'print(1)'"},
+            {"name": "b", "command": "python b.py --flag='value'"},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+    cmd = contract["command"]
+    m = re.search(r"echo (\S+) \| base64 -d \| bash", cmd)
+    assert m is not None, f"command did not match base64-decode pattern: {cmd!r}"
+    decoded = base64.b64decode(m.group(1)).decode()
+    assert "python -c 'print(1)'" in decoded
+    assert "python b.py --flag='value'" in decoded
+
+
+def test_arms_contract_validation_missing_declared_metric():
+    """arms without declared_metric is rejected."""
+    contract = {
+        "arms": [{"name": "a", "command": "python a.py"}],
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "declared_metric" in reason
+
+
+def test_arms_contract_validation_empty_declared_metric():
+    """declared_metric that is an empty string is rejected."""
+    contract = {
+        "arms": [{"name": "a", "command": "python a.py"}],
+        "declared_metric": "   ",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "declared_metric" in reason
+
+
+def test_arms_contract_validation_empty_arms_list():
+    """An empty arms list is rejected."""
+    contract = {
+        "arms": [],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "arms" in reason
+
+
+def test_arms_contract_validation_arm_missing_command():
+    """An arm with an empty command string is rejected with a descriptive error."""
+    contract = {
+        "arms": [
+            {"name": "good", "command": "python a.py"},
+            {"name": "bad", "command": ""},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "bad" in reason
+    assert "command" in reason
+
+
+def test_arms_contract_validation_arm_missing_name():
+    """An arm with a missing name is rejected."""
+    contract = {
+        "arms": [{"name": "", "command": "python a.py"}],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "name" in reason
+
+
+def test_declared_metric_non_empty_string_required_standalone():
+    """declared_metric alone (no arms) must be a non-empty string if present."""
+    contract = {
+        "command": "python run.py",
+        "declared_metric": "",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "declared_metric" in reason
+
+
+# ---------------------------------------------------------------------------
+# E2E: arms payload survives strategist spawn_task to child task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategist_spawn_compute_experiment_arms_e2e(
+    client: AsyncClient, db_session
+):
+    """Strategic spawn_task with an arms payload must validate, merge into the
+    child task payload, and land arms + declared_metric on the spawned child."""
+    project, task, token = await _make_strategic_task(db_session)
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "spawn_task",
+            "data": {
+                "type": "compute_experiment",
+                "title": "Arms e2e: compare adam vs sgd",
+                "prompt": "Measure val_loss for two optimisers",
+                "arms": [
+                    {"name": "adam", "command": "python train.py --opt adam --epochs 5"},
+                    {"name": "sgd", "command": "python train.py --opt sgd --epochs 5"},
+                ],
+                "declared_metric": "val_loss",
+                "spend_cap_usd": 3.0,
+                "deadline_seconds": 600,
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    child_id = uuid.UUID(resp.json()["task_id"])
+    child = await db_session.get(Task, child_id)
+    assert child is not None
+    payload = child.first_payload
+    assert payload.get("arms") == [
+        {"name": "adam", "command": "python train.py --opt adam --epochs 5"},
+        {"name": "sgd", "command": "python train.py --opt sgd --epochs 5"},
+    ]
+    assert payload.get("declared_metric") == "val_loss"
+    # A synthesized top-level command must also be present for the compute job.
+    assert isinstance(payload.get("command"), str) and payload["command"]

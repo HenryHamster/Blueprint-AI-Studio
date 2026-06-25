@@ -11,6 +11,7 @@ from app.models import (
 )
 from app.digest_metrics import (
     _FAILURE_CLASS_LABELS,
+    _SELF_REPAIR_MIN_ATTEMPTS,
     _compute_first_attempt_breakdowns,
     _compute_first_review_approval_breakdowns,
     _compute_non_code_outcomes,
@@ -442,20 +443,20 @@ def test_compute_timeout_rate_not_gameable_by_raw_volume():
 
 
 def test_compute_timeout_rate_denominator_excludes_never_started():
-    """Tasks that never reached execution (no started_at) are out of the denominator."""
+    """Never-started non-timeouts are excluded, but never-started timeouts are included."""
     from app.digest_metrics import compute_timeout_rate
 
     tasks = [_timeout_task("oom") for _ in range(2)]
     tasks += [_nontimeout_terminal_task() for _ in range(2)]
-    # Two terminal tasks that never started — excluded from the denominator so a
-    # task that could not have timed out does not deflate the rate.
+    # Two terminal tasks that never started — the timeout is included in denominator
+    # (it could have timed out, and did), but the non-timeout is excluded (it could
+    # not have timed out).
     tasks += [_timeout_task("oom", started=False)]
     tasks += [make_task(status=TaskStatus.CANCELLED, started_at=None, context={})]
     block = compute_timeout_rate(tasks)
-    # Denominator = 4 started tasks (the 2 timeouts + 2 non-timeouts). The
-    # never-started timeout still counts in timeout_count (it has persisted
-    # ground truth) but not in the denominator.
-    assert block["denominator"] == 4
+    # Denominator = 5: the 2 started timeouts + 2 started non-timeouts +
+    # 1 unstarted timeout. The unstarted non-timeout is not included.
+    assert block["denominator"] == 5
     assert block["timeout_count"] == 3
     assert block["by_subtype"]["oom"]["count"] == 3
 
@@ -490,6 +491,35 @@ def test_compute_timeout_rate_reads_persisted_not_derived():
     )
     block2 = compute_timeout_rate([not_persisted])
     assert block2["timeout_count"] == 0
+
+
+def test_compute_timeout_rate_counts_unstarted_timeout_in_denominator():
+    """Unstarted AGENT_TIMEOUT tasks are included in the denominator.
+
+    A never-started timeout is still a task that could have timed out (it did,
+    just before dispatching), so it should count in the denominator alongside
+    started tasks. This ensures numerator and denominator are consistent and the
+    rate is not inflated.
+    """
+    from app.digest_metrics import compute_timeout_rate
+
+    # 2 started timeouts + 2 non-timeout started tasks
+    tasks = [_timeout_task("oom") for _ in range(2)]
+    tasks += [_nontimeout_terminal_task() for _ in range(2)]
+    # 1 unstarted timeout + 1 unstarted non-timeout
+    tasks.append(_timeout_task("oom", started=False))
+    tasks.append(make_task(status=TaskStatus.CANCELLED, started_at=None, context={}))
+
+    block = compute_timeout_rate(tasks)
+    # Denominator = 5: the 2 started timeouts + 2 started non-timeouts +
+    # 1 unstarted timeout. The unstarted non-timeout is NOT in denominator.
+    assert block["denominator"] == 5
+    # Numerator = 3: all three timeouts (2 started + 1 unstarted).
+    assert block["timeout_count"] == 3
+    assert block["by_subtype"]["oom"]["count"] == 3
+    # Rate = 3/5 = 0.6
+    assert block["overall_rate"] == 0.6
+    assert block["by_subtype"]["oom"]["rate"] == 0.6
 
 
 def test_confident_dominant_timeout_subtype_gate():
@@ -5545,14 +5575,16 @@ def test_format_compliance_metrics_malformed_then_repaired_run():
     assert create["tasks_measured"] == 2
     assert create["well_formed_tasks"] == 1
     assert create["format_compliance_rate"] == 0.5
-    # One repair attempt, one success.
-    assert create["self_repair_success_rate"] == 1.0
+    # One repair attempt, one success — but below _SELF_REPAIR_MIN_ATTEMPTS so
+    # self_repair_success_rate is suppressed (None) to prevent phantom drift signals.
+    assert create["self_repair_success_rate"] is None
 
     fix = by_type["fix"]
     assert fix["tasks_measured"] == 1
     assert fix["well_formed_tasks"] == 0
     assert fix["format_compliance_rate"] == 0.0
-    assert fix["self_repair_success_rate"] == 0.5
+    # Two repair attempts, below threshold — suppressed.
+    assert fix["self_repair_success_rate"] is None
 
 
 def test_format_compliance_metrics_null_summaries_excluded():
@@ -5777,43 +5809,44 @@ def test_self_repair_rate_infra_failures_by_schema_aggregated():
             "create",
             {
                 "format_error_total": 1,
-                "format_repair_attempts": 4,
-                "format_repair_successes": 2,
+                "format_repair_attempts": 5,
+                "format_repair_successes": 3,
                 "format_repair_infra_failures": 2,
-                "format_repair_attempts_by_schema": {"ResearchPlan": 4},
-                "format_repair_successes_by_schema": {"ResearchPlan": 2},
+                "format_repair_attempts_by_schema": {"ResearchPlan": 5},
+                "format_repair_successes_by_schema": {"ResearchPlan": 3},
                 "format_repair_infra_failures_by_schema": {"ResearchPlan": 2},
             },
         ),
     ]
     overall = compute_format_compliance_metrics(tasks)["overall"]
     assert overall["repair_infra_failures"] == 2
-    # clean_attempts = 4 - 2 = 2; rate = 2/2 = 1.0
+    # clean_attempts = 5 - 2 = 3; rate = 3/3 = 1.0
     assert overall["self_repair_success_rate"] == 1.0
     by_schema = overall["by_schema"]
     assert "ResearchPlan" in by_schema
     assert by_schema["ResearchPlan"]["repair_infra_failures"] == 2
-    # clean_attempts = 4 - 2 = 2; rate = 2/2 = 1.0
+    # clean_attempts = 5 - 2 = 3 (at minimum-sample floor); rate = 3/3 = 1.0
     assert by_schema["ResearchPlan"]["self_repair_success_rate"] == 1.0
 
 
 def test_format_compliance_by_schema_success_rate():
     """Per-schema self_repair_success_rate is derived from per-schema counts.
 
-    Thinker schema: 1 success / (3 attempts - 1 infra) = 0.5
-    Other schema:   2 success / (2 attempts - 0 infra) = 1.0
+    Thinker schema: 2 success / (5 attempts - 1 infra) = 0.5
+    Other schema:   3 success / (3 attempts - 0 infra) = 1.0
     Schema with only infra failures: None (clean denominator == 0)
+    Each schema uses >=3 clean attempts to clear the minimum-sample floor.
     """
     tasks = [
         _fc_task(
             "create",
             {
                 "format_error_total": 2,
-                "format_repair_attempts": 5,
-                "format_repair_successes": 3,
+                "format_repair_attempts": 8,
+                "format_repair_successes": 5,
                 "format_repair_infra_failures": 1,
-                "format_repair_attempts_by_schema": {"thinker": 3, "Other": 2},
-                "format_repair_successes_by_schema": {"thinker": 1, "Other": 2},
+                "format_repair_attempts_by_schema": {"thinker": 5, "Other": 3},
+                "format_repair_successes_by_schema": {"thinker": 2, "Other": 3},
                 "format_repair_infra_failures_by_schema": {"thinker": 1, "Other": 0},
             },
         ),
@@ -5833,14 +5866,46 @@ def test_format_compliance_by_schema_success_rate():
     overall = compute_format_compliance_metrics(tasks)["overall"]
     by_schema = overall["by_schema"]
 
-    # thinker: 1 success / (3 - 1) clean = 0.5
+    # thinker: 2 success / (5 - 1) clean = 0.5
     assert by_schema["thinker"]["self_repair_success_rate"] == 0.5
 
-    # Other: 2 success / (2 - 0) clean = 1.0
+    # Other: 3 success / (3 - 0) clean = 1.0
     assert by_schema["Other"]["self_repair_success_rate"] == 1.0
 
     # InfraOnly: clean_attempts = 2 - 2 = 0 → None
     assert by_schema["InfraOnly"]["self_repair_success_rate"] is None
+
+
+def test_by_schema_self_repair_suppressed_below_min_attempts():
+    """Per-schema self_repair_success_rate is None when clean attempts < 3.
+
+    Low-volume schema labels (1–2 clean repairs per window) produce phantom
+    0%/100% rates that look like regressions but are noise artifacts. The
+    minimum-sample floor suppresses the rate to None so the operator dashboard
+    does not display misleading signals.
+    """
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 2,
+                "format_repair_attempts": 4,
+                "format_repair_successes": 2,
+                "format_repair_infra_failures": 0,
+                # strategic: 1 clean attempt — below floor → None
+                # thinker:   2 clean attempts — below floor → None
+                "format_repair_attempts_by_schema": {"strategic": 1, "thinker": 2},
+                "format_repair_successes_by_schema": {"strategic": 1, "thinker": 2},
+                "format_repair_infra_failures_by_schema": {"strategic": 0, "thinker": 0},
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    by_schema = overall["by_schema"]
+
+    # Both schemas are below the 3-attempt floor — rate must be None, not 0% or 100%
+    assert by_schema["strategic"]["self_repair_success_rate"] is None
+    assert by_schema["thinker"]["self_repair_success_rate"] is None
 
 
 def test_per_schema_repair_miss_aggregated():
@@ -5924,6 +5989,72 @@ def test_format_repair_miss_by_schema_in_schema_entry():
     assert thinker["repair_miss"] == 2
     assert thinker["repair_attempts"] == 3
     assert thinker["repair_successes"] == 1
+
+
+def test_format_miss_by_schema_and_reason_aggregation():
+    """format_miss_by_schema_and_reason merges nested reason counts across tasks.
+
+    Task 1: strategic_review → {missing_required_keys: 3, extra_keys: 1}
+    Task 2: strategic_review → {missing_required_keys: 2}, thinker → {bad_json: 1}
+    Expected merged: strategic_review → {missing_required_keys: 5, extra_keys: 1},
+                     thinker → {bad_json: 1}
+    """
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 4,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 1,
+                "format_miss_by_schema_and_reason": {
+                    "strategic_review": {
+                        "missing_required_keys": 3,
+                        "extra_keys": 1,
+                    }
+                },
+            },
+        ),
+        _fc_task(
+            "fix",
+            {
+                "format_error_total": 3,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 0,
+                "format_miss_by_schema_and_reason": {
+                    "strategic_review": {"missing_required_keys": 2},
+                    "thinker": {"bad_json": 1},
+                },
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    by_reason = overall["format_miss_by_schema_and_reason"]
+
+    # strategic_review: counts merged across both tasks
+    assert by_reason["strategic_review"]["missing_required_keys"] == 5
+    assert by_reason["strategic_review"]["extra_keys"] == 1
+
+    # thinker: from second task only
+    assert by_reason["thinker"]["bad_json"] == 1
+
+
+def test_format_miss_by_schema_and_reason_absent_tasks_excluded():
+    """Tasks lacking format_miss_by_schema_and_reason contribute nothing to that map."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 0,
+                "format_miss_by_reason": {"missing_required_keys": 1},
+                # no format_miss_by_schema_and_reason key
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    # map should be empty, not raise
+    assert overall["format_miss_by_schema_and_reason"] == {}
 
 
 def _fc_clean(task_type="create"):
@@ -6138,6 +6269,59 @@ def test_format_compliance_metrics_mixed_old_new_agents():
     # Empty by_schema when no tasks carry per-schema data.
     result_old_only = compute_format_compliance_metrics([old_agent_task])
     assert result_old_only["overall"]["by_schema"] == {}
+
+
+def test_per_type_self_repair_drift_suppressed_below_min_attempts():
+    """Per-type self_repair_success_rate is suppressed (None) when the type's clean
+    repair attempts are below _SELF_REPAIR_MIN_ATTEMPTS, preventing phantom regression
+    deltas from low-volume task types (e.g. strategic_review with ~2 repairs/window).
+
+    The overall rate uses the full window and is NOT suppressed when it has enough
+    clean attempts across all types combined.
+    """
+    # Build _SELF_REPAIR_MIN_ATTEMPTS - 1 clean repair tasks for "strategic_review"
+    # (below threshold) and _SELF_REPAIR_MIN_ATTEMPTS tasks for "create" (at/above).
+    low_volume_count = _SELF_REPAIR_MIN_ATTEMPTS - 1  # 9 — below the guard
+    high_volume_count = _SELF_REPAIR_MIN_ATTEMPTS  # 10 — at the guard
+
+    strategic_review_tasks = [
+        _fc_task(
+            "strategic_review",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+            },
+        )
+        for _ in range(low_volume_count)
+    ]
+    create_tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+            },
+        )
+        for _ in range(high_volume_count)
+    ]
+
+    result = compute_format_compliance_metrics(strategic_review_tasks + create_tasks)
+    by_type = result["by_type"]
+
+    # strategic_review has 9 clean attempts — below threshold — rate must be suppressed.
+    assert by_type["strategic_review"]["repair_attempts"] == low_volume_count
+    assert by_type["strategic_review"]["self_repair_success_rate"] is None
+
+    # create has 10 clean attempts — at/above threshold — rate is NOT suppressed.
+    assert by_type["create"]["repair_attempts"] == high_volume_count
+    assert by_type["create"]["self_repair_success_rate"] == 1.0
+
+    # The overall block spans both types (19 clean attempts) — not suppressed.
+    overall = result["overall"]
+    assert overall["repair_attempts"] == low_volume_count + high_volume_count
+    assert overall["self_repair_success_rate"] == 1.0
 
 
 def test_repair_token_accumulation_and_llm_usd():

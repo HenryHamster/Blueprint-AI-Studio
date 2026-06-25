@@ -943,6 +943,68 @@ async def set_version_goal(
     }
 
 
+class _SetVersionThemeBody(BaseModel):
+    theme: str | None = _Field(default=None, max_length=32)
+
+
+@router.post("/projects/{project_id}/version-theme")
+async def set_version_theme(
+    project_id: uuid.UUID,
+    payload: _SetVersionThemeBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Set the delivery theme of the open release version for a project.
+
+    Member+ role required.  Returns 404 when there is no open version.
+    Allows operators to override a mis-authored theme so the merge-grade
+    theme-delivery gate is not permanently blocked.
+
+    Valid themes: leanness, reliability, performance, feature, mixed, none.
+    Pass ``null`` to clear the theme back to unset.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    open_ver = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if open_ver is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+
+    operator_id = current_user.get("email") or current_user["user_id"]
+    try:
+        _release_version.set_version_theme(
+            open_ver, payload.theme, editor_id=operator_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    session.add(open_ver)
+    await session.commit()
+    await session.refresh(open_ver)
+    return {
+        "version_number": open_ver.version_number,
+        "theme": open_ver.theme,
+    }
+
+
 class _AbandonVersionBody(BaseModel):
     reason: str | None = _Field(default=None, max_length=500)
     # Client-generated idempotency key. When supplied, a repeat cut (double-click

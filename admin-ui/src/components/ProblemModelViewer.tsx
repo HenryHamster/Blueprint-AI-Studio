@@ -1,8 +1,9 @@
 import { useState } from 'react';
-import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag } from 'lucide-react';
+import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag, X } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { MarkdownContent } from './MarkdownContent';
 import { ProblemModelEditor } from './ProblemModelEditor';
+import { dismissPendingConfirmation } from '../api';
 import type {
   ProblemModel,
   Gap,
@@ -234,7 +235,14 @@ function FrictionRow({ friction }: { friction: Friction }) {
   );
 }
 
-function PendingConfirmationRow({ pending }: { pending: PendingConfirmation }) {
+function PendingConfirmationRow({
+  pending,
+  onDismiss,
+}: {
+  pending: PendingConfirmation;
+  onDismiss?: () => void;
+}) {
+  const [dismissing, setDismissing] = useState(false);
   return (
     <div className="border border-amber-500/40 rounded-md p-3 bg-amber-500/5">
       <div className="flex items-start gap-2">
@@ -254,6 +262,21 @@ function PendingConfirmationRow({ pending }: { pending: PendingConfirmation }) {
             <p className="text-ui-sm text-neutral-500 mt-1">{timeAgo(pending.created_at)}</p>
           )}
         </div>
+        {onDismiss && (
+          <button
+            type="button"
+            disabled={dismissing}
+            onClick={async () => {
+              setDismissing(true);
+              try { await onDismiss(); } finally { setDismissing(false); }
+            }}
+            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-neutral-700 bg-neutral-800/50 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 transition disabled:opacity-50"
+            title="Mark as resolved"
+          >
+            <X size={11} />
+            Resolve
+          </button>
+        )}
       </div>
     </div>
   );
@@ -374,7 +397,24 @@ export default function ProblemModelViewer({
               Needs your attention
             </SectionHeader>
             <div className="space-y-2">
-              {pending.map((p) => <PendingConfirmationRow key={p.id} pending={p} />)}
+              {pending.map((p) => (
+                <PendingConfirmationRow
+                  key={p.id}
+                  pending={p}
+                  onDismiss={async () => {
+                    try {
+                      await dismissPendingConfirmation(projectId, p.id);
+                      onUpdated({
+                        ...problemModel,
+                        pending_user_confirmation: pending.filter((x) => x.id !== p.id),
+                        revision: (problemModel.revision ?? 0) + 1,
+                      });
+                    } catch {
+                      addToast('Failed to dismiss — try again', 'error');
+                    }
+                  }}
+                />
+              ))}
             </div>
           </section>
         )}

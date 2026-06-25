@@ -384,12 +384,16 @@ async def sweep_orphaned_direction_provider_tasks(session) -> int:
     manually cancels them.
 
     This sweep finds EVALUATING tasks that carry a direction_id in their context and
-    whose direction row now has a retired status, then cancels them cleanly (not a
-    pipeline failure — the direction simply closed before the task completed).
+    whose direction row now has a retired status, then either:
+    - If the task has an open PR (pr_number in first payload), orphan it by clearing
+      the direction_id from context (allowing the PR to land independently).
+    - Otherwise, cancel it cleanly (not a pipeline failure — the direction simply
+      closed before the task completed).
 
-    Returns the number of tasks cancelled.
+    Returns the number of tasks cancelled (not counting orphaned tasks).
     """
     cancelled = 0
+    orphaned = 0
     try:
         # Step A: find EVALUATING tasks with a direction_id in context.
         # The context["direction_id"] key is set by research/refactor flows
@@ -404,6 +408,7 @@ async def sweep_orphaned_direction_provider_tasks(session) -> int:
                             Task.status,
                             Task.project_id,
                             Task.context,
+                            Task.payloads,
                             Task.latest_status_message,
                             Task.status_log,
                             raiseload=True,
@@ -470,26 +475,53 @@ async def sweep_orphaned_direction_provider_tasks(session) -> int:
                 dir_status = dir_status_by_key.get(did)
                 if dir_status not in _RETIRED_DIRECTION_STATUSES:
                     continue
-                logger.warning(
-                    "[REAPER] Auto-cancelling EVALUATING task %s: direction %s is %s",
-                    str(task.id)[:8],
-                    did,
-                    dir_status,
-                )
-                task.status = TaskStatus.CANCELLED
-                task.latest_status_message = (
-                    f"Auto-cancelled: direction {did} is {dir_status} — "
-                    "provider task has nowhere to land"
-                )
-                session.add(task)
-                cancelled += 1
 
-        if cancelled:
+                # Check if the task has an open PR in its first payload.
+                pr_number = task.first_payload.get("pr_number")
+                if pr_number:
+                    # Task has an open PR — orphan it by clearing direction_id
+                    # so the PR can land independently.
+                    logger.warning(
+                        "[REAPER] Orphaning task %s: direction %s is %s but task has open PR %s — preserving",
+                        str(task.id)[:8],
+                        did,
+                        dir_status,
+                        pr_number,
+                    )
+                    ctx = dict(task.context or {})
+                    ctx.pop("direction_id", None)
+                    task.context = ctx
+                    flag_modified(task, "context")
+                    session.add(task)
+                    orphaned += 1
+                else:
+                    # No open PR — cancel the task cleanly.
+                    logger.warning(
+                        "[REAPER] Auto-cancelling EVALUATING task %s: direction %s is %s",
+                        str(task.id)[:8],
+                        did,
+                        dir_status,
+                    )
+                    task.status = TaskStatus.CANCELLED
+                    task.latest_status_message = (
+                        f"Auto-cancelled: direction {did} is {dir_status} — "
+                        "provider task has nowhere to land"
+                    )
+                    session.add(task)
+                    cancelled += 1
+
+        if cancelled or orphaned:
             await session.commit()
-            logger.info(
-                "[REAPER] Cancelled %d EVALUATING tasks for retired directions",
-                cancelled,
-            )
+            if cancelled:
+                logger.info(
+                    "[REAPER] Cancelled %d EVALUATING tasks for retired directions",
+                    cancelled,
+                )
+            if orphaned:
+                logger.info(
+                    "[REAPER] Orphaned %d EVALUATING tasks with open PRs for retired directions",
+                    orphaned,
+                )
     except Exception as e:
         logger.error(
             "[REAPER] Orphaned direction provider sweep error: %s", e, exc_info=True

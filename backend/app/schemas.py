@@ -421,6 +421,9 @@ class HeartbeatRequest(BaseModel):
     # Keys are schema label strings (e.g. "ResearchPlan", "StructuredVerdict").
     # Older agents omitting these fields contribute only to scalar totals.
     format_miss_by_schema: Dict[str, int] | None = None
+    # Per-schema, per-reason breakdown of format misses (nested map: schema → reason → count).
+    # Backwards-compatible: older agents omit this field; treated as {}.
+    format_miss_by_schema_and_reason: Dict[str, Dict[str, int]] | None = None
     format_repair_attempts_by_schema: Dict[str, int] | None = None
     format_repair_successes_by_schema: Dict[str, int] | None = None
     # Count of reopen/retry runs that crashed (exitCode != 0) — these are infra
@@ -589,6 +592,17 @@ def sanitize_rpc_diagnostic(raw: Dict[str, Any] | None) -> Dict[str, Any] | None
     return out if out else None
 
 
+def _redact_dict_strings(obj: Any) -> Any:
+    """Recursively apply redact_command_log_text to all string values in a dict/list."""
+    if isinstance(obj, dict):
+        return {k: _redact_dict_strings(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_dict_strings(item) for item in obj]
+    if isinstance(obj, str):
+        return redact_command_log_text(obj)
+    return obj
+
+
 def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
     """Return a JSON-ready compute-job response with launch-spec fields redacted.
 
@@ -620,6 +634,12 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
             live_output = dict(live_output)
             live_output["text"] = redact_command_log_text(live_output["text"])
             metadata["live_output"] = live_output
+    # Recursively redact all string values in result_metrics so credentials in
+    # any experiment output field cannot leak through unrecognized paths.
+    if isinstance(metadata, dict):
+        result_metrics = metadata.get("result_metrics")
+        if isinstance(result_metrics, dict):
+            metadata["result_metrics"] = _redact_dict_strings(result_metrics)
 
     # Sanitize the promoted diagnostic — may carry raw provider exception text
     # with signed URLs or credential values.  Overwrite both the top-level

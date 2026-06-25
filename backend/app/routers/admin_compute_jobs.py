@@ -23,6 +23,11 @@ from app.compute_jobs import (
     kill_compute_job,
     list_compute_jobs,
 )
+from app.compute_jobs_aggregation import (
+    aggregate_all_compute_jobs_summary,
+    aggregate_compute_jobs_summary,
+    aggregate_criterion_summary,
+)
 from app.database import get_session
 from app.models import Artifact, ComputeJob, ComputeJobStatus, Task
 from app.schemas import serialize_compute_job_response_safe
@@ -186,26 +191,95 @@ async def get_project_compute_jobs(
     include_finished_minutes: int = Query(360, ge=0, le=10080),
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    all_terminal: bool = Query(False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """List a project's active and recently-finished compute jobs (viewer+)."""
+    """List a project's active and recently-finished compute jobs (viewer+).
+
+    When ``all_terminal=true``, all terminal jobs are returned regardless of
+    age — ``include_finished_minutes`` is accepted but ignored for the terminal
+    filter, allowing deep-history browsing of past experiments.
+    """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
+    window = timedelta(minutes=include_finished_minutes)
     jobs, has_more = await list_compute_jobs(
         session,
         project_id=project_id,
-        include_finished_within=timedelta(minutes=include_finished_minutes),
+        include_finished_within=window,
         limit=limit,
         offset=offset,
+        all_terminal=all_terminal,
     )
+    built_payload = await _build_compute_job_payload(session, jobs)
+    agg_summary = await aggregate_compute_jobs_summary(
+        session,
+        project_id=project_id,
+        include_finished_within=window,
+        all_terminal=all_terminal,
+    )
+    criterion_stats = await aggregate_criterion_summary(
+        session,
+        project_id=project_id,
+        include_finished_within=window,
+        all_terminal=all_terminal,
+    )
+    summary = {
+        **agg_summary,
+        "criterion_met": criterion_stats["criterion_met"],
+        "criterion_measured": criterion_stats["criterion_measured"],
+    }
     return {
-        "compute_jobs": await _build_compute_job_payload(session, jobs),
+        "compute_jobs": built_payload,
         "has_more": has_more,
         "limit": limit,
         "offset": offset,
+        "summary": summary,
     }
+
+
+@router.get("/projects/{project_id}/compute-jobs/summary")
+async def get_project_compute_jobs_aggregate_summary(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return aggregate summary over ALL compute jobs for a project (viewer+).
+
+    Unlike the list endpoint, this endpoint is not capped by include_finished_minutes
+    and covers the project's full history — suitable for cumulative experiment totals.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    return await aggregate_all_compute_jobs_summary(session, project_id=project_id)
+
+
+@router.get("/compute-jobs/{job_id}")
+async def get_compute_job_by_id(
+    job_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Fetch a single compute job by id (viewer+).
+
+    Returns the full job detail including its per-arm result block, task title,
+    success criterion, and criterion verdict. Normalizes 403 to 404 so job
+    existence is not leaked to callers without viewer access (IDOR protection).
+    """
+    job = await session.get(ComputeJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Compute job not found")
+    try:
+        await _get_user_project_with_role(
+            job.project_id, current_user["user_id"], session, "viewer"
+        )
+    except HTTPException as exc:
+        raise HTTPException(status_code=404, detail="Compute job not found") from exc
+    built = await _build_compute_job_payload(session, [job])
+    return {"compute_job": built[0]}
 
 
 @router.post("/compute-jobs/{job_id}/kill")

@@ -3011,6 +3011,19 @@ async def _apply_settings(
                             "evergreen_fill_deferred_memo_enrollment", False
                         )
                     ),
+                    # Persist structural-health audit config so an operator
+                    # change survives a Cloud Run restart. runtime_config_state.
+                    # sync_* reads this key back on boot; without it the in-memory
+                    # values revert to the env defaults.
+                    "structural_health_audit_mode": str(
+                        _runtime_config.get("structural_health_audit_mode", "observe")
+                    ),
+                    "structural_health_audit_interval_minutes": int(
+                        _runtime_config.get("structural_health_audit_interval_minutes", 60)
+                    ),
+                    "structural_health_audit_fat_row_bytes": int(
+                        _runtime_config.get("structural_health_audit_fat_row_bytes", 1048576)
+                    ),
                     # Persist the Cloud Run task-type allowlist so an operator
                     # configuration survives a Cloud Run restart. runtime_config_state.
                     # sync_* reads this key back on boot; without it the in-memory

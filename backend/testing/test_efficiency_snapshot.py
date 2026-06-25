@@ -46,6 +46,8 @@ from app.efficiency_snapshot import (
     _last_run_due,
     _task_llm_attempts,
     compute_current_axes,
+    compute_llm_cost_attribution_baseline_delta,
+    compute_llm_cost_attribution_window_delta,
     compute_llm_cost_breakdown,
     compute_llm_cost_by_task_type,
     compute_pr_rework_chain_breakdown,
@@ -4611,104 +4613,6 @@ def test_compact_llm_cost_attribution():
     assert create_row["cost_usd"] > 0
 
 
-def test_compact_llm_cost_attribution_includes_qualification_infra_usd():
-    """_compact_llm_cost_attribution includes qualification_infra_usd when passed."""
-    from app.efficiency_snapshot import _compact_llm_cost_attribution
-
-    result = _compact_llm_cost_attribution([], qualification_infra_usd=0.023)
-    assert result["qualification_infra_usd"] == pytest.approx(0.023)
-
-
-def test_compact_llm_cost_attribution_qualification_infra_usd_none_by_default():
-    """qualification_infra_usd is None when not provided (pre-tracking versions)."""
-    from app.efficiency_snapshot import _compact_llm_cost_attribution
-
-    result = _compact_llm_cost_attribution([])
-    assert result["qualification_infra_usd"] is None
-
-
-def test_qualification_infra_usd_sums_token_costs():
-    """_qualification_infra_usd computes cost from blind_merge_grade token records."""
-    from unittest.mock import MagicMock
-
-    from app.efficiency_snapshot import _qualification_infra_usd
-
-    v1 = MagicMock()
-    v1.last_qualification = {
-        "blind_merge_grade": {"input_tokens": 1000, "output_tokens": 100}
-    }
-    v2 = MagicMock()
-    v2.last_qualification = {
-        "blind_merge_grade": {"input_tokens": 500, "output_tokens": 50}
-    }
-    v_no_tokens = MagicMock()
-    v_no_tokens.last_qualification = {
-        "blind_merge_grade": {"coverage_verdict": "covers", "biggest_gap": "gap"}
-    }
-
-    result = _qualification_infra_usd([v1, v2, v_no_tokens])
-    # claude-opus-4-8: $15/MTok input, $75/MTok output
-    expected = (1500 * 15e-6) + (150 * 75e-6)
-    assert result == pytest.approx(expected, rel=1e-5)
-
-
-def test_qualification_infra_usd_returns_none_when_no_token_data():
-    """_qualification_infra_usd returns None when no grade records carry token data."""
-    from unittest.mock import MagicMock
-
-    from app.efficiency_snapshot import _qualification_infra_usd
-
-    v = MagicMock()
-    v.last_qualification = {
-        "blind_merge_grade": {"coverage_verdict": "covers", "biggest_gap": "gap"}
-    }
-    assert _qualification_infra_usd([v]) is None
-    assert _qualification_infra_usd([]) is None
-
-
-def test_qualification_infra_usd_accumulates_across_regrades():
-    """qualification_infra_usd counts tokens from all grade attempts, not just the last.
-
-    Each requalification on a new candidate SHA overwrites the blind_merge_grade
-    record but persist_blind_merge_grade folds prior token counts into cumulative
-    accumulators so _qualification_infra_usd reports the true total Opus spend.
-    """
-    from unittest.mock import MagicMock, patch
-
-    from app.blind_merge_grade import persist_blind_merge_grade
-    from app.efficiency_snapshot import _qualification_infra_usd
-
-    v = MagicMock()
-    v.last_qualification = None
-
-    grade1 = {
-        "candidate_sha": "sha1abc",
-        "coverage_verdict": "partial",
-        "biggest_gap": "missing test coverage",
-        "input_tokens": 1000,
-        "output_tokens": 100,
-        "model": "claude-opus-4-8",
-    }
-    grade2 = {
-        "candidate_sha": "sha2def",
-        "coverage_verdict": "covers",
-        "biggest_gap": "minor doc gap",
-        "input_tokens": 800,
-        "output_tokens": 90,
-        "model": "claude-opus-4-8",
-    }
-
-    with patch("app.blind_merge_grade.flag_modified"):
-        persist_blind_merge_grade(v, grade1)
-        persist_blind_merge_grade(v, grade2)
-
-    # Both attempts' tokens must be counted: grade1 is in the cumulative
-    # accumulators and grade2 is in the current blind_merge_grade record.
-    result = _qualification_infra_usd([v])
-    # claude-opus-4-8: $15/MTok input, $75/MTok output
-    expected = (1800 * 15e-6) + (190 * 75e-6)
-    assert result == pytest.approx(expected, rel=1e-5)
-
 
 @pytest.mark.asyncio
 async def test_llm_cost_breakdown_endpoint_includes_by_task_type(
@@ -6743,6 +6647,81 @@ async def test_read_baseline_surfaces_llm_cost_attribution_breakdown(db_session)
 
 
 @pytest.mark.asyncio
+async def test_cost_attribution_trend_includes_failure_class_and_merged_count(
+    db_session,
+):
+    """llm_cost_attribution_trend entries include by_failure_class and merged_count.
+
+    Writes a snapshot with one MERGED task and one COMPLETED_NO_PR task, then
+    asserts that every trend entry exposes by_failure_class (with the MERGED and
+    COMPLETED_NO_PR buckets) and merged_count equal to the number of merged tasks.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # One merged task
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "pr_number": 1}],
+            api_call_summary={
+                "total_input_tokens": 2000,
+                "total_output_tokens": 1000,
+                "llm_call_count": 8,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    # One completed but no PR (research task)
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            payloads=[{"type": "research"}],
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 4,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+
+    trend = drift.get("llm_cost_attribution_trend")
+    assert isinstance(trend, list), "llm_cost_attribution_trend must be a list"
+    assert len(trend) >= 1
+
+    for entry in trend:
+        assert "by_failure_class" in entry, "trend entry must include by_failure_class"
+        assert "merged_count" in entry, "trend entry must include merged_count"
+
+        fc_rows = entry["by_failure_class"]
+        assert isinstance(fc_rows, list), "by_failure_class must be a list"
+        fc_classes = {r["failure_class"] for r in fc_rows}
+        assert "MERGED" in fc_classes, "MERGED bucket must appear in by_failure_class"
+        assert (
+            "COMPLETED_NO_PR" in fc_classes
+        ), "COMPLETED_NO_PR bucket must appear in by_failure_class"
+
+        merged_row = next(r for r in fc_rows if r["failure_class"] == "MERGED")
+        assert merged_row["task_count"] == 1
+        assert entry["merged_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_read_baseline_surfaces_vm_cost_attribution_trend(db_session):
     """read_baseline_with_drift surfaces vm_cost_attribution_trend as a
     day-over-day series mirroring llm_cost_attribution_trend but for VM spend.
@@ -7111,6 +7090,148 @@ def test_panel_review_effectiveness_returns_none_when_no_gate_invocations():
     )
 
 
+def _peff(*, total_challenged, challenged_degraded):
+    """Minimal panel_review_effectiveness-shaped dict for classifier tests.
+
+    Mirrors compute_panel_review_effectiveness's fail_open_rate accounting:
+    fail_open_rate = degraded / (total + degraded), or None when both are zero.
+    """
+    invocations = total_challenged + challenged_degraded
+    return {
+        "total_challenged": total_challenged,
+        "challenged_degraded": challenged_degraded,
+        "fail_open_rate": (
+            round(challenged_degraded / invocations, 4) if invocations > 0 else None
+        ),
+    }
+
+
+def test_gate_health_verdict_no_data_on_none():
+    """None input → NO_DATA with zero invocations and a null rate."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    verdict = compute_gate_health_verdict(None)
+    assert verdict["state"] == "NO_DATA"
+    assert verdict["fail_open_rate"] is None
+    assert verdict["total_invocations"] == 0
+    assert verdict["min_sample"] == 30
+
+
+def test_gate_health_verdict_no_data_on_zero_invocations():
+    """A dict with zero gate invocations → NO_DATA (never HEALTHY)."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=0, challenged_degraded=0)
+    )
+    assert verdict["state"] == "NO_DATA"
+    assert verdict["total_invocations"] == 0
+
+
+def test_gate_health_verdict_degraded_below_min_sample():
+    """fail_open_rate >= 5% on a sub-min-sample window classifies DEGRADED.
+
+    DEGRADED takes priority over the min-sample gate: a degraded rate on a tiny
+    sample must NOT be reported as INSUFFICIENT or HEALTHY.
+    """
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    # 1 degraded / 10 invocations = 10% fail-open on only 10 invocations (< 30).
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=9, challenged_degraded=1)
+    )
+    assert verdict["state"] == "DEGRADED", (
+        f"5%+ fail-open on a small sample must be DEGRADED, got {verdict['state']}"
+    )
+    assert verdict["fail_open_rate"] == 0.1
+    assert verdict["total_invocations"] == 10
+
+
+def test_gate_health_verdict_insufficient_requires_min_sample():
+    """A clean, low-rate window below the min sample is INSUFFICIENT, never HEALTHY."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    # Zero fail-open but only 10 invocations — too few to certify HEALTHY.
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=10, challenged_degraded=0)
+    )
+    assert verdict["state"] == "INSUFFICIENT", (
+        f"low-rate window below 30 invocations must be INSUFFICIENT, got {verdict['state']}"
+    )
+    assert verdict["total_invocations"] == 10
+
+
+def test_gate_health_verdict_partial_at_min_sample():
+    """>= 30 invocations with 0.01 <= rate < 0.05 → PARTIAL."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    # 1 degraded / 50 invocations = 2% fail-open on a sufficient sample.
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=49, challenged_degraded=1)
+    )
+    assert verdict["state"] == "PARTIAL", (
+        f"2% fail-open on >=30 invocations must be PARTIAL, got {verdict['state']}"
+    )
+    assert verdict["fail_open_rate"] == 0.02
+    assert verdict["total_invocations"] == 50
+
+
+def test_gate_health_verdict_healthy_requires_min_sample_and_low_rate():
+    """>= 30 invocations with rate < 0.01 → HEALTHY."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    # Zero fail-open over 40 invocations — clean and sufficient.
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=40, challenged_degraded=0)
+    )
+    assert verdict["state"] == "HEALTHY"
+    assert verdict["fail_open_rate"] == 0.0
+    assert verdict["total_invocations"] == 40
+    assert verdict["min_sample"] == 30
+
+
+def test_gate_health_verdict_low_coverage_after_sufficient_sample():
+    """Sufficient sample, zero fail-open, but effective_coverage < 0.5 → LOW_COVERAGE."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    peff = {
+        **_peff(total_challenged=40, challenged_degraded=0),
+        "effective_coverage": 0.3,  # below 0.5 threshold
+    }
+    verdict = compute_gate_health_verdict(peff)
+    assert verdict["state"] == "LOW_COVERAGE", (
+        f"sufficient sample + zero fail-open + low effective_coverage must be LOW_COVERAGE, got {verdict['state']}"
+    )
+    assert verdict["total_invocations"] == 40
+
+    # Boundary: exactly 0.5 coverage should NOT trigger LOW_COVERAGE.
+    peff_boundary = {
+        **_peff(total_challenged=40, challenged_degraded=0),
+        "effective_coverage": 0.5,
+    }
+    verdict_boundary = compute_gate_health_verdict(peff_boundary)
+    assert verdict_boundary["state"] == "HEALTHY", (
+        f"effective_coverage == 0.5 must be HEALTHY, got {verdict_boundary['state']}"
+    )
+
+
+def test_gate_health_verdict_degraded_priority_over_insufficient_at_boundary():
+    """5% exactly on a small sample → DEGRADED; min_sample override respected."""
+    from app.efficiency_snapshot import compute_gate_health_verdict
+
+    # 1 degraded / 20 = 5% exactly, only 20 invocations.
+    verdict = compute_gate_health_verdict(
+        _peff(total_challenged=19, challenged_degraded=1)
+    )
+    assert verdict["state"] == "DEGRADED"
+    # min_sample override flows through to the returned supporting field.
+    custom = compute_gate_health_verdict(
+        _peff(total_challenged=10, challenged_degraded=0), min_sample=5
+    )
+    assert custom["state"] == "HEALTHY"
+    assert custom["min_sample"] == 5
+
+
 def test_panel_review_effectiveness_cost_per_challenge_usd():
     """compute_panel_review_effectiveness includes cost_per_challenge_usd.
 
@@ -7170,18 +7291,23 @@ def test_panel_review_effectiveness_cost_per_challenge_usd():
 
 
 def test_panel_review_effectiveness_escalated_fail_open():
-    """Escalated fail-open records (unchallenged + escalated=True) are counted in
-    challenged_escalated and excluded from total_challenged.
+    """Escalated records (unchallenged + escalated=True) are counted in
+    challenged_escalated (informational) and excluded from total_challenged and fail_open_rate.
+
+    These records represent a BLOCKED/fail-CLOSED path: the challenger crashed or
+    returned an unparseable verdict, so the merge was blocked and escalated for manual
+    review.  They are NOT auto-merges and must NOT inflate fail_open_rate.
 
     Setup:
       - 2 challenged_confirmed (normal gate invocations)
       - 1 challenged_rejected  (normal gate invocation)
-      - 2 unchallenged + escalated=True (challenger failed — fail-open)
+      - 2 unchallenged + escalated=True (challenger crashed — merge BLOCKED, not fail-open)
       - 1 unchallenged without escalated (gate not invoked — must be ignored)
 
     Expected:
       total_challenged = 3 (only the three successful gate invocations)
-      challenged_escalated = 2 (the two fail-open records)
+      challenged_escalated = 2 (safe/blocked escalations, informational)
+      fail_open_rate = 0.0 (gate was invoked but no degraded events — confirmed-zero, not no-data)
       overturn_rate = 1/3
     """
     from app.efficiency_snapshot import compute_panel_review_effectiveness
@@ -7218,18 +7344,33 @@ def test_panel_review_effectiveness_escalated_fail_open():
     assert result["overturn_rate"] == round(1 / 3, 4), (
         f"overturn_rate must be computed from total_challenged only, got {result['overturn_rate']}"
     )
+    # unchallenged+escalated=True records are safe (merge BLOCKED); fail_open_rate must not count them.
+    # Gate was invoked (total=3), so fail_open_rate is confirmed-zero (0.0), not None (no-data).
+    assert result["fail_open_rate"] == 0.0, (
+        f"fail_open_rate must be 0.0 (confirmed-zero) when gate was invoked but no degraded events exist, got {result['fail_open_rate']}"
+    )
+    assert result.get("challenged_degraded", 0) == 0, (
+        "challenged_degraded must be 0 when no degraded_model_unavailable records exist"
+    )
 
 
 def test_panel_review_effectiveness_fail_open_rate():
-    """fail_open_rate = escalated / (total_challenged + escalated).
+    """fail_open_rate = challenged_degraded / (total_challenged + challenged_degraded).
+
+    degraded_model_unavailable records are the true fail-open path: the challenger's
+    model was inaccessible so the primary verdict was adopted and the PR auto-merged.
+    unchallenged+escalated=True records are safe (merge BLOCKED) and must NOT drive
+    fail_open_rate.
 
     Setup:
       - 3 challenged_confirmed (successful gate invocations)
-      - 2 unchallenged + escalated=True (challenger failed — fail-open)
+      - 2 degraded_model_unavailable (silent auto-merges — true fail-opens)
+      - 1 unchallenged + escalated=True (challenger crashed — merge BLOCKED, not counted in fail_open_rate)
 
     Expected:
       total_challenged = 3
-      challenged_escalated = 2
+      challenged_degraded = 2
+      challenged_escalated = 1 (informational; does NOT affect fail_open_rate)
       fail_open_rate = 2 / (3 + 2) = 0.4
       Zero-invocations case (no tasks) returns None for fail_open_rate.
     """
@@ -7251,21 +7392,265 @@ def test_panel_review_effectiveness_fail_open_rate():
         _task({"state": "challenged_confirmed"}),
         _task({"state": "challenged_confirmed"}),
         _task({"state": "challenged_confirmed"}),
-        _task({"state": "unchallenged", "escalated": True}),
-        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "degraded_model_unavailable"}),
+        _task({"state": "degraded_model_unavailable"}),
+        _task({"state": "unchallenged", "escalated": True}),  # safe — must not affect fail_open_rate
     ]
 
     result = compute_panel_review_effectiveness(tasks)
     assert result is not None
     assert result["total_challenged"] == 3
-    assert result["challenged_escalated"] == 2
+    assert result["challenged_degraded"] == 2, (
+        f"expected challenged_degraded=2, got {result.get('challenged_degraded')}"
+    )
+    assert result["challenged_escalated"] == 1, (
+        f"expected challenged_escalated=1 (informational), got {result.get('challenged_escalated')}"
+    )
     expected_rate = round(2 / 5, 4)
+    assert result["fail_open_rate"] == expected_rate, (
+        f"expected fail_open_rate={expected_rate} (degraded only), got {result['fail_open_rate']}"
+    )
+    # Zero-invocations: no tasks with gate records returns None
+    assert compute_panel_review_effectiveness([]) is None
+
+
+def test_panel_review_effectiveness_degraded_fail_open_rate():
+    """degraded_model_unavailable is the true fail-open path; escalated is safe.
+
+    Mixed scenario with all three state classes to verify bucket separation:
+      - 4 challenged_confirmed
+      - 1 challenged_rejected
+      - 3 degraded_model_unavailable (silent auto-merges — true fail-opens)
+      - 2 unchallenged + escalated=True (merge BLOCKED — safe, not fail-open)
+      - 1 unchallenged (gate not invoked — ignored)
+
+    Expected:
+      total_challenged = 5
+      challenged_degraded = 3
+      challenged_escalated = 2
+      fail_open_rate = 3 / (5 + 3) = 0.375
+      overturn_rate = 1 / 5 = 0.2
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _task(recon):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    tasks = [
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_rejected"}),
+        _task({"state": "degraded_model_unavailable"}),
+        _task({"state": "degraded_model_unavailable"}),
+        _task({"state": "degraded_model_unavailable"}),
+        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "unchallenged", "escalated": True}),
+        _task({"state": "unchallenged"}),  # ignored
+    ]
+
+    result = compute_panel_review_effectiveness(tasks)
+    assert result is not None
+    assert result["total_challenged"] == 5, f"got {result['total_challenged']}"
+    assert result["challenged_degraded"] == 3, f"got {result.get('challenged_degraded')}"
+    assert result["challenged_escalated"] == 2, f"got {result.get('challenged_escalated')}"
+    assert result["overturn_rate"] == round(1 / 5, 4), f"got {result['overturn_rate']}"
+    expected_rate = round(3 / 8, 4)
     assert result["fail_open_rate"] == expected_rate, (
         f"expected fail_open_rate={expected_rate}, got {result['fail_open_rate']}"
     )
+    # Verify escalated records do NOT bleed into fail_open_rate numerator
+    assert result["fail_open_rate"] != round(5 / 10, 4), (
+        "fail_open_rate must not include challenged_escalated in the numerator"
+    )
 
-    # Zero-invocations: no tasks with gate records returns None
-    assert compute_panel_review_effectiveness([]) is None
+
+def test_fail_open_rate_distinguishes_confirmed_zero_from_insufficient_data():
+    """fail_open_rate=0.0 when gate was invoked and no fail-opens occurred (confirmed-zero).
+    fail_open_rate=None only when the window has no gate invocations at all (no-data).
+
+    This distinction is critical for the v18 <=5% audit: a None result means
+    'unknown' (cannot confirm or deny), while 0.0 means 'confirmed healthy'.
+
+    Setup A (confirmed-zero):
+      - 3 challenged_confirmed + 1 challenged_rejected = total=4, degraded=0
+      - Expected: fail_open_rate=0.0 (gate was invoked; zero degraded events measured)
+
+    Setup B (no-data):
+      - 0 gate invocations (only unchallenged tasks)
+      - Expected: fail_open_rate via None return (no gate invocations; rate is unknown)
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _task(recon):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    # Setup A: gate invoked with 0 degraded events → confirmed-zero
+    tasks_a = [
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_confirmed"}),
+        _task({"state": "challenged_rejected"}),
+    ]
+    result_a = compute_panel_review_effectiveness(tasks_a)
+    assert result_a is not None, "must return a result when gate was invoked"
+    assert result_a["total_challenged"] == 4
+    assert result_a["challenged_degraded"] == 0
+    assert result_a["fail_open_rate"] == 0.0, (
+        f"fail_open_rate must be 0.0 (confirmed-zero) when gate invoked and no degraded events, got {result_a['fail_open_rate']}"
+    )
+
+    # Setup B: no gate invocations → no-data (None return)
+    tasks_b = [
+        _task({"state": "unchallenged"}),       # gate not invoked — ignored
+        make_task(project_id=None, status=TaskStatus.COMPLETED),  # no recon key
+    ]
+    result_b = compute_panel_review_effectiveness(tasks_b)
+    assert result_b is None, (
+        f"must return None when no gate invocations exist (fail_open_rate would be meaningless), got {result_b}"
+    )
+
+
+def test_fail_open_rate_scoped_to_post_deploy_window():
+    """compute_panel_review_effectiveness respects since_dt to scope to post-deploy traffic.
+
+    Setup: mix of pre-deploy and post-deploy tasks with gate records.
+      Pre-deploy (before deploy boundary):
+        - 2 challenged_confirmed
+        - 1 degraded_model_unavailable (fail-open)
+      Post-deploy (after deploy boundary):
+        - 3 challenged_confirmed
+        - 1 degraded_model_unavailable (fail-open)
+
+    Without since_dt (7-day window):
+      total_challenged = 5, challenged_degraded = 2
+      fail_open_rate = 2 / (5 + 2) = 2/7
+
+    With since_dt = deploy boundary (post-deploy only):
+      total_challenged = 3, challenged_degraded = 1
+      fail_open_rate = 1 / (3 + 1) = 0.25
+
+    This confirms an operator can isolate the v18-specific rate from the rolling
+    window that mixes pre- and post-deployment traffic.
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+    deploy_boundary = now - timedelta(days=2)
+    pre_deploy = now - timedelta(days=5)
+
+    def _task(recon, updated_at):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=updated_at - timedelta(minutes=5),
+            vm_stopped_at=updated_at,
+            updated_at=updated_at,
+        )
+
+    pre_tasks = [
+        _task({"state": "challenged_confirmed"}, pre_deploy),
+        _task({"state": "challenged_confirmed"}, pre_deploy),
+        _task({"state": "degraded_model_unavailable"}, pre_deploy),
+    ]
+    post_tasks = [
+        _task({"state": "challenged_confirmed"}, now - timedelta(hours=12)),
+        _task({"state": "challenged_confirmed"}, now - timedelta(hours=6)),
+        _task({"state": "challenged_confirmed"}, now - timedelta(hours=1)),
+        _task({"state": "degraded_model_unavailable"}, now - timedelta(hours=3)),
+    ]
+    all_tasks = pre_tasks + post_tasks
+
+    # Full 7-day window: pre + post traffic mixed
+    full = compute_panel_review_effectiveness(all_tasks)
+    assert full is not None
+    assert full["total_challenged"] == 5
+    assert full["challenged_degraded"] == 2
+    assert full["fail_open_rate"] == round(2 / 7, 4), (
+        f"7-day window: expected fail_open_rate={round(2/7, 4)}, got {full['fail_open_rate']}"
+    )
+
+    # Post-deploy only: tasks before deploy_boundary are excluded
+    post_deploy_only = compute_panel_review_effectiveness(all_tasks, since_dt=deploy_boundary)
+    assert post_deploy_only is not None
+    assert post_deploy_only["total_challenged"] == 3, (
+        f"post-deploy: expected total_challenged=3, got {post_deploy_only['total_challenged']}"
+    )
+    assert post_deploy_only["challenged_degraded"] == 1, (
+        f"post-deploy: expected challenged_degraded=1, got {post_deploy_only.get('challenged_degraded')}"
+    )
+    expected_post_rate = round(1 / 4, 4)
+    assert post_deploy_only["fail_open_rate"] == expected_post_rate, (
+        f"post-deploy: expected fail_open_rate={expected_post_rate}, got {post_deploy_only['fail_open_rate']}"
+    )
+
+    # A deploy boundary after all tasks → no gate invocations → None
+    future = compute_panel_review_effectiveness(all_tasks, since_dt=now + timedelta(days=1))
+    assert future is None, (
+        "since_dt beyond all task timestamps must return None (no gate invocations in window)"
+    )
+
+
+def test_panel_review_effectiveness_fail_open_rate_none_with_only_escalated():
+    """fail_open_rate is None for escalated-only windows (total==0, degraded==0, escalated>0).
+
+    An escalated-only window (all gate invocations crashed/failed and the merge was
+    BLOCKED for manual review) has gate activity, so the function returns a non-None
+    result dict.  But fail_open_rate requires at least one successful gate invocation
+    (total>0) or a real fail-open (degraded>0) to be meaningful — neither holds in an
+    escalated-only window, so fail_open_rate is None rather than 0.0.
+
+    This distinguishes "no-data" (fail_open_rate=None, no successful gate runs) from
+    "confirmed-zero" (fail_open_rate=0.0, gate ran and found zero degraded events).
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _escalated_task():
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": "unchallenged", "escalated": True}},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    tasks = [_escalated_task(), _escalated_task(), _escalated_task()]
+
+    result = compute_panel_review_effectiveness(tasks)
+    assert result is not None, (
+        "escalated-only window must return non-None (escalated>0 bypasses early return)"
+    )
+    assert result["total_challenged"] == 0, f"got {result['total_challenged']}"
+    assert result["challenged_escalated"] == 3, f"got {result['challenged_escalated']}"
+    assert result["challenged_degraded"] == 0, f"got {result.get('challenged_degraded')}"
+    assert result["fail_open_rate"] is None, (
+        f"fail_open_rate must be None (no successful gate invocations or degraded events), "
+        f"got {result['fail_open_rate']}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8185,3 +8570,468 @@ def test_llm_cost_by_outcome_separates_completed_no_pr_from_other():
 
     assert "MERGED" in by_class
     assert by_class["MERGED"]["task_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# llm_cost_attribution_baseline_delta tests
+# ---------------------------------------------------------------------------
+
+
+def test_compute_llm_cost_attribution_baseline_delta_returns_none_on_missing():
+    """Returns None when either block is absent."""
+    assert compute_llm_cost_attribution_baseline_delta(None, None) is None
+    assert compute_llm_cost_attribution_baseline_delta({"total_llm_usd": 1.0}, None) is None
+    assert compute_llm_cost_attribution_baseline_delta(None, {"total_llm_usd": 1.0}) is None
+
+
+def test_llm_cost_attribution_baseline_delta():
+    """compute_llm_cost_attribution_baseline_delta computes correct deltas for
+    total_llm_usd, rework_share, self_repair_burn_share, by_model_delta, and
+    by_task_type_delta between a synthetic baseline and current attribution block.
+
+    Acceptance criterion: the named test must run green and exercise non-test
+    production code (compute_llm_cost_attribution_baseline_delta in
+    efficiency_snapshot.py).
+    """
+    baseline_attr = {
+        "total_llm_usd": 10.0,
+        "rework_share": 0.20,
+        SELF_REPAIR_BURN_SHARE_KEY: 0.05,
+        "by_model": [
+            {"provider": "anthropic", "model": "claude-sonnet-4-6", "cost_usd": 8.0},
+            {"provider": "anthropic", "model": "claude-opus-4-8", "cost_usd": 2.0},
+        ],
+        "by_task_type": [
+            {"task_type": "create", "cost_usd": 6.0},
+            {"task_type": "review", "cost_usd": 4.0},
+        ],
+    }
+    current_attr = {
+        "total_llm_usd": 12.6,
+        "rework_share": 0.25,
+        SELF_REPAIR_BURN_SHARE_KEY: 0.07,
+        "by_model": [
+            {"provider": "anthropic", "model": "claude-sonnet-4-6", "cost_usd": 9.0},
+            {"provider": "anthropic", "model": "claude-opus-4-8", "cost_usd": 3.6},
+        ],
+        "by_task_type": [
+            {"task_type": "create", "cost_usd": 7.0},
+            {"task_type": "review", "cost_usd": 5.6},
+        ],
+    }
+
+    delta = compute_llm_cost_attribution_baseline_delta(baseline_attr, current_attr)
+    assert delta is not None
+
+    # total_llm_usd delta
+    total_d = delta["total_llm_usd"]
+    assert total_d["baseline"] == pytest.approx(10.0)
+    assert total_d["current"] == pytest.approx(12.6)
+    assert total_d["abs_delta"] == pytest.approx(2.6, abs=1e-5)
+    assert total_d["rel_pct"] == pytest.approx(26.0, abs=0.01)
+
+    # rework_share delta
+    rework_d = delta["rework_share"]
+    assert rework_d["abs_delta"] == pytest.approx(0.05, abs=1e-6)
+
+    # self_repair_burn_share delta
+    repair_d = delta[SELF_REPAIR_BURN_SHARE_KEY]
+    assert repair_d["baseline"] == pytest.approx(0.05)
+    assert repair_d["current"] == pytest.approx(0.07)
+    assert repair_d["abs_delta"] == pytest.approx(0.02, abs=1e-6)
+
+    # by_model_delta sorted by abs(cost_delta_usd) desc; opus grew by 1.6, sonnet by 1.0
+    by_model = delta["by_model_delta"]
+    assert len(by_model) == 2
+    assert by_model[0]["model"] == "claude-opus-4-8"
+    assert by_model[0]["cost_delta_usd"] == pytest.approx(1.6, abs=1e-5)
+    assert by_model[0]["baseline_share"] == pytest.approx(0.2, abs=1e-4)
+    assert by_model[0]["current_share"] == pytest.approx(round(3.6 / 12.6, 4), abs=1e-4)
+
+    # by_task_type_delta
+    by_type = delta["by_task_type_delta"]
+    assert len(by_type) == 2
+    type_map = {r["task_type"]: r for r in by_type}
+    assert type_map["review"]["cost_delta_usd"] == pytest.approx(1.6, abs=1e-5)
+    assert type_map["create"]["cost_delta_usd"] == pytest.approx(1.0, abs=1e-5)
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_attribution_baseline_delta_in_read_baseline(db_session):
+    """read_baseline_with_drift exposes llm_cost_attribution_baseline_delta comparing
+    the baseline's llm_cost_attribution to the latest snapshot's block.
+
+    Two snapshots are written with different task sets so that the current
+    attribution differs from the baseline, and the delta is verified to reflect
+    the actual shift.  Exercises both write_snapshot and read_baseline_with_drift.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    # First snapshot (becomes baseline): one merged sonnet task.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "pr_number": 1}],
+            api_call_summary={
+                "total_input_tokens": 2000,
+                "total_output_tokens": 500,
+                "llm_call_count": 8,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    # Second snapshot (becomes latest/current): heavier task set, higher total cost.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "pr_number": 2}],
+            api_call_summary={
+                "total_input_tokens": 6000,
+                "total_output_tokens": 1500,
+                "llm_call_count": 20,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+
+    delta = drift.get("llm_cost_attribution_baseline_delta")
+    assert delta is not None, "llm_cost_attribution_baseline_delta must be present"
+
+    assert "total_llm_usd" in delta
+    assert "rework_share" in delta
+    assert SELF_REPAIR_BURN_SHARE_KEY in delta
+    assert "by_model_delta" in delta
+    assert "by_task_type_delta" in delta
+
+    # current window has both tasks so total_llm_usd grows; delta must be positive.
+    total_d = delta["total_llm_usd"]
+    assert total_d["current"] is not None
+    assert total_d["baseline"] is not None
+    assert total_d["abs_delta"] is not None
+    assert total_d["abs_delta"] > 0, (
+        "current LLM cost must exceed baseline when more tasks are in the window"
+    )
+
+    # by_model_delta must include the sonnet model that ran in both windows.
+    model_keys = {(r["provider"], r["model"]) for r in delta["by_model_delta"]}
+    assert ("anthropic", "claude-sonnet-4-6") in model_keys
+
+
+def test_low_coverage_not_healthy():
+    """Effective coverage-aware gate health: low coverage prevents HEALTHY verdict.
+
+    When sample_rate < 1.0, many merges are sampled_out (never challenged).
+    The fail_open_rate computed over only the challenged population can look
+    low (<=5%) even when most merges were never reviewed.
+
+    Scenario: 100 merges total
+      - 80 sampled_out (sample_rate=0.2, 80% skipped)
+      - 19 challenged_confirmed (low fail_open rate)
+      - 1 challenged_degraded (fail-open)
+
+    Metrics:
+      fail_open_rate = 1 / (19 + 1) = 0.05 = 5% (looks HEALTHY)
+      effective_coverage = 20 / 100 = 0.20 (only 20% actually reviewed)
+
+    Gate health verdict must account for low coverage and NOT return HEALTHY
+    when effective_coverage is below threshold. effective_coverage must be
+    exposed in the result so frontends can display it.
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+
+    def _task(recon):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+        )
+
+    tasks = [
+        # 80 sampled_out (not challenged, due to low sample_rate)
+        *[_task({"state": "sampled_out", "sample_rate": 0.2}) for _ in range(80)],
+        # 19 challenged_confirmed (low fail_open)
+        *[_task({"state": "challenged_confirmed"}) for _ in range(19)],
+        # 1 challenged_degraded (fail-open)
+        _task({"state": "degraded_model_unavailable"}),
+    ]
+
+    result = compute_panel_review_effectiveness(tasks)
+    assert result is not None, "must compute metrics with mix of sampled_out and challenged"
+
+    # fail_open_rate looks low: 1 / (19 + 1) = 5%
+    assert result["total_challenged"] == 19
+    assert result["challenged_degraded"] == 1
+    assert result["fail_open_rate"] == round(1 / 20, 4), (
+        f"expected fail_open_rate=0.05, got {result['fail_open_rate']}"
+    )
+
+    # Effective coverage: only 20 out of 100 total invocation opportunities
+    assert "sampled_out_count" in result, "must track sampled_out verdicts"
+    assert result["sampled_out_count"] == 80, (
+        f"expected sampled_out_count=80, got {result.get('sampled_out_count')}"
+    )
+
+    assert "effective_coverage" in result, "must compute and expose effective_coverage"
+    expected_coverage = round(20 / 100, 4)  # (challenged + degraded) / (all invocation opportunities)
+    assert result["effective_coverage"] == expected_coverage, (
+        f"expected effective_coverage={expected_coverage}, got {result.get('effective_coverage')}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# compute_llm_cost_attribution_window_delta — pure unit tests
+# ---------------------------------------------------------------------------
+
+def _make_trend_entry(
+    captured_at: str,
+    total_llm_usd: float,
+    rework_share: float,
+    self_repair_burn_share: float,
+    by_model: list | None = None,
+    by_task_type: list | None = None,
+) -> dict:
+    """Build a synthetic trend entry matching the shape assembled by read_baseline_with_drift."""
+    return {
+        "captured_at": captured_at,
+        "total_llm_usd": total_llm_usd,
+        "rework_share": rework_share,
+        SELF_REPAIR_BURN_SHARE_KEY: self_repair_burn_share,
+        "by_model": by_model or [
+            {"provider": "anthropic", "model": "claude-sonnet-4-6", "cost_usd": total_llm_usd * 0.8},
+            {"provider": "anthropic", "model": "claude-opus-4-8", "cost_usd": total_llm_usd * 0.2},
+        ],
+        "by_task_type": by_task_type or [
+            {"task_type": "create", "cost_usd": total_llm_usd * 0.6},
+            {"task_type": "review", "cost_usd": total_llm_usd * 0.4},
+        ],
+    }
+
+
+def test_compute_llm_cost_attribution_window_delta_returns_none_on_short_trend():
+    """Returns None when trend has fewer than 2*recent_n entries."""
+    assert compute_llm_cost_attribution_window_delta([]) is None
+    assert compute_llm_cost_attribution_window_delta([_make_trend_entry("2026-01-01", 10.0, 0.1, 0.05)]) is None
+    # Exactly recent_n * 2 - 1 entries (5 with default recent_n=3) → None
+    short = [_make_trend_entry(f"2026-01-0{i}", float(i), 0.1, 0.05) for i in range(1, 6)]
+    assert compute_llm_cost_attribution_window_delta(short) is None
+    # Exactly recent_n * 2 entries (6) → not None
+    six = [_make_trend_entry(f"2026-01-0{i}", float(i), 0.1, 0.05) for i in range(1, 7)]
+    assert compute_llm_cost_attribution_window_delta(six) is not None
+
+
+def test_compute_llm_cost_attribution_window_delta_scalar_fields():
+    """Scalar fields (total_llm_usd, rework_share, self_repair_burn_share) are
+    averaged within each window and compared correctly.
+
+    Acceptance criterion: asserts the recent-vs-prior window split and correct
+    scalar deltas for a synthetic 6-entry trend.
+    """
+    # prior window: entries 1-3 (total 10 each); recent window: entries 4-6 (total 20 each)
+    trend = [
+        _make_trend_entry("2026-01-01", 10.0, 0.10, 0.04),
+        _make_trend_entry("2026-01-02", 10.0, 0.12, 0.05),
+        _make_trend_entry("2026-01-03", 10.0, 0.08, 0.03),
+        _make_trend_entry("2026-01-04", 20.0, 0.20, 0.08),
+        _make_trend_entry("2026-01-05", 20.0, 0.22, 0.09),
+        _make_trend_entry("2026-01-06", 20.0, 0.18, 0.07),
+    ]
+
+    delta = compute_llm_cost_attribution_window_delta(trend)
+    assert delta is not None
+
+    # total_llm_usd: prior avg = 10.0, recent avg = 20.0 → abs_delta = +10.0, rel_pct = +100%
+    total_d = delta["total_llm_usd"]
+    assert total_d["prior"] == pytest.approx(10.0, abs=1e-4)
+    assert total_d["recent"] == pytest.approx(20.0, abs=1e-4)
+    assert total_d["abs_delta"] == pytest.approx(10.0, abs=1e-4)
+    assert total_d["rel_pct"] == pytest.approx(100.0, abs=0.1)
+
+    # rework_share: prior avg = (0.10+0.12+0.08)/3 = 0.10; recent avg = (0.20+0.22+0.18)/3 = 0.20
+    rework_d = delta["rework_share"]
+    assert rework_d["prior"] == pytest.approx(0.10, abs=1e-5)
+    assert rework_d["recent"] == pytest.approx(0.20, abs=1e-5)
+    assert rework_d["abs_delta"] == pytest.approx(0.10, abs=1e-5)
+
+    # self_repair_burn_share: prior avg = (0.04+0.05+0.03)/3 ≈ 0.04; recent avg ≈ 0.08
+    repair_d = delta[SELF_REPAIR_BURN_SHARE_KEY]
+    assert repair_d["abs_delta"] is not None
+    assert repair_d["abs_delta"] > 0
+
+
+def test_compute_llm_cost_attribution_window_delta_list_fields():
+    """Per-model and per-task-type deltas use averaged cost sums and are sorted
+    by abs(cost_delta_usd) descending (biggest mover first).
+
+    Acceptance criterion: asserts correct per-model and per-task-type cost delta
+    values and ordering for a synthetic trend where opus grows more than sonnet.
+    """
+    # prior: sonnet=8, opus=2 per snapshot; recent: sonnet=9, opus=5 per snapshot
+    def _entry(ts: str, sonnet: float, opus: float) -> dict:
+        return _make_trend_entry(
+            ts, sonnet + opus, 0.1, 0.05,
+            by_model=[
+                {"provider": "anthropic", "model": "claude-sonnet-4-6", "cost_usd": sonnet},
+                {"provider": "anthropic", "model": "claude-opus-4-8", "cost_usd": opus},
+            ],
+            by_task_type=[
+                {"task_type": "create", "cost_usd": (sonnet + opus) * 0.6},
+                {"task_type": "review", "cost_usd": (sonnet + opus) * 0.4},
+            ],
+        )
+
+    trend = [
+        _entry("2026-01-01", 8.0, 2.0),
+        _entry("2026-01-02", 8.0, 2.0),
+        _entry("2026-01-03", 8.0, 2.0),
+        _entry("2026-01-04", 9.0, 5.0),
+        _entry("2026-01-05", 9.0, 5.0),
+        _entry("2026-01-06", 9.0, 5.0),
+    ]
+
+    delta = compute_llm_cost_attribution_window_delta(trend)
+    assert delta is not None
+
+    by_model = delta["by_model_delta"]
+    assert len(by_model) == 2
+    # opus cost delta = 5-2 = +3; sonnet delta = 9-8 = +1 → opus is first
+    assert by_model[0]["model"] == "claude-opus-4-8"
+    assert by_model[0]["cost_delta_usd"] == pytest.approx(3.0, abs=1e-4)
+    assert by_model[1]["model"] == "claude-sonnet-4-6"
+    assert by_model[1]["cost_delta_usd"] == pytest.approx(1.0, abs=1e-4)
+
+    # share fields are present
+    assert by_model[0]["prior_share"] is not None
+    assert by_model[0]["recent_share"] is not None
+    assert by_model[0]["share_delta"] is not None
+    # opus share grew: 2/10 = 0.2 → 5/14 ≈ 0.357 → share_delta > 0
+    assert by_model[0]["share_delta"] > 0
+
+    # by_task_type_delta: both types grew proportionally; create grew more (larger abs USD)
+    by_type = delta["by_task_type_delta"]
+    assert len(by_type) == 2
+    type_map = {r["task_type"]: r for r in by_type}
+    assert "create" in type_map
+    assert "review" in type_map
+    # create: prior 6, recent 8.4 → delta +2.4; review: prior 4, recent 5.6 → delta +1.6
+    assert type_map["create"]["cost_delta_usd"] > type_map["review"]["cost_delta_usd"]
+
+
+def test_compute_llm_cost_attribution_window_delta_window_meta():
+    """window_meta includes snapshot counts and captured_at bounds."""
+    trend = [_make_trend_entry(f"2026-01-0{i}", 10.0 + i, 0.1, 0.05) for i in range(1, 7)]
+    delta = compute_llm_cost_attribution_window_delta(trend)
+    assert delta is not None
+
+    meta = delta["window_meta"]
+    assert meta is not None
+    assert meta["recent_n"] == 3
+    assert meta["prior_count"] == 3
+    assert meta["recent_count"] == 3
+    assert meta["prior_start"] == "2026-01-01"
+    assert meta["prior_end"] == "2026-01-03"
+    assert meta["recent_start"] == "2026-01-04"
+    assert meta["recent_end"] == "2026-01-06"
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_attribution_window_delta_in_read_baseline(db_session):
+    """read_baseline_with_drift exposes llm_cost_attribution_window_delta when
+    the stored trend has sufficient depth (at least 2*recent_n snapshots).
+
+    Seeds a project with 6 write_snapshot calls using different LLM cost loads
+    so that the recent window differs from the prior window.  Asserts the key is
+    present and the shape is correct.
+
+    Acceptance criterion (from task spec): efficiency_snapshot computes a
+    trailing-window (recent-vs-prior) cost-mix delta from the stored trend over
+    a synthetic multi-snapshot series.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    async def _write_with_task(tokens_in: int, tokens_out: int, pr_num: int) -> None:
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+                payloads=[{"type": "create", "pr_number": pr_num}],
+                api_call_summary={
+                    "total_input_tokens": tokens_in,
+                    "total_output_tokens": tokens_out,
+                    "llm_call_count": 4,
+                },
+                provider="anthropic",
+                model="claude-sonnet-4-6",
+            )
+        )
+        await db_session.commit()
+        await write_snapshot(db_session, project.id)
+        await db_session.commit()
+
+    # Write 3 low-cost snapshots (prior window)
+    for i in range(3):
+        await _write_with_task(1000, 200, i + 1)
+
+    # Write 3 higher-cost snapshots (recent window)
+    for i in range(3):
+        await _write_with_task(5000, 1000, i + 10)
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+
+    wd = drift.get("llm_cost_attribution_window_delta")
+    assert wd is not None, "llm_cost_attribution_window_delta must be present when trend depth >= 6"
+
+    assert "total_llm_usd" in wd
+    assert "rework_share" in wd
+    assert SELF_REPAIR_BURN_SHARE_KEY in wd
+    assert "by_model_delta" in wd
+    assert "by_task_type_delta" in wd
+    assert "window_meta" in wd
+
+    meta = wd["window_meta"]
+    assert meta["recent_n"] == 3
+    assert meta["recent_count"] == 3
+    assert meta["prior_count"] == 3
+
+    # Recent window had higher LLM cost than prior → abs_delta must be positive
+    total_d = wd["total_llm_usd"]
+    assert total_d["recent"] is not None
+    assert total_d["prior"] is not None
+    assert total_d["abs_delta"] is not None
+    assert total_d["abs_delta"] > 0, (
+        "recent window had heavier tasks so avg cost must exceed prior window"
+    )
+
+    # sonnet model must appear in the by_model_delta list
+    model_keys = {(r["provider"], r["model"]) for r in wd["by_model_delta"]}
+    assert ("anthropic", "claude-sonnet-4-6") in model_keys

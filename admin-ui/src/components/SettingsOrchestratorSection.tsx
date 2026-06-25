@@ -4,6 +4,8 @@ import { useTaskCapabilities } from '../taskCapabilities';
 import {
   fetchEvergreenFillSettings,
   patchEvergreenFillSettings,
+  patchStructuralHealthSettings,
+  apiFetch,
   type EvergreenFillSettings,
 } from '../api';
 import { EvergreenFillObservabilityPanel } from './EvergreenFillObservabilityPanel';
@@ -136,6 +138,9 @@ export function SettingsOrchestratorSection({
   const [fillMaxActiveInput, setFillMaxActiveInput] = useState('1');
   const [fillDailyCapInput, setFillDailyCapInput] = useState('3');
 
+  // Structural health audit mode — fetched directly and patched on change.
+  const [auditMode, setAuditMode] = useState<string>('off');
+
   const loadFillSettings = useCallback(async () => {
     try {
       const s = await fetchEvergreenFillSettings();
@@ -150,7 +155,21 @@ export function SettingsOrchestratorSection({
     }
   }, []);
 
+  const loadAuditMode = useCallback(async () => {
+    try {
+      const res = await apiFetch('/api/admin/settings');
+      if (res.ok) {
+        const data = await res.json();
+        const mode = data?.structural_health_audit_mode ?? 'off';
+        setAuditMode(String(mode));
+      }
+    } catch {
+      // silently ignore — defaults remain
+    }
+  }, []);
+
   useEffect(() => { void loadFillSettings(); }, [loadFillSettings]);
+  useEffect(() => { void loadAuditMode(); }, [loadAuditMode]);
 
   const patchFill = useCallback(async (patch: Partial<EvergreenFillSettings>) => {
     try {
@@ -160,6 +179,15 @@ export function SettingsOrchestratorSection({
       void loadFillSettings();
     }
   }, [loadFillSettings]);
+
+  const patchAuditMode = useCallback(async (mode: string) => {
+    try {
+      await patchStructuralHealthSettings({ structural_health_audit_mode: mode });
+      setAuditMode(mode);
+    } catch {
+      // on error, keep current mode
+    }
+  }, []);
 
   const commitFillNumber = useCallback((
     key: keyof EvergreenFillSettings,
@@ -575,7 +603,7 @@ export function SettingsOrchestratorSection({
       <EvergreenFillObservabilityPanel />
 
       {/* Structural Health Observability */}
-      <StructuralHealthObservabilityPanel />
+      <StructuralHealthObservabilityPanel auditMode={auditMode} onAuditModeChange={patchAuditMode} />
 
       {/* Evergreen Backlog (project-scoped) */}
       <EvergreenBacklogPanel projectId={selectedProjectId} />
