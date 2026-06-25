@@ -792,6 +792,31 @@ def mock_api(monkeypatch):
                  "polling_metadata": {"result_metrics": {"arms": {"passing": {"latency": 75.0}, "crashed": {"exit_code": 1, "error": "arm result file not written (arm may have failed)"}, "no_metric": {"exit_code": 0, "error": "metric 'latency' not found in result"}}},
                                       "command_log": {"text": "Running experiment\nArm 1 passed\nArm 2 crashed\nArm 3 completed but no metric", "truncated": False}},
                  "success_criterion": {"metric": "latency", "operator": "lt", "threshold": 100}},
+                {"id": "cjob-fff0-0000-0000-000000000006",
+                 "status": "FAILED", "task_title": "Failed list-arm test",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 3.5,
+                 "experiment": "exp-failed-list-arm",
+                 "criterion_verdict": None,
+                 "polling_metadata": {"result_metrics": {"arms": [
+                     {"name": "arm_ok", "score": 0.85},
+                     {"name": "arm_timeout", "exit_code": 124,
+                      "reason": "arm timed out (exit 124): wall-clock limit exceeded",
+                      "stderr_excerpt": "Timeout after 3600s"},
+                 ]}},
+                 "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.8}},
+                {"id": "cjob-ggg0-0000-0000-000000000007",
+                 "status": "FAILED", "task_title": "Failed arm test",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 4.0,
+                 "experiment": "exp-failed-arm",
+                 "criterion_verdict": None,
+                 "polling_metadata": {"result_metrics": {"arms": {
+                     "arm_ok": {"score": 0.91},
+                     "arm_crash": {"exit_code": 1, "error": "arm crashed (exit 1): result file not written",
+                                   "stderr_excerpt": "Traceback (most recent call last):\n  ...\nRuntimeError: CUDA OOM"},
+                 }}},
+                 "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.8}},
             ]
             job = next((j for j in _ALL_MOCK_JOBS if j["id"] == job_id), None)
             if job is None:
@@ -3586,6 +3611,41 @@ def test_compute_show_list_shaped_arms(mock_api, capsys):
     assert "second variant" in out
     assert "variant-a run log" in out
     assert "variant-b run log" in out
+
+
+def test_compute_show_failed_arm_renders_exit_and_error(mock_api, capsys):
+    """compute show renders a failed arm's exit code and error while the sibling arm's metric still appears."""
+    job_id = "cjob-ggg0-0000-0000-000000000007"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "per-arm results" in out
+    # Healthy arm still shows its metric
+    assert "[arm_ok]" in out
+    assert "0.91" in out
+    # Failed arm must show exit code and error reason
+    assert "[arm_crash]" in out
+    assert "exit_code: 1" in out
+    assert "arm crashed (exit 1): result file not written" in out
+    # stderr excerpt must appear
+    assert "CUDA OOM" in out
+
+
+def test_compute_show_list_arms_failed_arm_renders_diagnostics(mock_api, capsys):
+    """compute show renders failure diagnostics for a list-shaped arms entry with a timeout."""
+    job_id = "cjob-fff0-0000-0000-000000000006"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "per-arm results" in out
+    # Healthy arm still shows its metric
+    assert "[arm_ok]" in out
+    assert "0.85" in out
+    # Timed-out arm must show exit code and reason
+    assert "[arm_timeout]" in out
+    assert "exit_code: 124" in out
+    assert "wall-clock limit exceeded" in out
+    assert "Timeout after 3600s" in out
 
 
 def test_compute_run_local(capsys):

@@ -2815,3 +2815,79 @@ async def test_sweep_id_filter_scopes_to_sweep(client: AsyncClient, db_session):
     for doc in body["documents"]:
         assert doc["sweep_id"] == "swp-aaa"
         assert doc["arm_label"] in {"alpha", "beta"}
+
+
+# ── _build_compute_experiment_document failed-arms section ───────────────────
+
+
+def test_build_compute_experiment_document_failed_arms_dict():
+    """Dict-shaped arms: ### Failed arms section appears for arms with exit_code != 0 or error."""
+    from app.knowledge_completion import _build_compute_experiment_document
+
+    task = make_task(
+        title="compute_experiment: exp-fail",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "experiment": "exp-fail"}],
+    )
+
+    arms = {
+        "adam": {
+            "val_loss": 0.42,
+            "exit_code": 1,
+            "error": "RuntimeError: CUDA OOM",
+            "stderr_excerpt": "Traceback (most recent call last): ...",
+        },
+        "sgd": {"val_loss": 0.61},
+    }
+
+    result = _build_compute_experiment_document(
+        task,
+        outcome="FAILED",
+        cost=0.10,
+        criterion=None,
+        result_reference=None,
+        arms=arms,
+    )
+
+    body = result["body"]
+    assert "### Failed arms" in body
+    assert "adam" in body
+    failed_section = body.split("### Failed arms")[-1]
+    assert "FAILED" in failed_section
+    assert "RuntimeError: CUDA OOM" in failed_section
+    assert "Traceback" in failed_section
+    # sgd succeeded — must not appear in the failed section
+    assert "sgd" not in failed_section
+
+
+def test_build_compute_experiment_document_failed_arms_list():
+    """List-shaped arms: ### Failed arms section appears for arms using 'reason' field."""
+    from app.knowledge_completion import _build_compute_experiment_document
+
+    task = make_task(
+        title="compute_experiment: exp-list",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "experiment": "exp-list"}],
+    )
+
+    arms = [
+        {"name": "arm_a", "reason": "result file not written"},
+        {"name": "arm_b", "val_loss": 0.55},
+    ]
+
+    result = _build_compute_experiment_document(
+        task,
+        outcome="FAILED",
+        cost=0.05,
+        criterion=None,
+        result_reference=None,
+        arms=arms,
+    )
+
+    body = result["body"]
+    assert "### Failed arms" in body
+    failed_section = body.split("### Failed arms")[-1]
+    assert "arm_a" in failed_section
+    assert "result file not written" in failed_section
+    # arm_b succeeded — must not appear in the failed section
+    assert "arm_b" not in failed_section

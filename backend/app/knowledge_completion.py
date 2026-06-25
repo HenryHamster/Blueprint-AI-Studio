@@ -1309,6 +1309,35 @@ def _build_compute_experiment_document(
         body_lines.append("```json")
         body_lines.append(json.dumps(arms, sort_keys=True, default=str))
         body_lines.append("```")
+        # Append human-readable failure summary for any arm that failed so a
+        # strategist can see which arms crashed and why without parsing JSON.
+        failed_lines: list[str] = []
+        arm_items: list[tuple[str, Any]] = []
+        if isinstance(arms, dict):
+            arm_items = list(arms.items())
+        elif isinstance(arms, list):
+            arm_items = [(a.get("name") or a.get("label") or a.get("arm") or f"arm_{i}", a)
+                         for i, a in enumerate(arms) if isinstance(a, dict)]
+        for arm_name, arm_data in arm_items:
+            if not isinstance(arm_data, dict):
+                continue
+            arm_exit = arm_data.get("exit_code")
+            arm_error = arm_data.get("error") or arm_data.get("reason")
+            arm_stderr = arm_data.get("stderr_excerpt")
+            if (arm_exit is not None and arm_exit != 0) or arm_error:
+                parts: list[str] = [f"**{arm_name}** FAILED"]
+                if arm_exit is not None:
+                    parts.append(f"exit {arm_exit}")
+                if arm_error:
+                    parts.append(str(arm_error)[:200])
+                line = ": ".join(parts)
+                if arm_stderr:
+                    line += f" | stderr: {arm_stderr[:200]}"
+                failed_lines.append(f"- {line}")
+        if failed_lines:
+            body_lines.append("")
+            body_lines.append("### Failed arms")
+            body_lines.extend(failed_lines)
     body = "\n".join(body_lines)
 
     raw_tags = payload.get("tags")

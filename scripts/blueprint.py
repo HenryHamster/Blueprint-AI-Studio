@@ -3715,6 +3715,7 @@ def _render_compute_show(data: dict) -> None:
             print(f"  metrics   : {scalar_items}")
         if arms:
             print("  per-arm results:")
+            _DIAG_KEYS = {"label", "note", "log", "exit_code", "error", "reason", "stderr_excerpt"}
             if isinstance(arms, dict):
                 for arm_name, arm_metrics in arms.items():
                     if isinstance(arm_metrics, dict):
@@ -3722,8 +3723,9 @@ def _render_compute_show(data: dict) -> None:
                         note = arm_metrics.get("note")
                         log = arm_metrics.get("log")
                         exit_code = arm_metrics.get("exit_code")
-                        error = arm_metrics.get("error")
-                        scalar_metrics = {k: v for k, v in arm_metrics.items() if k not in ("label", "note", "log", "exit_code", "error")}
+                        error = arm_metrics.get("error") or arm_metrics.get("reason")
+                        stderr_excerpt = arm_metrics.get("stderr_excerpt")
+                        scalar_metrics = {k: v for k, v in arm_metrics.items() if k not in _DIAG_KEYS}
                         print(f"    [{arm_name}]", end="")
                         if error:
                             print(f" ⚠ FAILED", end="")
@@ -3734,6 +3736,8 @@ def _render_compute_show(data: dict) -> None:
                             print(f"      exit_code: {exit_code}")
                         if error:
                             print(f"      error: {error}")
+                        if stderr_excerpt:
+                            print(f"      stderr: {stderr_excerpt[:300]}")
                         if label:
                             print(f"      label: {label}")
                         if note:
@@ -3752,8 +3756,9 @@ def _render_compute_show(data: dict) -> None:
                         note = arm_entry.get("note")
                         log = arm_entry.get("log")
                         exit_code = arm_entry.get("exit_code")
-                        error = arm_entry.get("error")
-                        scalar_metrics = {k: v for k, v in arm_entry.items() if k not in ("label", "name", "arm", "note", "log", "exit_code", "error")}
+                        error = arm_entry.get("error") or arm_entry.get("reason")
+                        stderr_excerpt = arm_entry.get("stderr_excerpt")
+                        scalar_metrics = {k: v for k, v in arm_entry.items() if k not in (_DIAG_KEYS | {"name", "arm"})}
                         print(f"    [{heading}]", end="")
                         if error:
                             print(f" ⚠ FAILED", end="")
@@ -3764,6 +3769,8 @@ def _render_compute_show(data: dict) -> None:
                             print(f"      exit_code: {exit_code}")
                         if error:
                             print(f"      error: {error}")
+                        if stderr_excerpt:
+                            print(f"      stderr: {stderr_excerpt[:300]}")
                         if label:
                             print(f"      label: {label}")
                         if note:

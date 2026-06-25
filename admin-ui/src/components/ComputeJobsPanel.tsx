@@ -22,6 +22,8 @@ import {
 
 const POLL_INTERVAL_MS = 10_000;
 
+const DIAGNOSTIC_KEYS = new Set(['exit_code', 'error', 'reason', 'stderr_excerpt', 'label', 'note', 'log']);
+
 const WINDOW_OPTIONS: { label: string; minutes: number }[] = [
   { label: '6h', minutes: 360 },
   { label: '24h', minutes: 1440 },
@@ -210,7 +212,7 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
                   </div>
                   {arms.map((arm) => {
                     const armExitCode = typeof arm.metrics.exit_code === 'number' ? arm.metrics.exit_code : null;
-                    const armError = typeof arm.metrics.error === 'string' ? arm.metrics.error : null;
+                    const armError = typeof arm.metrics.error === 'string' ? arm.metrics.error : typeof arm.metrics.reason === 'string' ? arm.metrics.reason : null;
                     const armFailed = (armExitCode !== null && armExitCode !== 0) || armError !== null;
                     return (
                       <div key={arm.name} className={`flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm font-mono mb-0.5 pl-2`}>
@@ -223,7 +225,7 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
                             exit {armExitCode}
                           </span>
                         )}
-                        {Object.entries(arm.metrics).filter(([mk]) => mk !== 'exit_code' && mk !== 'error').map(([mk, mv]) => (
+                        {Object.entries(arm.metrics).filter(([mk]) => !DIAGNOSTIC_KEYS.has(mk)).map(([mk, mv]) => (
                           <span key={mk}>
                             <span className="text-neutral-500">{mk}:</span>{' '}
                             <span className="text-neutral-300">{String(mv)}</span>
@@ -1038,14 +1040,15 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <div className="flex flex-col gap-1">
                           {arms.map((arm) => {
                             const exitCodeVal = typeof arm.metrics.exit_code === 'number' ? arm.metrics.exit_code : null;
-                            const errorVal = typeof arm.metrics.error === 'string' ? arm.metrics.error : null;
+                            const errorVal = typeof arm.metrics.error === 'string' ? arm.metrics.error : typeof arm.metrics.reason === 'string' ? arm.metrics.reason : null;
+                            const stderrVal = typeof arm.metrics.stderr_excerpt === 'string' ? arm.metrics.stderr_excerpt : null;
                             const isFailed = (exitCodeVal !== null && exitCodeVal !== 0) || errorVal !== null;
-                            const numericEntries = Object.entries(arm.metrics).filter(([mk, mv]) => typeof mv === 'number' && mk !== 'exit_code');
+                            const numericEntries = Object.entries(arm.metrics).filter(([mk, mv]) => typeof mv === 'number' && !DIAGNOSTIC_KEYS.has(mk));
                             const labelVal = typeof arm.metrics.label === 'string' ? arm.metrics.label : null;
                             const noteVal = typeof arm.metrics.note === 'string' ? arm.metrics.note : null;
                             const logVal = typeof arm.metrics.log === 'string' ? arm.metrics.log : null;
                             const otherStrings = Object.entries(arm.metrics).filter(
-                              ([mk, mv]) => typeof mv === 'string' && mk !== 'label' && mk !== 'note' && mk !== 'log' && mk !== 'error',
+                              ([mk, mv]) => typeof mv === 'string' && !DIAGNOSTIC_KEYS.has(mk),
                             );
                             return (
                               <div
@@ -1090,6 +1093,9 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                                 )}
                                 {logVal && (
                                   <pre className="mt-0.5 rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-24 overflow-y-auto" data-testid="arm-log">{logVal}</pre>
+                                )}
+                                {stderrVal && (
+                                  <pre className="mt-0.5 rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-ui-xs text-red-200 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-24 overflow-y-auto" data-testid="arm-stderr">{stderrVal}</pre>
                                 )}
                               </div>
                             );

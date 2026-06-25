@@ -2043,6 +2043,11 @@ def test_arm_synthesis_isolates_per_arm_results():
     assert script.index("adam/result.json") != script.index("sgd/result.json")
     # Arms run in subshells so one failure cannot abort others.
     assert "(export BLUEPRINT_RESULT_FILE=" in script
+    # Per-arm stderr is captured to a file.
+    assert "2>" in script
+    # Aggregator receives per-arm exit-code and stderr file specs.
+    assert "--exit-codes" in script
+    assert "--stderr" in script
 
     # Aggregator produces {"arms": {name: {metric: value}}} with BOTH arms,
     # even when they emit DIFFERENT values — verifies not last-arm-wins.
@@ -2282,6 +2287,115 @@ def test_aggregator_metric_not_in_result_captured_as_error():
     assert result["arms"]["arm-a"] == {"score": 0.88}
     assert "error" in result["arms"]["arm-b"]
     assert "score" in result["arms"]["arm-b"]["error"]
+
+
+def test_aggregator_surfaces_per_arm_exit_code():
+    """A crashed arm surfaces a non-zero exit_code and a human-readable reason;
+    a sibling arm still shows its metric value (failure isolation preserved).
+    Exit code 124 produces a timeout reason; exit code 0 with missing metric
+    produces an unmeasured-criterion reason."""
+    import tempfile
+    from pathlib import Path
+
+    from app.compute_arm_aggregator import aggregate
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+
+        # good arm: wrote result.json, exit 0
+        good_result = base / "good_result.json"
+        good_result.write_text(json.dumps({"score": 0.95}))
+        good_exit = base / "good_exit"
+        good_exit.write_text("0\n")
+
+        # crashed arm: no result.json, exit 1, has stderr
+        crashed_exit = base / "crashed_exit"
+        crashed_exit.write_text("1\n")
+        crashed_stderr = base / "crashed_stderr"
+        crashed_stderr.write_text("Traceback (most recent call last):\n  RuntimeError: out of memory\n")
+
+        # timed-out arm: no result.json, exit 124
+        timeout_exit = base / "timeout_exit"
+        timeout_exit.write_text("124\n")
+
+        # unmeasured arm: wrote result.json but with wrong metric, exit 0
+        unmeasured_result = base / "unmeasured_result.json"
+        unmeasured_result.write_text(json.dumps({"other_metric": 42}))
+        unmeasured_exit = base / "unmeasured_exit"
+        unmeasured_exit.write_text("0\n")
+
+        output = base / "main_result.json"
+        result = aggregate(
+            [
+                ("good", str(good_result)),
+                ("crashed", str(base / "nonexistent_result.json")),
+                ("timed-out", str(base / "nonexistent_result2.json")),
+                ("unmeasured", str(unmeasured_result)),
+            ],
+            "score",
+            str(output),
+            exit_codes={
+                "good": str(good_exit),
+                "crashed": str(crashed_exit),
+                "timed-out": str(timeout_exit),
+                "unmeasured": str(unmeasured_exit),
+            },
+            stderr_files={
+                "crashed": str(crashed_stderr),
+            },
+        )
+
+    # Good arm: metric value present, exit_code attached
+    assert result["arms"]["good"]["score"] == 0.95
+    assert result["arms"]["good"]["exit_code"] == 0
+
+    # Crashed arm: non-zero exit_code, crash reason, stderr excerpt
+    crashed = result["arms"]["crashed"]
+    assert crashed["exit_code"] == 1
+    assert "error" in crashed
+    assert "crashed" in crashed["error"] or "1" in crashed["error"]
+    assert "stderr_excerpt" in crashed
+    assert "RuntimeError" in crashed["stderr_excerpt"]
+
+    # Timed-out arm: exit_code 124, timeout reason
+    timed_out = result["arms"]["timed-out"]
+    assert timed_out["exit_code"] == 124
+    assert "error" in timed_out
+    assert "timed out" in timed_out["error"] or "124" in timed_out["error"]
+
+    # Unmeasured arm: exit 0, but metric absent → unmeasured-criterion reason
+    unmeasured = result["arms"]["unmeasured"]
+    assert unmeasured["exit_code"] == 0
+    assert "error" in unmeasured
+    assert "unmeasured" in unmeasured["error"] or "score" in unmeasured["error"]
+
+
+def test_aggregator_exit_code_absent_tolerated():
+    """When no exit_code file is provided for an arm, aggregate() still records
+    the failure reason without crashing; existing callers are unaffected."""
+    import tempfile
+    from pathlib import Path
+
+    from app.compute_arm_aggregator import aggregate
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+
+        good_result = base / "good_result.json"
+        good_result.write_text(json.dumps({"val": 1.0}))
+        output = base / "out.json"
+
+        # Call with no exit_codes/stderr_files (backward-compat path)
+        result = aggregate(
+            [("arm-good", str(good_result)), ("arm-bad", str(base / "missing.json"))],
+            "val",
+            str(output),
+        )
+
+    assert result["arms"]["arm-good"] == {"val": 1.0}
+    assert "error" in result["arms"]["arm-bad"]
+    # No exit_code field when not provided
+    assert "exit_code" not in result["arms"]["arm-bad"]
 
 
 # ---------------------------------------------------------------------------

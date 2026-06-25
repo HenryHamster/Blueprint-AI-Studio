@@ -1379,7 +1379,7 @@ describe('ComputeJobsPanel render + kill', () => {
         result_metrics: {
           arms: {
             'arm-ok': { score: 0.85 },
-            'arm-crash': { exit_code: 1, error: 'OOM at step 40', score: null },
+            'arm-crash': { exit_code: 1, error: 'OOM at step 40', stderr_excerpt: 'RuntimeError: CUDA OOM' },
           },
         },
       },
@@ -1395,11 +1395,43 @@ describe('ComputeJobsPanel render + kill', () => {
     const errorBlocks = getAllByTestId('arm-error');
     expect(errorBlocks).toHaveLength(1);
     expect(errorBlocks[0].textContent).toContain('OOM at step 40');
+    // stderr excerpt shown
+    const stderrBlocks = getAllByTestId('arm-stderr');
+    expect(stderrBlocks).toHaveLength(1);
+    expect(stderrBlocks[0].textContent).toContain('CUDA OOM');
     // Failed arm card uses red border/background classes
     const armCards = armsBlock.querySelectorAll('[class*="border-red"]');
     expect(armCards.length).toBeGreaterThan(0);
+    // Diagnostic keys do NOT appear as plain metric rows
+    expect(armsBlock.textContent).not.toContain('exit_code:');
+    expect(armsBlock.textContent).not.toContain('stderr_excerpt:');
     // Successful arm does not have red border
     expect(armsBlock.textContent).toContain('arm-ok');
+  });
+
+  test('arm with reason field (no exit_code) renders error in arm-error', async () => {
+    const armsJob = makeJob({
+      id: 'job-arms-reason',
+      task_title: 'reason experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-timeout': { reason: 'arm result file not written', accuracy: 0.0 },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('arms-breakdown');
+    const errors = getAllByTestId('arm-error');
+    expect(errors[0].textContent).toContain('arm result file not written');
+    // reason must NOT appear as a plain string metric row
+    const armsBlock = await findByTestId('arms-breakdown');
+    expect(armsBlock.textContent).not.toContain('reason:');
   });
 
   test('arms breakdown does not apply failure styling when exit_code is 0', async () => {
@@ -1429,6 +1461,8 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(armCards.length).toBe(0);
     // No error block
     expect(queryAllByTestId('arm-error')).toHaveLength(0);
+    // exit_code NOT shown as a plain metric row
+    expect(armsBlock.textContent).not.toContain('exit_code:');
   });
 
   test('run comparison matrix arms-comparison section tints a failed arm name in red', async () => {
