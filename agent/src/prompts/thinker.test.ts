@@ -1127,3 +1127,51 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
     expect(additionalIdx).toBeGreaterThan(jobIdx);
   });
 });
+
+describe('spawn-fix allowlist sync', () => {
+  const base: ThinkerPromptParams = {
+    contextPrefix: '',
+    projectName: 'Test Project',
+    clockHeader: '',
+    isSelfRepo: false,
+    userStateLine: '',
+    packerMetaSection: '',
+    strategicContext: '',
+    problemModelSection: '',
+    problemModelRecovery: 'empty',
+    reflectionSection: '',
+    selfImprovementBlock: '',
+    runningUpdateSection: '',
+    designDocJson: '',
+    visionJson: '',
+    outcomeSection: '',
+    previousDecisionOutcomes: '',
+    pastRetirementCritiquesSection: '',
+    retiredDirectionsSummarySection: '',
+    dirSummaryText: '',
+    dirHealthSummary: '',
+    userPausedSection: '',
+    rejectedProposalsSection: '',
+    operatorOverridesSection: '',
+    portfolioCompositionText: '',
+    modelHealthSection: '',
+    systemMaturitySection: '',
+    driftSection: '',
+    recentWorkSection: '',
+    feedbackSection: '',
+    questionSection: '',
+    threadSection: '',
+    taskId: 'test-task',
+    versionPhaseSection: '',
+    memoCitationsSection: '',
+    efficiencySnapshotSection: '',
+  };
+
+  it('advertises create/refactor/qa for spawn-fix — not fix — matching backend STRATEGIST_ONE_TIME_SPAWNABLE_TYPES', () => {
+    const prompt = buildThinkerPrompt(base);
+    // spawn-fix section must list exactly the backend-allowed types (create, refactor, qa)
+    expect(prompt).toContain("types `create`/`refactor`/`qa`");
+    // 'fix' must not appear as an advertised spawn-fix type
+    expect(prompt).not.toMatch(/`spawn-fix`[^)]*types[^)]*`fix`/);
+  });
+});
