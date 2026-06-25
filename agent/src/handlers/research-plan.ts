@@ -1248,20 +1248,54 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
   const peff = snap.panel_review_effectiveness && typeof snap.panel_review_effectiveness === 'object'
     ? snap.panel_review_effectiveness as Record<string, unknown>
     : null;
-  if (peff) {
-    const gh = peff.gate_health && typeof peff.gate_health === 'object'
-      ? peff.gate_health as Record<string, unknown>
+  const peffPd = snap.panel_review_effectiveness_post_deploy && typeof snap.panel_review_effectiveness_post_deploy === 'object'
+    ? snap.panel_review_effectiveness_post_deploy as Record<string, unknown>
+    : null;
+  if (peff || peffPd) {
+    const pdGh = peffPd?.gate_health && typeof peffPd.gate_health === 'object'
+      ? peffPd.gate_health as Record<string, unknown>
       : null;
-    const state = gh && typeof gh.state === 'string' ? gh.state : 'NO_DATA';
-    const failOpenRate = typeof peff.fail_open_rate === 'number'
-      ? `${(peff.fail_open_rate * 100).toFixed(2)}%`
+    const pdState = pdGh && typeof pdGh.state === 'string' ? pdGh.state : null;
+    // Use post-deploy as primary when it has sufficient data.
+    // Fall back for NO_DATA (0 gate invocations) and INSUFFICIENT (<min_sample) — both are
+    // low-sample states. Keep DEGRADED as primary: it fires at >=5% even on tiny samples
+    // and is an intentional alarm, not a data-gap.
+    const usePostDeploy = peffPd !== null && pdState !== null
+      && pdState !== 'INSUFFICIENT' && pdState !== 'NO_DATA';
+    // Within this if-block, at least one of peff/peffPd is non-null.
+    // Prefer post-deploy when it has enough data; fall back to rolling otherwise.
+    let primary: Record<string, unknown>;
+    if (usePostDeploy) {
+      primary = peffPd;
+    } else if (peff) {
+      primary = peff;
+    } else {
+      primary = peffPd as Record<string, unknown>;
+    }
+    const primaryGh = primary.gate_health && typeof primary.gate_health === 'object'
+      ? primary.gate_health as Record<string, unknown>
+      : null;
+    const state = primaryGh && typeof primaryGh.state === 'string' ? primaryGh.state : 'NO_DATA';
+    const failOpenRate = typeof primary.fail_open_rate === 'number'
+      ? `${(primary.fail_open_rate * 100).toFixed(2)}%`
       : 'n/a';
-    const totalChallenged = typeof peff.total_challenged === 'number' ? String(peff.total_challenged) : 'n/a';
-    const coverage = typeof peff.effective_coverage === 'number'
-      ? `${(peff.effective_coverage * 100).toFixed(1)}%`
+    const totalChallenged = typeof primary.total_challenged === 'number' ? String(primary.total_challenged) : 'n/a';
+    const coverage = typeof primary.effective_coverage === 'number'
+      ? `${(primary.effective_coverage * 100).toFixed(1)}%`
       : 'n/a';
+    let label: string;
+    if (usePostDeploy) {
+      label = 'Adversarial gate health (post-deploy)';
+    } else if (peffPd !== null) {
+      // Post-deploy present but low-sample (INSUFFICIENT or NO_DATA) — annotate rolling source.
+      const pdTotal = pdGh && typeof pdGh.total_invocations === 'number' ? pdGh.total_invocations : 0;
+      const pdMinSample = pdGh && typeof pdGh.min_sample === 'number' ? pdGh.min_sample : 30;
+      label = `Adversarial gate health (rolling; post-deploy accumulating ${pdTotal}/${pdMinSample} invocations)`;
+    } else {
+      label = 'Adversarial gate health';
+    }
     lines.push('');
-    lines.push(`**Adversarial gate health:** ${state} — fail_open_rate ${failOpenRate} (n=${totalChallenged}, coverage ${coverage})`);
+    lines.push(`**${label}:** ${state} — fail_open_rate ${failOpenRate} (n=${totalChallenged}, coverage ${coverage})`);
   }
 
   return lines.join('\n') + '\n';

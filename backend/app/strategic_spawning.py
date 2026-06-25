@@ -1052,6 +1052,15 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
             "challenged_degraded": raw_peff.get("challenged_degraded"),
             "effective_coverage": raw_peff.get("effective_coverage"),
         }
+    raw_peff_pd = snapshot.get("panel_review_effectiveness_post_deploy") or {}
+    if raw_peff_pd:
+        result["panel_review_effectiveness_post_deploy"] = {
+            "gate_health": raw_peff_pd.get("gate_health"),
+            "fail_open_rate": raw_peff_pd.get("fail_open_rate"),
+            "total_challenged": raw_peff_pd.get("total_challenged"),
+            "challenged_degraded": raw_peff_pd.get("challenged_degraded"),
+            "effective_coverage": raw_peff_pd.get("effective_coverage"),
+        }
     return result
 
 
