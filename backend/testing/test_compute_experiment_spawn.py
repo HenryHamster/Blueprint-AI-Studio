@@ -814,14 +814,19 @@ async def test_unmeasured_criterion_surfaces_emitted_keys(
     """compute_unmeasured_criterion failure message surfaces what the command
     actually emitted so a case/name mismatch is instantly visible.
 
-    Case A: COMPUTE_RESULT emitted 'AUC' (wrong case) but criterion declares
-            'auc' → miss_reason lists emitted_keys=['AUC'].
+    Case A: COMPUTE_RESULT emitted a differently-NAMED metric ('roc_auc_score')
+            while the criterion declares 'auc' → the metric stays unmeasured and
+            miss_reason lists emitted_keys=['roc_auc_score'] hinting at the
+            name mismatch. (A pure case difference such as 'AUC' vs 'auc' is now
+            tolerated by the case-insensitive matcher in
+            evaluate_compute_success_criterion (#11745) and is therefore measured,
+            not surfaced here — only a genuine name divergence reaches this path.)
     Case B: COMPUTE_RESULT has no experiment metrics at all (only cost fields)
             → miss_reason reports emitted_keys=[].
     Case C: no COMPUTE_RESULT parsed (crash before result) — exercised separately
             by test_unmeasured_criterion_no_artifact_is_crash_path.
     """
-    # --- Case A: wrong-case metric key emitted ---
+    # --- Case A: differently-named metric key emitted (not a pure case diff) ---
     task_a = await _make_compute_task(
         db_session,
         {
@@ -836,23 +841,25 @@ async def test_unmeasured_criterion_surfaces_emitted_keys(
             },
         },
     )
-    result_with_wrong_case = json.dumps(
+    result_with_name_mismatch = json.dumps(
         {
             "outcome": "SUCCESS",
             "final_cost_usd": 0.10,
-            "AUC": 0.85,  # declared as 'auc' but emitted as 'AUC'
+            # declared as 'auc' but emitted under a different NAME (not just case),
+            # so the case-insensitive matcher does not resolve it → unmeasured.
+            "roc_auc_score": 0.85,
         }
     )
     await _handle_compute_experiment_completion(
-        task_a, result_with_wrong_case, db_session
+        task_a, result_with_name_mismatch, db_session
     )
     await db_session.refresh(task_a)
     assert task_a.status == TaskStatus.FAILED
     assert task_a.context["failure_category"] == "compute_unmeasured_criterion"
     gate_reason = task_a.context["evaluation_gate"]["reason"]
-    # Must name the declared metric, the emitted keys, and hint at case mismatch.
+    # Must name the declared metric, the emitted keys, and hint at a name mismatch.
     assert "auc" in gate_reason
-    assert "AUC" in gate_reason
+    assert "roc_auc_score" in gate_reason
     assert "emitted_keys" in gate_reason
     assert "case" in gate_reason.lower() or "name" in gate_reason.lower()
 

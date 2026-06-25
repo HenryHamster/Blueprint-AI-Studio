@@ -114,18 +114,47 @@ class TestDeterministicCoDeleteClassification:
             "classification clears the file as dead_code_removal; got None (hard-block)."
         )
 
-    def test_subject_still_present_blocks_without_llm_tag(self):
-        """A deleted test file whose subject is NOT co-deleted still hard-blocks
-        when the LLM produces no classification (fail-closed semantics preserved)."""
-        report = self._make_report(
+    def test_unflagged_deletion_passes_but_genuine_erosion_blocks(self):
+        """Fail-open disposition (operator steer, #11722): a deleted test file with
+        NO classification from either the deterministic or LLM path PASSES — only an
+        explicit ``genuine_erosion`` tag hard-blocks.
+
+        This was previously asserted fail-closed (absent → block) but #11722 flipped
+        the default disposition to fail-open so the auditor's frequent failure to
+        emit a tag stops false-blocking legitimate co-deletion/declutter cuts. The
+        deterministic-detection-and-overlay path added in #11721 is unchanged; only
+        the default for an un-flagged deletion is allow. The narrow erosion case
+        (subject demonstrably present, test stripped) still blocks — but only when
+        the auditor affirmatively classifies it ``genuine_erosion``.
+        """
+        # Part 1: no deterministic and no LLM classification → fail-OPEN (passes).
+        report_unflagged = self._make_report(
             deleted_test_files=["admin-ui/src/components/Foo.test.tsx"],
-            computed_classifications=None,  # no deterministic classification (subject still present)
+            computed_classifications=None,  # no deterministic classification
             llm_classifications=None,  # LLM also produced nothing
         )
-        _, test_erosion = _score_audit(report)
-        assert test_erosion is None, (
-            "Expected None (hard-block) when the deleted test file has no "
-            "dead_code_removal classification from either deterministic or LLM path."
+        _, test_erosion = _score_audit(report_unflagged)
+        assert test_erosion is not None, (
+            "Expected a non-None erosion score (fail-open) when the deleted test "
+            "file carries no classification — only explicit genuine_erosion blocks."
+        )
+
+        # Part 2: explicit genuine_erosion (subject still present) → still hard-blocks.
+        report_erosion = self._make_report(
+            deleted_test_files=["admin-ui/src/components/Live.test.tsx"],
+            computed_classifications=None,  # deterministic path never emits genuine_erosion
+            llm_classifications=[
+                {
+                    "path": "admin-ui/src/components/Live.test.tsx",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject Live.tsx is present and unchanged.",
+                }
+            ],
+        )
+        _, erosion_genuine = _score_audit(report_erosion)
+        assert erosion_genuine is None, (
+            "Expected None (hard-block) for an explicit genuine_erosion "
+            "classification — the one case fail-open preserves."
         )
 
     def test_deterministic_overrides_absent_llm_for_multiple_files(self):
@@ -154,10 +183,39 @@ class TestDeterministicCoDeleteClassification:
             "Expected numeric test_erosion when all deleted files cleared deterministically."
         )
 
-    def test_partial_deterministic_coverage_blocks_uncovered_file(self):
-        """When one file is cleared deterministically but a second is not, the
-        uncovered file still hard-blocks (fail-closed for uncovered files)."""
-        report = self._make_report(
+    def test_partial_deterministic_coverage_passes_unflagged_blocks_genuine_erosion(self):
+        """Partial deterministic coverage under the fail-open disposition (#11722):
+        one file cleared deterministically as ``dead_code_removal``, a second file
+        left unflagged.
+
+        Fail-open: the unflagged file PASSES (no longer hard-blocks merely because
+        the auditor didn't tag it). A second file is hard-blocked ONLY when it
+        carries an explicit ``genuine_erosion`` classification.
+        """
+        # Part 1: one file cleared deterministically, second unflagged → passes.
+        report_unflagged = self._make_report(
+            deleted_test_files=[
+                "admin-ui/src/components/Foo.test.tsx",
+                "admin-ui/src/components/Live.test.tsx",  # unflagged
+            ],
+            computed_classifications=[
+                {
+                    "path": "admin-ui/src/components/Foo.test.tsx",
+                    "classification": "dead_code_removal",
+                    "rationale": "Subject Foo.tsx deleted.",
+                },
+                # Live.test.tsx NOT classified — unflagged passes under fail-open.
+            ],
+            llm_classifications=None,
+        )
+        _, test_erosion = _score_audit(report_unflagged)
+        assert test_erosion is not None, (
+            "Expected non-None erosion (fail-open): one file is cleared "
+            "deterministically and the second is unflagged, which now passes."
+        )
+
+        # Part 2: second file flagged genuine_erosion (subject present) → blocks.
+        report_genuine = self._make_report(
             deleted_test_files=[
                 "admin-ui/src/components/Foo.test.tsx",
                 "admin-ui/src/components/Live.test.tsx",  # subject still present
@@ -168,13 +226,19 @@ class TestDeterministicCoDeleteClassification:
                     "classification": "dead_code_removal",
                     "rationale": "Subject Foo.tsx deleted.",
                 },
-                # Live.test.tsx NOT classified (subject still present)
             ],
-            llm_classifications=None,
+            llm_classifications=[
+                {
+                    "path": "admin-ui/src/components/Live.test.tsx",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject Live.tsx is present and unchanged.",
+                }
+            ],
         )
-        _, test_erosion = _score_audit(report)
-        assert test_erosion is None, (
-            "Expected None (hard-block) when at least one file is not deterministically cleared."
+        _, erosion_genuine = _score_audit(report_genuine)
+        assert erosion_genuine is None, (
+            "Expected None (hard-block) when a deleted file is explicitly "
+            "classified genuine_erosion, even alongside a deterministically cleared file."
         )
 
 
