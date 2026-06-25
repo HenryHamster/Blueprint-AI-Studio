@@ -2258,6 +2258,8 @@ async def test_build_knowledge_index_compact_fields_no_body(db_session):
         "compute_acceptance_reason",
         "unavailable_cause",
         "origin_provenance",
+        "sweep_id",
+        "arm_label",
     }
     assert "body" not in entry
     assert entry["knowledge_acceptance_evidence"] is True
@@ -2623,3 +2625,49 @@ async def test_fetch_direction_knowledge_index_empty_direction_list(db_session):
     project, _ = await _make_web_research_task(db_session, project_name="FDK3")
     result = await fetch_direction_knowledge_index(db_session, project.id, [])
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_sweep_id_filter_scopes_to_sweep(client: AsyncClient, db_session):
+    """?sweep_id=<id> returns only documents for that sweep, excluding others."""
+    proj = await _seed_project_with_membership(db_session, "SweepFilter")
+    task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _seed_doc(
+        db_session, proj.id, task.id,
+        title="Arm alpha result",
+        source_kind="compute_experiment",
+        sweep_id="swp-aaa",
+        arm_label="alpha",
+    )
+    await _seed_doc(
+        db_session, proj.id, task.id,
+        title="Arm beta result",
+        source_kind="compute_experiment",
+        sweep_id="swp-aaa",
+        arm_label="beta",
+    )
+    await _seed_doc(
+        db_session, proj.id, task.id,
+        title="Different sweep doc",
+        source_kind="compute_experiment",
+        sweep_id="swp-bbb",
+        arm_label="gamma",
+    )
+
+    resp = await client.get(
+        f"/api/admin/projects/{proj.id}/knowledge-documents",
+        params={"sweep_id": "swp-aaa"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 2
+    titles = {d["title"] for d in body["documents"]}
+    assert titles == {"Arm alpha result", "Arm beta result"}
+    # sweep_id and arm_label must appear in the serialized documents
+    for doc in body["documents"]:
+        assert doc["sweep_id"] == "swp-aaa"
+        assert doc["arm_label"] in {"alpha", "beta"}

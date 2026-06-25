@@ -3330,6 +3330,17 @@ class KnowledgeDocument(SQLModel, table=True):
         default=None, sa_column=Column(String, nullable=True)
     )
 
+    # Sweep identity for compute_experiment docs. Populated when the task belongs
+    # to a multi-task sweep (task.first_payload["sweep_id"]). Indexed for
+    # per-sweep grouping queries. arm_label carries the human-readable arm name
+    # (first_payload["experiment"] or ["arm_label"]); null for sweep-aggregate docs.
+    sweep_id: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    arm_label: str | None = Field(
+        default=None, sa_column=Column(String(256), nullable=True)
+    )
+
     # Free-form tag list and citation list (web URLs plus any file refs).
     tags: List[str] = Field(
         default_factory=list,
@@ -3418,6 +3429,7 @@ class KnowledgeDocument(SQLModel, table=True):
         Index("ix_knowledge_document_origin_state", "origin_state"),
         Index("ix_knowledge_document_origin_challenge_state", "origin_challenge_state"),
         Index("ix_knowledge_document_origin_finding_hash", "origin_finding_hash"),
+        Index("ix_knowledge_document_sweep_id", "sweep_id"),
     )
 
 

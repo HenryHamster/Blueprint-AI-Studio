@@ -70,6 +70,7 @@ from app.knowledge_completion import (
     _build_compute_experiment_document,
     _extract_job_terminal_diagnostics,
 )
+from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
 from app.task_completion import _handle_compute_experiment_completion
 
 
@@ -5294,3 +5295,104 @@ async def test_local_backend_e2e_smoke(db_session, monkeypatch, _quiet_compute_i
     assert prereqs and prereqs[0]["source_task_id"] == str(task.id), (
         "dependent must receive knowledge prerequisite pointer after task completes"
     )
+
+
+# ── Sweep-arm knowledge indexing ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_completed_arm_knowledge_retrievable_by_sweep_and_surfaced_to_strategist(
+    db_session, _quiet_compute_io, mocker
+):
+    """Completed sweep arms create KnowledgeDocuments tagged with sweep_id and
+    arm_label; build_sweep_knowledge_index returns them grouped by sweep; and
+    build_compute_sweep_groups exposes the sweep to the strategist payload."""
+    # Suppress sweep-aggregate spawn so arms complete cleanly and this test
+    # stays focused on knowledge document creation / sweep indexing.
+    mocker.patch(
+        "app.task_completion._maybe_spawn_sweep_aggregate_followon",
+        new=AsyncMock(return_value=None),
+    )
+    sweep_id = f"sweep-{uuid.uuid4().hex[:12]}"
+    project = Project(name="SweepTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    async def _make_arm(experiment_name: str) -> Task:
+        arm = Task(
+            project_id=project.id,
+            title=f"compute_experiment: arm {experiment_name}",
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "base_branch": "main",
+                    "sweep_id": sweep_id,
+                    "experiment": experiment_name,
+                    "success_criterion": {
+                        "metric": "accuracy",
+                        "operator": ">=",
+                        "threshold": 0.9,
+                    },
+                }
+            ],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(arm)
+        await db_session.commit()
+        await db_session.refresh(arm)
+        return arm
+
+    arm_a = await _make_arm("baseline")
+    arm_b = await _make_arm("optimized")
+
+    # Complete both arms — each should produce one KnowledgeDocument.
+    for arm, accuracy in [(arm_a, 0.93), (arm_b, 0.88)]:
+        await _handle_compute_experiment_completion(
+            arm, _result_artifact(accuracy=accuracy), db_session
+        )
+
+    await db_session.refresh(arm_a)
+    await db_session.refresh(arm_b)
+    assert arm_a.status == TaskStatus.COMPLETED
+    assert arm_b.status == TaskStatus.COMPLETED
+
+    # Each arm must have exactly one KnowledgeDocument with sweep_id + arm_label set.
+    docs_a = await _knowledge_docs_for(db_session, arm_a)
+    docs_b = await _knowledge_docs_for(db_session, arm_b)
+    assert len(docs_a) == 1, "arm_a must produce one KnowledgeDocument"
+    assert len(docs_b) == 1, "arm_b must produce one KnowledgeDocument"
+
+    doc_a = docs_a[0]
+    doc_b = docs_b[0]
+    assert doc_a.sweep_id == sweep_id, "doc_a.sweep_id must be set"
+    assert doc_b.sweep_id == sweep_id, "doc_b.sweep_id must be set"
+    assert doc_a.arm_label == "baseline", "doc_a.arm_label must be 'baseline'"
+    assert doc_b.arm_label == "optimized", "doc_b.arm_label must be 'optimized'"
+    assert doc_a.source_kind == "compute_experiment"
+    assert doc_b.source_kind == "compute_experiment"
+
+    # build_sweep_knowledge_index returns both arm docs for the sweep.
+    sweep_entries = await build_sweep_knowledge_index(db_session, project.id, sweep_id)
+    assert len(sweep_entries) == 2, (
+        f"build_sweep_knowledge_index must return 2 entries for sweep {sweep_id!r}; "
+        f"got {len(sweep_entries)}"
+    )
+    entry_labels = {e["arm_label"] for e in sweep_entries}
+    assert entry_labels == {"baseline", "optimized"}, (
+        f"sweep entries must have arm_labels baseline and optimized; got {entry_labels}"
+    )
+    for e in sweep_entries:
+        assert e["sweep_id"] == sweep_id
+        assert e["source_kind"] == "compute_experiment"
+
+    # build_compute_sweep_groups groups this sweep for the strategist.
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert sweep_id in groups, (
+        f"build_compute_sweep_groups must include sweep {sweep_id!r}; got keys {list(groups.keys())}"
+    )
+    group_entries = groups[sweep_id]
+    assert len(group_entries) == 2
+    group_labels = {e["arm_label"] for e in group_entries}
+    assert group_labels == {"baseline", "optimized"}

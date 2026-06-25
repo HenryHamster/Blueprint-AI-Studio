@@ -141,6 +141,7 @@ HELP_INVOCATIONS = [
     ["knowledge"],
     ["knowledge", "list"],
     ["knowledge", "show"],
+    ["knowledge", "sweep"],
     ["compute"],
     ["compute", "list"],
     ["compute", "show"],
@@ -687,15 +688,36 @@ def mock_api(monkeypatch):
             docs = [
                 {"id": "kdoc-001", "title": "API Rate Limiting", "source_kind": "web_research",
                  "direction_id": "d-abc12345", "created_at": "2026-06-15T00:00:00Z",
-                 "topic": "api", "tags": ["rate-limiting", "resilience"]},
+                 "topic": "api", "tags": ["rate-limiting", "resilience"],
+                 "sweep_id": None, "arm_label": None},
                 {"id": "kdoc-002", "title": "Design Patterns", "source_kind": "design",
                  "direction_id": "d-def67890", "created_at": "2026-06-14T00:00:00Z",
-                 "topic": "architecture", "tags": []},
+                 "topic": "architecture", "tags": [],
+                 "sweep_id": None, "arm_label": None},
+                {"id": "kdoc-arm-a", "title": "Sweep arm alpha", "source_kind": "compute_experiment",
+                 "direction_id": "d-sweep01", "created_at": "2026-06-20T00:00:00Z",
+                 "topic": "experiment", "tags": [],
+                 "sweep_id": "swp-test001", "arm_label": "alpha",
+                 "forward_quality_verdict": {
+                     "criterion_met": True,
+                     "cost_usd": 1.25,
+                     "result_metrics": {"accuracy": 0.92},
+                 }},
+                {"id": "kdoc-arm-b", "title": "Sweep arm beta", "source_kind": "compute_experiment",
+                 "direction_id": "d-sweep01", "created_at": "2026-06-20T01:00:00Z",
+                 "topic": "experiment", "tags": [],
+                 "sweep_id": "swp-test001", "arm_label": "beta",
+                 "forward_quality_verdict": {
+                     "criterion_met": False,
+                     "cost_usd": 1.10,
+                     "result_metrics": {"accuracy": 0.81},
+                 }},
             ]
             direction_f = qs.get("direction", [None])[0]
             source_kind_f = qs.get("source_kind", [None])[0]
             q_f = qs.get("q", [None])[0]
             tag_f = qs.get("tag", [None])[0]
+            sweep_id_f = qs.get("sweep_id", [None])[0]
             if direction_f:
                 docs = [d for d in docs if d.get("direction_id") == direction_f]
             if source_kind_f:
@@ -704,6 +726,8 @@ def mock_api(monkeypatch):
                 docs = [d for d in docs if q_f.lower() in (d.get("title") or "").lower()]
             if tag_f:
                 docs = [d for d in docs if tag_f in (d.get("tags") or [])]
+            if sweep_id_f:
+                docs = [d for d in docs if d.get("sweep_id") == sweep_id_f]
             return {"documents": docs, "total": len(docs)}
         if "/compute-jobs/" in path and "/kill" in path and method == "POST":
             job_id = path.split("/compute-jobs/")[1].split("/")[0]
@@ -3322,6 +3346,83 @@ def test_knowledge_show_prefix_no_match_prints_error(monkeypatch, capsys):
     assert rc == 0
     err = capsys.readouterr().err
     assert "no-match" in err
+
+
+def test_knowledge_sweep_lists_arms_side_by_side(mock_api, capsys):
+    """knowledge sweep <sweep_id> renders a side-by-side arm comparison table."""
+    rc = blueprint.main(["knowledge", "sweep", "swp-test001"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Header shows the sweep id
+    assert "swp-test001" in out
+    # Both arm labels appear
+    assert "alpha" in out
+    assert "beta" in out
+    # criterion_met renders distinctly: MET vs NOT MET
+    assert "MET" in out
+    assert "NOT MET" in out
+    # Cost values appear
+    assert "1.25" in out
+    assert "1.10" in out
+    # The API was called with the sweep_id filter
+    assert any("sweep_id=swp-test001" in path for _, path, _ in mock_api)
+
+
+def test_knowledge_sweep_request_carries_sweep_id_and_source_kind(mock_api, capsys):
+    """knowledge sweep passes sweep_id and source_kind=compute_experiment to the API."""
+    blueprint.main(["knowledge", "sweep", "swp-test001"])
+    sweep_calls = [p for _, p, _ in mock_api if "sweep_id=swp-test001" in p]
+    assert sweep_calls, "Expected at least one API call with sweep_id=swp-test001"
+    assert all("source_kind=compute_experiment" in p for p in sweep_calls)
+
+
+def test_knowledge_sweep_empty_state(monkeypatch, capsys):
+    """knowledge sweep prints a clear message when no arm results are indexed."""
+    def fake_api(method, path, body=None, timeout=30):
+        if "/knowledge-documents" in path and method == "GET":
+            return {"documents": [], "total": 0}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["knowledge", "sweep", "swp-missing"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no arm results" in out.lower() or "none" in out.lower()
+
+
+def test_knowledge_sweep_aggregate_doc_arms_block(monkeypatch, capsys):
+    """knowledge sweep parses arm rows from an aggregate doc's forward_quality_verdict['arms'] block."""
+    aggregate_doc = {
+        "id": "kdoc-agg-1",
+        "title": "Sweep aggregate",
+        "source_kind": "compute_experiment",
+        "sweep_id": "swp-agg01",
+        "arm_label": None,
+        "forward_quality_verdict": {
+            "arms": {
+                "ctrl": {"criterion_met": True, "cost_usd": 0.50, "result_metrics": {"accuracy": 0.95}},
+                "trt": {"criterion_met": False, "cost_usd": 0.55, "result_metrics": {"accuracy": 0.78}},
+            }
+        },
+    }
+
+    def fake_api(method, path, body=None, timeout=30):
+        if "/knowledge-documents" in path and method == "GET":
+            return {"documents": [aggregate_doc], "total": 1}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["knowledge", "sweep", "swp-agg01"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ctrl" in out
+    assert "trt" in out
+    assert "MET" in out
+    assert "NOT MET" in out
 
 
 def test_compute_kill_aborts_without_yes(mock_api, monkeypatch, capsys):

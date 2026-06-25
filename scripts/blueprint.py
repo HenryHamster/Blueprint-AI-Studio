@@ -3296,10 +3296,12 @@ def _render_playbook(data: dict) -> None:
 # ── knowledge ────────────────────────────────────────────────────────────────
 
 def cmd_knowledge(args: argparse.Namespace) -> None:
-    """Dispatch knowledge subcommands: list / show."""
+    """Dispatch knowledge subcommands: list / show / sweep."""
     sub = getattr(args, "knowledge_cmd", None) or "list"
     if sub == "show":
         _knowledge_show(args)
+    elif sub == "sweep":
+        _knowledge_sweep(args)
     else:
         _knowledge_list(args)
 
@@ -3396,6 +3398,105 @@ def _render_knowledge_doc(doc: dict) -> None:
             else:
                 ref = str(c)
             print(f"    {i}. {ref}")
+
+
+def _knowledge_sweep(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    sweep_id = args.sweep_id
+    path = (
+        f"/api/admin/projects/{pid}/knowledge-documents"
+        f"?sweep_id={sweep_id}&source_kind=compute_experiment&limit=200"
+    )
+    resp = api("GET", path)
+    docs = resp.get("documents", resp) if isinstance(resp, dict) else resp
+    _emit(args, {"sweep_id": sweep_id, "documents": docs or []}, _render_knowledge_sweep)
+
+
+def _render_knowledge_sweep(data: dict) -> None:
+    sweep_id = data.get("sweep_id", "?")
+    docs = data.get("documents") or []
+    print(f"=== SWEEP ARMS: {sweep_id} ===")
+    if not docs:
+        print("  (no arm results indexed for this sweep)")
+        return
+
+    # Build arm rows from per-arm docs (arm_label set) and/or the aggregate
+    # doc whose forward_quality_verdict['arms'] block carries per-arm results.
+    rows: list[dict] = []
+    for doc in docs:
+        arm_label = doc.get("arm_label")
+        verdict = doc.get("forward_quality_verdict") or {}
+        if arm_label:
+            # Per-arm document
+            rows.append({
+                "arm": arm_label,
+                "metric": _sweep_metric_value(verdict),
+                "criterion_met": verdict.get("criterion_met"),
+                "cost_usd": verdict.get("cost_usd"),
+            })
+        else:
+            # Aggregate document — parse arms block
+            arms_block = verdict.get("arms") or {}
+            if isinstance(arms_block, dict):
+                for name, arm_data in arms_block.items():
+                    if isinstance(arm_data, dict):
+                        rows.append({
+                            "arm": name,
+                            "metric": _sweep_metric_value(arm_data),
+                            "criterion_met": arm_data.get("criterion_met"),
+                            "cost_usd": arm_data.get("cost_usd"),
+                        })
+            elif isinstance(arms_block, list):
+                for arm_data in arms_block:
+                    if isinstance(arm_data, dict):
+                        rows.append({
+                            "arm": arm_data.get("arm") or arm_data.get("arm_label") or "?",
+                            "metric": _sweep_metric_value(arm_data),
+                            "criterion_met": arm_data.get("criterion_met"),
+                            "cost_usd": arm_data.get("cost_usd"),
+                        })
+
+    if not rows:
+        print("  (no per-arm results found in indexed documents)")
+        return
+
+    col_arm = max(len(r["arm"]) for r in rows)
+    col_arm = max(col_arm, 4)
+    header = f"  {'ARM':<{col_arm}}  {'METRIC':>14}  {'CRITERION':>9}  {'COST (USD)':>10}"
+    print(header)
+    print("  " + "-" * (col_arm + 14 + 9 + 10 + 9))
+    for r in rows:
+        arm = r["arm"]
+        metric = r["metric"]
+        met = r["criterion_met"]
+        if met is True:
+            crit_str = "MET"
+        elif met is False:
+            crit_str = "NOT MET"
+        else:
+            crit_str = "?"
+        cost = r["cost_usd"]
+        cost_str = f"${cost:.4f}" if isinstance(cost, (int, float)) else "?"
+        metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else (str(metric) if metric is not None else "?")
+        print(f"  {arm:<{col_arm}}  {metric_str:>14}  {crit_str:>9}  {cost_str:>10}")
+
+
+def _sweep_metric_value(verdict: dict) -> "float | str | None":
+    """Extract the primary metric value from a per-arm verdict or arm-block entry."""
+    # Direct scalar value
+    if "value" in verdict:
+        return verdict["value"]
+    # result_metrics: prefer the first non-'arms' scalar
+    metrics = verdict.get("result_metrics") or {}
+    if isinstance(metrics, dict):
+        for k, v in metrics.items():
+            if k != "arms" and isinstance(v, (int, float)):
+                return v
+    # criterion carries threshold — not a measured value, skip
+    criterion = verdict.get("criterion") or {}
+    if isinstance(criterion, dict) and "value" in criterion:
+        return criterion["value"]
+    return None
 
 
 # ── compute ───────────────────────────────────────────────────────────────────
@@ -4482,6 +4583,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ks = knowledge_sub.add_parser("show", parents=[common],
                                     help="Show a knowledge document with its full body.")
     p_ks.add_argument("doc_id", help="Knowledge document id.")
+    p_ksw = knowledge_sub.add_parser(
+        "sweep", parents=[common],
+        help="Show a side-by-side arm comparison table for a compute-experiment sweep.",
+    )
+    p_ksw.add_argument("sweep_id", help="Sweep id (e.g. swp-abc123).")
 
     # compute
     p_compute = sub.add_parser(

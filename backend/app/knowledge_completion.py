@@ -1935,6 +1935,12 @@ async def _persist_compute_knowledge_document(
     direction_id = (task.context or {}).get("direction_id")
     direction_id = str(direction_id) if direction_id else None
 
+    payload = task.first_payload or {}
+    raw_sweep_id = payload.get("sweep_id") or None
+    sweep_id_val = (str(raw_sweep_id).strip()[:128] if raw_sweep_id else None) or None
+    raw_arm = payload.get("experiment") or payload.get("arm_label") or None
+    arm_label_val = (str(raw_arm).strip()[:256] if raw_arm else None) or None
+
     title = document["title"]
     summary = document["summary"]
     topic = document["topic"]
@@ -2014,6 +2020,8 @@ async def _persist_compute_knowledge_document(
             tags=tags,
             source_citations=citations,
             forward_quality_verdict=verdict_record,
+            sweep_id=sweep_id_val,
+            arm_label=arm_label_val,
         )
         session.add(doc)
     else:
@@ -2028,6 +2036,11 @@ async def _persist_compute_knowledge_document(
             doc.tags = tags
             doc.source_citations = citations
             doc.forward_quality_verdict = verdict_record
+            # Backfill sweep identity on upgrade if not yet set.
+            if doc.sweep_id is None and sweep_id_val:
+                doc.sweep_id = sweep_id_val
+            if doc.arm_label is None and arm_label_val:
+                doc.arm_label = arm_label_val
             flag_modified(doc, "tags")
             flag_modified(doc, "source_citations")
             flag_modified(doc, "forward_quality_verdict")

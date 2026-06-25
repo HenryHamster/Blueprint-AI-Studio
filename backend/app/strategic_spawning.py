@@ -25,7 +25,7 @@ from app.direction_outcomes import (
     verified_merged_count,
 )
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
-from app.knowledge_query import build_knowledge_index, fetch_direction_knowledge_index
+from app.knowledge_query import build_knowledge_index, build_compute_sweep_groups, fetch_direction_knowledge_index
 from app.models import (
     Task,
     Project,
@@ -6007,6 +6007,7 @@ async def _spawn_strategic_review(
     # design output) so the strategist knows what knowledge already exists and
     # can fetch full bodies on demand — included only when documents exist.
     _knowledge_index = await build_knowledge_index(session, project.id)
+    _compute_sweep_groups = await build_compute_sweep_groups(session, project.id)
     _active_direction_ids = [
         d.get("id")
         for d in (project.directions or [])
@@ -6043,6 +6044,7 @@ async def _spawn_strategic_review(
             # large/oversized AND something is actually prunable. Advisory list.
             **({"prune_candidates": _prune_candidates} if _prune_candidates else {}),
             **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
+            **({"compute_experiment_sweeps": _compute_sweep_groups} if _compute_sweep_groups else {}),
             "running_update": project.running_update or "",
             "running_update_acknowledged_at": (
                 project.running_update_acknowledged_at.isoformat()
