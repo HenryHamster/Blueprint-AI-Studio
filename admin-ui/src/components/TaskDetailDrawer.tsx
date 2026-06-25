@@ -270,7 +270,6 @@ export function TaskDetailDrawer({
 
   // Reset log filter when task changes
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLogFilter('');
     setLogLevel('all');
   }, [task.id]);
