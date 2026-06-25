@@ -24,9 +24,6 @@ const GATE_VERDICT_COLORS: Record<string, string> = {
 };
 
 function GateHealthBadge({ backendVerdict }: {
-  failOpen: number;
-  total: number;
-  effectiveCoverage?: number | null;
   backendVerdict?: { state: string; fail_open_rate: number | null; total_invocations: number; min_sample: number };
 }) {
   if (!backendVerdict) {
@@ -50,7 +47,7 @@ function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <span className="text-neutral-400 text-ui-sm">Gate health</span>
-        <GateHealthBadge failOpen={failOpen} total={total} backendVerdict={data.gate_health} effectiveCoverage={data.effective_coverage} />
+        <GateHealthBadge backendVerdict={data.gate_health} />
       </div>
       {total > 0 && (
         <>
@@ -128,7 +125,7 @@ export function AdversarialQualityPanel({ projectId }: { projectId: string | nul
               <PanelReviewView data={data} />
               {postDeploy && (
                 <div data-testid="post-deploy-row" className="mt-2 pt-2 border-t border-neutral-700/50 text-ui-sm text-neutral-500">
-                  post-deploy: <GateHealthBadge failOpen={postDeploy.challenged_degraded ?? 0} total={postDeploy.total_challenged} backendVerdict={postDeploy.gate_health} />
+                  post-deploy: <GateHealthBadge backendVerdict={postDeploy.gate_health} />
                   {postDeploy.fail_open_rate != null && (
                     <span className="ml-1">({(postDeploy.fail_open_rate * 100).toFixed(1)}% fail-open, {postDeploy.total_challenged + (postDeploy.challenged_degraded ?? 0)} gate invocations)</span>
                   )}
