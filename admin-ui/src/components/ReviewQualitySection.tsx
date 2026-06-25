@@ -391,10 +391,11 @@ export function ReviewQualitySection({
           );
         })()}
         {digest?.sr_regression_risk_test_signal_trends?.current?.miss_by_test_signal_rate != null && (() => {
-          const rrts = digest.sr_regression_risk_test_signal_trends!;
-          const missRate = rrts.current!.miss_by_test_signal_rate!;
-          const numer = rrts.current!.numerator ?? 0;
-          const denom = rrts.current!.denominator ?? 0;
+          const rrts = digest?.sr_regression_risk_test_signal_trends;
+          if (!rrts?.current) return null;
+          const missRate = rrts.current.miss_by_test_signal_rate ?? 0;
+          const numer = rrts.current.numerator ?? 0;
+          const denom = rrts.current.denominator ?? 0;
           const trend = rrts.trend;
           const delta = rrts.miss_by_test_signal_rate_delta;
           const color = missRate <= 0.15 ? 'text-emerald-400' : missRate <= 0.35 ? 'text-amber-400' : 'text-red-400';
@@ -443,7 +444,8 @@ export function ReviewQualitySection({
           );
         })()}
         {digest?.self_review_prediction_accuracy_trends?.reviewer_hallucination_rate != null && (() => {
-          const hall = digest.self_review_prediction_accuracy_trends.reviewer_hallucination_rate!;
+          const hall = digest?.self_review_prediction_accuracy_trends?.reviewer_hallucination_rate;
+          if (!hall) return null;
           const curr = hall.current_rate;
           const prev = hall.previous_rate;
           const sample = hall.current_sample ?? 0;
@@ -482,7 +484,8 @@ export function ReviewQualitySection({
           );
         })()}
         {digest?.sr_disallowed_blind_spot_rate != null && (() => {
-          const dbs = digest.sr_disallowed_blind_spot_rate!;
+          const dbs = digest?.sr_disallowed_blind_spot_rate;
+          if (!dbs) return null;
           const rate = dbs.overall_rate;
           const color = rate <= 0.05 ? 'text-emerald-400' : rate <= 0.15 ? 'text-amber-400' : 'text-red-400';
           const byTypeEntries = Object.entries(dbs.by_task_type ?? {});
@@ -509,7 +512,8 @@ export function ReviewQualitySection({
           );
         })()}
         {digest?.sr_false_attestation_trends?.per_category != null && (() => {
-          const cats = digest.sr_false_attestation_trends!.per_category!;
+          const cats = digest?.sr_false_attestation_trends?.per_category;
+          if (!cats) return null;
           const entries = Object.entries(cats).filter(([, v]) => v.false_attestation_rate != null);
           if (entries.length === 0) return null;
           const CAT_LABELS: Record<string, string> = {
@@ -519,7 +523,7 @@ export function ReviewQualitySection({
           };
           const tooltipLines = entries.map(([cat, v]) => {
             const label = CAT_LABELS[cat] ?? cat;
-            const rate = v.false_attestation_rate!;
+            const rate = v.false_attestation_rate ?? 0;
             const n = (v.ci_confirmed ?? 0) + (v.false_attested ?? 0);
             const trendStr = v.trend === 'improving' ? '↓' : v.trend === 'regressing' ? '↑' : '→';
             return `${label}: ${Math.round(rate * 100)}% (${v.false_attested ?? 0}/${n}) ${trendStr}`;
@@ -539,7 +543,7 @@ export function ReviewQualitySection({
               <div className="flex flex-col gap-0.5 mt-0.5">
                 {entries.map(([cat, v]) => {
                   const label = CAT_LABELS[cat] ?? cat;
-                  const rate = v.false_attestation_rate!;
+                  const rate = v.false_attestation_rate ?? 0;
                   const trendIcon = v.trend === 'improving' ? '↓' : v.trend === 'regressing' ? '↑' : '→';
                   const trendColor = v.trend === 'improving' ? 'text-emerald-500' : v.trend === 'regressing' ? 'text-red-500' : 'text-neutral-500';
                   return (

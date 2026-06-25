@@ -219,7 +219,6 @@ export function useTaskModal(
       clearTimeout(timer);
       controller.abort();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [newTaskType, newTaskRepo, computeExperiment.accelerator, computeExperiment.machineType, computeExperiment.spendCapUsd, computeExperiment.deadlineSeconds, computeExperiment.provisioningModel]);
 
   const getDefaultBranchForRepo = (repo: string) => {

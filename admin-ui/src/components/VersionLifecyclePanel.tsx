@@ -870,7 +870,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       )}
                       {v.id && (
                         <button
-                          onClick={() => setExpandedVersionId(isExpanded ? null : v.id!)}
+                          onClick={() => setExpandedVersionId(isExpanded ? null : v.id ?? null)}
                           className="min-h-[44px] min-w-[44px] flex items-center justify-center text-neutral-600 hover:text-neutral-300 transition-colors"
                           title={isExpanded ? 'Hide summary' : "What's new"}
                         >

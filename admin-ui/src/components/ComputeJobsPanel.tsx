@@ -49,7 +49,7 @@ function bestIndex(values: (number | null)[], dir: MetricDirection): number | nu
     const v = values[i];
     if (v === null) continue;
     if (bi === null) { bi = i; continue; }
-    const bv = values[bi]!;
+    const bv = values[bi] ?? 0;
     if (dir === 'higher_better' ? v > bv : v < bv) bi = i;
   }
   return bi;
@@ -248,8 +248,8 @@ function bestRunId(group: ComputeJob[]): string | null {
   const op = measurable[0].criterion_verdict?.operator ?? '>=';
   const higherBetter = op === '>=' || op === '>';
   return measurable.reduce((best, job) => {
-    const bv = best.criterion_verdict!.value!;
-    const jv = job.criterion_verdict!.value!;
+    const bv = best.criterion_verdict?.value ?? 0;
+    const jv = job.criterion_verdict?.value ?? 0;
     return higherBetter ? (jv > bv ? job : best) : (jv < bv ? job : best);
   }, measurable[0]).id;
 }

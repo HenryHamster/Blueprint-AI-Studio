@@ -38,6 +38,13 @@ export default defineConfig([
     rules: {
       '@typescript-eslint/no-non-null-assertion': 'warn',
       'no-console': ['warn', { allow: ['warn', 'error'] }],
+      'react-hooks/rules-of-hooks': 'error',
+      'react-hooks/exhaustive-deps': 'warn',
+      'react-hooks/set-state-in-effect': 'error',
+      'react-hooks/refs': 'error',
+      'react-hooks/purity': 'error',
+      'react-hooks/preserve-manual-memoization': 'error',
+      'react-hooks/immutability': 'error',
       'viewport/no-fixed-width': 'error',
       'viewport/min-touch-target': 'error',
       'viewport/no-arbitrary-font-size': 'error',
