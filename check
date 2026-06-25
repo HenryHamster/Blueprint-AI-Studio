@@ -145,7 +145,10 @@ if touches "admin-ui/"; then
       echo "[check] no changed JS/TS files in admin-ui, skipping lint"
     fi
   fi
-  run "admin-ui build" bash -c 'cd "admin-ui" && npm run build'
+  # Use typecheck-only on agent VMs: vite build is OOM-killed (exit 137) under
+  # memory cgroup constraints. tsc -b --noEmit catches all type errors; the
+  # full vite bundle runs in CI after ./pr open.
+  run "admin-ui typecheck" bash -c 'cd "admin-ui" && npm run typecheck'
 fi
 
 if touches "agent/"; then
