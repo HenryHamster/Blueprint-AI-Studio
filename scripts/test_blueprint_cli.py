@@ -3486,3 +3486,94 @@ def test_compute_run_local(capsys):
     assert "0.95" in out
     # No API call required — runs entirely locally
     assert "metrics" in out
+
+
+def test_compute_run_local_reads_spec_and_executes(tmp_path, monkeypatch):
+    """compute run --local <spec.json> reads spec, runs command, reports metrics."""
+    import subprocess as _subprocess
+
+    spec = {"command": "echo hi", "declared_metric": "loss"}
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf:
+            with open(rf, "w") as f:
+                json.dump({"loss": 0.5}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    captured = io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured)
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = captured.getvalue()
+    assert "SUCCEEDED" in out
+    assert "loss" in out
+    assert "0.5" in out
+
+
+def test_compute_run_no_args_exits(capsys):
+    """compute run with no positional and no --local should exit with error."""
+    with pytest.raises(SystemExit) as exc_info:
+        blueprint.main(["compute", "run"])
+    assert exc_info.value.code != 0
+    out = capsys.readouterr().out
+    assert "error" in out
+
+
+def test_compute_run_local_missing_spec_file_exits(tmp_path, capsys):
+    """compute run --local with a non-existent spec file exits with error."""
+    missing = str(tmp_path / "nonexistent.json")
+    with pytest.raises(SystemExit) as exc_info:
+        blueprint.main(["compute", "run", "--local", missing])
+    assert exc_info.value.code != 0
+    out = capsys.readouterr().out
+    assert "error" in out and "could not read spec file" in out
+
+
+def test_compute_run_local_missing_command_field_exits(tmp_path, capsys):
+    """compute run --local with a spec file missing 'command' exits with error."""
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps({"declared_metric": "loss"}))
+    with pytest.raises(SystemExit) as exc_info:
+        blueprint.main(["compute", "run", "--local", str(spec_file)])
+    assert exc_info.value.code != 0
+    out = capsys.readouterr().out
+    assert "error" in out and "command" in out
+
+
+def test_compute_run_local_not_captured_metric(tmp_path, monkeypatch, capsys):
+    """compute run --local prints NOT CAPTURED when declared_metric is absent from emitted metrics."""
+    import subprocess as _subprocess
+
+    spec = {"command": "echo hi", "declared_metric": "auc"}
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf:
+            with open(rf, "w") as f:
+                json.dump({"loss": 0.5}, f)  # 'auc' not present
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "NOT CAPTURED" in out

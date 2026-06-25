@@ -3702,7 +3702,30 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     emit metrics and artifacts via the standard file-contract, then reports the
     result inline.
     """
-    command = args.run_command
+    declared_metric: str | None = None
+    if getattr(args, "local_spec", None):
+        # --local <spec.json>: read spec file; validate_backend_name is bypassed
+        # because we call subprocess.run directly (no DB-backed flow).
+        if getattr(args, "run_command", None):
+            print("warning: both a positional command and --local were given; --local takes precedence")
+        try:
+            with open(args.local_spec) as f:
+                spec = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: could not read spec file {args.local_spec!r}: {exc}")
+            sys.exit(1)
+        command = spec.get("command")
+        if not command:
+            print("error: spec JSON must contain a 'command' field")
+            sys.exit(1)
+        declared_metric = spec.get("declared_metric")
+    else:
+        command = args.run_command
+
+    if command is None:
+        print("error: provide a run command or --local <spec.json>")
+        sys.exit(1)
+
     tmpdir = tempfile.mkdtemp(prefix="blueprint-compute-run-")
     result_file = os.path.join(tmpdir, "result.json")
     artifact_dir = os.path.join(tmpdir, "artifacts")
@@ -3713,6 +3736,8 @@ def _compute_run_local(args: argparse.Namespace) -> None:
 
     print(f"command     : {command}")
     print(f"result_file : {result_file}")
+    if declared_metric:
+        print(f"declared    : {declared_metric}")
     print("running...")
 
     proc = subprocess.run(["bash", "-lc", command], env=env)
@@ -3727,13 +3752,21 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"  warning: could not parse result file: {exc}")
 
-    result = {"status": status, "exit_code": exit_code, "metrics": metrics}
+    result = {"status": status, "exit_code": exit_code, "metrics": metrics,
+              "declared_metric": declared_metric}
 
     def _render(r: dict) -> None:
         print(f"status      : {r['status']} (exit_code={r['exit_code']})")
         m = r.get("metrics")
+        dm = r.get("declared_metric")
         if m:
             print(f"metrics     : {m}")
+            if dm:
+                val = m.get(dm)
+                if val is not None:
+                    print(f"  {dm} (declared) : {val}")
+                else:
+                    print(f"  {dm} (declared) : NOT CAPTURED")
         else:
             print("metrics     : (none emitted)")
 
@@ -4327,9 +4360,14 @@ def build_parser() -> argparse.ArgumentParser:
                     "Sets BLUEPRINT_RESULT_FILE and BLUEPRINT_ARTIFACT_DIR so the command "
                     "can emit metrics via the standard file contract, then reports the result.")
     p_compute_run.add_argument(
-        "run_command",
+        "run_command", nargs="?", default=None,
         help="Bash command string to execute. "
              "Write a flat JSON object of {metric: value} to $BLUEPRINT_RESULT_FILE to report metrics.")
+    p_compute_run.add_argument(
+        "--local", dest="local_spec", metavar="SPEC_JSON",
+        help="Path to a spec JSON file. The JSON must contain 'command' (str), and "
+             "optionally 'declared_metric' (str). Runs the command locally without the orchestrator."
+    )
 
     # playbook
     p_pb = sub.add_parser("playbook", parents=[common],
