@@ -1950,6 +1950,98 @@ async def test_audit_finding_resolution_rejects_stale_task_version(
     assert row is None
 
 
+@pytest.mark.asyncio
+async def test_keyless_finding_key_round_trips_through_resolution_endpoint(
+    client: AsyncClient, db_session
+):
+    """A keyless finding surfaced in finding_resolution carries the __keyless__
+    sentinel as its key, which the resolution endpoint accepts without error.
+
+    This validates the full round-trip: GET qualification → read finding_key →
+    POST audit-finding-resolution with that key → GET qualification again and
+    confirm the finding now shows as stale.
+    """
+    from app.release_readiness import _KEYLESS_FINDING_SENTINEL
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-keyless-rt"
+    )
+
+    # A keyless gating finding: severity HIGH, no 'key' field (challenger-independent).
+    keyless_finding = {"severity": "HIGH", "summary": "Fail-open rate false positive"}
+
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="a" * 40,
+        confidence=0.5,
+        sub_scores={"audit": 0.4},
+        terminal_status="not_promoted",
+        audit_findings=[keyless_finding],
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+
+    read_token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": read_token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    # The finding_resolution list must expose the sentinel key (not empty string)
+    # so the caller can pass it directly to the resolution endpoint.
+    assert len(body["finding_resolution"]) == 1
+    finding_key_from_api = body["finding_resolution"][0]["key"]
+    assert finding_key_from_api == _KEYLESS_FINDING_SENTINEL, (
+        f"Expected sentinel '{_KEYLESS_FINDING_SENTINEL}', got '{finding_key_from_api}'"
+    )
+    assert body["finding_resolution"][0]["state"] == "unresolved"
+    assert body["requalification_ready"] is False
+
+    # Use the key exactly as surfaced by the API to call the resolution endpoint.
+    audit_task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-keyless-audit",
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    write_token = create_agent_token(
+        str(audit_task.id), audit_task.vm_instance_id, task_type="research"
+    )
+
+    res2 = await client.post(
+        "/api/agent/audit-finding-resolution",
+        json={
+            "task_id": str(audit_task.id),
+            "finding_key": finding_key_from_api,
+            "state": "stale",
+            "note": "False positive — fail_open_rate formula verified correct at HEAD",
+        },
+        headers={"x-agent-token": write_token},
+    )
+    assert res2.status_code == 200, res2.text
+    body2 = res2.json()
+    assert body2["status"] == "ok"
+    assert body2["finding_key"] == _KEYLESS_FINDING_SENTINEL
+
+    # Re-read qualification: the keyless finding should now show as stale and
+    # requalification_ready should flip to True.
+    res3 = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": read_token},
+    )
+    assert res3.status_code == 200, res3.text
+    body3 = res3.json()
+    assert body3["finding_resolution"][0]["key"] == _KEYLESS_FINDING_SENTINEL
+    assert body3["finding_resolution"][0]["state"] == "stale"
+    assert body3["requalification_ready"] is True
+
+
 # ---------------------------------------------------------------------------
 # resolve_message_ref DB-side prefix filter tests
 # ---------------------------------------------------------------------------

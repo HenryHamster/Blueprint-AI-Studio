@@ -1005,10 +1005,9 @@ async def compute_requalification_readiness(
         key = f.get("key")
         if not key:
             # No content key (e.g. challenger-independent blocker persisted
-            # without a hash key).  Look up the sentinel row written by the
-            # auto-stale sweep so these findings can be resolved just like
-            # keyed ones; fall back to unresolved if no sentinel row exists.
-            key = ""
+            # without a hash key).  Expose the sentinel so callers can pass
+            # it directly to the resolution endpoint without reading internals.
+            key = _KEYLESS_FINDING_SENTINEL
             ledger = ledger_by_key.get(_KEYLESS_FINDING_SENTINEL)
         else:
             ledger = ledger_by_key.get(key)
