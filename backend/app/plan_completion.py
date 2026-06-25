@@ -903,6 +903,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                             "live_release_proof_marker",
                             "requires_live_release",
                             "require_durable_artifact",
+                            "sweep_id",
                         )
                         if compute_contract.get(key) is not None
                     },

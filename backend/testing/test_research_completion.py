@@ -7796,6 +7796,7 @@ def _compute_finding(
     nested_key=None,
     title="Measure throughput regression",
     smoke_sample=_DEFAULT_SMOKE_SAMPLE,
+    sweep_id=None,
 ):
     """A compute_experiment-typed research finding carrying a launch contract.
 
@@ -7823,6 +7824,8 @@ def _compute_finding(
         launch["provisioning_model"] = provisioning_model
     if smoke_sample is not None:
         launch["smoke_sample"] = smoke_sample
+    if sweep_id is not None:
+        launch["sweep_id"] = sweep_id
     if nested_key:
         finding[nested_key] = launch
     else:
@@ -8378,6 +8381,45 @@ class TestComputeExperimentSpawn:
         )
         assert evidence["kind"] == "downstream_artifact"
         assert evidence["artifact_id"] == "benchmark-result-bundle"
+
+    @_pytest.mark.asyncio
+    async def test_compute_experiment_sweep_id_propagated(self, db_session, mocker):
+        """sweep_id on a compute_experiment finding is forwarded to the child payload.
+
+        task_completion._handle_compute_experiment_completion gates the sweep
+        aggregate path on sweep_id (line 3194); when it is None the aggregate
+        path is bypassed and arm_task_ids is never stamped.  This test pins that
+        sweep_id is present in the spawned child's first_payload.
+        """
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-cx-sweep01"
+        )
+        finding = _compute_finding(
+            direction["id"],
+            spend_cap_usd=2.0,
+            deadline_seconds=3600,
+            sweep_id="sweep-test-123",
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = await _children_of(db_session, task)
+        assert len(children) == 1
+        payload = children[0].first_payload or {}
+        assert payload.get("type") == "compute_experiment"
+        assert payload.get("sweep_id") == "sweep-test-123", (
+            f"sweep_id missing from compute_experiment child payload; got {payload.get('sweep_id')!r}"
+        )
 
     @_pytest.mark.asyncio
     async def test_compute_experiment_malformed_acceptance_evidence_degrades_not_aborts(

@@ -171,6 +171,25 @@ def test_author_contract_omits_absent_gpu_fields():
     assert "provisioning_model" not in contract
 
 
+def test_author_contract_forwards_sweep_id():
+    # sweep_id is forwarded when present so the completion handler can route the
+    # result through the sweep aggregate path instead of the standalone verdict path.
+    finding = {
+        "command": "python sweep.py",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 300,
+        "sweep_id": "sid-x",
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["sweep_id"] == "sid-x"
+
+
+def test_author_contract_omits_absent_sweep_id():
+    finding = {"command": "python run.py", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    contract = _author_compute_launch_contract(finding)
+    assert "sweep_id" not in contract
+
+
 # --- contract validation --------------------------------------------------
 
 

@@ -4396,6 +4396,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "live_release_proof_marker",
                             "requires_live_release",
                             "require_durable_artifact",
+                            "sweep_id",
                         )
                         if _cc.get(k) is not None
                     },
