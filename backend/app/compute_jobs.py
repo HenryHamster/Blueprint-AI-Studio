@@ -24,11 +24,13 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from app.compute_backends import (
-    LOCAL_BACKEND_NAME,
+    GCP_BACKEND_NAME,
+    LOCAL_GPU_BACKEND_NAME,
     ComputeLaunchSpec,
     ComputeStatusResult,
     collect_terminal_artifact_reference,
     default_compute_backend_name,
+    detect_local_gpu,
     get_compute_backend,
     validate_backend_name,
 )
@@ -280,15 +282,28 @@ async def create_compute_job(
     if reject_reason is not None:
         raise ValueError(reject_reason)
 
-    normalized_backend = backend_name or default_compute_backend_name()
+    if backend_name is not None:
+        normalized_backend = backend_name
+    elif accel_spec is not None:
+        # GPU job: route to local GPU when present, fall back to cloud.
+        normalized_backend = (
+            LOCAL_GPU_BACKEND_NAME
+            if detect_local_gpu() is not None
+            else GCP_BACKEND_NAME
+        )
+    else:
+        normalized_backend = default_compute_backend_name()
     # Validate BEFORE persisting: an unknown / mode-incompatible backend would
     # otherwise wedge the row in QUEUED forever (monitor raises every pass).
     validate_backend_name(normalized_backend)
-    # A GPU can never be provisioned by the local-subprocess backend — reject
-    # loudly at create time rather than silently running the command CPU-only.
-    if accel_spec is not None and normalized_backend == LOCAL_BACKEND_NAME:
+    # A GPU can never be provisioned by the CPU-only local-subprocess backend —
+    # reject loudly at create time rather than silently running the command CPU-only.
+    if accel_spec is not None and normalized_backend not in (
+        LOCAL_GPU_BACKEND_NAME,
+        GCP_BACKEND_NAME,
+    ):
         raise ValueError(
-            "GPU compute jobs are unavailable on the local-subprocess backend"
+            f"GPU compute jobs require the local-gpu or gcp backend (got {normalized_backend!r})"
         )
     normalized_provisioning = normalize_provisioning_model(provisioning_model)
     capped_spend = clamp_spend_cap_usd(spend_cap_usd)

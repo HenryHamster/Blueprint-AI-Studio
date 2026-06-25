@@ -3284,6 +3284,127 @@ async def test_create_compute_job_rejects_gpu_on_local_backend(db_session, monke
         )
 
 
+def test_detect_local_gpu_absent(monkeypatch):
+    """detect_local_gpu returns None when nvidia-smi is not on the PATH."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: None)
+    result = cb.detect_local_gpu()
+    assert result is None
+    # Reset cache so later tests are unaffected.
+    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
+
+
+def test_detect_local_gpu_present(monkeypatch):
+    """detect_local_gpu returns parsed name + memory when nvidia-smi succeeds."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/nvidia-smi")
+
+    class _FakeResult:
+        returncode = 0
+        stdout = "Tesla T4, 15360\n"
+
+    monkeypatch.setattr(cb.subprocess, "run", lambda *_a, **_kw: _FakeResult())
+    result = cb.detect_local_gpu()
+    assert result == {"name": "Tesla T4", "memory_mib": 15360}
+    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
+
+
+def test_detect_local_gpu_subprocess_error(monkeypatch):
+    """detect_local_gpu returns None and does not raise when nvidia-smi errors."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/nvidia-smi")
+
+    def _raise(*_a, **_kw):
+        raise RuntimeError("oops")
+
+    monkeypatch.setattr(cb.subprocess, "run", _raise)
+    result = cb.detect_local_gpu()
+    assert result is None
+    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
+
+
+def test_validate_backend_name_local_gpu_no_gpu(monkeypatch):
+    """validate_backend_name raises for local-gpu when no GPU is detected."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: None)
+    with pytest.raises(ValueError, match="no local GPU detected"):
+        cb.validate_backend_name("local-gpu")
+
+
+def test_validate_backend_name_local_gpu_present(monkeypatch):
+    """validate_backend_name accepts local-gpu when a GPU is detected."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: {"name": "T4", "memory_mib": 15360})
+    assert cb.validate_backend_name("local-gpu") == "local-gpu"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_selects_local_gpu_when_present(
+    db_session, monkeypatch
+):
+    """GPU job with no explicit backend selects local-gpu when a GPU is detected."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: {"name": "Tesla T4", "memory_mib": 15360})
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: {"name": "Tesla T4", "memory_mib": 15360})
+    task = await _make_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        accelerator="T4",
+    )
+    assert job.backend == "local-gpu"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_selects_gcp_when_no_gpu(db_session, monkeypatch):
+    """GPU job with no explicit backend auto-routes to gcp when no local GPU is detected."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: None)
+    task = await _make_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        accelerator="T4",
+    )
+    assert job.backend == "gcp"
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_still_rejected_for_gpu(db_session, monkeypatch):
+    """Explicitly requesting local-subprocess with a GPU job raises ValueError."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match="local-subprocess"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="n1-standard-1",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            backend_name="local-subprocess",
+            accelerator="T4",
+        )
+
+
 @pytest.mark.asyncio
 async def test_process_compute_jobs_once_kills_on_spend_cap(db_session, monkeypatch):
     project = Project(name="Compute Job Budget Kill", user_id="test-user")

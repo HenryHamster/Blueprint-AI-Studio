@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import tarfile
@@ -109,6 +110,42 @@ _MAX_COMMAND_LOG_DECODED_BYTES = 65536
 
 LOCAL_BACKEND_NAME = "local-subprocess"
 GCP_BACKEND_NAME = "gcp"
+LOCAL_GPU_BACKEND_NAME = "local-gpu"
+
+_DETECT_LOCAL_GPU_UNSET = object()
+_detect_local_gpu_cache: object = _DETECT_LOCAL_GPU_UNSET
+
+
+def detect_local_gpu() -> dict | None:
+    """Detect a local GPU via nvidia-smi. Cached for process lifetime. Never raises."""
+    global _detect_local_gpu_cache
+    if _detect_local_gpu_cache is not _DETECT_LOCAL_GPU_UNSET:
+        return _detect_local_gpu_cache  # type: ignore[return-value]
+    result: dict | None = None
+    try:
+        if shutil.which("nvidia-smi") is not None:
+            proc = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=name,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode == 0:
+                line = proc.stdout.strip().split("\n")[0]
+                parts = [p.strip() for p in line.split(",", 1)]
+                if len(parts) == 2:
+                    name, mem_str = parts
+                    result = {"name": name, "memory_mib": int(mem_str)}
+    except Exception:
+        pass
+    _detect_local_gpu_cache = result
+    return result
+
+
 _LOCAL_STATE_ROOT = os.path.join(tempfile.gettempdir(), "blueprint-compute-jobs")
 _LOCAL_PID_FILENAME = "pid"
 _LOCAL_STARTED_AT_FILENAME = "started_at"
@@ -521,8 +558,44 @@ class GcpComputeBackend:
         return await _ensure_vm_deleted(external_id, reason=f"compute_job_{reason}")
 
 
+class LocalGPUComputeBackend:
+    """Local subprocess backend that injects GPU metadata into launch results.
+
+    Delegates all execution to LocalSubprocessComputeBackend; the only
+    difference is that detect_local_gpu() output is stamped into the
+    launch result metadata so callers can see what GPU substrate was used.
+    """
+
+    name = LOCAL_GPU_BACKEND_NAME
+
+    def __init__(self) -> None:
+        self._delegate = LocalSubprocessComputeBackend()
+
+    def external_id_for(self, job: ComputeJob) -> str:
+        return self._delegate.external_id_for(job)
+
+    async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
+        result = await self._delegate.launch(spec)
+        gpu_info = detect_local_gpu()
+        if gpu_info is not None:
+            result.metadata["local_gpu"] = gpu_info
+        return result
+
+    async def poll_status(self, job: ComputeJob) -> ComputeStatusResult:
+        return await self._delegate.poll_status(job)
+
+    async def poll_cost(
+        self, job: ComputeJob, *, as_of: datetime
+    ) -> ComputeCostResult:
+        return await self._delegate.poll_cost(job, as_of=as_of)
+
+    async def terminate(self, job: ComputeJob, *, reason: str) -> bool:
+        return await self._delegate.terminate(job, reason=reason)
+
+
 _LOCAL_BACKEND = LocalSubprocessComputeBackend()
 _GCP_BACKEND = GcpComputeBackend()
+_LOCAL_GPU_BACKEND = LocalGPUComputeBackend()
 
 
 def get_compute_backend(name: str) -> ComputeBackend:
@@ -530,6 +603,8 @@ def get_compute_backend(name: str) -> ComputeBackend:
         return _LOCAL_BACKEND
     if name == _GCP_BACKEND.name:
         return _GCP_BACKEND
+    if name == _LOCAL_GPU_BACKEND.name:
+        return _LOCAL_GPU_BACKEND
     raise ValueError(f"unknown compute backend: {name}")
 
 
@@ -550,6 +625,11 @@ def validate_backend_name(name: str) -> str:
         raise ValueError("gcp backend is unavailable in LOCAL_MODE")
     if not compute.LOCAL_MODE and backend is _LOCAL_BACKEND:
         raise ValueError("local-subprocess backend is unavailable outside LOCAL_MODE")
+    if backend is _LOCAL_GPU_BACKEND:
+        if detect_local_gpu() is None:
+            raise ValueError(
+                "local-gpu backend is unavailable: no local GPU detected"
+            )
     return name
 
 
@@ -898,7 +978,7 @@ async def collect_terminal_artifact_reference(
     terminal completion.
     """
     try:
-        if job.backend == LOCAL_BACKEND_NAME:
+        if job.backend in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME):
             return _collect_local_artifact_reference(job)
         if job.backend == GCP_BACKEND_NAME:
             return await _collect_gcp_artifact_reference(job)
@@ -924,7 +1004,7 @@ def _collect_local_artifact_reference(
     uri = str(meta.get("artifact_uri") or "").strip() or f"file://{artifact_dir}"
     return TerminalArtifactReference(
         uri=uri,
-        backend=LOCAL_BACKEND_NAME,
+        backend=job.backend,
         file_count=file_count,
         total_size_bytes=_compute_tree_size_bytes(artifact_dir),
     )
