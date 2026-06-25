@@ -17351,6 +17351,105 @@ class TestStrategistSpawnableRegistry:
         for impl in ("create", "fix", "refactor", "migrate", "qa"):
             assert impl not in STRATEGIST_SPAWNABLE_TASK_TYPES
 
+    @pytest.mark.asyncio
+    async def test_strategist_spawn_compute_experiment_persists_launch_contract(
+        self, client: AsyncClient, db_session
+    ):
+        """Strategic spawn_task for compute_experiment persists launch contract fields
+        in the task payload, applies the spend-gate, and does not require a prompt
+        (hypothesis is the description).
+
+        This exercises the spawn_task handler's compute_experiment branch:
+        _author_compute_launch_contract + _validate_compute_launch_contract +
+        resolve_compute_spend_approval, verifying the contract lands in the DB.
+        """
+        import app.shared_state as _shared_state
+        from app.auth import create_agent_token
+
+        project = Project(name="StrategistContractPersist", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for compute spawn",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-strat-contract-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-strat-contract-test",
+            task_type="strategic_review",
+        )
+
+        prev_threshold = _shared_state.runtime_config.get(
+            "compute_experiment_spend_threshold_usd"
+        )
+        _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/agent/strategic",
+                headers={"x-agent-token": token},
+                json={
+                    "task_id": str(strategic_task.id),
+                    "op": "spawn_task",
+                    "data": {
+                        "type": "compute_experiment",
+                        "title": "Benchmark: throughput under load",
+                        # No prompt — compute_experiment uses hypothesis instead
+                        "hypothesis": "Batching requests reduces p99 latency by 30%",
+                        "command": "python3 bench/run.py --batch 32",
+                        "spend_cap_usd": 8.0,
+                        "deadline_seconds": 900,
+                        "success_criterion": {
+                            "metric": "p99_latency_ms",
+                            "operator": "<",
+                            "threshold": 200,
+                        },
+                    },
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["op"] == "spawn_task"
+            assert body["type"] == "compute_experiment"
+
+            child_id = uuid.UUID(body["task_id"])
+            child = await db_session.get(Task, child_id)
+            assert child is not None
+
+            # Launch contract fields must be persisted in the task payload
+            payload = child.first_payload
+            assert payload["type"] == "compute_experiment"
+            assert payload["command"] == "python3 bench/run.py --batch 32"
+            assert payload["spend_cap_usd"] == 8.0
+            assert payload["deadline_seconds"] == 900
+            assert payload["success_criterion"]["metric"] == "p99_latency_ms"
+            assert payload["success_criterion"]["operator"] == "<"
+            assert payload["success_criterion"]["threshold"] == 200
+
+            # Spend gate: 8.0 > threshold 5.0 → requires_approval=True
+            assert child.requires_approval is True
+
+            # Spawned with strategic_direct context
+            assert child.context["spawned_by"] == "strategic_direct"
+            assert child.context["parent_strategic_task_id"] == str(strategic_task.id)
+        finally:
+            if prev_threshold is not None:
+                _shared_state.runtime_config[
+                    "compute_experiment_spend_threshold_usd"
+                ] = prev_threshold
+            else:
+                _shared_state.runtime_config.pop(
+                    "compute_experiment_spend_threshold_usd", None
+                )
+
 
 @pytest.mark.asyncio
 async def test_qa_task_receives_rejection_patterns(client: AsyncClient, db_session):

@@ -1914,7 +1914,11 @@ async def strategic_operation(
                 detail=f"spawn_task type must be one of {sorted(STRATEGIST_SPAWNABLE_TASK_TYPES)}; got '{spawn_type}'",
             )
         raw_prompt = str(data.get("prompt", "")).strip()
-        if not raw_prompt:
+        # compute_experiment is described by its launch contract (command +
+        # hypothesis); a free-text prompt is optional — fall back to hypothesis.
+        if not raw_prompt and spawn_type == "compute_experiment":
+            raw_prompt = str(data.get("hypothesis", "")).strip()
+        if not raw_prompt and spawn_type != "compute_experiment":
             raise HTTPException(status_code=400, detail="prompt is required")
         raw_title = str(data.get("title", "")).strip()
         if not raw_title:

@@ -265,6 +265,24 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('Staging is NOT deferral');
   });
 
+  it('Section 3 documents experiment commissions move with compute_experiment type', () => {
+    const prompt = buildThinkerPrompt(base);
+    // The new paragraph must be present and appear after Knowledge commissions
+    expect(prompt).toContain('**Experiment commissions.**');
+    expect(prompt).toContain('compute_experiment');
+    // The launch contract fields must be described
+    expect(prompt).toContain('spend_cap_usd');
+    expect(prompt).toContain('deadline_seconds');
+    expect(prompt).toContain('success_criterion');
+    // The section must explain the hypothesis/falsifiable-conjecture framing
+    expect(prompt).toContain('hypothesis');
+    // Experiment commissions must appear after Knowledge commissions
+    const knowledgeIdx = prompt.indexOf('**Knowledge commissions.**');
+    const experimentIdx = prompt.indexOf('**Experiment commissions.**');
+    expect(knowledgeIdx).toBeGreaterThan(-1);
+    expect(experimentIdx).toBeGreaterThan(knowledgeIdx);
+  });
+
   it('staging guidance directs new next-version ideas to the atomic staged flag (not create-then-stage)', () => {
     const prompt = buildThinkerPrompt(base);
     // A genuinely new idea is created with the staged flag in a single atomic

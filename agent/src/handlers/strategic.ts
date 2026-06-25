@@ -852,12 +852,16 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # Spawn a targeted investigation/knowledge task when something from the Recent
 # Work section needs attention NOW instead of waiting for the next autonomous
 # cycle. Choose the type by what you need:
-#   research     — codebase investigation that yields implementation findings
-#   plan         — decompose a large change into implementation subtasks
-#   web_research — external / web knowledge (best practices, unfamiliar
-#                  protocols/APIs/vendors); produces a citation-grounded doc
-#   design       — codebase-grounded design exploration for a subsystem before
-#                  implementation; produces a design document
+#   research          — codebase investigation that yields implementation findings
+#   plan              — decompose a large change into implementation subtasks
+#   web_research      — external / web knowledge (best practices, unfamiliar
+#                       protocols/APIs/vendors); produces a citation-grounded doc
+#   design            — codebase-grounded design exploration for a subsystem before
+#                       implementation; produces a design document
+#   compute_experiment — run a command and measure a declared metric to resolve a
+#                       falsifiable hypothesis; requires command, spend_cap_usd,
+#                       deadline_seconds; optional success_criterion {metric,
+#                       operator (<|>|<=|>=), threshold}
 # web_research and design are HIGH-ROI and chronically under-used: one durable
 # knowledge document de-risks every later task in the area and compounds across
 # cycles. Spawn them PROACTIVELY, not only reactively — signals that warrant one:
@@ -867,11 +871,14 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #     should be settled by a design doc instead of re-derived per task)
 #   - the "Existing knowledge documents" index is empty or thin for a direction
 #     you are actively advancing
-# (Implementation/PR types are intentionally NOT spawnable here — they flow
-# through the normal direction → research → plan → create path.)
+# (Implementation/PR types — create/fix/refactor/migrate/qa — are intentionally
+# NOT spawnable here; they flow through the normal direction → research → plan →
+# create path. compute_experiment is the exception: it is empirical measurement,
+# not implementation, so it IS spawnable directly from the strategist.)
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "web_research", "title": "...", "prompt": "What external knowledge to gather...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "design", "title": "...", "prompt": "Design question grounded in the codebase...", "direction_id": "d-xxx"}'
+./strategic spawn-task '{"type": "compute_experiment", "title": "Measure effect of batch size on throughput", "hypothesis": "Doubling batch size from 32 to 64 increases throughput by ≥20% without OOM on 16 GB GPU", "command": "python3 scripts/train.py --batch-size 64 --epochs 1 --output /tmp/metrics.json", "spend_cap_usd": 2.50, "deadline_seconds": 1800, "success_criterion": {"metric": "throughput_samples_per_sec", "operator": ">=", "threshold": 480}, "direction_id": "d-xxx"}'
 
 # Pull full detail for items the strategic packer trimmed (see "Context not
 # shipped this cycle" section in your prompt). Use only when you actually
