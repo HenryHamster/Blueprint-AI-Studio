@@ -3577,3 +3577,147 @@ def test_compute_run_local_not_captured_metric(tmp_path, monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "NOT CAPTURED" in out
+
+
+# ---------------------------------------------------------------------------
+# Success-criterion verdict tests (case-insensitive capture->eval loop)
+# ---------------------------------------------------------------------------
+
+def _make_fake_run(metrics: dict | None, returncode: int = 0):
+    """Return a fake subprocess.run that writes metrics to BLUEPRINT_RESULT_FILE."""
+    def fake_run(cmd, env=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf and metrics is not None:
+            with open(rf, "w") as f:
+                json.dump(metrics, f)
+
+        class R:
+            pass
+        R.returncode = returncode
+        return R()
+    return fake_run
+
+
+def test_compute_run_local_criterion_verdict_case_mismatch(tmp_path, monkeypatch, capsys):
+    """Case-insensitive capture->eval loop: emits Accuracy=0.95, criterion accuracy >= 0.9 => MET."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    # Command emits upper-camel-case key; criterion uses lowercase — must match case-insensitively
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"Accuracy": 0.95}))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "MET" in out
+    assert "NOT MET" not in out
+    assert "NOT EVALUABLE" not in out
+    assert "0.95" in out
+
+
+def test_compute_run_local_criterion_not_met(tmp_path, monkeypatch, capsys):
+    """Criterion NOT MET: emits loss=0.8, criterion loss <= 0.5 => NOT MET."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "success_criterion": {"metric": "loss", "operator": "<=", "threshold": 0.5},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"loss": 0.8}))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "NOT MET" in out
+    assert "0.8" in out
+
+
+def test_compute_run_local_criterion_not_evaluable_missing_metric(tmp_path, monkeypatch, capsys):
+    """NOT EVALUABLE (fail-closed): criterion metric absent from emitted result."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    # Result file contains a different metric — 'accuracy' not present
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"loss": 0.1}))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "NOT EVALUABLE" in out
+
+
+def test_compute_run_local_criterion_not_evaluable_no_result_file(tmp_path, monkeypatch, capsys):
+    """NOT EVALUABLE (fail-closed): no result file written at all."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    # fake_run writes nothing to BLUEPRINT_RESULT_FILE
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run(None))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "NOT EVALUABLE" in out
+
+
+def test_compute_run_local_criterion_via_cli_flags(tmp_path, monkeypatch, capsys):
+    """Criterion supplied via --criterion-metric/--criterion-op/--criterion-threshold."""
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"f1": 0.88}))
+
+    args = blueprint.build_parser().parse_args([
+        "compute", "run", "echo hi",
+        "--criterion-metric", "f1",
+        "--criterion-op", ">=",
+        "--criterion-threshold", "0.8",
+    ])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "MET" in out
+    assert "0.88" in out
+
+
+def test_compute_run_local_no_criterion_unchanged(tmp_path, monkeypatch, capsys):
+    """Back-compat: spec with only command/declared_metric and no success_criterion emits no verdict."""
+    import subprocess as _subprocess
+
+    spec = {"command": "echo hi", "declared_metric": "loss"}
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"loss": 0.3}))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "verdict" not in out.lower() or "NOT EVALUABLE" not in out
+    assert "MET" not in out
+    assert "SUCCEEDED" in out

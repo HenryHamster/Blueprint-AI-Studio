@@ -3695,6 +3695,71 @@ def _compute_analyze(args: argparse.Namespace) -> None:
     ))
 
 
+_CRITERION_OPS = {
+    ">=": lambda a, b: a >= b,
+    "<=": lambda a, b: a <= b,
+    ">": lambda a, b: a > b,
+    "<": lambda a, b: a < b,
+    "==": lambda a, b: a == b,
+    "!=": lambda a, b: a != b,
+}
+
+
+def _coerce_number(value: object) -> float | None:
+    """Return value as float when it is a real number (bool excluded), else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _find_metric_case_insensitive(metrics: dict, metric: str) -> object:
+    """Return the value for metric using case/whitespace-normalized key lookup.
+
+    Returns None when no key matches or multiple distinct keys match (fail closed).
+    """
+    normalized = metric.strip().lower()
+    matches = [(k, v) for k, v in metrics.items() if k.strip().lower() == normalized]
+    if len(matches) == 1:
+        return matches[0][1]
+    return None  # missing or ambiguous
+
+
+def _evaluate_criterion(metrics: dict | None, criterion: dict) -> dict:
+    """Evaluate a success criterion against captured metrics.
+
+    Returns a dict with keys: verdict ("MET"|"NOT MET"|"NOT EVALUABLE"),
+    metric, operator, threshold, value (float|None), met (bool).
+    Fail-closed: any missing/invalid/ambiguous input yields NOT EVALUABLE + met=False.
+    """
+    metric_name = criterion.get("metric")
+    op = criterion.get("operator")
+    threshold = criterion.get("threshold")
+
+    base = {"metric": metric_name, "operator": op, "threshold": threshold,
+            "value": None, "met": False}
+
+    fn = _CRITERION_OPS.get(op) if op else None
+    thr = _coerce_number(threshold)
+
+    if not metric_name or fn is None or thr is None:
+        return {"verdict": "NOT EVALUABLE", **base}
+
+    if metrics is None:
+        return {"verdict": "NOT EVALUABLE", **base}
+
+    raw_value = _find_metric_case_insensitive(metrics, metric_name)
+    value = _coerce_number(raw_value)
+    if value is None:
+        return {"verdict": "NOT EVALUABLE", **base}
+
+    met = fn(value, thr)
+    verdict = "MET" if met else "NOT MET"
+    return {"verdict": verdict, "metric": metric_name, "operator": op,
+            "threshold": thr, "value": value, "met": met}
+
+
 def _compute_run_local(args: argparse.Namespace) -> None:
     """Execute a compute_experiment command locally without the orchestrator.
 
@@ -3703,6 +3768,7 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     result inline.
     """
     declared_metric: str | None = None
+    success_criterion: dict | None = None
     if getattr(args, "local_spec", None):
         # --local <spec.json>: read spec file; validate_backend_name is bypassed
         # because we call subprocess.run directly (no DB-backed flow).
@@ -3719,8 +3785,22 @@ def _compute_run_local(args: argparse.Namespace) -> None:
             print("error: spec JSON must contain a 'command' field")
             sys.exit(1)
         declared_metric = spec.get("declared_metric")
+        raw_sc = spec.get("success_criterion")
+        if isinstance(raw_sc, dict):
+            success_criterion = raw_sc
+        elif raw_sc is not None:
+            print("error: spec 'success_criterion' must be an object with metric/operator/threshold")
+            sys.exit(1)
     else:
         command = args.run_command
+
+    # CLI flags as fallback criterion source (spec takes precedence)
+    if success_criterion is None:
+        cm = getattr(args, "criterion_metric", None)
+        co = getattr(args, "criterion_op", None)
+        ct = getattr(args, "criterion_threshold", None)
+        if cm is not None and co is not None and ct is not None:
+            success_criterion = {"metric": cm, "operator": co, "threshold": ct}
 
     if command is None:
         print("error: provide a run command or --local <spec.json>")
@@ -3738,6 +3818,9 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     print(f"result_file : {result_file}")
     if declared_metric:
         print(f"declared    : {declared_metric}")
+    if success_criterion:
+        sc = success_criterion
+        print(f"criterion   : {sc.get('metric')} {sc.get('operator')} {sc.get('threshold')}")
     print("running...")
 
     proc = subprocess.run(["bash", "-lc", command], env=env)
@@ -3752,8 +3835,12 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"  warning: could not parse result file: {exc}")
 
+    verdict: dict | None = None
+    if success_criterion is not None:
+        verdict = _evaluate_criterion(metrics, success_criterion)
+
     result = {"status": status, "exit_code": exit_code, "metrics": metrics,
-              "declared_metric": declared_metric}
+              "declared_metric": declared_metric, "verdict": verdict}
 
     def _render(r: dict) -> None:
         print(f"status      : {r['status']} (exit_code={r['exit_code']})")
@@ -3769,6 +3856,17 @@ def _compute_run_local(args: argparse.Namespace) -> None:
                     print(f"  {dm} (declared) : NOT CAPTURED")
         else:
             print("metrics     : (none emitted)")
+        v = r.get("verdict")
+        if v:
+            vstr = v["verdict"]
+            val = v.get("value")
+            op = v.get("operator")
+            thr = v.get("threshold")
+            mn = v.get("metric")
+            if val is not None:
+                print(f"verdict     : {vstr}  ({mn}={val} {op} {thr})")
+            else:
+                print(f"verdict     : {vstr}  ({mn} not evaluable)")
 
     _emit(args, result, _render)
 
@@ -4366,8 +4464,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_compute_run.add_argument(
         "--local", dest="local_spec", metavar="SPEC_JSON",
         help="Path to a spec JSON file. The JSON must contain 'command' (str), and "
-             "optionally 'declared_metric' (str). Runs the command locally without the orchestrator."
+             "optionally 'declared_metric' (str) and 'success_criterion' (object with "
+             "metric/operator/threshold). Runs the command locally without the orchestrator."
     )
+    p_compute_run.add_argument(
+        "--criterion-metric", dest="criterion_metric", default=None, metavar="METRIC",
+        help="Metric name for success criterion (positional form only; spec takes precedence).")
+    p_compute_run.add_argument(
+        "--criterion-op", dest="criterion_op", default=None, metavar="OP",
+        help="Operator for success criterion: >= <= > < == !=")
+    p_compute_run.add_argument(
+        "--criterion-threshold", dest="criterion_threshold", type=float, default=None,
+        metavar="THRESHOLD",
+        help="Threshold for success criterion.")
 
     # playbook
     p_pb = sub.add_parser("playbook", parents=[common],
