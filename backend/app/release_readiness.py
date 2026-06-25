@@ -119,6 +119,134 @@ _READINESS_GROUND_TRUTH_CAVEAT = (
 # ``ground_truth_validated`` stays False and the caveat keeps self-approval framing.
 _READINESS_MIN_RESOLVED_OUTCOMES = 5
 
+# Governance manifest for the promotion-gate readiness block emitted by
+# ``compute_promotion_readiness``.  Every field the function returns must have an
+# entry here with a named ground-truth source and consumer, or a dated
+# retired/pending annotation — so a new field cannot land without declaring who
+# reads it.  Mirrors PANEL_REVIEW_METRIC_MANIFEST / TIMEOUT_RATE_METRIC_MANIFEST.
+PROMOTION_READINESS_METRIC_MANIFEST: dict[str, dict] = {
+    # ── core readiness verdict ──
+    "ready": {
+        "ground_truth": "would_promote_rate >= _READINESS_MIN_WOULD_PROMOTE_RATE AND consecutive_clean_passes >= _READINESS_MIN_CLEAN_STREAK AND no recurring blockers",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
+    },
+    "reason": {
+        "ground_truth": "human-readable explanation assembled from threshold comparisons",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
+    },
+    "verdicts_evaluated": {
+        "ground_truth": "count of QualificationVerdict rows (promotion_enabled=False, not infra_failure) in last _READINESS_HISTORY_WINDOW",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "would_promote_count": {
+        "ground_truth": "count of verdicts where QualificationVerdict.would_promote is True",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "would_promote_rate": {
+        "ground_truth": "would_promote_count / verdicts_evaluated; QualificationVerdict.would_promote (qualifier confidence >= threshold)",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel (primary self-approval rate metric)",
+    },
+    "consecutive_clean_passes": {
+        "ground_truth": "leading run of QualificationVerdict rows where would_promote=True and blocker is None",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
+    },
+    "consecutive_infra_errors": {
+        "ground_truth": "consecutive_infra_errors from most-recent ReleaseVersion.last_qualification when status == 'infra_failure' or 'pending'",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "infra_failure_count": {
+        "ground_truth": "count of ReleaseVersion.last_qualification rows with status == 'infra_failure' in last _READINESS_HISTORY_WINDOW",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "confidence": {
+        "ground_truth": "mean/stdev/min/max of QualificationVerdict.confidence_score for evaluated window",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "recurring_blockers": {
+        "ground_truth": "QualificationVerdict.blocker codes appearing >= _READINESS_RECURRING_BLOCKER_MIN times in the window",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "blocker_counts": {
+        "ground_truth": "per-code count of QualificationVerdict.blocker across the evaluated window (excludes ci_unresolved)",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "thresholds": {
+        "ground_truth": "static threshold constants (_READINESS_MIN_VERDICTS, _READINESS_MIN_CLEAN_STREAK, etc.)",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
+    },
+    # ── validated precision (ground-truth post-promotion outcomes) ──
+    "validated_precision": {
+        "ground_truth": "serving_confirmed / (serving_confirmed + deploy_failed) from QualificationVerdict.post_promotion_outcome where terminal_status='promoted' and outcome in {serving_confirmed, deploy_failed}",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel (true post-promotion precision metric)",
+    },
+    "resolved_outcome_sample": {
+        "ground_truth": "count of QualificationVerdict rows with terminal_status='promoted' and resolved post_promotion_outcome",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "serving_confirmed_count": {
+        "ground_truth": "count of promoted verdicts where post_promotion_outcome == 'serving_confirmed'",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "deploy_failed_count": {
+        "ground_truth": "count of promoted verdicts where post_promotion_outcome == 'deploy_failed'",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "ground_truth_validated": {
+        "ground_truth": "resolved_outcome_sample >= _READINESS_MIN_RESOLVED_OUTCOMES",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel (gates trusted-precision display)",
+    },
+    "caveat": {
+        "ground_truth": "_readiness_caveat(validated): 'self-approval only' when ground_truth_validated is False; 'validated precision N%' otherwise",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
+    },
+    # ── acceptance signal (advisory, never flips ready) ──
+    "acceptance_proven": {
+        "ground_truth": "count of merged tasks whose declared acceptance evidence was machine-verified (TaskAcceptanceRecord.bucket == 'proven')",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "acceptance_satisfied_unproven": {
+        "ground_truth": "TaskAcceptanceRecord.bucket == 'satisfied_unproven' for tasks in the open version window",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "acceptance_declared_unsatisfied": {
+        "ground_truth": "TaskAcceptanceRecord.bucket == 'declared_unsatisfied' for tasks in the open version window",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "acceptance_undeclared": {
+        "ground_truth": "TaskAcceptanceRecord.bucket == 'undeclared' (legacy or undeclared work, never counts against readiness)",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "acceptance_merged_unverified_degraded": {
+        "ground_truth": "TaskAcceptanceRecord.bucket == 'merged_unverified_degraded' (degraded merge, could not verify acceptance)",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "acceptance_malformed": {
+        "ground_truth": "TaskAcceptanceRecord.bucket == 'malformed' (unparseable acceptance record)",
+        "consumer": "admin_release_version router (readiness API response)",
+    },
+    "acceptance_unproven_present": {
+        "ground_truth": "acceptance_satisfied_unproven + acceptance_declared_unsatisfied + acceptance_merged_unverified_degraded + acceptance_malformed > 0",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel (advisory caveat gate)",
+    },
+    "acceptance_caveat": {
+        "ground_truth": "_acceptance_caveat(): non-None when any unproven/unsatisfied/degraded/malformed tasks are present in the open version (conditional field — omitted when no caveat)",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
+    },
+    # ── regime annotation (_annotate_regime) ──
+    "promotion_enabled": {
+        "ground_truth": "resolve_project_promotion_enabled(project_id) — runtime config flag",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
+    },
+    "regime": {
+        "ground_truth": "'live' when promotion_enabled else 'pre_go_live_calibration'",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
+    },
+    "is_current_readiness": {
+        "ground_truth": "not promotion_enabled (False once promotion is live, since the dry-run window is then stale pre-go-live history)",
+        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
+    },
+}
+
 
 def _readiness_caveat(validated: dict[str, Any]) -> str:
     """Build the ground-truth caveat from the validated-precision aggregate.
