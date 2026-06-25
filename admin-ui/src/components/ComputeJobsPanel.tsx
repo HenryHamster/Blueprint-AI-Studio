@@ -208,17 +208,33 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
                   <div className="text-ui-sm font-semibold text-neutral-300 font-mono mb-0.5">
                     {(job.task_title ?? job.id).slice(0, 24)}
                   </div>
-                  {arms.map((arm) => (
-                    <div key={arm.name} className="flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm font-mono mb-0.5 pl-2">
-                      <span className="text-neutral-400 font-semibold">{arm.name}:</span>
-                      {Object.entries(arm.metrics).map(([mk, mv]) => (
-                        <span key={mk}>
-                          <span className="text-neutral-500">{mk}:</span>{' '}
-                          <span className="text-neutral-300">{String(mv)}</span>
-                        </span>
-                      ))}
-                    </div>
-                  ))}
+                  {arms.map((arm) => {
+                    const armExitCode = typeof arm.metrics.exit_code === 'number' ? arm.metrics.exit_code : null;
+                    const armError = typeof arm.metrics.error === 'string' ? arm.metrics.error : null;
+                    const armFailed = (armExitCode !== null && armExitCode !== 0) || armError !== null;
+                    return (
+                      <div key={arm.name} className={`flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm font-mono mb-0.5 pl-2`}>
+                        <span className={`font-semibold ${armFailed ? 'text-red-300' : 'text-neutral-400'}`}>{arm.name}:</span>
+                        {armExitCode !== null && (
+                          <span
+                            className={`rounded border px-1 py-0.5 text-ui-xs ${armFailed ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-700 bg-neutral-800/60 text-neutral-400'}`}
+                            data-testid="arm-exit-code"
+                          >
+                            exit {armExitCode}
+                          </span>
+                        )}
+                        {Object.entries(arm.metrics).filter(([mk]) => mk !== 'exit_code' && mk !== 'error').map(([mk, mv]) => (
+                          <span key={mk}>
+                            <span className="text-neutral-500">{mk}:</span>{' '}
+                            <span className="text-neutral-300">{String(mv)}</span>
+                          </span>
+                        ))}
+                        {armError && (
+                          <span className="text-red-300/90 break-words" data-testid="arm-error">{armError.slice(0, 120)}{armError.length > 120 ? '…' : ''}</span>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               );
             })}
@@ -1021,16 +1037,32 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <div className="text-ui-sm text-neutral-500 font-mono mb-0.5">Arms</div>
                         <div className="flex flex-col gap-1">
                           {arms.map((arm) => {
-                            const numericEntries = Object.entries(arm.metrics).filter(([, mv]) => typeof mv === 'number');
+                            const exitCodeVal = typeof arm.metrics.exit_code === 'number' ? arm.metrics.exit_code : null;
+                            const errorVal = typeof arm.metrics.error === 'string' ? arm.metrics.error : null;
+                            const isFailed = (exitCodeVal !== null && exitCodeVal !== 0) || errorVal !== null;
+                            const numericEntries = Object.entries(arm.metrics).filter(([mk, mv]) => typeof mv === 'number' && mk !== 'exit_code');
                             const labelVal = typeof arm.metrics.label === 'string' ? arm.metrics.label : null;
                             const noteVal = typeof arm.metrics.note === 'string' ? arm.metrics.note : null;
                             const logVal = typeof arm.metrics.log === 'string' ? arm.metrics.log : null;
                             const otherStrings = Object.entries(arm.metrics).filter(
-                              ([mk, mv]) => typeof mv === 'string' && mk !== 'label' && mk !== 'note' && mk !== 'log',
+                              ([mk, mv]) => typeof mv === 'string' && mk !== 'label' && mk !== 'note' && mk !== 'log' && mk !== 'error',
                             );
                             return (
-                              <div key={arm.name} className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1">
-                                <div className="text-ui-sm font-semibold text-neutral-300 font-mono">{arm.name}</div>
+                              <div
+                                key={arm.name}
+                                className={`rounded border px-2 py-1 ${isFailed ? 'border-red-500/30 bg-red-500/10' : 'border-neutral-700/50 bg-neutral-800/40'}`}
+                              >
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <div className={`text-ui-sm font-semibold font-mono ${isFailed ? 'text-red-300' : 'text-neutral-300'}`}>{arm.name}</div>
+                                  {exitCodeVal !== null && (
+                                    <span
+                                      className={`rounded border px-1 py-0.5 text-ui-xs ${isFailed ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-700 bg-neutral-800/60 text-neutral-400'}`}
+                                      data-testid="arm-exit-code"
+                                    >
+                                      exit {exitCodeVal}
+                                    </span>
+                                  )}
+                                </div>
                                 {labelVal && (
                                   <div className="text-ui-sm text-neutral-400 italic mt-0.5" data-testid="arm-label">{labelVal}</div>
                                 )}
@@ -1048,6 +1080,11 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                                     <span className="text-neutral-500">{mk}:</span> {String(mv)}
                                   </div>
                                 ))}
+                                {errorVal && (
+                                  <div className="mt-0.5 text-ui-sm text-red-300/90 break-words font-mono" data-testid="arm-error">
+                                    {errorVal.slice(0, 120)}{errorVal.length > 120 ? '…' : ''}
+                                  </div>
+                                )}
                                 {noteVal && (
                                   <div className="mt-0.5 text-ui-sm text-neutral-400 break-words" data-testid="arm-note">{noteVal}</div>
                                 )}

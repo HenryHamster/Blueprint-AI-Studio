@@ -1368,6 +1368,115 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(armsBlock.textContent).toContain('best');
   });
 
+  test('arms breakdown renders a failed arm with exit code chip and error excerpt in red styling', async () => {
+    const armsJob = makeJob({
+      id: 'job-failed-arm',
+      task_title: 'failed arm experiment',
+      status: 'FAILED',
+      outcome: 'FAILURE',
+      final_cost_usd: 1.0,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-ok': { score: 0.85 },
+            'arm-crash': { exit_code: 1, error: 'OOM at step 40', score: null },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const armsBlock = await findByTestId('arms-breakdown');
+    // Failed arm shows exit code chip
+    const exitChips = getAllByTestId('arm-exit-code');
+    expect(exitChips).toHaveLength(1);
+    expect(exitChips[0].textContent).toBe('exit 1');
+    // Failed arm shows error excerpt
+    const errorBlocks = getAllByTestId('arm-error');
+    expect(errorBlocks).toHaveLength(1);
+    expect(errorBlocks[0].textContent).toContain('OOM at step 40');
+    // Failed arm card uses red border/background classes
+    const armCards = armsBlock.querySelectorAll('[class*="border-red"]');
+    expect(armCards.length).toBeGreaterThan(0);
+    // Successful arm does not have red border
+    expect(armsBlock.textContent).toContain('arm-ok');
+  });
+
+  test('arms breakdown does not apply failure styling when exit_code is 0', async () => {
+    const armsJob = makeJob({
+      id: 'job-success-arm',
+      task_title: 'success arm experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-a': { exit_code: 0, score: 0.92 },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId, queryAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const armsBlock = await findByTestId('arms-breakdown');
+    // Exit code chip shown (exit 0)
+    const exitChips = queryAllByTestId('arm-exit-code');
+    expect(exitChips).toHaveLength(1);
+    expect(exitChips[0].textContent).toBe('exit 0');
+    // No red styling — success exit
+    const armCards = armsBlock.querySelectorAll('[class*="border-red"]');
+    expect(armCards.length).toBe(0);
+    // No error block
+    expect(queryAllByTestId('arm-error')).toHaveLength(0);
+  });
+
+  test('run comparison matrix arms-comparison section tints a failed arm name in red', async () => {
+    const job1 = makeJob({
+      id: 'arms-fail-matrix-1',
+      task_title: 'matrix run A',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'fail-matrix-test',
+      criterion_verdict: { metric: 'score', operator: '>=', threshold: 0.8, value: 0.85, met: true, measurable: true },
+      polling_metadata: {
+        result_metrics: {
+          score: 0.85,
+          arms: {
+            'arm-good': { score: 0.85 },
+            'arm-bad': { exit_code: 2, error: 'segfault in eval loop' },
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'arms-fail-matrix-2',
+      task_title: 'matrix run B',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.2,
+      experiment: 'fail-matrix-test',
+      criterion_verdict: { metric: 'score', operator: '>=', threshold: 0.8, value: 0.79, met: false, measurable: true },
+      polling_metadata: { result_metrics: { score: 0.79 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job1, job2]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    const armsSection = await findByTestId('arms-comparison');
+    // Error excerpt is visible in the comparison section
+    expect(armsSection.textContent).toContain('arm-bad');
+    expect(armsSection.textContent).toContain('segfault in eval loop');
+    // Failed arm name is rendered with red styling
+    const redArmNames = armsSection.querySelectorAll('[class*="text-red"]');
+    expect(redArmNames.length).toBeGreaterThan(0);
+  });
+
   test('run comparison matrix skips arms key from scalar metric rows', async () => {
     const job1 = makeJob({
       id: 'arms-cmp-1',

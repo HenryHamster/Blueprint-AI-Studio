@@ -783,6 +783,15 @@ def mock_api(monkeypatch):
                      {"label": "variant-b", "note": "second variant", "log": "variant-b run log\nperformance improved", "score": 0.88},
                  ]}},
                  "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.7}},
+                {"id": "cjob-eee0-0000-0000-000000000005",
+                 "status": "SUCCEEDED", "task_title": "Failed arms test",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 2.1,
+                 "experiment": "exp-failed",
+                 "criterion_verdict": {"met": False, "metric": "latency", "operator": "lt", "threshold": 100, "value": None, "measurable": False},
+                 "polling_metadata": {"result_metrics": {"arms": {"passing": {"latency": 75.0}, "crashed": {"exit_code": 1, "error": "arm result file not written (arm may have failed)"}, "no_metric": {"exit_code": 0, "error": "metric 'latency' not found in result"}}},
+                                      "command_log": {"text": "Running experiment\nArm 1 passed\nArm 2 crashed\nArm 3 completed but no metric", "truncated": False}},
+                 "success_criterion": {"metric": "latency", "operator": "lt", "threshold": 100}},
             ]
             job = next((j for j in _ALL_MOCK_JOBS if j["id"] == job_id), None)
             if job is None:
@@ -822,6 +831,15 @@ def mock_api(monkeypatch):
                      "polling_metadata": {"result_metrics": {"score": 0.95, "arms": {"baseline": {"score": 0.85, "label": "baseline version", "note": "original implementation", "log": "baseline test output\nall checks passed"}, "optimized": {"score": 0.95, "label": "optimized version", "note": "after refactoring", "log": "optimized test output\nperformance improved"}}},
                                           "command_log": {"text": "Setup phase complete\nRunning comprehensive benchmark\nResults collected\nAnalysis complete", "truncated": False}},
                      "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.8}},
+                    {"id": "cjob-eee0-0000-0000-000000000005",
+                     "status": "SUCCEEDED", "task_title": "Failed arms test",
+                     "task_type": "compute_experiment",
+                     "final_cost_usd": 2.1,
+                     "experiment": "exp-failed",
+                     "criterion_verdict": {"met": False, "metric": "latency", "operator": "lt", "threshold": 100, "value": None, "measurable": False},
+                     "polling_metadata": {"result_metrics": {"arms": {"passing": {"latency": 75.0}, "crashed": {"exit_code": 1, "error": "arm result file not written (arm may have failed)"}, "no_metric": {"exit_code": 0, "error": "metric 'latency' not found in result"}}},
+                                          "command_log": {"text": "Running experiment\nArm 1 passed\nArm 2 crashed\nArm 3 completed but no metric", "truncated": False}},
+                     "success_criterion": {"metric": "latency", "operator": "lt", "threshold": 100}},
                 ],
                 "has_more": False,
                 "limit": 20,
@@ -3072,7 +3090,7 @@ def test_compute_list_json(mock_api, capsys):
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
     jobs = parsed["compute_jobs"]
-    assert len(jobs) == 3
+    assert len(jobs) == 4
     # running job has no cost yet
     running = next(j for j in jobs if j["status"] == "RUNNING")
     assert running["task_title"] == "GPU benchmark alpha"
@@ -3080,7 +3098,7 @@ def test_compute_list_json(mock_api, capsys):
     assert running["final_cost_usd"] is None
     # succeeded jobs have cost and a criterion verdict
     done_jobs = [j for j in jobs if j["status"] == "SUCCEEDED"]
-    assert len(done_jobs) == 2
+    assert len(done_jobs) == 3
     gpu_benchmark = next(j for j in done_jobs if j["task_title"] == "GPU benchmark beta")
     assert gpu_benchmark["final_cost_usd"] == 12.5
     assert gpu_benchmark["criterion_verdict"]["met"] is True
@@ -3261,6 +3279,29 @@ def test_compute_show_renders_per_arm_transcript(mock_api, capsys):
     # Per-arm logs must appear (rendered as transcripts)
     assert "baseline test output" in out
     assert "optimized test output" in out
+
+
+def test_compute_show_renders_per_arm_failure_diagnostics(mock_api, capsys):
+    """compute show renders a crashed arm's exit code + error excerpt and flags a ran-but-no-metric arm."""
+    job_id = "cjob-eee0-0000-0000-000000000005"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Per-arm breakdown must appear
+    assert "per-arm results" in out
+    assert "passing" in out
+    assert "crashed" in out
+    assert "no_metric" in out
+    # Passing arm must show metric
+    assert "latency" in out
+    assert "75" in out or "75.0" in out
+    # Crashed arm must show exit code and error
+    assert "exit_code" in out or "exit code" in out
+    assert "1" in out
+    assert "arm result file not written" in out or "may have failed" in out
+    # No-metric arm must show exit code and error
+    assert "0" in out
+    assert "metric 'latency' not found" in out or "not found in result" in out
 
 
 def test_compute_show_registers_in_help_invocations():

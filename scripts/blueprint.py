@@ -3721,11 +3721,19 @@ def _render_compute_show(data: dict) -> None:
                         label = arm_metrics.get("label")
                         note = arm_metrics.get("note")
                         log = arm_metrics.get("log")
-                        scalar_metrics = {k: v for k, v in arm_metrics.items() if k not in ("label", "note", "log")}
+                        exit_code = arm_metrics.get("exit_code")
+                        error = arm_metrics.get("error")
+                        scalar_metrics = {k: v for k, v in arm_metrics.items() if k not in ("label", "note", "log", "exit_code", "error")}
                         print(f"    [{arm_name}]", end="")
-                        if scalar_metrics:
+                        if error:
+                            print(f" ⚠ FAILED", end="")
+                        elif scalar_metrics:
                             print(f" {scalar_metrics}", end="")
                         print()
+                        if exit_code is not None:
+                            print(f"      exit_code: {exit_code}")
+                        if error:
+                            print(f"      error: {error}")
                         if label:
                             print(f"      label: {label}")
                         if note:
@@ -3743,11 +3751,19 @@ def _render_compute_show(data: dict) -> None:
                         label = arm_entry.get("label")
                         note = arm_entry.get("note")
                         log = arm_entry.get("log")
-                        scalar_metrics = {k: v for k, v in arm_entry.items() if k not in ("label", "name", "arm", "note", "log")}
+                        exit_code = arm_entry.get("exit_code")
+                        error = arm_entry.get("error")
+                        scalar_metrics = {k: v for k, v in arm_entry.items() if k not in ("label", "name", "arm", "note", "log", "exit_code", "error")}
                         print(f"    [{heading}]", end="")
-                        if scalar_metrics:
+                        if error:
+                            print(f" ⚠ FAILED", end="")
+                        elif scalar_metrics:
                             print(f" {scalar_metrics}", end="")
                         print()
+                        if exit_code is not None:
+                            print(f"      exit_code: {exit_code}")
+                        if error:
+                            print(f"      error: {error}")
                         if label:
                             print(f"      label: {label}")
                         if note:
