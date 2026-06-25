@@ -146,6 +146,13 @@ logger = logging.getLogger(__name__)
 
 _CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retirement signal
 
+# Minimum clean repair attempts (repair_attempts - infra_failures) for a per-type
+# self_repair_success_rate to be considered reliable.  Mirrors the same threshold
+# in efficiency_snapshot.SELF_REPAIR_MIN_ATTEMPTS (efficiency_snapshot imports
+# digest_metrics only lazily inside a function, so a module-level import here would
+# not create a cycle, but duplicating the literal keeps the dependency one-directional).
+_SELF_REPAIR_MIN_ATTEMPTS = 10
+
 _FAILURE_CLASS_LABELS = {
     CODE_ERROR: "Code Error",
     PROVISION_FAILURE: "Provision Failure",
@@ -417,6 +424,9 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
     miss_by_reason: defaultdict[str, int] = defaultdict(int)
     repair_miss_by_reason: defaultdict[str, int] = defaultdict(int)
     miss_by_schema: defaultdict[str, int] = defaultdict(int)
+    miss_by_schema_and_reason: defaultdict[str, defaultdict[str, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
     repair_attempts_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_successes_by_schema: defaultdict[str, int] = defaultdict(int)
     repair_infra_failures_by_schema: defaultdict[str, int] = defaultdict(int)
@@ -450,6 +460,10 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
             repair_miss_by_reason[str(reason)] += int(count)
         for schema, count in (summary.get("format_miss_by_schema") or {}).items():
             miss_by_schema[str(schema)] += int(count)
+        for schema, reasons in (summary.get("format_miss_by_schema_and_reason") or {}).items():
+            if isinstance(reasons, dict):
+                for reason, count in reasons.items():
+                    miss_by_schema_and_reason[str(schema)][str(reason)] += int(count)
         for schema, count in (
             summary.get("format_repair_attempts_by_schema") or {}
         ).items():
@@ -556,6 +570,9 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         "by_schema": by_schema,
         "format_miss_by_reason": dict(miss_by_reason),
         "format_repair_miss_by_reason": dict(repair_miss_by_reason),
+        "format_miss_by_schema_and_reason": {
+            schema: dict(reasons) for schema, reasons in miss_by_schema_and_reason.items()
+        },
     }
 
 
@@ -620,6 +637,15 @@ def compute_format_compliance_metrics(
         task_type: _accumulate_format_compliance(tasks)
         for task_type, tasks in by_type_groups.items()
     }
+    # Suppress self_repair_success_rate on per-type blocks with fewer than the
+    # minimum clean attempts — small-volume task types (e.g. strategic_review with
+    # ~2 repairs/window) produce phantom regression deltas that are pure noise.
+    for _block in by_type.values():
+        _clean = (_block.get("repair_attempts") or 0) - (
+            _block.get("repair_infra_failures") or 0
+        )
+        if _clean < _SELF_REPAIR_MIN_ATTEMPTS:
+            _block["self_repair_success_rate"] = None
 
     if prev_terminal_tasks is not None:
         prev_overall = _accumulate_format_compliance(prev_terminal_tasks)

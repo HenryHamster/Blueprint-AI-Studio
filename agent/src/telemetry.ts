@@ -163,6 +163,9 @@ let _formatRepairInfraFailures = 0; // @per-role
 let _formatRepairInputTokens = 0; // @per-role
 let _formatRepairOutputTokens = 0; // @per-role
 let _formatMissBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
+// Cross-product: schema → reason → count. Enables localizing a miss-reason regression
+// to a specific handler (schema label) rather than only the global reason bucket.
+let _formatMissBySchemaAndReason: Partial<Record<SchemaLabel, Record<string, number>>> = {}; // @per-role
 let _formatRepairAttemptsBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 let _formatRepairSuccessesBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
 let _formatRepairInfraFailuresBySchema: Partial<Record<SchemaLabel, number>> = {}; // @per-role
@@ -172,12 +175,16 @@ let _formatRepairMissBySchema: Partial<Record<SchemaLabel, number>> = {}; // @pe
 
 /** Record one unparseable final output, bucketed by the extraction verdict's
  *  reason class and, when provided, by the bounded schema label. Bumps the
- *  per-reason count and the format-error total. */
+ *  per-reason count and the format-error total. Also records the cross-product
+ *  (schema × reason) when both dimensions are present. */
 export function recordFormatMiss(reason: FormatMissReason, schemaLabel?: SchemaLabel): void {
   _formatMissByReason[reason] = (_formatMissByReason[reason] ?? 0) + 1;
   _formatErrorTotal += 1;
   if (schemaLabel !== undefined) {
     _formatMissBySchema[schemaLabel] = (_formatMissBySchema[schemaLabel] ?? 0) + 1;
+    const reasonMap = _formatMissBySchemaAndReason[schemaLabel] ?? {};
+    reasonMap[reason] = (reasonMap[reason] ?? 0) + 1;
+    _formatMissBySchemaAndReason[schemaLabel] = reasonMap;
   }
 }
 
@@ -260,7 +267,12 @@ export function getFormatComplianceTelemetry(): {
   format_repair_input_tokens_by_schema: Partial<Record<SchemaLabel, number>>;
   format_repair_output_tokens_by_schema: Partial<Record<SchemaLabel, number>>;
   format_repair_miss_by_schema: Partial<Record<SchemaLabel, number>>;
+  format_miss_by_schema_and_reason: Partial<Record<SchemaLabel, Record<string, number>>>;
 } {
+  const schemaAndReason: Partial<Record<SchemaLabel, Record<string, number>>> = {};
+  for (const [schema, reasons] of Object.entries(_formatMissBySchemaAndReason)) {
+    schemaAndReason[schema as SchemaLabel] = { ...reasons };
+  }
   return {
     format_miss_by_reason: { ..._formatMissByReason },
     format_repair_miss_by_reason: { ..._formatRepairMissByReason },
@@ -277,6 +289,7 @@ export function getFormatComplianceTelemetry(): {
     format_repair_input_tokens_by_schema: { ..._formatRepairInputTokensBySchema },
     format_repair_output_tokens_by_schema: { ..._formatRepairOutputTokensBySchema },
     format_repair_miss_by_schema: { ..._formatRepairMissBySchema },
+    format_miss_by_schema_and_reason: schemaAndReason,
   };
 }
 
@@ -297,6 +310,7 @@ export function resetFormatComplianceTelemetry(): void {
   _formatRepairInputTokensBySchema = {};
   _formatRepairOutputTokensBySchema = {};
   _formatRepairMissBySchema = {};
+  _formatMissBySchemaAndReason = {};
 }
 
 /** Estimate token count from character count (4 chars ≈ 1 token).

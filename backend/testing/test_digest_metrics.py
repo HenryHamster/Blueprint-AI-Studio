@@ -11,6 +11,7 @@ from app.models import (
 )
 from app.digest_metrics import (
     _FAILURE_CLASS_LABELS,
+    _SELF_REPAIR_MIN_ATTEMPTS,
     _compute_first_attempt_breakdowns,
     _compute_first_review_approval_breakdowns,
     _compute_non_code_outcomes,
@@ -5545,14 +5546,16 @@ def test_format_compliance_metrics_malformed_then_repaired_run():
     assert create["tasks_measured"] == 2
     assert create["well_formed_tasks"] == 1
     assert create["format_compliance_rate"] == 0.5
-    # One repair attempt, one success.
-    assert create["self_repair_success_rate"] == 1.0
+    # One repair attempt, one success — but below _SELF_REPAIR_MIN_ATTEMPTS so
+    # self_repair_success_rate is suppressed (None) to prevent phantom drift signals.
+    assert create["self_repair_success_rate"] is None
 
     fix = by_type["fix"]
     assert fix["tasks_measured"] == 1
     assert fix["well_formed_tasks"] == 0
     assert fix["format_compliance_rate"] == 0.0
-    assert fix["self_repair_success_rate"] == 0.5
+    # Two repair attempts, below threshold — suppressed.
+    assert fix["self_repair_success_rate"] is None
 
 
 def test_format_compliance_metrics_null_summaries_excluded():
@@ -5959,6 +5962,72 @@ def test_format_repair_miss_by_schema_in_schema_entry():
     assert thinker["repair_successes"] == 1
 
 
+def test_format_miss_by_schema_and_reason_aggregation():
+    """format_miss_by_schema_and_reason merges nested reason counts across tasks.
+
+    Task 1: strategic_review → {missing_required_keys: 3, extra_keys: 1}
+    Task 2: strategic_review → {missing_required_keys: 2}, thinker → {bad_json: 1}
+    Expected merged: strategic_review → {missing_required_keys: 5, extra_keys: 1},
+                     thinker → {bad_json: 1}
+    """
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 4,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 1,
+                "format_miss_by_schema_and_reason": {
+                    "strategic_review": {
+                        "missing_required_keys": 3,
+                        "extra_keys": 1,
+                    }
+                },
+            },
+        ),
+        _fc_task(
+            "fix",
+            {
+                "format_error_total": 3,
+                "format_repair_attempts": 2,
+                "format_repair_successes": 0,
+                "format_miss_by_schema_and_reason": {
+                    "strategic_review": {"missing_required_keys": 2},
+                    "thinker": {"bad_json": 1},
+                },
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    by_reason = overall["format_miss_by_schema_and_reason"]
+
+    # strategic_review: counts merged across both tasks
+    assert by_reason["strategic_review"]["missing_required_keys"] == 5
+    assert by_reason["strategic_review"]["extra_keys"] == 1
+
+    # thinker: from second task only
+    assert by_reason["thinker"]["bad_json"] == 1
+
+
+def test_format_miss_by_schema_and_reason_absent_tasks_excluded():
+    """Tasks lacking format_miss_by_schema_and_reason contribute nothing to that map."""
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 0,
+                "format_miss_by_reason": {"missing_required_keys": 1},
+                # no format_miss_by_schema_and_reason key
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    # map should be empty, not raise
+    assert overall["format_miss_by_schema_and_reason"] == {}
+
+
 def _fc_clean(task_type="create"):
     """Task with a clean (well-formed) format_compliance_summary."""
     return _fc_task(
@@ -6171,6 +6240,59 @@ def test_format_compliance_metrics_mixed_old_new_agents():
     # Empty by_schema when no tasks carry per-schema data.
     result_old_only = compute_format_compliance_metrics([old_agent_task])
     assert result_old_only["overall"]["by_schema"] == {}
+
+
+def test_per_type_self_repair_drift_suppressed_below_min_attempts():
+    """Per-type self_repair_success_rate is suppressed (None) when the type's clean
+    repair attempts are below _SELF_REPAIR_MIN_ATTEMPTS, preventing phantom regression
+    deltas from low-volume task types (e.g. strategic_review with ~2 repairs/window).
+
+    The overall rate uses the full window and is NOT suppressed when it has enough
+    clean attempts across all types combined.
+    """
+    # Build _SELF_REPAIR_MIN_ATTEMPTS - 1 clean repair tasks for "strategic_review"
+    # (below threshold) and _SELF_REPAIR_MIN_ATTEMPTS tasks for "create" (at/above).
+    low_volume_count = _SELF_REPAIR_MIN_ATTEMPTS - 1  # 9 — below the guard
+    high_volume_count = _SELF_REPAIR_MIN_ATTEMPTS  # 10 — at the guard
+
+    strategic_review_tasks = [
+        _fc_task(
+            "strategic_review",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+            },
+        )
+        for _ in range(low_volume_count)
+    ]
+    create_tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 1,
+                "format_repair_attempts": 1,
+                "format_repair_successes": 1,
+            },
+        )
+        for _ in range(high_volume_count)
+    ]
+
+    result = compute_format_compliance_metrics(strategic_review_tasks + create_tasks)
+    by_type = result["by_type"]
+
+    # strategic_review has 9 clean attempts — below threshold — rate must be suppressed.
+    assert by_type["strategic_review"]["repair_attempts"] == low_volume_count
+    assert by_type["strategic_review"]["self_repair_success_rate"] is None
+
+    # create has 10 clean attempts — at/above threshold — rate is NOT suppressed.
+    assert by_type["create"]["repair_attempts"] == high_volume_count
+    assert by_type["create"]["self_repair_success_rate"] == 1.0
+
+    # The overall block spans both types (19 clean attempts) — not suppressed.
+    overall = result["overall"]
+    assert overall["repair_attempts"] == low_volume_count + high_volume_count
+    assert overall["self_repair_success_rate"] == 1.0
 
 
 def test_repair_token_accumulation_and_llm_usd():

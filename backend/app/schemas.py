@@ -421,6 +421,9 @@ class HeartbeatRequest(BaseModel):
     # Keys are schema label strings (e.g. "ResearchPlan", "StructuredVerdict").
     # Older agents omitting these fields contribute only to scalar totals.
     format_miss_by_schema: Dict[str, int] | None = None
+    # Per-schema, per-reason breakdown of format misses (nested map: schema → reason → count).
+    # Backwards-compatible: older agents omit this field; treated as {}.
+    format_miss_by_schema_and_reason: Dict[str, Dict[str, int]] | None = None
     format_repair_attempts_by_schema: Dict[str, int] | None = None
     format_repair_successes_by_schema: Dict[str, int] | None = None
     # Count of reopen/retry runs that crashed (exitCode != 0) — these are infra

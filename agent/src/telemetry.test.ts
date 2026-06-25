@@ -184,6 +184,7 @@ describe('format-compliance telemetry', () => {
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
       format_repair_miss_by_schema: {},
+      format_miss_by_schema_and_reason: {},
     });
   });
 
@@ -222,6 +223,7 @@ describe('format-compliance telemetry', () => {
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
       format_repair_miss_by_schema: {},
+      format_miss_by_schema_and_reason: {},
     });
   });
 
@@ -250,6 +252,7 @@ describe('format-compliance telemetry', () => {
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
       format_repair_miss_by_schema: {},
+      format_miss_by_schema_and_reason: {},
     });
   });
 
@@ -274,6 +277,7 @@ describe('format-compliance telemetry', () => {
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
       format_repair_miss_by_schema: {},
+      format_miss_by_schema_and_reason: {},
     });
   });
 
@@ -298,6 +302,7 @@ describe('format-compliance telemetry', () => {
       format_repair_input_tokens_by_schema: {},
       format_repair_output_tokens_by_schema: {},
       format_repair_miss_by_schema: {},
+      format_miss_by_schema_and_reason: {},
     });
   });
 
@@ -521,6 +526,56 @@ describe('format-compliance telemetry — repair token counters', () => {
     const snap = getFormatComplianceTelemetry();
     (snap.format_repair_input_tokens_by_schema as Record<string, number>)['thinker'] = 999;
     expect(getFormatComplianceTelemetry().format_repair_input_tokens_by_schema).toEqual({ thinker: 600 });
+  });
+});
+
+describe('format-compliance telemetry — cross-product (schema × reason)', () => {
+  it('records format miss cross-product by schema and reason', () => {
+    // Two schemas, multiple reasons — the cross-product must be independent per cell.
+    recordFormatMiss('missing_required_key', 'research_plan');
+    recordFormatMiss('unbalanced_json', 'research_plan');
+    recordFormatMiss('missing_required_key', 'research_plan');
+    recordFormatMiss('no_json_start', 'security_audit');
+    recordFormatMiss('unbalanced_json', 'security_audit');
+
+    const tel = getFormatComplianceTelemetry();
+
+    // Global aggregates are unaffected.
+    expect(tel.format_error_total).toBe(5);
+    expect(tel.format_miss_by_reason).toEqual({
+      missing_required_key: 2,
+      unbalanced_json: 2,
+      no_json_start: 1,
+    });
+    expect(tel.format_miss_by_schema).toEqual({ research_plan: 3, security_audit: 2 });
+
+    // Cross-product localizes each reason to its handler.
+    expect(tel.format_miss_by_schema_and_reason).toEqual({
+      research_plan: { missing_required_key: 2, unbalanced_json: 1 },
+      security_audit: { no_json_start: 1, unbalanced_json: 1 },
+    });
+  });
+
+  it('calls without schemaLabel do not appear in format_miss_by_schema_and_reason', () => {
+    recordFormatMiss('malformed_json');
+    recordFormatMiss('unbalanced_json', 'memo');
+    const tel = getFormatComplianceTelemetry();
+    expect(tel.format_miss_by_schema_and_reason).toEqual({ memo: { unbalanced_json: 1 } });
+  });
+
+  it('format_miss_by_schema_and_reason snapshot is a copy — mutating it does not affect internal state', () => {
+    recordFormatMiss('no_json_start', 'design');
+    const snap = getFormatComplianceTelemetry();
+    (snap.format_miss_by_schema_and_reason as Record<string, Record<string, number>>)['design']['no_json_start'] = 999;
+    expect(getFormatComplianceTelemetry().format_miss_by_schema_and_reason).toEqual({
+      design: { no_json_start: 1 },
+    });
+  });
+
+  it('reset clears format_miss_by_schema_and_reason', () => {
+    recordFormatMiss('unbalanced_json', 'memo');
+    resetFormatComplianceTelemetry();
+    expect(getFormatComplianceTelemetry().format_miss_by_schema_and_reason).toEqual({});
   });
 });
 
