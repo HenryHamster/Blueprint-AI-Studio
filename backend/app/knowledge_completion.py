@@ -1164,7 +1164,10 @@ def _build_compute_experiment_document(
     multi-arm comparison block, when the experiment reported one) are captured
     FAITHFULLY — verbatim, no interpretation — into the body and the
     ``verdict_record`` so the strategist and the later opt-in judgment agent can
-    query the real result rather than a truncated narrative.
+    query the real result rather than a truncated narrative. Supports arms-only
+    results (no top-level scalars, only an ``arms`` block): scalar-only results,
+    mixed results with both scalars and arms, and arms-only results all render
+    correctly with appropriate sections in the body.
     """
     payload = task.first_payload or {}
     experiment = str(payload.get("experiment") or "").strip()

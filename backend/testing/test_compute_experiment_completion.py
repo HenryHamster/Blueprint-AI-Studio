@@ -2168,6 +2168,95 @@ async def test_faithful_capture_persists_arms_and_verdict(
     assert "compute_vm_analysis_attempts" not in (task.context or {})
 
 
+@pytest.mark.asyncio
+async def test_arms_only_result_persists_direction_linked_knowledge(
+    db_session, _quiet_compute_io
+):
+    """Multi-arm results are arms-ONLY (no top-level scalars); verify end-to-end.
+
+    Production multi-arm aggregators emit a result with NO top-level scalars,
+    only an arms block (per-arm comparisons). Verify that an arms-only result
+    captures correctly into a direction-linked KnowledgeDocument so arm results
+    cannot silently regress for the shape production actually emits.
+
+    This test uses a task with NO declared metric criterion so the gate passes
+    on presence (outcome + cost). The real production flow may eventually measure
+    a criterion from the arms or use a different criterion kind; this test pins
+    that arm-only results ARE captured and persisted faithfully when they occur.
+    """
+    # Task with identity and direction, but NO declared success criterion.
+    # This allows arms-only results to complete without an unmeasured-criterion
+    # failure; the arms themselves become the durable measured knowledge.
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "A/B comparison",
+            "benchmark": "bench-v2",
+            "tags": ["perf"],
+            # No success_criterion declared.
+        }
+    ]
+    task.context = {"direction_id": "d-compute"}
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job, _artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    # Arms-only result: no top-level scalars, just the arms block.
+    # This is the real multi-arm aggregator shape from production.
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": [
+                {"name": "baseline", "latency_ms": 105},
+                {"name": "optimized", "latency_ms": 95},
+            ],
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    logs = _result_artifact(job_id=str(job.id))
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    doc = docs[0]
+
+    # Direction tagging preserved: the knowledge document is linked to the
+    # direction that commissioned the experiment.
+    assert doc.direction_id == "d-compute"
+
+    verdict = doc.forward_quality_verdict
+
+    # Arms-only result: result_metrics carries ONLY the arms block, no scalars.
+    assert verdict["result_metrics"] == {
+        "arms": [
+            {"name": "baseline", "latency_ms": 105},
+            {"name": "optimized", "latency_ms": 95},
+        ],
+    }
+
+    # Arms preserved in verdict_record for strategic comparison.
+    arms = verdict["arms"]
+    assert isinstance(arms, list)
+    assert len(arms) == 2
+    assert arms[0]["name"] == "baseline"
+    assert arms[1]["name"] == "optimized"
+
+    # Body includes the arms section (but NOT a separate scalar metrics section).
+    assert "Experiment arms" in doc.body
+    assert "Reported result metrics" not in doc.body
+
+    # Deterministic capture: no LLM interpretation.
+    assert verdict["analysis_mode"] == "deterministic"
+
+
 def _mock_anthropic_returning(citations: list[str]):
     """Build a mock anthropic.AsyncAnthropic class that returns a cited analysis."""
     fake_text = json.dumps(
