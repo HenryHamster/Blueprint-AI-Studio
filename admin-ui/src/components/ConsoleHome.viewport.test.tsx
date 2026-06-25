@@ -42,6 +42,11 @@ vi.mock('../api', () => ({
     return new Response('{}', { status: 200 });
   }),
   fetchFleetUtilization: vi.fn(async () => ({ pools: [] })),
+  // ConsoleHome statically imports fetchTask from '../api' (used in the
+  // onViewTask click path). In browser-mode ESM, the mock factory must
+  // expose every named export the component imports or the module linker
+  // throws "does not provide an export named 'fetchTask'" at import time.
+  fetchTask: vi.fn(async () => ({})),
   API_BASE_URL: '',
   authGet: vi.fn(async () => ({})),
 }));
