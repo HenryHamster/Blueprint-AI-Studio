@@ -808,6 +808,88 @@ async def test_compute_unmeasured_criterion_spawns_followon(
 
 
 @pytest.mark.asyncio
+async def test_unmeasured_criterion_surfaces_emitted_keys(
+    db_session, _quiet_compute_io
+):
+    """compute_unmeasured_criterion failure message surfaces what the command
+    actually emitted so a case/name mismatch is instantly visible.
+
+    Case A: COMPUTE_RESULT emitted 'AUC' (wrong case) but criterion declares
+            'auc' → miss_reason lists emitted_keys=['AUC'].
+    Case B: COMPUTE_RESULT has no experiment metrics at all (only cost fields)
+            → miss_reason reports emitted_keys=[].
+    Case C: no COMPUTE_RESULT parsed (crash before result) — exercised separately
+            by test_unmeasured_criterion_no_artifact_is_crash_path.
+    """
+    # --- Case A: wrong-case metric key emitted ---
+    task_a = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "auc-experiment",
+            "success_criterion": {
+                "kind": "metric",
+                "metric": "auc",
+                "operator": ">=",
+                "threshold": 0.8,
+            },
+        },
+    )
+    result_with_wrong_case = json.dumps(
+        {
+            "outcome": "SUCCESS",
+            "final_cost_usd": 0.10,
+            "AUC": 0.85,  # declared as 'auc' but emitted as 'AUC'
+        }
+    )
+    await _handle_compute_experiment_completion(
+        task_a, result_with_wrong_case, db_session
+    )
+    await db_session.refresh(task_a)
+    assert task_a.status == TaskStatus.FAILED
+    assert task_a.context["failure_category"] == "compute_unmeasured_criterion"
+    gate_reason = task_a.context["evaluation_gate"]["reason"]
+    # Must name the declared metric, the emitted keys, and hint at case mismatch.
+    assert "auc" in gate_reason
+    assert "AUC" in gate_reason
+    assert "emitted_keys" in gate_reason
+    assert "case" in gate_reason.lower() or "name" in gate_reason.lower()
+
+    # --- Case B: no experiment metrics in result at all ---
+    task_b = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "empty-metrics-experiment",
+            "success_criterion": {
+                "kind": "metric",
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+            },
+        },
+    )
+    result_no_metrics = json.dumps(
+        {
+            "outcome": "SUCCESS",
+            "final_cost_usd": 0.05,
+            # intentionally no 'accuracy' or any other experiment metric key
+        }
+    )
+    await _handle_compute_experiment_completion(
+        task_b, result_no_metrics, db_session
+    )
+    await db_session.refresh(task_b)
+    assert task_b.status == TaskStatus.FAILED
+    assert task_b.context["failure_category"] == "compute_unmeasured_criterion"
+    gate_reason_b = task_b.context["evaluation_gate"]["reason"]
+    assert "accuracy" in gate_reason_b
+    assert "emitted_keys=[]" in gate_reason_b
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kill_outcome", ["TIMED_OUT", "SPEND_CAP_EXCEEDED"])
 async def test_intentional_kill_spawns_no_followon(
     db_session, _quiet_compute_io, kill_outcome

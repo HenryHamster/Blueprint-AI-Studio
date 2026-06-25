@@ -69,6 +69,7 @@ from app.task_evaluators import (
     REVIEW_SECOND_OPINION_SOURCE_KEY,
     EvaluationVerdict,
     _extract_compute_measurement,
+    describe_emitted_compute_metric_keys,
     evaluate_compute_success_criterion,
     evaluate_terminal_output,
     record_failed_gate,
@@ -3410,10 +3411,11 @@ async def _handle_compute_experiment_completion(
             )
 
             metric_name = (criterion or {}).get("metric")
+            emitted_diag = describe_emitted_compute_metric_keys(logs)
             miss_reason = (
                 f"compute_unmeasured_criterion: declared metric {metric_name!r} "
                 f"produced no numeric value (outcome={outcome}); the experiment "
-                f"ran but the declared hypothesis was never measured"
+                f"ran but the declared hypothesis was never measured — {emitted_diag}"
             )
             record_failed_gate(
                 task,

@@ -41,6 +41,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 from blueprint_api import APIError, api, get_project_id, load_config
@@ -3439,7 +3440,7 @@ def _compute_job_projected_spend(j: dict, burn_rate: "float | None", now: "datet
 
 
 def cmd_compute(args: argparse.Namespace) -> None:
-    """Dispatch compute subcommands: list / show / kill / analyze."""
+    """Dispatch compute subcommands: list / show / kill / analyze / run."""
     sub = getattr(args, "compute_cmd", None) or "list"
     if sub == "kill":
         _compute_kill(args)
@@ -3447,6 +3448,8 @@ def cmd_compute(args: argparse.Namespace) -> None:
         _compute_analyze(args)
     elif sub == "show":
         _compute_show(args)
+    elif sub == "run":
+        _compute_run_local(args)
     else:
         _compute_list(args)
 
@@ -3690,6 +3693,51 @@ def _compute_analyze(args: argparse.Namespace) -> None:
         f"outcome={r.get('outcome', '?')}  "
         f"knowledge_doc={r.get('knowledge_document_id', 'none')}"
     ))
+
+
+def _compute_run_local(args: argparse.Namespace) -> None:
+    """Execute a compute_experiment command locally without the orchestrator.
+
+    Sets BLUEPRINT_RESULT_FILE and BLUEPRINT_ARTIFACT_DIR so the command can
+    emit metrics and artifacts via the standard file-contract, then reports the
+    result inline.
+    """
+    command = args.run_command
+    tmpdir = tempfile.mkdtemp(prefix="blueprint-compute-run-")
+    result_file = os.path.join(tmpdir, "result.json")
+    artifact_dir = os.path.join(tmpdir, "artifacts")
+    os.makedirs(artifact_dir, exist_ok=True)
+    env = os.environ.copy()
+    env["BLUEPRINT_RESULT_FILE"] = result_file
+    env["BLUEPRINT_ARTIFACT_DIR"] = artifact_dir
+
+    print(f"command     : {command}")
+    print(f"result_file : {result_file}")
+    print("running...")
+
+    proc = subprocess.run(["bash", "-lc", command], env=env)
+    exit_code = proc.returncode
+    status = "SUCCEEDED" if exit_code == 0 else "FAILED"
+
+    metrics: dict | None = None
+    if os.path.exists(result_file):
+        try:
+            with open(result_file) as f:
+                metrics = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  warning: could not parse result file: {exc}")
+
+    result = {"status": status, "exit_code": exit_code, "metrics": metrics}
+
+    def _render(r: dict) -> None:
+        print(f"status      : {r['status']} (exit_code={r['exit_code']})")
+        m = r.get("metrics")
+        if m:
+            print(f"metrics     : {m}")
+        else:
+            print("metrics     : (none emitted)")
+
+    _emit(args, result, _render)
 
 
 # ── argument parser ──────────────────────────────────────────────────────────
@@ -4272,6 +4320,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_compute_analyze.add_argument("job_id", help="Compute job id (UUID).")
     p_compute_analyze.add_argument("--yes", action="store_true",
                                    help="Skip the confirmation prompt.")
+    p_compute_run = compute_sub.add_parser(
+        "run", parents=[common],
+        help="Run a compute_experiment command locally (no orchestrator, no DB, no GCP).",
+        description="Execute a compute_experiment command locally on this machine. "
+                    "Sets BLUEPRINT_RESULT_FILE and BLUEPRINT_ARTIFACT_DIR so the command "
+                    "can emit metrics via the standard file contract, then reports the result.")
+    p_compute_run.add_argument(
+        "run_command",
+        help="Bash command string to execute. "
+             "Write a flat JSON object of {metric: value} to $BLUEPRINT_RESULT_FILE to report metrics.")
 
     # playbook
     p_pb = sub.add_parser("playbook", parents=[common],

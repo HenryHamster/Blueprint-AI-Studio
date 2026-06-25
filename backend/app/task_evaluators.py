@@ -990,6 +990,37 @@ def _parse_artifact_json(artifact_text: str | None) -> dict | None:
     return scan_balanced_json_objects(text)
 
 
+# Fields that are always present in a COMPUTE_RESULT but are NOT
+# experiment-emitted metric keys (they are operational/job-level fields).
+_COMPUTE_RESULT_NON_METRIC_KEYS: frozenset[str] = (
+    _RESERVED_COMPUTE_RESULT_KEYS
+    | frozenset({"outcome", "status", "job_id", "intentional_terminal"})
+)
+
+
+def describe_emitted_compute_metric_keys(artifact_text: str | None) -> str:
+    """Produce a one-line diagnostic of what experiment metric keys the agent emitted.
+
+    Used by the compute_unmeasured_criterion failure path to tell the operator
+    what the command actually wrote so a case-mismatch is instantly visible:
+    declared 'auc' but emitted 'AUC' shows up as "emitted_keys=['AUC']".
+
+    Two distinguishable cases:
+    * no COMPUTE_RESULT parsed at all → experiment likely crashed before writing
+      its result JSON (happens when the command fails at startup and emits only
+      a traceback with no terminal JSON block).
+    * result parsed but declared key absent → command completed, wrote a result,
+      but the metric name differs (case mismatch, typo) or was never written.
+    """
+    obj = _parse_artifact_json(artifact_text)
+    if obj is None:
+        return "no COMPUTE_RESULT parsed — experiment likely crashed before emitting result"
+    emitted = sorted(k for k in obj if k not in _COMPUTE_RESULT_NON_METRIC_KEYS)
+    if not emitted:
+        return "emitted_keys=[] (command wrote no experiment metrics to COMPUTE_RESULT)"
+    return f"emitted_keys={emitted!r} (declared key absent — possible case/name mismatch)"
+
+
 # ---------------------------------------------------------------------------
 # Forward-quality ESCALATION: independent grader for blast-radius artifacts.
 #

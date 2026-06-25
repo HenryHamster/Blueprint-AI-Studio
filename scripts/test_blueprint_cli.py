@@ -146,6 +146,7 @@ HELP_INVOCATIONS = [
     ["compute", "show"],
     ["compute", "kill"],
     ["compute", "analyze"],
+    ["compute", "run"],
 ]
 
 
@@ -3471,3 +3472,17 @@ def test_compute_show_list_shaped_arms(mock_api, capsys):
     assert "second variant" in out
     assert "variant-a run log" in out
     assert "variant-b run log" in out
+
+
+def test_compute_run_local(capsys):
+    """compute run executes a trivial command locally and reports its emitted metric."""
+    # Write {"accuracy": 0.95} to the result file that the wrapper provides via $BLUEPRINT_RESULT_FILE
+    command = 'python3 -c "import json, os; open(os.environ[\'BLUEPRINT_RESULT_FILE\'], \'w\').write(json.dumps({\'accuracy\': 0.95}))"'
+    rc = blueprint.main(["compute", "run", command])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "SUCCEEDED" in out
+    assert "accuracy" in out
+    assert "0.95" in out
+    # No API call required — runs entirely locally
+    assert "metrics" in out
