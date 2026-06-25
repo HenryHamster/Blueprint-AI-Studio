@@ -6,6 +6,7 @@ same compute_experiment payload shape without importing each other.
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 
@@ -57,6 +58,8 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "requires_live_release",
         "require_durable_artifact",
         "smoke_sample",
+        "arms",
+        "declared_metric",
     ):
         val = _pick(opt_key)
         if val is not None:
@@ -76,9 +79,38 @@ def _validate_compute_launch_contract(
     is declared, emits a numeric metric.  Operator-triggered launches may pass
     ``require_smoke=False`` to skip that check.
     """
+    arms = contract.get("arms")
     command = contract.get("command")
-    if not (isinstance(command, str) and command.strip()):
+
+    if arms is not None:
+        # Arms-based multi-arm experiment: validate each arm and synthesize command.
+        if not isinstance(arms, list) or len(arms) == 0:
+            return False, "arms must be a non-empty list of {name, command} objects"
+        for i, arm in enumerate(arms):
+            if not isinstance(arm, dict):
+                return False, f"arms[{i}] must be a dict with 'name' and 'command' fields"
+            arm_name = arm.get("name")
+            arm_cmd = arm.get("command")
+            if not (isinstance(arm_name, str) and arm_name.strip()):
+                return False, f"arms[{i}].name is missing or empty"
+            if not (isinstance(arm_cmd, str) and arm_cmd.strip()):
+                return False, f"arms[{i}].command (arm '{arm_name}') is missing or empty"
+        declared_metric = contract.get("declared_metric")
+        if not (isinstance(declared_metric, str) and declared_metric.strip()):
+            return False, "declared_metric is required and must be a non-empty string when arms are specified"
+        if not (isinstance(command, str) and command.strip()):
+            # Synthesize a sequential shell script from arms. Base64-encode the script
+            # so single quotes, double quotes, and other shell metacharacters in arm
+            # commands cannot break the outer shell invocation.
+            script = "set -e\n" + "\n".join(arm["command"].strip() for arm in arms)
+            encoded = base64.b64encode(script.encode()).decode()
+            contract["command"] = f"echo {encoded} | base64 -d | bash"
+    elif not (isinstance(command, str) and command.strip()):
         return False, "missing or empty command"
+
+    declared_metric = contract.get("declared_metric")
+    if declared_metric is not None and not (isinstance(declared_metric, str) and declared_metric.strip()):
+        return False, "declared_metric must be a non-empty string"
     try:
         spend = float(contract.get("spend_cap_usd"))
     except (TypeError, ValueError):

@@ -1798,3 +1798,241 @@ async def test_strategist_spawn_compute_experiment_invalid_contract_rejected(
         or ""
     ).lower()
     assert "contract invalid" in error_text
+
+
+# ---------------------------------------------------------------------------
+# Arms + declared_metric contract tests
+# ---------------------------------------------------------------------------
+
+
+def test_arms_contract_authoring_flat():
+    """arms and declared_metric are picked up from flat finding fields."""
+    finding = {
+        "arms": [{"name": "adam", "command": "python train.py --opt adam"}],
+        "declared_metric": "val_loss",
+        "spend_cap_usd": 3.0,
+        "deadline_seconds": 600,
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["arms"] == [{"name": "adam", "command": "python train.py --opt adam"}]
+    assert contract["declared_metric"] == "val_loss"
+
+
+def test_arms_contract_authoring_nested():
+    """arms and declared_metric are picked up from nested compute_experiment dict."""
+    finding = {
+        "compute_experiment": {
+            "arms": [
+                {"name": "a", "command": "python a.py"},
+                {"name": "b", "command": "python b.py"},
+            ],
+            "declared_metric": "accuracy",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        }
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert len(contract["arms"]) == 2
+    assert contract["declared_metric"] == "accuracy"
+
+
+def test_arms_contract_authoring_omits_absent_arms():
+    """When no arms key is present, the contract omits it."""
+    finding = {"command": "python run.py", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    contract = _author_compute_launch_contract(finding)
+    assert "arms" not in contract
+    assert "declared_metric" not in contract
+
+
+def test_arms_contract_validation_ok():
+    """A well-formed two-arm contract with declared_metric passes validation."""
+    contract = {
+        "arms": [
+            {"name": "adam", "command": "python train.py --optimizer adam --epochs 5"},
+            {"name": "sgd", "command": "python train.py --optimizer sgd --epochs 5"},
+        ],
+        "declared_metric": "val_loss",
+        "spend_cap_usd": 5.0,
+        "deadline_seconds": 3600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+    assert reason == ""
+
+
+def test_arms_contract_validation_synthesizes_command():
+    """Validation synthesizes a base64-encoded command from arms so the compute job always has one."""
+    import base64
+    import re
+
+    contract = {
+        "arms": [
+            {"name": "a", "command": "python a.py"},
+            {"name": "b", "command": "python b.py"},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+    assert "command" in contract
+    cmd = contract["command"]
+    # Command must use base64 to avoid shell-quoting issues.
+    assert "base64" in cmd
+    m = re.search(r"echo (\S+) \| base64 -d \| bash", cmd)
+    assert m is not None, f"command did not match base64-decode pattern: {cmd!r}"
+    decoded = base64.b64decode(m.group(1)).decode()
+    assert "python a.py" in decoded
+    assert "python b.py" in decoded
+
+
+def test_arms_contract_validation_single_quote_safe():
+    """Arms with single quotes in commands produce a safe base64-encoded command."""
+    import base64
+    import re
+
+    contract = {
+        "arms": [
+            {"name": "a", "command": "python -c 'print(1)'"},
+            {"name": "b", "command": "python b.py --flag='value'"},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+    cmd = contract["command"]
+    m = re.search(r"echo (\S+) \| base64 -d \| bash", cmd)
+    assert m is not None, f"command did not match base64-decode pattern: {cmd!r}"
+    decoded = base64.b64decode(m.group(1)).decode()
+    assert "python -c 'print(1)'" in decoded
+    assert "python b.py --flag='value'" in decoded
+
+
+def test_arms_contract_validation_missing_declared_metric():
+    """arms without declared_metric is rejected."""
+    contract = {
+        "arms": [{"name": "a", "command": "python a.py"}],
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "declared_metric" in reason
+
+
+def test_arms_contract_validation_empty_declared_metric():
+    """declared_metric that is an empty string is rejected."""
+    contract = {
+        "arms": [{"name": "a", "command": "python a.py"}],
+        "declared_metric": "   ",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "declared_metric" in reason
+
+
+def test_arms_contract_validation_empty_arms_list():
+    """An empty arms list is rejected."""
+    contract = {
+        "arms": [],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "arms" in reason
+
+
+def test_arms_contract_validation_arm_missing_command():
+    """An arm with an empty command string is rejected with a descriptive error."""
+    contract = {
+        "arms": [
+            {"name": "good", "command": "python a.py"},
+            {"name": "bad", "command": ""},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "bad" in reason
+    assert "command" in reason
+
+
+def test_arms_contract_validation_arm_missing_name():
+    """An arm with a missing name is rejected."""
+    contract = {
+        "arms": [{"name": "", "command": "python a.py"}],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "name" in reason
+
+
+def test_declared_metric_non_empty_string_required_standalone():
+    """declared_metric alone (no arms) must be a non-empty string if present."""
+    contract = {
+        "command": "python run.py",
+        "declared_metric": "",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "declared_metric" in reason
+
+
+# ---------------------------------------------------------------------------
+# E2E: arms payload survives strategist spawn_task to child task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategist_spawn_compute_experiment_arms_e2e(
+    client: AsyncClient, db_session
+):
+    """Strategic spawn_task with an arms payload must validate, merge into the
+    child task payload, and land arms + declared_metric on the spawned child."""
+    project, task, token = await _make_strategic_task(db_session)
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "spawn_task",
+            "data": {
+                "type": "compute_experiment",
+                "title": "Arms e2e: compare adam vs sgd",
+                "prompt": "Measure val_loss for two optimisers",
+                "arms": [
+                    {"name": "adam", "command": "python train.py --opt adam --epochs 5"},
+                    {"name": "sgd", "command": "python train.py --opt sgd --epochs 5"},
+                ],
+                "declared_metric": "val_loss",
+                "spend_cap_usd": 3.0,
+                "deadline_seconds": 600,
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    child_id = uuid.UUID(resp.json()["task_id"])
+    child = await db_session.get(Task, child_id)
+    assert child is not None
+    payload = child.first_payload
+    assert payload.get("arms") == [
+        {"name": "adam", "command": "python train.py --opt adam --epochs 5"},
+        {"name": "sgd", "command": "python train.py --opt sgd --epochs 5"},
+    ]
+    assert payload.get("declared_metric") == "val_loss"
+    # A synthesized top-level command must also be present for the compute job.
+    assert isinstance(payload.get("command"), str) and payload["command"]

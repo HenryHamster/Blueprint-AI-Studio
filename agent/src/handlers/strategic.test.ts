@@ -1202,3 +1202,59 @@ describe('handleStrategic infra-error propagation (vm_config_missing)', () => {
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
   });
 });
+
+describe('handleStrategic executor prompt: arms-based compute_experiment commission', () => {
+  beforeEach(() => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    } as unknown as { ok: boolean; analysisText: string });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+  });
+
+  it('executor prompt contains the arms-based spawn-task example', async () => {
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-arms-commission',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toBeDefined();
+    expect(executorPrompt).toContain('"arms"');
+    expect(executorPrompt).toContain('"declared_metric"');
+  });
+
+  it('executor prompt arms example includes name and command fields', async () => {
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-arms-fields',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toBeDefined();
+    // Arms example must include specific arm names unique to the arms example (not the single-command example).
+    expect(executorPrompt).toContain('"name": "adam"');
+    expect(executorPrompt).toContain('"name": "sgd"');
+    // declared_metric documents what the command emits
+    expect(executorPrompt).toContain('declared_metric');
+  });
+});
