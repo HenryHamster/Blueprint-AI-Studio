@@ -125,7 +125,7 @@ vi.mock('../prompts/thinker.js', () => ({
 }));
 
 vi.mock('./research-plan.js', () => ({
-  buildStrategicCompletionLogs: () => ({ logs: '', warning: '' }),
+  buildStrategicCompletionLogs: () => ({ logs: '' }),
   readProgressArtifact: () => '',
   buildRejectedProposalsSection: () => '',
   buildOperatorOverridesSection: (o: Array<Record<string, unknown>>) =>
@@ -202,7 +202,7 @@ import { runClaudeCode, apiPost } from '../index.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 import { runThinkerWithGate } from '../prompts/thinker.js';
 import { runStrategicChallenge } from './strategic-helpers.js';
-import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairTokens, getLlmTelemetry } from '../telemetry.js';
+import { recordFormatMiss, recordFormatRepairAttempt } from '../telemetry.js';
 
 describe('buildStagedDirectionsSection', () => {
   it('returns empty string when nothing is staged', () => {
@@ -453,7 +453,7 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText: 'analysis',
-    } as unknown as { ok: boolean; analysisText: string });
+    });
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0,
       allOutput: '',
@@ -485,7 +485,7 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText: 'analysis',
-    } as unknown as { ok: boolean; analysisText: string });
+    });
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0,
       allOutput: '',
@@ -508,49 +508,26 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
     expect(executorPrompt).toContain('if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen');
   });
 
-  it('records format misses and repair attempts with schemaLabel="strategic"', async () => {
+
+  it('does not record format miss or repair attempt for a command-mode strategic run', async () => {
     vi.mocked(runClaudeCode).mockClear();
     vi.mocked(recordFormatMiss).mockClear();
     vi.mocked(recordFormatRepairAttempt).mockClear();
-    vi.mocked(recordFormatRepairTokens).mockClear();
-    vi.mocked(getLlmTelemetry).mockClear();
 
-    // Mock the thinker analysis pass to return ok=true
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText: 'analysis',
-    } as unknown as { ok: boolean; analysisText: string });
+    });
 
-    // Executor run 1: missing JSON (format miss) → triggers repair
-    // Executor run 2: repair attempt (returns still-unparseable)
-    vi.mocked(runClaudeCode)
-      .mockResolvedValueOnce({
-        exitCode: 0,
-        allOutput: 'some text without JSON markers',
-        lastResultText: '',
-      })
-      .mockResolvedValueOnce({
-        exitCode: 0,
-        allOutput: 'repaired response',
-        lastResultText: 'repaired',
-      });
-
-    // Mock buildStrategicCompletionLogs to return warning on first call (triggers repair)
-    // then return clean result on second call (repair succeeded)
-    const researchPlanModule = await import('./research-plan.js');
-    const mockBuildStrategicCompletionLogs = vi.spyOn(researchPlanModule, 'buildStrategicCompletionLogs');
-    mockBuildStrategicCompletionLogs
-      .mockReturnValueOnce({ logs: '', warning: 'no_json_found', missReason: 'no_matching_candidate' })
-      .mockReturnValueOnce({ logs: '', warning: '' });
-
-    // Mock the token telemetry snapshots for before/after repair
-    vi.mocked(getLlmTelemetry)
-      .mockReturnValueOnce({ llm_call_count: 1, total_input_tokens: 100, total_output_tokens: 50, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 })
-      .mockReturnValueOnce({ llm_call_count: 2, total_input_tokens: 200, total_output_tokens: 100, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\nProblem model set at revision 42.',
+      lastResultText: 'Commands ran successfully.',
+    });
 
     const statusRef = { value: '' };
     await handleStrategic(
-      'task-format-repair',
+      'task-cmd-mode',
       { project_name: 'Blueprint' },
       {},
       'tok',
@@ -560,16 +537,10 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
       statusRef,
     );
 
-    // Verify recordFormatMiss is called with schemaLabel='strategic'
-    expect(recordFormatMiss).toHaveBeenCalledWith(expect.any(String), 'strategic');
-
-    // Verify recordFormatRepairAttempt is called with schemaLabel='strategic'
-    expect(recordFormatRepairAttempt).toHaveBeenCalledWith('strategic');
-
-    // Verify recordFormatRepairTokens is called with correct delta and schemaLabel='strategic'
-    expect(recordFormatRepairTokens).toHaveBeenCalledWith(100, 50, 'strategic');
-
-    mockBuildStrategicCompletionLogs.mockRestore();
+    expect(recordFormatMiss).not.toHaveBeenCalled();
+    expect(recordFormatRepairAttempt).not.toHaveBeenCalled();
+    // Executor ran (runClaudeCode called at least once for the executor pass)
+    expect(vi.mocked(runClaudeCode).mock.calls.length).toBeGreaterThan(0);
   });
 });
 
@@ -591,7 +562,7 @@ describe('handleStrategic strategic challenge gate', () => {
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText: 'ANALYSIS_UNDER_CHALLENGE',
-    } as unknown as { ok: boolean; analysisText: string });
+    });
 
     const challengeRecord = {
       challenge_version: 1,
@@ -647,7 +618,7 @@ describe('handleStrategic strategic challenge gate', () => {
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText: 'analysis',
-    } as unknown as { ok: boolean; analysisText: string });
+    });
 
     const blockedRecord = {
       challenge_version: 1,
@@ -683,7 +654,7 @@ describe('handleStrategic strategic challenge gate', () => {
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText: 'analysis',
-    } as unknown as { ok: boolean; analysisText: string });
+    });
 
     const challengeWithRetirement = {
       ...DEFAULT_CHALLENGE_RECORD,
@@ -718,7 +689,7 @@ describe('handleStrategic strategic challenge gate', () => {
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText: 'analysis',
-    } as unknown as { ok: boolean; analysisText: string });
+    });
 
     // The challenge itself produced an OK record with an approved pair — proving the
     // degradation comes from the persist failure, not from a blocked challenge.
@@ -1088,7 +1059,7 @@ describe('handleStrategic executor prompt: version-signal sibling passthrough', 
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText: 'analysis',
-    } as unknown as { ok: boolean; analysisText: string });
+    });
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0,
       allOutput: '',
@@ -1141,7 +1112,7 @@ describe('handleStrategic pre-merge: new_version_theme written into problem_mode
       analysisText: 'analysis',
       newVersionGoal: 'Ship reliable error recovery so ops incidents drop by 50%.',
       newVersionTheme: 'reliability',
-    } as unknown as { ok: boolean; analysisText: string; newVersionGoal?: string; newVersionTheme?: string });
+    });
 
     // fs.readFileSync returns the initial problem_model JSON for the pre-merge read.
     vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
@@ -1182,7 +1153,7 @@ describe('handleStrategic infra-error propagation (vm_config_missing)', () => {
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText: 'analysis',
-    } as unknown as { ok: boolean; analysisText: string });
+    });
     // Executor (call 0) returns exit 0 with no required-call evidence → triggers the
     // required-calls retry (call 1), which dies vm_config_missing.
     vi.mocked(runClaudeCode)
@@ -1209,7 +1180,7 @@ describe('handleStrategic executor prompt: arms-based compute_experiment commiss
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText: 'analysis',
-    } as unknown as { ok: boolean; analysisText: string });
+    });
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0,
       allOutput: '',

@@ -84,7 +84,7 @@ import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import { writeDesignDocHelper } from '../prompt.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
-import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
+import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import {
   calcMessageAge,
   parseResearchContext,
@@ -371,51 +371,15 @@ describe('aggregateDirectionStats', () => {
 });
 
 describe('buildStrategicCompletionLogs', () => {
-  it('does not warn for successful command-based strategic output without legacy JSON', () => {
+  it('returns lastResultText as logs for a command-mode strategic run', () => {
     const result = buildStrategicCompletionLogs(
       'Problem model set at revision 38.\nRunning update set (2387 chars).',
       'Both commands ran successfully.',
     );
 
-    expect(result.warning).toBeUndefined();
     expect(result.logs).toBe('Both commands ran successfully.');
   });
 
-  it('extracts legacy inline strategic JSON when both required keys are present', () => {
-    const result = buildStrategicCompletionLogs(
-      'done\n{"vision":"build great things","direction_operations":[]}',
-      '',
-    );
-
-    expect(result.warning).toBeUndefined();
-    expect(JSON.parse(result.logs)).toEqual({
-      vision: 'build great things',
-      direction_operations: [],
-    });
-  });
-
-  it('extracts problem-model inline strategic JSON without requiring vision', () => {
-    const result = buildStrategicCompletionLogs(
-      'done\n{"problem_model":{"revision":39},"direction_operations":[]}',
-      '',
-    );
-
-    expect(result.warning).toBeUndefined();
-    expect(JSON.parse(result.logs)).toEqual({
-      problem_model: { revision: 39 },
-      direction_operations: [],
-    });
-  });
-
-  it('warns only when legacy-looking strategic JSON cannot be extracted', () => {
-    const result = buildStrategicCompletionLogs(
-      'Legacy keys mentioned: "vision" and "direction_operations", but no JSON object.',
-      'fallback summary',
-    );
-
-    expect(result.warning).toContain('Could not extract strategic JSON');
-    expect(result.logs).toBe('fallback summary');
-  });
 });
 
 describe('classifyFailureCategory', () => {
@@ -1085,10 +1049,10 @@ describe('buildEmptyRepoGuidance', () => {
   const setSourceRichClone = () =>
     vi.mocked(execFileSync).mockReturnValue(
       // > GREENFIELD_SOURCE_FILE_THRESHOLD (8) real source files → live scan false
-      Array.from({ length: 12 }, (_, i) => `src/m${i}.ts`).join('\n') as never,
+      Array.from({ length: 12 }, (_, i) => `src/m${i}.ts`).join('\n'),
     );
   const setEmptyClone = () =>
-    vi.mocked(execFileSync).mockReturnValue('package.json\nREADME.md\n.gitignore' as never);
+    vi.mocked(execFileSync).mockReturnValue('package.json\nREADME.md\n.gitignore');
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -3242,139 +3206,6 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
   });
 });
 
-// ── handleStrategic — bounded self-repair on a legacy-strategic-JSON format miss ─
-//
-// The strategic completion path consumes buildStrategicCompletionLogs (a pure
-// function in research-plan.ts). When the executor emits the legacy inline
-// markers (direction_operations AND (problem_model OR vision)) but the JSON
-// fails to extract on a clean exit, the handler now issues exactly ONE bounded
-// re-ask before falling through. A command-based run with no inline JSON (no
-// warning) is NOT re-asked — preserved by the existing buildStrategicCompletionLogs
-// gate tests above.
-describe('handleStrategic — bounded self-repair on legacy strategic JSON format miss', () => {
-  const SR_TASK_ID = 'sr-strategic-001';
-  const SR_TASK = { title: 'Strategic cycle', description: 'strategic', context: {}, project_context: {} };
-  const SR_PAYLOAD = { base_branch: 'main', research_mode: 'strategic', prompt: 'run the cycle' };
-
-  // Thinker mock must return parseable problem-model JSON with "intent" so that
-  // repairStructuredOutput in runThinkerWithGate is NOT triggered (otherwise it
-  // makes an extra runClaudeCode call that shifts the mock sequence).
-  const THINKER_OUTPUT = '{"intent":{"purpose":"test","current_focus":"test"}}';
-
-  // Challenge mock: empty output → invalid/blocked record, gate fails closed.
-  // The executor still runs; nothing is pre-approved. Inserting this mock is
-  // required because handleStrategic now runs runStrategicChallenge (adversarial
-  // second opinion) between the thinker and executor passes.
-  const CHALLENGE_MOCK = { exitCode: 0, allOutput: '', lastResultText: '' };
-
-  // Executor output that satisfies the three required-call post-checks AND carries
-  // the legacy inline markers in prose (so buildStrategicCompletionLogs sets a
-  // warning) but contains no parseable JSON object.
-  const EXECUTOR_MARKERS_NO_JSON =
-    './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\n' +
-    'I prepared the "problem_model" and "direction_operations" but never emitted the JSON object.';
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
-    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
-    vi.mocked(fs.readFileSync).mockReturnValue('');
-    // Thinker gate needs both handoff files present; returning true everywhere
-    // also makes the legacy /tmp/strategic_output read attempt fire (it then
-    // yields null via the readHandlerOutput mock, so the completion-logs path runs).
-    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(true);
-  });
-
-  function lastPostedStatus(): Record<string, unknown> {
-    const calls = vi.mocked(persistAndPostStatus).mock.calls;
-    return calls[calls.length - 1][1];
-  }
-
-  it('does NOT re-ask a command-based executor that cites markers in prose (command-mode gate prevents extraction)', async () => {
-    // With the fix, executor outputs containing ./strategic commands skip legacy extraction
-    // entirely, even when prose mentions the marker keys. This prevents false-positive
-    // format misses that trigger unnecessary self-repair LLM calls.
-    vi.mocked(runClaudeCode)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
-      .mockResolvedValueOnce(CHALLENGE_MOCK)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: 'Executed.' });
-
-    await handleStrategic(
-      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
-    );
-
-    // Only thinker + challenge + executor — no re-ask despite prose markers, thanks to command-mode gate.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
-    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
-    expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
-    expect(lastPostedStatus().status).toBe('COMPLETED');
-  });
-
-  it('does NOT record repair success when a command-based executor cites markers in prose', async () => {
-    // Command-mode runs with ./strategic signals skip legacy extraction, so no format miss is recorded
-    // even if the output mentions marker keys. This validates the core fix preventing false-positive
-    // format misses from causing LLM waste.
-    vi.mocked(runClaudeCode)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
-      .mockResolvedValueOnce(CHALLENGE_MOCK)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: EXECUTOR_MARKERS_NO_JSON, lastResultText: 'Commands executed.' });
-
-    await handleStrategic(
-      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
-    );
-
-    // Only thinker + challenge + executor; no format telemetry due to command-mode gate.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
-    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
-    expect(vi.mocked(recordFormatRepairSuccess)).not.toHaveBeenCalled();
-    expect(lastPostedStatus().status).toBe('COMPLETED');
-  });
-
-  it('does NOT re-ask a command-based run that emits no inline strategic JSON (no warning gate)', async () => {
-    vi.mocked(runClaudeCode)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
-      .mockResolvedValueOnce(CHALLENGE_MOCK)
-      .mockResolvedValueOnce({
-        exitCode: 0,
-        allOutput: './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\nProblem model set at revision 40.',
-        lastResultText: 'Commands ran successfully.',
-      });
-
-    await handleStrategic(
-      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
-    );
-
-    // Only thinker + challenge + executor — no re-ask, no format telemetry.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
-    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
-    expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
-    expect(lastPostedStatus().status).toBe('COMPLETED');
-  });
-
-  it('does NOT re-ask a command-based run even when prose mentions marker keys (command-mode gate)', async () => {
-    // This validates the core fix: buildStrategicCompletionLogs skips legacy extraction
-    // when ./strategic commands are present, even if marker names appear in prose.
-    vi.mocked(runClaudeCode)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: THINKER_OUTPUT, lastResultText: THINKER_OUTPUT })
-      .mockResolvedValueOnce(CHALLENGE_MOCK)
-      .mockResolvedValueOnce({
-        exitCode: 0,
-        allOutput: EXECUTOR_MARKERS_NO_JSON, // Has commands + prose markers but no JSON
-        lastResultText: 'Commands executed.',
-      });
-
-    await handleStrategic(
-      SR_TASK_ID, SR_PAYLOAD, SR_TASK, 'gh-token', 'owner', 'repo', null, { value: '' },
-    );
-
-    // Only thinker + challenge + executor — no re-ask despite prose markers.
-    // The command-mode signal gates legacy extraction off, preventing false-positive format miss.
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
-    expect(vi.mocked(recordFormatMiss)).not.toHaveBeenCalled();
-    expect(vi.mocked(recordFormatRepairAttempt)).not.toHaveBeenCalled();
-    expect(lastPostedStatus().status).toBe('COMPLETED');
-  });
-});
 
 // ── handlePlan greenfield bootstrap-from-goal mode ───────────────────────────
 // On an empty / near-empty repo the plan prompt must gain an explicit greenfield
@@ -3405,15 +3236,15 @@ describe('handlePlan greenfield bootstrap mode', () => {
     // verifyCloneDelivered still resolves a HEAD (rev-parse → stable sha).
     vi.mocked(execFileSync).mockImplementation((_file: string, args?: unknown) => {
       const a = Array.isArray(args) ? (args as string[]) : [];
-      if (a[0] === 'rev-parse') return 'deadbeefcafe0000' as never;
-      return Buffer.from('') as never;
+      if (a[0] === 'rev-parse') return 'deadbeefcafe0000';
+      return Buffer.from('');
     });
   });
 
   it('injects the greenfield foundation branch when the tree is config-only', async () => {
     // git ls-files returns only config/scaffolding → 0 source files → greenfield.
     vi.mocked(execFileSync).mockReturnValue(
-      'package.json\nREADME.md\ntsconfig.json\n.gitignore\npnpm-lock.yaml\n' as never,
+      'package.json\nREADME.md\ntsconfig.json\n.gitignore\npnpm-lock.yaml\n',
     );
     await handlePlan(GF_TASK_ID, GF_PAYLOAD, GF_TASK, GF_GH_TOKEN, GF_OWNER, GF_REPO, GF_WS, GF_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
@@ -3429,7 +3260,7 @@ describe('handlePlan greenfield bootstrap mode', () => {
   it('omits the greenfield branch and keeps standard no-op guidance on a populated repo', async () => {
     // git ls-files returns many real source files → well above the threshold.
     const sourceFiles = Array.from({ length: 20 }, (_, i) => `src/module${i}.ts`).join('\n');
-    vi.mocked(execFileSync).mockReturnValue(sourceFiles as never);
+    vi.mocked(execFileSync).mockReturnValue(sourceFiles);
     await handlePlan(GF_TASK_ID, GF_PAYLOAD, GF_TASK, GF_GH_TOKEN, GF_OWNER, GF_REPO, GF_WS, GF_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(p).not.toContain('GREENFIELD MODE');

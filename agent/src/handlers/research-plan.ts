@@ -29,7 +29,6 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   describeJsonExtractionResult,
   extractJsonArrayDetailed,
-  extractJsonObjectDetailed,
 } from '../json-extract.js';
 import {
   PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE, readClaudeMd, buildContextPrefix, buildFileTree, isGreenfieldRepo, verifyCloneDelivered, configureAgentPermissions,
@@ -192,56 +191,8 @@ export function aggregateDirectionStats(
 export function buildStrategicCompletionLogs(
   allOutput: string,
   lastResultText: string | null | undefined,
-): { logs: string; warning?: string; missReason?: import('../json-extract.js').JsonExtractionMissReason } {
-  const fallbackLogs = sanitize(lastResultText || allOutput.slice(-50_000));
-
-  // Command-mode signal: presence of strategist `./strategic` commands in the
-  // OUTPUT means no inline JSON is expected. Skip legacy extraction entirely to
-  // avoid false-positive format misses on prose markers.
-  //
-  // NOTE: the marker is assembled from fragments rather than written as a single
-  // literal on purpose. This is an output detector for the strategic handler
-  // (which consumes buildStrategicCompletionLogs), NOT a prompt advertisement —
-  // research/plan share this file but never tell their agent to run that helper.
-  // A contiguous literal would be mis-read as a `./<helper>` advertisement by the
-  // per-handler provisioning-parity invariant (prompt-helper-refs.test.ts) and
-  // wrongly demand research/plan provision a strategist-only helper.
-  const STRATEGIC_COMMAND_MARKER = './' + 'strategic ';
-  if (allOutput.includes(STRATEGIC_COMMAND_MARKER)) {
-    return { logs: fallbackLogs };
-  }
-
-  const hasDirectionOperations = allOutput.includes('"direction_operations"');
-  const hasProblemModel = allOutput.includes('"problem_model"');
-  const hasVision = allOutput.includes('"vision"');
-
-  // Current strategic cycles apply state through ./strategic commands. A final
-  // inline strategic JSON object is a legacy artifact, so its absence should
-  // not warn after a command-based run succeeds.
-  if (!hasDirectionOperations || (!hasProblemModel && !hasVision)) {
-    return { logs: fallbackLogs };
-  }
-
-  const requiredKeys = hasProblemModel
-    ? ['problem_model', 'direction_operations']
-    : ['vision', 'direction_operations'];
-
-  try {
-    const stratObj = extractJsonObjectDetailed(allOutput, ...requiredKeys);
-    if (stratObj.ok) {
-      return { logs: sanitize(JSON.stringify(stratObj.value)) };
-    }
-    return {
-      logs: fallbackLogs,
-      warning: `Could not extract strategic JSON: ${describeJsonExtractionResult(stratObj)}`,
-      missReason: stratObj.reason,
-    };
-  } catch (err: unknown) {
-    return {
-      logs: fallbackLogs,
-      warning: `Could not extract strategic JSON: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
+): { logs: string } {
+  return { logs: sanitize(lastResultText || allOutput.slice(-50_000)) };
 }
 
 /** Maps raw agent-reported failure_category to a high-level failure class. */
@@ -1486,10 +1437,10 @@ export function buildCapabilityVerificationSection(
   for (const capName of Object.keys(capVerif).sort()) {
     if (capName.startsWith('_')) continue;
     const v = capVerif[capName];
-    const status = strVal(v.status as string);
+    const status = strVal(v.status);
     const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
     const present = Array.isArray(v.present) ? v.present as string[] : [];
-    const claimed = strVal(v.claimed_status as string);
+    const claimed = strVal(v.claimed_status);
     const claimedNote = claimed ? ` (design-doc status: ${claimed})` : '';
     if (status === 'claimed_absent') {
       absent.push(`- **${capName}**${claimedNote}: CLAIMED-BUT-ABSENT — all ${missing.length} declared backing path(s) missing: ${missing.join(', ')}`);
@@ -1878,7 +1829,7 @@ export async function handleResearch(
   const researchProjectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
   if (researchProjectId) writeFetchHelper(taskId, researchProjectId, WORKSPACE, { verbs: RESEARCH_FETCH_VERBS });
   const researchFetchGuidance = researchProjectId ? buildFetchGuidance(RESEARCH_FETCH_VERBS) : '';
-  const researchMode = strVal(payload.research_mode as string, 'research');
+  const researchMode = strVal(payload.research_mode, 'research');
   const disallowedTools = configureAgentPermissions(researchMode);
   const promptFingerprint = computeResearchPlanPromptFingerprint('research');
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
@@ -2069,23 +2020,23 @@ ${hotspotsSection}
     // mature" branch never fires on code that does not exist.
     const sys = reconcileSystemEntry(dirDesignCtx.system as Record<string, unknown> | undefined, WORKSPACE);
     if (sys) {
-      lines.push(`System: ${strVal(sys.name as string)} (${strVal(sys.id as string)}) — status: **${strVal(sys.status as string)}**`);
-      if (sys.description) lines.push(`Description: ${strVal(sys.description as string)}`);
+      lines.push(`System: ${strVal(sys.name)} (${strVal(sys.id)}) — status: **${strVal(sys.status)}**`);
+      if (sys.description) lines.push(`Description: ${strVal(sys.description)}`);
       if (sys.spec) {
         const spec = sys.spec as Record<string, unknown>;
         lines.push('Architectural spec (use this as your blueprint):');
-        if (spec.approach) lines.push(`  Approach: ${strVal(spec.approach as string)}`);
+        if (spec.approach) lines.push(`  Approach: ${strVal(spec.approach)}`);
         if (Array.isArray(spec.technology)) lines.push(`  Technology: ${(spec.technology as string[]).join(', ')}`);
         if (Array.isArray(spec.interfaces)) lines.push(`  Interfaces: ${(spec.interfaces as string[]).join('; ')}`);
         if (Array.isArray(spec.integration_points)) lines.push(`  Integration: ${(spec.integration_points as string[]).join('; ')}`);
-        if (spec.notes) lines.push(`  Notes: ${strVal(spec.notes as string)}`);
+        if (spec.notes) lines.push(`  Notes: ${strVal(spec.notes)}`);
       }
     } else {
-      lines.push(`System ${strVal(dirDesignCtx.system_id as string)}: not yet documented in design doc`);
+      lines.push(`System ${strVal(dirDesignCtx.system_id)}: not yet documented in design doc`);
     }
     const dirVerif = dirDesignCtx.verification as Record<string, unknown> | undefined;
     if (dirVerif) {
-      const vstatus = strVal(dirVerif.status as string);
+      const vstatus = strVal(dirVerif.status);
       const missing = Array.isArray(dirVerif.missing) ? dirVerif.missing as string[] : [];
       const present = Array.isArray(dirVerif.present) ? dirVerif.present as string[] : [];
       if (vstatus === 'claimed_absent') {
@@ -2143,10 +2094,10 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
     for (const sysId of Object.keys(sysVerif).sort()) {
       if (sysId.startsWith('_')) continue;
       const v = sysVerif[sysId];
-      const status = strVal(v.status as string);
+      const status = strVal(v.status);
       const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
       const present = Array.isArray(v.present) ? v.present as string[] : [];
-      const claimed = strVal(v.claimed_status as string);
+      const claimed = strVal(v.claimed_status);
       const claimedNote = claimed ? ` (design-doc status: ${claimed})` : '';
       if (status === 'claimed_absent') {
         absent.push(`- **${sysId}**${claimedNote}: CLAIMED-BUT-ABSENT — all ${missing.length} declared module(s) missing: ${missing.join(', ')}`);
