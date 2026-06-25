@@ -211,6 +211,12 @@ if touches "backend/"; then
         # only with memory headroom for it.
         _GATE_MODE="harness"
       fi
+    elif [ -f scripts/test-backend.sh ] && grep -qs -- '--standalone' scripts/test-backend.sh && grep -qs -- '--no-postgres' scripts/test-backend.sh; then
+      # Docker unavailable but harness supports --standalone --no-postgres: run
+      # the no-DB invariant + manifest suites directly (no Docker, no Postgres
+      # required). Keeps typed-mock/helper-leak/manifest violations from
+      # silently passing when they would only be caught at the promotion qualifier.
+      _GATE_MODE="harness-standalone"
     fi
     if [ "$_GATE_MODE" = "bare" ] && [ "$_PG_ENV_OK" = "0" ] && grep -qs USE_TEST_POSTGRES "backend/conftest.py" "backend"/*/conftest.py; then
       # The suite selects Postgres-vs-SQLite from env, the Postgres test env

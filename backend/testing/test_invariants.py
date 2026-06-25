@@ -669,7 +669,15 @@ class TestSchemaRevisionSync:
             text=True,
         ).stdout.splitlines()
         pattern = re.compile(rf"^(?:{'|'.join(map(re.escape, helpers))})$|\.bak$")
-        leaked = [path for path in tracked if pattern.search(path)]
+        # 'check' is the repo's own build-runner and is intentionally tracked in git.
+        # It also appears in AGENT_HELPER_NAMES because agents overwrite it with a
+        # task-specific version via writeCheckHelper; the /.gitignore entry prevents
+        # an UNTRACKED 'check' file from being accidentally staged.
+        _TRACKED_BY_DESIGN: frozenset = frozenset({'check'})
+        leaked = [
+            path for path in tracked
+            if pattern.search(path) and path not in _TRACKED_BY_DESIGN
+        ]
         assert not leaked, "Tracked helper or backup files found:\n  " + "\n  ".join(
             leaked
         )

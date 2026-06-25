@@ -3475,7 +3475,7 @@ describe('mid-run ./fetch provisioning for review/fix', () => {
     expect(prompt).toContain('./fetch section <key>');
     expect(prompt).toContain('./fetch playbook <key>');
     expect(prompt).not.toContain('./fetch problem-model');
-    expect(vi.mocked(writeFetchHelper)).toHaveBeenCalledWith(
+    expectCalledWith(writeFetchHelper,
       'task-review-fetch', 'p-rev', expect.anything(), { verbs: PLAN_FETCH_VERBS },
     );
   });
@@ -3498,7 +3498,7 @@ describe('mid-run ./fetch provisioning for review/fix', () => {
     );
     const prompt = capturedFixPrompt();
     expect(prompt).toContain('MID-RUN FETCH (./fetch)');
-    expect(vi.mocked(writeFetchHelper)).toHaveBeenCalledWith(
+    expectCalledWith(writeFetchHelper,
       'task-fix-fetch', 'p-fix', expect.anything(), { verbs: PLAN_FETCH_VERBS },
     );
   });
