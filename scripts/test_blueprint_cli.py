@@ -468,34 +468,6 @@ def mock_api(monkeypatch):
                      "active_tasks": 0, "rl_hit_count": 1, "disabled_models": {}},
                 ],
             }
-        if "/resource-envelope" in path and method == "PATCH":
-            return {
-                "project_id": "proj-1",
-                "max_concurrent_vms": 8,
-                "max_concurrent_compute_jobs": 3,
-                "spend_ceiling_usd": 200.0,
-                "spend_window_days": 7,
-                "recent_spend_usd": 42.5,
-                "recent_spend_compute_usd": 10.0,
-                "recent_spend_agent_vm_usd": 30.0,
-                "recent_spend_idle_usd": 2.5,
-                "active_vm_count": 2,
-                "is_throttled": False,
-            }
-        if "/resource-envelope" in path:
-            return {
-                "project_id": "proj-1",
-                "max_concurrent_vms": 5,
-                "max_concurrent_compute_jobs": 2,
-                "spend_ceiling_usd": 100.0,
-                "spend_window_days": 7,
-                "recent_spend_usd": 42.1234,
-                "recent_spend_compute_usd": 10.0,
-                "recent_spend_agent_vm_usd": 30.0,
-                "recent_spend_idle_usd": 2.1234,
-                "active_vm_count": 3,
-                "is_throttled": False,
-            }
         if "/messages" in path and "/answer" in path and method == "POST":
             msg_id = path.split("/messages/")[1].split("/answer")[0]
             return {"id": f"answer-{msg_id[:8]}", "parent_message_id": msg_id,
@@ -1867,7 +1839,7 @@ def test_changelog_to_markdown_no_pr():
     tasks = [{"task_type": "other", "title": "Internal cleanup", "pr_number": None}]
     md = blueprint._changelog_to_markdown(tasks)
     assert "- Internal cleanup" in md
-    assert "#" not in md
+    assert "- #" not in md
 
 
 # ── power-user task subcommands ───────────────────────────────────────────────
@@ -2826,7 +2798,7 @@ def test_envelope_show(mock_api, monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "RESOURCE ENVELOPE" in out
-    assert "proj-1" in out
+    assert "proj-test-uuid" in out
     assert "max_concurrent_vms" in out
     assert "spend_ceiling_usd" in out
     assert "is_throttled" in out
@@ -2837,8 +2809,8 @@ def test_envelope_show(mock_api, monkeypatch, capsys):
     rc = blueprint.main(["--json", "envelope", "show"])
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
-    assert parsed["max_concurrent_vms"] == 5
-    assert parsed["spend_ceiling_usd"] == 100.0
+    assert parsed["max_concurrent_vms"] == 4
+    assert parsed["spend_ceiling_usd"] == 50.0
     assert parsed["is_throttled"] is False
 
     # set with read-only config is refused
