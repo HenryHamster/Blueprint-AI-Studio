@@ -57,6 +57,7 @@ import { handleMemo } from './memo.js';
 import { runClaudeCode, persistAndPostStatus, sendHeartbeatSync, setCurrentPromptFingerprint } from '../index.js';
 import { configureAgentPermissions } from '../prompt.js';
 import { recordFormatRepairTokens, recordFormatRepairMiss, getLlmTelemetry } from '../telemetry.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 const TASK_ID = 'task-memo-123';
@@ -267,7 +268,7 @@ describe('handleMemo', () => {
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     // Verify recordFormatRepairTokens is called with positive delta and schemaLabel='memo'
-    expect(vi.mocked(recordFormatRepairTokens)).toHaveBeenCalledWith(200, 100, 'memo');
+    expectCalledWith(recordFormatRepairTokens, 200, 100, 'memo');
   });
 
   it('does NOT reopen when first run failed (exitCode !== 0)', async () => {
@@ -314,7 +315,7 @@ describe('handleMemo', () => {
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     // recordFormatRepairMiss should be called with the retry's miss reason
-    expect(vi.mocked(recordFormatRepairMiss)).toHaveBeenCalledWith('parsed_object_missing_key', 'memo');
+    expectCalledWith(recordFormatRepairMiss, 'parsed_object_missing_key', 'memo');
   });
 
   it('logs the serialized memo object on success', async () => {
