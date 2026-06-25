@@ -1941,6 +1941,43 @@ async def strategic_operation(
         }
         if direction_id:
             spawn_payload["direction_id"] = direction_id
+
+        # compute_experiment requires a validated launch contract with spend-gate.
+        spawn_requires_approval: bool | None = None
+        if spawn_type == "compute_experiment":
+            from app.compute_experiment_contract import (
+                _author_compute_launch_contract,
+                _validate_compute_launch_contract,
+                resolve_compute_spend_approval,
+            )
+
+            contract = _author_compute_launch_contract(data)
+            ok, reason = _validate_compute_launch_contract(
+                contract, require_smoke=False
+            )
+            if not ok:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"compute_experiment contract invalid: {reason}",
+                )
+            spend_cap = float(contract.get("spend_cap_usd") or 0)
+            direction_ctx = next(
+                (
+                    d
+                    for d in (project.directions or [])
+                    if d.get("id") == direction_id
+                ),
+                None,
+            )
+            needs_approval, _threshold = resolve_compute_spend_approval(
+                runtime_config=_runtime_config,
+                direction=direction_ctx,
+                spend_cap_usd=spend_cap,
+            )
+            spawn_requires_approval = needs_approval
+            # Merge contract fields into the payload so the handler gets them.
+            spawn_payload.update(contract)
+
         # Apply per-type model/effort defaults
         type_model = _runtime_config.get("task_type_models", {}).get(spawn_type) or None
         type_effort = (
@@ -2125,6 +2162,11 @@ async def strategic_operation(
             priority=100,  # ahead of default (50) — course-correction runs first
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             created_by="STRATEGIC_AGENT",
+            **(
+                {"requires_approval": spawn_requires_approval}
+                if spawn_requires_approval is not None
+                else {}
+            ),
         )
         session.add(new_task)
         await session.flush()

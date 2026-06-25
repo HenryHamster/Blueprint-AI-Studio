@@ -17318,7 +17318,7 @@ class TestStrategistSpawnableRegistry:
     def test_allowlist_equals_expected_knowledge_types(self):
         from app.task_capabilities import STRATEGIST_SPAWNABLE_TASK_TYPES
 
-        expected = frozenset({"research", "plan", "web_research", "design"})
+        expected = frozenset({"research", "plan", "web_research", "design", "compute_experiment"})
         assert expected == STRATEGIST_SPAWNABLE_TASK_TYPES
 
     def test_allowlist_is_derived_from_capability_flag(self):

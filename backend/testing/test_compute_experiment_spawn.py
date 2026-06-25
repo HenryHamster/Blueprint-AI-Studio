@@ -1570,3 +1570,149 @@ async def test_launch_allows_zero_config_project_below_global_threshold(db_sessi
             rcs.runtime_config["compute_experiment_spend_threshold_usd"] = prev
         else:
             rcs.runtime_config.pop("compute_experiment_spend_threshold_usd", None)
+
+
+# ---------------------------------------------------------------------------
+# Strategist spawn_task spend-gate regression tests
+# ---------------------------------------------------------------------------
+
+
+async def _make_strategic_task(db_session) -> tuple:
+    """Create a project and a strategic_review task; return (project, task, token)."""
+    project = Project(name="StrategistSpawnGate", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Strategic review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-strategic-spawn",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-strategic-spawn", task_type="strategic_review"
+    )
+    return project, task, token
+
+
+@pytest.mark.asyncio
+async def test_strategist_spawn_compute_experiment_above_threshold_requires_approval(
+    client: AsyncClient, db_session
+):
+    """Strategic spawn_task for compute_experiment with spend_cap above threshold
+    must set requires_approval=True on the created task."""
+    import app.shared_state as _shared_state
+
+    project, task, token = await _make_strategic_task(db_session)
+    prev = _shared_state.runtime_config.get("compute_experiment_spend_threshold_usd")
+    _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = 5.0
+    try:
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "compute_experiment",
+                    "title": "Strategist above-threshold experiment",
+                    "prompt": "Run the benchmark to measure throughput improvement",
+                    "command": "python bench.py",
+                    "spend_cap_usd": 10.0,
+                    "deadline_seconds": 600,
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        child_id = uuid.UUID(resp.json()["task_id"])
+        child = await db_session.get(Task, child_id)
+        assert child is not None
+        assert child.requires_approval is True
+    finally:
+        if prev is not None:
+            _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = prev
+        else:
+            _shared_state.runtime_config.pop(
+                "compute_experiment_spend_threshold_usd", None
+            )
+
+
+@pytest.mark.asyncio
+async def test_strategist_spawn_compute_experiment_below_threshold_no_approval(
+    client: AsyncClient, db_session
+):
+    """Strategic spawn_task for compute_experiment with spend_cap at or below
+    threshold must NOT set requires_approval."""
+    import app.shared_state as _shared_state
+
+    project, task, token = await _make_strategic_task(db_session)
+    prev = _shared_state.runtime_config.get("compute_experiment_spend_threshold_usd")
+    _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = 5.0
+    try:
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "compute_experiment",
+                    "title": "Strategist below-threshold experiment",
+                    "prompt": "Run the benchmark to measure throughput improvement",
+                    "command": "python bench.py",
+                    "spend_cap_usd": 3.0,
+                    "deadline_seconds": 600,
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        child_id = uuid.UUID(resp.json()["task_id"])
+        child = await db_session.get(Task, child_id)
+        assert child is not None
+        assert child.requires_approval is False
+    finally:
+        if prev is not None:
+            _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = prev
+        else:
+            _shared_state.runtime_config.pop(
+                "compute_experiment_spend_threshold_usd", None
+            )
+
+
+@pytest.mark.asyncio
+async def test_strategist_spawn_compute_experiment_invalid_contract_rejected(
+    client: AsyncClient, db_session
+):
+    """Strategic spawn_task for compute_experiment with a malformed contract
+    (missing command) must be rejected with 400 before any task is created."""
+    project, task, token = await _make_strategic_task(db_session)
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "spawn_task",
+            "data": {
+                "type": "compute_experiment",
+                "title": "Invalid contract experiment",
+                "prompt": "Run something",
+                "command": "",
+                "spend_cap_usd": 2.0,
+                "deadline_seconds": 300,
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    error_text = (
+        body.get("detail")
+        or (body.get("error") or {}).get("message")
+        or ""
+    ).lower()
+    assert "contract invalid" in error_text

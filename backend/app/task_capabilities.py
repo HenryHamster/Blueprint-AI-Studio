@@ -632,6 +632,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         completion_handler="compute_experiment",
         evaluation="artifact-delivery",
         run_shape="experiment_loop",
+        strategist_spawnable=True,
     ),
     TaskCapability(
         TaskType.web_research,
@@ -812,7 +813,7 @@ PLAN_KNOWLEDGE_SUBTASK_TYPES: frozenset[str] = frozenset(
 # a newly registered investigation/knowledge type becomes strategist-spawnable by
 # declaring ``strategist_spawnable=True`` alone, with no handler edit. Deliberately
 # limited to investigation/knowledge/plan types (research, plan, web_research,
-# design); implementation / PR-producing write types are excluded and must flow
+# design, compute_experiment); implementation / PR-producing write types are excluded and must flow
 # through the normal direction → research → plan → create path.
 STRATEGIST_SPAWNABLE_TASK_TYPES: frozenset[str] = frozenset(
     capability.id.value
