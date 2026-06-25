@@ -3721,3 +3721,26 @@ def test_compute_run_local_no_criterion_unchanged(tmp_path, monkeypatch, capsys)
     assert "verdict" not in out.lower() or "NOT EVALUABLE" not in out
     assert "MET" not in out
     assert "SUCCEEDED" in out
+
+
+def test_compute_run_local_criterion_verdict_auc_case_mismatch(tmp_path, monkeypatch, capsys):
+    """Case-insensitive capture->eval loop: emits AUC=0.9, criterion auc >= 0.8 => MET."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "success_criterion": {"metric": "auc", "operator": ">=", "threshold": 0.8},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    # Command emits uppercase key; criterion uses lowercase — must match case-insensitively
+    monkeypatch.setattr(_subprocess, "run", _make_fake_run({"AUC": 0.9}))
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "MET" in out
+    assert "NOT MET" not in out
+    assert "0.9" in out
