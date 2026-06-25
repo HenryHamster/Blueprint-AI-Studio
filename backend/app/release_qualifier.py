@@ -1382,6 +1382,15 @@ async def run_qualification(
         if prior_qual.get("status") == "infra_failure"
         else []
     )
+    # Carry forward the prior-superseded flag: when the reconciler previously
+    # wrote blocker='qualification_superseded' (force-promote out-of-band), the
+    # new qualification's diff is stabilization-only and grading it against the
+    # frozen goal is meaningless.  Sticky: once set it survives across infra-
+    # failure retry cycles until a genuine new version cycle clears it.
+    prior_superseded: bool = bool(
+        prior_qual.get("prior_superseded")
+        or prior_qual.get("blocker") == "qualification_superseded"
+    )
 
     # 5. Spawn the heavy children.
     started_at = _utcnow().isoformat()
@@ -1496,6 +1505,7 @@ async def run_qualification(
         "previous_infra_failure_signature": prior_infra_failure_signature,
         "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
         "infra_attempt_history": infra_attempt_history,
+        "prior_superseded": prior_superseded,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
@@ -3227,6 +3237,19 @@ async def _finalize_qualification(
             )
             return await _handle_infra_failure(session, version, qual, label)
         merge_grade_blocked = bool(merge_grade_cert["blocked"])
+        # Already-promoted exemption: when the previous qualification was
+        # qualification_superseded (force-promoted out-of-band), the feature
+        # content is already on the promotion target.  Grading stabilization-
+        # only tail commits against the frozen goal is meaningless — suppress.
+        if merge_grade_blocked and qual.get("prior_superseded"):
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d merge_grade_goal_coverage suppressed: "
+                "prior qualification was superseded (force-promoted out-of-band); "
+                "stabilization-only diff graded against frozen goal is not actionable",
+                version.version_number,
+            )
+            merge_grade_blocked = False
+            merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
 
     # --- Compute the composite ---------------------------------------------
     # Whether an UNRESOLVED candidate CI (pending / no check-runs) hard-blocks

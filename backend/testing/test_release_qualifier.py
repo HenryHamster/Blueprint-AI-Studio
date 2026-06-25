@@ -8841,6 +8841,104 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
+    db_session, mocker
+):
+    """Already-promoted exemption: when the previous qualification was
+    qualification_superseded (force-promoted out-of-band), the merge-grade block
+    is suppressed even when covers_goal=False.  A fresh version that never had
+    qualification_superseded still blocks.
+
+    Scenarios:
+      (a) prior_superseded=True + failing merge-grade -> NOT blocked, promote proceeds
+      (b) prior_superseded absent/False + failing merge-grade -> hard block (gate
+          remains load-bearing for never-promoted versions)
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    clean_audit = {
+        "audit_score": 1.0,
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 5,
+            "test_count_delta": 2,
+        },
+    }
+    clean_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+    failing_merge_grade = {
+        "covers_goal": False,
+        "coverage_score": 0.05,
+        "biggest_gap": "Stabilization-only tail commits; feature content already on main.",
+        "candidate_sha": "feed" * 10,
+    }
+    goal = "Deliver the already-promoted merge-grade exemption"
+
+    # --- (a) prior_superseded=True -> merge-grade block suppressed, promote proceeds
+    project_a, version_a = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_a,
+        version_a,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    # Stamp prior_superseded=True directly on last_qualification (simulates
+    # run_qualification carrying forward the qualification_superseded blocker).
+    version_a.last_qualification = {
+        **version_a.last_qualification,
+        "prior_superseded": True,
+    }
+    db_session.add(version_a)
+    await db_session.commit()
+    await db_session.refresh(version_a)
+
+    promote_a = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+    result_a = await rq._finalize_qualification(db_session, version_a)
+    await db_session.commit()
+
+    promote_a.assert_called_once()
+    assert result_a == {"status": "promoted"}, (
+        f"Expected promotion for superseded version but got: {result_a}"
+    )
+
+    # --- (b) prior_superseded absent -> gate still fires for a fresh version ---
+    project_b, version_b = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_b,
+        version_b,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    # Do NOT set prior_superseded — version_b is a never-promoted fresh version.
+    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result_b = await rq._finalize_qualification(db_session, version_b)
+    await db_session.commit()
+
+    assert result_b["status"] == "not_promoted"
+    assert result_b["blocker"] == "merge_grade_goal_coverage"
+    promote_b.assert_not_called()
+    await db_session.refresh(version_b)
+    assert version_b.last_qualification["status"] == "not_promoted"
+    assert version_b.last_qualification["blocker"] == "merge_grade_goal_coverage"
+
+
+@pytest.mark.asyncio
 async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocker):
     """Fail-safe: when the apply gate cannot determine safety (prod state
     unreadable, candidate fetch failed, scratch DB unprovisionable) it returns
