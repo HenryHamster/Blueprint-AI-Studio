@@ -29,6 +29,10 @@ _GUARDED_MODULES = [
     "sqlalchemy",
     "sqlmodel",
     "pydantic",
+    "alembic",
+    "uvicorn",
+    "asyncpg",
+    "jwt",
 ]
 
 

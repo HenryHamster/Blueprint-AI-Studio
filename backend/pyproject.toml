@@ -235,6 +235,14 @@ filterwarnings = [
     "error::PendingDeprecationWarning:sqlmodel",
     "error::DeprecationWarning:pydantic",
     "error::PendingDeprecationWarning:pydantic",
+    "error::DeprecationWarning:alembic",
+    "error::PendingDeprecationWarning:alembic",
+    "error::DeprecationWarning:uvicorn",
+    "error::PendingDeprecationWarning:uvicorn",
+    "error::DeprecationWarning:asyncpg",
+    "error::PendingDeprecationWarning:asyncpg",
+    "error::DeprecationWarning:jwt",
+    "error::PendingDeprecationWarning:jwt",
 ]
 markers = [
     "smoketest: Critical tests run by the smoketest agent after every merge to main",
