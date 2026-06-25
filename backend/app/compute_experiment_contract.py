@@ -7,7 +7,25 @@ same compute_experiment payload shape without importing each other.
 from __future__ import annotations
 
 import base64
+import re
+from pathlib import Path
 from typing import Any
+
+# Safe identifier charset for arm names: no shell metacharacters, no colons
+# (colon is the delimiter in the NAME:PATH aggregator spec), no slashes/dots
+# (would escape per-arm result directories).
+_ARM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# Safe charset for metric keys: allows common patterns like val/loss, top-1
+# while excluding shell metacharacters (", $, ;, backticks, spaces).
+_METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+
+# Read and encode the aggregator script at module-load time.  The blob is then
+# embedded in generated per-arm bash wrappers so the aggregator runs on the
+# remote compute node without a separate deploy step.
+_AGGREGATOR_B64 = base64.b64encode(
+    (Path(__file__).parent / "compute_arm_aggregator.py").read_bytes()
+).decode()
 
 
 COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY = (
@@ -87,6 +105,7 @@ def _validate_compute_launch_contract(
         # Arms-based multi-arm experiment: validate each arm and synthesize command.
         if not isinstance(arms, list) or len(arms) == 0:
             return False, "arms must be a non-empty list of {name, command} objects"
+        seen_names: set[str] = set()
         for i, arm in enumerate(arms):
             if not isinstance(arm, dict):
                 return False, f"arms[{i}] must be a dict with 'name' and 'command' fields"
@@ -94,24 +113,72 @@ def _validate_compute_launch_contract(
             arm_cmd = arm.get("command")
             if not (isinstance(arm_name, str) and arm_name.strip()):
                 return False, f"arms[{i}].name is missing or empty"
+            if not _ARM_NAME_RE.match(arm_name):
+                return (
+                    False,
+                    f"arms[{i}].name {arm_name!r} contains invalid characters — "
+                    "arm names must match ^[A-Za-z0-9_-]+$",
+                )
+            if arm_name in seen_names:
+                return False, f"duplicate arm name {arm_name!r} — arm names must be unique"
+            seen_names.add(arm_name)
             if not (isinstance(arm_cmd, str) and arm_cmd.strip()):
                 return False, f"arms[{i}].command (arm '{arm_name}') is missing or empty"
         declared_metric = contract.get("declared_metric")
         if not (isinstance(declared_metric, str) and declared_metric.strip()):
             return False, "declared_metric is required and must be a non-empty string when arms are specified"
+        if not _METRIC_KEY_RE.match(declared_metric):
+            return (
+                False,
+                f"declared_metric {declared_metric!r} contains invalid characters — "
+                "metric keys must match ^[A-Za-z0-9_./-]+$",
+            )
         if not (isinstance(command, str) and command.strip()):
-            # Synthesize a sequential shell script from arms. Base64-encode the script
-            # so single quotes, double quotes, and other shell metacharacters in arm
-            # commands cannot break the outer shell invocation.
-            script = "set -e\n" + "\n".join(arm["command"].strip() for arm in arms)
+            # Synthesize a per-arm isolation script. Each arm runs in its own
+            # subshell with BLUEPRINT_RESULT_FILE pointed to a private path so
+            # arms cannot overwrite each other's metric (no last-arm-wins).
+            # A subshell failure is captured as an exit_code file and does NOT
+            # abort the remaining arms.  After all arms finish, the aggregator
+            # script (embedded as a base64 blob) combines each arm's result into
+            # the canonical {"arms": {name: {declared_metric: value}}} block and
+            # writes it to the real BLUEPRINT_RESULT_FILE.
+            lines: list[str] = [
+                '_BRF_MAIN="${BLUEPRINT_RESULT_FILE:-/tmp/blueprint_result.json}"',
+                '_BRF_BASE="$(dirname "${_BRF_MAIN}")/.blueprint_arm_results"',
+                'mkdir -p "${_BRF_BASE}"',
+            ]
+            arm_result_specs: list[str] = []
+            for arm in arms:
+                aname = arm["name"]
+                acmd = arm["command"].strip()
+                lines += [
+                    f'mkdir -p "${{_BRF_BASE}}/{aname}"',
+                    f'(export BLUEPRINT_RESULT_FILE="${{_BRF_BASE}}/{aname}/result.json"; {acmd})',
+                    f'echo $? > "${{_BRF_BASE}}/{aname}/exit_code"',
+                ]
+                arm_result_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/result.json"')
+            arm_specs_arg = " ".join(arm_result_specs)
+            lines += [
+                f"echo {_AGGREGATOR_B64} | base64 -d > /tmp/blueprint_arm_agg.py",
+                f'python3 /tmp/blueprint_arm_agg.py --arms {arm_specs_arg}'
+                f' --declared-metric "{declared_metric}" --output "${{_BRF_MAIN}}"',
+            ]
+            script = "\n".join(lines)
             encoded = base64.b64encode(script.encode()).decode()
             contract["command"] = f"echo {encoded} | base64 -d | bash"
     elif not (isinstance(command, str) and command.strip()):
         return False, "missing or empty command"
 
     declared_metric = contract.get("declared_metric")
-    if declared_metric is not None and not (isinstance(declared_metric, str) and declared_metric.strip()):
-        return False, "declared_metric must be a non-empty string"
+    if declared_metric is not None:
+        if not (isinstance(declared_metric, str) and declared_metric.strip()):
+            return False, "declared_metric must be a non-empty string"
+        if not _METRIC_KEY_RE.match(declared_metric):
+            return (
+                False,
+                f"declared_metric {declared_metric!r} contains invalid characters — "
+                "metric keys must match ^[A-Za-z0-9_./-]+$",
+            )
     try:
         spend = float(contract.get("spend_cap_usd"))
     except (TypeError, ValueError):

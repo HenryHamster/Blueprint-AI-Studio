@@ -3769,6 +3769,7 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     """
     declared_metric: str | None = None
     success_criterion: dict | None = None
+    arms: list | None = None
     if getattr(args, "local_spec", None):
         # --local <spec.json>: read spec file; validate_backend_name is bypassed
         # because we call subprocess.run directly (no DB-backed flow).
@@ -3780,9 +3781,10 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"error: could not read spec file {args.local_spec!r}: {exc}")
             sys.exit(1)
+        arms = spec.get("arms") or None
         command = spec.get("command")
-        if not command:
-            print("error: spec JSON must contain a 'command' field")
+        if not command and not arms:
+            print("error: spec JSON must contain a 'command' field (or an 'arms' list)")
             sys.exit(1)
         declared_metric = spec.get("declared_metric")
         raw_sc = spec.get("success_criterion")
@@ -3802,17 +3804,83 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         if cm is not None and co is not None and ct is not None:
             success_criterion = {"metric": cm, "operator": co, "threshold": ct}
 
-    if command is None:
+    if command is None and not arms:
         print("error: provide a run command or --local <spec.json>")
         sys.exit(1)
 
     tmpdir = tempfile.mkdtemp(prefix="blueprint-compute-run-")
-    result_file = os.path.join(tmpdir, "result.json")
     artifact_dir = os.path.join(tmpdir, "artifacts")
     os.makedirs(artifact_dir, exist_ok=True)
     env = os.environ.copy()
-    env["BLUEPRINT_RESULT_FILE"] = result_file
     env["BLUEPRINT_ARTIFACT_DIR"] = artifact_dir
+
+    if arms:
+        arm_names = [a.get("name", f"arm_{i}") for i, a in enumerate(arms)]
+        print(f"arms        : {arm_names}")
+        if declared_metric:
+            print(f"declared    : {declared_metric}")
+        print("running arms...")
+
+        arm_results: dict[str, dict] = {}
+        overall_exit_code = 0
+        for i, arm in enumerate(arms):
+            arm_name = arm.get("name", f"arm_{i}")
+            arm_cmd = arm.get("command", "")
+            arm_result_file = os.path.join(tmpdir, f"result_{arm_name}.json")
+            arm_env = env.copy()
+            arm_env["BLUEPRINT_RESULT_FILE"] = arm_result_file
+
+            print(f"  [{arm_name}] running...")
+            arm_proc = subprocess.run(["bash", "-lc", arm_cmd], env=arm_env)
+            arm_exit_code = arm_proc.returncode
+
+            if arm_exit_code != 0:
+                overall_exit_code = arm_exit_code
+                arm_results[arm_name] = {"__failed__": True, "__exit_code__": arm_exit_code}
+                continue
+
+            arm_metrics: dict | None = None
+            if os.path.exists(arm_result_file):
+                try:
+                    with open(arm_result_file) as f:
+                        arm_metrics = json.load(f)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  [{arm_name}] warning: could not parse result file: {exc}")
+
+            arm_results[arm_name] = arm_metrics if arm_metrics is not None else {}
+
+        status = "SUCCEEDED" if overall_exit_code == 0 else "FAILED"
+        metrics: dict | None = {"arms": arm_results}
+        verdict: dict | None = None
+        result = {"status": status, "exit_code": overall_exit_code, "metrics": metrics,
+                  "declared_metric": declared_metric, "verdict": verdict}
+
+        def _render(r: dict) -> None:
+            print(f"status      : {r['status']} (exit_code={r['exit_code']})")
+            dm = r.get("declared_metric")
+            arms_block = (r.get("metrics") or {}).get("arms", {})
+            if arms_block:
+                print(f"arms        : {len(arms_block)} arm(s)")
+                for aname, ametrics in arms_block.items():
+                    if ametrics.get("__failed__"):
+                        ec = ametrics.get("__exit_code__", "?")
+                        print(f"  [{aname}] FAILED (exit_code={ec})")
+                    elif dm:
+                        val = ametrics.get(dm)
+                        if val is not None:
+                            print(f"  [{aname}] {dm}={val}")
+                        else:
+                            print(f"  [{aname}] {dm}=NOT CAPTURED")
+                    else:
+                        print(f"  [{aname}] {ametrics}")
+            else:
+                print("metrics     : (none emitted)")
+
+        _emit(args, result, _render)
+        return
+
+    result_file = os.path.join(tmpdir, "result.json")
+    env["BLUEPRINT_RESULT_FILE"] = result_file
 
     print(f"command     : {command}")
     print(f"result_file : {result_file}")
@@ -3827,7 +3895,7 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     exit_code = proc.returncode
     status = "SUCCEEDED" if exit_code == 0 else "FAILED"
 
-    metrics: dict | None = None
+    metrics = None
     if os.path.exists(result_file):
         try:
             with open(result_file) as f:
@@ -3835,7 +3903,7 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"  warning: could not parse result file: {exc}")
 
-    verdict: dict | None = None
+    verdict = None
     if success_criterion is not None:
         verdict = _evaluate_criterion(metrics, success_criterion)
 

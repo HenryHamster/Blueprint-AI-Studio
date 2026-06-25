@@ -3716,3 +3716,100 @@ def test_compute_run_local_criterion_verdict_auc_case_mismatch(tmp_path, monkeyp
     assert "MET" in out
     assert "NOT MET" not in out
     assert "0.9" in out
+
+
+def test_compute_run_local_two_arm_metric_isolation(tmp_path, monkeypatch, capsys):
+    """Each arm writes to its own isolated result file; both values are captured independently (not last-arm-wins)."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "score",
+        "arms": [
+            {"name": "arm_a", "command": "echo arm_a"},
+            {"name": "arm_b", "command": "echo arm_b"},
+        ],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run_arms(cmd, env=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf:
+            # Each arm writes a distinct score value to its own result file.
+            # arm_a gets 0.7; arm_b gets 0.9 — determined by the path suffix.
+            value = 0.7 if "arm_a" in rf else 0.9
+            with open(rf, "w") as f:
+                json.dump({"score": value}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run_arms)
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "SUCCEEDED" in out
+    # Both arm values must appear in output — not overwritten by last arm
+    assert "arm_a" in out
+    assert "arm_b" in out
+    assert "0.7" in out
+    assert "0.9" in out
+    # Verify the JSON result structure directly by re-running and capturing result
+    import io as _io
+    captured = _io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured)
+    args2 = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args2)
+    # The render output shows per-arm values; both arms' distinct metric values present
+    out2 = captured.getvalue()
+    assert "arm_a" in out2 and "0.7" in out2
+    assert "arm_b" in out2 and "0.9" in out2
+
+
+def test_compute_run_local_arms_one_failure_captured(tmp_path, monkeypatch, capsys):
+    """One arm fails; the other arm's metric is still captured (failure does not suppress success)."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "accuracy",
+        "arms": [
+            {"name": "good_arm", "command": "echo good"},
+            {"name": "bad_arm", "command": "exit 1"},
+        ],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run_mixed(cmd, env=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+
+        class R:
+            pass
+
+        if rf and "good_arm" in rf:
+            with open(rf, "w") as f:
+                json.dump({"accuracy": 0.85}, f)
+            R.returncode = 0
+        else:
+            R.returncode = 1
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run_mixed)
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    # Overall status reflects the failure
+    assert "FAILED" in out
+    # The good arm's metric must still appear
+    assert "good_arm" in out
+    assert "0.85" in out
+    # The bad arm is marked as failed, not silently dropped
+    assert "bad_arm" in out
+    assert "FAILED" in out

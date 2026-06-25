@@ -2007,6 +2007,69 @@ def test_arms_contract_validation_single_quote_safe():
     assert "python b.py --flag='value'" in decoded
 
 
+def test_arm_synthesis_isolates_per_arm_results():
+    """Synthesised bash script gives each arm its own BLUEPRINT_RESULT_FILE; two
+    arms emitting different declared_metric values both appear in the aggregated
+    output (not last-arm-wins)."""
+    import re
+    import tempfile
+    from pathlib import Path
+
+    from app.compute_arm_aggregator import aggregate
+
+    contract = {
+        "arms": [
+            {"name": "adam", "command": "python train.py --opt adam"},
+            {"name": "sgd", "command": "python train.py --opt sgd"},
+        ],
+        "declared_metric": "val_loss",
+        "spend_cap_usd": 5.0,
+        "deadline_seconds": 3600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+
+    cmd = contract["command"]
+    m = re.search(r"echo (\S+) \| base64 -d \| bash", cmd)
+    assert m is not None, f"command did not match base64-decode pattern: {cmd!r}"
+    import base64 as _b64
+
+    script = _b64.b64decode(m.group(1)).decode()
+
+    # Each arm must export BLUEPRINT_RESULT_FILE to its own per-arm result path.
+    assert "adam/result.json" in script
+    assert "sgd/result.json" in script
+    # The two per-arm paths must be at different positions (not sharing one file).
+    assert script.index("adam/result.json") != script.index("sgd/result.json")
+    # Arms run in subshells so one failure cannot abort others.
+    assert "(export BLUEPRINT_RESULT_FILE=" in script
+
+    # Aggregator produces {"arms": {name: {metric: value}}} with BOTH arms,
+    # even when they emit DIFFERENT values — verifies not last-arm-wins.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        adam_result = Path(tmpdir) / "adam_result.json"
+        sgd_result = Path(tmpdir) / "sgd_result.json"
+        output = Path(tmpdir) / "main_result.json"
+
+        adam_result.write_text(json.dumps({"val_loss": 0.42}))
+        sgd_result.write_text(json.dumps({"val_loss": 0.61}))
+
+        result = aggregate(
+            [("adam", str(adam_result)), ("sgd", str(sgd_result))],
+            "val_loss",
+            str(output),
+        )
+
+    assert result == {
+        "arms": {
+            "adam": {"val_loss": 0.42},
+            "sgd": {"val_loss": 0.61},
+        }
+    }
+    # Confirm neither arm overwrote the other.
+    assert result["arms"]["adam"]["val_loss"] != result["arms"]["sgd"]["val_loss"]
+
+
 def test_arms_contract_validation_missing_declared_metric():
     """arms without declared_metric is rejected."""
     contract = {
@@ -2086,6 +2149,139 @@ def test_declared_metric_non_empty_string_required_standalone():
     ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
     assert ok is False
     assert "declared_metric" in reason
+
+
+def test_arms_duplicate_name_rejected():
+    """Two arms with the same name must be rejected — they would silently overwrite
+    each other's result file, reintroducing the last-arm-wins data loss."""
+    contract = {
+        "arms": [
+            {"name": "dup", "command": "python a.py"},
+            {"name": "dup", "command": "python b.py"},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "dup" in reason
+    assert "duplicate" in reason.lower() or "unique" in reason.lower()
+
+
+def test_arms_invalid_name_charset_rejected():
+    """Arm names with shell metacharacters are rejected before interpolation into bash."""
+    bad_names = [
+        'a"; touch /tmp/PWNED #',
+        "arm with spaces",
+        "arm$var",
+        "arm;cmd",
+        "arm`cmd`",
+        "arm:colon",
+        "arm/slash",
+    ]
+    for bad_name in bad_names:
+        contract = {
+            "arms": [{"name": bad_name, "command": "python a.py"}],
+            "declared_metric": "score",
+            "spend_cap_usd": 2.0,
+            "deadline_seconds": 600,
+        }
+        ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+        assert ok is False, f"expected rejection for arm name {bad_name!r}, got ok=True"
+        assert "invalid characters" in reason or "name" in reason
+
+
+def test_declared_metric_invalid_charset_rejected():
+    """declared_metric with shell metacharacters is rejected before interpolation."""
+    bad_metrics = [
+        'loss"; touch /tmp/X #',
+        "metric with spaces",
+        "metric$var",
+        "metric;cmd",
+    ]
+    for bad_metric in bad_metrics:
+        contract = {
+            "arms": [{"name": "arm-a", "command": "python a.py"}],
+            "declared_metric": bad_metric,
+            "spend_cap_usd": 2.0,
+            "deadline_seconds": 600,
+        }
+        ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+        assert ok is False, f"expected rejection for declared_metric {bad_metric!r}, got ok=True"
+        assert "declared_metric" in reason or "invalid characters" in reason
+
+
+def test_declared_metric_valid_charsets_accepted():
+    """Metric keys with common valid patterns (val/loss, top-1, accuracy) are accepted."""
+    valid_metrics = ["val_loss", "val/loss", "top-1", "accuracy", "f1.score"]
+    for metric in valid_metrics:
+        contract = {
+            "arms": [{"name": "arm-a", "command": "python a.py"}],
+            "declared_metric": metric,
+            "spend_cap_usd": 2.0,
+            "deadline_seconds": 600,
+        }
+        ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+        assert ok is True, f"expected acceptance for metric {metric!r}, got reason={reason!r}"
+
+
+# ---------------------------------------------------------------------------
+# compute_arm_aggregator: error-branch coverage
+# ---------------------------------------------------------------------------
+
+
+def test_aggregator_missing_result_file_captured_as_error():
+    """A missing arm result file is recorded as an error for that arm; other
+    arms still appear with their real metric values (failure isolation)."""
+    import tempfile
+    from pathlib import Path
+
+    from app.compute_arm_aggregator import aggregate
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        good_result = Path(tmpdir) / "good_result.json"
+        output = Path(tmpdir) / "main_result.json"
+        good_result.write_text(json.dumps({"score": 0.95}))
+
+        missing_path = Path(tmpdir) / "nonexistent_result.json"
+
+        result = aggregate(
+            [("good-arm", str(good_result)), ("missing-arm", str(missing_path))],
+            "score",
+            str(output),
+        )
+
+    assert result["arms"]["good-arm"] == {"score": 0.95}
+    assert "error" in result["arms"]["missing-arm"]
+    assert "not written" in result["arms"]["missing-arm"]["error"] or "result" in result["arms"]["missing-arm"]["error"]
+
+
+def test_aggregator_metric_not_in_result_captured_as_error():
+    """When the declared metric is absent from an arm's result file, that arm
+    records an error while other arms still capture their metric."""
+    import tempfile
+    from pathlib import Path
+
+    from app.compute_arm_aggregator import aggregate
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        good_result = Path(tmpdir) / "good_result.json"
+        bad_result = Path(tmpdir) / "bad_result.json"
+        output = Path(tmpdir) / "main_result.json"
+
+        good_result.write_text(json.dumps({"score": 0.88}))
+        bad_result.write_text(json.dumps({"other_metric": 42}))  # missing 'score'
+
+        result = aggregate(
+            [("arm-a", str(good_result)), ("arm-b", str(bad_result))],
+            "score",
+            str(output),
+        )
+
+    assert result["arms"]["arm-a"] == {"score": 0.88}
+    assert "error" in result["arms"]["arm-b"]
+    assert "score" in result["arms"]["arm-b"]["error"]
 
 
 # ---------------------------------------------------------------------------
