@@ -890,6 +890,28 @@ def _declared_success_criterion(task: Task) -> tuple[str, str, float] | None:
     return metric.strip(), op, threshold
 
 
+def _find_metric_case_insensitive(obj: dict, metric: str) -> object:
+    """Find a metric value by case/whitespace-normalized key.
+
+    Returns the matched value, or None when no key matches or multiple
+    distinct keys match (ambiguity guard: a collision is more likely a
+    schema mistake than an intentional overload; fail closed).
+    """
+    normalized = metric.strip().lower()
+    matches = [(k, v) for k, v in obj.items() if k.strip().lower() == normalized]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        logger.warning(
+            "[EVAL] Ambiguous case-insensitive metric match for %r: found keys %r "
+            "— failing closed",
+            metric,
+            [k for k, _ in matches],
+        )
+        return None
+    return matches[0][1]
+
+
 def evaluate_compute_success_criterion(
     task: Task,
     artifact_text: str | None,
@@ -929,6 +951,8 @@ def evaluate_compute_success_criterion(
     else:
         obj = _parse_artifact_json(artifact_text) or {}
         raw_value = obj.get(metric)
+        if raw_value is None:
+            raw_value = _find_metric_case_insensitive(obj, metric)
         value = _coerce_number(raw_value)
     # Shared fail-closed core: a metric absent/non-numeric in the result is never
     # "met" (and ``criterion_met`` enforces that identically for the code gate).
