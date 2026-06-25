@@ -212,13 +212,10 @@ async def _assert_compute_spend_not_gated(
     if task_type != "compute_experiment":
         return
     project = await session.get(Project, task.project_id)
-    # Start from the global runtime_config (same source as the four spawn sites),
-    # then layer any per-project overrides on top so project-level config wins.
+    # Use the global runtime_config which already includes deployment-state settings.
     runtime_config: dict = dict(_global_runtime_config)
     direction: dict | None = None
     if project is not None:
-        project_overrides = dict(getattr(project, "runtime_config_json", None) or {})
-        runtime_config.update(project_overrides)
         direction_id = str((task.context or {}).get("direction_id") or "")
         if direction_id:
             direction = next(

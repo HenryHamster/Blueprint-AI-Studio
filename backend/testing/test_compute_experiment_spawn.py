@@ -1546,14 +1546,14 @@ async def test_agent_spawn_compute_experiment_below_threshold_no_approval(
 @pytest.mark.asyncio
 async def test_launch_refuses_above_threshold_unapproved_compute_job(db_session):
     """Chokepoint: create_compute_job raises ComputeLaunchPreconditionFailed when
-    spend_cap_usd exceeds the project threshold and spend_approval_cleared_at is None,
-    regardless of the requires_approval flag on the Task."""
+    spend_cap_usd exceeds the global threshold and spend_approval_cleared_at is None,
+    regardless of the requires_approval flag on the Task. Exercises the
+    global-threshold chokepoint (Project has no per-project override column)."""
     from app.compute_jobs import ComputeLaunchPreconditionFailed
 
     project = Project(
         name="ChokeGateRefuse",
         user_id="test-user",
-        runtime_config_json={"compute_experiment_spend_threshold_usd": 5.0},
     )
     db_session.add(project)
     await db_session.commit()
@@ -1578,14 +1578,14 @@ async def test_launch_refuses_above_threshold_unapproved_compute_job(db_session)
             task,
             command="python bench.py",
             machine_type="e2-standard-2",
-            spend_cap_usd=10.0,
+            spend_cap_usd=12.0,
             deadline_seconds=300,
         )
 
     detail = exc_info.value.detail
     assert detail["error"] == "spend_cap_requires_approval"
-    assert detail["spend_cap_usd"] == 10.0
-    assert detail["threshold_usd"] == 5.0
+    assert detail["spend_cap_usd"] == 12.0
+    assert detail["threshold_usd"] == 10.0
 
 
 @pytest.mark.asyncio
