@@ -328,6 +328,30 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('some data');
   });
 
+  it('sweepComparisonSection rendered when non-empty', () => {
+    const section = '## Completed experiment sweeps\nArm A: MET, Arm B: NOT MET\n';
+    const prompt = buildThinkerPrompt({ ...base, sweepComparisonSection: section });
+    expect(prompt).toContain('## Completed experiment sweeps');
+    expect(prompt).toContain('Arm A: MET, Arm B: NOT MET');
+  });
+
+  it('sweepComparisonSection omitted when absent or empty', () => {
+    const withoutField = buildThinkerPrompt(base);
+    expect(withoutField).not.toContain('## Completed experiment sweeps');
+
+    const withEmpty = buildThinkerPrompt({ ...base, sweepComparisonSection: '' });
+    expect(withEmpty).not.toContain('## Completed experiment sweeps');
+  });
+
+  it('sweepComparisonSection appears after efficiencySnapshotSection and before # Your job', () => {
+    const efficiency = '\n## Pipeline Efficiency Axes\ndata\n';
+    const sweep = '## Completed experiment sweeps\nArm A: MET\n';
+    const prompt = buildThinkerPrompt({ ...base, efficiencySnapshotSection: efficiency, sweepComparisonSection: sweep });
+    const idx = (s: string) => prompt.indexOf(s);
+    expect(idx('## Pipeline Efficiency Axes')).toBeLessThan(idx('## Completed experiment sweeps'));
+    expect(idx('## Completed experiment sweeps')).toBeLessThan(idx('# Your job'));
+  });
+
   it('self-improvement block rendered when selfImprovementBlock is non-empty', () => {
     const selfRepoPrompt = buildThinkerPrompt({
       ...base,

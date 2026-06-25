@@ -567,6 +567,98 @@ describe('formatDomainOverview', () => {
 });
 
 // ── buildContextPrefix — domain_overview wiring ──────────────────────────────
+describe('buildContextPrefix — compute experiment sweeps', () => {
+  it('renders compute_experiment_sweeps as sweep comparison section', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        compute_experiment_sweeps: {
+          'sweep-abc': [
+            {
+              id: 'kd-arm-1',
+              title: 'Arm A: baseline',
+              summary: 'Baseline result summary.',
+              arm_label: 'baseline',
+              compute_acceptance_grade: 'acceptance',
+              source_kind: 'compute_experiment',
+            },
+            {
+              id: 'kd-arm-2',
+              title: 'Arm B: optimized',
+              summary: 'Optimized result summary.',
+              arm_label: 'optimized',
+              compute_acceptance_grade: 'measured_only',
+              source_kind: 'compute_experiment',
+            },
+          ],
+        },
+      }],
+    });
+
+    expect(prefix).toContain('## Completed experiment sweeps');
+    expect(prefix).toContain('### Sweep sweep-abc');
+    expect(prefix).toContain('**baseline**');
+    expect(prefix).toContain('[MET]');
+    expect(prefix).toContain('[kd-arm-1]');
+    expect(prefix).toContain('Baseline result summary.');
+    expect(prefix).toContain('**optimized**');
+    expect(prefix).toContain('[NOT MET]');
+    expect(prefix).toContain('[kd-arm-2]');
+    expect(prefix).toContain('./fetch knowledge <id>');
+  });
+
+  it('shows unavailable verdict when unavailable_cause is set', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        compute_experiment_sweeps: {
+          'sweep-xyz': [
+            {
+              id: 'kd-arm-3',
+              title: 'Arm C: failed',
+              summary: 'Run failed to capture metric.',
+              arm_label: 'failed_arm',
+              compute_acceptance_grade: 'measured_only',
+              unavailable_cause: 'metric_not_written',
+              source_kind: 'compute_experiment',
+            },
+          ],
+        },
+      }],
+    });
+
+    expect(prefix).toContain('[unavailable (metric_not_written)]');
+    expect(prefix).not.toContain('[MET]');
+    expect(prefix).not.toContain('[NOT MET]');
+  });
+
+  it('omits sweep section when compute_experiment_sweeps is absent', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'strategic_review', knowledge_index: [] }],
+    });
+    expect(prefix).not.toContain('## Completed experiment sweeps');
+  });
+
+  it('omits sweep section when taskType is not strategic_review', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'research',
+        compute_experiment_sweeps: {
+          'sweep-abc': [
+            {
+              id: 'kd-arm-1',
+              title: 'Some arm',
+              arm_label: 'a',
+              compute_acceptance_grade: 'acceptance',
+            },
+          ],
+        },
+      }],
+    });
+    expect(prefix).not.toContain('## Completed experiment sweeps');
+  });
+});
+
 describe('buildContextPrefix — domain overview', () => {
   it('renders Domain Knowledge block when domain_overview is present', () => {
     const prefix = buildContextPrefix({

@@ -435,6 +435,49 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     prefix += kdLines.join('\n') + '\n';
   }
 
+  // Completed experiment sweeps — comparative arm results grouped by sweep_id.
+  // Presence-gated: only rendered for strategic_review tasks when the backend
+  // ships a non-empty compute_experiment_sweeps map.
+  if (taskType === 'strategic_review') {
+    const sweepMap = payload?.compute_experiment_sweeps as Record<string, Array<Record<string, unknown>>> | undefined;
+    if (sweepMap && typeof sweepMap === 'object' && !Array.isArray(sweepMap)) {
+      const sweepIds = Object.keys(sweepMap);
+      if (sweepIds.length > 0) {
+        const sweepLines: string[] = ['## Completed experiment sweeps'];
+        sweepLines.push(
+          'Comparative arm results from completed multi-arm compute experiments. Use `./fetch knowledge <id>` to retrieve the full analysis body for any arm.',
+        );
+        for (const sweepId of sweepIds) {
+          const arms = sweepMap[sweepId];
+          if (!Array.isArray(arms) || arms.length === 0) continue;
+          sweepLines.push(`\n### Sweep ${sweepId}`);
+          for (const arm of arms) {
+            const id = strVal(arm.id);
+            const title = strVal(arm.title);
+            if (!id || !title) continue;
+            const armLabel = strVal(arm.arm_label);
+            const grade = strVal(arm.compute_acceptance_grade);
+            const unavailableCause = strVal(arm.unavailable_cause);
+            let verdict: string;
+            if (unavailableCause) {
+              verdict = `unavailable (${unavailableCause})`;
+            } else if (grade === 'acceptance') {
+              verdict = 'MET';
+            } else {
+              verdict = 'NOT MET';
+            }
+            const armPrefix = armLabel ? `**${armLabel}**` : id;
+            sweepLines.push(`- ${armPrefix} [${verdict}] [${id}] ${title}`);
+            const summary = strVal(arm.summary);
+            if (summary) sweepLines.push(`  ${summary}`);
+          }
+        }
+        sweepLines.push('');
+        prefix += sweepLines.join('\n') + '\n';
+      }
+    }
+  }
+
   if (projectCtx) {
     const hasData = Object.keys(projectCtx).some(k => {
       const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;

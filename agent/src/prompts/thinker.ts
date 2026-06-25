@@ -118,6 +118,12 @@ export interface ThinkerPromptParams {
    * so existing constructions/tests that omit it still compile; '' renders nothing.
    */
   availableCapabilitiesSection?: string;
+  /**
+   * Comparative sweep results rendered per completed compute-experiment sweep.
+   * Built from the strategic payload's `compute_experiment_sweeps` field. Optional
+   * so existing constructions/tests that omit it still compile; '' renders nothing.
+   */
+  sweepComparisonSection?: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -184,7 +190,7 @@ ${p.dirHealthSummary}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}
 ${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
@@ -268,6 +274,8 @@ Directions to retire (one-sentence reason each) and to create (name the gap_id e
 **Knowledge commissions.** You can also direct the Executor to spawn a \`web_research\` or \`design\` knowledge task (it has the spawn-task command). These are HIGH-ROI and chronically under-used: one durable, citation-grounded document de-risks every later task in its area and compounds across cycles. Plan one when a direction hinges on external facts nobody has documented (APIs, vendors, pricing/quotas, standards, how mature OSS solves the same problem), when an area keeps producing failed or churning implementation work (settle the structure once in a design doc instead of re-deriving it per task), or when the knowledge index is thin for a direction you are actively advancing. Name the task type, title, and what the document must answer.
 
 **Experiment commissions.** When you hold a MEASURABLE conjecture — a hypothesis that can be settled empirically by running a command and observing a declared metric, rather than by reading code or the web — you can commission a budget-gated \`compute_experiment\` directly (the Executor has the spawn-task command for it). Use this move when all four conditions hold: (1) the conjecture is falsifiable (there is a clear success criterion expressible as a metric + comparator + threshold), (2) the only way to resolve it is to run compute and measure an output, (3) a reasonable spend cap and deadline can be stated up front, and (4) no cheaper read-only research would settle it first. The launch contract the Executor sends requires: a \`command\` string to execute, a positive \`spend_cap_usd\`, a positive \`deadline_seconds\`, and an OPTIONAL \`success_criterion\` of \`{metric, operator, threshold}\` (where \`operator\` is one of \`<\`, \`>\`, \`<=\`, \`>=\`). For multi-arm (A/B) comparisons, use \`arms: [{name, command}]\` instead of a single \`command\`, and supply \`declared_metric\` (the exact key each arm's command writes to \`$BLUEPRINT_RESULT_FILE\`); \`declared_metric\` is required when \`arms\` is present. The platform runs each arm with an isolated result path and assembles the \`{"arms": {name: {metric: value}}}\` comparison block automatically — arm commands simply write their metric as usual. A free-text \`prompt\` is optional because \`hypothesis\` serves as the description. Note: experiments above the configured per-experiment spend threshold require operator spend-approval — the backend gates this automatically and will pause the task for approval if needed. Name the hypothesis, the command (or arms), the metric being measured, and what the outcome changes.
+
+**Sweep synthesis.** When the "Completed experiment sweeps" section above lists a sweep where every arm shows a verdict (MET or NOT MET), synthesize a comparative conclusion before proposing a follow-on move: which arm won, by how much, and what it implies. Then propose exactly one concrete next step — adopt the winning arm in an implementation direction, commission a deeper follow-on experiment to resolve ambiguity, or retire the hypothesis as settled if the answer is conclusive. Use \`./fetch knowledge <id>\` to read an arm's full analysis body before concluding. Do not leave a complete sweep without a move.
 
 **Pick the right dispatch for the work — three distinct moves:**
 - **\`spawn-fix\`** (the Executor's \`./strategic spawn-fix\` command, types \`create\`/\`refactor\`/\`qa\`) — for ONE-TIME implementation work: a bug fix, a CI remediation, a single isolated cleanup. It carries NO direction, has no evidence/retirement lifecycle, and never appears in the portfolio — it fires once and lands a PR. Use this for a discrete fix you can describe and finish, instead of inventing a direction just to staff one task.
