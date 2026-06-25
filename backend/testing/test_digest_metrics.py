@@ -5777,43 +5777,44 @@ def test_self_repair_rate_infra_failures_by_schema_aggregated():
             "create",
             {
                 "format_error_total": 1,
-                "format_repair_attempts": 4,
-                "format_repair_successes": 2,
+                "format_repair_attempts": 5,
+                "format_repair_successes": 3,
                 "format_repair_infra_failures": 2,
-                "format_repair_attempts_by_schema": {"ResearchPlan": 4},
-                "format_repair_successes_by_schema": {"ResearchPlan": 2},
+                "format_repair_attempts_by_schema": {"ResearchPlan": 5},
+                "format_repair_successes_by_schema": {"ResearchPlan": 3},
                 "format_repair_infra_failures_by_schema": {"ResearchPlan": 2},
             },
         ),
     ]
     overall = compute_format_compliance_metrics(tasks)["overall"]
     assert overall["repair_infra_failures"] == 2
-    # clean_attempts = 4 - 2 = 2; rate = 2/2 = 1.0
+    # clean_attempts = 5 - 2 = 3; rate = 3/3 = 1.0
     assert overall["self_repair_success_rate"] == 1.0
     by_schema = overall["by_schema"]
     assert "ResearchPlan" in by_schema
     assert by_schema["ResearchPlan"]["repair_infra_failures"] == 2
-    # clean_attempts = 4 - 2 = 2; rate = 2/2 = 1.0
+    # clean_attempts = 5 - 2 = 3 (at minimum-sample floor); rate = 3/3 = 1.0
     assert by_schema["ResearchPlan"]["self_repair_success_rate"] == 1.0
 
 
 def test_format_compliance_by_schema_success_rate():
     """Per-schema self_repair_success_rate is derived from per-schema counts.
 
-    Thinker schema: 1 success / (3 attempts - 1 infra) = 0.5
-    Other schema:   2 success / (2 attempts - 0 infra) = 1.0
+    Thinker schema: 2 success / (5 attempts - 1 infra) = 0.5
+    Other schema:   3 success / (3 attempts - 0 infra) = 1.0
     Schema with only infra failures: None (clean denominator == 0)
+    Each schema uses >=3 clean attempts to clear the minimum-sample floor.
     """
     tasks = [
         _fc_task(
             "create",
             {
                 "format_error_total": 2,
-                "format_repair_attempts": 5,
-                "format_repair_successes": 3,
+                "format_repair_attempts": 8,
+                "format_repair_successes": 5,
                 "format_repair_infra_failures": 1,
-                "format_repair_attempts_by_schema": {"thinker": 3, "Other": 2},
-                "format_repair_successes_by_schema": {"thinker": 1, "Other": 2},
+                "format_repair_attempts_by_schema": {"thinker": 5, "Other": 3},
+                "format_repair_successes_by_schema": {"thinker": 2, "Other": 3},
                 "format_repair_infra_failures_by_schema": {"thinker": 1, "Other": 0},
             },
         ),
@@ -5833,14 +5834,46 @@ def test_format_compliance_by_schema_success_rate():
     overall = compute_format_compliance_metrics(tasks)["overall"]
     by_schema = overall["by_schema"]
 
-    # thinker: 1 success / (3 - 1) clean = 0.5
+    # thinker: 2 success / (5 - 1) clean = 0.5
     assert by_schema["thinker"]["self_repair_success_rate"] == 0.5
 
-    # Other: 2 success / (2 - 0) clean = 1.0
+    # Other: 3 success / (3 - 0) clean = 1.0
     assert by_schema["Other"]["self_repair_success_rate"] == 1.0
 
     # InfraOnly: clean_attempts = 2 - 2 = 0 → None
     assert by_schema["InfraOnly"]["self_repair_success_rate"] is None
+
+
+def test_by_schema_self_repair_suppressed_below_min_attempts():
+    """Per-schema self_repair_success_rate is None when clean attempts < 3.
+
+    Low-volume schema labels (1–2 clean repairs per window) produce phantom
+    0%/100% rates that look like regressions but are noise artifacts. The
+    minimum-sample floor suppresses the rate to None so the operator dashboard
+    does not display misleading signals.
+    """
+    tasks = [
+        _fc_task(
+            "create",
+            {
+                "format_error_total": 2,
+                "format_repair_attempts": 4,
+                "format_repair_successes": 2,
+                "format_repair_infra_failures": 0,
+                # strategic: 1 clean attempt — below floor → None
+                # thinker:   2 clean attempts — below floor → None
+                "format_repair_attempts_by_schema": {"strategic": 1, "thinker": 2},
+                "format_repair_successes_by_schema": {"strategic": 1, "thinker": 2},
+                "format_repair_infra_failures_by_schema": {"strategic": 0, "thinker": 0},
+            },
+        ),
+    ]
+    overall = compute_format_compliance_metrics(tasks)["overall"]
+    by_schema = overall["by_schema"]
+
+    # Both schemas are below the 3-attempt floor — rate must be None, not 0% or 100%
+    assert by_schema["strategic"]["self_repair_success_rate"] is None
+    assert by_schema["thinker"]["self_repair_success_rate"] is None
 
 
 def test_per_schema_repair_miss_aggregated():

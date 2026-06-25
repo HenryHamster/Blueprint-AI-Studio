@@ -484,6 +484,11 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
         | set(repair_miss_by_schema)
     )
 
+    # Minimum clean repair attempts per schema before self_repair_success_rate
+    # is meaningful. Below this threshold the ratio is too noisy (1-2 repairs
+    # flip the rate between 0% and 100%) and the value is suppressed to None.
+    _SCHEMA_MIN_REPAIR_ATTEMPTS = 3
+
     def _schema_entry(schema: str) -> dict:
         attempts = repair_attempts_by_schema.get(schema, 0)
         successes = repair_successes_by_schema.get(schema, 0)
@@ -498,7 +503,7 @@ def _accumulate_format_compliance(tasks: List[Task]) -> Dict[str, Any]:
             "repair_input_tokens": repair_input_tokens_by_schema.get(schema, 0),
             "repair_output_tokens": repair_output_tokens_by_schema.get(schema, 0),
             "self_repair_success_rate": round(successes / clean, 3)
-            if clean > 0
+            if clean >= _SCHEMA_MIN_REPAIR_ATTEMPTS
             else None,
         }
 
