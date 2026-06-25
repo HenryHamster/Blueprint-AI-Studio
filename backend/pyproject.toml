@@ -223,6 +223,8 @@ python_classes = ["Test", "*Test"]
 # (Motivating case: httpx 0.27 deprecated app=; the suite never surfaced it;
 # httpx 0.28 removed it and would have been a hard failure without this guard.)
 filterwarnings = [
+    "error::DeprecationWarning",
+    "error::PendingDeprecationWarning",
     "error::DeprecationWarning:httpx",
     "error::PendingDeprecationWarning:httpx",
     "error::DeprecationWarning:starlette",
