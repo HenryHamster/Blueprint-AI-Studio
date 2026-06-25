@@ -14,39 +14,26 @@ function DistributionBar({ confirmed, revised, rejected }: { confirmed: number; 
   );
 }
 
-const GATE_MIN_SAMPLE = 30;
-const GATE_MIN_COVERAGE = 0.5; // Require 50% effective coverage for HEALTHY verdict
+const GATE_VERDICT_COLORS: Record<string, string> = {
+  NO_DATA: 'text-neutral-500',
+  DEGRADED: 'text-red-400',
+  INSUFFICIENT: 'text-neutral-400',
+  LOW_COVERAGE: 'text-neutral-400',
+  PARTIAL: 'text-amber-400',
+  HEALTHY: 'text-emerald-400',
+};
 
-function GateHealthBadge({
-  failOpen,
-  total,
-  effectiveCoverage,
-  backendVerdict,
-}: {
+function GateHealthBadge({ backendVerdict }: {
   failOpen: number;
   total: number;
   effectiveCoverage?: number | null;
   backendVerdict?: { state: string; fail_open_rate: number | null; total_invocations: number; min_sample: number };
 }) {
-  if (backendVerdict) {
-    const colors: Record<string, string> = {
-      NO_DATA: 'text-neutral-500',
-      DEGRADED: 'text-red-400',
-      INSUFFICIENT: 'text-neutral-400',
-      LOW_COVERAGE: 'text-neutral-400',
-      PARTIAL: 'text-amber-400',
-      HEALTHY: 'text-emerald-400',
-    };
-    const label = backendVerdict.state.replace(/_/g, ' ');
-    return <span data-testid="health-badge" className={`${colors[backendVerdict.state] || 'text-neutral-400'} font-mono text-ui-sm`}>{label}</span>;
+  if (!backendVerdict) {
+    return <span data-testid="health-badge" className="text-neutral-500 font-mono text-ui-sm">NO DATA</span>;
   }
-  if (total + failOpen === 0) return <span data-testid="health-badge" className="text-neutral-500 font-mono text-ui-sm">NO DATA</span>;
-  const rate = failOpen / (total + failOpen);
-  if (rate >= 0.05) return <span data-testid="health-badge" className="text-red-400 font-mono text-ui-sm">DEGRADED</span>;
-  if (total + failOpen < GATE_MIN_SAMPLE) return <span data-testid="health-badge" className="text-neutral-400 font-mono text-ui-sm">INSUFFICIENT</span>;
-  if (effectiveCoverage !== null && effectiveCoverage !== undefined && effectiveCoverage < GATE_MIN_COVERAGE) return <span data-testid="health-badge" className="text-neutral-400 font-mono text-ui-sm">LOW COVERAGE</span>;
-  if (rate >= 0.01) return <span data-testid="health-badge" className="text-amber-400 font-mono text-ui-sm">PARTIAL</span>;
-  return <span data-testid="health-badge" className="text-emerald-400 font-mono text-ui-sm">HEALTHY</span>;
+  const label = backendVerdict.state.replace(/_/g, ' ');
+  return <span data-testid="health-badge" className={`${GATE_VERDICT_COLORS[backendVerdict.state] || 'text-neutral-400'} font-mono text-ui-sm`}>{label}</span>;
 }
 
 function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
@@ -103,13 +90,13 @@ function PanelReviewView({ data }: { data: PanelReviewEffectiveness }) {
 
 export function AdversarialQualityPanel({ projectId }: { projectId: string | null }) {
   const [axes, setAxes] = useState<EfficiencyAxesResponse | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!!projectId);
 
   useEffect(() => {
-    if (!projectId) { setLoading(false); return; }
+    if (!projectId) return;
     let mounted = true;
-    setLoading(true);
     (async () => {
+      if (mounted) setLoading(true);
       try {
         const result = await fetchEfficiencyAxes(projectId);
         if (mounted) setAxes(result);
