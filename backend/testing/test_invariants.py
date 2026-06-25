@@ -10051,3 +10051,44 @@ def test_task_type_evaluation_registry_is_consistent():
         "This invariant is always-on (every PR) to catch vocabulary changes early. "
         "If the drift is intentional, update both task_capabilities.py AND this assertion."
     )
+
+
+def test_pytest_filterwarnings_includes_httpx_error_guard():
+    """pyproject.toml must configure filterwarnings to turn httpx DeprecationWarnings into errors.
+
+    This guard prevents silent regressions where a dependency bump introduces a
+    deprecated-API call that only surfaces as a hard removal in the next version.
+    Motivating case: httpx 0.27 deprecated app=; httpx 0.28 removed it.
+    """
+    import sys
+
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        try:
+            import tomli as tomllib  # type: ignore[no-redef]
+        except ImportError:
+            pytest.skip("tomllib/tomli not available on Python < 3.11")
+            return
+
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    assert pyproject_path.exists(), f"pyproject.toml not found at {pyproject_path}"
+
+    with open(pyproject_path, "rb") as fh:
+        config = tomllib.load(fh)
+
+    filterwarnings = (
+        config.get("tool", {})
+        .get("pytest", {})
+        .get("ini_options", {})
+        .get("filterwarnings", [])
+    )
+
+    assert any(
+        entry == "error::DeprecationWarning:httpx" for entry in filterwarnings
+    ), (
+        "Missing 'error::DeprecationWarning:httpx' in "
+        "[tool.pytest.ini_options].filterwarnings in pyproject.toml. "
+        "This guard ensures httpx deprecation warnings surface as test failures "
+        "before they become hard removals in the next version bump."
+    )
