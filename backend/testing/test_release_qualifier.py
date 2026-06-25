@@ -15816,6 +15816,106 @@ async def test_timed_out_not_promoted_uses_qualification_timeout(db_session, moc
     assert version.phase == "stabilize"
 
 
+@pytest.mark.asyncio
+async def test_timed_out_supersession_check_exception_falls_back_to_qualification_timeout(
+    db_session, mocker
+):
+    """When _candidate_already_on_main raises an exception, the sweep falls back
+    to qualification_timeout (fail-closed), never fabricating a supersession."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "deadbeef1234"
+
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+        candidate_sha=candidate_sha,
+    )
+
+    mocker.patch(
+        "app.release_qualifier_sweep._resolve_github_with_session",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.release_promotion._candidate_already_on_main",
+        new=AsyncMock(side_effect=RuntimeError("github 503")),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "qualification_timeout"
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+
+
+@pytest.mark.asyncio
+async def test_timed_out_cred_missing_falls_back_to_qualification_timeout(
+    db_session, mocker
+):
+    """When _resolve_github_with_session returns None (no credentials), the sweep
+    falls back to qualification_timeout without fabricating a supersession."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "nocreds999abc"
+
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+        candidate_sha=candidate_sha,
+    )
+
+    mocker.patch(
+        "app.release_qualifier_sweep._resolve_github_with_session",
+        new=AsyncMock(return_value=None),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "qualification_timeout"
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+
+
 # ===========================================================================
 # _maybe_reconcile_after_promotion_conflict — promotion-conflict self-heal
 # ===========================================================================

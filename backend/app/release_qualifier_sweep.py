@@ -172,6 +172,12 @@ async def _force_finalize_timed_out_qualification(
                             version.version_number,
                             candidate_sha[:8],
                         )
+                else:
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] sweep: no GitHub credentials for v%d — "
+                        "cannot check out-of-band supersession; using qualification_timeout",
+                        version.version_number,
+                    )
         except Exception:
             logger.exception(
                 "[RELEASE_QUALIFIER] sweep: out-of-band supersession check failed "
