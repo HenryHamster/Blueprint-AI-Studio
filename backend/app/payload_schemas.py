@@ -23,6 +23,10 @@ from app.task_capabilities import ALL_TASK_TYPES, TaskType
 
 logger = logging.getLogger(__name__)
 
+# Pydantic v2 is required. V1 idioms (@validator, @root_validator, .dict(),
+# class Config, parse_obj) are banned — enforced by
+# test_no_pydantic_v1_idioms_in_app_source in test_dependency_deprecations.py.
+_PYDANTIC_V2_ONLY = True
 
 # Hard upper bound on a serialized task payload. Two constraints stack:
 #   1) Agent startup stalls when the claim response is bloated — see the

@@ -142,6 +142,54 @@ def test_pending_deprecation_warning_also_raises_for_httpx():
 # ---------------------------------------------------------------------------
 
 
+def test_no_pydantic_v1_idioms_in_app_source():
+    """backend/app must not contain pydantic-v1 idioms that break under pydantic v2.
+
+    Scans every .py file under backend/app for patterns that are either removed
+    or deprecated in pydantic v2: the @validator/@root_validator decorators, the
+    pydantic.v1 compat shim import, and direct imports of the old ``validator``
+    symbol.  ``payload_schemas._PYDANTIC_V2_ONLY`` being importable is the
+    companion production-code anchor — removing it would break this test.
+
+    Why static rather than runtime: a deprecated idiom on an untested code path
+    ships silently past filterwarnings=error and becomes a hard failure at the
+    next pydantic major.  A static ratchet catches reintroduction immediately
+    regardless of test coverage.
+    """
+    import importlib
+
+    # Verify the production-code anchor is present (fails if someone removes the
+    # sentinel that documents the v2-only policy in payload_schemas).
+    ps = importlib.import_module("app.payload_schemas")
+    assert getattr(ps, "_PYDANTIC_V2_ONLY", None) is True, (
+        "app.payload_schemas._PYDANTIC_V2_ONLY sentinel is missing. "
+        "Do not remove it — it anchors the pydantic-v2-only policy."
+    )
+
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    assert app_dir.is_dir(), f"backend/app directory not found at {app_dir}"
+
+    # Unambiguous pydantic v1 patterns.  Each tuple is (human label, regex).
+    v1_patterns = [
+        ("@validator( deprecated decorator", re.compile(r"^\s*@validator\s*\(", re.MULTILINE)),
+        ("@root_validator deprecated decorator", re.compile(r"^\s*@root_validator\b", re.MULTILINE)),
+        ("pydantic.v1 compat shim import", re.compile(r"\bfrom\s+pydantic\.v1\b")),
+        ("import of deprecated validator symbol", re.compile(r"\bfrom\s+pydantic\s+import\b[^#\n]*\bvalidator\b")),
+    ]
+
+    violations: list[str] = []
+    for py_file in sorted(app_dir.rglob("*.py")):
+        source = py_file.read_text(encoding="utf-8")
+        for label, pattern in v1_patterns:
+            if pattern.search(source):
+                violations.append(f"{py_file.relative_to(app_dir.parent.parent)}: {label}")
+
+    assert not violations, (
+        "Pydantic v1 idioms found in backend/app — replace with v2 equivalents:\n"
+        + "\n".join(f"  {v}" for v in violations)
+    )
+
+
 def test_pyproject_toml_filterwarnings_present():
     """pyproject.toml must declare a filterwarnings list under [tool.pytest.ini_options]."""
     import sys
