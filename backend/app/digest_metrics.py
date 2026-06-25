@@ -3355,26 +3355,30 @@ def compute_timeout_rate(
 ) -> Dict[str, Any]:
     """Windowed AGENT_TIMEOUT rate, decomposed by persisted subtype.
 
-    DENOMINATOR — ``execution_reached``: terminal tasks in the window that
-    actually reached execution, i.e. carry a ``started_at`` timestamp. This makes
-    the rate a fraction over tasks that COULD have timed out (a task that never
-    started cannot time out), so it is comparable over time and not inflated or
-    deflated by queued/never-dispatched volume. Callers pass the already-windowed
-    terminal task set (e.g. efficiency_snapshot._load_recent_tasks); ``tasks`` is
-    not re-filtered by time here.
+    DENOMINATOR — ``execution_or_timed_out``: terminal tasks in the window that
+    either reached execution (carry a ``started_at`` timestamp) or persisted as
+    AGENT_TIMEOUT without reaching execution. This makes the rate a fraction over
+    tasks that COULD have timed out (a never-started AGENT_TIMEOUT is still a task
+    that timed out, just before dispatching), so numerator and denominator remain
+    consistent and rates are not inflated by never-dispatched volume. Callers pass
+    the already-windowed terminal task set (e.g. efficiency_snapshot._load_recent_tasks);
+    ``tasks`` is not re-filtered by time here.
 
     NUMERATOR — ``timeout_count``: tasks whose persisted
     ``ctx['failure_category']`` is AGENT_TIMEOUT. Read from durable ground truth
     only — never re-derived from logs.
 
     Returns a block with the overall rate, a per-subtype ``{count, rate}`` map
-    covering all seven subtypes (rate over the SAME execution-reached denominator,
+    covering all seven subtypes (rate over the SAME execution-or-timed-out denominator,
     so the per-subtype rates sum to the overall rate), and the dominant subtype +
     its share among timeouts. ``overall_rate`` / per-subtype ``rate`` are None
-    only when the denominator is 0 (no tasks reached execution — rate undefined,
-    distinct from a real 0.0). ``window_days`` is echoed for provenance.
+    only when the denominator is 0 (no tasks reached execution or timed out —
+    rate undefined, distinct from a real 0.0). ``window_days`` is echoed for provenance.
     """
-    denominator = sum(1 for t in tasks if getattr(t, "started_at", None) is not None)
+    denominator = sum(
+        1 for t in tasks
+        if getattr(t, "started_at", None) is not None or _persisted_timeout_subtype(t) is not None
+    )
     subtype_counts: Dict[str, int] = {s: 0 for s in TIMEOUT_SUBTYPES}
     timeout_count = 0
     for t in tasks:
@@ -3395,8 +3399,9 @@ def compute_timeout_rate(
         "window_days": window_days,
         "denominator": denominator,
         "denominator_definition": (
-            "terminal tasks in the window that reached execution (started_at "
-            "present); a task that never started cannot time out"
+            "terminal tasks in the window that either reached execution (started_at "
+            "present) or timed out before execution (persisted AGENT_TIMEOUT without "
+            "started_at); a task in this set could have timed out"
         ),
         "timeout_count": timeout_count,
         "overall_rate": _rate(timeout_count),

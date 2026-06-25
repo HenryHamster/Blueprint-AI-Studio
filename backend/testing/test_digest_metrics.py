@@ -443,20 +443,20 @@ def test_compute_timeout_rate_not_gameable_by_raw_volume():
 
 
 def test_compute_timeout_rate_denominator_excludes_never_started():
-    """Tasks that never reached execution (no started_at) are out of the denominator."""
+    """Never-started non-timeouts are excluded, but never-started timeouts are included."""
     from app.digest_metrics import compute_timeout_rate
 
     tasks = [_timeout_task("oom") for _ in range(2)]
     tasks += [_nontimeout_terminal_task() for _ in range(2)]
-    # Two terminal tasks that never started — excluded from the denominator so a
-    # task that could not have timed out does not deflate the rate.
+    # Two terminal tasks that never started — the timeout is included in denominator
+    # (it could have timed out, and did), but the non-timeout is excluded (it could
+    # not have timed out).
     tasks += [_timeout_task("oom", started=False)]
     tasks += [make_task(status=TaskStatus.CANCELLED, started_at=None, context={})]
     block = compute_timeout_rate(tasks)
-    # Denominator = 4 started tasks (the 2 timeouts + 2 non-timeouts). The
-    # never-started timeout still counts in timeout_count (it has persisted
-    # ground truth) but not in the denominator.
-    assert block["denominator"] == 4
+    # Denominator = 5: the 2 started timeouts + 2 started non-timeouts +
+    # 1 unstarted timeout. The unstarted non-timeout is not included.
+    assert block["denominator"] == 5
     assert block["timeout_count"] == 3
     assert block["by_subtype"]["oom"]["count"] == 3
 
@@ -491,6 +491,35 @@ def test_compute_timeout_rate_reads_persisted_not_derived():
     )
     block2 = compute_timeout_rate([not_persisted])
     assert block2["timeout_count"] == 0
+
+
+def test_compute_timeout_rate_counts_unstarted_timeout_in_denominator():
+    """Unstarted AGENT_TIMEOUT tasks are included in the denominator.
+
+    A never-started timeout is still a task that could have timed out (it did,
+    just before dispatching), so it should count in the denominator alongside
+    started tasks. This ensures numerator and denominator are consistent and the
+    rate is not inflated.
+    """
+    from app.digest_metrics import compute_timeout_rate
+
+    # 2 started timeouts + 2 non-timeout started tasks
+    tasks = [_timeout_task("oom") for _ in range(2)]
+    tasks += [_nontimeout_terminal_task() for _ in range(2)]
+    # 1 unstarted timeout + 1 unstarted non-timeout
+    tasks.append(_timeout_task("oom", started=False))
+    tasks.append(make_task(status=TaskStatus.CANCELLED, started_at=None, context={}))
+
+    block = compute_timeout_rate(tasks)
+    # Denominator = 5: the 2 started timeouts + 2 started non-timeouts +
+    # 1 unstarted timeout. The unstarted non-timeout is NOT in denominator.
+    assert block["denominator"] == 5
+    # Numerator = 3: all three timeouts (2 started + 1 unstarted).
+    assert block["timeout_count"] == 3
+    assert block["by_subtype"]["oom"]["count"] == 3
+    # Rate = 3/5 = 0.6
+    assert block["overall_rate"] == 0.6
+    assert block["by_subtype"]["oom"]["rate"] == 0.6
 
 
 def test_confident_dominant_timeout_subtype_gate():
