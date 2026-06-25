@@ -8840,6 +8840,101 @@ class TestSetVersionGoal:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# admin_release_version.py — Set Version Theme
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestSetVersionTheme:
+    @pytest.mark.asyncio
+    async def test_operator_can_set_version_theme(
+        self, client: AsyncClient, db_session
+    ):
+        """Member can override the version theme; the new theme is persisted."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-theme",
+            json={"theme": "reliability"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["theme"] == "reliability"
+        assert data["version_number"] == version.version_number
+
+        await db_session.refresh(version)
+        assert version.theme == "reliability"
+        assert version.theme_editor_info == f"[operator:{TEST_USER_EMAIL}]"
+
+    @pytest.mark.asyncio
+    async def test_set_theme_invalid_value_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """An unrecognised theme value is rejected with 422."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-theme",
+            json={"theme": "bogus_theme"},
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_set_theme_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when no open release version exists."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-theme",
+            json={"theme": "feature"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_set_theme_idempotent_same_value(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-posting the identical theme is a no-op that returns 200."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        for _ in range(2):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/version-theme",
+                json={"theme": "leanness"},
+            )
+            assert resp.status_code == 200
+
+        await db_session.refresh(version)
+        assert version.theme == "leanness"
+
+    @pytest.mark.asyncio
+    async def test_set_theme_clear_with_null(
+        self, client: AsyncClient, db_session
+    ):
+        """Posting null theme clears it back to None."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        await client.post(
+            f"/api/admin/projects/{project.id}/version-theme",
+            json={"theme": "performance"},
+        )
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-theme",
+            json={"theme": None},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["theme"] is None
+
+        await db_session.refresh(version)
+        assert version.theme is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # admin_release_version.py — Cut/Abandon Version
 # ═══════════════════════════════════════════════════════════════════════════════
 

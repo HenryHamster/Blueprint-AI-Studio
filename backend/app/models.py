@@ -3698,10 +3698,17 @@ class ReleaseVersion(SQLModel, table=True):
 
     # Delivery theme authored by the strategist (new_version_theme field).
     # One of: leanness | reliability | performance | feature | mixed | none.
-    # Frozen once set. Nullable: pre-0332 rows carry no theme.
+    # Nullable: pre-0332 rows carry no theme.
     theme: str | None = Field(
         default=None,
         sa_column=Column(String(32), nullable=True),
+    )
+
+    # Editor provenance for the theme: "[operator:email]" or "[strategist:id]" format,
+    # mirroring goal_editor_info. Operator-set themes are frozen to strategist overwrites.
+    theme_editor_info: str | None = Field(
+        default=None,
+        sa_column=Column(String(255), nullable=True),
     )
 
     opened_at: datetime = Field(

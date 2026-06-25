@@ -14221,6 +14221,82 @@ async def test_set_problem_model_api_does_not_refresh_version_goal(client, db_se
 
 
 # ===========================================================================
+# _apply_new_version_goal — strategist correction of already-set goal
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_strategist_can_correct_already_set_version_goal(db_session):
+    """Strategist can correct a previously-authored version goal.
+
+    A strategist-set goal (goal_editor_info startswith "[strategist:") is NOT
+    frozen — a subsequent strategic task can correct a mis-authored goal.
+    Operator-set goals remain frozen.
+    """
+    from app.strategic_completion import _apply_new_version_goal
+    from app import release_version as rv
+
+    project = Project(
+        name="GoalCorrect",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    # Simulate a prior strategist run that authored an incorrect goal.
+    rv.set_version_goal(version, "wrong initial goal", editor_id="abc12345", source="strategist")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal == "wrong initial goal"
+    assert version.goal_editor_info == "[strategist:abc12345]"
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _apply_new_version_goal(
+        "corrected goal — accurate statement", task, project, db_session, path="test"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Strategist must be able to correct its own previously-authored goal.
+    assert version.goal == "corrected goal — accurate statement", (
+        f"Expected strategist correction to apply; got {version.goal!r}"
+    )
+    assert version.goal_editor_info == f"[strategist:{str(task.id)[:8]}]"
+
+    # Operator-set goals must remain frozen to the strategist.
+    rv.set_version_goal(version, "operator override", editor_id="op@example.com", source="operator")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal_editor_info == "[operator:op@example.com]"
+
+    await _apply_new_version_goal(
+        "strategist attempt to override operator", task, project, db_session, path="test"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.goal == "operator override", (
+        f"Operator goal must not be overridden by strategist; got {version.goal!r}"
+    )
+
+
+# ===========================================================================
 # extract_new_version_theme + _apply_new_version_theme
 # ===========================================================================
 
@@ -14285,13 +14361,13 @@ async def test_apply_new_version_theme_sets_theme(db_session):
 
 
 @pytest.mark.asyncio
-async def test_apply_new_version_theme_frozen_once_set(db_session):
-    """_apply_new_version_theme is a no-op when theme is already set."""
+async def test_apply_new_version_theme_can_be_corrected(db_session):
+    """_apply_new_version_theme allows strategist to correct a previously-set theme."""
     from app.strategic_completion import _apply_new_version_theme
     from app import release_version as rv
 
     project = Project(
-        name="ThemeFrozen",
+        name="ThemeCorrect",
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
         problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
@@ -14319,8 +14395,56 @@ async def test_apply_new_version_theme_frozen_once_set(db_session):
     await db_session.commit()
     await db_session.refresh(version)
 
-    # Theme must stay as originally set — frozen once set.
-    assert version.theme == "leanness"
+    # Strategist can correct a previously-set theme.
+    assert version.theme == "feature"
+
+
+@pytest.mark.asyncio
+async def test_apply_new_version_theme_operator_freeze(db_session):
+    """Operator-set theme is frozen to strategist overwrites."""
+    from app.strategic_completion import _apply_new_version_theme
+    from app import release_version as rv
+
+    project = Project(
+        name="ThemeOperatorFreeze",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+
+    # Simulate an operator setting the theme via the admin endpoint.
+    rv.set_version_theme(version, "reliability", editor_id="op@example.com", source="operator")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.theme == "reliability"
+    assert version.theme_editor_info == "[operator:op@example.com]"
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Strategist attempts to overwrite the operator theme — must be a no-op.
+    await _apply_new_version_theme("feature", task, project, db_session, path="test")
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.theme == "reliability", (
+        f"Operator theme must not be overridden by strategist; got {version.theme!r}"
+    )
+    assert version.theme_editor_info == "[operator:op@example.com]", (
+        f"theme_editor_info must remain operator-set; got {version.theme_editor_info!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -14923,11 +15047,11 @@ async def test_handle_strategic_completion_sets_new_version_goal(db_session, moc
 
 
 @pytest.mark.asyncio
-async def test_handle_strategic_completion_skips_new_version_goal_when_already_set(
+async def test_handle_strategic_completion_skips_new_version_goal_when_operator_set(
     db_session, mocker
 ):
-    """When the open version already has a goal, new_version_goal from the
-    agent output does not overwrite it — the goal is frozen once authored."""
+    """Operator-set goals are frozen to the strategist — new_version_goal from
+    a strategic cycle must not overwrite a goal that an operator authored."""
     from unittest.mock import AsyncMock
 
     from app import release_version as rv
@@ -14936,7 +15060,7 @@ async def test_handle_strategic_completion_skips_new_version_goal_when_already_s
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="GoalFrozen",
+        name="GoalFrozenOperator",
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
     )
@@ -14950,12 +15074,13 @@ async def test_handle_strategic_completion_skips_new_version_goal_when_already_s
     await db_session.commit()
 
     rv.set_version_goal(
-        version, "original strategist goal", editor_id="abc12345", source="strategist"
+        version, "operator-chosen goal", editor_id="op@example.com", source="operator"
     )
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
-    assert version.goal == "original strategist goal"
+    assert version.goal == "operator-chosen goal"
+    assert version.goal_editor_info == "[operator:op@example.com]"
 
     task = Task(
         project_id=project.id,
@@ -14972,13 +15097,13 @@ async def test_handle_strategic_completion_skips_new_version_goal_when_already_s
     await db_session.commit()
     await db_session.refresh(task)
 
-    logs = json.dumps({"new_version_goal": "replacement goal that must be ignored"})
+    logs = json.dumps({"new_version_goal": "strategist attempt that must be ignored"})
 
     await _handle_strategic_completion(task, logs, db_session)
     await db_session.refresh(version)
 
-    assert version.goal == "original strategist goal", (
-        f"Goal must be frozen once authored; got {version.goal!r}"
+    assert version.goal == "operator-chosen goal", (
+        f"Operator goal must not be overridden by strategist; got {version.goal!r}"
     )
 
 
@@ -15155,7 +15280,9 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
         f"goal_editor_info must use source='strategist'; got {version.goal_editor_info!r}"
     )
 
-    # A second call with a different goal must NOT clobber the already-set goal.
+    # A second call with a different goal from the strategist IS allowed —
+    # the strategist can correct its own previously-authored goal.
+    corrected_goal = "A corrected goal — strategist can revise its own authorship."
     resp2 = await client.post(
         "/api/agent/strategic",
         json={
@@ -15165,7 +15292,7 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
                 "intent": {"purpose": "Ship the thing", "current_focus": "build"},
                 "capabilities": [],
                 "gaps": [],
-                "new_version_goal": "A different goal that must be ignored.",
+                "new_version_goal": corrected_goal,
             },
         },
         headers={"x-agent-token": token},
@@ -15174,9 +15301,8 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
     await db_session.refresh(task)
     await _handle_strategic_completion(task, "", db_session)
     await db_session.refresh(version)
-    assert version.goal == goal_text, (
-        f"Goal must be frozen once authored; a second emit must not clobber it. "
-        f"Got {version.goal!r}"
+    assert version.goal == corrected_goal, (
+        f"Strategist must be able to correct its own goal; got {version.goal!r}"
     )
 
 
@@ -15286,7 +15412,9 @@ async def test_set_problem_model_lifts_new_version_theme_api_path(
         f"Expected open version theme to be set to {theme_text!r}; got {version.theme!r}"
     )
 
-    # A second call with a different theme must NOT clobber the already-set theme.
+    # A second call with a different theme from the strategist IS allowed —
+    # the strategist can correct its own previously-authored theme.
+    corrected_theme = "feature"
     resp2 = await client.post(
         "/api/agent/strategic",
         json={
@@ -15296,7 +15424,7 @@ async def test_set_problem_model_lifts_new_version_theme_api_path(
                 "intent": {"purpose": "Ship the thing", "current_focus": "build"},
                 "capabilities": [],
                 "gaps": [],
-                "new_version_theme": "feature",
+                "new_version_theme": corrected_theme,
             },
         },
         headers={"x-agent-token": token},
@@ -15305,7 +15433,6 @@ async def test_set_problem_model_lifts_new_version_theme_api_path(
     await db_session.refresh(task)
     await _handle_strategic_completion(task, "", db_session)
     await db_session.refresh(version)
-    assert version.theme == theme_text, (
-        f"Theme must be frozen once authored; a second emit must not clobber it. "
-        f"Got {version.theme!r}"
+    assert version.theme == corrected_theme, (
+        f"Strategist must be able to correct its own theme; got {version.theme!r}"
     )

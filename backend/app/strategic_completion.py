@@ -40,6 +40,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.release_version import _VALID_THEMES as _VALID_THEME_VALUES
 from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import strategic_phase_for
 from app.time_utils import _utcnow
@@ -419,11 +420,6 @@ _NEW_VERSION_GOAL_MAX = 500
 # Transient task.context key carrying an agent-emitted new_version_theme from the
 # set_problem_model endpoint to _handle_strategic_completion's API path.
 NEW_VERSION_THEME_CONTEXT_KEY = "_strategic_new_version_theme"
-
-# Valid delivery theme values the strategic agent may author.
-_VALID_THEME_VALUES: frozenset[str] = frozenset(
-    {"leanness", "reliability", "performance", "feature", "mixed", "none"}
-)
 
 # OPTIONAL agent verdict that refines the deterministic outcome-progress
 # (scaffolding) detector. For each long-running ACTIVE direction the strategic
@@ -1111,15 +1107,17 @@ async def _apply_new_version_goal(
       - the API path: ``task.context.get(NEW_VERSION_GOAL_CONTEXT_KEY)``
       - the fallback parse path: ``parsed.get("new_version_goal")``
 
-    When valid and the open version has no goal yet, sets the goal with
-    ``source='strategist'`` and ``session.add``s the row — the caller's
-    surrounding ``await session.commit()`` persists it.
+    When valid, sets the goal with ``source='strategist'`` and ``session.add``s
+    the row — the caller's surrounding ``await session.commit()`` persists it.
+    A strategist-set goal may be corrected by a subsequent strategist call;
+    only operator-set goals (``goal_editor_info`` starts with ``'[operator:'``)
+    are frozen against strategist overwrite.
 
     Silently no-ops when:
       - ``goal`` is None / not a non-empty string
       - ``is_contentless_goal`` returns True
       - The project has no open ``ReleaseVersion``
-      - The open version already has a goal (frozen-once-set)
+      - The open version has an operator-set goal (operator goals are frozen to strategist)
 
     All errors are logged and swallowed — a bad or absent goal must never
     block vision/direction writes.
@@ -1149,14 +1147,23 @@ async def _apply_new_version_goal(
             )
             return
         if _open_ver.goal is not None:
-            logger.debug(
-                "[STRATEGIC] Task %s (%s path): open version v%d already has a goal "
-                "— skipping new_version_goal (frozen once set)",
+            _ei = _open_ver.goal_editor_info or ""
+            if _ei.startswith("[operator:"):
+                logger.debug(
+                    "[STRATEGIC] Task %s (%s path): open version v%d has an operator-set goal "
+                    "— skipping new_version_goal (operator goals are frozen to strategist)",
+                    task.id,
+                    path,
+                    _open_ver.version_number,
+                )
+                return
+            logger.info(
+                "[STRATEGIC] Task %s (%s path): open version v%d has a non-operator goal "
+                "— allowing strategist correction",
                 task.id,
                 path,
                 _open_ver.version_number,
             )
-            return
         _set_version_goal(
             _open_ver,
             _nvg_text,
@@ -1214,15 +1221,14 @@ async def _apply_new_version_theme(
       - the API path: ``task.context.get(NEW_VERSION_THEME_CONTEXT_KEY)``
       - the fallback parse path: ``parsed.get("new_version_theme")``
 
-    When valid and the open version has no theme yet, sets the theme and
-    ``session.add``s the row — the caller's surrounding ``await session.commit()``
-    persists it.
+    When valid, sets the theme and ``session.add``s the row — the caller's
+    surrounding ``await session.commit()`` persists it.
 
     Silently no-ops when:
       - ``theme`` is None / not a non-empty string
       - the value is not one of the valid theme values
       - The project has no open ``ReleaseVersion``
-      - The open version already has a theme (frozen-once-set)
+      - The open version has an operator-set theme (theme_editor_info starts with "[operator:")
 
     All errors are logged and swallowed — a bad or absent theme must never
     block vision/direction writes.
@@ -1233,7 +1239,10 @@ async def _apply_new_version_theme(
     if _nvt_text not in _VALID_THEME_VALUES:
         return
     try:
-        from app.release_version import current_open_version as _cur_open_version
+        from app.release_version import (
+            current_open_version as _cur_open_version,
+            set_version_theme as _set_version_theme,
+        )
 
         _open_ver = await _cur_open_version(session, project.id)
         if _open_ver is None:
@@ -1246,15 +1255,29 @@ async def _apply_new_version_theme(
             )
             return
         if _open_ver.theme is not None:
-            logger.debug(
-                "[STRATEGIC] Task %s (%s path): open version v%d already has a theme "
-                "— skipping new_version_theme (frozen once set)",
+            _ei = _open_ver.theme_editor_info or ""
+            if _ei.startswith("[operator:"):
+                logger.debug(
+                    "[STRATEGIC] Task %s (%s path): open version v%d has an operator-set theme "
+                    "— skipping new_version_theme (operator themes are frozen to strategist)",
+                    task.id,
+                    path,
+                    _open_ver.version_number,
+                )
+                return
+            logger.info(
+                "[STRATEGIC] Task %s (%s path): open version v%d has a non-operator theme "
+                "— allowing strategist correction",
                 task.id,
                 path,
                 _open_ver.version_number,
             )
-            return
-        _open_ver.theme = _nvt_text
+        _set_version_theme(
+            _open_ver,
+            _nvt_text,
+            editor_id=str(task.id)[:8],
+            source="strategist",
+        )
         session.add(_open_ver)
         logger.info(
             "[STRATEGIC] Task %s (%s path): authored version theme for v%d project=%s: %s",
