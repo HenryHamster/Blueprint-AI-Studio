@@ -8872,7 +8872,7 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker, caplog):
     task_id = uuid.uuid4()
     caplog.set_level(logging.INFO)
     with (
-        TestClient(app=main_module.app) as tc,
+        TestClient(main_module.app) as tc,
         pytest.raises(WebSocketDisconnect) as exc_info,
         tc.websocket_connect(f"/api/agent/ws/{task_id}") as ws,
     ):
