@@ -422,7 +422,7 @@ export function SettingsDropdown({
       <button
         data-viewport-allow-small-target
         onClick={onToggleSettings}
-        className={`bg-neutral-800 hover:bg-neutral-700 text-neutral-300 p-2 rounded text-xs transition-colors border border-neutral-700${triggerClassName ? ` ${triggerClassName}` : ''}`}
+        className={`p-2 rounded-md text-xs transition-colors flex items-center ${showSettings ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}${triggerClassName ? ` ${triggerClassName}` : ''}`}
         title="Settings"
       >
         <Settings className="w-4 h-4" />

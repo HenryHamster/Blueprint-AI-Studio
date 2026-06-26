@@ -1,6 +1,6 @@
 import { useState, useRef, useReducer, useCallback } from 'react';
 
-export type PrimaryTab = 'home' | 'board' | 'directions' | 'compute' | 'settings';
+export type PrimaryTab = 'home' | 'board' | 'directions' | 'compute';
 
 export function useUIState() {
   const [activeTab, setActiveTab] = useState<PrimaryTab>('home');

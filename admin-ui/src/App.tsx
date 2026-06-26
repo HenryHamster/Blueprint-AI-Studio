@@ -31,7 +31,6 @@ import { DashboardHome } from './components/DashboardHome';
 import { ConsoleHome } from './components/ConsoleHome';
 import { ComputeJobsPanel } from './components/ComputeJobsPanel';
 import { defaultComputeExperimentForm } from './hooks/useTaskModal';
-import { ProjectSwitcherDropdown } from './components/ProjectSwitcherDropdown';
 import type { PrimaryTab } from './hooks/useUIState';
 import { BulkActionBar } from './components/BulkActionBar';
 import { KanbanBoard } from './components/KanbanBoard';
@@ -47,8 +46,6 @@ import { QuickFilterPresets } from './components/QuickFilterPresets';
 import { BoardSavedViewsBar, type BoardFilterSnapshot } from './components/BoardSavedViewsBar';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
-// StatusBar removed — redundant connection info
-import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import { parseTimestamp } from './utils/time';
@@ -510,10 +507,6 @@ export default function App() {
   // the kanban/pipeline views, 'directions' renders DirectionsPanel in page mode.
   const activeTab: PrimaryTab = s.activeTab;
   const handleTabChange = (tab: PrimaryTab) => {
-    if (tab === 'settings') {
-      s.handleToggleSettings();
-      return;
-    }
     s.setActiveTab(tab);
     if (tab === 'board' && s.viewMode === 'home') {
       s.setViewMode('kanban');
@@ -631,7 +624,7 @@ export default function App() {
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={s.needsAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
-        onShowDirections={() => s.setActiveTab('directions')}
+        onNewProject={() => setShowNewProjectModal(true)}
         onSignOut={() => signOut(auth)}
         userEmail={s.user.email || ''}
         wsRef={s.wsRef}
@@ -774,6 +767,13 @@ export default function App() {
         onUpdateIntegrationBranch={s.handleUpdateIntegrationBranch}
         promotionTargetData={s.promotionTargetData}
         onUpdatePromotionTarget={s.handleUpdatePromotionTarget}
+        projects={s.projects}
+        onSelectProject={s.setSelectedProjectId}
+        activeTab={activeTab}
+        onTabChange={handleTabChange}
+        health={s.orchestratorHealth}
+        detailedHealth={s.detailedHealth}
+        pipelineThrottle={s.pipelineThrottle}
       />
 
       <div
@@ -794,51 +794,6 @@ export default function App() {
         </ErrorBoundary>
       </div>
 
-      <OrchestratorHealthBar
-        health={s.orchestratorHealth}
-        detailedHealth={s.detailedHealth}
-        apiHealthy={s.apiHealthy}
-        wsConnected={s.wsConnected}
-        lastFetchTime={s.lastFetchTime}
-        tasks={s.tasks}
-        pipelineThrottle={s.pipelineThrottle}
-      />
-
-      {/* Primary nav: project switcher + tab strip */}
-      <div className="flex items-center gap-3 shrink-0 border-b border-neutral-800/60 pb-1 mb-1">
-        <ProjectSwitcherDropdown
-          projects={s.projects}
-          selectedProjectId={s.selectedProjectId}
-          onSelectProject={s.setSelectedProjectId}
-        />
-        <nav className="flex items-center gap-0.5 flex-1">
-          {(['home', 'board', 'directions', 'compute', 'settings'] as const).map(tab => {
-            const isActive = tab === 'settings' ? s.showSettings : activeTab === tab;
-            const label = tab.charAt(0).toUpperCase() + tab.slice(1);
-            return (
-              <button
-                key={tab}
-                onClick={() => handleTabChange(tab)}
-                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-                  isActive
-                    ? 'bg-neutral-800 text-neutral-100'
-                    : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
-                }`}
-              >
-                {label}
-              </button>
-            );
-          })}
-        </nav>
-        {/* eslint-disable-next-line viewport/min-touch-target */}
-        <button
-          onClick={() => setShowNewProjectModal(true)}
-          className="text-xs text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
-          title="New project"
-        >
-          + Project
-        </button>
-      </div>
 
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
         const projectId = s.selectedProjectId;
