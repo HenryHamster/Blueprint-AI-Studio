@@ -5,6 +5,7 @@ import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
+import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import {
   isComputeJobActive,
@@ -1069,6 +1070,9 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                             </button>
                           )}
                         </div>
+                        <div className="mt-1 flex items-center gap-2 flex-wrap">
+                          <AcceptanceGradeBadge doc={doc} />
+                        </div>
                         {!expanded && doc.summary && (
                           <div className="mt-0.5 text-sky-300/80 break-words whitespace-pre-wrap line-clamp-3">{doc.summary}</div>
                         )}
@@ -1354,6 +1358,17 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       )}
                       {chip}
                     </div>
+                    {verdict?.binding_status && (
+                      <div className="flex items-center gap-1.5 text-neutral-500">
+                        <span className="shrink-0">Binding status</span>
+                        <span
+                          className="font-semibold text-neutral-300"
+                          data-testid="criterion-binding-status"
+                        >
+                          {verdict.binding_status}
+                        </span>
+                      </div>
+                    )}
                     {margin !== null && (
                       <div className="flex items-center gap-1.5 text-neutral-500">
                         <span className="shrink-0">Margin</span>

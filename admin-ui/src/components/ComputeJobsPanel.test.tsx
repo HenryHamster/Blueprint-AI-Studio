@@ -877,6 +877,61 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(body.textContent).toContain('The complete LLM-grounded analysis body');
   });
 
+  test('knowledge doc shows acceptance grade badge for compute_experiment', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      knowledge_document_id: 'doc-badge-1',
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    fetchKnowledgeDocument.mockResolvedValue({
+      id: 'doc-badge-1',
+      title: 'Compute experiment result',
+      summary: 'LLM-grounded analysis with artifact citation.',
+      tags: [],
+      source_citations: [],
+      source_task_id: 'task-1',
+      source_kind: 'compute_experiment',
+      created_at: null,
+      updated_at: null,
+      forward_quality_verdict: null,
+      compute_acceptance_grade: 'acceptance',
+      compute_acceptance_reason: 'llm_artifact_cited',
+    });
+    const { findByTestId, getByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('compute-knowledge-doc-link');
+    expect(getByText('Acceptance')).toBeTruthy();
+  });
+
+  test('knowledge doc shows measured only badge for compute_experiment', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      knowledge_document_id: 'doc-badge-2',
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    fetchKnowledgeDocument.mockResolvedValue({
+      id: 'doc-badge-2',
+      title: 'Compute experiment result',
+      summary: 'Measured-only analysis.',
+      tags: [],
+      source_citations: [],
+      source_task_id: 'task-1',
+      source_kind: 'compute_experiment',
+      created_at: null,
+      updated_at: null,
+      forward_quality_verdict: null,
+      compute_acceptance_grade: 'measured_only',
+      compute_acceptance_reason: 'analysis_mode_not_llm',
+      analysis_mode: 'deterministic',
+    });
+    const { findByTestId, getByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('compute-knowledge-doc-link');
+    expect(getByText('Measured only')).toBeTruthy();
+  });
+
   test('terminal job with hypothesis and experiment shows experiment identity block', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
@@ -1243,6 +1298,22 @@ describe('ComputeJobsPanel render + kill', () => {
     const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByTestId('criterion-verdict-row');
     expect(queryByTestId('criterion-margin')).toBeNull();
+  });
+
+  test('terminal job with release-echo criterion verdict displays binding_status label', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        success_criterion: { metric: 'release_echo_verified', operator: '==', threshold: 1 },
+        criterion_verdict: { metric: 'release_echo_verified', operator: '==', threshold: 1, value: 1, met: true, measurable: true, binding_status: 'verified' },
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('criterion-verdict-row');
+    const bindingStatus = await findByTestId('criterion-binding-status');
+    expect(bindingStatus.textContent).toBe('verified');
   });
 
   test('window selector renders with 6h active by default', async () => {
