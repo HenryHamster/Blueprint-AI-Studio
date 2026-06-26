@@ -19,6 +19,11 @@ import { provisionAmbientHelpers } from './providers/runners.js';
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 
+// These tests assert helper scripts are written with the Unix executable bit
+// (statSync mode & 0o111). Windows has no executable bit, so probe the real
+// capability and skip there while still running fully in Linux CI.
+const SUPPORTS_EXEC_BIT = process.platform !== 'win32';
+
 // Strip both block and line comments so doc-comment examples (`// ./design-doc`)
 // don't read as live prompt advertisements.
 function stripComments(src: string): string {
@@ -93,7 +98,8 @@ describe('helper-script reference drift', () => {
 // each handler's workspace by invoking the same writer functions the handler
 // invokes, builds the advertised-helper set from the handler's prompt source,
 // and asserts every advertised (non-ambient) helper is a real executable file.
-describe('per-handler prompt/helper provisioning parity', () => {
+// Requires the Unix executable bit (statSync mode & 0o111) — skip where absent.
+describe.skipIf(!SUPPORTS_EXEC_BIT)('per-handler prompt/helper provisioning parity', () => {
   // ── Helper categories ──────────────────────────────────────────────────────
   // AMBIENT helpers are provisioned for EVERY model task by the provider runner
   // (provisionAmbientHelpers, called from runProviderAgent). The test exercises

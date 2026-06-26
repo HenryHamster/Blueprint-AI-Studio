@@ -117,7 +117,7 @@ export function buildCitationRepairPrompt(
 
 ${list}${more > 0 ? `\n(+${more} more)` : ''}
 
-Fix ONLY the source_citations array — keep title, summary, body, tags, and topic unchanged. Each file citation must be the repository-relative path of a real file you actually read, exactly as it exists on disk (verify each with ls): bare like backend/app/example.py or prefixed like file:backend/app/example.py. Do NOT wrap paths in backticks or quotes, do NOT append descriptions or line ranges, and do NOT use absolute paths.
+Fix ONLY the source_citations array — keep title, summary, body, tags, and topic unchanged. Each file citation must be the repository-relative path of a real file you actually read, exactly as it exists on disk (verify each with ls): bare like src/example.py or prefixed like file:src/example.py. Do NOT wrap paths in backticks or quotes, do NOT append descriptions or line ranges, and do NOT use absolute paths.
 
 Rewrite the FULL corrected document JSON to ${documentPath} (use Bash — the Write tool is disabled), and ALSO output the same complete JSON object as the VERY LAST thing in your response.`;
 }
@@ -300,14 +300,14 @@ Write your document as a JSON object to ${documentPath} (use Bash to write the f
   "title": "Concise design title (under ~120 chars)",
   "summary": "1-3 sentence summary of the proposed design.",
   "body": "The full design in markdown. Use headings, lists, and short paragraphs. Cover the current state, the proposed design, contracts/shapes, trade-offs, and rollout. This is the durable design artifact.",
-  "source_citations": ["file:backend/app/example.py", "path/to/another.ts", "https://optional-external-ref"],
+  "source_citations": ["file:path/to/example.py", "path/to/another.ts", "https://optional-external-ref"],
   "tags": ["short-tag-1", "short-tag-2"],
   "topic": "${topic || 'short topic slug'}"
 }
 
 Rules:
 - title, summary, and body are REQUIRED and must be non-empty strings. body must be substantive markdown grounded in the code you read.
-- source_citations is REQUIRED and must contain at least one usable citation. FILE references are the default — cite the actual files your design is grounded in (file:path or a path like backend/app/x.py). Web URLs (https://...) are also accepted. An ungrounded design with no usable citation FAILS the forward-quality gate and is discarded.
+- source_citations is REQUIRED and must contain at least one usable citation. FILE references are the default — cite the actual files your design is grounded in (file:path or a path like path/to/file.py). Web URLs (https://...) are also accepted. An ungrounded design with no usable citation FAILS the forward-quality gate and is discarded.
 - file citations are MACHINE-CHECKED against the working tree: each must be a repository-relative path exactly as it exists on disk (verify with ls before emitting). Do NOT wrap paths in backticks or quotes, do NOT append descriptions or line ranges, and do NOT use absolute paths — a design whose file citations ALL fail to resolve is DISCARDED.
 - tags and topic are optional but recommended; tags is a list of short strings.
 - Also emit the same JSON object as the VERY LAST thing in your response (in addition to writing the file), so it can be recovered if the file write fails.
@@ -350,7 +350,7 @@ ${designFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
       requiredKeys: ['title', 'summary', 'body'],
       schemaLabel: 'design',
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `${priorAnalysisSection}You did not emit the design document JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required fields: title, summary, body. Schema:\n\n{"title":"Concise design title","summary":"1-3 sentence summary.","body":"Full design in markdown.","source_citations":["file:backend/app/example.py"],"tags":["tag"],"topic":"slug"}\n\nOutput ONLY the JSON object.`,
+      reopenPrompt: `${priorAnalysisSection}You did not emit the design document JSON in the required schema. Output ONLY the JSON object now — no markdown, no explanation. Required fields: title, summary, body. Schema:\n\n{"title":"Concise design title","summary":"1-3 sentence summary.","body":"Full design in markdown.","source_citations":["file:path/to/example.py"],"tags":["tag"],"topic":"slug"}\n\nOutput ONLY the JSON object.`,
       ws,
       statusRef,
       model,

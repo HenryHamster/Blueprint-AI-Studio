@@ -182,12 +182,12 @@ Your text output will be DISCARDED. The ONLY way to save your work is the \`./de
 \`\`\`bash
 ./design-doc set "summary" '"Brief project description"'
 ./design-doc set "architecture" '{"type": "monolith", "description": "...", "key_decisions": [...]}'
-./design-doc set "systems/sys-auth" '{"id": "sys-auth", "name": "Auth", "status": "functional", "description": "...", "modules": ["backend/app/auth.py"]}'
+./design-doc set "systems/<id>" '{"id": "<id>", "name": "<System Name>", "status": "functional", "description": "...", "modules": ["<path/to/module>"]}'
 ./design-doc set "capabilities/testing" '{"status": "partial", "notes": "Unit tests only"}'
 ./design-doc set "risks" '["Risk 1", "Risk 2"]'
 ./design-doc set "notes/observations" '"Any notes for future reference"'
 ./design-doc delete "systems/sys-removed"
-./design-doc get "systems/sys-auth"   # read a section's FULL content (the Current pages list below is only an index)
+./design-doc get "systems/<id>"   # read a section's FULL content (the Current pages list below is only an index)
 ./design-doc list
 \`\`\`
 
@@ -219,7 +219,7 @@ Skip full re-analysis of systems with no files in the manifest.
 3. For capabilities: \`./design-doc set "capabilities/<name>" '{...}'\`
 4. For risks: \`./design-doc set "risks" '[...]'\`
 5. For notes/observations: \`./design-doc set "notes/<topic>" '"..."'\`
-6. Use stable system IDs (sys-auth, sys-pipeline, sys-frontend, etc.)
+6. Use stable, kebab-case system IDs (sys-<name>) that describe THIS project's actual systems.
 7. Focus on WHAT IS. Document missing things as missing.
 8. For each system, include a "ready_for_features" field (true/false) with a brief reason.
    A system is ready if other systems can reliably build on it (APIs work, tests pass, config is wired up).

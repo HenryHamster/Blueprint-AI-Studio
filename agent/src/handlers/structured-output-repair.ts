@@ -93,7 +93,7 @@ const MAX_PRIOR_OUTPUT_CHARS = 4000;
 // agent knows exactly what was wrong, appends a bounded tail of the first-pass
 // output as reformatting context, then appends the caller's schema restatement.
 // Including the prior output means recovery is a reformat rather than a cold
-// re-derivation (the first pass is often ~90s Opus work). When missReason is
+// re-derivation (the first pass is often expensive multi-paragraph reasoning). When missReason is
 // null (shouldn't happen on the repair path but defensive), the prior context
 // is still included when non-empty so the caller's prompt gets full context.
 function buildMissAwarePrompt(

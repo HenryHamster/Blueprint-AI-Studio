@@ -47,6 +47,8 @@ import {
 } from './strategic-helpers.js';
 import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
+import { resolveBuildConfig } from '../build-config.js';
+import { resolveMigrationLayout } from './specialized.js';
 
 export const PR_INELIGIBLE_TASK_TYPES = [
   'research', 'investigate', 'audit', 'memo',
@@ -1649,6 +1651,24 @@ export async function handlePlan(
   if (planProjectId) writeFetchHelper(taskId, planProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
   const planFetchGuidance = planProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
   const disallowedTools = configureAgentPermissions('plan');
+
+  // ATOMIC SCHEMA RULE guidance — when this project configures a migration
+  // layout (build_config.migration, or any python directory), name the resolved
+  // model/migration/schema-revision paths so the planner keeps the model edit
+  // and its migration in ONE subtask. With no migration config we fall back to
+  // a stack-agnostic statement (don't hardcode any one project's paths).
+  const planBuildConfig = resolveBuildConfig(task);
+  const planHasMigrationLayout =
+    !!planBuildConfig?.migration ||
+    (planBuildConfig?.directories ?? []).some(d => d.type === 'python');
+  let atomicSchemaPathsNote = '';
+  if (planHasMigrationLayout) {
+    const planMigrationLayout = resolveMigrationLayout(planBuildConfig);
+    const revisionTarget = planMigrationLayout.schemaRevisionFile
+      ? ` and ${planMigrationLayout.schemaRevisionFile} for ${planMigrationLayout.schemaRevisionConst}`
+      : '';
+    atomicSchemaPathsNote = ` Set the subtask's type="migrate" and include in its related_files the model file(s) under ${planMigrationLayout.modelsDir}, the new migration file under ${planMigrationLayout.versionsDir}${revisionTarget}.`;
+  }
   const promptFingerprint = computeResearchPlanPromptFingerprint('plan');
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
   if (setPromptFingerprint) setPromptFingerprint(promptFingerprint);
@@ -1728,7 +1748,7 @@ If — and ONLY if — your exploration shows there is genuinely nothing to buil
 
 {
   "subtasks": [],
-  "no_op_reason": "Specific, verified reason (at least 30 chars) naming exactly what is already present / why no code subtasks are needed — cite the concrete files, symbols, or sibling work you checked, e.g. 'app/config.py already loads repo layout from settings.REPO_LAYOUT and shared_state.py:get_repo_root() derives all paths from it; no hardcoded layout remains to de-hardcode'."
+  "no_op_reason": "Specific, verified reason (at least 30 chars) naming exactly what is already present / why no code subtasks are needed — name the concrete files, symbols, or sibling work you verified already implement the requested change."
 }
 
 The no_op_reason MUST be at least 30 characters and name the concrete evidence you verified. This is the ONLY clean way for a plan to complete with zero subtasks — an empty "subtasks" array WITHOUT a specific no_op_reason is treated as a failed plan. This is NOT a give-up path: only use it when you have actually VERIFIED the work is already done or genuinely needs no code change. If you simply could not figure out how to decompose the task, that is a real plan failure — let the agent exit non-zero rather than emitting a bogus no_op_reason.${isGreenfield ? `
@@ -1736,8 +1756,8 @@ The no_op_reason MUST be at least 30 characters and name the concrete evidence y
 GREENFIELD CAVEAT: on this empty/near-empty repo, "there is no source code to change" or "the codebase is empty" is NOT a valid no_op_reason. Absent source is exactly the signal to bootstrap — decompose "build the foundation for the goal" into ordered subtasks driven by the Project Vision / goal and any design-doc specs. Only emit a no-op here if the foundation the goal requires already exists on this branch.` : ''}
 
 Risk guidance:
-- risk=high: changes to auth flows, JWT/token handling, database models (models.py), Alembic migrations, core orchestration (main.py worker loops), VM provisioning (compute.py), any change that if wrong could cause data loss or security breach
-- risk=medium: new API endpoints, changes to existing API request/response shapes, new agent handler types, frontend state management, WebSocket protocol changes
+- risk=high: changes to auth/secrets handling, data-model or schema changes, database migrations, core control/orchestration loops, infrastructure provisioning, any change that if wrong could cause data loss or a security breach
+- risk=medium: new or changed public API surfaces (endpoints, request/response shapes), frontend state management, cross-process or protocol changes
 - risk=low: UI-only changes, new utility functions, log/error message changes, documentation, tests that don't touch production code
 When risk=high for a subtask, the task will require human approval before executing. Set this judiciously — only when a mistake would be hard to roll back. When risk=high, also set "approval_reason" to a brief explanation of why this needs approval.
 
@@ -1759,7 +1779,7 @@ Rules:
 - acceptance_evidence (OPTIONAL, additive — omit when you have nothing substantive to declare): the concrete evidence that will prove THIS subtask's claim true, carried forward to the implementing agent and the evaluation lane. Exactly one of four kinds: (1) {"kind": "named_test", "test_path": "tests/test_x.py", "test_id": "test_fn"} — a test exercising the changed seam (test_path must name a real test file; test_id optional, or embed inline as path::test_fn); (2) {"kind": "observable_behavior", "description": "..."} — a substantive (≥10 char, non-placeholder) description of a behavior that should be exercised; (3) {"kind": "downstream_artifact", "artifact_id": "..."} — an artifact a later task consumes; (4) {"kind": "visual", "component": "<UI component under test>", "viewport_width": <px, 1-4096>, "assertion_type": "<optional, e.g. overflow|text_truncation>"} — for FRONTEND-TOUCHING work (admin-ui components), proven by an uploaded viewport screenshot of that component captured at that width on a successful run. Declare it only for subtasks where the success condition is concrete; never invent a placeholder/always-true declaration (those are rejected).
 - prerequisite (OPTIONAL, default null): a FOUNDATION this subtask depends on that is built OUTSIDE this plan (another lane / an already-built capability). Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` or \`{"kind": "capability", "ref": "<capability-name>"}\`. For a capability ref, DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above so it resolves to whichever task advertises it (the matcher is EXACT). Use depends_on_indices — NOT prerequisite — to order subtasks WITHIN this plan; prerequisite is only for cross-lane/cross-plan foundations.
 - provides_capability (OPTIONAL, default null): a short kebab-case capability name THIS subtask advertises so another lane's prerequisite \`{"kind": "capability", "ref": "<name>"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability. ${CAPABILITY_DECLARATION_DOC}
-- ATOMIC SCHEMA RULE: a database schema change is ONE subtask, never split across dependent subtasks. If a subtask modifies SQLAlchemy/SQLModel models (backend/app/models.py) or adds/changes tables or columns, that SAME subtask must also generate the Alembic migration and bump the schema revision. Do NOT emit a separate dependent type="migrate" subtask for the migration of a model change in another subtask — splitting the model edit from its migration manufactures dead serialization and ships a model PR with no migration (which reviewers reject). Set the subtask's type="migrate" and include in its related_files the model file(s) (backend/app/models.py), the new Alembic file (backend/alembic/versions/...), and backend/app/main.py for EXPECTED_SCHEMA_REVISION. The migration agent will handle Alembic generation and the revision bump within that single subtask/PR. Only create a separate subtask when the other work is genuinely independent of the schema change — never to carry the migration for it.
+- ATOMIC SCHEMA RULE: a database schema change is ONE subtask, never split across dependent subtasks. If a subtask edits the data model (adds/changes tables, columns, or model definitions), that SAME subtask must also generate the matching migration and bump the schema revision. Do NOT emit a separate dependent type="migrate" subtask for the migration of a model change in another subtask — splitting the model edit from its migration manufactures dead serialization and ships a model PR with no migration (which reviewers reject).${atomicSchemaPathsNote} The migration agent will handle migration generation and the revision bump within that single subtask/PR. Only create a separate subtask when the other work is genuinely independent of the schema change — never to carry the migration for it.
 - If any subtask adds new user-facing functionality, consider whether a test subtask is needed. New API endpoints should have corresponding integration tests. New agent handlers should have at least one smoke test. Add a test subtask with depends_on_indices pointing to the implementation subtask.
 - If any subtask changes a public API interface (endpoint signatures, request/response shapes, TypeScript types exported to frontend), include explicit notes in the prompt about backward compatibility requirements.
 - IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
@@ -2188,7 +2208,7 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
   const researchRetryContext = buildRetryContext(task);
   const researchFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const researchEmptyRepoGuidance = buildEmptyRepoGuidance(task);
-  const researchPrompt = `${contextPrefix}${researchPlaybookSection}${researchRetryContext}You are a codebase research agent inside Blueprint, an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
+  const researchPrompt = `${contextPrefix}${researchPlaybookSection}${researchRetryContext}You are a codebase research agent inside an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
 
 # MISSION
 
@@ -2390,7 +2410,7 @@ implementation findings. Add metadata alongside them when relevant.
   "actionability_grade": "HIGH|MEDIUM|LOW",
   "verification_basis": "code_verified|path_verified|pattern_inferred|deduced",
   "acceptance_evidence": null,
-  "related_files": ["path/to/file.py"],
+  "related_files": ["path/to/file.<ext>"],
   "depends_on_indices": [],
   "prerequisite": null,
   "provides_capability": null,
@@ -2399,12 +2419,11 @@ implementation findings. Add metadata alongside them when relevant.
   "compute_experiment": {"command": "command run inside a clone of this repo at cwd, e.g. 'python3 -m pkg.eval --episodes 1000'", "spend_cap_usd": 5.0, "deadline_seconds": 1800, "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}, "accelerator": "T4"},
   "smoke_sample": {"exit_code": 0, "startup_ok": true, "metric_captured": true, "timed_out": false, "error_excerpt": ""},
   "claims": ["short factual assertion backed by your investigation (omit when synthesizing)"],
-  "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.py or pr#123 or msg_id", "excerpt": "optional short quote"}],
-  "acceptance_evidence": {"kind": "test", "descriptor": "named test exercising the new seam end-to-end", "selector": "testing/test_foo.py::test_bar"}
+  "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.<ext> or pr#123 or msg_id", "excerpt": "optional short quote"}]
 }]
 \`\`\`
 
-**claims** (optional): Short factual assertions that back this finding — one sentence each, verifiable (e.g. 'backend/app/task_completion.py:_handle_research_completion stores findings in task.plan_output'). Omit the field when synthesizing across many observations with no single traceable origin.
+**claims** (optional): Short factual assertions that back this finding — one sentence each, verifiable (e.g. '<module>:<function> does X at <path>:<line>'). Omit the field when synthesizing across many observations with no single traceable origin.
 
 **sources** (optional, provenance only): Cite a specific origin when you have one. type 'file': a file you read, 'pr': a merged PR number, 'log': a pipeline log line, 'message': a user message. Omit the field when synthesizing. excerpt is optional — include only a directly relevant short quote.
 
@@ -2412,7 +2431,7 @@ implementation findings. Add metadata alongside them when relevant.
 
 **compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`accelerator\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). The \`accelerator\` field (one of \`T4\`, \`L4\`, \`V100\`) is **sufficient on its own** to request a single GPU — you do NOT need to specify \`machine_type\` when requesting a single GPU by accelerator name; the system resolves the correct GPU machine type automatically. Omit entirely on non-experiment findings.
 
-**provides_capability** (optional, default null): A short kebab-case capability name this finding's task advertises (e.g. "payment-core"), so a sibling finding (or another lane) declaring \`{"kind": "capability", "ref": "payment-core"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability not already listed. Omit unless another task needs to gate on this one by capability. ${CAPABILITY_DECLARATION_DOC}
+**provides_capability** (optional, default null): A short kebab-case capability name this finding's task advertises (e.g. "<feature>-core"), so a sibling finding (or another lane) declaring \`{"kind": "capability", "ref": "<feature>-core"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability not already listed. Omit unless another task needs to gate on this one by capability. ${CAPABILITY_DECLARATION_DOC}
 
 **acceptance_evidence** (optional): Declare the proof that will show this finding's claim is true. Shape: \`{"kind": "test"|"behavior"|"artifact"|"visual", "descriptor": "short human-readable proof", "selector": "optional test path/selector, artifact ref, or viewport width"}\`. kind=test = a named test/selector exercising the seam end-to-end; behavior = an observable runtime behavior; artifact = an artifact a downstream task consumes; visual = a viewport screenshot of a FRONTEND/admin-ui component (descriptor = the component name, selector = the viewport width in px as a string), proven by an uploaded screenshot of that component at that width on a successful run. Omit the whole object when you are not declaring a proof — omitting it preserves today's behavior exactly. Do NOT invent other kinds.
 

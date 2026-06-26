@@ -399,7 +399,7 @@ export async function handleReleaseAuditChallenge(
 
 2. **Re-judge each higher-severity finding.** ${primaryFindingsSection}For EACH finding you judge, READ the relevant unchanged files in the full repository (not just the diff) to check for existing mitigations (guards, exception handlers, per-request checks, hardcoded constants at the call site). Then assign exactly one verdict:
    - \`confirmed\` — you independently reproduced the issue against the real code; it is a genuine problem.
-   - \`refuted_false_positive\` — you investigated and the issue does NOT hold (e.g. a hardcoded constant reaching a sink is not injection; a per-request DB check is not a replay gap; an exception-guarded comparison is not a TypeError).
+   - \`refuted_false_positive\` — you investigated and the issue does NOT hold once you account for an existing mitigation (e.g. a guard, check, or constraint already present at the call site neutralises the reported problem).
    - \`uncertain\` — you could not confidently confirm or refute it from the available code.
 ${versionGoalSection}
 3. **Emit results.** Write your verdicts as a JSON object to \`/tmp/release_audit_challenge_${taskId}.json\` with EXACTLY this structure:
@@ -414,7 +414,7 @@ ${versionGoalSection}
       "summary": "EXACT primary finding summary text when primary_findings were supplied; otherwise one sentence describing the finding",
       "file": "path/to/affected/file.py",
       "verdict": "confirmed",
-      "reason": "Read app/auth.py lines 45-62 — req.user_id is user-controlled and reaches the SQL call at line 60 with no sanitisation, so the injection finding is real."
+      "reason": "<auditable justification citing the specific files/lines you read, e.g. '<file>:<lines> — the finding holds because …'>"
     }
   ]
 }

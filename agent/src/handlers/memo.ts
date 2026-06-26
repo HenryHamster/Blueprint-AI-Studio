@@ -65,7 +65,7 @@ function extractCodexAgentMessageTexts(text: string): string[] {
 }
 
 const MEMO_SCHEMA_HINT =
-  `{\n  "summary": "One- to two-sentence summary of the reasoning.",\n  "reasoning": "Detailed reasoning (a few paragraphs at most).",\n  "citations": ["task:<id>", "direction:<id>", "file:path/to/x.py", ...],\n  "tags": ["tag-1", "tag-2", ...]\n}\nAll four keys are required. summary and reasoning must be non-empty strings; citations and tags must be arrays of strings (empty arrays allowed).`;
+  `{\n  "summary": "One- to two-sentence summary of the reasoning.",\n  "reasoning": "Detailed reasoning (a few paragraphs at most).",\n  "citations": ["task:<id>", "direction:<id>", "file:path/to/source", ...],\n  "tags": ["tag-1", "tag-2", ...]\n}\nAll four keys are required. summary and reasoning must be non-empty strings; citations and tags must be arrays of strings (empty arrays allowed).`;
 
 // ── Handler: Memo (terminal reasoning artifact, no repo clone, no PR) ────────
 //
@@ -188,7 +188,7 @@ Instructions:
 {
   "summary": "One- to two-sentence summary of the reasoning.",
   "reasoning": "Detailed reasoning (a few paragraphs at most).",
-  "citations": ["task:<id>", "direction:<id>", "file:path/to/x.py", ...],
+  "citations": ["task:<id>", "direction:<id>", "file:path/to/source", ...],
   "tags": ["tag-1", "tag-2", ...]
 }
 

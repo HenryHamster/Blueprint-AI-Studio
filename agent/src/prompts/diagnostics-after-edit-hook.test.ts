@@ -2,6 +2,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import fs from 'fs';
 import { execSync } from 'child_process';
 
+// These tests assert hardcoded POSIX forward-slash paths that only match what
+// path.join() produces on non-Windows platforms (Windows yields backslashes).
+const IS_POSIX = process.platform !== 'win32';
+
 vi.mock('../index.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../index.js')>();
   return {
@@ -32,7 +36,8 @@ describe('diagnostics-after-edit Claude hook writer', () => {
     });
   });
 
-  it('writes a PostToolUse hook and a syntactically valid diagnostics script', async () => {
+  // requires POSIX path separators: settings written under path.join() use '/' only on non-win32
+  it.skipIf(!IS_POSIX)('writes a PostToolUse hook and a syntactically valid diagnostics script', async () => {
     const {
       DIAGNOSTICS_AFTER_EDIT_HOOK_MATCHER,
       writeDiagnosticsAfterEditHook,
@@ -62,7 +67,8 @@ describe('diagnostics-after-edit Claude hook writer', () => {
     execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
   });
 
-  it('keeps generated Claude workspace state out of git', async () => {
+  // requires POSIX path separators: appendFileSync is called with a path.join() result ('/' only on non-win32)
+  it.skipIf(!IS_POSIX)('keeps generated Claude workspace state out of git', async () => {
     const { writeDiagnosticsAfterEditHook } = await import('./diagnostics-after-edit-hook.js');
     writeDiagnosticsAfterEditHook('/tmp/workspace');
 

@@ -1700,7 +1700,7 @@ describe('specialized handler structural prompt invariants', () => {
 
   it.each([
     ['handleSecurityAudit', () => handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'OWASP Top 10'],
-    ['handlePerf',          () => handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'N+1 database queries'],
+    ['handlePerf',          () => handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'N+1 data-access queries'],
     ['handleDebug',         () => handleDebug(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'Do NOT make any code changes'],
     ['handleInvestigate',   () => handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'Do NOT modify any files'],
     ['handleSelfAudit',     () => handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'test_coverage'],
