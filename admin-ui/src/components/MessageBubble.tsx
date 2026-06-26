@@ -2,6 +2,7 @@ import { X, Check, AlertTriangle, HelpCircle, Bug, StickyNote, MessageSquare, Pl
 import { useState, useCallback } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS } from './eventPrefs';
+import { MarkdownContent } from './MarkdownContent';
 
 type CitationState = 'absent' | 'present' | 'indeterminate';
 
@@ -314,7 +315,13 @@ export function MessageBubble({
             </div>
           )}
           {/* Content */}
-          <p className="text-sm text-neutral-200 leading-relaxed whitespace-pre-wrap">{msg.content}</p>
+          {userMsg ? (
+            <p className="text-sm text-neutral-200 leading-relaxed whitespace-pre-wrap">{msg.content}</p>
+          ) : (
+            <div className="text-sm text-neutral-200 leading-relaxed">
+              <MarkdownContent content={msg.content} />
+            </div>
+          )}
           <StaleCitationBadge msg={msg} />
           {/* Context badges */}
           <ContextBadges context={msg.context} fromType={msg.from_type} />

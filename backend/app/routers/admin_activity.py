@@ -207,6 +207,7 @@ async def get_activity(
                     "repo_url": None,
                     "commit_hash": None,
                     "error_summary": error_log_map.get(tid),
+                    "investigation_summary": investigation_report_map.get(tid),
                     "failure_class": classify_failure(t, error_log_map.get(tid)),
                     "taxonomy": classify_failure_taxonomy(t),
                     "finding_count": None,

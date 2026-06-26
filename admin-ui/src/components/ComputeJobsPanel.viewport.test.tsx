@@ -407,4 +407,54 @@ describe('ComputeJobsPanel — viewport regression', () => {
       { waitMs: 60 },
     );
   });
+
+  test('renders re-run button disabled when job has no source task at 1024px', async () => {
+    const jobWithoutTaskId: ComputeJob = {
+      id: 'job-no-task',
+      project_id: 'proj-1',
+      task_id: null,
+      backend: 'gcp_compute_engine',
+      external_compute_id: null,
+      machine_type: 'e2-standard-2',
+      status: 'SUCCEEDED',
+      terminal_reason: 'experiment completed',
+      outcome: 'SUCCESS',
+      spend_cap_usd: 5.0,
+      wall_clock_deadline: null,
+      created_at: new Date(Date.now() - 900_000).toISOString(),
+      updated_at: new Date(Date.now() - 300_000).toISOString(),
+      started_at: new Date(Date.now() - 890_000).toISOString(),
+      completed_at: new Date(Date.now() - 300_000).toISOString(),
+      last_polled_at: new Date(Date.now() - 300_000).toISOString(),
+      accrued_cost_usd: 1.5,
+      final_cost_usd: 1.5,
+      result_reference: null,
+      task_title: 'compute_experiment: no source task',
+      task_type: 'compute_experiment',
+    };
+    jobsToReturn = [jobWithoutTaskId];
+    await expectFullViewportAt(
+      1024,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" onDuplicateTask={async () => {}} />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        const text = host.textContent ?? '';
+        if (!text.includes('no source task')) throw new Error('job title not rendered');
+        if (!text.includes('Run analysis')) throw new Error('Run analysis button not rendered');
+        if (!text.includes('Re-run')) throw new Error('Re-run button not rendered');
+        const allBtns = Array.from(host.querySelectorAll('button'));
+        const rerunBtn = allBtns.find(btn => (btn.textContent ?? '').includes('Re-run'));
+        if (!rerunBtn) throw new Error('Re-run button element not found');
+        if (!rerunBtn.disabled) throw new Error('Re-run button should be disabled');
+      },
+      { waitMs: 60 },
+    );
+  });
 });

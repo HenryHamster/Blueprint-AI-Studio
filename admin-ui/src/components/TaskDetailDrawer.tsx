@@ -290,6 +290,12 @@ export function TaskDetailDrawer({
     setIncludePatch(false);
   }, [task.id]);
 
+  // Reset edit prompt state when task changes
+  useEffect(() => {
+    setEditingPrompt(false);
+    setEditPromptValue(task.description);
+  }, [task.id, task.description]);
+
   const loadPrFiles = async (withPatch: boolean) => {
     setPrFilesLoading(true);
     setPrFilesError(null);

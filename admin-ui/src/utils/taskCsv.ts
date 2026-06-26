@@ -79,8 +79,11 @@ function sortValue(task: Task, sortBy: TaskSortBy, nowMs: number): number | stri
     case 'title':
       return task.title ?? '';
     case 'duration': {
-      const baseTs = parseTimestamp(task.started_at ?? task.created_at).getTime();
-      return Number.isNaN(baseTs) ? -1 : nowMs - baseTs;
+      const createdTs = parseTimestamp(task.created_at).getTime();
+      if (Number.isNaN(createdTs)) return -1;
+      const endTs = getTaskEndTime(task, nowMs);
+      if (endTs === null) return -1;
+      return Math.max(0, endTs - createdTs);
     }
     case 'attempts':
       return task.attempt_count ?? 0;

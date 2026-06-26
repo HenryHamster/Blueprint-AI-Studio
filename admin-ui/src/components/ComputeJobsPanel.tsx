@@ -1119,7 +1119,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       {onDuplicateTask && (
                         <button
                           onClick={() => job.task_id && void onDuplicateTask(job.task_id)}
-                          className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-sky-500/20 text-sky-200 hover:bg-sky-500/30 text-ui-md font-semibold px-3 transition-colors"
+                          disabled={!job.task_id}
+                          className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-sky-500/20 text-sky-200 hover:bg-sky-500/30 text-ui-md font-semibold px-3 transition-colors disabled:opacity-50"
                           title="Re-run this experiment with the same configuration"
                         >
                           <Cpu className="w-3 h-3" />

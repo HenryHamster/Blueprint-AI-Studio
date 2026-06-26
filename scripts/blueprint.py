@@ -1955,10 +1955,11 @@ def _render_messages(data: dict) -> None:
         print("No messages.")
         return
     for m in msgs:
+        msg_id = m.get("id", "?")
         icon = _MSG_ICONS.get(m.get("type", ""), "?")
         src = m.get("from", "?")
         age = (m.get("created_at") or "?")[:16]
-        print(f"  [{icon}] ({src}, {age}) {(m.get('content') or '')[:120]}")
+        print(f"  {msg_id} [{icon}] ({src}, {age}) {(m.get('content') or '')[:120]}")
 
 
 def _messages_send(args: argparse.Namespace) -> None:
@@ -2307,6 +2308,10 @@ def cmd_ops(args: argparse.Namespace) -> None:
 
 def _ops_repair(args: argparse.Namespace) -> None:
     """Repair stuck state."""
+    _require_write_config("repair")
+    if not _confirm("Repair stuck/orphaned tasks?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
     result = api("POST", "/api/admin/repair-state", {})
     repairs = result.get('repairs', [])
     data = {"action": "repair", "count": result.get('count', 0), "repairs": repairs}
@@ -2322,16 +2327,24 @@ def _ops_repair(args: argparse.Namespace) -> None:
 
 def _ops_reset_health(args: argparse.Namespace) -> None:
     """Force-reset health checks."""
+    _require_write_config("reset-health")
+    if not _confirm("Force-reset health checks?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
     result = api("POST", "/api/admin/deploy-state/reset-health", {})
     _emit(args, result, lambda d: print(json.dumps(d, indent=2, default=str)))
 
 
 def _ops_requeue_failed(args: argparse.Namespace) -> None:
     """Requeue all FAILED tasks."""
+    _require_write_config("requeue-failed")
     from blueprint_api import list_tasks
     failed = list_tasks(status="FAILED", limit=100)
     if not failed:
         _emit(args, {"count": 0}, lambda d: print("No failed tasks."))
+        return
+    if not _confirm(f"Requeue {len(failed)} failed task(s)?", getattr(args, "yes", False)):
+        print("Aborted.")
         return
     requeued = []
     failed_requeue = []
@@ -2360,6 +2373,10 @@ def _ops_requeue_failed(args: argparse.Namespace) -> None:
 
 def _ops_restart_orchestrator(args: argparse.Namespace) -> None:
     """Restart background loops."""
+    _require_write_config("restart-orchestrator")
+    if not _confirm("Restart orchestrator background loops?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
     result = api("POST", "/api/admin/restart-orchestrator", {})
     _emit(args, result, lambda d: print(json.dumps(d, indent=2, default=str)))
 
@@ -2367,7 +2384,11 @@ def _ops_restart_orchestrator(args: argparse.Namespace) -> None:
 def _ops_circuit_breaker(args: argparse.Namespace) -> None:
     """Show circuit breaker state, optionally reset for a project."""
     if getattr(args, "reset", None):
+        _require_write_config("circuit-breaker reset")
         pid = args.reset if args.reset else get_project_id()
+        if not _confirm(f"Reset circuit breaker for {pid}?", getattr(args, "yes", False)):
+            print("Aborted.")
+            return
         result = api("POST", f"/api/admin/projects/{pid}/circuit-breaker/reset", {})
         _emit(args, {"action": "reset", "project_id": pid, "result": result},
               lambda d: print(json.dumps(d.get('result'), indent=2, default=str)))
@@ -3750,6 +3771,20 @@ def _render_compute_show(data: dict) -> None:
         cost = j.get("final_cost_usd")
         if cost is not None:
             print(f"  cost      : ${cost:.4f}")
+        terminal_reason = j.get("terminal_reason")
+        if terminal_reason:
+            print(f"  terminal  : {terminal_reason}")
+        vm_phase = j.get("vm_phase")
+        if vm_phase == "provisioning":
+            print(f"  vm_phase  : {vm_phase}")
+            launch_contract = j.get("launch_contract") or {}
+            if launch_contract:
+                deadline = launch_contract.get("requested_deadline_seconds")
+                model = launch_contract.get("provisioning_model")
+                if deadline:
+                    print(f"    deadline: {deadline}s")
+                if model:
+                    print(f"    model   : {model}")
     exit_code = (j.get("polling_metadata") or {}).get("exit_code")
     if exit_code is not None:
         print(f"  exit_code : {exit_code}")
@@ -4474,18 +4509,28 @@ def build_parser() -> argparse.ArgumentParser:
                            description="System intervention subcommands for stuck-state recovery, "
                                        "health resets, task requeuing, and orchestrator restarts.")
     ops_sub = p_ops.add_subparsers(dest="ops_cmd")
-    ops_sub.add_parser("repair", parents=[common],
+    p_ops_repair = ops_sub.add_parser("repair", parents=[common],
                        help="Repair stuck state (orphaned parents, stale locks).")
-    ops_sub.add_parser("reset-health", parents=[common],
+    p_ops_repair.add_argument("--yes", action="store_true",
+                              help="Skip the confirmation prompt (for scripting).")
+    p_ops_reset = ops_sub.add_parser("reset-health", parents=[common],
                        help="Force-reset health checks.")
-    ops_sub.add_parser("requeue-failed", parents=[common],
+    p_ops_reset.add_argument("--yes", action="store_true",
+                             help="Skip the confirmation prompt (for scripting).")
+    p_ops_requeue = ops_sub.add_parser("requeue-failed", parents=[common],
                        help="Requeue all FAILED tasks.")
-    ops_sub.add_parser("restart-orchestrator", parents=[common],
+    p_ops_requeue.add_argument("--yes", action="store_true",
+                               help="Skip the confirmation prompt (for scripting).")
+    p_ops_restart = ops_sub.add_parser("restart-orchestrator", parents=[common],
                        help="Restart background loops.")
+    p_ops_restart.add_argument("--yes", action="store_true",
+                               help="Skip the confirmation prompt (for scripting).")
     p_ops_cb = ops_sub.add_parser("circuit-breaker", parents=[common],
                                   help="Show circuit breaker state or reset for a project.")
     p_ops_cb.add_argument("--reset", metavar="PROJECT_ID", default=None,
                           help="Reset circuit breaker for a project (defaults to current project).")
+    p_ops_cb.add_argument("--yes", action="store_true",
+                          help="Skip the confirmation prompt (for scripting).")
 
     # trials
     sub.add_parser("trials", parents=[common],

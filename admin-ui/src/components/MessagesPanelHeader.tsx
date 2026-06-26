@@ -1,4 +1,4 @@
-import { type Dispatch, type SetStateAction, type RefObject, useState } from 'react';
+import { type Dispatch, type SetStateAction, type RefObject, useState, useRef, useEffect } from 'react';
 import { X, MessageSquare, AlertTriangle, ChevronUp, Save } from 'lucide-react';
 import { type EventPref } from './eventPrefs';
 import { type MuteWindow } from './muteWindow';
@@ -120,6 +120,24 @@ export function MessagesPanelHeader({
   onClose,
 }: MessagesPanelHeaderProps) {
   const [showWebhookDetail, setShowWebhookDetail] = useState(false);
+  const [localSearchQuery, setLocalSearchQuery] = useState(searchQuery);
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    setLocalSearchQuery(searchQuery);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    debounceTimerRef.current = setTimeout(() => {
+      onSearchChange(localSearchQuery);
+    }, 300);
+
+    return () => {
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+    };
+  }, [localSearchQuery, onSearchChange]);
 
   return (
     <div className="px-4 md:px-6 py-3 border-b border-neutral-800 flex flex-col gap-2 shrink-0">
@@ -250,8 +268,8 @@ export function MessagesPanelHeader({
       <div className="flex items-center gap-2">
         <input
           type="text"
-          value={searchQuery}
-          onChange={e => onSearchChange(e.target.value)}
+          value={localSearchQuery}
+          onChange={e => setLocalSearchQuery(e.target.value)}
           placeholder="Search messages..."
           className="flex-1 bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600"
         />

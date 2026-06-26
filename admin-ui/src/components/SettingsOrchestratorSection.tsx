@@ -119,6 +119,12 @@ export function SettingsOrchestratorSection({
   const [evalTimeoutInputVal, setEvalTimeoutInputVal] = useState(String(evaluatingPipelineTimeoutMinutes));
   const [evalFailHoursInputVal, setEvalFailHoursInputVal] = useState(String(evaluatingFailHours));
   const [ciBackstopInputVal, setCiBackstopInputVal] = useState(String(ciBackstopTimeoutMinutes));
+  const [archiveAgeCapsInputVal, setArchiveAgeCapsInputVal] = useState(String(autoArchiveTerminalAfterDays));
+  const [archivePerProjectCapInputVal, setArchivePerProjectCapInputVal] = useState(String(autoArchiveMaxTerminalTasksPerProject));
+  const [archiveIntervalInputVal, setArchiveIntervalInputVal] = useState(String(autoArchiveIntervalMinutes));
+  const [autonomousResearchIntervalInputVal, setAutonomousResearchIntervalInputVal] = useState(String(autonomousResearchIntervalMinutes));
+  const [directionCooldownInputVal, setDirectionCooldownInputVal] = useState(String(directionCooldownMinutes));
+  const [strategicResearchFreqInputVal, setStrategicResearchFreqInputVal] = useState(String(strategicResearchFrequency));
   const [restarting, setRestarting] = useState(false);
   const [restartStatus, setRestartStatus] = useState<'idle' | 'success' | 'error'>('idle');
 
@@ -216,6 +222,12 @@ export function SettingsOrchestratorSection({
   useEffect(() => { setEvalTimeoutInputVal(String(evaluatingPipelineTimeoutMinutes)); }, [evaluatingPipelineTimeoutMinutes]);
   useEffect(() => { setEvalFailHoursInputVal(String(evaluatingFailHours)); }, [evaluatingFailHours]);
   useEffect(() => { setCiBackstopInputVal(String(ciBackstopTimeoutMinutes)); }, [ciBackstopTimeoutMinutes]);
+  useEffect(() => { setArchiveAgeCapsInputVal(String(autoArchiveTerminalAfterDays)); }, [autoArchiveTerminalAfterDays]);
+  useEffect(() => { setArchivePerProjectCapInputVal(String(autoArchiveMaxTerminalTasksPerProject)); }, [autoArchiveMaxTerminalTasksPerProject]);
+  useEffect(() => { setArchiveIntervalInputVal(String(autoArchiveIntervalMinutes)); }, [autoArchiveIntervalMinutes]);
+  useEffect(() => { setAutonomousResearchIntervalInputVal(String(autonomousResearchIntervalMinutes)); }, [autonomousResearchIntervalMinutes]);
+  useEffect(() => { setDirectionCooldownInputVal(String(directionCooldownMinutes)); }, [directionCooldownMinutes]);
+  useEffect(() => { setStrategicResearchFreqInputVal(String(strategicResearchFrequency)); }, [strategicResearchFrequency]);
 
   const reserved = (t: string) => reservedSlotsForTypes[t] ?? 0;
   const setReserved = (t: string, value: number) =>
@@ -408,8 +420,10 @@ export function SettingsOrchestratorSection({
               type="number"
               min={1}
               max={90}
-              value={autoArchiveTerminalAfterDays}
-              onChange={e => onUpdateAutoArchiveTerminalAfterDays(parseInt(e.target.value) || 7)}
+              value={archiveAgeCapsInputVal}
+              onChange={e => setArchiveAgeCapsInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(archiveAgeCapsInputVal); if (!isNaN(n) && n >= 1 && n <= 90) onUpdateAutoArchiveTerminalAfterDays(n); else setArchiveAgeCapsInputVal(String(autoArchiveTerminalAfterDays)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(archiveAgeCapsInputVal); if (!isNaN(n) && n >= 1 && n <= 90) onUpdateAutoArchiveTerminalAfterDays(n); else setArchiveAgeCapsInputVal(String(autoArchiveTerminalAfterDays)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
@@ -419,8 +433,10 @@ export function SettingsOrchestratorSection({
               type="number"
               min={0}
               max={10000}
-              value={autoArchiveMaxTerminalTasksPerProject}
-              onChange={e => onUpdateAutoArchiveMaxTerminalTasksPerProject(parseInt(e.target.value) || 0)}
+              value={archivePerProjectCapInputVal}
+              onChange={e => setArchivePerProjectCapInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(archivePerProjectCapInputVal); if (!isNaN(n) && n >= 0 && n <= 10000) onUpdateAutoArchiveMaxTerminalTasksPerProject(n); else setArchivePerProjectCapInputVal(String(autoArchiveMaxTerminalTasksPerProject)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(archivePerProjectCapInputVal); if (!isNaN(n) && n >= 0 && n <= 10000) onUpdateAutoArchiveMaxTerminalTasksPerProject(n); else setArchivePerProjectCapInputVal(String(autoArchiveMaxTerminalTasksPerProject)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
@@ -430,8 +446,10 @@ export function SettingsOrchestratorSection({
               type="number"
               min={5}
               max={1440}
-              value={autoArchiveIntervalMinutes}
-              onChange={e => onUpdateAutoArchiveIntervalMinutes(parseInt(e.target.value) || 60)}
+              value={archiveIntervalInputVal}
+              onChange={e => setArchiveIntervalInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(archiveIntervalInputVal); if (!isNaN(n) && n >= 5 && n <= 1440) onUpdateAutoArchiveIntervalMinutes(n); else setArchiveIntervalInputVal(String(autoArchiveIntervalMinutes)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(archiveIntervalInputVal); if (!isNaN(n) && n >= 5 && n <= 1440) onUpdateAutoArchiveIntervalMinutes(n); else setArchiveIntervalInputVal(String(autoArchiveIntervalMinutes)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
@@ -448,8 +466,10 @@ export function SettingsOrchestratorSection({
               type="number"
               min={1}
               max={1440}
-              value={autonomousResearchIntervalMinutes}
-              onChange={e => onUpdateAutonomousResearchInterval(parseInt(e.target.value) || 30)}
+              value={autonomousResearchIntervalInputVal}
+              onChange={e => setAutonomousResearchIntervalInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(autonomousResearchIntervalInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateAutonomousResearchInterval(n); else setAutonomousResearchIntervalInputVal(String(autonomousResearchIntervalMinutes)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(autonomousResearchIntervalInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateAutonomousResearchInterval(n); else setAutonomousResearchIntervalInputVal(String(autonomousResearchIntervalMinutes)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
@@ -459,8 +479,10 @@ export function SettingsOrchestratorSection({
               type="number"
               min={1}
               max={10080}
-              value={directionCooldownMinutes}
-              onChange={e => onUpdateDirectionCooldownMinutes(parseInt(e.target.value) || 240)}
+              value={directionCooldownInputVal}
+              onChange={e => setDirectionCooldownInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(directionCooldownInputVal); if (!isNaN(n) && n >= 1 && n <= 10080) onUpdateDirectionCooldownMinutes(n); else setDirectionCooldownInputVal(String(directionCooldownMinutes)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(directionCooldownInputVal); if (!isNaN(n) && n >= 1 && n <= 10080) onUpdateDirectionCooldownMinutes(n); else setDirectionCooldownInputVal(String(directionCooldownMinutes)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
@@ -470,8 +492,10 @@ export function SettingsOrchestratorSection({
               type="number"
               min={0}
               max={100}
-              value={strategicResearchFrequency}
-              onChange={e => onUpdateStrategicResearchFrequency(parseInt(e.target.value) || 0)}
+              value={strategicResearchFreqInputVal}
+              onChange={e => setStrategicResearchFreqInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(strategicResearchFreqInputVal); if (!isNaN(n) && n >= 0 && n <= 100) onUpdateStrategicResearchFrequency(n); else setStrategicResearchFreqInputVal(String(strategicResearchFrequency)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(strategicResearchFreqInputVal); if (!isNaN(n) && n >= 0 && n <= 100) onUpdateStrategicResearchFrequency(n); else setStrategicResearchFreqInputVal(String(strategicResearchFrequency)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
             <p className="text-ui-sm text-neutral-600 mt-1">Every Nth cycle reviews vision</p>

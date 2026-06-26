@@ -126,6 +126,11 @@ export function FleetRunnersPanel({ projectId }: Props) {
 
   useEffect(() => { setLoading(true); load(); }, [load]);
 
+  useEffect(() => {
+    const interval = setInterval(load, 30000);
+    return () => clearInterval(interval);
+  }, [load]);
+
   const handleEnroll = async () => {
     setEnrolling(true);
     try {

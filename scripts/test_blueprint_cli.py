@@ -819,6 +819,16 @@ def mock_api(monkeypatch):
                                    "stderr_excerpt": "Traceback (most recent call last):\n  ...\nRuntimeError: CUDA OOM"},
                  }}},
                  "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.8}},
+                {"id": "cjob-hhh0-0000-0000-000000000008",
+                 "status": "FAILED", "task_title": "Provisioning failure test",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 0.0,
+                 "experiment": "exp-prov-fail",
+                 "terminal_reason": "VM provisioning failed: insufficient quota for machine_type n2-standard-32 in zone us-central1-a",
+                 "vm_phase": "provisioning",
+                 "launch_contract": {"requested_deadline_seconds": 7200, "provisioning_model": "SPOT"},
+                 "criterion_verdict": None,
+                 "success_criterion": {"metric": "latency", "operator": "lt", "threshold": 100}},
             ]
             job = next((j for j in _ALL_MOCK_JOBS if j["id"] == job_id), None)
             if job is None:
@@ -1272,6 +1282,52 @@ def test_promote_recover_qualify_fires_with_yes(mock_api, monkeypatch, capsys):
     rc = blueprint.main(["--json", "promote-recover", "qualify", "--yes"])
     assert rc == 0
     assert any(method == "POST" and "qualify" in path for method, path, _ in mock_api)
+
+
+def test_ops_requeue_failed_aborts_without_confirmation(mock_api, monkeypatch, capsys):
+    """ops requeue-failed without --yes on non-interactive stdin must not fire."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = blueprint.main(["ops", "requeue-failed"])
+    assert rc == 0
+    # no PATCH to tasks should have been issued
+    assert not any("/tasks/" in path and method == "PATCH" for method, path, _ in mock_api)
+    err = capsys.readouterr().err
+    assert "Refusing to mutate without --yes" in err
+
+
+def test_ops_requeue_failed_read_only_config_refuses(mock_api, monkeypatch):
+    """ops requeue-failed refuses under a read-only (agent-JWT) config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["ops", "requeue-failed", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_ops_requeue_failed_fires_with_yes(mock_api, monkeypatch, capsys):
+    """ops requeue-failed with --yes fires the mutation and emits human summary."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["ops", "requeue-failed", "--yes"])
+    assert rc == 0
+    # PATCH to tasks should have been issued
+    assert any("/tasks/" in path and method == "PATCH" for method, path, _ in mock_api)
+    out = capsys.readouterr().out
+    # human summary without --json
+    assert "Requeued" in out
+
+
+def test_ops_requeue_failed_json(mock_api, monkeypatch, capsys):
+    """ops requeue-failed --json emits JSON output."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["--json", "ops", "requeue-failed", "--yes"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert "count" in parsed
+    assert "requeued" in parsed
 
 
 def test_logs_json_with_mocked_fetch(monkeypatch, capsys):
@@ -2783,6 +2839,8 @@ def test_messages_group(mock_api, monkeypatch, capsys):
     assert "please fix the CI" in out
     assert "[Q]" in out            # QUESTION icon
     assert "operator" in out
+    assert "msg-001" in out        # message ID
+    assert "msg-002" in out        # message ID
     # default status=open must be sent
     assert any("/messages?status=open" in path for _, path, _ in mock_api)
 
@@ -3706,6 +3764,29 @@ def test_compute_show_list_arms_failed_arm_renders_diagnostics(mock_api, capsys)
     assert "exit_code: 124" in out
     assert "wall-clock limit exceeded" in out
     assert "Timeout after 3600s" in out
+
+
+def test_compute_show_renders_terminal_reason_and_provisioning_cause(mock_api, capsys):
+    """compute show renders terminal_reason and provisioning-failure diagnostics."""
+    job_id = "cjob-hhh0-0000-0000-000000000008"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Terminal reason must be displayed
+    assert "terminal" in out
+    assert "VM provisioning failed" in out
+    assert "insufficient quota" in out
+    # Provisioning phase must be displayed
+    assert "vm_phase" in out
+    assert "provisioning" in out
+    # Launch contract must be displayed
+    assert "deadline" in out
+    assert "7200" in out
+    assert "model" in out
+    assert "SPOT" in out
+    # Status and title must be shown
+    assert "FAILED" in out
+    assert "Provisioning failure test" in out
 
 
 def test_compute_run_local(capsys):

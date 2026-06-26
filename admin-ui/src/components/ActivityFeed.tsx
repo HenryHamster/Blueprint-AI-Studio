@@ -17,6 +17,7 @@ export interface ActivityEvent {
   task_id?: string;
   pr_url?: string;
   error_summary?: string;
+  investigation_summary?: string | null;
   finding_count?: number;
   deploy_status?: string;
   project_id?: string;
@@ -33,6 +34,8 @@ export interface ActivityEvent {
   review_iterations?: number | null;
   failure_class?: string | null;
   taxonomy?: string | null;
+  rollback_count?: number | null;
+  rolled_back_from_sha?: string | null;
 }
 
 interface ActivityFeedProps {
@@ -92,7 +95,7 @@ type FilterOption = ActivityEventType | 'ALL' | 'NEEDS_REVIEW';
 
 const FILTER_PILLS: { label: string; value: FilterOption; activeClass: string }[] = [
   { label: 'All', value: 'ALL', activeClass: 'bg-neutral-600 text-neutral-100 border-neutral-500' },
-  { label: 'Pending Approval', value: 'NEEDS_REVIEW', activeClass: 'bg-amber-500/20 text-amber-400 border-amber-500/40' },
+  { label: 'Running', value: 'TASK_IN_PROGRESS', activeClass: 'bg-amber-500/20 text-amber-400 border-amber-500/40' },
   { label: 'Completed', value: 'TASK_COMPLETED', activeClass: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40' },
   { label: 'Failed', value: 'TASK_FAILED', activeClass: 'bg-red-500/20 text-red-400 border-red-500/40' },
   { label: 'Research', value: 'RESEARCH_FINDINGS', activeClass: 'bg-blue-500/20 text-blue-400 border-blue-500/40' },
@@ -235,6 +238,12 @@ function FeedRow({
                     {event.deploy_status}
                   </span>
                 )}
+
+                {event.type === 'DEPLOY_EVENT' && event.rolled_back_from_sha && (
+                  <span className="shrink-0 bg-red-500/10 text-red-400 border border-red-500/30 text-ui-sm font-mono px-1.5 py-0.5 rounded" title={`Rolled back from ${event.rolled_back_from_sha}`}>
+                    rolled back from {event.rolled_back_from_sha}
+                  </span>
+                )}
               </div>
 
               {event.type === 'TASK_FAILED' && event.error_summary && (
@@ -247,6 +256,17 @@ function FeedRow({
                     {event.error_summary}
                   </p>
                 )
+              )}
+
+              {event.type === 'TASK_FAILED' && !event.error_summary && event.investigation_summary && (
+                <p className="text-xs text-neutral-500 mt-0.5 truncate" title={event.investigation_summary}>
+                  {event.investigation_summary}
+                </p>
+              )}
+              {event.type === 'TASK_FAILED' && event.error_summary && event.investigation_summary && isExpanded && (
+                <p className="text-xs text-neutral-400 mt-1 italic" title={event.investigation_summary}>
+                  Investigation: {event.investigation_summary.slice(0, 200)}
+                </p>
               )}
 
               {event.type === 'TASK_IN_PROGRESS' && event.latest_status_message && (
@@ -392,14 +412,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
   });
 
   const filteredEvents = useMemo(() => events.filter(e => {
-    let statusMatches: boolean;
-    if (activeFilter === 'ALL') {
-      statusMatches = true;
-    } else if (activeFilter === 'NEEDS_REVIEW') {
-      statusMatches = e.status === 'NEEDS_REVIEW';
-    } else {
-      statusMatches = e.type === activeFilter;
-    }
+    const statusMatches = activeFilter === 'ALL' || e.type === activeFilter;
     if (!statusMatches) return false;
 
     if (!searchQuery) return true;
@@ -615,8 +628,8 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
               ? 'No events match your search'
               : activeFilter === 'ALL'
                 ? 'No recent activity'
-                : activeFilter === 'NEEDS_REVIEW'
-                  ? 'No events pending approval'
+                : activeFilter === 'TASK_IN_PROGRESS'
+                  ? 'No running tasks'
                   : 'No matching events'}
           </p>
           <p className="text-xs mt-1 opacity-70">
@@ -624,8 +637,8 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
               ? 'Try different keywords'
               : activeFilter === 'ALL'
                 ? 'Events will appear here as tasks run'
-                : activeFilter === 'NEEDS_REVIEW'
-                  ? 'Tasks waiting for review will appear here'
+                : activeFilter === 'TASK_IN_PROGRESS'
+                  ? 'Running tasks will appear here'
                   : 'Try a different filter'}
           </p>
         </div>

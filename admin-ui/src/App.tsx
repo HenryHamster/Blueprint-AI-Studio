@@ -1009,6 +1009,8 @@ export default function App() {
                   { label: 'Oldest first', value: 'oldest' },
                   { label: 'Type', value: 'type' },
                   { label: 'Title', value: 'title' },
+                  { label: 'Longest running', value: 'duration' },
+                  { label: 'Most retried', value: 'attempts' },
                 ]}
                 value={sortBy}
                 onChange={v => setSortBy(v as SortBy)}

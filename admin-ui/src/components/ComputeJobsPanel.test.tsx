@@ -2387,4 +2387,26 @@ describe('ComputeJobsPanel render + kill', () => {
     await findByText('No compute jobs');
     expect(queryByTestId('sweep-knowledge-groups')).toBeNull();
   });
+
+  test('disables re-run button when job has no source task', async () => {
+    const onDuplicateTask = vi.fn();
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0, task_id: null });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" onDuplicateTask={onDuplicateTask} />);
+    await findByRole('button', { name: 'Run analysis' });
+    const rerunBtn = await findByRole('button', { name: 'Re-run' });
+    expect(rerunBtn).toBeDisabled();
+  });
+
+  test('enables re-run button when job has a source task', async () => {
+    const onDuplicateTask = vi.fn();
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0, task_id: 'task-1' });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" onDuplicateTask={onDuplicateTask} />);
+    await findByRole('button', { name: 'Run analysis' });
+    const rerunBtn = await findByRole('button', { name: 'Re-run' });
+    expect(rerunBtn).not.toBeDisabled();
+    await act(async () => { rerunBtn.click(); });
+    expect(onDuplicateTask).toHaveBeenCalledWith('task-1');
+  });
 });
