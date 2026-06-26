@@ -105,6 +105,7 @@ import {
   handleSelfAudit,
   handleReleaseAudit,
   resolveCandidateSha,
+  fetchCandidateCommitWithRetry,
 } from './audits.js';
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode, git,
@@ -559,6 +560,57 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     // No rev-list call — the fetch already failed so there is nothing to check.
     const revListCall = vi.mocked(git).mock.calls.find(c => c[0][0] === 'rev-list');
     expect(revListCall).toBeUndefined();
+  });
+
+  it('RETRIES a transient candidate fetch and proceeds to audit once it succeeds', async () => {
+    // A single transient GitHub I/O blip on `git fetch origin <sha>` must NOT
+    // torch the qualification attempt: the fetch is retried and the audit runs.
+    let fetchAttempts = 0;
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (Array.isArray(a) && a[0] === 'fetch') {
+        fetchAttempts += 1;
+        if (fetchAttempts < 2) throw new Error('fatal: could not read from remote repository');
+      }
+      return Buffer.from('');
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // The transient first attempt was retried; the second succeeded.
+    expect(fetchAttempts).toBe(2);
+    const fetchCalls = vi.mocked(execFileSync).mock.calls.filter(
+      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[])[0] === 'fetch',
+    );
+    expect(fetchCalls.length).toBe(2);
+    // The agent ran — the blip did not fail the audit loud.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => c[1].failure_category === 'diff_range_unresolvable',
+    );
+    expect(failedCall).toBeUndefined();
+  });
+
+  it('attempts the candidate fetch 3 times before failing loud (retries exhausted)', async () => {
+    // The fail-loud diff_range_unresolvable safety property survives the retry:
+    // after all bounded attempts blip out, the audit still refuses to run.
+    let fetchAttempts = 0;
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (Array.isArray(a) && a[0] === 'fetch') {
+        fetchAttempts += 1;
+        throw new Error('network down');
+      }
+      return Buffer.from('');
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(fetchAttempts).toBe(3);
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('diff_range_unresolvable');
   });
 
   it('emits RELEASE_AUDIT_REPORT preserving the audit_score/test_erosion artifact contract on success', async () => {
@@ -1181,5 +1233,86 @@ describe('audit handlers use distinct schema labels', () => {
     await handleReleaseAudit(TASK_ID, { base_branch: 'main', candidate_sha: CANDIDATE_SHA }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     expect(recordFormatRepairAttempt).toHaveBeenCalledWith('release_audit');
+  });
+});
+
+// ── fetchCandidateCommitWithRetry — bounded retry on the candidate fetch ──────
+//
+// The shared helper all three release-qualifier audit/grade handlers use. A
+// transient GitHub I/O blip on the single `git fetch origin <sha>` must NOT
+// torch the (terminal) qualification attempt — it is retried with backoff —
+// while a diff range that is genuinely unresolvable after a CLEAN fetch must
+// still fail loud (never retried/masked: the safety property). Driven directly
+// with injected sleep/fetch/verify so the retry mechanics are exercised without
+// real timers or git.
+describe('fetchCandidateCommitWithRetry — bounded candidate-fetch retry', () => {
+  const CANDIDATE_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+  const DIFF_RANGE = `main...${CANDIDATE_SHA}`;
+
+  it('retries a transient fetch failure and then succeeds (no fail-loud)', async () => {
+    let attempts = 0;
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const fetchOnce = vi.fn(() => {
+      attempts += 1;
+      if (attempts < 3) throw new Error('fatal: could not read from remote repository');
+    });
+    const verifyDiffRange = vi.fn();
+
+    const res = await fetchCandidateCommitWithRetry(CANDIDATE_SHA, DIFF_RANGE, null, {
+      sleep, fetchOnce, verifyDiffRange,
+    });
+
+    expect(fetchOnce).toHaveBeenCalledTimes(3); // 2 transient + 1 success
+    expect(sleep).toHaveBeenCalledTimes(2);     // backoff between the 3 attempts
+    expect(res.fetchOk).toBe(true);
+    expect(res.diffRangeResolves).toBe(true);
+    expect(verifyDiffRange).toHaveBeenCalledWith(CANDIDATE_SHA, DIFF_RANGE);
+  });
+
+  it('uses increasing (linear) backoff between attempts', async () => {
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const fetchOnce = vi.fn(() => { throw new Error('transient'); });
+
+    await fetchCandidateCommitWithRetry(CANDIDATE_SHA, DIFF_RANGE, null, {
+      maxAttempts: 3, backoffBaseMs: 100, sleep, fetchOnce, verifyDiffRange: vi.fn(),
+    });
+
+    expect(sleep).toHaveBeenNthCalledWith(1, 100);
+    expect(sleep).toHaveBeenNthCalledWith(2, 200);
+  });
+
+  it('fails loud only AFTER exhausting all retries', async () => {
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const fetchOnce = vi.fn(() => { throw new Error('network down'); });
+    const verifyDiffRange = vi.fn();
+
+    const res = await fetchCandidateCommitWithRetry(CANDIDATE_SHA, DIFF_RANGE, null, {
+      maxAttempts: 3, sleep, fetchOnce, verifyDiffRange,
+    });
+
+    expect(fetchOnce).toHaveBeenCalledTimes(3);     // exhausted every attempt
+    expect(verifyDiffRange).not.toHaveBeenCalled(); // fetch never succeeded → no verify
+    expect(res.fetchOk).toBe(false);
+    expect(res.diffRangeResolves).toBe(false);
+    expect(res.diffRangeFailDetail).toContain('3 attempt');
+    expect(res.diffRangeFailDetail).toContain('network down');
+  });
+
+  it('does NOT retry a clean fetch whose diff range is genuinely unresolvable', async () => {
+    // Safety property: a successful fetch leaving the merge-base unreachable is a
+    // GENUINE unresolvable range — it must fail loud, never be retried/masked.
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const fetchOnce = vi.fn(); // succeeds on the first attempt
+    const verifyDiffRange = vi.fn(() => { throw new Error('fatal: bad revision main...<sha>'); });
+
+    const res = await fetchCandidateCommitWithRetry(CANDIDATE_SHA, DIFF_RANGE, null, {
+      sleep, fetchOnce, verifyDiffRange,
+    });
+
+    expect(fetchOnce).toHaveBeenCalledTimes(1); // fetch succeeded → not retried
+    expect(sleep).not.toHaveBeenCalled();
+    expect(res.fetchOk).toBe(true);
+    expect(res.diffRangeResolves).toBe(false);  // genuine unresolvable → fail loud
+    expect(res.diffRangeFailDetail).toContain('bad revision');
   });
 });

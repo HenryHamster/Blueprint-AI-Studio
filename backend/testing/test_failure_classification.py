@@ -886,6 +886,36 @@ class TestNormalizeAgentFailureCategory:
         )
         assert classify_failure(task) == PROVISION_FAILURE
 
+    def test_diff_range_unresolvable_routes_to_provision_failure(self):
+        """A release audit / audit-challenge / merge-grade handler emits
+        diff_range_unresolvable when it cannot fetch the pinned candidate commit
+        (or verify the three-dot diff range) before invoking the agent — a
+        workspace candidate-fetch transient (one GitHub I/O blip on
+        `git fetch origin <sha>`), NOT a code defect. Must route to
+        PROVISION_FAILURE so the release qualifier respawns the audit/challenge
+        leg under _MAX_AUDIT_RL_RESPAWNS instead of finalizing the whole attempt
+        infra_failure. Before this mapping it fell through to classify_failure()
+        and defaulted to EXTERNAL_API, which the respawn gate excludes — so a
+        single fetch blip terminally burned the qualification attempt
+        (2026-06-26: the SAME candidate re-fetched + COMPLETED ~9 min later)."""
+        task = _task(
+            "Release audit aborted: diff range main...<sha> does not resolve"
+        )
+        assert (
+            normalize_agent_failure_category("diff_range_unresolvable", task)
+            == PROVISION_FAILURE
+        )
+
+    def test_diff_range_unresolvable_via_classify_failure_context_fast_path(self):
+        """End-to-end: classify_failure sees diff_range_unresolvable in context
+        and routes to PROVISION_FAILURE (the value the respawn gate compares),
+        not the EXTERNAL_API the text classifier would otherwise default to."""
+        task = _task(
+            "Release audit aborted: diff range does not resolve",
+            {"failure_category": "diff_range_unresolvable"},
+        )
+        assert classify_failure(task) == PROVISION_FAILURE
+
     def test_github_token_fetch_failed_routes_to_provision_failure(self):
         """Agent emits github_token_fetch_failed when the startup github/token fetch
         times out or fails. The backend can legitimately block up to ~120s while

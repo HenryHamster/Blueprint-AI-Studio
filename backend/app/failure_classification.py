@@ -833,6 +833,18 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # eligibility instead of burning the code-error retry budget on something
     # the agent can't fix by editing code.
     "build_failed": PROVISION_FAILURE,
+    # ``diff_range_unresolvable`` — a release audit / audit-challenge / merge-grade
+    # handler could not fetch the pinned candidate commit (or verify the three-dot
+    # diff range) before invoking the agent. Same family as clone_failed /
+    # build_failed / vm_config_missing: a workspace candidate-fetch transient
+    # (a single GitHub I/O blip on `git fetch origin <sha>`), NOT a code defect.
+    # Routing to PROVISION_FAILURE lets the release qualifier respawn the audit /
+    # challenge leg under _MAX_AUDIT_RL_RESPAWNS instead of finalizing the whole
+    # attempt infra_failure. (The agent-side fetch now retries with backoff; this
+    # is defense-in-depth for the residual case where all retries blip out.)
+    # Production 2026-06-26: an attempt died on this category, yet the SAME
+    # candidate re-fetched and COMPLETED ~9 min later — proving it transient.
+    "diff_range_unresolvable": PROVISION_FAILURE,
     "test_failed": CODE_ERROR,
     "lint_failed": CODE_ERROR,
     "pr_creation_failed": EXTERNAL_API,

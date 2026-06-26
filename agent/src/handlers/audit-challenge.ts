@@ -1,4 +1,3 @@
-import { execFileSync } from 'child_process';
 /**
  * Release audit challenge handler — independent re-examination of audit findings.
  *
@@ -15,7 +14,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
-  persistAndPostStatus, git, runClaudeCode, sendHeartbeatSync,
+  persistAndPostStatus, runClaudeCode, sendHeartbeatSync,
   setCurrentPromptFingerprint, resolveBaseBranch,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
@@ -29,6 +28,7 @@ import { resolveBuildConfig } from '../build-config.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
 import {
   resolveCandidateSha, provisionAuditFetchHelpers, designDocAdvertisement,
+  fetchCandidateCommitWithRetry,
 } from './audits.js';
 
 // ── Release-audit-challenge contract ─────────────────────────────────────────
@@ -320,36 +320,13 @@ export async function handleReleaseAuditChallenge(
   // Fetch the EXACT candidate commit so git diff can compute the merge-base
   // diff (do NOT check it out — the working tree stays on baseBranch). A SHA
   // fetch leaves a real commit object behind where a bare-branch fetch only
-  // updates FETCH_HEAD.
-  let fetchOk = false;
-  let fetchFailDetail = '';
+  // updates FETCH_HEAD. Bounded retry-with-backoff so a transient GitHub I/O
+  // blip on this one fetch does not torch the whole qualification attempt;
+  // pre-flight-verify the diff range and fail loud below if it stays
+  // unresolvable. Mirrors handleReleaseAudit's diff_range_unresolvable guard.
   sendLog(ws, `Fetching candidate commit ${candidateSha.slice(0, 12)} (full history) for diff computation...\n`);
-  try {
-    execFileSync('git', ['fetch', 'origin', candidateSha], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
-    fetchOk = true;
-    sendLog(ws, `Fetched candidate commit ${candidateSha.slice(0, 12)} successfully.\n`);
-  } catch (e) {
-    fetchFailDetail = e instanceof Error ? e.message : String(e);
-    sendLog(ws, `[WARNING] git fetch origin ${candidateSha.slice(0, 12)} failed: ${fetchFailDetail}\n`);
-  }
-
-  // Pre-flight: verify the diff range actually resolves before invoking the
-  // agent. Mirrors handleReleaseAudit's diff_range_unresolvable guard.
-  let diffRangeResolves = false;
-  let diffRangeFailDetail = '';
-  if (fetchOk) {
-    try {
-      git(['rev-parse', '--verify', `${candidateSha}^{commit}`]);
-      git(['rev-list', '--count', diffRange]);
-      diffRangeResolves = true;
-      sendLog(ws, `Diff range ${diffRange} resolves — merge-base is reachable.\n`);
-    } catch (e) {
-      diffRangeFailDetail = e instanceof Error ? e.message : String(e);
-      sendLog(ws, `[ERROR] Diff range ${diffRange} does not resolve: ${diffRangeFailDetail}\n`);
-    }
-  } else {
-    diffRangeFailDetail = `git fetch origin ${candidateSha} failed (${fetchFailDetail || 'no detail'}); ${diffRange} cannot be resolved`;
-  }
+  const { diffRangeResolves, diffRangeFailDetail } =
+    await fetchCandidateCommitWithRetry(candidateSha, diffRange, ws);
 
   if (!diffRangeResolves) {
     sendLog(ws, `Aborting release audit challenge: cannot compute ${diffRange}.\n`);
