@@ -16,7 +16,7 @@ and this endpoint hands those pinned tasks to the polling runner.
 """
 
 import logging
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Response, status
 from pydantic import BaseModel
@@ -35,6 +35,10 @@ router = APIRouter(prefix="/api/runner", tags=["runner"])
 
 class HeartbeatRequest(BaseModel):
     active_task_ids: List[str] = []
+    # Runner-reported hardware capabilities (optional; old runners omit these).
+    has_gpu: Optional[bool] = None
+    gpu_count: Optional[int] = None
+    gpu_names: Optional[List[str]] = None
 
 
 @router.post("/next-task")
@@ -117,6 +121,15 @@ async def heartbeat(
     runner.last_seen_at = _utcnow()
     caps = dict(runner.capabilities or {})
     caps["active_task_ids"] = list(payload.active_task_ids)
+    # Merge runner-reported hardware capabilities when present.
+    # These override the registration-time default but never clobber
+    # operator-configured fields (task_types, max_concurrent).
+    if payload.has_gpu is not None:
+        caps["has_gpu"] = payload.has_gpu
+    if payload.gpu_count is not None:
+        caps["gpu_count"] = payload.gpu_count
+    if payload.gpu_names is not None:
+        caps["gpu_names"] = payload.gpu_names
     runner.capabilities = caps
     session.add(runner)
     await session.commit()

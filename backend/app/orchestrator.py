@@ -498,6 +498,15 @@ def _runner_active_task_count(runner: LocalRunner) -> int:
         return 0
 
 
+def _runner_at_capacity(runner: LocalRunner) -> bool:
+    """True when the runner's active count has reached its declared max_concurrent."""
+    caps = runner.capabilities or {}
+    max_concurrent = caps.get("max_concurrent")
+    if max_concurrent is None:
+        return False
+    return _runner_active_task_count(runner) >= max_concurrent
+
+
 async def _load_active_runners_cache(
     session: AsyncSession,
 ) -> dict[uuid.UUID, list[LocalRunner]]:
@@ -553,7 +562,11 @@ async def _try_runner_dispatch(
         return False
 
     candidates = active_runners_cache.get(task.project_id) or []
-    eligible = [r for r in candidates if _runner_handles_task_type(r, task_type)]
+    eligible = [
+        r
+        for r in candidates
+        if _runner_handles_task_type(r, task_type) and not _runner_at_capacity(r)
+    ]
     if not eligible:
         return False
 

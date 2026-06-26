@@ -4017,6 +4017,178 @@ def test_compute_run_local_arms_one_failure_captured(tmp_path, monkeypatch, caps
     assert "FAILED" in out
 
 
+def test_compute_run_local_arms_emit_canonical_shape(tmp_path, monkeypatch, capsys):
+    """Per-arm entries match the canonical aggregator shape on both success and failure."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "accuracy",
+        "arms": [
+            {"name": "good_arm", "command": "echo good"},
+            {"name": "bad_arm", "command": "exit 1"},
+        ],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run_mixed(cmd, env=None, stderr=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+
+        class R:
+            pass
+
+        if rf and "good_arm" in rf:
+            with open(rf, "w") as f:
+                json.dump({"accuracy": 0.85}, f)
+            R.returncode = 0
+        else:
+            R.returncode = 1
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run_mixed)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    arms_block = data["metrics"]["arms"]
+
+    # Success arm: {declared_metric: value, exit_code: 0} — no legacy __failed__ key
+    good = arms_block["good_arm"]
+    assert good["accuracy"] == 0.85
+    assert good["exit_code"] == 0
+    assert "__failed__" not in good
+    assert "error" not in good
+
+    # Failure arm: {error: reason, exit_code: N} — no legacy __failed__ / __exit_code__ keys
+    bad = arms_block["bad_arm"]
+    assert "error" in bad
+    assert bad["exit_code"] == 1
+    assert "__failed__" not in bad
+    assert "__exit_code__" not in bad
+    # Reason should be a classified string mentioning the exit code
+    assert "exit 1" in bad["error"] or "crash" in bad["error"]
+
+
+def test_compute_run_arms_success_extracts_declared_metric(tmp_path, monkeypatch, capsys):
+    """Successful arm with declared_metric emits only {declared_metric, exit_code}, not the full dict."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "loss",
+        "arms": [{"name": "arm_a", "command": "echo hi"}],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, stderr=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf:
+            with open(rf, "w") as f:
+                json.dump({"loss": 0.12, "extra_field": "noise"}, f)
+
+        class R:
+            returncode = 0
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    arm = data["metrics"]["arms"]["arm_a"]
+    assert arm["loss"] == 0.12
+    assert arm["exit_code"] == 0
+    # The canonical shape extracts only the declared metric (plus exit_code)
+    assert "extra_field" not in arm
+
+
+def test_compute_run_arms_exit0_metric_missing_emits_unmeasured_reason(tmp_path, monkeypatch, capsys):
+    """Arm exits 0 but declared_metric is absent from result → unmeasured criterion error."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "auc",
+        "arms": [{"name": "arm_x", "command": "echo hi"}],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, stderr=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf:
+            # Writes result file but WITHOUT the declared metric
+            with open(rf, "w") as f:
+                json.dump({"wrong_metric": 0.5}, f)
+
+        class R:
+            returncode = 0
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    arm = data["metrics"]["arms"]["arm_x"]
+    assert "error" in arm
+    assert arm["exit_code"] == 0
+    assert "unmeasured criterion" in arm["error"]
+    assert "auc" in arm["error"]
+
+
+def test_compute_run_arms_stderr_captured_in_failure_entry(tmp_path, monkeypatch, capsys):
+    """Failed arm's stderr output appears as stderr_excerpt in the canonical entry."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "score",
+        "arms": [{"name": "failing_arm", "command": "echo oops >&2; exit 2"}],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, stderr=None, **kwargs):
+        # Write stderr content to the captured file handle if provided
+        if stderr is not None and hasattr(stderr, "write"):
+            stderr.write(b"Traceback: something went wrong\n")
+
+        class R:
+            returncode = 2
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    arm = data["metrics"]["arms"]["failing_arm"]
+    assert "error" in arm
+    assert arm["exit_code"] == 2
+    assert "stderr_excerpt" in arm
+    assert "Traceback" in arm["stderr_excerpt"]
+
+
 # ── GPU detection tests ───────────────────────────────────────────────────────
 
 

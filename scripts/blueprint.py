@@ -3936,6 +3936,44 @@ def _detect_local_gpu() -> dict:
     return {"detected": False, "backend": None, "devices": []}
 
 
+_COMPUTE_STDERR_MAX_BYTES = 2048
+
+
+def _compute_arm_failure_reason(
+    exit_code: int | None,
+    declared_metric: str | None,
+    *,
+    result_missing: bool,
+    metric_missing: bool,
+) -> str:
+    if exit_code == 124:
+        return "arm timed out (exit 124)"
+    if result_missing:
+        if exit_code is not None and exit_code != 0:
+            return f"arm crashed (exit {exit_code}): result file not written"
+        return "arm result file not written (arm may have failed)"
+    if metric_missing:
+        metric_name = declared_metric or "<unknown>"
+        if exit_code is not None and exit_code != 0:
+            return f"arm crashed (exit {exit_code}): metric '{metric_name}' not found in result"
+        return f"unmeasured criterion: metric '{metric_name}' not found in result"
+    if exit_code is not None and exit_code != 0:
+        return f"arm crashed (exit {exit_code})"
+    return "unknown failure"
+
+
+def _read_arm_stderr_excerpt(path: str) -> str | None:
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if not data:
+            return None
+        tail = data[-_COMPUTE_STDERR_MAX_BYTES:]
+        return tail.decode(errors="replace").strip() or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _compute_run_local(args: argparse.Namespace) -> None:
     """Execute a compute_experiment command locally without the orchestrator.
 
@@ -4060,52 +4098,83 @@ def _compute_run_local(args: argparse.Namespace) -> None:
             arm_name = arm.get("name", f"arm_{i}")
             arm_cmd = arm.get("command", "")
             arm_result_file = os.path.join(tmpdir, f"result_{arm_name}.json")
+            arm_stderr_file = os.path.join(tmpdir, f"stderr_{arm_name}.txt")
             arm_env = env.copy()
             arm_env["BLUEPRINT_RESULT_FILE"] = arm_result_file
 
             if not _json_mode(args):
                 print(f"  [{arm_name}] running...")
-            if container_image:
-                container_result = f"/tmp/blueprint_out/result_{arm_name}.json"
-                docker_arm_cmd = ["docker", "run", "--rm"]
-                if gpu_info["detected"]:
-                    docker_arm_cmd += ["--gpus", "all"]
-                if spec_repo_clone:
-                    _repo_root = os.path.abspath(".")
-                    docker_arm_cmd += ["-v", f"{_repo_root}:/workspace"]
-                    docker_arm_cmd += ["-e", "PYTHONPATH=/workspace"]
-                    docker_arm_cmd += ["-w", "/workspace"]
-                elif spec_cwd:
-                    docker_arm_cmd += ["-w", spec_cwd]
-                for _k, _v in (spec_env or {}).items():
-                    docker_arm_cmd += ["-e", f"{_k}={_v}"]
-                docker_arm_cmd += [
-                    "-v", f"{tmpdir}:/tmp/blueprint_out",
-                    "-e", f"BLUEPRINT_RESULT_FILE={container_result}",
-                    "-e", "BLUEPRINT_ARTIFACT_DIR=/tmp/blueprint_out/artifacts",
-                    container_image, "bash", "-lc", arm_cmd,
-                ]
-                arm_proc = subprocess.run(docker_arm_cmd)
-            else:
-                arm_env.update(spec_env or {})
-                arm_proc = subprocess.run(["bash", "-lc", arm_cmd], env=arm_env, cwd=spec_cwd or None)
+            with open(arm_stderr_file, "wb") as arm_stderr_fh:
+                if container_image:
+                    container_result = f"/tmp/blueprint_out/result_{arm_name}.json"
+                    docker_arm_cmd = ["docker", "run", "--rm"]
+                    if gpu_info["detected"]:
+                        docker_arm_cmd += ["--gpus", "all"]
+                    if spec_repo_clone:
+                        _repo_root = os.path.abspath(".")
+                        docker_arm_cmd += ["-v", f"{_repo_root}:/workspace"]
+                        docker_arm_cmd += ["-e", "PYTHONPATH=/workspace"]
+                        docker_arm_cmd += ["-w", "/workspace"]
+                    elif spec_cwd:
+                        docker_arm_cmd += ["-w", spec_cwd]
+                    for _k, _v in (spec_env or {}).items():
+                        docker_arm_cmd += ["-e", f"{_k}={_v}"]
+                    docker_arm_cmd += [
+                        "-v", f"{tmpdir}:/tmp/blueprint_out",
+                        "-e", f"BLUEPRINT_RESULT_FILE={container_result}",
+                        "-e", "BLUEPRINT_ARTIFACT_DIR=/tmp/blueprint_out/artifacts",
+                        container_image, "bash", "-lc", arm_cmd,
+                    ]
+                    arm_proc = subprocess.run(docker_arm_cmd, stderr=arm_stderr_fh)
+                else:
+                    arm_env.update(spec_env or {})
+                    arm_proc = subprocess.run(
+                        ["bash", "-lc", arm_cmd], env=arm_env, cwd=spec_cwd or None,
+                        stderr=arm_stderr_fh,
+                    )
             arm_exit_code = arm_proc.returncode
-
             if arm_exit_code != 0:
                 overall_exit_code = arm_exit_code
-                arm_results[arm_name] = {"__failed__": True, "__exit_code__": arm_exit_code}
-                continue
 
+            # Parse result file
+            result_missing = not os.path.exists(arm_result_file)
             arm_metrics: dict | None = None
-            if os.path.exists(arm_result_file):
+            if not result_missing:
                 try:
                     with open(arm_result_file) as f:
                         arm_metrics = json.load(f)
                 except Exception as exc:  # noqa: BLE001
                     if not _json_mode(args):
                         print(f"  [{arm_name}] warning: could not parse result file: {exc}")
+                    result_missing = True
 
-            arm_results[arm_name] = arm_metrics if arm_metrics is not None else {}
+            metric_missing = (
+                declared_metric is not None
+                and not result_missing
+                and arm_metrics is not None
+                and arm_metrics.get(declared_metric) is None
+            )
+
+            # Build canonical per-arm entry
+            is_failure = arm_exit_code != 0 or result_missing or metric_missing
+            if is_failure:
+                reason = _compute_arm_failure_reason(
+                    arm_exit_code,
+                    declared_metric,
+                    result_missing=result_missing,
+                    metric_missing=metric_missing,
+                )
+                arm_entry: dict = {"error": reason, "exit_code": arm_exit_code}
+                excerpt = _read_arm_stderr_excerpt(arm_stderr_file)
+                if excerpt:
+                    arm_entry["stderr_excerpt"] = excerpt
+                arm_results[arm_name] = arm_entry
+            elif declared_metric and arm_metrics is not None:
+                arm_results[arm_name] = {declared_metric: arm_metrics[declared_metric], "exit_code": arm_exit_code}
+            else:
+                arm_entry = arm_metrics if arm_metrics is not None else {}
+                arm_entry["exit_code"] = arm_exit_code
+                arm_results[arm_name] = arm_entry
 
         status = "SUCCEEDED" if overall_exit_code == 0 else "FAILED"
         metrics: dict | None = {"arms": arm_results}
@@ -4120,9 +4189,12 @@ def _compute_run_local(args: argparse.Namespace) -> None:
             if arms_block:
                 print(f"arms        : {len(arms_block)} arm(s)")
                 for aname, ametrics in arms_block.items():
-                    if ametrics.get("__failed__"):
-                        ec = ametrics.get("__exit_code__", "?")
-                        print(f"  [{aname}] FAILED (exit_code={ec})")
+                    error = ametrics.get("error")
+                    if error:
+                        print(f"  [{aname}] FAILED: {error}")
+                        excerpt = ametrics.get("stderr_excerpt")
+                        if excerpt:
+                            print(f"  [{aname}] stderr: {excerpt[:200]}")
                     elif dm:
                         val = ametrics.get(dm)
                         if val is not None:

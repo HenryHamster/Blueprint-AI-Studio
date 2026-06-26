@@ -397,5 +397,87 @@ class TestGracefulShutdown(unittest.TestCase):
         proc.terminate.assert_called_once()
 
 
+# ── GPU detection ─────────────────────────────────────────────────────────────
+
+class TestGpuDetection(unittest.TestCase):
+    def test_nvidia_smi_absent_returns_no_gpu(self):
+        """FileNotFoundError → has_gpu=False, no crash."""
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            result = local_runner._detect_gpu()
+        self.assertFalse(result["has_gpu"])
+        self.assertEqual(result["gpu_count"], 0)
+        self.assertEqual(result["gpu_names"], [])
+
+    def test_nvidia_smi_timeout_returns_no_gpu(self):
+        """TimeoutExpired → has_gpu=False, no crash."""
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="nvidia-smi", timeout=5)):
+            result = local_runner._detect_gpu()
+        self.assertFalse(result["has_gpu"])
+        self.assertEqual(result["gpu_count"], 0)
+
+    def test_nvidia_smi_error_returns_no_gpu(self):
+        """Non-zero returncode → has_gpu=False."""
+        fake = MagicMock()
+        fake.returncode = 1
+        fake.stdout = ""
+        with patch("subprocess.run", return_value=fake):
+            result = local_runner._detect_gpu()
+        self.assertFalse(result["has_gpu"])
+
+    def test_nvidia_smi_parses_single_gpu(self):
+        """Single GPU line → has_gpu=True, gpu_count=1, name captured."""
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "GPU 0: Tesla T4 (UUID: GPU-abc123)\n"
+        with patch("subprocess.run", return_value=fake):
+            result = local_runner._detect_gpu()
+        self.assertTrue(result["has_gpu"])
+        self.assertEqual(result["gpu_count"], 1)
+        self.assertEqual(len(result["gpu_names"]), 1)
+        self.assertIn("Tesla T4", result["gpu_names"][0])
+
+    def test_nvidia_smi_parses_multi_gpu(self):
+        """Multiple GPU lines → gpu_count=2."""
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = (
+            "GPU 0: Tesla T4 (UUID: GPU-abc)\n"
+            "GPU 1: Tesla T4 (UUID: GPU-def)\n"
+        )
+        with patch("subprocess.run", return_value=fake):
+            result = local_runner._detect_gpu()
+        self.assertTrue(result["has_gpu"])
+        self.assertEqual(result["gpu_count"], 2)
+
+    def test_gpu_capabilities_included_in_heartbeat_body(self):
+        """Heartbeat body includes GPU fields detected at startup."""
+        posted_bodies = []
+
+        def fake_post(url, token, body):
+            posted_bodies.append(body)
+            # Stop the loop after the first heartbeat so the test doesn't block.
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True, "last_seen_at": "2026-01-01T00:00:00"}
+
+        gpu_caps = {"has_gpu": True, "gpu_count": 1, "gpu_names": ["Tesla T4"]}
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock, gpu_caps
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        self.assertIn("has_gpu", posted_bodies[0])
+        self.assertTrue(posted_bodies[0]["has_gpu"])
+        self.assertEqual(posted_bodies[0]["gpu_count"], 1)
+        self.assertEqual(posted_bodies[0]["gpu_names"], ["Tesla T4"])
+
+
 if __name__ == "__main__":
     unittest.main()

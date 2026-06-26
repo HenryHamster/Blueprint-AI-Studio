@@ -323,6 +323,58 @@ class TestRunnerEndpoints:
         assert runner.last_seen_at > old_seen
         assert runner.capabilities["active_task_ids"] == ["abc", "def"]
 
+    @pytest.mark.asyncio
+    async def test_heartbeat_persists_runner_reported_capabilities(
+        self, client: AsyncClient, db_session
+    ):
+        """Runner-reported GPU capabilities are persisted; operator fields are preserved."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 4,
+            },
+        )
+
+        # Heartbeat carries runner-detected GPU info.
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "has_gpu": True,
+                "gpu_count": 1,
+                "gpu_names": ["Tesla T4"],
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+
+        # Hardware fields are updated to runner-reported ground truth.
+        assert runner.capabilities["has_gpu"] is True
+        assert runner.capabilities["gpu_count"] == 1
+        assert runner.capabilities["gpu_names"] == ["Tesla T4"]
+
+        # Operator-configured fields must NOT be clobbered.
+        assert runner.capabilities["task_types"] == "all"
+        assert runner.capabilities["max_concurrent"] == 4
+
+        # Backward-compat: omitting GPU fields in a follow-up heartbeat must
+        # leave has_gpu intact (old runner protocol still works).
+        resp2 = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": ["x"]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp2.status_code == 200
+        await db_session.refresh(runner)
+        # has_gpu persists from the previous heartbeat.
+        assert runner.capabilities["has_gpu"] is True
+        assert runner.capabilities["active_task_ids"] == ["x"]
+
 
 # ── Orchestrator routing helpers ─────────────────────────────────────────────
 
@@ -474,6 +526,74 @@ class TestOrchestratorRunnerRouting:
             )
             is False
         )
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_respects_max_concurrent(self, db_session):
+        project = await _make_project(db_session)
+        # saturated runner: 2 active tasks, max_concurrent=2
+        saturated, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": ["a", "b"],
+                "max_concurrent": 2,
+            },
+        )
+        # free runner: 0 active tasks, max_concurrent=2
+        free, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": [],
+                "max_concurrent": 2,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session, task, {project.id: [saturated, free]}
+        )
+        await db_session.refresh(task)
+        # saturated runner must not be chosen
+        assert task.vm_instance_id == f"runner:{free.id}"
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_skips_when_all_at_capacity(self, db_session):
+        project = await _make_project(db_session)
+        saturated, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": ["a", "b"],
+                "max_concurrent": 2,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        # all runners at capacity → dispatch returns False
+        assert (
+            await orch._try_runner_dispatch(
+                db_session, task, {project.id: [saturated]}
+            )
+            is False
+        )
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
 
     @pytest.mark.asyncio
     async def test_deactivate_stale_runners(self, db_session):

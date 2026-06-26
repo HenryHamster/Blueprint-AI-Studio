@@ -98,6 +98,33 @@ def _post(url: str, token: str, body: dict) -> tuple[int, dict | None]:
         raise RuntimeError(f"Network error: {exc.reason}") from exc
 
 
+# ── GPU detection ────────────────────────────────────────────────────────────
+
+def _detect_gpu() -> dict:
+    """Detect GPU hardware by probing nvidia-smi.
+
+    Returns a dict with has_gpu, gpu_count, and gpu_names.  Any error
+    (binary absent, timeout, non-zero exit) is treated as no GPU present so
+    detection is always non-fatal.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return {"has_gpu": False, "gpu_count": 0, "gpu_names": []}
+        import re
+        gpu_names = re.findall(r"^GPU \d+:\s*(.+?)(?:\s*\(UUID:.+)?\s*$", result.stdout, re.MULTILINE)
+        if gpu_names:
+            return {"has_gpu": True, "gpu_count": len(gpu_names), "gpu_names": gpu_names}
+        return {"has_gpu": False, "gpu_count": 0, "gpu_names": []}
+    except Exception:
+        return {"has_gpu": False, "gpu_count": 0, "gpu_names": []}
+
+
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 
 _shutdown_event = threading.Event()
@@ -124,13 +151,14 @@ def _reap_loop(active_tasks: dict, lock: threading.Lock) -> None:
 
 # ── Heartbeat (background thread) ─────────────────────────────────────────────
 
-def _heartbeat_loop(orchestrator_url: str, token: str, active_tasks: dict, lock: threading.Lock) -> None:
+def _heartbeat_loop(orchestrator_url: str, token: str, active_tasks: dict, lock: threading.Lock, gpu_capabilities: dict) -> None:
     url = f"{orchestrator_url}/api/runner/heartbeat"
     while not _shutdown_event.is_set():
         try:
             with lock:
                 task_ids = list(active_tasks.keys())
-            status, _ = _post(url, token, {"active_task_ids": task_ids})
+            body = {"active_task_ids": task_ids, **gpu_capabilities}
+            status, _ = _post(url, token, body)
             if status not in (200, 204):
                 print(f"[runner] heartbeat warning: HTTP {status}", flush=True)
         except Exception as exc:
@@ -164,9 +192,20 @@ def main() -> None:
     print(f"  max concurrent: {max_concurrent}", flush=True)
     print(f"  runner token : {token_prefix}", flush=True)
 
-    # Initial heartbeat to validate token
+    # Detect GPU hardware once at startup
+    gpu_capabilities = _detect_gpu()
+    if gpu_capabilities.get("has_gpu"):
+        print(f"  gpu detected : {gpu_capabilities['gpu_count']}x {gpu_capabilities['gpu_names']}", flush=True)
+    else:
+        print("  gpu detected : none", flush=True)
+
+    # Initial heartbeat to validate token (includes gpu capabilities)
     try:
-        status, body = _post(f"{orchestrator_url}/api/runner/heartbeat", token, {"active_task_ids": []})
+        status, body = _post(
+            f"{orchestrator_url}/api/runner/heartbeat",
+            token,
+            {"active_task_ids": [], **gpu_capabilities},
+        )
     except Exception as exc:
         print(f"ERROR: initial heartbeat failed: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -191,7 +230,7 @@ def main() -> None:
     reaper.start()
 
     heartbeat = threading.Thread(
-        target=_heartbeat_loop, args=(orchestrator_url, token, active_tasks, lock), daemon=True
+        target=_heartbeat_loop, args=(orchestrator_url, token, active_tasks, lock, gpu_capabilities), daemon=True
     )
     heartbeat.start()
 

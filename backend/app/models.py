@@ -5000,7 +5000,9 @@ class LocalRunner(SQLModel, table=True):
         default="active",
         sa_column=Column(String(16), nullable=False, server_default=text("'active'")),
     )
-    # {"task_types": "all" | [str], "has_gpu": bool, "max_concurrent": int}
+    # {"task_types": "all" | [str], "has_gpu": bool (heartbeat-reported ground truth),
+    #  "gpu_count": int, "gpu_names": [str], "max_concurrent": int,
+    #  "active_task_ids": [str]}  — has_gpu et al. are overwritten at first heartbeat.
     capabilities: Dict[str, Any] = Field(
         default_factory=lambda: {
             "task_types": "all",
