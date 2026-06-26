@@ -3083,6 +3083,49 @@ class TestAutonomousMode:
         assert body["counts"].get(direction_id) == 1
         assert body["counts_by_type"][direction_id]["research"] == 1
 
+    @pytest.mark.asyncio
+    async def test_directions_lite_mode_omits_heavy_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """?lite=1 omits design_doc, problem_model, self_reflection_log, and
+        running_update_reconciliation while preserving directions and lightweight fields."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.directions = [{"id": "d-lite1", "text": "Lite test", "priority": "medium"}]
+        project.design_doc = {"key": "large doc"}
+        project.problem_model = {"intent": {"purpose": "Build X."}}
+        project.self_reflection_log = [{"entry": "some reflection"}]
+        flag_modified(project, "directions")
+        flag_modified(project, "design_doc")
+        flag_modified(project, "problem_model")
+        flag_modified(project, "self_reflection_log")
+        db_session.add(project)
+        await db_session.commit()
+
+        # Full response includes heavy fields
+        full = await client.get(f"/api/admin/projects/{project.id}/directions")
+        assert full.status_code == 200
+        full_data = full.json()
+        assert "design_doc" in full_data
+        assert "problem_model" in full_data
+        assert "self_reflection_log" in full_data
+        assert len(full_data["directions"]) == 1
+
+        # Lite response omits heavy fields but keeps directions and lightweight fields
+        lite = await client.get(
+            f"/api/admin/projects/{project.id}/directions?lite=1"
+        )
+        assert lite.status_code == 200
+        lite_data = lite.json()
+        assert "design_doc" not in lite_data
+        assert "problem_model" not in lite_data
+        assert "self_reflection_log" not in lite_data
+        assert "running_update_reconciliation" not in lite_data
+        assert len(lite_data["directions"]) == 1
+        assert "autonomous_enabled" in lite_data
+        assert "running_update" in lite_data
+
 
 class TestAutonomyDebug:
     """Tests for GET /api/admin/projects/{project_id}/autonomy-debug."""

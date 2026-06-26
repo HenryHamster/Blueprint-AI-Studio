@@ -92,46 +92,59 @@ export function useDashboardDigest(
       ? `/api/admin/digest?hours=${windowHours}&project_id=${encodeURIComponent(selectedProjectId)}`
       : `/api/admin/digest?hours=${windowHours}`;
 
-    const digestPromise = (async () => {
-      try {
-        const res = await apiFetch(url);
-        if (signal.aborted) return;
-        if (res.ok) {
-          const data = await res.json();
-          if (!signal.aborted && assertDigestContract<DirectionProgress>(data)) {
-            setDigest(data);
-            setDigestStale(false);
-            digestDataScopeRef.current = scopeKey;
-            digestOk = true;
-          } else if (!signal.aborted) {
-            setDigestStale(true);
-          }
+    // Diagnostics is a background health probe — fire it in parallel but don't
+    // gate the loading spinner on it. It can be slow (up to-500-task DB scan)
+    // and its only role is to confirm the server is reachable when digest fails.
+    let diagnosticsSettled = false;
+    const diagnosticsPromise = selectedProjectId
+      ? apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/diagnostics`)
+          .then(r => { if (!signal.aborted && r.ok) diagnosticsOk = true; })
+          .catch(() => { /* silent */ })
+          .finally(() => { diagnosticsSettled = true; })
+      : Promise.resolve().then(() => { diagnosticsSettled = true; });
+
+    try {
+      const res = await apiFetch(url);
+      if (signal.aborted) return;
+      if (res.ok) {
+        const data = await res.json();
+        if (!signal.aborted && assertDigestContract<DirectionProgress>(data)) {
+          setDigest(data);
+          setDigestStale(false);
+          digestDataScopeRef.current = scopeKey;
+          digestOk = true;
         } else if (!signal.aborted) {
           setDigestStale(true);
         }
-      } catch {
-        if (!signal.aborted) setDigestStale(true);
+      } else if (!signal.aborted) {
+        setDigestStale(true);
       }
-    })();
+    } catch {
+      if (!signal.aborted) setDigestStale(true);
+    }
 
-    const diagnosticsPromise = selectedProjectId
-      ? (async () => {
-        try {
-          const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/diagnostics`);
-          if (!signal.aborted && res.ok) diagnosticsOk = true;
-        } catch { /* silent */ }
-      })()
-      : Promise.resolve();
-
-    await Promise.allSettled([digestPromise, diagnosticsPromise]);
     if (signal.aborted) return;
 
+    // Unblock the loading spinner as soon as the digest response is done —
+    // don't wait for diagnostics, which runs purely as an error-detection probe.
     setLoading(false);
-    const hasDataForCurrentScope = digestDataScopeRef.current === scopeKey;
-    const allFailed = selectedProjectId
-      ? !digestOk && !diagnosticsOk && !hasDataForCurrentScope
-      : !digestOk && !hasDataForCurrentScope;
-    setLastFetchError(allFailed);
+
+    // Determine error state. If diagnostics hasn't settled yet, check it only
+    // once it completes (non-blocking from the operator's perspective).
+    const checkError = () => {
+      if (signal.aborted) return;
+      const hasDataForCurrentScope = digestDataScopeRef.current === scopeKey;
+      const allFailed = selectedProjectId
+        ? !digestOk && !diagnosticsOk && !hasDataForCurrentScope
+        : !digestOk && !hasDataForCurrentScope;
+      setLastFetchError(allFailed);
+    };
+
+    if (diagnosticsSettled) {
+      checkError();
+    } else {
+      diagnosticsPromise.then(checkError);
+    }
   }, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId, windowHours, refreshTrigger] });
 
   return { digest, digestStale, loading, lastFetchError, sparkData, refetchDigest };

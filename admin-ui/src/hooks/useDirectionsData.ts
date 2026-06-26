@@ -73,10 +73,12 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
 
   // Periodically refresh directions to keep time-derived badges (cooldown countdown,
   // hold auto-recovery countdown, staged waiting age) live while the panel is open.
+  // Uses lite=true to skip heavy stable fields (problem_model, design_doc, etc.)
+  // that don't change on a 10-second cadence.
   usePoller(
     () => {
       if (selectedProjectId) {
-        return fetchDirectionsLatestRef.current();
+        return fetchDirectionsLatestRef.current({ lite: true });
       }
     },
     {
@@ -102,43 +104,51 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     };
   }, [fetchDirectionsRef]);
 
-  async function fetchDirections() {
+  async function fetchDirections({ lite = false }: { lite?: boolean } = {}) {
     setLoading(true);
     try {
+      const baseUrl = `/api/admin/projects/${selectedProjectId}/directions`;
+      const directionsUrl = lite ? `${baseUrl}?lite=1` : baseUrl;
+
+      // On the initial (full) load, kick off all three requests in parallel:
+      // directions, task-counts, and version-lifecycle. On lite poll ticks,
+      // skip version-lifecycle since staging availability doesn't change at 10s.
+      const versionLifecyclePromise = !lite && selectedProjectId
+        ? fetchVersionLifecycle(selectedProjectId).catch(() => null)
+        : null;
+
       const [res, countsRes] = await Promise.all([
-        apiFetch(`/api/admin/projects/${selectedProjectId}/directions`),
-        apiFetch(`/api/admin/projects/${selectedProjectId}/directions/task-counts`),
+        apiFetch(directionsUrl),
+        apiFetch(`${baseUrl}/task-counts`),
       ]);
       if (!res.ok) throw new Error('Failed to fetch directions');
       const data = await res.json();
       setDirections(data.directions ?? []);
       setAutonomousEnabled(data.autonomous_enabled ?? false);
-      setDesignDoc(data.design_doc ?? {});
-      setProblemModel(data.problem_model ?? {});
-      setProblemModelSizeHealth(data.problem_model_size_health ?? null);
       setRunningUpdate(typeof data.running_update === 'string' ? data.running_update : null);
       setRunningUpdateAckAt(data.running_update_acknowledged_at ?? null);
-      setRunningUpdateReconciliation(data.running_update_reconciliation ?? null);
-      setSelfReflectionLog(data.self_reflection_log ?? []);
+      // Heavy stable fields are only present on full (non-lite) fetches; don't
+      // overwrite existing state on poll ticks that intentionally omit them.
+      if (!lite) {
+        setDesignDoc(data.design_doc ?? {});
+        setProblemModel(data.problem_model ?? {});
+        setProblemModelSizeHealth(data.problem_model_size_health ?? null);
+        setRunningUpdateReconciliation(data.running_update_reconciliation ?? null);
+        setSelfReflectionLog(data.self_reflection_log ?? []);
+      }
       if (countsRes.ok) {
         const countsData = await countsRes.json();
         setTaskCounts(countsData.counts ?? {});
         setActiveTasks(countsData.active_tasks ?? {});
       }
+      // Await the version lifecycle that was already running in parallel (full load only).
+      if (versionLifecyclePromise) {
+        const lifecycle = await versionLifecyclePromise;
+        setOpenVersionNumber(lifecycle?.current_version?.version_number ?? null);
+      }
     } catch (err) {
       console.error('Failed to fetch directions:', err);
       addToast('Failed to load directions', 'error');
-    }
-    // Fetch the open version separately so a version-lifecycle failure never
-    // blocks the directions list. A null result simply disables staging in the UI.
-    if (selectedProjectId) {
-      try {
-        const lifecycle = await fetchVersionLifecycle(selectedProjectId);
-        setOpenVersionNumber(lifecycle.current_version?.version_number ?? null);
-      } catch (err) {
-        console.error('Failed to fetch version lifecycle:', err);
-        setOpenVersionNumber(null);
-      }
     }
     setLoading(false);
   }
