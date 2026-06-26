@@ -148,6 +148,8 @@ HELP_INVOCATIONS = [
     ["compute", "kill"],
     ["compute", "analyze"],
     ["compute", "run"],
+    ["compute", "launch"],
+    ["tasks", "create"],
 ]
 
 
@@ -4722,3 +4724,187 @@ def test_compute_run_docker_login_skipped_when_no_password(tmp_path, monkeypatch
     blueprint._compute_run_local(args)
 
     assert not login_calls, "docker login must not be called when password is absent"
+
+
+# ── tasks create ─────────────────────────────────────────────────────────────
+
+def test_tasks_create_posts_task(mock_api, monkeypatch, capsys):
+    """tasks create POSTs to /api/admin/tasks with correct fields."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    rc = blueprint.main(["tasks", "create", "My new task", "Do the thing.", "--yes"])
+    assert rc == 0
+    create_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/api/admin/tasks" in p and "compute-experiment" not in p]
+    assert create_calls, "Expected a POST to /api/admin/tasks"
+    body = create_calls[0][2]
+    assert body["title"] == "My new task"
+    assert body["prompt"] == "Do the thing."
+    assert body["github_repo"] == "owner/repo"
+    assert body["task_type"] == "create"
+    assert body["base_branch"] == "main"
+
+
+def test_tasks_create_custom_type_and_repo(mock_api, monkeypatch, capsys):
+    """tasks create respects --type, --repo, and --base-branch overrides."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "default/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "default/repo", "default_base_branch": "main",
+    })
+    rc = blueprint.main([
+        "tasks", "create", "Fix bug", "Patch the thing.",
+        "--type", "fix", "--repo", "myorg/myrepo", "--base-branch", "dev", "--yes",
+    ])
+    assert rc == 0
+    create_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/api/admin/tasks" in p and "compute-experiment" not in p]
+    assert create_calls
+    body = create_calls[0][2]
+    assert body["task_type"] == "fix"
+    assert body["github_repo"] == "myorg/myrepo"
+    assert body["base_branch"] == "dev"
+
+
+def test_tasks_create_read_only_refused(mock_api, monkeypatch):
+    """tasks create refuses under a read-only (agent-JWT) config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "create", "T", "P", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_tasks_create_aborts_without_yes(mock_api, monkeypatch, capsys):
+    """tasks create aborts on non-interactive stdin without --yes."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = blueprint.main(["tasks", "create", "T", "P"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Aborted" in out
+    assert not any(m == "POST" and "/api/admin/tasks" in p and "compute-experiment" not in p for m, p, _ in mock_api)
+
+
+def test_tasks_create_missing_repo_errors(mock_api, monkeypatch, capsys):
+    """tasks create exits with error when no repo is configured or supplied."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "",
+    })
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "create", "T", "P", "--yes"])
+    assert exc.value.code == 1
+
+
+# ── compute launch ────────────────────────────────────────────────────────────
+
+def test_compute_launch_creates_cloud_experiment(mock_api, monkeypatch, capsys):
+    """compute launch --dud --yes POSTs to /api/admin/tasks/compute-experiment with correct body."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    rc = blueprint.main(["compute", "launch", "--dud", "--yes"])
+    assert rc == 0
+    launch_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "compute-experiment" in p]
+    assert launch_calls, "Expected a POST to /api/admin/tasks/compute-experiment"
+    body = launch_calls[0][2]
+    assert body["github_repo"] == "owner/repo"
+    assert "dud_ok" in body["command"]
+    assert body["success_criterion"]["metric"] == "dud_ok"
+    assert body["success_criterion"]["operator"] == ">="
+    assert body["success_criterion"]["threshold"] == 1.0
+    assert body["spend_cap_usd"] == 0.50
+    assert body["deadline_seconds"] == 600
+
+
+def test_compute_launch_custom_command(mock_api, monkeypatch, capsys):
+    """compute launch with explicit --command and --metric posts the correct criterion."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    rc = blueprint.main([
+        "compute", "launch",
+        "--repo", "myorg/ml",
+        "--command", "python3 train.py",
+        "--metric", "accuracy",
+        "--operator", ">=",
+        "--threshold", "0.9",
+        "--title", "Train run",
+        "--yes",
+    ])
+    assert rc == 0
+    launch_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "compute-experiment" in p]
+    assert launch_calls
+    body = launch_calls[0][2]
+    assert body["github_repo"] == "myorg/ml"
+    assert body["command"] == "python3 train.py"
+    assert body["success_criterion"]["metric"] == "accuracy"
+    assert body["success_criterion"]["threshold"] == 0.9
+    assert body["title"] == "Train run"
+
+
+def test_compute_launch_read_only_refused(mock_api, monkeypatch):
+    """compute launch refuses under a read-only config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["compute", "launch", "--dud", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_compute_launch_aborts_without_yes(mock_api, monkeypatch, capsys):
+    """compute launch aborts on non-interactive stdin without --yes."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = blueprint.main(["compute", "launch", "--dud"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Aborted" in out
+    assert not any(m == "POST" and "compute-experiment" in p for m, p, _ in mock_api)
+
+
+def test_compute_launch_no_command_errors(mock_api, monkeypatch):
+    """compute launch without --dud or --command exits with error."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "owner/repo",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "owner/repo",
+    })
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["compute", "launch", "--yes"])
+    assert exc.value.code == 1

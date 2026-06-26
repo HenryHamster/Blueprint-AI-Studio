@@ -17128,6 +17128,104 @@ class TestComputeExperimentTaskLaunch:
             "set so the bootstrap-recovery sweep skips it"
         )
 
+    @pytest.mark.asyncio
+    async def test_arms_launch_synthesizes_command_and_persists_contract(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /api/admin/tasks/compute-experiment with arms + declared_metric
+        must persist the arms/declared_metric on the payload and synthesize
+        a command via the contract validator."""
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json={
+                    "github_repo": "acme/compute",
+                    "title": "A vs B sweep",
+                    "prompt": "Compare arm-A and arm-B",
+                    "base_branch": "automain",
+                    "arms": [
+                        {"name": "arm-A", "command": "python train.py --lr 0.01"},
+                        {"name": "arm-B", "command": "python train.py --lr 0.001"},
+                    ],
+                    "declared_metric": "val/accuracy",
+                    "spend_cap_usd": 5.0,
+                    "deadline_seconds": 900,
+                },
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert payload["type"] == "compute_experiment"
+        # Arms and declared_metric must be persisted on the stored payload.
+        assert payload["arms"] == [
+            {"name": "arm-A", "command": "python train.py --lr 0.01"},
+            {"name": "arm-B", "command": "python train.py --lr 0.001"},
+        ]
+        assert payload["declared_metric"] == "val/accuracy"
+        # The contract validator synthesizes a command from the arms; it must be
+        # a non-empty string (the actual script is an opaque base64 blob).
+        assert isinstance(payload["command"], str) and payload["command"].strip()
+
+    @pytest.mark.asyncio
+    async def test_arms_without_declared_metric_rejected(
+        self, client: AsyncClient, db_session
+    ):
+        """Providing arms without declared_metric must return 422."""
+        await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={
+                "github_repo": "acme/compute",
+                "title": "Missing metric sweep",
+                "prompt": "Compare arms without a declared metric",
+                "base_branch": "automain",
+                "arms": [
+                    {"name": "arm-A", "command": "python train.py --lr 0.01"},
+                    {"name": "arm-B", "command": "python train.py --lr 0.001"},
+                ],
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+            },
+        )
+        assert resp.status_code == 422, resp.text
+        assert "declared_metric" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_neither_command_nor_arms_rejected(
+        self, client: AsyncClient, db_session
+    ):
+        """Providing neither command nor arms must return 422."""
+        await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={
+                "github_repo": "acme/compute",
+                "title": "Missing command sweep",
+                "prompt": "No command or arms",
+                "base_branch": "automain",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+            },
+        )
+        assert resp.status_code == 422, resp.text
+        assert "command" in resp.text
+
 
 class TestBugReportCitationGate:
     """Reproduce-on-HEAD citation grounding for free-text bug reports.

@@ -204,7 +204,9 @@ export interface ComputeExperimentLaunchRequest {
   base_branch: string;
   title: string;
   prompt: string;
-  command: string;
+  command?: string;
+  arms?: Array<{ name: string; command: string }>;
+  declared_metric?: string;
   spend_cap_usd: number;
   deadline_seconds: number;
   accelerator?: string;
@@ -3148,6 +3150,35 @@ export async function fetchComputeJobsPaged(
     hasMore: !!data.has_more,
     summary: data.summary ?? emptySummary,
   };
+}
+
+export interface ComputeSweepKnowledgeEntry {
+  id: string;
+  title: string;
+  summary?: string | null;
+  acceptance_grade?: string | null;
+  arm_label?: string | null;
+  created_at?: string | null;
+  source_kind?: string | null;
+}
+
+export interface ComputeSweepGroupsResponse {
+  sweep_groups: Record<string, ComputeSweepKnowledgeEntry[]>;
+}
+
+export async function fetchComputeSweepGroups(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ComputeSweepGroupsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs/sweep-groups`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch sweep groups: ${res.status}`);
+  return res.json();
 }
 
 export async function fetchComputeJobsAggregateSummary(

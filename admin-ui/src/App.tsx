@@ -930,6 +930,7 @@ export default function App() {
             onViewTask={s.handleViewLogs}
             onShowAnalytics={() => setShowAnalytics(true)}
             onOpenFleet={() => s.setShowFleetDetail(true)}
+            onCreateTask={s.openNewTaskModal}
           />
         </ErrorBoundary>
       ) : (

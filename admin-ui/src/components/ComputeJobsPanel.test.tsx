@@ -21,6 +21,7 @@ const fetchKnowledgeDocument = vi.fn();
 const resolveArtifactDownloadUrl = vi.fn();
 const fetchComputeJobsAggregateSummary = vi.fn();
 const fetchHeldComputeExperiments = vi.fn();
+const fetchComputeSweepGroups = vi.fn();
 
 vi.mock('../api', () => ({
   fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
@@ -34,6 +35,7 @@ vi.mock('../api', () => ({
   resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
   fetchComputeJobsAggregateSummary: (...args: unknown[]) => fetchComputeJobsAggregateSummary(...args),
   fetchHeldComputeExperiments: (...args: unknown[]) => fetchHeldComputeExperiments(...args),
+  fetchComputeSweepGroups: (...args: unknown[]) => fetchComputeSweepGroups(...args),
 }));
 
 function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
@@ -210,6 +212,7 @@ describe('ComputeJobsPanel render + kill', () => {
     resolveArtifactDownloadUrl.mockReset();
     fetchComputeJobsAggregateSummary.mockReset();
     fetchHeldComputeExperiments.mockReset();
+    fetchComputeSweepGroups.mockReset();
     vi.restoreAllMocks();
   });
 
@@ -2245,5 +2248,40 @@ describe('ComputeJobsPanel render + kill', () => {
     // margin = 120 - 80 = 40
     expect(marginChip.textContent).toContain('+40.00');
     expect(marginChip.textContent).toContain('arm-slow');
+  });
+
+  test('compares_runs_grouped_by_sweep_id: renders sweep knowledge groups section when sweep groups returned', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchComputeSweepGroups.mockResolvedValue({
+      sweep_groups: {
+        'sweep-abc': [
+          { id: 'doc-1', title: 'accuracy_v1 sweep run A', summary: 'Achieved 0.91 accuracy', acceptance_grade: 'B', arm_label: 'run-a', created_at: '2026-06-20T10:00:00Z' },
+          { id: 'doc-2', title: 'accuracy_v1 sweep run B', summary: 'Achieved 0.95 accuracy', acceptance_grade: 'A', arm_label: 'run-b', created_at: '2026-06-20T11:00:00Z' },
+        ],
+      },
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // The sweep knowledge groups section renders
+    await findByTestId('sweep-knowledge-groups');
+    // The first doc's title appears as the group label
+    const groupLabel = await findByTestId('sweep-knowledge-group-label');
+    expect(groupLabel.textContent).toContain('accuracy_v1 sweep run A');
+    // Toggle the compare view
+    const compareBtn = await findByTestId('sweep-knowledge-compare-toggle');
+    await act(async () => { compareBtn.click(); });
+    // Comparison table rendered
+    const table = await findByTestId('sweep-knowledge-comparison-table');
+    expect(table.textContent).toContain('run-a');
+    expect(table.textContent).toContain('run-b');
+    expect(table.textContent).toContain('A');
+    expect(table.textContent).toContain('B');
+  });
+
+  test('compares_runs_grouped_by_sweep_id: hides sweep knowledge groups section when no groups returned', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchComputeSweepGroups.mockResolvedValue({ sweep_groups: {} });
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('No compute jobs');
+    expect(queryByTestId('sweep-knowledge-groups')).toBeNull();
   });
 });

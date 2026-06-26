@@ -123,6 +123,7 @@ export function KanbanBoard({
   onTrack,
   trackedTaskIds,
   onDuplicate,
+  hasActiveFilters,
   searchQuery,
   onDirectionClick,
 }: KanbanBoardProps) {
@@ -442,7 +443,7 @@ export function KanbanBoard({
                 </SortableContext>
                 {columnTasks.length === 0 && !loading && (
                   <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
-                    No tasks
+                    {hasActiveFilters ? 'No tasks match filters' : 'No tasks'}
                   </div>
                 )}
               </div>
@@ -511,6 +512,7 @@ export function KanbanBoard({
               maxRetries={maxRetries}
               actionLoadingMap={actionLoadingMap}
               searchQuery={searchQuery}
+              hasActiveFilters={hasActiveFilters}
               onBulkToggle={onBulkToggle}
               onShiftSelect={onShiftSelect}
               onApprove={onApprove}

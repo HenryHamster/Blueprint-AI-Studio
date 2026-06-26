@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { AlertTriangle, BarChart2, Clock, ExternalLink, Layers } from 'lucide-react';
+import { AlertTriangle, BarChart2, Clock, ExternalLink, Layers, PlusCircle } from 'lucide-react';
 import { useDashboardDigest } from '../hooks/useDashboardDigest';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { fetchFleetUtilization, fetchTask } from '../api';
@@ -19,6 +19,7 @@ interface ConsoleHomeProps {
   onViewTask: (task: Task) => void;
   onShowAnalytics: () => void;
   onOpenFleet?: () => void;
+  onCreateTask?: () => void;
 }
 
 function NeedsAttentionSection({
@@ -89,6 +90,7 @@ export function ConsoleHome({
   onViewTask,
   onShowAnalytics,
   onOpenFleet,
+  onCreateTask,
 }: ConsoleHomeProps) {
   const pageActiveCount = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
   const pageQueuedCount = tasks.filter(t => t.status === 'QUEUED').length;
@@ -155,6 +157,20 @@ export function ConsoleHome({
       {/* Task fetch error */}
       {fetchError && (
         <p className="text-xs text-red-400 px-1">{fetchError}</p>
+      )}
+
+      {/* Empty-state CTA: shown when nothing is running or queued */}
+      {!loading && activeCount === 0 && queuedCount === 0 && onCreateTask && (
+        <button
+          onClick={onCreateTask}
+          className="w-full flex items-center gap-3 px-4 py-4 bg-neutral-900/50 border border-dashed border-neutral-700 rounded-xl hover:border-neutral-500 hover:bg-neutral-800/50 transition-colors text-left"
+        >
+          <PlusCircle className="w-5 h-5 text-neutral-500 shrink-0" />
+          <div>
+            <p className="text-sm font-medium text-neutral-300">Create your first task</p>
+            <p className="text-xs text-neutral-500 mt-0.5">Nothing is running yet — launch a task to get started</p>
+          </div>
+        </button>
       )}
 
       {/* Needs attention */}

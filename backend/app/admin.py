@@ -1543,7 +1543,9 @@ class ComputeExperimentTaskPayload(BaseModel):
     base_branch: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
     )
-    command: str = Field(..., min_length=1)
+    command: str | None = None
+    arms: list[dict[str, str]] | None = None
+    declared_metric: str | None = None
     spend_cap_usd: float
     deadline_seconds: int
     accelerator: str | None = None
@@ -1561,6 +1563,16 @@ class ComputeExperimentTaskPayload(BaseModel):
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
+
+    @model_validator(mode="after")
+    def validate_command_or_arms(self) -> "ComputeExperimentTaskPayload":
+        has_command = bool(self.command and self.command.strip())
+        has_arms = bool(self.arms)
+        if not has_command and not has_arms:
+            raise ValueError("Either 'command' or 'arms' (with 'declared_metric') must be provided")
+        if has_arms and not (self.declared_metric and self.declared_metric.strip()):
+            raise ValueError("'declared_metric' is required when 'arms' is specified")
+        return self
 
     @field_validator("provisioning_model")
     @classmethod
@@ -2124,10 +2136,14 @@ async def create_compute_experiment_task(
         payload.base_branch or _get_project_promotion_target_for_task(project)
     )
     launch_contract: dict[str, Any] = {
-        "command": payload.command,
         "spend_cap_usd": payload.spend_cap_usd,
         "deadline_seconds": payload.deadline_seconds,
     }
+    if payload.arms is not None:
+        launch_contract["arms"] = payload.arms
+        launch_contract["declared_metric"] = payload.declared_metric
+    else:
+        launch_contract["command"] = payload.command
     if payload.success_criterion is not None:
         launch_contract["success_criterion"] = payload.success_criterion.model_dump()
     for opt_key in (
@@ -2228,6 +2244,8 @@ async def create_compute_experiment_task(
                 "hypothesis",
                 "metric",
                 "provisioning_model",
+                "arms",
+                "declared_metric",
             )
             if launch_contract.get(k) is not None
         },

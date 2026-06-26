@@ -20,7 +20,15 @@ export const COMPUTE_EXPERIMENT_TASK_TYPE = 'compute_experiment';
 // as strings (raw input) and validated/coerced at submit time, mirroring how
 // the PR-number field is kept as a string. The success-criterion sub-fields are
 // all-or-nothing: leave them blank to launch without a machine-checkable goal.
+export interface ComputeExperimentArm {
+  name: string;
+  command: string;
+}
+
 export interface ComputeExperimentForm {
+  useArmsMode: boolean;
+  arms: ComputeExperimentArm[];
+  declaredMetric: string;
   command: string;
   cwd: string;
   envVars: string;
@@ -53,6 +61,9 @@ export function canonicalMachineTypeForAccelerator(accelerator: string): string 
 
 export function defaultComputeExperimentForm(): ComputeExperimentForm {
   return {
+    useArmsMode: false,
+    arms: [{ name: '', command: '' }, { name: '', command: '' }],
+    declaredMetric: '',
     command: '',
     cwd: '',
     envVars: '',
@@ -382,9 +393,21 @@ export function useTaskModal(
       return;
     }
     const command = computeExperiment.command.trim();
-    if (!command) {
+    const usingArms = computeExperiment.useArmsMode;
+    if (!usingArms && !command) {
       addToast('Command is required for compute experiments', 'error');
       return;
+    }
+    if (usingArms) {
+      const validArms = computeExperiment.arms.filter(a => a.name.trim() && a.command.trim());
+      if (validArms.length < 2) {
+        addToast('At least two arms with name and command are required for multi-arm experiments', 'error');
+        return;
+      }
+      if (!computeExperiment.declaredMetric.trim()) {
+        addToast('Declared metric is required for multi-arm experiments', 'error');
+        return;
+      }
     }
     const spendCap = Number(computeExperiment.spendCapUsd);
     if (!Number.isFinite(spendCap) || spendCap <= 0) {
@@ -435,14 +458,22 @@ export function useTaskModal(
       envRecord[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1);
     }
     const hasEnv = Object.keys(envRecord).length > 0;
-    const title = newTaskTitle.trim() || `Compute experiment: ${command.slice(0, 60)}`;
-    const prompt = newTaskPrompt.trim() || hypothesis || `Run compute experiment: ${command}`;
+    const validArms = computeExperiment.arms.filter(a => a.name.trim() && a.command.trim());
+    const armsLabel = usingArms ? validArms.map(a => a.name).join(' vs ') : '';
+    const title = newTaskTitle.trim() || (usingArms
+      ? `Compute sweep: ${armsLabel.slice(0, 60)}`
+      : `Compute experiment: ${command.slice(0, 60)}`);
+    const prompt = newTaskPrompt.trim() || hypothesis || (usingArms
+      ? `Run multi-arm compute experiment: ${armsLabel}`
+      : `Run compute experiment: ${command}`);
     const body: ComputeExperimentLaunchRequest = {
       github_repo: newTaskRepo,
       base_branch: newTaskBranch,
       title,
       prompt,
-      command,
+      ...(usingArms
+        ? { arms: validArms.map(a => ({ name: a.name.trim(), command: a.command.trim() })), declared_metric: computeExperiment.declaredMetric.trim() }
+        : { command }),
       spend_cap_usd: spendCap,
       deadline_seconds: deadline,
       ...(accelerator ? { accelerator } : {}),
@@ -636,7 +667,12 @@ export function useTaskModal(
 
     // For compute_experiment tasks, prefill the compute experiment form from the payload.
     if ((task.task_type as string) === COMPUTE_EXPERIMENT_TASK_TYPE) {
+      const payloadArms = payload.arms as Array<{ name: string; command: string }> | undefined;
+      const hasArms = Array.isArray(payloadArms) && payloadArms.length > 0;
       setComputeExperiment({
+        useArmsMode: hasArms,
+        arms: hasArms ? payloadArms : [{ name: '', command: '' }, { name: '', command: '' }],
+        declaredMetric: (payload.declared_metric as string) || '',
         command: (payload.command as string) || '',
         cwd: (payload.cwd as string) || '',
         envVars: (() => {

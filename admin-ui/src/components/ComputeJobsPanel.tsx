@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -270,6 +270,126 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
   );
 }
 
+function SweepKnowledgeGroupsSection({
+  sweepGroups,
+  onNavigateToKnowledge,
+}: {
+  sweepGroups: ComputeSweepGroupsResponse['sweep_groups'];
+  onNavigateToKnowledge?: (documentId: string) => void;
+}) {
+  const [compareSet, setCompareSet] = useState<Set<string>>(new Set());
+  const entries = Object.entries(sweepGroups);
+  if (entries.length === 0) return null;
+
+  function toggleCompare(sweepId: string) {
+    setCompareSet((prev) => {
+      const next = new Set(prev);
+      if (next.has(sweepId)) next.delete(sweepId); else next.add(sweepId);
+      return next;
+    });
+  }
+
+  return (
+    <div className="mb-3 flex flex-col gap-2" data-testid="sweep-knowledge-groups">
+      <div className="text-ui-xs font-semibold text-neutral-500 uppercase tracking-widest">
+        Sweep comparisons (knowledge)
+      </div>
+      {entries.map(([sweepId, docs]) => {
+        const comparing = compareSet.has(sweepId);
+        const label = docs[0]?.title ?? sweepId;
+        return (
+          <div
+            key={sweepId}
+            className="rounded-lg border border-indigo-500/20 bg-indigo-500/5 px-3 py-2"
+            data-testid="sweep-knowledge-group"
+          >
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <span className="text-ui-sm font-semibold text-indigo-300 break-words min-w-0" data-testid="sweep-knowledge-group-label">
+                {label}
+              </span>
+              <div className="flex items-center gap-2 shrink-0">
+                {!comparing && (
+                  <span className="text-ui-sm text-neutral-400 font-mono">
+                    {docs.length} runs
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => toggleCompare(sweepId)}
+                  className="min-h-[44px] flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-indigo-400 hover:text-indigo-200 hover:bg-indigo-500/15 transition-colors"
+                  data-testid="sweep-knowledge-compare-toggle"
+                >
+                  <LayoutGrid className="w-3 h-3" />
+                  {comparing ? 'List' : 'Compare'}
+                </button>
+              </div>
+            </div>
+            {comparing ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-ui-sm font-mono" data-testid="sweep-knowledge-comparison-table">
+                  <thead>
+                    <tr>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Run</th>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Grade</th>
+                      <th className="text-left pb-1 text-neutral-500 font-normal">Summary</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {docs.map((doc) => (
+                      <tr key={doc.id} className="border-t border-neutral-800/50">
+                        <td className="py-0.5 pr-3 text-neutral-300 max-w-32 truncate">
+                          {onNavigateToKnowledge ? (
+                            <button
+                              type="button"
+                              onClick={() => onNavigateToKnowledge(doc.id)}
+                              className="text-sky-300 hover:text-sky-200 hover:underline text-left truncate max-w-full"
+                            >
+                              {(doc.arm_label ?? doc.title).slice(0, 28)}
+                            </button>
+                          ) : (
+                            <span className="truncate">{(doc.arm_label ?? doc.title).slice(0, 28)}</span>
+                          )}
+                        </td>
+                        <td className="py-0.5 pr-3 text-neutral-400">{doc.acceptance_grade ?? '—'}</td>
+                        <td className="py-0.5 text-neutral-400 max-w-xs truncate">{doc.summary?.slice(0, 80) ?? '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-0.5">
+                {docs.map((doc) => (
+                  <div key={doc.id} className="flex items-center gap-2 text-ui-sm font-mono text-neutral-400">
+                    <span className="min-w-0 flex-1 truncate">
+                      {onNavigateToKnowledge ? (
+                        <button
+                          type="button"
+                          onClick={() => onNavigateToKnowledge(doc.id)}
+                          className="text-sky-300 hover:text-sky-200 hover:underline text-left truncate"
+                        >
+                          {doc.arm_label ?? doc.title}
+                        </button>
+                      ) : (
+                        doc.arm_label ?? doc.title
+                      )}
+                    </span>
+                    {doc.acceptance_grade && (
+                      <span className="shrink-0 rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-ui-xs text-neutral-300">
+                        {doc.acceptance_grade}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function groupJobsByExperiment(jobs: ComputeJob[]): Map<string, ComputeJob[]> {
   const groups = new Map<string, ComputeJob[]>();
   for (const job of jobs) {
@@ -497,6 +617,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
   const [analysisDocs, setAnalysisDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
+  const [sweepGroups, setSweepGroups] = useState<ComputeSweepGroupsResponse['sweep_groups']>({});
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -562,6 +683,22 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       }
     },
     { intervalMs: 30_000, enabled: !!projectId, deps: [projectId] },
+  );
+
+  // Poll sweep-grouped knowledge docs every 60s — complementary to the live job
+  // poll, uses durable knowledge documents so changes are infrequent.
+  usePoller(
+    async (signal) => {
+      if (!projectId) return;
+      try {
+        const result = await fetchComputeSweepGroups(projectId, signal);
+        setSweepGroups(result.sweep_groups ?? {});
+      } catch (e) {
+        if (e instanceof Error && e.name === 'AbortError') return;
+        // Non-fatal: sweep groups are supplementary
+      }
+    },
+    { intervalMs: 60_000, enabled: !!projectId, deps: [projectId] },
   );
 
   // Fetch lifetime aggregate summary once per project (unbounded lifetime totals).
@@ -791,6 +928,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         onApprove={onApproveExperiment}
         onDismiss={onDismissExperiment}
       />
+
+      <SweepKnowledgeGroupsSection sweepGroups={sweepGroups} onNavigateToKnowledge={onNavigateToKnowledge} />
 
       <ExperimentSweepSummary jobs={jobs} />
 

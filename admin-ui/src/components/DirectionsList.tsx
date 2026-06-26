@@ -116,7 +116,7 @@ export function DirectionsList(props: DirectionsListProps) {
       ) : !selectedProjectId ? (
         <p className="text-xs text-neutral-500 text-center py-8">Select a project</p>
       ) : directions.length === 0 ? (
-        <p className="text-xs text-neutral-500 text-center py-8">No directions yet</p>
+        <p className="text-xs text-neutral-500 text-center py-8">No directions yet — use the form above to add one</p>
       ) : (
         <div className="space-y-4">
           {grouped.map(({ key, label, items }) => {

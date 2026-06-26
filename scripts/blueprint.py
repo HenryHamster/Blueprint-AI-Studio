@@ -307,6 +307,8 @@ def cmd_tasks(args: argparse.Namespace) -> None:
         _tasks_research(args)
     elif sub == "autonomy-debug":
         _tasks_autonomy_debug(args)
+    elif sub == "create":
+        _tasks_create(args)
     else:
         _tasks_list(args)
 
@@ -920,6 +922,39 @@ def _tasks_research(args: argparse.Namespace) -> None:
         print("No recent research tasks found.")
         return
     _emit(args, {"tasks": tasks, "total": len(tasks)}, _render_task_list)
+
+
+def _tasks_create(args: argparse.Namespace) -> None:
+    _require_write_config("tasks create")
+    cfg = load_config()
+    title = args.title
+    prompt = args.prompt
+    task_type = getattr(args, "task_type", "create")
+    github_repo = getattr(args, "repo", None) or cfg.get("default_repo", "")
+    base_branch = getattr(args, "base_branch", None) or cfg.get("default_base_branch", "main")
+    if not github_repo:
+        print("ERROR: --repo is required (or set default_repo in config).", file=sys.stderr)
+        sys.exit(1)
+    if not _confirm(f"Create task: {title[:60]}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {
+        "github_repo": github_repo,
+        "title": title,
+        "prompt": prompt,
+        "task_type": task_type,
+        "base_branch": base_branch,
+    }
+    if getattr(args, "model", None):
+        body["model"] = args.model
+    if getattr(args, "effort", None):
+        body["effort"] = args.effort
+    if getattr(args, "hotfix", False):
+        body["hotfix"] = True
+    result = api("POST", "/api/admin/tasks", body)
+    _emit(args, result, lambda r: print(
+        f"  task created: {r.get('id', '?')}  [{r.get('task_type', '?')}]  {r.get('title', '')}"
+    ))
 
 
 # ── versions ──────────────────────────────────────────────────────────────--
@@ -3554,7 +3589,7 @@ def _compute_job_projected_spend(j: dict, burn_rate: "float | None", now: "datet
 
 
 def cmd_compute(args: argparse.Namespace) -> None:
-    """Dispatch compute subcommands: list / show / kill / analyze / run."""
+    """Dispatch compute subcommands: list / show / kill / analyze / run / launch."""
     sub = getattr(args, "compute_cmd", None) or "list"
     if sub == "kill":
         _compute_kill(args)
@@ -3564,6 +3599,8 @@ def cmd_compute(args: argparse.Namespace) -> None:
         _compute_show(args)
     elif sub == "run":
         _compute_run_local(args)
+    elif sub == "launch":
+        _compute_launch(args)
     else:
         _compute_list(args)
 
@@ -4326,6 +4363,74 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     _emit(args, result, _render)
 
 
+# No-repo substrate probe command (inlined from launch_compute_experiment.py).
+_COMPUTE_DUD_COMMAND = """python3 - <<'PYEOF'
+import json
+import os
+import sys
+
+result = {"dud_ok": 1, "py_major": sys.version_info[0]}
+rf = os.environ.get("BLUEPRINT_RESULT_FILE")
+if rf:
+    with open(rf, "w") as f:
+        json.dump(result, f)
+ad = os.environ.get("BLUEPRINT_ARTIFACT_DIR")
+if ad:
+    with open(os.path.join(ad, "dud.txt"), "w") as f:
+        f.write("compute substrate reached runtime and wrote an artifact\\n")
+print(json.dumps(result))
+PYEOF"""
+
+
+def _compute_launch(args: argparse.Namespace) -> None:
+    _require_write_config("compute launch")
+    dud = getattr(args, "dud", False)
+    command = _COMPUTE_DUD_COMMAND if dud else getattr(args, "experiment_command", None)
+    if not command:
+        print("ERROR: provide --dud or --command.", file=sys.stderr)
+        sys.exit(1)
+    cfg = load_config()
+    github_repo = getattr(args, "repo", None) or cfg.get("default_repo", "")
+    if not github_repo:
+        print("ERROR: --repo is required (or set default_repo in config).", file=sys.stderr)
+        sys.exit(1)
+    title = getattr(args, "title", None) or ("operator substrate probe" if dud else "operator compute experiment")
+    prompt = getattr(args, "prompt", None) or "Operator-launched compute_experiment."
+    base_branch = getattr(args, "base_branch", None) or cfg.get("default_base_branch", "main")
+    spend_cap = getattr(args, "spend_cap", 0.50)
+    deadline = getattr(args, "deadline", 600)
+    raw_metric = getattr(args, "metric", None)
+    metric = (raw_metric or "dud_ok") if dud else raw_metric
+    operator = getattr(args, "operator", ">=")
+    raw_threshold = getattr(args, "threshold", None)
+    threshold = (raw_threshold if raw_threshold is not None else 1.0) if dud else raw_threshold
+    if not _confirm(f"Launch compute experiment: {title[:60]}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {
+        "github_repo": github_repo,
+        "title": title,
+        "prompt": prompt,
+        "base_branch": base_branch,
+        "command": command,
+        "spend_cap_usd": spend_cap,
+        "deadline_seconds": deadline,
+    }
+    if metric:
+        body["success_criterion"] = {
+            "metric": metric,
+            "operator": operator,
+            "threshold": threshold,
+        }
+    if getattr(args, "machine_type", None):
+        body["machine_type"] = args.machine_type
+    result = api("POST", "/api/admin/tasks/compute-experiment", body)
+    _emit(args, result, lambda r: print(
+        f"  compute experiment created: {r.get('task_id', r.get('id', '?'))}"
+        + (f"  job_id={r.get('compute_job_id', '')}" if r.get("compute_job_id") else "")
+    ))
+
+
 # ── argument parser ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4508,6 +4613,31 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_sub.add_parser(
         "autonomy-debug", parents=[common],
         help="Show why autonomy is or isn't spawning: blocking guards and eligible directions.")
+    p_tasks_create = tasks_sub.add_parser(
+        "create", parents=[common],
+        help="Create and queue a new task (confirms before mutating).")
+    p_tasks_create.add_argument("title", help="Short task title.")
+    p_tasks_create.add_argument("prompt", help="Full task prompt / description.")
+    p_tasks_create.add_argument(
+        "--type", dest="task_type", default="create",
+        choices=["create", "fix", "research", "memo", "design_doc_update"],
+        help="Task type (default: create).")
+    p_tasks_create.add_argument(
+        "--repo", default=None, metavar="OWNER/REPO",
+        help="GitHub repo (default: default_repo from config).")
+    p_tasks_create.add_argument(
+        "--base-branch", dest="base_branch", default=None,
+        help="Base branch (default: default_base_branch from config or 'main').")
+    p_tasks_create.add_argument(
+        "--model", default=None, help="Model override for this task.")
+    p_tasks_create.add_argument(
+        "--effort", default=None,
+        choices=["low", "medium", "high", "xhigh", "max"],
+        help="Effort/reasoning level override.")
+    p_tasks_create.add_argument(
+        "--hotfix", action="store_true", help="Mark task as hotfix priority.")
+    p_tasks_create.add_argument("--yes", action="store_true",
+                                help="Skip the confirmation prompt.")
 
     # versions
     p_versions = sub.add_parser("versions", parents=[common],
@@ -4944,6 +5074,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--criterion-threshold", dest="criterion_threshold", type=float, default=None,
         metavar="THRESHOLD",
         help="Threshold for success criterion.")
+    p_compute_launch = compute_sub.add_parser(
+        "launch", parents=[common],
+        help="Launch a cloud compute experiment on the orchestrator (confirms before mutating).",
+        description="POST a compute_experiment task to the orchestrator. "
+                    "Use --dud for a no-repo substrate probe, or supply --command for a custom experiment.")
+    p_compute_launch.add_argument(
+        "--repo", default=None, metavar="OWNER/REPO",
+        help="GitHub repo for the experiment (default: default_repo from config).")
+    p_compute_launch.add_argument(
+        "--dud", action="store_true",
+        help="Use the built-in no-repo substrate-probe command with dud_ok>=1 criterion.")
+    p_compute_launch.add_argument(
+        "--command", dest="experiment_command", default=None,
+        help="Bash command string for the experiment (ignored when --dud).")
+    p_compute_launch.add_argument(
+        "--title", default=None, help="Task title (default: 'operator substrate probe' for --dud).")
+    p_compute_launch.add_argument(
+        "--prompt", default=None, help="Task prompt / description.")
+    p_compute_launch.add_argument(
+        "--base-branch", dest="base_branch", default=None,
+        help="Base branch (default: default_base_branch from config or 'main').")
+    p_compute_launch.add_argument(
+        "--spend-cap", dest="spend_cap", type=float, default=0.50,
+        help="Spend cap in USD (default 0.50).")
+    p_compute_launch.add_argument(
+        "--deadline", type=int, default=600,
+        help="Deadline in seconds (default 600).")
+    p_compute_launch.add_argument(
+        "--metric", default=None,
+        help="Success-criterion metric name (default 'dud_ok' for --dud).")
+    p_compute_launch.add_argument(
+        "--operator", default=">=",
+        help="Success-criterion operator: >= <= > < == != (default >=).")
+    p_compute_launch.add_argument(
+        "--threshold", type=float, default=None,
+        help="Success-criterion threshold (default 1.0 for --dud).")
+    p_compute_launch.add_argument(
+        "--machine-type", dest="machine_type", default=None,
+        help="GCP machine type override (e.g. n1-standard-4).")
+    p_compute_launch.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt.")
 
     # playbook
     p_pb = sub.add_parser("playbook", parents=[common],

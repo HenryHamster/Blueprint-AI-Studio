@@ -147,9 +147,21 @@ export function NewTaskModal({
       };
     });
   };
+  const updateArm = (idx: number, field: 'name' | 'command', value: string) =>
+    setComputeExperiment(f => {
+      const next = f.arms.map((a, i) => i === idx ? { ...a, [field]: value } : a);
+      return { ...f, arms: next };
+    });
+  const addArm = () =>
+    setComputeExperiment(f => ({ ...f, arms: [...f.arms, { name: '', command: '' }] }));
+  const removeArm = (idx: number) =>
+    setComputeExperiment(f => ({ ...f, arms: f.arms.filter((_, i) => i !== idx) }));
+
   // Client-side mirror of the backend launch-contract rules (non-empty command,
   // positive spend cap + deadline). Surfaced inline once a submit is attempted.
-  const computeCommandInvalid = !computeExperiment.command.trim();
+  const hasValidArms = computeExperiment.useArmsMode &&
+    computeExperiment.arms.filter(a => a.name.trim() && a.command.trim()).length >= 2;
+  const computeCommandInvalid = !computeExperiment.useArmsMode && !computeExperiment.command.trim();
   const computeSpendCap = Number(computeExperiment.spendCapUsd);
   const computeSpendInvalid = !(Number.isFinite(computeSpendCap) && computeSpendCap > 0);
   const computeDeadline = Number(computeExperiment.deadlineSeconds);
@@ -172,6 +184,9 @@ export function NewTaskModal({
     }
     if (isComputeExperiment && (computeCommandInvalid || computeSpendInvalid || computeDeadlineInvalid)) {
       // Inline errors render via submitAttempted; don't round-trip a doomed launch.
+      return;
+    }
+    if (isComputeExperiment && computeExperiment.useArmsMode && !hasValidArms) {
       return;
     }
     if (isComputeExperiment && isPreflightBlocking) {
@@ -340,20 +355,88 @@ export function NewTaskModal({
           </div>
           {isComputeExperiment && (
             <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
-              <div className="flex items-center gap-1.5 mb-3 text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">
-                <Cpu className="w-3.5 h-3.5 text-neutral-500" />
-                Compute Experiment Contract
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-1.5 text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">
+                  <Cpu className="w-3.5 h-3.5 text-neutral-500" />
+                  Compute Experiment Contract
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setComputeExperiment(f => ({ ...f, useArmsMode: !f.useArmsMode }))}
+                  className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors min-h-[44px] sm:min-h-0"
+                >
+                  {computeExperiment.useArmsMode ? 'Single command' : 'Multi-arm sweep'}
+                </button>
               </div>
-              <div className="mb-3">
-                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Command</label>
-                <textarea
-                  value={computeExperiment.command}
-                  onChange={e => updateCompute('command', e.target.value)}
-                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600 ${submitAttempted && computeCommandInvalid ? 'border-red-500' : 'border-neutral-800'}`}
-                  placeholder="python train.py --epochs 3"
-                />
-                {submitAttempted && computeCommandInvalid && <p className="text-ui-sm text-red-500 mt-1">Command is required.</p>}
-              </div>
+              {computeExperiment.useArmsMode ? (
+                <div className="mb-3">
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">
+                    Arms <span className="text-neutral-600 normal-case font-normal tracking-normal">(name + command per arm)</span>
+                  </label>
+                  {computeExperiment.arms.map((arm, idx) => (
+                    <div key={idx} className="flex gap-2 mb-2 items-start">
+                      <input
+                        type="text"
+                        value={arm.name}
+                        onChange={e => updateArm(idx, 'name', e.target.value)}
+                        className="w-24 flex-shrink-0 bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-2 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                        placeholder="arm-A"
+                      />
+                      <textarea
+                        value={arm.command}
+                        onChange={e => updateArm(idx, 'command', e.target.value)}
+                        className="flex-1 bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-2 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[40px] transition-all placeholder:text-neutral-600"
+                        placeholder="python train.py --lr 0.01"
+                      />
+                      {computeExperiment.arms.length > 2 && (
+                        <button
+                          type="button"
+                          onClick={() => removeArm(idx)}
+                          className="text-neutral-600 hover:text-red-400 transition-colors mt-2 min-h-[44px] sm:min-h-0"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={addArm}
+                    className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors flex items-center gap-1 mt-1 min-h-[44px] sm:min-h-0"
+                  >
+                    <Plus className="w-3 h-3" /> Add arm
+                  </button>
+                  {submitAttempted && !hasValidArms && (
+                    <p className="text-ui-sm text-red-500 mt-1">At least two arms with name and command are required.</p>
+                  )}
+                  <div className="mt-2">
+                    <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">
+                      Declared Metric <span className="text-neutral-600 normal-case font-normal tracking-normal">(metric key all arms emit)</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={computeExperiment.declaredMetric}
+                      onChange={e => updateCompute('declaredMetric', e.target.value)}
+                      className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && computeExperiment.useArmsMode && !computeExperiment.declaredMetric.trim() ? 'border-red-500' : 'border-neutral-800'}`}
+                      placeholder="val/accuracy"
+                    />
+                    {submitAttempted && computeExperiment.useArmsMode && !computeExperiment.declaredMetric.trim() && (
+                      <p className="text-ui-sm text-red-500 mt-1">Declared metric is required for multi-arm experiments.</p>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="mb-3">
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Command</label>
+                  <textarea
+                    value={computeExperiment.command}
+                    onChange={e => updateCompute('command', e.target.value)}
+                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600 ${submitAttempted && computeCommandInvalid ? 'border-red-500' : 'border-neutral-800'}`}
+                    placeholder="python train.py --epochs 3"
+                  />
+                  {submitAttempted && computeCommandInvalid && <p className="text-ui-sm text-red-500 mt-1">Command is required.</p>}
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>
                   <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Working Dir <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>

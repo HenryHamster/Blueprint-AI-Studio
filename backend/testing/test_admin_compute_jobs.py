@@ -1403,3 +1403,65 @@ async def test_aggregate_summary_endpoint_empty_project(
     assert body["outcome_breakdown"] == {}
     assert body["criterion_measured"] == 0
     assert body["criterion_met"] == 0
+
+
+# ---------------------------------------------------------------------------
+# sweep-groups endpoint tests
+# ---------------------------------------------------------------------------
+
+
+async def _seed_sweep_doc(session, project, task, *, sweep_id, arm_label):
+    """Seed a compute-experiment KnowledgeDocument with sweep metadata."""
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        title=f"arm {arm_label}",
+        summary="Summary.",
+        body="# Body",
+        topic="exp",
+        sweep_id=sweep_id,
+        arm_label=arm_label,
+    )
+    session.add(doc)
+    await session.commit()
+    await session.refresh(doc)
+    return doc
+
+
+@pytest.mark.asyncio
+async def test_sweep_groups_endpoint_viewer_ok(client: AsyncClient, db_session):
+    """A viewer can retrieve sweep groups; response shape includes sweep_id key."""
+    project = await _make_project(db_session, name="Sweep Groups Viewer")
+    await _add_member(db_session, project.id, "viewer")
+    task = Task(
+        project_id=project.id,
+        title="sweep task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    # Two arms in one sweep — minimum for build_compute_sweep_groups to include it.
+    await _seed_sweep_doc(db_session, project, task, sweep_id="sw-abc", arm_label="baseline")
+    await _seed_sweep_doc(db_session, project, task, sweep_id="sw-abc", arm_label="treatment")
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "sweep_groups" in body
+    groups = body["sweep_groups"]
+    assert "sw-abc" in groups
+    assert len(groups["sw-abc"]) == 2
+    arm_labels = {e["arm_label"] for e in groups["sw-abc"]}
+    assert arm_labels == {"baseline", "treatment"}
+
+
+@pytest.mark.asyncio
+async def test_sweep_groups_endpoint_non_member_404(client: AsyncClient, db_session):
+    """A user with no project membership receives 404 from the sweep-groups endpoint."""
+    project = await _make_project(db_session, name="Sweep Groups No Access")
+    # No ProjectMember row — request must be rejected.
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
+    assert resp.status_code == 404
