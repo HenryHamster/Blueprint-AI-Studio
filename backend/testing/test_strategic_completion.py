@@ -14297,6 +14297,153 @@ async def test_strategist_can_correct_already_set_version_goal(db_session):
 
 
 # ===========================================================================
+# extract_new_version_goal unit tests
+# ===========================================================================
+
+
+def test_extract_new_version_goal_valid_string():
+    """Valid, non-contentless strings are returned cleaned."""
+    from app.strategic_completion import extract_new_version_goal
+
+    goal = "Deliver autonomous coordination so Blueprint manages 3+ projects with zero daily interventions."
+    assert extract_new_version_goal(goal) == goal
+    # Trims surrounding whitespace
+    assert extract_new_version_goal(f"  {goal}  ") == goal
+
+
+def test_extract_new_version_goal_invalid_inputs():
+    """Non-string, blank, and None inputs are rejected."""
+    from app.strategic_completion import extract_new_version_goal
+
+    assert extract_new_version_goal(None) is None
+    assert extract_new_version_goal(42) is None
+    assert extract_new_version_goal([]) is None
+    assert extract_new_version_goal("") is None
+    assert extract_new_version_goal("   ") is None
+
+
+def test_extract_new_version_goal_contentless_rejected():
+    """Contentless single-word placeholder goals are rejected by is_contentless_goal."""
+    from app.strategic_completion import extract_new_version_goal
+
+    # is_contentless_goal only rejects single-word placeholders (see release_scoring.py)
+    assert extract_new_version_goal("test") is None
+    assert extract_new_version_goal("n/a") is None
+
+
+def test_extract_new_version_goal_max_length():
+    """Values are bounded to _NEW_VERSION_GOAL_MAX characters."""
+    from app.strategic_completion import extract_new_version_goal, _NEW_VERSION_GOAL_MAX
+
+    # A non-contentless string just under the limit passes
+    short_goal = "Deliver " + "x" * 400
+    result = extract_new_version_goal(short_goal)
+    assert result is not None
+    assert len(result) <= _NEW_VERSION_GOAL_MAX
+
+    # A very long string is truncated, not rejected
+    long_goal = "Deliver " + "x" * 2000
+    result_long = extract_new_version_goal(long_goal)
+    assert result_long is not None
+    assert len(result_long) == _NEW_VERSION_GOAL_MAX
+
+
+# ===========================================================================
+# _apply_new_version_goal — non-silent no-op logging
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_apply_new_version_goal_logs_info_when_no_open_version(db_session, caplog):
+    """When there is no open ReleaseVersion, _apply_new_version_goal must log at
+    INFO level (not silently swallow the no-op) so operators can diagnose why
+    the goal was not stored."""
+    import logging
+    from app.strategic_completion import _apply_new_version_goal
+
+    project = Project(
+        name="NoVersion",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # No ReleaseVersion opened — project has no open version.
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with caplog.at_level(logging.INFO, logger="app.strategic_completion"):
+        await _apply_new_version_goal(
+            "A substantive directional goal that should have been stored.",
+            task, project, db_session, path="test",
+        )
+
+    assert any(
+        "skipping new_version_goal" in record.message and record.levelno == logging.INFO
+        for record in caplog.records
+    ), f"Expected INFO-level skip log; got: {[r.message for r in caplog.records]}"
+
+
+@pytest.mark.asyncio
+async def test_apply_new_version_goal_logs_info_when_operator_goal_frozen(db_session, caplog):
+    """When the open version has an operator-set goal, _apply_new_version_goal
+    must log at INFO level (not debug) so the skip is visible in standard logs."""
+    import logging
+    from app.strategic_completion import _apply_new_version_goal
+    from app import release_version as rv
+
+    project = Project(
+        name="OpFrozen",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_goal(version, "operator choice", editor_id="op@example.com", source="operator")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal_editor_info == "[operator:op@example.com]"
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with caplog.at_level(logging.INFO, logger="app.strategic_completion"):
+        await _apply_new_version_goal(
+            "Strategist attempt that must be rejected.",
+            task, project, db_session, path="test",
+        )
+
+    assert any(
+        "operator goals are frozen to strategist" in record.message and record.levelno == logging.INFO
+        for record in caplog.records
+    ), f"Expected INFO-level frozen-goal log; got: {[r.message for r in caplog.records]}"
+
+    # Goal must remain unchanged
+    await db_session.refresh(version)
+    assert version.goal == "operator choice"
+
+
+# ===========================================================================
 # extract_new_version_theme + _apply_new_version_theme
 # ===========================================================================
 

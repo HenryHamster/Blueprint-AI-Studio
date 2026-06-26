@@ -490,16 +490,18 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('/tmp/problem_model_abc-456.json');
     expect(prompt).toContain('/tmp/running_update_abc-456.md');
     expect(prompt).toContain('/tmp/research_progress_abc-456.md');
-    expect(prompt).toContain('/tmp/new_version_goal_abc-456.txt');
+    // new_version_goal is a first-class JSON field — no separate tmp file
+    expect(prompt).not.toContain('/tmp/new_version_goal_abc-456.txt');
   });
 
   it('includes READ_ONLY_BASH_WRITE_NOTE next to each /tmp output path', () => {
     const prompt = buildThinkerPrompt({ ...base, taskId: 'abc-789' });
     expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
     // Note should appear multiple times (once per output file path):
-    // running_update, problem_model, research_progress, new_version_goal
+    // running_update, problem_model, research_progress, new_version_theme
+    // (new_version_goal is now a first-class JSON field, not a separate file)
     const count = prompt.split(READ_ONLY_BASH_WRITE_NOTE).length - 1;
-    expect(count).toBeGreaterThanOrEqual(4);
+    expect(count).toBeGreaterThanOrEqual(3);
   });
 
   it('includes PLAYBOOK_GUIDANCE (structural invariant: strategic_review class)', () => {
@@ -532,8 +534,12 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('new_version_goal');
     // Section 7 is the dedicated output section for the version goal and theme
     expect(prompt).toContain('## 7. Version goal');
-    // Must reference the dedicated handoff file
-    expect(prompt).toContain('/tmp/new_version_goal_');
+    // new_version_goal is now a first-class JSON field, not a separate tmp file
+    expect(prompt).not.toContain('/tmp/new_version_goal_');
+    // Must instruct the thinker to include it as a top-level JSON field
+    expect(prompt).toContain('top level');
+    // Must note it does not persist in the stored model
+    expect(prompt).toContain('does not persist in the stored model');
     // Must explain when to write it (only when goal is unset)
     expect(prompt).toContain('goal is currently unset');
     // Must note that once set, it is frozen (skip if already set)
@@ -889,6 +895,58 @@ describe('runThinkerWithGate', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.newVersionTheme).toBeUndefined();
+    }
+  });
+
+  it('(m) new_version_goal first-class: JSON field present, no tmp file → returned in newVersionGoal', async () => {
+    // First-class path: the thinker embeds new_version_goal directly in the
+    // problem_model JSON rather than writing a separate tmp file.
+    const goalText = 'Deliver autonomous cross-project coordination with zero operator interventions per day.';
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    // No new_version_goal_<taskId>.txt in presentFiles (tmp file absent)
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === problemModelPath) {
+          return JSON.stringify({ intent: { purpose: 'ok' }, gaps: [], new_version_goal: goalText });
+        }
+        return '';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionGoal).toBe(goalText);
+    }
+  });
+
+  it('(n) new_version_goal first-class: JSON field takes precedence over tmp file', async () => {
+    // When both sources are present, the JSON field (first-class) wins.
+    const goalInJson = 'Primary goal from problem_model JSON field.';
+    const goalInFile = 'Secondary goal from legacy tmp file.';
+    const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.presentFiles.add(newVersionGoalPath);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === problemModelPath) {
+          return JSON.stringify({ intent: { purpose: 'ok' }, gaps: [], new_version_goal: goalInJson });
+        }
+        if (path === newVersionGoalPath) return goalInFile;
+        return '';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionGoal).toBe(goalInJson);
     }
   });
 });

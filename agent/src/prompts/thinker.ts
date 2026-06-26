@@ -371,16 +371,16 @@ Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_W
 
 **Version goal (only when the Goal shown in Version Phase is unset):**
 
-**Skip if the version already has a goal** — the goal is frozen once set; re-emitting is silently ignored.
+**Skip if the version already has a goal** — the goal is frozen once set; re-emitting is a non-fatal no-op.
 
-**Only when the goal is currently unset:** write one concise version objective to \`/tmp/new_version_goal_${p.taskId}.txt\` ${READ_ONLY_BASH_WRITE_NOTE}. Single line, under 500 characters.
+**Only when the goal is currently unset:** include a \`new_version_goal\` key at the **top level** of your problem_model JSON (a peer of \`intent\`, \`context\`, \`constraints\`, etc.) with the objective text as its value. Single line, under 500 characters. The backend lifts this field before ProblemModel validation and applies it — it does not persist in the stored model.
 
 The goal must be SUBSTANTIVE and DIRECTIONAL — a concrete deliverable statement that orients a new contributor reading it cold. It becomes the frozen scoring target for every merge in this version.
 
 Bad: "Fix CI, improve quality, pass audit." — feature list / status echo, rejected by the contentless-goal guard.
 Good: "Deliver autonomous cross-project coordination so Blueprint manages 3+ concurrent projects with fewer than 1 operator intervention per day." — outcome-framed, measurable, non-trivial.
 
-Write only the goal text — no JSON, no label, no quotes. Omit the file entirely if the goal is already set.
+Omit the \`new_version_goal\` key entirely if the goal is already set.
 
 **Version theme (only when the Theme shown in Version Phase is unset):**
 
@@ -637,15 +637,29 @@ export async function runThinkerWithGate(
     }
   }
 
-  // Read the optional Section 7 version-goal file if the thinker wrote it.
-  const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+  // Extract the optional new_version_goal — primary: first-class field in the
+  // problem_model JSON (the authoritative handoff file the gate already validated);
+  // fallback: legacy tmp file written by older thinker agents for backward compat.
   let newVersionGoal: string | undefined;
-  if (fs.existsSync(newVersionGoalPath)) {
-    try {
-      const raw = fs.readFileSync(newVersionGoalPath, 'utf8').trim();
-      if (raw) newVersionGoal = raw;
-    } catch (e) {
-      sendLog(ws, `[WARNING] Failed to read ${newVersionGoalPath}: ${String(e)}\n`);
+  try {
+    const pmRaw = fs.readFileSync(problemModelPath, 'utf8');
+    const pm = JSON.parse(pmRaw) as Record<string, unknown>;
+    if (typeof pm.new_version_goal === 'string') {
+      const trimmed = pm.new_version_goal.trim();
+      if (trimmed) newVersionGoal = trimmed;
+    }
+  } catch {
+    // problem_model JSON unreadable at this point — fall through to tmp-file fallback.
+  }
+  if (!newVersionGoal) {
+    const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+    if (fs.existsSync(newVersionGoalPath)) {
+      try {
+        const raw = fs.readFileSync(newVersionGoalPath, 'utf8').trim();
+        if (raw) newVersionGoal = raw;
+      } catch (e) {
+        sendLog(ws, `[WARNING] Failed to read ${newVersionGoalPath}: ${String(e)}\n`);
+      }
     }
   }
 

@@ -1138,7 +1138,7 @@ async def _apply_new_version_goal(
             return
         _open_ver = await _cur_open_version(session, project.id)
         if _open_ver is None:
-            logger.debug(
+            logger.info(
                 "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project %s "
                 "— skipping new_version_goal",
                 task.id,
@@ -1149,7 +1149,7 @@ async def _apply_new_version_goal(
         if _open_ver.goal is not None:
             _ei = _open_ver.goal_editor_info or ""
             if _ei.startswith("[operator:"):
-                logger.debug(
+                logger.info(
                     "[STRATEGIC] Task %s (%s path): open version v%d has an operator-set goal "
                     "— skipping new_version_goal (operator goals are frozen to strategist)",
                     task.id,
