@@ -1186,6 +1186,74 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(chips).toHaveLength(2);
   });
 
+  test('matrix-verdict-chip renders amber/inconclusive for measurable:false verdict', async () => {
+    const jobs = [
+      makeJob({
+        id: 'job-a',
+        task_title: 'run A',
+        experiment: 'sweep-inconclusive',
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        polling_metadata: { result_metrics: { accuracy: 0.9 } },
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+        criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: null, met: false, measurable: false },
+      }),
+      makeJob({
+        id: 'job-b',
+        task_title: 'run B',
+        experiment: 'sweep-inconclusive',
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        polling_metadata: { result_metrics: { accuracy: 0.95 } },
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+        criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.95, met: true, measurable: true },
+      }),
+    ];
+    fetchComputeJobs.mockResolvedValue(wrapJobs(jobs));
+    const { findByTestId, queryAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    await findByTestId('run-comparison-matrix');
+    const chips = queryAllByTestId('matrix-verdict-chip');
+    const inconclusiveChip = chips.find((c) => c.textContent?.includes('inconclusive'));
+    expect(inconclusiveChip).toBeTruthy();
+    expect(inconclusiveChip!.className).toContain('amber');
+    expect(inconclusiveChip!.className).not.toContain('red');
+  });
+
+  test('sweep run row chip renders amber/inconclusive for measurable:false verdict', async () => {
+    const jobs = [
+      makeJob({
+        id: 'job-s1',
+        experiment: 'sweep-exp2',
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        polling_metadata: { result_metrics: { score: 0.8 } },
+        success_criterion: { metric: 'score', operator: '>=', threshold: 0.9 },
+        criterion_verdict: { metric: 'score', operator: '>=', threshold: 0.9, value: null, met: false, measurable: false },
+      }),
+      makeJob({
+        id: 'job-s2',
+        experiment: 'sweep-exp2',
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        polling_metadata: { result_metrics: { score: 0.95 } },
+        success_criterion: { metric: 'score', operator: '>=', threshold: 0.9 },
+        criterion_verdict: { metric: 'score', operator: '>=', threshold: 0.9, value: 0.95, met: true, measurable: true },
+      }),
+    ];
+    fetchComputeJobs.mockResolvedValue(wrapJobs(jobs));
+    const { findAllByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const inconclusiveChips = await findAllByText('inconclusive');
+    expect(inconclusiveChips.length).toBeGreaterThanOrEqual(1);
+    expect(inconclusiveChips[0].className).toContain('amber');
+    expect(inconclusiveChips[0].className).not.toContain('red');
+  });
+
   test('active jobs are excluded from sweep summary groups', async () => {
     const activeJob = makeJob({ experiment: 'active-sweep', status: 'RUNNING', outcome: null });
     const terminalJob = makeJob({

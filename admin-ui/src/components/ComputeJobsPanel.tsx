@@ -207,10 +207,10 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
           return (
             <span
               key={job.id}
-              className={`rounded border px-1.5 py-0.5 text-ui-xs font-semibold ${v?.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : v ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-600/40 bg-neutral-800/60 text-neutral-400'}`}
+              className={`rounded border px-1.5 py-0.5 text-ui-xs font-semibold ${v?.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : v && !v.measurable ? 'border-amber-500/40 bg-amber-500/15 text-amber-300' : v ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-600/40 bg-neutral-800/60 text-neutral-400'}`}
               data-testid="matrix-verdict-chip"
             >
-              {(job.task_title ?? job.id).slice(0, 20)}: {v?.met ? 'met' : v ? 'missed' : 'no verdict'}
+              {(job.task_title ?? job.id).slice(0, 20)}: {v?.met ? 'met' : v && !v.measurable ? 'inconclusive' : v ? 'missed' : 'no verdict'}
             </span>
           );
         })}
@@ -481,6 +481,10 @@ function ExperimentSweepSummary({ jobs }: { jobs: ComputeJob[] }) {
                         verdict.met ? (
                           <span className="shrink-0 rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-ui-xs text-emerald-300">
                             met
+                          </span>
+                        ) : !verdict.measurable ? (
+                          <span className="shrink-0 rounded border border-amber-500/40 bg-amber-500/15 px-1 py-0.5 text-ui-xs text-amber-300">
+                            inconclusive
                           </span>
                         ) : (
                           <span className="shrink-0 rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-ui-xs text-red-300">
@@ -1511,6 +1515,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         </span>
                       </div>
                     )}
+                    {(hasIdentity || sc) && (
+                      <div className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-0.5">
                     {hasIdentity && (
                       <div
                         className="flex flex-col gap-0.5 text-ui-sm font-mono"
@@ -1532,7 +1538,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     )}
                     {sc && (
                       <div
-                        className={`flex flex-col gap-1 text-ui-sm font-mono${hasIdentity ? ' mt-0.5' : ''}`}
+                        className="flex flex-col gap-1 text-ui-sm font-mono"
                         data-testid="criterion-verdict-row"
                       >
                         <div className="flex items-center gap-1.5">
@@ -1569,6 +1575,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                             </span>
                           </div>
                         )}
+                      </div>
+                    )}
                       </div>
                     )}
                   </div>
